@@ -194,7 +194,15 @@ DKV_ACC_LAYOUTS = ("natural", "permuted")
 # (num_queries <= the token chunk the workspace budget allows); otherwise the
 # single-pass stage.  Passes run over the whole row only (grid = num_queries
 # per pass; no token chunking), so the workspace grows by num_queries *
-# (147,456 + 4 * topk + 4) bytes.
+# (147,456 + 4 * topk + 4) bytes.  The passes split the whole key row
+# ``[0, S)`` into equal ranges, which matches an index row whose keys spread
+# over the whole row (one document); in a packed multi-segment row every
+# token's keys lie inside its own segment, so whole-row ranges leave most
+# passes empty for most tokens while the per-pass fixed cost (Q/dO reload,
+# FP32 dQ partial round trip, compaction) is still paid.  The policy therefore
+# applies to one-segment rows only: ``num_segments > 1`` (the varlen entry
+# passes ``len(cu_seqlens_k) - 1``, host metadata, no device sync) plans one
+# pass unless ``key_passes`` overrides.
 KEY_PASS_STAGES = ("bwd_compact", "bwd_main_pass")
 DQ_PARTIAL_BYTES_PER_TOKEN = (
     NUM_HEADS * D_QK * 4
@@ -242,7 +250,15 @@ class KeyPassPolicy:
         m = self.token_chunk_multiple
         return max(m, (self.workspace_budget_bytes // per_token) // m * m)
 
-    def passes(self, num_queries: int, num_kv: int, topk: int) -> int:
+    def passes(
+        self, num_queries: int, num_kv: int, topk: int, *, num_segments: int = 1
+    ) -> int:
+        """Passes of a binding: the formula when the key row is one segment, the
+        whole row is one launch and the formula gives more than one; else 1."""
+        if int(num_segments) < 1:
+            raise ValueError(f"num_segments must be >= 1, got {num_segments}")
+        if int(num_segments) > 1:
+            return 1
         formula = self.formula_passes(num_kv)
         if formula == 1:
             return 1
@@ -256,12 +272,17 @@ def plan_key_passes(
     num_kv: int,
     topk: int,
     key_passes: Optional[int] = None,
+    *,
+    num_segments: int = 1,
 ) -> int:
     """Number of key-range passes of one backward binding.
 
     ``key_passes`` overrides the record's policy (1 = the single-pass stage);
     a program without the pass stages serves one pass only, and a record
     without a ``key_pass_policy`` never takes the pass path by default.
+    ``num_segments`` is the packed segment count of the key row (see the
+    comment above ``KEY_PASS_STAGES``): the policy plans one pass for more
+    than one segment.
     """
     multi_pass = all(stage in stages for stage in KEY_PASS_STAGES)
     if key_passes is not None:
@@ -285,7 +306,7 @@ def plan_key_passes(
     policy = KeyPassPolicy.from_record(record)
     if policy is None:
         return 1
-    return policy.passes(num_queries, num_kv, topk)
+    return policy.passes(num_queries, num_kv, topk, num_segments=num_segments)
 
 
 def key_pass_ranges(num_kv: int, passes: int) -> tuple[tuple[int, int], ...]:
@@ -719,15 +740,25 @@ def dsa_train_workspace_size(
     *,
     backward: bool = True,
     key_passes: Optional[int] = None,
+    num_segments: int = 1,
 ) -> int:
     """Workspace bytes :func:`prepare_dsa_train` needs for ``(T, S, topk)`` on ``device``.
 
-    ``key_passes`` as in :func:`prepare_dsa_train` (``None`` = the record's policy).
+    ``key_passes`` / ``num_segments`` as in :func:`prepare_dsa_train`
+    (``None`` = the record's policy; the packed segment count of the key row).
     """
     name, record = record_for(device)
     stages = registered_stages(name)
     passes = (
-        plan_key_passes(record, stages, num_queries, num_kv, topk, key_passes)
+        plan_key_passes(
+            record,
+            stages,
+            num_queries,
+            num_kv,
+            topk,
+            key_passes,
+            num_segments=num_segments,
+        )
         if backward
         else 1
     )
@@ -767,7 +798,8 @@ def offset_gather_kv_indices(
     *,
     causal: bool = False,
     out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    return_topk_length: bool = False,
+):
     """Turn per-document key indices into global key rows.
 
     ``gather_kv_indices [T, topk]`` holds, for query row ``t`` of document
@@ -781,10 +813,21 @@ def offset_gather_kv_indices(
     the rule is the one of the Cake facade (``globalize_topk_indices``).  The
     default ``causal=False`` is the plain offsetting of the first release: the
     index row is taken as is and only ``-1`` / out-of-range slots are dropped.
-    The result
-    addresses the packed ``kv_*`` tensors; invalid slots become ``-1``.  A
-    zero-length query segment contributes no rows.  Runs on device without a
-    host synchronization.
+    The result addresses the packed ``kv_*`` tensors; invalid slots become
+    ``-1``.  A zero-length query segment contributes no rows.
+
+    This glue counts in the step time of the varlen entry and is launch-bound
+    (a ``[T, topk]`` pass is 5-10 us of GPU time against ~10 us of dispatch),
+    so it runs with as few launches as the rule allows: a handful of ``[T]``
+    int32 ops for the per-row document data, then two compares into one bool
+    mask (``0 <= idx`` and ``idx <= bound`` -- the bound is the row's own key
+    position with ``causal``, itself ``< seqlen_k``, and ``seqlen_k - 1``
+    otherwise) and one ``where`` over ``idx + key_base``.  With
+    ``return_topk_length=True`` the per-row ``topk_length`` (last valid slot
+    + 1; bitwise what :func:`derive_topk_length` computes from the result) is
+    derived from the same mask with one ``where`` and one ``amax`` and the
+    function returns ``(indices, topk_length)``.  Runs on device without a
+    host synchronization, in int32 throughout.
     """
     if gather_kv_indices.ndim != 2 or gather_kv_indices.dtype != torch.int32:
         raise ValueError("gather_kv_indices must be an int32 [T, topk] tensor")
@@ -795,33 +838,67 @@ def offset_gather_kv_indices(
         raise ValueError(
             "cu_seqlens_q and cu_seqlens_k must describe the same documents"
         )
-    total_q = int(gather_kv_indices.shape[0])
-    num_docs = int(cu_seqlens_q.numel()) - 1
+    total_q, topk = (int(d) for d in gather_kv_indices.shape)
     device = gather_kv_indices.device
-    seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int64)
-    doc_of_row = torch.repeat_interleave(
-        torch.arange(num_docs, device=device), seqlens_q, output_size=total_q
-    )
-    key_base = cu_seqlens_k[:-1].to(torch.int64)[doc_of_row][:, None]
-    key_len = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int64)[doc_of_row][
-        :, None
-    ]
-    local = gather_kv_indices.to(torch.int64)
-    valid = (local >= 0) & (local < key_len)
+    # per-row document data: [T]-sized, int32 like cu_seqlens (key rows and positions fit int32)
+    rows = torch.arange(total_q, device=device, dtype=torch.int32)
+    doc_of_row = torch.searchsorted(cu_seqlens_q, rows, right=True) - 1
+    key_base = cu_seqlens_k[:-1][doc_of_row]
     if causal:
-        # Own key position of row t: (seqlen_k[d] - seqlen_q[d]) + (t - cu_seqlens_q[d]).
-        query_base = cu_seqlens_q[:-1].to(torch.int64)[doc_of_row]
-        own_position = (key_len[:, 0] - seqlens_q[doc_of_row]) + (
-            torch.arange(total_q, device=device, dtype=torch.int64) - query_base
-        )
-        valid &= local <= own_position[:, None]
-    result = torch.where(valid, local + key_base, torch.full_like(local, -1)).to(
-        torch.int32
-    )
+        # Own key position of row t: (seqlen_k[d] - seqlen_q[d]) + (t - cu_seqlens_q[d])
+        # == (cu_seqlens_k[d + 1] - cu_seqlens_q[d + 1]) + t - key_base.
+        bound = (cu_seqlens_k[1:] - cu_seqlens_q[1:])[doc_of_row] + rows - key_base
+    else:
+        bound = (cu_seqlens_k[1:] - cu_seqlens_k[:-1])[doc_of_row] - 1
+    local = gather_kv_indices
+    # [T, topk] passes: two int32 compares into one bool mask, one add, one where
+    valid = local >= 0
+    valid &= local <= bound[:, None]
     if out is None:
+        result = torch.where(valid, local + key_base[:, None], -1)
+    else:
+        # the out= overload takes tensors only
+        result = torch.where(
+            valid, local + key_base[:, None], local.new_full((), -1), out=out
+        )
+    if not return_topk_length:
         return result
-    out.copy_(result)
-    return out
+    topk_length = torch.where(valid, _slot_positions(topk, device), 0).amax(dim=-1)
+    return result, topk_length
+
+
+_SLOT_POSITIONS: dict[tuple, torch.Tensor] = {}
+
+
+def _slot_positions(topk: int, device: torch.device) -> torch.Tensor:
+    """Cached ``[1 .. topk]`` int32 on ``device`` (constant per problem)."""
+    key = (int(topk), str(device))
+    pos = _SLOT_POSITIONS.get(key)
+    if pos is None:
+        pos = torch.arange(1, int(topk) + 1, device=device, dtype=torch.int32)
+        _SLOT_POSITIONS[key] = pos
+    return pos
+
+
+def derive_topk_length(indices: torch.Tensor, num_kv: int) -> torch.Tensor:
+    """``[T]`` int32: position of the last valid slot + 1 per row (0 for a fully masked row).
+
+    The public entries' default when the caller passes no ``topk_length``: a slot
+    is valid iff ``0 <= idx < num_kv`` (``idx == clamp(idx, 0, num_kv - 1)`` for
+    int32 ``idx``), every slot past the last valid one is invalid, so the kernels
+    may skip the trailing invalid key blocks while the masking semantics -- and
+    the results -- stay those of the full row.  Four small launches (clamp, eq,
+    where, amax) on device, no host synchronization.
+    """
+    if indices.ndim != 2 or indices.dtype != torch.int32:
+        raise ValueError("indices must be an int32 [T, topk] tensor")
+    T, topk = indices.shape
+    S = int(num_kv)
+    if S < 1:
+        return torch.zeros((T,), dtype=torch.int32, device=indices.device)
+    pos = _slot_positions(topk, indices.device)
+    valid = indices == indices.clamp(0, S - 1)
+    return torch.where(valid, pos, 0).amax(dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -1257,6 +1334,7 @@ def prepare_dsa_train(
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     backend: str = "cake",
+    num_segments: int = 1,
 ) -> DSATrainRunner:
     """Validate one binding and prepare its launches.
 
@@ -1352,7 +1430,15 @@ def prepare_dsa_train(
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
     passes = (
-        plan_key_passes(record, stages, num_queries, num_kv, topk, key_passes)
+        plan_key_passes(
+            record,
+            stages,
+            num_queries,
+            num_kv,
+            topk,
+            key_passes,
+            num_segments=num_segments,
+        )
         if backward
         else 1
     )
@@ -1671,12 +1757,13 @@ def backward_binding_key(
     key_passes: Optional[int] = None,
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    num_segments: int = 1,
 ) -> tuple:
     """Cache key of a backward binding: the forward key's inputs plus the saved
     forward outputs, ``dout``, the ``dkv_fp32`` option, the ``key_passes``
-    override (``None`` = policy) and the packed accumulator / destination map
+    override (``None`` = policy), the packed accumulator / destination map
     (``None`` when absent; their row stride and presence are baked into the
-    cast's launch)."""
+    cast's launch) and the segment count the pass policy saw."""
     return (
         "bwd",
         _meta(q_latent),
@@ -1694,6 +1781,7 @@ def backward_binding_key(
         None if key_passes is None else int(key_passes),
         None if dkv_acc is None else _meta(dkv_acc),
         None if dkv_dst_map is None else _meta(dkv_dst_map),
+        int(num_segments),
     )
 
 
@@ -2130,6 +2218,7 @@ def backward(
     key_passes: Optional[int] = None,
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    num_segments: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward pass from the saved forward outputs: ``(dq_latent, dq_rope, dkv_latent, dk_rope)``.
 
@@ -2137,7 +2226,10 @@ def backward(
     ``dkv_fp32=True`` the dK/dV gradients are natural-layout FP32 tensors
     (fresh per call, never the kernels' internal accumulators).  ``key_passes``
     overrides the key-range-pass policy of the main stage (``None`` = the
-    registered policy; see :func:`plan_key_passes`).  A call without query
+    registered policy; see :func:`plan_key_passes`); ``num_segments`` is the
+    packed segment count of the key row the policy plans with (the varlen
+    entry passes ``len(cu_seqlens_k) - 1``; more than one segment plans one
+    pass).  A call without query
     rows returns empty ``dq`` and zero ``dkv`` gradients without binding or
     launching.  ``dkv_acc`` (FP32 ``[S_dst, >= 576]``) receives the dK/dV
     gradients in place instead -- latent columns ``0:512``, rope ``512:576`` of
@@ -2198,6 +2290,7 @@ def backward(
             key_passes,
             dkv_acc,
             dkv_dst_map,
+            num_segments,
         )
         binding = cache.lookup(key)
         if binding is not None:
@@ -2237,6 +2330,7 @@ def backward(
         key_passes=key_passes,
         dkv_acc=dkv_acc,
         dkv_dst_map=dkv_dst_map,
+        num_segments=num_segments,
     )
     result = runner.backward()
     if key is not None and runner.abi == ABI_CONTRACT:
@@ -2264,6 +2358,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         key_passes=None,
         dkv_acc=None,
         dkv_dst_map=None,
+        num_segments=1,
     ):
         out, lse, o_lo = forward(
             q_latent,
@@ -2279,6 +2374,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         )  # no zero-filled grad for an unused lse; dout is None when out is unused
         ctx.softmax_scale = softmax_scale
         ctx.key_passes = key_passes
+        ctx.num_segments = int(num_segments)
         ctx.has_topk_length = topk_length is not None
         # The packed accumulator is mutated in place by the backward (+=), so it is kept on ctx rather than saved: a
         # saved tensor's version check would reject that mutation when the graph is retained for another backward.
@@ -2298,7 +2394,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
                 "gradients through lse are not supported; only out is differentiable"
             )
         if dout is None:  # out unused downstream
-            return (None,) * 10
+            return (None,) * 11
         q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo, topk_length = (
             ctx.saved_tensors
         )
@@ -2321,13 +2417,15 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             key_passes=ctx.key_passes,
             dkv_acc=ctx.dkv_acc,
             dkv_dst_map=ctx.dkv_dst_map,
+            num_segments=ctx.num_segments,
         )
-        # dkv_latent / dk_rope are None when the gradients went into dkv_acc; no gradient for the six other inputs
+        # dkv_latent / dk_rope are None when the gradients went into dkv_acc; no gradient for the seven other inputs
         return (
             dq_latent,
             dq_rope,
             dkv_latent,
             dk_rope,
+            None,
             None,
             None,
             None,
@@ -2350,6 +2448,7 @@ def dsa_sparse_attention(
     key_passes: Optional[int] = None,
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    num_segments: int = 1,
 ):
     """Differentiable sparse attention over global key indices (see the module docstring).
 
@@ -2361,10 +2460,19 @@ def dsa_sparse_attention(
     FP32 ``[S_dst, >= 576]`` accumulated in place: latent columns ``0:512``,
     rope ``512:576``) and ``dkv_dst_map`` (int32 ``[S]`` destination row per
     key row, default identity) are handed to the backward; with ``dkv_acc``
-    the ``kv_latent`` / ``k_rope`` gradients are ``None``.
+    the ``kv_latent`` / ``k_rope`` gradients are ``None``.  ``num_segments``
+    is the packed segment count of the key row (``len(cu_seqlens_k) - 1`` for
+    a packed batch; :func:`dsa_sparse_attention_varlen` passes it): the
+    backward's whole-row key-range passes apply to one-segment rows only.
+    Without ``topk_length`` the per-row lengths are derived once per step
+    (:func:`derive_topk_length`: last valid slot + 1, counted in the forward
+    time, saved for the backward) so the kernels skip the trailing invalid
+    key blocks of short rows; the results are those of the full row.
     """
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
+    if topk_length is None and q_latent.shape[0] > 0:
+        topk_length = derive_topk_length(indices, int(kv_latent.shape[0]))
     out, lse = DSASparseAttentionFunction.apply(
         q_latent,
         q_rope,
@@ -2376,6 +2484,7 @@ def dsa_sparse_attention(
         key_passes,
         dkv_acc,
         dkv_dst_map,
+        int(num_segments),
     )
     return (out, lse) if return_lse else out
 
@@ -2406,13 +2515,27 @@ def dsa_sparse_attention_varlen(
     offsetting also drops selected keys after the query's own position
     ``(seqlen_k - seqlen_q) + local_q`` (:func:`offset_gather_kv_indices`); the
     default ``causal=False`` keeps the index rows as is (the behaviour of the
-    first release).
+    first release).  Without an explicit ``topk_length`` the per-row lengths
+    come out of the same glue pass (no separate derivation).
     ``max_seqlen_q/k`` are accepted for signature parity and not used on the
-    host.  ``dkv_acc`` / ``dkv_dst_map`` as in :func:`dsa_sparse_attention`."""
+    host.  ``dkv_acc`` / ``dkv_dst_map`` as in :func:`dsa_sparse_attention`.
+    The segment count ``len(cu_seqlens_k) - 1`` (host metadata, no device
+    sync) is passed on as ``num_segments``: with more than one segment the
+    backward plans the single-pass stage unless ``key_passes`` overrides."""
     del max_seqlen_q, max_seqlen_k
-    indices = offset_gather_kv_indices(
-        gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal=causal
-    )
+    if topk_length is None:
+        # one glue pass: global rows and the per-row lengths from the same validity mask
+        indices, topk_length = offset_gather_kv_indices(
+            gather_kv_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=causal,
+            return_topk_length=True,
+        )
+    else:
+        indices = offset_gather_kv_indices(
+            gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal=causal
+        )
     return dsa_sparse_attention(
         q_latent,
         q_rope,
@@ -2425,4 +2548,5 @@ def dsa_sparse_attention_varlen(
         key_passes=key_passes,
         dkv_acc=dkv_acc,
         dkv_dst_map=dkv_dst_map,
+        num_segments=int(cu_seqlens_k.numel()) - 1,
     )
