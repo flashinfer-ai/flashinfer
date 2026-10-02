@@ -121,12 +121,11 @@ def keys_per_cta(topk: int, num_ctas: int) -> int:
 
 def plan_ctas(*, num_tokens: int, topk: int, capacity: Dict[int, int]) -> int:
     """Key splits per token: the largest of 8, 6, 5, 4, 3, 2 giving every CTA at least one full 32-key stage
-    whose ``num_tokens`` clusters are co-resident in one wave (``capacity[c]`` clusters of ``c`` CTAs run at
-    once); otherwise the smallest such size (several waves); 1 when no split leaves a full stage per CTA."""
+    and leaving no CTA without keys (:func:`is_valid_split`) whose ``num_tokens`` clusters are co-resident in
+    one wave (``capacity[c]`` clusters of ``c`` CTAs run at once); otherwise the smallest such size (several
+    waves); 1 when no split leaves a full stage per CTA."""
     valid = [
-        c
-        for c in PLAN_CTAS
-        if topk // c >= STAGE_KEYS and keys_per_cta(topk, c) * c >= topk
+        c for c in PLAN_CTAS if topk // c >= STAGE_KEYS and is_valid_split(topk, c)
     ]
     for c in valid:
         if num_tokens <= capacity.get(c, 0):

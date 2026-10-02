@@ -259,6 +259,23 @@ def test_cake_plan_needs_one_full_stage_per_cta():
     assert cake_backend.plan_ctas(num_tokens=1, topk=32, capacity=GB200_CAPACITY) == 1
 
 
+B200_CAPACITY = {8: 15, 6: 22, 5: 26, 4: 33, 3: 45, 2: 74}
+
+
+@pytest.mark.parametrize(
+    "capacity", [GB200_CAPACITY, B200_CAPACITY], ids=["gb300_table", "b200_table"]
+)
+@pytest.mark.parametrize("topk", [64, 128, 512, 1024, 2048])
+def test_cake_plan_never_leaves_a_cta_empty(topk, capacity):
+    for num_tokens in range(1, 129):
+        num_ctas = cake_backend.plan_ctas(
+            num_tokens=num_tokens, topk=topk, capacity=capacity
+        )
+        assert cake_backend.is_valid_split(topk, num_ctas), (num_tokens, num_ctas)
+    # 512 keys over 5 CTAs round to 128 per CTA and leave the fifth empty: 25 tokens take the 4-CTA split
+    assert cake_backend.plan_ctas(num_tokens=25, topk=512, capacity=capacity) == 4
+
+
 @pytest.mark.parametrize(
     "topk, num_ctas, expected",
     [

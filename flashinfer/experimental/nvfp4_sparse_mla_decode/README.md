@@ -150,9 +150,10 @@ in fp32 and P is f16; the acceptance run below confirms the tolerance of the tes
 - Cluster sizes 1, 2, 3, 4, 5, 6 and 8: one JIT module per (architecture, `C`), registered in `cake_jit.py`
   with its sources under `csrc/cake_nvfp4_sparse_mla_decode/{sm_100a,sm_103a}/`. `num_ctas_per_token=7` is
   rejected (`ValueError`), not re-planned.
-- Plan (`cake_backend.plan_ctas`): the largest of 8, 6, 5, 4, 3, 2 whose `num_tokens` clusters are co-resident
-  in one wave (`cudaOccupancyMaxActiveClusters` of each module, queried once per device), otherwise 2 in several
-  waves; 1 when no split leaves every CTA a full 32-key stage. `keys_per_cta = ceil(topk / C)` rounded up to a
+- Plan (`cake_backend.plan_ctas`): the largest of 8, 6, 5, 4, 3, 2 that gives every CTA a full 32-key stage and
+  leaves no CTA without keys (`is_valid_split`; 512 keys skip 5), whose `num_tokens` clusters are co-resident
+  in one wave (`cudaOccupancyMaxActiveClusters` of each module, queried once per device), otherwise the smallest
+  such split in several waves; 1 when no split qualifies. `keys_per_cta = ceil(topk / C)` rounded up to a
   multiple of 32, at most 2048. A forced split that leaves a CTA without keys is rejected.
 - Dynamic shared memory 192,256 bytes (`C = 1`) or 226,816 bytes (`C > 1`), the schedule's pool plus its mbarriers: one CTA per SM.
 - `cake_backend.prepare_nvfp4_sparse_mla_decode(...)` returns a runner that launches without allocation (CUDA
