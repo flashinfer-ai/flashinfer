@@ -131,9 +131,10 @@ layouts, ownership and reset semantics can change while names remain stable.
 
 Preserve the integration's correctness fixes when adapting: physical K-major
 weight concatenation, bounded preprocessing temporaries, padded physical router
-capacity, per-launch masked-slot clearing/output resets, validated routing and
-unit-normalization contract. Recheck warmed graph bindings across different
-weights/streams and safe workspace teardown if those contracts change.
+capacity, per-launch masked-slot clearing/output resets, routing validation,
+and normalization and scalar-override semantics. Recheck warmed graph bindings
+across different weights/streams and safe workspace teardown if those contracts
+change.
 
 ### 5. Carry supported changes through the FlashInfer API
 

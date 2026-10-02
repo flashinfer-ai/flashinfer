@@ -1,0 +1,47 @@
+# Cake Kimi-K3 AttnRes (experimental, SM100 / SM103)
+
+Generated-program backend for the Kimi-K3 attention-residual mixing operator
+(`_apply_attn_res` of the model; the vLLM `attn_res` op): on caller-owned BF16
+tensors with hidden size 7168 and `K = num_blocks` in `[0, 8]`, one launch
+performs the BF16 residual add `prefix += delta`, the optional exact snapshot
+write `blocks[:, block_write_idx, :] = prefix`, the FP32 RMS-normalized score
+of the `K + 1` candidate rows (`K` snapshot rows and the updated prefix), a
+stable FP32 softmax over the candidates, the FP32 probability-weighted mix, and
+the fused output RMSNorm with a single BF16 cast into `out`.
+
+Public entry points: `flashinfer.kimi_k3_attn_res.prepare_kimi_k3_attn_res`
+(bind one call; `launch()` allocates nothing and is CUDA-graph capturable) and
+`flashinfer.kimi_k3_attn_res.kimi_k3_attn_res` (prepare + launch).
+
+## Routes
+
+`cake_backend.plan_route(arch, sm_count, M, num_blocks, enable_pdl, ...)` selects
+the generated program from host-known facts only (the Cake production policy,
+ported and checked row by row by the export):
+
+| kind | program | when |
+| --- | --- | --- |
+| `native_{k5,k6,k7,k8,m128}` | installed native ports, 148 CTAs x 288 threads, three sources per chunk, depth 2 | the measured cells of the 148-SM parts (`M = 1` for K5 / K6 / K7, `M <= 1024` cells for K4, small `M` / `M = 256` for K8) |
+| `k0_tma` | exact `K = 0` persistent path (bulk-copy fed, no TMEM) | `num_blocks == 0` |
+| `persistent` | persistent TMEM common path, 288 threads, `nc` sources per chunk (1..5), depth 2 or 3, retraced per cell | every other dense call with `delta` and `output_norm_weight` and no snapshot write |
+| `direct` | one 256-thread CTA per token | no `delta`, snapshot write, no output norm, or row-padded layouts |
+
+`KERNELS[arch][kernel_key]` in `cake_jit.py` names the registered module of a
+plan; a call whose program is not registered raises `NotImplementedError`
+(`generated_program_available` answers without raising).  The checkout registers
+the programs of the Kimi-K3 evaluation: `M` in {1, 2, 4, ..., 16384} x `K` in
+{0, 1, 4, 8}, every `K` at `M` = 1 / 4096, and the semantic variants at `M` =
+1 / 3 / 7 / 17, with and without programmatic dependent launch, on `sm_100a`
+and `sm_103a` (148 SMs).
+
+## Correctness contract
+
+Output within `atol 8e-2 / rtol 3e-2` of the independent FP32 reference
+(`cake_backend.reference_kimi_k3_attn_res`); `prefix` and `blocks` bit-exact
+(including every unwritten byte); read-only inputs untouched.
+
+## Generated sources
+
+`csrc/cake_kimi_k3_attn_res/<arch>/*.cu` (device + TVM-FFI binding per module)
+and the `MODULES` / `KERNELS` literals of `cake_jit.py` are receipt-bound
+exporter output: do not edit by hand.

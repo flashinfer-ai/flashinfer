@@ -10,7 +10,7 @@ Match the deployment's GPU, EP world size, geometry, and token capacity::
         --dtype nvfp4 --hidden 7168 --intermediate 2048 \
         --num-experts 256 --topk 8 --max-tokens 8 512 2048
 
-``--intermediate`` is the post-SwiGLU width. Use ``MEGA_NO_DIST=1`` for
+``--intermediate`` is the width after activation. Use ``MEGA_NO_DIST=1`` for
 single-rank tuning. Atomic reduction candidates require
 ``--allow-nondeterministic`` and an engine configuration that enables IKR.
 """
@@ -60,7 +60,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--intermediate",
         type=int,
         required=True,
-        help="model post-SwiGLU intermediate size "
+        help="model width after activation "
         "(*MegaMoeConfig.intermediate_size convention)",
     )
     parser.add_argument("--num-experts", type=int, required=True)
@@ -80,6 +80,38 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="cross-rank combine wire (nvfp4 dtype only)",
     )
     parser.add_argument("--gate-up-clamp", type=float, default=None)
+    parser.add_argument(
+        "--activation",
+        choices=("swiglu", "situ"),
+        default="swiglu",
+        help="SM107 activation; SiTU requires both beta arguments",
+    )
+    parser.add_argument("--situ-beta", type=float)
+    parser.add_argument("--situ-linear-beta", type=float)
+    parser.add_argument(
+        "--input-norm-const",
+        type=float,
+        default=1.0,
+        help="SM107 NVFP4 input quantization normalization",
+    )
+    parser.add_argument(
+        "--fc1-alpha",
+        type=float,
+        default=1.0,
+        help="SM107 NVFP4 FC1 accumulator multiplier for every expert",
+    )
+    parser.add_argument(
+        "--fc2-alpha",
+        type=float,
+        default=1.0,
+        help="SM107 NVFP4 FC2 accumulator multiplier for every expert",
+    )
+    parser.add_argument(
+        "--fc1-norm-const",
+        type=float,
+        default=1.0,
+        help="SM107 NVFP4 intermediate quantization normalization",
+    )
     parser.add_argument(
         "--allow-nondeterministic",
         action="store_true",
@@ -170,6 +202,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if family == "sm107" and args.combine_dtype != "bf16":
         print("SM107 supports --combine-dtype bf16 only", file=sys.stderr)
+        return 2
+
+    activation_requested = (
+        args.activation != "swiglu"
+        or args.situ_beta is not None
+        or args.situ_linear_beta is not None
+    )
+    scaling_requested = any(
+        getattr(args, name) != 1.0
+        for name in ("input_norm_const", "fc1_alpha", "fc2_alpha", "fc1_norm_const")
+    )
+    if family != "sm107" and (activation_requested or scaling_requested):
+        print(
+            "activation and normalization options require --arch sm107", file=sys.stderr
+        )
+        return 2
+    if scaling_requested and args.dtype != "nvfp4":
+        print("normalization options require --dtype nvfp4", file=sys.stderr)
         return 2
 
     tuner = importlib.import_module(

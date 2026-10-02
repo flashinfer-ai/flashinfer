@@ -265,7 +265,7 @@ def prepared_stage_inputs(inputs, *, tactic=None):
         "fc1_token_scales": view(sp1, sf_rows * h // 16, torch.uint8, (-1,)),
         "fc2_tokens": view(qp, s * i // 2, torch.uint8, (s, i // 2)),
         "fc2_token_scales": view(sp2, sf_rows * i // 16, torch.uint8, (-1,)),
-        "offsets": view(op, e, torch.int32, (e,)),
+        "offsets": view(op, e + 1, torch.int32, (e + 1,)),
     }
     if mp >= 0:
         result["fc1_output"] = view(mp, s * i, torch.bfloat16, (s, i))

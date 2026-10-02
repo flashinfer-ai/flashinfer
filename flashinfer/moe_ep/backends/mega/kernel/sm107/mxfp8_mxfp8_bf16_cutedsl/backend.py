@@ -155,6 +155,10 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 max_tokens=fleet_params.max_tokens_per_rank,
                 allow_nondeterministic=k.in_kernel_fc2_reduce,
                 apply_topk_at_fc1=k.apply_topk_in_fc1,
+                activation=k.activation,
+                situ_beta=k.situ_beta,
+                situ_linear_beta=k.situ_linear_beta,
+                gate_up_clamp=_resolve_gate_up_clamp(k),
             )
             if self.ep_rank == 0:
                 print(
@@ -271,6 +275,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.top_k,
             fp.token_hidden_size,
             k.intermediate_size,
+            k.activation,
+            k.situ_beta,
+            k.situ_linear_beta,
             k.kind,
             _resolve_gate_up_clamp(k),
             k.in_kernel_fc2_reduce,

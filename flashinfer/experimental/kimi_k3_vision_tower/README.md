@@ -16,7 +16,8 @@ sequence of generated tcgen05 programs:
 | --- | --- | --- |
 | `patch_embed` | `gemm:pos_sqxw:*` | `x = bf16(pixels[T, 588] @ Wpe^T) + pos_rows` (Conv2d 14x14/14 as a GEMM, bilinear-resized 64x64 positional table + sincos time rows) + handoff `xw = bf16(x * norm0[0])`, `stats = rowsumsq(x)` |
 | `layer_norm_qkv_rope` (x27) | `gemm:norm_qkv_rope:*_cs` | `q, k, v = RoPE2D(bf16((xw @ Wqkv^T) * rstd(x)))`: the RMSNorm weight applied on the activation side by the producer (`xw`), row `rstd` from the FP32 `stats` handoff, original `Wqkv`, interleaved-pair 2-D RoPE in the epilogue from the packed f16x2 `(cos, sin)` table of the plan (`pack_rope_table`; FP32 rotation), head-split outputs |
-| `layer_attention` (x27) | `attention:tiles2` / `attention:tiles1` / `attention:ring3` | packed-varlen noncausal attention per `grid_thw` segment, 12 heads x 128, FP32 softmax, one BF16 rounding; `ring3` = the one-tile layout with the shared-O three-deep score ring (`cake_backend.ring3_selected`: every one-tile row on SM100, 576..10764-token segments on SM103) |
+| `layer_attention` (x27) | `attention:<layout>[:wide][:split]`, layout = `tiles2` / `tiles1` / `ring3` | packed-varlen noncausal attention per `grid_thw` segment, 12 heads x 128, FP32 softmax, one BF16 rounding; `ring3` = the one-tile layout with the shared-O three-deep score ring (`cake_backend.ring3_selected`: every one-tile row on SM100, 576..10764-token segments on SM103); `:wide` = the wide unit table with the next-unit prefetch on short rows (`unit_prefetch_selected`: T <= 1656 on SM100, T <= 2552 on SM103); `:split` = the KV-split build that writes the tail-round units' K/V parts as FP32 partials (`cake_backend.select_layout_and_split`) |
+| `layer_attention_merge` (x27, split rows only) | `attention_merge` | exact fixed-order merge of the K/V parts of every split unit (`softmax(m, l)` rescale in FP32, one BF16 rounding into `attn_out`); launched right after the attention kernel when the plan has `num_merge_units > 0` |
 | `layer_out_proj` (x27) | `gemm:residual_wo_sqxw:*` | `x += bf16(a @ Wo^T)` + handoff `xw = bf16(x * norm1)`, `stats` |
 | `layer_norm_fc0_gelu` (x27) | `gemm:norm_gelu:*` | `f = bf16(gelu_tanh(bf16((xw @ Wfc0^T) * rstd(x))))`, original `Wfc0` |
 | `layer_fc1` (x26) / `layer_fc1_last` (x1) | `gemm:residual_fc1_sqxw:*` / `gemm:residual_fc1:*` | `x += bf16(f @ Wfc1^T)` + handoff `xw = bf16(x * norm0[l+1])`, `stats`; the last layer runs the plain form (the merge reads `x` directly) |
@@ -34,10 +35,33 @@ the residual GEMMs while the pair grid underfills the machine (out-proj to
 out-proj pair tile is the TMA-epilogue twin `m_tma1`); the residual / pos
 forms run their packed bf16x2-epilogue twins `*_p` / `*_pf` with the
 pre-mainloop residual prefetch, the QKV GEMM its packed-RoPE-table twins
-`*_cs`); the attention unit layout is chosen per `grid_thws` batch from the
-LPT makespans of both layouts (`cake_backend.select_tiles_per_cta`) and the
-one-tile layout's kernel form per architecture and longest segment
-(`cake_backend.ring3_selected`).
+`*_cs`; the half-N tail twins `*_h` (`cake_backend.HALF_TWIN`,
+`half_tail_split`) run the tiles past the last full persistent round as
+half-width items whenever they fit one half-round with margin, bitwise
+identical per output element to the base tile); the attention unit layout
+and the automatic tail split are chosen per `grid_thws` batch from the
+split-aware LPT makespans of both layouts
+(`cake_backend.select_layout_and_split`: the `units mod G` cheapest units of
+the tail round are cut into `k <= 8` K/V parts when that shortens the
+makespan), the persistent grid is trimmed to the smallest cluster count with
+the same makespan where that frees at least 10 clusters (SM103;
+`cake_backend.shape_grid`), and the one-tile layout's kernel form follows the
+architecture and the longest segment (`cake_backend.ring3_selected`).
+
+Registered programs and the contract denominator: `REQUIRED_KERNEL_KEYS`
+lists every logical kernel the plan rule can select per architecture (the
+GEMM tile / PDL census, the attention-form census over single segments up to
+70016 tokens and the exported rows, the merge kernels).  The export registers
+the programs its rows launch: the 22 rows of the evaluation contract (the
+acceptance denominator) plus six export-only *coverage* rows
+(`COVERAGE_ROW_GRIDS`; validated bitwise against the source tower, not part
+of the acceptance geomean) that reach the keys no contract row exercises
+(half-N twins at token counts outside the rows, the plain two-tile form on
+SM100, the plain / split one-tile forms on SM103) -- so every reachable key is
+registered and `UNCOVERED_KERNEL_KEYS` is empty.  The check stays: a
+`grid_thws` batch whose plan resolves to an unregistered key raises
+`NotImplementedError` naming the missing keys -- it is never served by another
+binary.
 
 Programmatic dependent launch: the registered programs follow the Cake
 production PDL default (`KIMI_K3_VISION_TOWER_PDL`, on since the round-2
@@ -89,12 +113,16 @@ graph.replay()                                               # new pixel values 
 
 `prepare_kimi_k3_vision_tower` derives everything a serving runtime keeps per
 `grid_thws` batch (`cu_seqlens`, RoPE `cos`/`sin` and their packed f16x2
-table, positional rows, the merge table, the attention segment plan and unit
-table, the tile selection and all workspaces) and binds the 27 x 5 + 5
-launches; `launch()` performs no
+table, positional rows, the merge table, the attention segment plan, unit
+table and merge table, the tile selection and all workspaces incl. the FP32
+partial workspace of a split plan) and binds the 27 x 5 + 5 launches (27 x 6
++ 5 on a split plan: the attention merge follows every attention launch);
+`launch()` performs no
 allocation and no host synchronization. Pass a cached
 `build_kimi_k3_vision_plan(...)` / `pos_emb_rows(...)` to skip the derivation.
-Per-stage launches for tests and profiling: `runner.stages[name]()`.
+Per-stage launches for tests and profiling: `runner.stages[name]()`
+(`layer_attention` runs the attention kernel and, on a split plan, its merge;
+`layer_attention_merge` the merge alone).
 
 Correctness (tests in `tests/experimental/test_cake_kimi_k3_vision_tower.py`):
 every stage against the FP32 oracle of its operator on BF16 inputs at
