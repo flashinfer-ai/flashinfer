@@ -140,6 +140,7 @@ def prepare_for_launch(
         "softmax_scale_log2": q_scale * _SOFTMAX_SCALE_LOG2,
     }
     workspace: tuple[torch.Tensor, ...] = ()
+    arguments: tuple[Any, ...]
     if split_count == 1:
         arguments = (
             bindings["Q"],
