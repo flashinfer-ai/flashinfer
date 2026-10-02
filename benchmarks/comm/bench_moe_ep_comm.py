@@ -29,7 +29,6 @@ runs use the usual torchrun rendezvous flags instead of --standalone.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import json
 import os
 from dataclasses import dataclass
@@ -523,28 +522,11 @@ def _time_dispatch_and_combine(
     torch.cuda.synchronize()
 
     # ---- Timing events ----
-    if use_cuda_graph:
-        # cudaEventRecordExternal (0x1) keeps events recorded inside a CUDA graph
-        # queryable with elapsed_time() after replay.
-        cudart = ctypes.CDLL("libcudart.so")
-        cudart.cudaEventRecordWithFlags.restype = ctypes.c_int
-        cudart.cudaEventRecordWithFlags.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_uint,
-        ]
-
-    def _record(event: torch.cuda.Event) -> None:
-        if not use_cuda_graph:
-            event.record()
-            return
-        stream = torch.cuda.current_stream().cuda_stream
-        ret = cudart.cudaEventRecordWithFlags(event.cuda_event, stream, 0x1)
-        if ret != 0:
-            raise RuntimeError(f"cudaEventRecordWithFlags failed with code {ret}")
-
+    # External events become event-record nodes when captured into a CUDA
+    # graph, so they stay queryable with elapsed_time() after replay.
     d_starts, d_ends, c_starts, c_ends = (
-        [torch.cuda.Event(enable_timing=True) for _ in range(iters)] for _ in range(4)
+        [torch.cuda.Event(enable_timing=True, external=True) for _ in range(iters)]
+        for _ in range(4)
     )
     # A CUDA event handle is created lazily on its first record().
     for event in d_starts + d_ends + c_starts + c_ends:
@@ -571,14 +553,14 @@ def _time_dispatch_and_combine(
             comm.combine(output)
         for i in range(iters):
             l2_buffer.zero_()
-            _record(d_starts[i])
+            d_starts[i].record()
             _dispatch()
-            _record(d_ends[i])
+            d_ends[i].record()
             output = _expert_output()
             output.zero_()
-            _record(c_starts[i])
+            c_starts[i].record()
             comm.combine(output)
-            _record(c_ends[i])
+            c_ends[i].record()
 
     if use_cuda_graph:
         # One replay covers warmup and timed iterations, so no host gaps remain.

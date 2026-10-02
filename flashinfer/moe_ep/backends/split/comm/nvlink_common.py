@@ -6,7 +6,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from .....comm.comm_backend import CommBackend
+    from .....comm.abstractions import CommBackend
     from .....comm.mapping import Mapping
     from .....comm.mnnvl import MnnvlConfig
     from ....config import BootstrapConfig

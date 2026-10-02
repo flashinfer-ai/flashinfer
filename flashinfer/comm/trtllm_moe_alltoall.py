@@ -917,7 +917,7 @@ class MoeAlltoAll:
     """
     Manages MoE All-to-All operations with proper workspace allocation and synchronization.
 
-    .. deprecated::
+    .. deprecated:: 0.7.1
         Use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`
         (:class:`flashinfer.moe_ep.CakeAlltoAll` for
         ``backend="cake"``). The implementation of this class will move into

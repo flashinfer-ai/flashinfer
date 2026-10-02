@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from ......comm.comm_backend import CommBackend
+    from ......comm.abstractions import CommBackend
 
 
 @dataclass

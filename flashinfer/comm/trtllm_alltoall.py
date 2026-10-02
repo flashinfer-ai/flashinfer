@@ -441,7 +441,7 @@ _MNNVL_MOE_DEPRECATION = (
 class MnnvlMoe:
     """NVLink two-sided MoE all-to-all-v over MNNVL FIFO workspaces.
 
-    .. deprecated::
+    .. deprecated:: 0.7.1
         Use :class:`flashinfer.moe_ep.NVLinkTwoSidedAlltoAll`. The
         implementation of this class will move into it; it will no longer
         wrap this class.
