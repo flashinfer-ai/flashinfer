@@ -1,12 +1,16 @@
 """Prepared compressed sparse MQA metadata and logits on SM100a/SM103a.
 
-Two generated programs per KV layout serve every architecture: the metadata
-kernel (one per layout; SM count, sparse capacity, split width, block size and
-page size are runtime arguments) and the block-scaled logits kernel (one per
-format and layout).  ``MODULES`` registers each program once with the
-architectures it compiles for; ``ROUTES`` maps a logical kernel key to its
-program; ``LIMITS`` carries the exported geometry.  Plans bind user tensors
-once; ``run()`` submits on the current PyTorch stream without allocations.
+Generated programs serve every architecture: per KV layout a runtime metadata
+kernel (SM count, sparse capacity, split width, block size and page size are
+runtime arguments) and an exact-geometry metadata kernel for the production
+geometry (``LIMITS["exact_capacity"]`` sparse blocks of ``LIMITS["sparse_block_kv"]``
+tokens, ``LIMITS["page_kv"]``-token pages; the format's split width is compiled in
+and selected by the ``blocks_per_split`` argument), plus the block-scaled logits
+kernel (one per format and layout).  ``MODULES`` registers each program once
+with the architectures it compiles for; ``ROUTES`` maps a logical kernel key
+(``metadata_route_key``, ``logits:<fmt>:<layout>``) to its program; ``LIMITS``
+carries the exported geometry.  Plans bind user tensors once; ``run()`` submits
+on the current PyTorch stream without allocations.
 """
 
 from __future__ import annotations
@@ -17,197 +21,9 @@ from typing import Any
 import tvm_ffi
 
 # Populated verbatim by the generated-program export; do not edit by hand.
-MODULES: dict[str, dict[str, Any]] = {
-    "cake_deepgemm_sparse_mqa_0b50154d6224672096ae": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_0b50154d6224672096ae_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_0b50154d6224672096ae_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "SF_Q"],
-            ["tma_buffer", "Weights"],
-            ["tma_buffer", "KV_TMA"],
-            ["tma_buffer", "SF_KV_TMA"],
-            ["buffer", "KV"],
-            ["buffer", "SF_KV"],
-            ["buffer", "Metadata"],
-            ["buffer", "Logits"],
-            ["parameter", "logits_stride"],
-            ["parameter", "kv_page_stride_bytes"],
-            ["parameter", "num_sms"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_sparse_mqa_1102c64983cbe199412d": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_1102c64983cbe199412d_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_1102c64983cbe199412d_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "Starts"],
-            ["buffer", "Ends"],
-            ["buffer", "Context"],
-            ["buffer", "BlockTable"],
-            ["buffer", "Requests"],
-            ["buffer", "Sparse"],
-            ["buffer", "Metadata"],
-            ["buffer", "Workspace"],
-            ["parameter", "num_q_tokens"],
-            ["parameter", "num_kv_tokens"],
-            ["parameter", "block_table_stride"],
-            ["parameter", "num_ctas"],
-            ["parameter", "num_sms"],
-            ["parameter", "sms_divmod"],
-            ["parameter", "num_max_sparse_blocks"],
-            ["parameter", "blocks_per_split"],
-            ["parameter", "split_divmod"],
-            ["parameter", "sparse_block_kv"],
-            ["parameter", "block_shift"],
-            ["parameter", "blocks_per_page"],
-            ["parameter", "page_shift"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_sparse_mqa_3cbe2c53c45f0f3fe3b5": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_3cbe2c53c45f0f3fe3b5_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_3cbe2c53c45f0f3fe3b5_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "SF_Q"],
-            ["tma_buffer", "Weights"],
-            ["tma_buffer", "KV_TMA"],
-            ["tma_buffer", "SF_KV_TMA"],
-            ["buffer", "KV"],
-            ["buffer", "SF_KV"],
-            ["buffer", "Metadata"],
-            ["buffer", "Logits"],
-            ["parameter", "logits_stride"],
-            ["parameter", "kv_page_stride_bytes"],
-            ["parameter", "num_sms"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_sparse_mqa_603a27fb24d569d8d78c": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_603a27fb24d569d8d78c_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_603a27fb24d569d8d78c_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "SF_Q"],
-            ["tma_buffer", "Weights"],
-            ["tma_buffer", "KV_TMA"],
-            ["tma_buffer", "SF_KV_TMA"],
-            ["buffer", "KV"],
-            ["buffer", "SF_KV"],
-            ["buffer", "Metadata"],
-            ["buffer", "Logits"],
-            ["parameter", "logits_stride"],
-            ["parameter", "kv_page_stride_bytes"],
-            ["parameter", "num_sms"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_sparse_mqa_6a8db9d32c43b0fa39ee": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_6a8db9d32c43b0fa39ee_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_6a8db9d32c43b0fa39ee_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "Starts"],
-            ["buffer", "Ends"],
-            ["buffer", "Context"],
-            ["buffer", "BlockTable"],
-            ["buffer", "Requests"],
-            ["buffer", "Sparse"],
-            ["buffer", "Metadata"],
-            ["buffer", "Workspace"],
-            ["parameter", "num_q_tokens"],
-            ["parameter", "num_kv_tokens"],
-            ["parameter", "block_table_stride"],
-            ["parameter", "num_ctas"],
-            ["parameter", "num_sms"],
-            ["parameter", "sms_divmod"],
-            ["parameter", "num_max_sparse_blocks"],
-            ["parameter", "blocks_per_split"],
-            ["parameter", "split_divmod"],
-            ["parameter", "sparse_block_kv"],
-            ["parameter", "block_shift"],
-            ["parameter", "blocks_per_page"],
-            ["parameter", "page_shift"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_deepgemm_sparse_mqa_e7329cdf0bf190a2b7b2": {
-        "sources": [
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_e7329cdf0bf190a2b7b2_kernel.cu",
-            "experimental/deepgemm_sparse_mqa/generated/cake_deepgemm_sparse_mqa_e7329cdf0bf190a2b7b2_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "Q"],
-            ["tma_buffer", "SF_Q"],
-            ["tma_buffer", "Weights"],
-            ["tma_buffer", "KV_TMA"],
-            ["tma_buffer", "SF_KV_TMA"],
-            ["buffer", "KV"],
-            ["buffer", "SF_KV"],
-            ["buffer", "Metadata"],
-            ["buffer", "Logits"],
-            ["parameter", "logits_stride"],
-            ["parameter", "kv_page_stride_bytes"],
-            ["parameter", "num_sms"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-    },
-}
-ROUTES: dict[str, str] = {
-    "logits:mxfp4:contiguous": "cake_deepgemm_sparse_mqa_0b50154d6224672096ae",
-    "logits:mxfp4:paged": "cake_deepgemm_sparse_mqa_3cbe2c53c45f0f3fe3b5",
-    "logits:mxfp8:contiguous": "cake_deepgemm_sparse_mqa_603a27fb24d569d8d78c",
-    "logits:mxfp8:paged": "cake_deepgemm_sparse_mqa_e7329cdf0bf190a2b7b2",
-    "metadata:contiguous": "cake_deepgemm_sparse_mqa_6a8db9d32c43b0fa39ee",
-    "metadata:paged": "cake_deepgemm_sparse_mqa_1102c64983cbe199412d",
-}
-LIMITS: dict[str, int] = {
-    "max_sparse_blocks": 2048,
-    "max_sms": 160,
-    "sparse_block_kv": 8,
-    "page_kv": 64,
-    "heads": 32,
-}
+MODULES: dict[str, dict[str, Any]] = {}
+ROUTES: dict[str, str] = {}
+LIMITS: dict[str, int] = {}
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
@@ -335,6 +151,20 @@ def metadata_workspace_words(queries, capacity, *, fmt, sparse_block_kv, paged):
     return words
 
 
+def metadata_route_key(*, paged, capacity, sparse_block_kv, page_kv, use_unaligned_ks=False):
+    """``ROUTES`` key of the metadata program for one geometry: the exact-geometry program at the exported
+    production geometry (capacity ``LIMITS["exact_capacity"]``, ``LIMITS["sparse_block_kv"]``-token blocks and,
+    for paged rows, ``LIMITS["page_kv"]``-token pages), the runtime program otherwise."""
+    layout = "paged" if paged else "contiguous"
+    exact = (
+        not use_unaligned_ks
+        and capacity == LIMITS["exact_capacity"]
+        and sparse_block_kv == LIMITS["sparse_block_kv"]
+        and (not paged or page_kv == LIMITS["page_kv"])
+    )
+    return f"metadata:{layout}" + (":exact" if exact else "")
+
+
 def _arguments(record, bindings):
     arguments = []
     for kind, key in record["arg_plan"]:
@@ -441,12 +271,19 @@ class SparseMetadataPlan:
             page_kv=page_kv,
             use_unaligned_ks=bool(use_unaligned_ks),
         )
-        layout = "paged" if paged else "contiguous"
         if use_unaligned_ks:
             raise NotImplementedError(
                 "unaligned contiguous windows are not an exported sparse MQA specialization"
             )
-        self.program = ROUTES[f"metadata:{layout}"]
+        self.program = ROUTES[
+            metadata_route_key(
+                paged=paged,
+                capacity=capacity,
+                sparse_block_kv=sparse_block_kv,
+                page_kv=page_kv,
+                use_unaligned_ks=use_unaligned_ks,
+            )
+        ]
         size = metadata_size_bytes(
             queries,
             capacity,

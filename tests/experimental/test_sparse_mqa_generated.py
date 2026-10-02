@@ -154,10 +154,13 @@ def test_sparse_logits_analytical(fmt, paged, capacity):
     metadata, plan, output = _run_pipeline(case)
     assert torch.equal(output, analytical_expected(case, False))
     assert not bool(torch.count_nonzero(metadata.workspace[[0, 32, 64]]))
-    assert (
-        plan.programs["metadata"]
-        == _runtime.ROUTES[f"metadata:{'paged' if paged else 'contiguous'}"]
+    key = _runtime.metadata_route_key(
+        paged=paged, capacity=capacity, sparse_block_kv=8, page_kv=64
     )
+    # The production geometry (capacity 2048, 8-token blocks, 64-token pages) runs the exact-geometry program,
+    # every other capacity the runtime program of the layout.
+    assert key.endswith(":exact") == (capacity == _runtime.LIMITS["exact_capacity"])
+    assert plan.programs["metadata"] == _runtime.ROUTES[key]
 
 
 @pytest.mark.parametrize("fmt", ["mxfp4", "mxfp8"])
@@ -333,13 +336,24 @@ def geometry_case(fmt, paged, *, capacity, block, page, queries=37, seed=7):
         ("mxfp4", False, 256, 16, 64),
         ("mxfp8", False, 1024, 8, 64),
         ("mxfp8", False, 2048, 16, 64),
+        ("mxfp4", True, 2048, 8, 64),
+        ("mxfp8", False, 2048, 8, 64),
     ],
 )
 def test_sparse_metadata_runtime_geometry(fmt, paged, capacity, block, page):
-    """The metadata kernel takes the split width, capacity, block size and page size at runtime."""
+    """The runtime metadata kernel takes the split width, capacity, block size and page size at runtime; the
+    production geometry (capacity 2048, 8-token blocks, 64-token pages) runs the exact-geometry program."""
     _skip_unless_exported()
     case = geometry_case(fmt, paged, capacity=capacity, block=block, page=page)
     plan = prepare_sparse_mqa_metadata(case["sparse"], **case["kwargs"])
+    key = _runtime.metadata_route_key(
+        paged=paged, capacity=capacity, sparse_block_kv=block, page_kv=page
+    )
+    exact = (capacity, block) == (_runtime.LIMITS["exact_capacity"], 8) and (
+        not paged or page == 64
+    )
+    assert key.endswith(":exact") == exact
+    assert plan.program == _runtime.ROUTES[key]
     plan.run()
     torch.cuda.synchronize()
     check_metadata(
