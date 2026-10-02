@@ -46,8 +46,12 @@ _CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS = frozenset(
         "cake_sparse_mla_sm120_dsv4_nvfp4_format_info",
         "cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks",
         "cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill",
         "cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_prefill",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles",
         "cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel",
         "cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads",
     }
 )
