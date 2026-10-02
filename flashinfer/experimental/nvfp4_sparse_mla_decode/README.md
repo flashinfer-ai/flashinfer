@@ -147,9 +147,10 @@ output directly; a cluster merges its fp32 partials `(O, m, l)` through distribu
 owning 8-dim output group `G`. By design every e2m1 x e4m3 product is formed exactly in f16, S and O accumulate
 in fp32 and P is f16; the acceptance run below confirms the tolerance of the tests.
 
-- Cluster sizes 1, 2, 3, 4, 5, 6 and 8: one JIT module per (architecture, `C`), registered in `cake_jit.py`
-  with its sources under `csrc/cake_nvfp4_sparse_mla_decode/{sm_100a,sm_103a}/`. `num_ctas_per_token=7` is
-  rejected (`ValueError`), not re-planned.
+- Cluster sizes 1, 2, 3, 4, 5, 6 and 8: one JIT module per (architecture, `C`), registered in `cake_jit.py`;
+  the sm_100a and sm_103a programs of a cluster size render to the same text, so each is one shared
+  kernel + binding source pair under `csrc/cake_nvfp4_sparse_mla_decode/`, compiled per architecture.
+  `num_ctas_per_token=7` is rejected (`ValueError`), not re-planned.
 - Plan (`cake_backend.plan_ctas`): the largest of 8, 6, 5, 4, 3, 2 that gives every CTA a full 32-key stage and
   leaves no CTA without keys (`is_valid_split`; 512 keys skip 5), whose `num_tokens` clusters are co-resident
   in one wave (`cudaOccupancyMaxActiveClusters` of each module, queried once per device), otherwise the smallest

@@ -59,7 +59,8 @@ ARG_PLAN: list[list[str]] = [
 # flags, FFI entry, argument plan and launch resources (block, cluster,
 # cooperative flag, dynamic shared memory).  ``module`` / ``sources`` /
 # ``closure_sha256`` are ``None`` / empty until the generated-program export
-# fills them in verbatim (see ``csrc/cake_nvfp4_sparse_mla_decode/*/MANIFEST.todo``);
+# fills them in verbatim (see ``csrc/cake_nvfp4_sparse_mla_decode/MANIFEST.todo``; the
+# sm_100a and sm_103a records of one cluster size share the same sources);
 # such a record is not registered.  Do not edit the exported values by hand.
 #
 # Launch resources are generated-kernel constants: 448 threads (8 math warps,
