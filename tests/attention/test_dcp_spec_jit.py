@@ -20,10 +20,7 @@ from flashinfer.cake_dcp import (
 )
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 from flashinfer.jit.cake_dcp import get_dcp_spec_fp8_uri, get_dcp_spec_uri
-from flashinfer.jit.cake_fmha import (
-    CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
-    CAKE_FMHA_MANIFEST_SHA256,
-)
+from flashinfer.jit.cake_fmha import CAKE_FMHA_JIT_TAG
 from flashinfer.trace.templates.attention import (
     trtllm_batch_decode_dcp_spec_split_kv_trace,
     trtllm_batch_decode_dcp_spec_trace,
@@ -34,21 +31,14 @@ from flashinfer.trace.templates.attention import (
 def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
     v1_uri = get_dcp_spec_uri("v1", "sm103a", 64, 5, 32, 4, 8, 1)
     assert v1_uri.startswith("cake_fmha_dcp_spec_bf16_v1_")
-    assert v1_uri.endswith(
-        f"_b64_q5_hq32_hkv4_cp8_retain1_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
+    assert v1_uri.endswith(f"_b64_q5_hq32_hkv4_cp8_retain1_{CAKE_FMHA_JIT_TAG}")
     v4_uri = get_dcp_spec_uri("v4", "sm100a", 1, 8, 64, 8, 4, 16)
     assert v4_uri.startswith("cake_fmha_dcp_spec_bf16_v4_")
-    assert v4_uri.endswith(
-        f"_b1_q8_hq64_hkv8_cp4_split16_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
+    assert v4_uri.endswith(f"_b1_q8_hq64_hkv8_cp4_split16_{CAKE_FMHA_JIT_TAG}")
     fp8_uri = get_dcp_spec_fp8_uri("sm100a", 256, 3, 64, 8, 4, 3, 1)
     assert fp8_uri == (
         "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1_"
-        f"{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"{CAKE_FMHA_JIT_TAG}"
     )
 
 
