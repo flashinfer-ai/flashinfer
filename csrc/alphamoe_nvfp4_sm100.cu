@@ -56,8 +56,30 @@ inline LoomTensorMap64 CopyTensorMap64(const CUtensorMap& descriptor) {
 // clang-format off
 
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #include <string>
+#include <tuple>
 #include <utility>
+
+// ---- dynamic shared-memory opt-in, set once per (kernel, device) ----
+static cudaError_t SetMaxDynamicSmemOnce(const void* kernel, int bytes) {
+  int device = -1;
+  cudaError_t status = cudaGetDevice(&device);
+  if (status != cudaSuccess) return status;
+  static std::mutex mutex;
+  static std::set<std::tuple<const void*, int, int>> done;
+  std::lock_guard<std::mutex> guard(mutex);
+  if (done.count({kernel, device, bytes}) != 0) return cudaSuccess;
+  status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+  if (status == cudaSuccess) done.insert({kernel, device, bytes});
+  return status;
+}
+
+template <typename... Params>
+static cudaError_t SetMaxDynamicSmemOnce(void (*kernel)(Params...), int bytes) {
+  return SetMaxDynamicSmemOnce(reinterpret_cast<const void*>(kernel), bytes);
+}
 
 // ---- S1: programmatic dependent launch for the routed decode chain ----
 static bool AlphamoeNvfp4PdlEnabled() {
@@ -20679,8 +20701,7 @@ inline void LaunchSplitOrFallback(const TensorView& hidden_states, const TensorV
     const dim3 up_grid(static_cast<unsigned int>(capacity), static_cast<unsigned int>(blocks), 2);
     const dim3 down_grid(static_cast<unsigned int>(capacity), static_cast<unsigned int>(blocks), down_splits);
     if (packed_scale_loads) {
-      CheckCuda(cudaFuncSetAttribute(nvfp4_split_scale_word_up::kernel_alpha_moe_nvfp4_up_split_k2_workspace_word,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_scale_word_up::kGeneratedSmemTotal),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_scale_word_up::kernel_alpha_moe_nvfp4_up_split_k2_workspace_word, nvfp4_split_scale_word_up::kGeneratedSmemTotal),
           "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split up dynamic smem)");
       nvfp4_split_scale_word_up::kernel_alpha_moe_nvfp4_up_split_k2_workspace_word<<<up_grid, dim3(nvfp4_split_scale_word_up::kGeneratedThreads, 1, 1),
           nvfp4_split_scale_word_up::kGeneratedSmemTotal, stream>>>(
@@ -20698,8 +20719,7 @@ inline void LaunchSplitOrFallback(const TensorView& hidden_states, const TensorV
           dims.block_m);
       CheckCuda(cudaGetLastError(),
                 "alphamoe_nvfp4_sm100 split up kernel launch");
-      CheckCuda(cudaFuncSetAttribute(nvfp4_split_scale_word_down::kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace_word,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_scale_word_down::kGeneratedSmemTotal),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_scale_word_down::kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace_word, nvfp4_split_scale_word_down::kGeneratedSmemTotal),
           "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split down dynamic smem)");
       nvfp4_split_scale_word_down::kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace_word<<<down_grid, dim3(nvfp4_split_scale_word_down::kGeneratedThreads, 1, 1),
           nvfp4_split_scale_word_down::kGeneratedSmemTotal, stream>>>(
@@ -20723,8 +20743,7 @@ inline void LaunchSplitOrFallback(const TensorView& hidden_states, const TensorV
                 "alphamoe_nvfp4_sm100 split down kernel launch");
     }
     else {
-      CheckCuda(cudaFuncSetAttribute(nvfp4_split_scale_byte_up::kernel_alpha_moe_nvfp4_up_split_k2_workspace_byte,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_scale_byte_up::kGeneratedSmemTotal),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_scale_byte_up::kernel_alpha_moe_nvfp4_up_split_k2_workspace_byte, nvfp4_split_scale_byte_up::kGeneratedSmemTotal),
           "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split up dynamic smem)");
       nvfp4_split_scale_byte_up::kernel_alpha_moe_nvfp4_up_split_k2_workspace_byte<<<up_grid, dim3(nvfp4_split_scale_byte_up::kGeneratedThreads, 1, 1),
           nvfp4_split_scale_byte_up::kGeneratedSmemTotal, stream>>>(
@@ -20742,8 +20761,7 @@ inline void LaunchSplitOrFallback(const TensorView& hidden_states, const TensorV
           dims.block_m);
       CheckCuda(cudaGetLastError(),
                 "alphamoe_nvfp4_sm100 split up kernel launch");
-      CheckCuda(cudaFuncSetAttribute(nvfp4_split_scale_byte_down::kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace_byte,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_scale_byte_down::kGeneratedSmemTotal),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_scale_byte_down::kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace_byte, nvfp4_split_scale_byte_down::kGeneratedSmemTotal),
           "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split down dynamic smem)");
       nvfp4_split_scale_byte_down::kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace_byte<<<down_grid, dim3(nvfp4_split_scale_byte_down::kGeneratedThreads, 1, 1),
           nvfp4_split_scale_byte_down::kGeneratedSmemTotal, stream>>>(
@@ -20773,8 +20791,7 @@ inline void LaunchSplitOrFallback(const TensorView& hidden_states, const TensorV
     const dim3 up_grid(static_cast<unsigned int>(capacity), static_cast<unsigned int>(blocks), 1);
     const dim3 down_grid(static_cast<unsigned int>(capacity), static_cast<unsigned int>(blocks), down_splits);
     if (packed_scale_loads) {
-      CheckCuda(cudaFuncSetAttribute(nvfp4_fallback_scale_word_up::kernel_alpha_moe_nvfp4_up_workspace_word,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_fallback_scale_word_up::kGeneratedSmemTotal),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_fallback_scale_word_up::kernel_alpha_moe_nvfp4_up_workspace_word, nvfp4_fallback_scale_word_up::kGeneratedSmemTotal),
           "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 fallback up dynamic smem)");
       nvfp4_fallback_scale_word_up::kernel_alpha_moe_nvfp4_up_workspace_word<<<up_grid, dim3(nvfp4_fallback_scale_word_up::kGeneratedThreads, 1, 1),
           nvfp4_fallback_scale_word_up::kGeneratedSmemTotal, stream>>>(
@@ -20795,8 +20812,7 @@ inline void LaunchSplitOrFallback(const TensorView& hidden_states, const TensorV
           dims.block_m);
       CheckCuda(cudaGetLastError(),
                 "alphamoe_nvfp4_sm100 fallback up kernel launch");
-      CheckCuda(cudaFuncSetAttribute(nvfp4_fallback_scale_word_down::kernel_alpha_moe_nvfp4_down_workspace_word,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_fallback_scale_word_down::kGeneratedSmemTotal),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_fallback_scale_word_down::kernel_alpha_moe_nvfp4_down_workspace_word, nvfp4_fallback_scale_word_down::kGeneratedSmemTotal),
           "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 fallback down dynamic smem)");
       nvfp4_fallback_scale_word_down::kernel_alpha_moe_nvfp4_down_workspace_word<<<down_grid, dim3(nvfp4_fallback_scale_word_down::kGeneratedThreads, 1, 1),
           nvfp4_fallback_scale_word_down::kGeneratedSmemTotal, stream>>>(
@@ -20819,8 +20835,7 @@ inline void LaunchSplitOrFallback(const TensorView& hidden_states, const TensorV
                 "alphamoe_nvfp4_sm100 fallback down kernel launch");
     }
     else {
-      CheckCuda(cudaFuncSetAttribute(nvfp4_fallback_scale_byte_up::kernel_alpha_moe_nvfp4_up_workspace_byte,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_fallback_scale_byte_up::kGeneratedSmemTotal),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_fallback_scale_byte_up::kernel_alpha_moe_nvfp4_up_workspace_byte, nvfp4_fallback_scale_byte_up::kGeneratedSmemTotal),
           "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 fallback up dynamic smem)");
       nvfp4_fallback_scale_byte_up::kernel_alpha_moe_nvfp4_up_workspace_byte<<<up_grid, dim3(nvfp4_fallback_scale_byte_up::kGeneratedThreads, 1, 1),
           nvfp4_fallback_scale_byte_up::kGeneratedSmemTotal, stream>>>(
@@ -20841,8 +20856,7 @@ inline void LaunchSplitOrFallback(const TensorView& hidden_states, const TensorV
           dims.block_m);
       CheckCuda(cudaGetLastError(),
                 "alphamoe_nvfp4_sm100 fallback up kernel launch");
-      CheckCuda(cudaFuncSetAttribute(nvfp4_fallback_scale_byte_down::kernel_alpha_moe_nvfp4_down_workspace_byte,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_fallback_scale_byte_down::kGeneratedSmemTotal),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_fallback_scale_byte_down::kernel_alpha_moe_nvfp4_down_workspace_byte, nvfp4_fallback_scale_byte_down::kGeneratedSmemTotal),
           "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 fallback down dynamic smem)");
       nvfp4_fallback_scale_byte_down::kernel_alpha_moe_nvfp4_down_workspace_byte<<<down_grid, dim3(nvfp4_fallback_scale_byte_down::kGeneratedThreads, 1, 1),
           nvfp4_fallback_scale_byte_down::kGeneratedSmemTotal, stream>>>(
@@ -20888,8 +20902,7 @@ inline void LaunchFusedBatch(const TensorView& hidden_states, const TensorView& 
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_scale_word::kernel_alpha_moe_nvfp4_up_down_word,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_scale_word::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_scale_word::kernel_alpha_moe_nvfp4_up_down_word, nvfp4_scale_word::kGeneratedSmemTotal),
               "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 dynamic smem)");
     nvfp4_scale_word::kernel_alpha_moe_nvfp4_up_down_word<<<grid, block, nvfp4_scale_word::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -20912,8 +20925,7 @@ inline void LaunchFusedBatch(const TensorView& hidden_states, const TensorView& 
         dims.block_m,
         routed_scaling_factor);
   } else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_scale_byte::kernel_alpha_moe_nvfp4_up_down_byte,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_scale_word::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_scale_byte::kernel_alpha_moe_nvfp4_up_down_byte, nvfp4_scale_word::kGeneratedSmemTotal),
               "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 dynamic smem)");
     nvfp4_scale_byte::kernel_alpha_moe_nvfp4_up_down_byte<<<grid, block, nvfp4_scale_word::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -20984,8 +20996,7 @@ inline void LaunchSplitK4(const TensorView& hidden_states, const TensorView& hid
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_split_k4_scale_word_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_word,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_k4_scale_word_up::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_k4_scale_word_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_word, nvfp4_split_k4_scale_word_up::kGeneratedSmemTotal),
         "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split k4 up)");
     nvfp4_split_k4_scale_word_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_word<<<up_grid, dim3(nvfp4_split_k4_scale_word_up::kGeneratedThreads, 1, 1),
         nvfp4_split_k4_scale_word_up::kGeneratedSmemTotal, stream>>>(
@@ -21002,8 +21013,7 @@ inline void LaunchSplitK4(const TensorView& hidden_states, const TensorView& hid
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4_sm100 split k4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_split_k4_scale_word_down::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_word,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_k4_scale_word_down::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_k4_scale_word_down::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_word, nvfp4_split_k4_scale_word_down::kGeneratedSmemTotal),
         "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split k4 down)");
     nvfp4_split_k4_scale_word_down::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_word<<<down_grid, dim3(nvfp4_split_k4_scale_word_down::kGeneratedThreads, 1, 1),
         nvfp4_split_k4_scale_word_down::kGeneratedSmemTotal, stream>>>(
@@ -21026,8 +21036,7 @@ inline void LaunchSplitK4(const TensorView& hidden_states, const TensorView& hid
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4_sm100 split k4 down launch");
   }
   else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_split_k4_scale_byte_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_byte,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_k4_scale_byte_up::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_k4_scale_byte_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_byte, nvfp4_split_k4_scale_byte_up::kGeneratedSmemTotal),
         "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split k4 up)");
     nvfp4_split_k4_scale_byte_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_byte<<<up_grid, dim3(nvfp4_split_k4_scale_byte_up::kGeneratedThreads, 1, 1),
         nvfp4_split_k4_scale_byte_up::kGeneratedSmemTotal, stream>>>(
@@ -21044,8 +21053,7 @@ inline void LaunchSplitK4(const TensorView& hidden_states, const TensorView& hid
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4_sm100 split k4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_split_k4_scale_byte_down::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_byte,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_k4_scale_byte_down::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_k4_scale_byte_down::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_byte, nvfp4_split_k4_scale_byte_down::kGeneratedSmemTotal),
         "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split k4 down)");
     nvfp4_split_k4_scale_byte_down::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_byte<<<down_grid, dim3(nvfp4_split_k4_scale_byte_down::kGeneratedThreads, 1, 1),
         nvfp4_split_k4_scale_byte_down::kGeneratedSmemTotal, stream>>>(
@@ -21092,8 +21100,7 @@ inline void LaunchFirstW2M1(const TensorView& hidden_states, const TensorView& h
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_split_k4_scale_word_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_word,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_k4_scale_word_up::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_k4_scale_word_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_word, nvfp4_split_k4_scale_word_up::kGeneratedSmemTotal),
         "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split k4 up)");
     nvfp4_split_k4_scale_word_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_word<<<up_grid, dim3(nvfp4_split_k4_scale_word_up::kGeneratedThreads, 1, 1),
         nvfp4_split_k4_scale_word_up::kGeneratedSmemTotal, stream>>>(
@@ -21110,8 +21117,7 @@ inline void LaunchFirstW2M1(const TensorView& hidden_states, const TensorView& h
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4_sm100 split k4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_first_w2_down_word::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_nvfp4_first_w2_down_word,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_first_w2_down_word::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_first_w2_down_word::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_nvfp4_first_w2_down_word, nvfp4_first_w2_down_word::kGeneratedSmemTotal),
         "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split k4 down)");
     nvfp4_first_w2_down_word::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_nvfp4_first_w2_down_word<<<down_grid, dim3(nvfp4_first_w2_down_word::kGeneratedThreads, 1, 1),
         nvfp4_first_w2_down_word::kGeneratedSmemTotal, stream>>>(
@@ -21134,8 +21140,7 @@ inline void LaunchFirstW2M1(const TensorView& hidden_states, const TensorView& h
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4_sm100 split k4 down launch");
   }
   else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_split_k4_scale_byte_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_byte,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_k4_scale_byte_up::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_k4_scale_byte_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_byte, nvfp4_split_k4_scale_byte_up::kGeneratedSmemTotal),
         "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split k4 up)");
     nvfp4_split_k4_scale_byte_up::kernel_alpha_moe_nvfp4_up_split_k4_workspace_byte<<<up_grid, dim3(nvfp4_split_k4_scale_byte_up::kGeneratedThreads, 1, 1),
         nvfp4_split_k4_scale_byte_up::kGeneratedSmemTotal, stream>>>(
@@ -21152,8 +21157,7 @@ inline void LaunchFirstW2M1(const TensorView& hidden_states, const TensorView& h
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4_sm100 split k4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_split_k4_scale_byte_down::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_byte,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nvfp4_split_k4_scale_byte_down::kGeneratedSmemTotal),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_split_k4_scale_byte_down::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_byte, nvfp4_split_k4_scale_byte_down::kGeneratedSmemTotal),
         "cudaFuncSetAttribute(alphamoe_nvfp4_sm100 split k4 down)");
     nvfp4_split_k4_scale_byte_down::kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_byte<<<down_grid, dim3(nvfp4_split_k4_scale_byte_down::kGeneratedThreads, 1, 1),
         nvfp4_split_k4_scale_byte_down::kGeneratedSmemTotal, stream>>>(
@@ -21222,8 +21226,7 @@ inline void LaunchDecodeUp2Z2(const TensorView& hidden_states, const TensorView&
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_decode_up2_word_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_word_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_decode_up2_word_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_decode_up2_word_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_word_up, nvfp4_decode_up2_word_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_decode_up2_word_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_word_up<<<up_grid, dim3(nvfp4_decode_up2_word_up::kGeneratedThreads, 1, 1),
         nvfp4_decode_up2_word_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21242,8 +21245,7 @@ inline void LaunchDecodeUp2Z2(const TensorView& hidden_states, const TensorView&
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_fallback_scale_word_down::kernel_alpha_moe_nvfp4_down_workspace_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_fallback_scale_word_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_fallback_scale_word_down::kernel_alpha_moe_nvfp4_down_workspace_word, nvfp4_fallback_scale_word_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_fallback_scale_word_down::kernel_alpha_moe_nvfp4_down_workspace_word<<<down_grid, dim3(nvfp4_fallback_scale_word_down::kGeneratedThreads, 1, 1),
         nvfp4_fallback_scale_word_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -21264,8 +21266,7 @@ inline void LaunchDecodeUp2Z2(const TensorView& hidden_states, const TensorView&
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 down launch");
   }
   else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_decode_up2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_byte_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_decode_up2_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_decode_up2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_byte_up, nvfp4_decode_up2_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_decode_up2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_byte_up<<<up_grid, dim3(nvfp4_decode_up2_byte_up::kGeneratedThreads, 1, 1),
         nvfp4_decode_up2_byte_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21284,8 +21285,7 @@ inline void LaunchDecodeUp2Z2(const TensorView& hidden_states, const TensorView&
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_fallback_scale_byte_down::kernel_alpha_moe_nvfp4_down_workspace_byte, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_fallback_scale_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_fallback_scale_byte_down::kernel_alpha_moe_nvfp4_down_workspace_byte, nvfp4_fallback_scale_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_fallback_scale_byte_down::kernel_alpha_moe_nvfp4_down_workspace_byte<<<down_grid, dim3(nvfp4_fallback_scale_byte_down::kGeneratedThreads, 1, 1),
         nvfp4_fallback_scale_byte_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -21330,8 +21330,7 @@ inline void LaunchBatchWordG2(const TensorView& hidden_states, const TensorView&
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_word_g2_word_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_word_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_word_g2_word_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_word_g2_word_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_word_up, nvfp4_batch_word_g2_word_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_word_g2_word_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_word_up<<<up_grid, dim3(nvfp4_batch_word_g2_word_up::kGeneratedThreads, 1, 1),
         nvfp4_batch_word_g2_word_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21350,8 +21349,7 @@ inline void LaunchBatchWordG2(const TensorView& hidden_states, const TensorView&
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_word_g2_word_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_word_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_word_g2_word_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_word_g2_word_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_word_down, nvfp4_batch_word_g2_word_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_word_g2_word_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_word_down<<<down_grid, dim3(nvfp4_batch_word_g2_word_down::kGeneratedThreads, 1, 1),
         nvfp4_batch_word_g2_word_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -21373,8 +21371,7 @@ inline void LaunchBatchWordG2(const TensorView& hidden_states, const TensorView&
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 down launch");
   }
   else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_word_g2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_byte_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_word_g2_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_word_g2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_byte_up, nvfp4_batch_word_g2_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_word_g2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_byte_up<<<up_grid, dim3(nvfp4_batch_word_g2_byte_up::kGeneratedThreads, 1, 1),
         nvfp4_batch_word_g2_byte_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21393,8 +21390,7 @@ inline void LaunchBatchWordG2(const TensorView& hidden_states, const TensorView&
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_word_g2_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_byte_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_word_g2_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_word_g2_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_byte_down, nvfp4_batch_word_g2_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_word_g2_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_byte_down<<<down_grid, dim3(nvfp4_batch_word_g2_byte_down::kGeneratedThreads, 1, 1),
         nvfp4_batch_word_g2_byte_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -21440,8 +21436,7 @@ inline void LaunchBatchRetainedG8(const TensorView& hidden_states, const TensorV
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_g8_word_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_word_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_g8_word_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_g8_word_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_word_up, nvfp4_batch_g8_word_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_g8_word_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_word_up<<<up_grid, dim3(nvfp4_batch_g8_word_up::kGeneratedThreads, 1, 1),
         nvfp4_batch_g8_word_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21460,8 +21455,7 @@ inline void LaunchBatchRetainedG8(const TensorView& hidden_states, const TensorV
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_g8_word_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_word_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_g8_word_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_g8_word_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_word_down, nvfp4_batch_g8_word_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_g8_word_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_word_down<<<down_grid, dim3(nvfp4_batch_g8_word_down::kGeneratedThreads, 1, 1),
         nvfp4_batch_g8_word_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -21483,8 +21477,7 @@ inline void LaunchBatchRetainedG8(const TensorView& hidden_states, const TensorV
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 down launch");
   }
   else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_g8_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_g8_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_g8_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up, nvfp4_batch_g8_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_g8_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up<<<up_grid, dim3(nvfp4_batch_g8_byte_up::kGeneratedThreads, 1, 1),
         nvfp4_batch_g8_byte_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21503,8 +21496,7 @@ inline void LaunchBatchRetainedG8(const TensorView& hidden_states, const TensorV
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_g8_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_g8_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_g8_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down, nvfp4_batch_g8_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_g8_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down<<<down_grid, dim3(nvfp4_batch_g8_byte_down::kGeneratedThreads, 1, 1),
         nvfp4_batch_g8_byte_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -21630,8 +21622,7 @@ inline void LaunchBatchPreparedW1G8(const TensorView& hidden_states, const Tenso
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_prepared_g8_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_prepared_g8_up_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_prepared_g8_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_prepared_g8_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_prepared_g8_up_word, nvfp4_batch_prepared_g8_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_prepared_g8_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_prepared_g8_up_word<<<up_grid, dim3(nvfp4_batch_prepared_g8_up_word::kGeneratedThreads, 1, 1),
         nvfp4_batch_prepared_g8_up_word::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21650,8 +21641,7 @@ inline void LaunchBatchPreparedW1G8(const TensorView& hidden_states, const Tenso
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_g8_word_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_word_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_g8_word_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_g8_word_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_word_down, nvfp4_batch_g8_word_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_g8_word_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_word_down<<<down_grid, dim3(nvfp4_batch_g8_word_down::kGeneratedThreads, 1, 1),
         nvfp4_batch_g8_word_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -21673,8 +21663,7 @@ inline void LaunchBatchPreparedW1G8(const TensorView& hidden_states, const Tenso
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 down launch");
   }
   else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_g8_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_g8_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_g8_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up, nvfp4_batch_g8_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_g8_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up<<<up_grid, dim3(nvfp4_batch_g8_byte_up::kGeneratedThreads, 1, 1),
         nvfp4_batch_g8_byte_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21693,8 +21682,7 @@ inline void LaunchBatchPreparedW1G8(const TensorView& hidden_states, const Tenso
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_g8_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_g8_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_g8_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down, nvfp4_batch_g8_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_g8_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down<<<down_grid, dim3(nvfp4_batch_g8_byte_down::kGeneratedThreads, 1, 1),
         nvfp4_batch_g8_byte_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -21742,8 +21730,7 @@ inline void LaunchBatchPreparedG8(const TensorView& hidden_states, const TensorV
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_n32_sequential_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_n32_sequential_up_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_n32_sequential_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_n32_sequential_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_n32_sequential_up_word, nvfp4_batch_n32_sequential_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_n32_sequential_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_n32_sequential_up_word<<<up_grid, dim3(nvfp4_batch_n32_sequential_up_word::kGeneratedThreads, 1, 1),
         nvfp4_batch_n32_sequential_up_word::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21762,8 +21749,7 @@ inline void LaunchBatchPreparedG8(const TensorView& hidden_states, const TensorV
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_prepared_g8_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_prepared_g8_down_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_prepared_g8_down_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_prepared_g8_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_prepared_g8_down_word, nvfp4_batch_prepared_g8_down_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_prepared_g8_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_prepared_g8_down_word<<<down_grid, dim3(nvfp4_batch_prepared_g8_down_word::kGeneratedThreads, 1, 1),
         nvfp4_batch_prepared_g8_down_word::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -21785,8 +21771,7 @@ inline void LaunchBatchPreparedG8(const TensorView& hidden_states, const TensorV
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 down launch");
   }
   else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_g8_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_g8_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_g8_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up, nvfp4_batch_g8_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_g8_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up<<<up_grid, dim3(nvfp4_batch_g8_byte_up::kGeneratedThreads, 1, 1),
         nvfp4_batch_g8_byte_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -21805,8 +21790,7 @@ inline void LaunchBatchPreparedG8(const TensorView& hidden_states, const TensorV
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_g8_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_g8_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_g8_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down, nvfp4_batch_g8_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_g8_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down<<<down_grid, dim3(nvfp4_batch_g8_byte_down::kGeneratedThreads, 1, 1),
         nvfp4_batch_g8_byte_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -26687,8 +26671,7 @@ inline void LaunchRank5W1Data(const TensorView& hidden_states, const TensorView&
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_decode_rank5_w1_data_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_rank5_w1_data_up_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_decode_rank5_w1_data_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_decode_rank5_w1_data_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_rank5_w1_data_up_word, nvfp4_decode_rank5_w1_data_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_decode_rank5_w1_data_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_rank5_w1_data_up_word<<<up_grid, dim3(nvfp4_decode_rank5_w1_data_up_word::kGeneratedThreads, 1, 1),
         nvfp4_decode_rank5_w1_data_up_word::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -26707,8 +26690,7 @@ inline void LaunchRank5W1Data(const TensorView& hidden_states, const TensorView&
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_decode_first_w2_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_decode_first_w2_down_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_decode_first_w2_down_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_decode_first_w2_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_decode_first_w2_down_word, nvfp4_decode_first_w2_down_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_decode_first_w2_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_decode_first_w2_down_word<<<down_grid, dim3(nvfp4_decode_first_w2_down_word::kGeneratedThreads, 1, 1),
         nvfp4_decode_first_w2_down_word::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -26729,8 +26711,7 @@ inline void LaunchRank5W1Data(const TensorView& hidden_states, const TensorView&
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 down launch");
   }
   else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_decode_up2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_byte_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_decode_up2_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_decode_up2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_byte_up, nvfp4_decode_up2_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_decode_up2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_byte_up<<<up_grid, dim3(nvfp4_decode_up2_byte_up::kGeneratedThreads, 1, 1),
         nvfp4_decode_up2_byte_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -26749,8 +26730,7 @@ inline void LaunchRank5W1Data(const TensorView& hidden_states, const TensorView&
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_fallback_scale_byte_down::kernel_alpha_moe_nvfp4_down_workspace_byte, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_fallback_scale_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_fallback_scale_byte_down::kernel_alpha_moe_nvfp4_down_workspace_byte, nvfp4_fallback_scale_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_fallback_scale_byte_down::kernel_alpha_moe_nvfp4_down_workspace_byte<<<down_grid, dim3(nvfp4_fallback_scale_byte_down::kGeneratedThreads, 1, 1),
         nvfp4_fallback_scale_byte_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -26797,8 +26777,7 @@ inline void LaunchRank5GateUp(const TensorView& hidden_states, const TensorView&
       reinterpret_cast<uintptr_t>(gemm1_weights_scale.data_ptr()) % 4 == 0 &&
       reinterpret_cast<uintptr_t>(gemm2_weights_scale.data_ptr()) % 4 == 0;
   if (packed_scale_loads) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_rank5_gate_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_rank5_gate_up_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_rank5_gate_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_rank5_gate_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_rank5_gate_up_word, nvfp4_batch_rank5_gate_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_rank5_gate_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_rank5_gate_up_word<<<up_grid, dim3(nvfp4_batch_rank5_gate_up_word::kGeneratedThreads, 1, 1),
         nvfp4_batch_rank5_gate_up_word::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -26817,8 +26796,7 @@ inline void LaunchRank5GateUp(const TensorView& hidden_states, const TensorView&
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_first_w2_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_first_w2_down_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_first_w2_down_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_first_w2_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_first_w2_down_word, nvfp4_batch_first_w2_down_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_first_w2_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_first_w2_down_word<<<down_grid, dim3(nvfp4_batch_first_w2_down_word::kGeneratedThreads, 1, 1),
         nvfp4_batch_first_w2_down_word::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -26840,8 +26818,7 @@ inline void LaunchRank5GateUp(const TensorView& hidden_states, const TensorView&
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 down launch");
   }
   else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_word_g2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_byte_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_word_g2_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_word_g2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_byte_up, nvfp4_batch_word_g2_byte_up::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
     nvfp4_batch_word_g2_byte_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_byte_up<<<up_grid, dim3(nvfp4_batch_word_g2_byte_up::kGeneratedThreads, 1, 1),
         nvfp4_batch_word_g2_byte_up::kGeneratedSmemTotal, stream>>>(
         hidden_states_map,
@@ -26860,8 +26837,7 @@ inline void LaunchRank5GateUp(const TensorView& hidden_states, const TensorView&
         dims.top_k,
         dims.block_m);
     CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-    CheckCuda(cudaFuncSetAttribute(nvfp4_batch_word_g2_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_byte_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        nvfp4_batch_word_g2_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_word_g2_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_byte_down, nvfp4_batch_word_g2_byte_down::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
     nvfp4_batch_word_g2_byte_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_byte_down<<<down_grid, dim3(nvfp4_batch_word_g2_byte_down::kGeneratedThreads, 1, 1),
         nvfp4_batch_word_g2_byte_down::kGeneratedSmemTotal, stream>>>(
         gemm2_map,
@@ -27060,8 +27036,7 @@ inline void LaunchCompactOwnerPreparedG8(const TensorView& hidden_states, const 
   auto sf_workspace = alloc_tensor({capacity * blocks, 1024}, dl_uint8, hidden_states.device());
   const dim3 up_grid(static_cast<unsigned int>(compact_owner_plan.size(0)), static_cast<unsigned int>(blocks), 1);
   const dim3 down_grid(static_cast<unsigned int>(capacity), static_cast<unsigned int>((blocks + 7) / 8), 1);
-  CheckCuda(cudaFuncSetAttribute(nvfp4_batch_compact_owner_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_compact_owner_up_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      nvfp4_batch_compact_owner_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_compact_owner_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_compact_owner_up_word, nvfp4_batch_compact_owner_up_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 up)");
   nvfp4_batch_compact_owner_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_compact_owner_up_word<<<up_grid, dim3(nvfp4_batch_compact_owner_up_word::kGeneratedThreads, 1, 1),
       nvfp4_batch_compact_owner_up_word::kGeneratedSmemTotal, stream>>>(
       hidden_states_map,
@@ -27082,8 +27057,7 @@ inline void LaunchCompactOwnerPreparedG8(const TensorView& hidden_states, const 
       dims.top_k,
       dims.block_m);
   CheckCuda(cudaGetLastError(), "alphamoe_nvfp4 up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_batch_prepared_g8_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_prepared_g8_down_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      nvfp4_batch_prepared_g8_down_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_batch_prepared_g8_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_prepared_g8_down_word, nvfp4_batch_prepared_g8_down_word::kGeneratedSmemTotal), "cudaFuncSetAttribute(alphamoe_nvfp4 down)");
   nvfp4_batch_prepared_g8_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_prepared_g8_down_word<<<down_grid, dim3(nvfp4_batch_prepared_g8_down_word::kGeneratedThreads, 1, 1),
       nvfp4_batch_prepared_g8_down_word::kGeneratedSmemTotal, stream>>>(
       gemm2_map,
@@ -58085,7 +58059,7 @@ void RunCompleteRoutedImpl(
       TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(act_workspace.value().data_ptr()) % 16 == 0 &&
                      reinterpret_cast<uintptr_t>(sf_workspace.value().data_ptr()) % 16 == 0) << "act/sf workspaces must be 16-byte aligned";
       const CUtensorMap w1_scale_map_m1 = EncodePreparedScaleTma(w1_scale_prepared.value(), 16);
-      CheckCuda(cudaFuncSetAttribute(nvfp4_s5_c208v3b_up::kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b_nvfp4_s5_c208v3b_up, cudaFuncAttributeMaxDynamicSharedMemorySize, 122496),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s5_c208v3b_up::kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b_nvfp4_s5_c208v3b_up, 122496),
                 "cudaFuncSetAttribute(S5 M=1 up)");
       nvfp4_s5_c208v3b_up::kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b_nvfp4_s5_c208v3b_up<<<dim3(capacity, blocks, 4), dim3(192, 1, 1), 122496, stream>>>(
           hidden_states_map,
@@ -58107,7 +58081,7 @@ void RunCompleteRoutedImpl(
           dims.top_k,
           dims.block_m);
       CheckCuda(cudaGetLastError(), "S5 M=1 up launch");
-      CheckCuda(cudaFuncSetAttribute(nvfp4_s5_c426v26_gemv::kernel_alpha_moe_nvfp4_down_m1_gemv_slot_per_warp_actws_seedbf16_v26_nvfp4_s5_c426v26_gemv, cudaFuncAttributeMaxDynamicSharedMemorySize, 9088),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s5_c426v26_gemv::kernel_alpha_moe_nvfp4_down_m1_gemv_slot_per_warp_actws_seedbf16_v26_nvfp4_s5_c426v26_gemv, 9088),
                 "cudaFuncSetAttribute(S5 M=1 gemv)");
       nvfp4_s5_c426v26_gemv::kernel_alpha_moe_nvfp4_down_m1_gemv_slot_per_warp_actws_seedbf16_v26_nvfp4_s5_c426v26_gemv<<<dim3(dims.k / 16, 1, 1), dim3(256, 1, 1), 9088, stream>>>(
           static_cast<uint8_t*>(gemm2_weights.data_ptr()),
@@ -58137,8 +58111,7 @@ void RunCompleteRoutedImpl(
       CheckCuda(cudaGetLastError(), "S5 M=1 gemv launch");
       return;
     }
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c279_alignment::kernel_alpha_moe_small_route_alignment_seed_init_nvfp4_qualified_c279_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12672), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c279_alignment::kernel_alpha_moe_small_route_alignment_seed_init_nvfp4_qualified_c279_alignment, 12672), "cudaFuncSetAttribute(complete alignment)");
   CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c279_alignment::kernel_alpha_moe_small_route_alignment_seed_init_nvfp4_qualified_c279_alignment, dim3((std::max(out.numel(), route_accumulator.numel()) + 1023) / 1024 + 1, 1, 1), dim3(256, 1, 1), static_cast<size_t>(12672), stream,
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -58157,8 +58130,7 @@ void RunCompleteRoutedImpl(
       static_cast<long long>(route_accumulator.numel())), "complete alignment launch (pdl)");
   CheckCuda(cudaGetLastError(), "complete alignment launch");
     if (packed_scales) {
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c208_up_word::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      121088), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c208_up_word::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_word, 121088), "cudaFuncSetAttribute(complete up)");
   CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c208_up_word::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_word, dim3(capacity, blocks, 4), dim3(192, 1, 1), static_cast<size_t>(121088), stream,
       hidden_states_map,
       gemm1_map,
@@ -58173,8 +58145,7 @@ void RunCompleteRoutedImpl(
       dims.top_k,
       dims.block_m), "complete up launch (pdl)");
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c275_down_word::kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      34560), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c275_down_word::kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_word, 34560), "cudaFuncSetAttribute(complete down)");
   CheckCuda(AlphamoeNvfp4LaunchPdl(nvfp4_qualified_c275_down_word::kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_word, dim3(capacity, blocks, std::min(12, dims.k / 128)), dim3(192, 1, 1), static_cast<size_t>(34560), stream,
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58195,8 +58166,7 @@ void RunCompleteRoutedImpl(
       static_cast<float>(routed_scaling_factor)), "complete down launch (pdl)");
   CheckCuda(cudaGetLastError(), "complete down launch");
     } else {
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c208_up_byte::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_byte, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      121088), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c208_up_byte::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_byte, 121088), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c208_up_byte::kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_byte<<<dim3(capacity, blocks, 4), dim3(192, 1, 1), 121088, stream>>>(
       hidden_states_map,
       gemm1_map,
@@ -58211,8 +58181,7 @@ void RunCompleteRoutedImpl(
       dims.top_k,
       dims.block_m);
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c275_down_byte::kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_byte, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      34560), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c275_down_byte::kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_byte, 34560), "cudaFuncSetAttribute(complete down)");
   nvfp4_qualified_c275_down_byte::kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_byte<<<dim3(capacity, blocks, std::min(12, dims.k / 128)), dim3(192, 1, 1), 34560, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58250,8 +58219,7 @@ void RunCompleteRoutedImpl(
     return;
   }
   if (route_id == 8) {
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c248_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c248_up_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      121088), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c248_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c248_up_word, 121088), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c248_up_word::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c248_up_word<<<dim3(capacity, blocks, 1), dim3(192, 1, 1), 121088, stream>>>(
       hidden_states_map,
       gemm1_map,
@@ -58269,8 +58237,7 @@ void RunCompleteRoutedImpl(
       dims.top_k,
       dims.block_m);
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c248_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c248_down_word, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      34304), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c248_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c248_down_word, 34304), "cudaFuncSetAttribute(complete down)");
   nvfp4_qualified_c248_down_word::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c248_down_word<<<dim3(capacity, blocks, std::min(4, dims.k / 128)), dim3(192, 1, 1), 34304, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58326,7 +58293,7 @@ void RunCompleteRoutedImpl(
       const CUtensorMap w1_map_i = EncodePreparedW1DataHalfTma(w1_data_prepared.value());
       const CUtensorMap w1_scale_map_i = EncodePreparedScaleTma(w1_scale_prepared_interleaved.value(), 16);
       const CUtensorMap w2_scale_map_p = EncodePreparedScaleTma(w2_scale_prepared.value(), 8);
-      CheckCuda(cudaFuncSetAttribute(nvfp4_s11_c416s_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank_nvfp4_s11_c416s_up, cudaFuncAttributeMaxDynamicSharedMemorySize, 207104),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s11_c416s_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank_nvfp4_s11_c416s_up, 207104),
                 "cudaFuncSetAttribute(S5 M=8 up)");
       nvfp4_s11_c416s_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank_nvfp4_s11_c416s_up<<<dim3(static_cast<unsigned>(up_grid_x), static_cast<unsigned>(panels64), 1), dim3(192, 1, 1), 207104, stream>>>(
           hidden_states_map,
@@ -58356,7 +58323,7 @@ void RunCompleteRoutedImpl(
           dims.top_k,
           dims.block_m);
       CheckCuda(cudaGetLastError(), "S5 M=8 up launch");
-      CheckCuda(cudaFuncSetAttribute(nvfp4_s11_c407_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz_nvfp4_s11_c407_down, cudaFuncAttributeMaxDynamicSharedMemorySize, 38912),
+      CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s11_c407_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz_nvfp4_s11_c407_down, 38912),
                 "cudaFuncSetAttribute(S5 M=8 down)");
       nvfp4_s11_c407_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz_nvfp4_s11_c407_down<<<dim3(static_cast<unsigned>(down_grid_x), static_cast<unsigned>((blocks + 3) / 4), 1), dim3(192, 1, 1), 38912, stream>>>(
           gemm2_map,
@@ -58402,8 +58369,7 @@ void RunCompleteRoutedImpl(
         << "complete route requires compatible prepared W1 data";
     CheckNoOverlap(out, w1_data_prepared.value(), "w1_data_prepared");
     const CUtensorMap prepared_w1_map = EncodePreparedW1DataTma(w1_data_prepared.value());
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c307_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c307_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c307_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c307_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c307_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c307_alignment<<<dim3((out.numel() + 1023) / 1024 + 1, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(route_experts.data_ptr()),
@@ -58421,8 +58387,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(sorted_token_ids.numel()),
       static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c338_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nvfp4_qualified_c338_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      216064), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c338_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nvfp4_qualified_c338_up, 216064), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c338_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nvfp4_qualified_c338_up<<<dim3(owner_capacity, blocks, 1), dim3(192, 1, 1), 216064, stream>>>(
       hidden_states_map,
       prepared_w1_map,
@@ -58442,8 +58407,7 @@ void RunCompleteRoutedImpl(
       dims.top_k,
       dims.block_m);
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c346_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_nvfp4_qualified_c346_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      38912), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c346_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_nvfp4_qualified_c346_down, 38912), "cudaFuncSetAttribute(complete down)");
   nvfp4_qualified_c346_down::kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_nvfp4_qualified_c346_down<<<dim3(capacity, (blocks + 3) / 4, std::min(8, dims.k / 128)), dim3(192, 1, 1), 38912, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58480,8 +58444,7 @@ void RunCompleteRoutedImpl(
     return;
   }
   if (route_id == 2) {
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c307_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c307_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c307_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c307_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c307_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c307_alignment<<<dim3((out.numel() + 1023) / 1024 + 1, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(route_experts.data_ptr()),
@@ -58499,8 +58462,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(sorted_token_ids.numel()),
       static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c334_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave_nvfp4_qualified_c334_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      216064), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c334_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave_nvfp4_qualified_c334_up, 216064), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c334_up::kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave_nvfp4_qualified_c334_up<<<dim3(owner_capacity, blocks, 1), dim3(192, 1, 1), 216064, stream>>>(
       hidden_states_map,
       gemm1_map,
@@ -58520,8 +58482,7 @@ void RunCompleteRoutedImpl(
       dims.top_k,
       dims.block_m);
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c304_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c304_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      38912), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c304_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c304_down, 38912), "cudaFuncSetAttribute(complete down)");
   nvfp4_qualified_c304_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c304_down<<<dim3(capacity, (blocks + 3) / 4, std::min(4, dims.k / 128)), dim3(192, 1, 1), 38912, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58568,8 +58529,7 @@ void RunCompleteRoutedImpl(
         << "complete route requires compatible prepared W2 data";
     CheckNoOverlap(out, w2_data_prepared.value(), "w2_data_prepared");
     const CUtensorMap prepared_w2_map = EncodePreparedW2DataTma(w2_data_prepared.value());
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c327_alignment::kernel_alpha_moe_route_alignment_only_map_init_nvfp4_qualified_c327_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c327_alignment::kernel_alpha_moe_route_alignment_only_map_init_nvfp4_qualified_c327_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c327_alignment::kernel_alpha_moe_route_alignment_only_map_init_nvfp4_qualified_c327_alignment<<<dim3(1, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -58584,8 +58544,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s8_c336el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1_nvfp4_s8_c336el_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s8_c336el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1_nvfp4_s8_c336el_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_s8_c336el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1_nvfp4_s8_c336el_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(320, 1, 1), 87552, stream>>>(
       hidden_states_map,
       prepared_w1_map,
@@ -58606,8 +58565,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s12_c360_down::kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst_nvfp4_s12_c360_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      38912), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s12_c360_down::kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst_nvfp4_s12_c360_down, 38912), "cudaFuncSetAttribute(complete down)");
   nvfp4_s12_c360_down::kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst_nvfp4_s12_c360_down<<<dim3(capacity, (blocks + 3) / 4, std::min(2, dims.k / 128)), dim3(192, 1, 1), 38912, stream>>>(
       prepared_w2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58651,8 +58609,7 @@ void RunCompleteRoutedImpl(
         << "complete route requires compatible prepared W2 data";
     CheckNoOverlap(out, w2_data_prepared.value(), "w2_data_prepared");
     const CUtensorMap prepared_w2_map = EncodePreparedW2DataTma(w2_data_prepared.value());
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c327_alignment::kernel_alpha_moe_route_alignment_only_map_init_nvfp4_qualified_c327_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c327_alignment::kernel_alpha_moe_route_alignment_only_map_init_nvfp4_qualified_c327_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c327_alignment::kernel_alpha_moe_route_alignment_only_map_init_nvfp4_qualified_c327_alignment<<<dim3(1, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -58667,8 +58624,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s8_c336el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1_nvfp4_s8_c336el_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s8_c336el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1_nvfp4_s8_c336el_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_s8_c336el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1_nvfp4_s8_c336el_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(320, 1, 1), 87552, stream>>>(
       hidden_states_map,
       prepared_w1_map,
@@ -58689,8 +58645,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s12_c360_down::kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst_nvfp4_s12_c360_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      38912), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s12_c360_down::kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst_nvfp4_s12_c360_down, 38912), "cudaFuncSetAttribute(complete down)");
   nvfp4_s12_c360_down::kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst_nvfp4_s12_c360_down<<<dim3(capacity, (blocks + 3) / 4, std::min(2, dims.k / 128)), dim3(192, 1, 1), 38912, stream>>>(
       prepared_w2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58729,8 +58684,7 @@ void RunCompleteRoutedImpl(
         << "complete route requires compatible prepared W1 data";
     CheckNoOverlap(out, w1_gate_up_data_prepared.value(), "w1_gate_up_data_prepared");
     const CUtensorMap prepared_w1_map = EncodeAdjacentW1DataTma(w1_gate_up_data_prepared.value());
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment<<<dim3(1 + (topk_ids.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -58745,8 +58699,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c388_up::kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up_two_consumer_nvfp4_qualified_c388_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c388_up::kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up_two_consumer_nvfp4_qualified_c388_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c388_up::kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up_two_consumer_nvfp4_qualified_c388_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(256, 1, 1), 87552, stream>>>(
       hidden_states_map,
       prepared_w1_map,
@@ -58767,8 +58720,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      49152), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, 49152), "cudaFuncSetAttribute(complete down)");
   nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down<<<dim3(owner_capacity, (blocks + 3) / 4, std::min(2, dims.k / 128)), dim3(192, 1, 1), 49152, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58809,8 +58761,7 @@ void RunCompleteRoutedImpl(
         << "complete route requires compatible prepared W1 data";
     CheckNoOverlap(out, w1_gate_up_data_prepared.value(), "w1_gate_up_data_prepared");
     const CUtensorMap prepared_w1_map = EncodeAdjacentW1DataTma(w1_gate_up_data_prepared.value());
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment<<<dim3(1 + (topk_ids.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -58825,8 +58776,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c388_up::kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up_two_consumer_nvfp4_qualified_c388_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c388_up::kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up_two_consumer_nvfp4_qualified_c388_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c388_up::kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up_two_consumer_nvfp4_qualified_c388_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(256, 1, 1), 87552, stream>>>(
       hidden_states_map,
       prepared_w1_map,
@@ -58847,8 +58797,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      49152), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, 49152), "cudaFuncSetAttribute(complete down)");
   nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down<<<dim3(owner_capacity, (blocks + 3) / 4, std::min(2, dims.k / 128)), dim3(192, 1, 1), 49152, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58894,8 +58843,7 @@ void RunCompleteRoutedImpl(
         << "complete route requires compatible prepared W2 data";
     CheckNoOverlap(out, w2_data_prepared.value(), "w2_data_prepared");
     const CUtensorMap prepared_w2_map = EncodePreparedW2DataTma(w2_data_prepared.value());
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment<<<dim3(1 + (topk_ids.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -58910,8 +58858,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s8_c340el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1_nvfp4_s8_c340el_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s8_c340el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1_nvfp4_s8_c340el_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_s8_c340el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1_nvfp4_s8_c340el_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(320, 1, 1), 87552, stream>>>(
       hidden_states_map,
       prepared_w1_map,
@@ -58932,8 +58879,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s14_c358n_down::kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst_nvfp4_s14_c358n_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      49152), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s14_c358n_down::kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst_nvfp4_s14_c358n_down, 49152), "cudaFuncSetAttribute(complete down)");
   nvfp4_s14_c358n_down::kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst_nvfp4_s14_c358n_down<<<dim3(owner_capacity, (blocks + 3) / 4, std::min(2, dims.k / 128)), dim3(192, 1, 1), 49152, stream>>>(
       prepared_w2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -58979,8 +58925,7 @@ void RunCompleteRoutedImpl(
         << "complete route requires compatible prepared W2 data";
     CheckNoOverlap(out, w2_data_prepared.value(), "w2_data_prepared");
     const CUtensorMap prepared_w2_map = EncodePreparedW2DataTma(w2_data_prepared.value());
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c376_alignment::kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment<<<dim3(1 + (topk_ids.numel() + 255) / 256, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -58995,8 +58940,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s8_c340el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1_nvfp4_s8_c340el_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s8_c340el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1_nvfp4_s8_c340el_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_s8_c340el_up::kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1_nvfp4_s8_c340el_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(320, 1, 1), 87552, stream>>>(
       hidden_states_map,
       prepared_w1_map,
@@ -59017,8 +58961,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s14_c358n_down::kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst_nvfp4_s14_c358n_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      49152), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s14_c358n_down::kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst_nvfp4_s14_c358n_down, 49152), "cudaFuncSetAttribute(complete down)");
   nvfp4_s14_c358n_down::kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst_nvfp4_s14_c358n_down<<<dim3(owner_capacity, (blocks + 3) / 4, std::min(2, dims.k / 128)), dim3(192, 1, 1), 49152, stream>>>(
       prepared_w2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -59054,8 +58997,7 @@ void RunCompleteRoutedImpl(
     return;
   }
   if (route_id == 3) {
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c327_alignment::kernel_alpha_moe_route_alignment_only_map_init_nvfp4_qualified_c327_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c327_alignment::kernel_alpha_moe_route_alignment_only_map_init_nvfp4_qualified_c327_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c327_alignment::kernel_alpha_moe_route_alignment_only_map_init_nvfp4_qualified_c327_alignment<<<dim3(1, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -59070,8 +59012,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c332_up::kernel_alpha_moe_nvfp4_up_workspace_readback_x8_m128_nvfp4_qualified_c332_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c332_up::kernel_alpha_moe_nvfp4_up_workspace_readback_x8_m128_nvfp4_qualified_c332_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c332_up::kernel_alpha_moe_nvfp4_up_workspace_readback_x8_m128_nvfp4_qualified_c332_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(320, 1, 1), 87552, stream>>>(
       hidden_states_map,
       gemm1_map,
@@ -59092,8 +59033,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c272_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c272_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      38912), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c272_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c272_down, 38912), "cudaFuncSetAttribute(complete down)");
   nvfp4_qualified_c272_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c272_down<<<dim3(capacity, (blocks + 3) / 4, std::min(4, dims.k / 128)), dim3(192, 1, 1), 38912, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -59127,8 +59067,7 @@ void RunCompleteRoutedImpl(
     return;
   }
   if (route_id == 4) {
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c309_alignment::kernel_alpha_moe_route_alignment_only_nvfp4_qualified_c309_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c309_alignment::kernel_alpha_moe_route_alignment_only_nvfp4_qualified_c309_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c309_alignment::kernel_alpha_moe_route_alignment_only_nvfp4_qualified_c309_alignment<<<dim3(1, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -59142,8 +59081,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c312_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c312_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c312_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c312_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c312_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c312_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(320, 1, 1), 87552, stream>>>(
       hidden_states_map,
       gemm1_map,
@@ -59164,8 +59102,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      49152), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, 49152), "cudaFuncSetAttribute(complete down)");
   nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down<<<dim3(owner_capacity, (blocks + 3) / 4, std::min(4, dims.k / 128)), dim3(192, 1, 1), 49152, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -59201,8 +59138,7 @@ void RunCompleteRoutedImpl(
     return;
   }
   if (route_id == 5) {
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c309_alignment::kernel_alpha_moe_route_alignment_only_nvfp4_qualified_c309_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c309_alignment::kernel_alpha_moe_route_alignment_only_nvfp4_qualified_c309_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c309_alignment::kernel_alpha_moe_route_alignment_only_nvfp4_qualified_c309_alignment<<<dim3(1, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -59216,8 +59152,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(topk_ids.numel()),
       static_cast<int>(sorted_token_ids.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c312_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c312_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c312_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c312_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c312_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c312_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(320, 1, 1), 87552, stream>>>(
       hidden_states_map,
       gemm1_map,
@@ -59238,8 +59173,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      49152), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, 49152), "cudaFuncSetAttribute(complete down)");
   nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down<<<dim3(owner_capacity, (blocks + 3) / 4, std::min(4, dims.k / 128)), dim3(192, 1, 1), 49152, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -59275,8 +59209,7 @@ void RunCompleteRoutedImpl(
     return;
   }
   if (route_id == 6) {
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c218_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c218_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c218_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c218_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c218_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c218_alignment<<<dim3((out.numel() + 1023) / 1024 + 1, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -59293,8 +59226,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(sorted_token_ids.numel()),
       static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c284_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c284_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      87552), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c284_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c284_up, 87552), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c284_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c284_up<<<dim3(owner_capacity, blocks / 2, 1), dim3(320, 1, 1), 87552, stream>>>(
       hidden_states_map,
       gemm1_map,
@@ -59315,8 +59247,7 @@ void RunCompleteRoutedImpl(
       dims.block_m,
       static_cast<int>(blocks));
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      49152), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down, 49152), "cudaFuncSetAttribute(complete down)");
   nvfp4_s14_c302n_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down<<<dim3(owner_capacity, (blocks + 3) / 4, std::min(4, dims.k / 128)), dim3(192, 1, 1), 49152, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -59353,8 +59284,7 @@ void RunCompleteRoutedImpl(
     return;
   }
   if (route_id == 7) {
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c218_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c218_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      12416), "cudaFuncSetAttribute(complete alignment)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c218_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c218_alignment, 12416), "cudaFuncSetAttribute(complete alignment)");
   nvfp4_qualified_c218_alignment::kernel_alpha_moe_route_alignment_seed_nvfp4_qualified_c218_alignment<<<dim3((out.numel() + 1023) / 1024 + 1, 1, 1), dim3(256, 1, 1), 12416, stream>>>(
       static_cast<int*>(topk_ids.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()),
@@ -59371,8 +59301,7 @@ void RunCompleteRoutedImpl(
       static_cast<int>(sorted_token_ids.numel()),
       static_cast<long long>(deferred ? 0 : out.numel()));
   CheckCuda(cudaGetLastError(), "complete alignment launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c271_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c271_up, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      216064), "cudaFuncSetAttribute(complete up)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c271_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c271_up, 216064), "cudaFuncSetAttribute(complete up)");
   nvfp4_qualified_c271_up::kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c271_up<<<dim3(owner_capacity, blocks, 1), dim3(192, 1, 1), 216064, stream>>>(
       hidden_states_map,
       gemm1_map,
@@ -59392,8 +59321,7 @@ void RunCompleteRoutedImpl(
       dims.top_k,
       dims.block_m);
   CheckCuda(cudaGetLastError(), "complete up launch");
-  CheckCuda(cudaFuncSetAttribute(nvfp4_qualified_c266_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c266_down, cudaFuncAttributeMaxDynamicSharedMemorySize,
-      38912), "cudaFuncSetAttribute(complete down)");
+  CheckCuda(SetMaxDynamicSmemOnce(nvfp4_qualified_c266_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c266_down, 38912), "cudaFuncSetAttribute(complete down)");
   nvfp4_qualified_c266_down::kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c266_down<<<dim3(capacity, (blocks + 3) / 4, std::min(4, dims.k / 128)), dim3(192, 1, 1), 38912, stream>>>(
       gemm2_map,
       static_cast<uint8_t*>(gemm2_weights_scale.data_ptr()),
@@ -59670,7 +59598,7 @@ void RunTokenTileRouted(
     int num_experts_i = static_cast<int>(e + 1), block_size_i = 128, num_pairs_i = static_cast<int>(pairs), sorted_capacity_i = static_cast<int>(tiles * 128);
     void* align_args[] = {&topk_ptr, &sorted_ptr, &tile_expert_ptr, &ntp_ptr, &cumsum_ptr, &route_experts_ptr, &pair_row_ptr,
                           &cta_counts_ptr, &tile_counter_ptr, &num_experts_i, &block_size_i, &num_pairs_i, &sorted_capacity_i};
-    CheckCuda(cudaFuncSetAttribute(nvfp4_s13_c503c_alignment::kernel_alpha_moe_route_alignment_tile_c503c_nvfp4_s13_c503c_alignment, cudaFuncAttributeMaxDynamicSharedMemorySize, 6272),
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s13_c503c_alignment::kernel_alpha_moe_route_alignment_tile_c503c_nvfp4_s13_c503c_alignment, 6272),
               "cudaFuncSetAttribute(token-tile alignment)");
     CheckCuda(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(&nvfp4_s13_c503c_alignment::kernel_alpha_moe_route_alignment_tile_c503c_nvfp4_s13_c503c_alignment), dim3(16, 1, 1), dim3(256, 1, 1),
                                           align_args, 6272, stream),
@@ -59691,7 +59619,7 @@ void RunTokenTileRouted(
   const CUtensorMap w1_scale_map = EncodePreparedScaleTma(w1_scale_prepared, 16);
   const unsigned up_grid = static_cast<unsigned>(std::min<int64_t>(tiles * blocks, sm_count));
   if (large_rows) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_s13_c500y_up::kernel_alpha_moe_nvfp4_up_token_tile_c500y_nvfp4_s13_c500y_up, cudaFuncAttributeMaxDynamicSharedMemorySize, 222208), "cudaFuncSetAttribute(token-tile up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s13_c500y_up::kernel_alpha_moe_nvfp4_up_token_tile_c500y_nvfp4_s13_c500y_up, 222208), "cudaFuncSetAttribute(token-tile up)");
     nvfp4_s13_c500y_up::kernel_alpha_moe_nvfp4_up_token_tile_c500y_nvfp4_s13_c500y_up<<<dim3(up_grid, 1, 1), dim3(320, 1, 1), 222208, stream>>>(
         x_map, w1_map, x_sf_map, w1_scale_map,
         static_cast<float*>(output1_scale_gate_scalar.data_ptr()), static_cast<float*>(output1_scale_scalar.data_ptr()),
@@ -59700,7 +59628,7 @@ void RunTokenTileRouted(
         static_cast<uint8_t*>(act_workspace.data_ptr()), static_cast<uint8_t*>(sf_workspace.data_ptr()),
         m_i, k_i, top_k_i, blocks_i);
   } else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_s13_c500ab_up::kernel_alpha_moe_nvfp4_up_token_tile_c500ab_nvfp4_s13_c500ab_up, cudaFuncAttributeMaxDynamicSharedMemorySize, 222208), "cudaFuncSetAttribute(token-tile up)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s13_c500ab_up::kernel_alpha_moe_nvfp4_up_token_tile_c500ab_nvfp4_s13_c500ab_up, 222208), "cudaFuncSetAttribute(token-tile up)");
     nvfp4_s13_c500ab_up::kernel_alpha_moe_nvfp4_up_token_tile_c500ab_nvfp4_s13_c500ab_up<<<dim3(up_grid, 1, 1), dim3(320, 1, 1), 222208, stream>>>(
         x_map, w1_map, x_sf_map, w1_scale_map,
         static_cast<float*>(output1_scale_gate_scalar.data_ptr()), static_cast<float*>(output1_scale_scalar.data_ptr()),
@@ -59719,7 +59647,7 @@ void RunTokenTileRouted(
   const unsigned down_grid = static_cast<unsigned>(std::min<int64_t>(tiles * down_z, sm_count));
   const int down_z_i = static_cast<int>(down_z), tile_expert_shift_i = 0;
   if (large_rows) {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_s13_c502u_down::kernel_alpha_moe_nvfp4_down_token_tile_c502u_nvfp4_s13_c502u_down, cudaFuncAttributeMaxDynamicSharedMemorySize, 214144), "cudaFuncSetAttribute(token-tile down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s13_c502u_down::kernel_alpha_moe_nvfp4_down_token_tile_c502u_nvfp4_s13_c502u_down, 214144), "cudaFuncSetAttribute(token-tile down)");
     nvfp4_s13_c502u_down::kernel_alpha_moe_nvfp4_down_token_tile_c502u_nvfp4_s13_c502u_down<<<dim3(down_grid, 1, 1), dim3(192, 1, 1), 214144, stream>>>(
         act_map, w2_map, w2_scale_map, static_cast<float*>(output2_scale_scalar.data_ptr()),
         static_cast<int*>(sorted_token_ids.data_ptr()), static_cast<int*>(tile_expert_ids.data_ptr()),
@@ -59728,7 +59656,7 @@ void RunTokenTileRouted(
         static_cast<int*>(route_experts.data_ptr()), static_cast<int*>(tile_counter.data_ptr()),
         down_z_i, m_i, k_i, top_k_i, blocks_i, tile_expert_shift_i);
   } else {
-    CheckCuda(cudaFuncSetAttribute(nvfp4_s13_c502t_down::kernel_alpha_moe_nvfp4_down_token_tile_c502t_nvfp4_s13_c502t_down, cudaFuncAttributeMaxDynamicSharedMemorySize, 214144), "cudaFuncSetAttribute(token-tile down)");
+    CheckCuda(SetMaxDynamicSmemOnce(nvfp4_s13_c502t_down::kernel_alpha_moe_nvfp4_down_token_tile_c502t_nvfp4_s13_c502t_down, 214144), "cudaFuncSetAttribute(token-tile down)");
     nvfp4_s13_c502t_down::kernel_alpha_moe_nvfp4_down_token_tile_c502t_nvfp4_s13_c502t_down<<<dim3(down_grid, 1, 1), dim3(192, 1, 1), 214144, stream>>>(
         act_map, w2_map, w2_scale_map, static_cast<float*>(output2_scale_scalar.data_ptr()),
         static_cast<int*>(sorted_token_ids.data_ptr()), static_cast<int*>(tile_expert_ids.data_ptr()),
