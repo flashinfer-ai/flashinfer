@@ -55,9 +55,15 @@ def output_of(plan, family):
     return plan.output if family == "source" else plan.outputs
 
 
-def make_model(family, precision, num_tokens=16, seed=0):
+def make_model(family, precision, num_tokens=16, seed=0, l2_scale_shift=0):
     require_model_memory()
-    return fixtures.make_model(family, precision, num_tokens=num_tokens, seed=seed)
+    return fixtures.make_model(
+        family,
+        precision,
+        num_tokens=num_tokens,
+        seed=seed,
+        l2_scale_shift=l2_scale_shift,
+    )
 
 
 def model_reference(inputs, x_scales, shared=None):
@@ -225,6 +231,46 @@ def test_v3_single_token_route_workspace_lifecycle():
         torch.cuda.synchronize()
         torch.testing.assert_close(plan.outputs, first, atol=1.0, rtol=0.1)
         check_v3_workspace(plan, scratch_cleared=True)
+
+
+@pytest.mark.parametrize("num_tokens", [1024, 4096])
+def test_v3_long_token_routes(num_tokens):
+    """FP4 model routes at 1024 and 4096 tokens: reference match, direct and
+    graph replay, one kernel node per run() and a clean self-cleaning workspace.
+    These routes use the 32- and 128-row source tile heights. The down-projection
+    weight scales are lowered by five powers of two so that every bf16-rounded
+    weighted expert output stays below 128 in magnitude: with the fixture's
+    default scales a single accumulation-order flip in one expert output moves
+    a small element by one bf16 ulp of that output (2.0 near 256-512), outside
+    the elementwise tolerance for every implementation, including the shipped
+    source family. Tolerances are unchanged."""
+    plan, inputs, xs, _ = make_model(
+        "v3", "fp4", num_tokens=num_tokens, l2_scale_shift=5
+    )
+    assert plan.self_cleaning
+    expected = model_reference(inputs, xs)
+    first = None
+    for _ in range(2):
+        plan.outputs.fill_(float("nan"))
+        plan.run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(plan.outputs, expected, atol=1.0, rtol=0.1)
+        check_v3_workspace(plan)
+        if first is None:
+            first = plan.outputs.clone()
+        else:
+            torch.testing.assert_close(plan.outputs, first, atol=1.0, rtol=0.1)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        plan.run()
+    check_single_kernel_graph(graph_node_names(graph))
+    graph.instantiate()
+    for _ in range(2):
+        plan.outputs.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(plan.outputs, first, atol=1.0, rtol=0.1)
+        check_v3_workspace(plan)
 
 
 def test_source_update_inputs_reuses_workspace():
