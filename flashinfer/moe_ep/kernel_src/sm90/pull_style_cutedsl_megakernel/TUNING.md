@@ -470,6 +470,67 @@ token-back modes — 38 candidates.
   `dedup_topk_design.md`.
 - `fp8_accum_mode`, `kind` (e4m3/e5m2), clamps.
 
+## BF16 operands (`sm90_bf16_bf16_bf16_pull_cutedsl`, 2026-10-01)
+
+Preview on ONE H100 (EP1, `MEGA_NO_DIST` off, real NVSHMEM), DSv4 P03
+geometry with the per-rank expert count of EP4 (96 local experts, hidden
+7168, intermediate 3072, top-6), heuristic launch configs, compute p50 µs
+(`torchrun --nproc_per_node=1 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
+--scale-mode all --num-experts 96 --tokens 8,64,512,2048,8192`):
+
+| tokens/rank | FP8 per-tensor | FP8 blockwise | BF16 | BF16 / FP8 pt |
+|---:|---:|---:|---:|---:|
+| 8 | 1542 | 1547 | 2923 | 1.90× |
+| 64 | 3019 | 3210 | 5821 | 1.93× |
+| 512 | 3400 | 3430 | 6457 | 1.90× |
+| 2048 | 3683 (441 TF) | 3771 | 7197 (225 TF) | 1.95× |
+| 8192 | 7173 (905 TF) | 8703 | 20319 (319 TF) | 2.83× |
+
+~2× is the expected cost of BF16 (twice the weight/token bytes in the
+bandwidth-bound buckets, half the WGMMA rate in the compute-bound ones).
+EP1 has no cross-rank traffic, where BF16 also doubles the dispatch bytes;
+see the 4-GPU table below.
+
+**4× H200 EP4 (2026-10-02).**  `"bf16"` heuristic rows retuned with
+`torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune --arch sm90 --dtype
+sm90_bf16 --hidden 7168 --intermediate 3072 --num-experts 384 --topk 6
+--max-tokens 8 ... 32768` (they were a copy of the per-tensor rows; BF16
+sweeps also try a K=64 twin of every geometry).  Winners, all swap-AB
+ping-pong cga(1,2,1): M128N8 at 8-32, M128N16 (tail-split) at 64-256,
+M128N64 (tail-split) at 512, and from 1024 the **K=64** M128N128 tile
+(tail-split; group_hint 264 up to 4096, none from 8192).  At K=128 a BF16
+A/B stage is twice the FP8 bytes, so the M128N128 tile keeps only two SMEM
+stages at hidden 7168; K=64 halves the stage and restores the depth.  Best
+K=64 vs best K=128 tile in the tuner: -1.2 / -17 / -21 / -22 / -22 / -22% at
+1024 / 2048 / 4096 / 8192 / 16384 / 32768, a tie (+-0.4%) up to 512.  The
+copied per-tensor rows had been 0-7% slower than the best K=128 rows up to
+1024 and 15-37% slower from 2048.
+
+Same-run compute p50 µs (4×H200 NVLink, SM clocks not locked, max 1980
+MHz; DSv4 P03: 384 experts, hidden 7168, intermediate 3072, top-6,
+heuristic configs, `torchrun --nproc_per_node=4
+benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py --scale-mode all`):
+
+| tokens/rank | FP8 per-tensor | FP8 blockwise | BF16 | BF16 / FP8 pt |
+|---:|---:|---:|---:|---:|
+| 8 | 764 | 771 | 1385 | 1.81× |
+| 64 | 1512 | 1576 | 2872 | 1.90× |
+| 512 | 1699 | 1743 | 3133 | 1.84× |
+| 1024 | 1730 | 1984 | 3378 | 1.95× |
+| 2048 | 2254 (711 TF) | 3000 | 4181 (388 TF) | 1.85× |
+| 8192 | 7071 (929 TF) | 8296 | 14133 (460 TF) | 2.00× |
+| 32768 | 26511 (980 TF) | 31771 | 47490 (509 TF) | 1.79× |
+
+The K=64 rows took 2048-32768 from 4877 / 8646 / 16202 / 31029 / 60461 µs
+(K=128 rows, same machine) to 4181 / 7146 / 14133 / 24382 / 47490 µs.  At
+1024 K=64 and K=128 are within run noise (tuner -1.2%, bench +1.8%).  The
+H100 EP4 32768 BF16 point that once read 244 ms was run noise (an isolated
+rerun gave 107-114 ms); on H200 the large buckets scale linearly.
+
+Open BF16 levers:
+- The per-tensor E8M0 SF wire (hidden/32 bytes per token) is still
+  dispatched for BF16 although nothing reads it.
+
 ## Sweep methodology + environment (reproduce recipe)
 
 **Hardware / software.**  One H200 node, 4x NVIDIA H200 141GB (sm_90,

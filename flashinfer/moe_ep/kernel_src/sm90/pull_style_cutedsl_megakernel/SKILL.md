@@ -25,6 +25,24 @@ syncing future drops.
 Local extensions pending upstream (re-apply when syncing a drop that has
 not picked them up):
 
+- BF16 operands (2026-10-01, `sm90_bf16_bf16_bf16_pull_cutedsl`): the
+  per-tensor/1xacc path with unit dequant scales, compiled with
+  `ab_dtype=BFloat16`.  `kernel_fp8_glu_fc12{,_swapab}.py` admit BFloat16
+  in `VALID_AB_DTYPE_SF_SIZE` (per_tensor/1xacc only, rcp limit unused);
+  `epilogue_fp8.py` sizes the FC1 R2S pair copy by the output width (16 ->
+  `2 * width` bits); `kernel_fp8_glu_fc12.py` lets the FC1 ring stage be a
+  multiple of the FC2 BF16 stage (BF16 FC1 64x64 = 8 KiB vs FC2 4 KiB) by
+  scaling the FC2 view's stage stride (`fc2_c_stage_stride_ratio`,
+  `_scale_int_tuple`) and `_compute_stages` raises when fewer than two A/B
+  stages fit (was a trace-time assert); `megamoe_kernel_fp8.py` sizes
+  `hidden_bytes` by the operand width; `heuristic_config.py` adds the
+  `"bf16"` rows (4x H200 EP4 sweep).  K granularity is dtype-aware
+  (`_Sm90Fp8Fc12KernelBase._mma_tile_k_atom`, both validators): BF16
+  per_tensor accepts K=64 tiles (no per-K scale tiles; one 128-B swizzle
+  atom), FP8 keeps the 128 dispatch scale atom.  `test_heuristic_config.py`
+  checks the drop's FP8 tables plus the FI `"bf16"` / `"bf16_nvfp4"` rows.
+  Shim: kind `"bf16"` (K atom 64); tuner `is_valid(k_atom=)` and K=64
+  candidates for dense BF16 sweeps.
 - Masked-route reduce (2026-10-01): the separate-reduce `TopkReduce` summed
   every top-k slot, but a `-1` route is never dispatched, so its
   `(token, topk)` combine row kept a PREVIOUS launch's term (wrong output on

@@ -1,7 +1,7 @@
 """CUDA graph capture/replay for the SM90 pull-style mega path (single rank).
 
 Hopper counterpart of ``test_mega_cuda_graph.py`` for
-``sm90_fp8_fp8_bf16_pull_cutedsl``: after ``MoEEpMegaLayer.warmup()``,
+``sm90_fp8_fp8_bf16_pull_cutedsl`` and ``sm90_bf16_bf16_bf16_pull_cutedsl``: after ``MoEEpMegaLayer.warmup()``,
 ``layer.forward`` captures into a ``torch.cuda.CUDAGraph`` and replays match
 eager forwards bit-exactly (the default separate-reduce path is
 deterministic), including replays over in-place-mutated inputs with masked
@@ -40,13 +40,18 @@ def _require_sm90_tree():
 
 def _single_rank_layer(
     *,
-    fp8_scale_mode: str,
+    compute: str,
     swap_ab: bool,
     weights: str,
     hidden: int = 1024,
     intermediate: int = 512,
 ):
-    """MoEEpMegaLayer on one rank (MEGA_NO_DIST) with bf16 staging."""
+    """MoEEpMegaLayer on one rank (MEGA_NO_DIST) with bf16 staging.
+
+    ``compute``: ``"per_tensor"`` / ``"blockwise"`` select the FP8 backend's
+    scale mode; ``"bf16"`` selects ``sm90_bf16_bf16_bf16_pull_cutedsl``.
+    ``weights``: checkpoint format, ``"bf16"`` or ``"mxfp8"`` (FP8 only).
+    """
     import torch
 
     from flashinfer.moe_ep import (
@@ -55,6 +60,7 @@ def _single_rank_layer(
         MegaConfig,
         MoEEpMegaLayer,
         MoEWeightPack,
+        Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig,
         Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
     )
 
@@ -77,6 +83,23 @@ def _single_rank_layer(
     else:
         pack = MoEWeightPack(w13=w13.to(torch.bfloat16), w2=w2.to(torch.bfloat16))
 
+    if compute == "bf16":
+        megakernel = Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig(
+            intermediate_size=intermediate,
+            top_k=topk,
+            swap_ab=swap_ab,
+            gate_up_clamp=10.0,
+        )
+    else:
+        megakernel = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
+            intermediate_size=intermediate,
+            top_k=topk,
+            fp8_scale_mode=compute,
+            swap_ab=swap_ab,
+            gate_up_clamp=10.0,
+            fc1_activation_dequant_scale=ACT_SCALE,
+            fc2_activation_dequant_scale=ACT_SCALE,
+        )
     layer = MoEEpMegaLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
         fleet_params=FleetParams(
@@ -86,15 +109,7 @@ def _single_rank_layer(
         ),
         weights=pack,
         backend=MegaConfig(
-            megakernel=Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
-                intermediate_size=intermediate,
-                top_k=topk,
-                fp8_scale_mode=fp8_scale_mode,
-                swap_ab=swap_ab,
-                gate_up_clamp=10.0,
-                fc1_activation_dequant_scale=ACT_SCALE,
-                fc2_activation_dequant_scale=ACT_SCALE,
-            ),
+            megakernel=megakernel,
             quantize_input=True,
             preprocess_weights=True,
         ),
@@ -130,20 +145,22 @@ _CONFIGS = [
     ("blockwise", True, "bf16"),
     ("blockwise", False, "mxfp8"),
     ("blockwise", True, "mxfp8"),
+    ("bf16", False, "bf16"),
+    ("bf16", True, "bf16"),
 ]
 
 
 @pytest.mark.arch_hopper
-@pytest.mark.parametrize("fp8_scale_mode,swap_ab,weights", _CONFIGS)
+@pytest.mark.parametrize("compute,swap_ab,weights", _CONFIGS)
 def test_sm90_pull_graph_capture_replay_matches_eager(
-    monkeypatch, fp8_scale_mode, swap_ab, weights
+    monkeypatch, compute, swap_ab, weights
 ):
     import torch
 
     _require_sm90_tree()
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     layer, problem = _single_rank_layer(
-        fp8_scale_mode=fp8_scale_mode, swap_ab=swap_ab, weights=weights
+        compute=compute, swap_ab=swap_ab, weights=weights
     )
     graph = None
     try:
@@ -190,7 +207,7 @@ def test_sm90_pull_capture_without_warmup_raises(monkeypatch):
     _require_sm90_tree()
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     layer, problem = _single_rank_layer(
-        fp8_scale_mode="blockwise", swap_ab=False, weights="bf16"
+        compute="blockwise", swap_ab=False, weights="bf16"
     )
     try:
         t = _random_batch(problem, seed=5)
@@ -205,16 +222,18 @@ def test_sm90_pull_capture_without_warmup_raises(monkeypatch):
 
 
 @pytest.mark.arch_hopper
-@pytest.mark.parametrize("weights", ["bf16", "mxfp8"])
-def test_sm90_pull_multi_size_graphs_and_eager_interleave(monkeypatch, weights):
+@pytest.mark.parametrize(
+    "compute,weights", [("blockwise", "bf16"), ("blockwise", "mxfp8"), ("bf16", "bf16")]
+)
+def test_sm90_pull_multi_size_graphs_and_eager_interleave(
+    monkeypatch, compute, weights
+):
     """One graph per batch size plus eager calls, interleaved on one workspace."""
     import torch
 
     _require_sm90_tree()
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    layer, problem = _single_rank_layer(
-        fp8_scale_mode="blockwise", swap_ab=True, weights=weights
-    )
+    layer, problem = _single_rank_layer(compute=compute, swap_ab=True, weights=weights)
     try:
         layer.warmup()
         t64 = _random_batch(problem, seed=51, num_tokens=64)
