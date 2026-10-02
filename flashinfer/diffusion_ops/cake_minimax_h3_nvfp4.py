@@ -75,9 +75,13 @@ def _stage_workspace(
     The keyword arguments are kept for API stability and must be ``None``.
     """
     if any(str(kind) == "workspace" for kind, _name in record["arg_plan"]):
-        raise RuntimeError(f"generated stage {record['name']!r} unexpectedly requires a descriptor workspace")
+        raise RuntimeError(
+            f"generated stage {record['name']!r} unexpectedly requires a descriptor workspace"
+        )
     if value is not None:
-        raise ValueError(f"{name} must be None: the generated stages take their tensor maps by value")
+        raise ValueError(
+            f"{name} must be None: the generated stages take their tensor maps by value"
+        )
     return None
 
 
@@ -332,8 +336,12 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     route = minimax_h3_nvfp4_route_record(device, P)
     norm_record = route["stages"]["norm_adaln_nvfp4_quantize"]
     gemm_record = route["stages"]["qkv_nvfp4_gemm_fused_pack"]
-    _stage_workspace(norm_descriptor_workspace, name="norm_descriptor_workspace", record=norm_record)
-    _stage_workspace(gemm_descriptor_workspace, name="gemm_descriptor_workspace", record=gemm_record)
+    _stage_workspace(
+        norm_descriptor_workspace, name="norm_descriptor_workspace", record=norm_record
+    )
+    _stage_workspace(
+        gemm_descriptor_workspace, name="gemm_descriptor_workspace", record=gemm_record
+    )
     norm_module, gemm_module = load_minimax_h3_nvfp4_route(device, P)
     # Operands derived once at preparation: the GEMM output scale
     # alpha = 1 / (x_global_scale * w_global_scale) and the CTA-pair ordering
@@ -394,8 +402,12 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         "ROWS_PER_DESTINATION": rows_per_destination,
         "SCALE_STRIDE": out_sf_stride,
     }
-    norm_args = _stage_call_args(norm_record, values, grid=_stage_launch_grid(norm_record, M=M, P=P))
-    gemm_args = _stage_call_args(gemm_record, values, grid=_stage_launch_grid(gemm_record, M=M, P=P))
+    norm_args = _stage_call_args(
+        norm_record, values, grid=_stage_launch_grid(norm_record, M=M, P=P)
+    )
+    gemm_args = _stage_call_args(
+        gemm_record, values, grid=_stage_launch_grid(gemm_record, M=M, P=P)
+    )
     return PreparedMiniMaxH3Nvfp4PreAttention(
         M=M,
         P=P,

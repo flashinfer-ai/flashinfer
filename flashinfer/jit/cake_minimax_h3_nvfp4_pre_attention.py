@@ -286,7 +286,9 @@ def gen_minimax_h3_nvfp4_stage_module(
         extra_include_paths=[csrc, csrc.parent, _get_include_dir()],
         needs_device_linking=True,
     )
-    logger.info("Generated MiniMax-H3 NVFP4 %s %s JIT spec: %s", target, stage, spec.name)
+    logger.info(
+        "Generated MiniMax-H3 NVFP4 %s %s JIT spec: %s", target, stage, spec.name
+    )
     return spec
 
 
@@ -301,7 +303,10 @@ def load_minimax_h3_nvfp4_route(device: torch.device, P: int):
     """``(norm_module, gemm_module)`` of the device's exact target."""
     route = minimax_h3_nvfp4_route_record(device, P)
     target = route["target"]
-    return tuple(load_minimax_h3_nvfp4_stage_build(target, stage) for stage in MINIMAX_H3_NVFP4_STAGES)
+    return tuple(
+        load_minimax_h3_nvfp4_stage_build(target, stage)
+        for stage in MINIMAX_H3_NVFP4_STAGES
+    )
 
 
 __all__ = [
