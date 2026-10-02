@@ -77,12 +77,18 @@ def hopper_fp8_candidates(
     *,
     fp8_scale_mode: str = "per_tensor",
     max_tokens: int = 0,
+    k64: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default candidate knob dicts: heuristic winner first, then every
     geometry that wins some bucket of the drop's sweep.  The heuristic
-    winner leads so a tie keeps the established default."""
+    winner leads so a tie keeps the established default.
+
+    ``k64`` (dense BF16 only) also sweeps every geometry with a K=64 tile,
+    which doubles the A/B pipeline depth."""
     out: List[Dict[str, Any]] = []
     seen = set()
+    # The BF16 table itself carries K=64 rows; accept them even without k64.
+    k_atom = 64 if (k64 or fp8_scale_mode == "bf16") else 128
 
     def _add(knobs: Dict[str, Any]) -> None:
         key = tuple(
@@ -90,7 +96,7 @@ def hopper_fp8_candidates(
                 (k, tuple(v) if isinstance(v, tuple) else v) for k, v in knobs.items()
             )
         )
-        if key not in seen and is_valid(knobs):
+        if key not in seen and is_valid(knobs, k_atom=k_atom):
             seen.add(key)
             out.append(knobs)
 
@@ -101,6 +107,17 @@ def hopper_fp8_candidates(
     for geometry in _sweep_geometries():
         for token_back in ("epi_warps", "reuse_dispatch_warps"):
             _add({**geometry, "token_back_mode": token_back})
+    if k64:
+        # K=64 twins (epi_warps; token-back is orthogonal to the K depth).
+        for geometry in _sweep_geometries():
+            m, n, _ = geometry["mma_tiler_mnk"]
+            _add(
+                {
+                    **geometry,
+                    "mma_tiler_mnk": (m, n, 64),
+                    "token_back_mode": "epi_warps",
+                }
+            )
     return out
 
 
@@ -232,8 +249,10 @@ def autotune_hopper_fp8_mega_moe(
     cfg = symm_buffer._frontend.config
     if candidates is None:
         candidates = hopper_fp8_candidates(
-            fp8_scale_mode=cfg.fp8_scale_mode,
+            # BF16 sessions start from their own heuristic rows.
+            fp8_scale_mode="bf16" if cfg.kind == "bf16" else cfg.fp8_scale_mode,
             max_tokens=cfg.num_tokens_per_rank,
+            k64=cfg.kind == "bf16",
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:

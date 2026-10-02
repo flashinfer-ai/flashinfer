@@ -100,7 +100,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:
-        validate_mega_arch_sm90()
+        validate_mega_arch_sm90(self.kernel_name())
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,

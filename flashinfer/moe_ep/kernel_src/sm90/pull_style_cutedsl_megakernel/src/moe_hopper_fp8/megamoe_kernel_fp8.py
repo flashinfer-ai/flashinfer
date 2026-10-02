@@ -287,8 +287,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             else logical_fc2_activation_sf_cols
         )
 
-        # FP8: 8 bits/elem = 1 byte/element (NVFP4 packs 2 per byte).
-        self.hidden_bytes = self.hidden
+        # FP8: 1 byte/element; BF16 (FI local extension): 2 (NVFP4 packs 2
+        # per byte).
+        self.hidden_bytes = self.hidden * self.ab_dtype.width // 8
         # Dispatch pulls scale metadata in uint32 units.  Per-tensor interprets
         # each word as four E8M0 bytes; blockwise interprets it as one FP32
         # scale.  In both modes the atom covers 128 K elements, so dispatch
