@@ -154,8 +154,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
     # Largest kernel N a narrow (< 64) N tile may run at. A narrow tile is a
     # sub-tile of the 128-token SFB tile: the mainloop shifts the MMA's SFB
-    # TMEM column by tok_off // 32, and only column shift 0 (every sub-tile
-    # within the first 32 tokens) is validated. See can_implement.
+    # TMEM column by tok_off // 32, and an odd shift makes tcgen05.mma fault,
+    # so every sub-tile must stay within the first 32 tokens. See can_implement.
     NARROW_TILE_MAX_N = 32
 
     @classmethod
@@ -1256,6 +1256,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     # by one column per 32 tokens and start the S2T copy's smem
                     # source at the remaining token row (16 B per row of the
                     # 32x4 SF block) so the sub-tile's first token lands in lane 0.
+                    # can_implement limits narrow tiles to a kernel-N extent of
+                    # 32, so the column shift below is always 0 in practice: an
+                    # odd column shift makes tcgen05.mma fault (misaligned
+                    # address), the 64-wide tile above shifts by two columns.
                     tok_off = (
                         mma_tile_coord_mnl[1] % self.sfb_sub_tiles_per_tile
                     ) * self.cta_tile_shape_mnk[1]
@@ -1954,15 +1958,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         ):
             can_implement = False
 
-        # Narrow (< 64) N tiles: restore the M/N <= 32 envelope that #5609
-        # documents for its SFB sub-tile addressing (an 8/16-wide token tile
-        # covers up to 32 tokens). Each sub-tile shifts the MMA's SFB TMEM
-        # column by tok_off // 32, and only column shift 0 is validated.
-        # Shifts >= 1 (kernel N > 32) fault with cudaErrorMisalignedAddress:
-        # MXFP8 under autotune (#5725), and forced NVFP4 / MXFP4 tactics at
-        # N = 40 and 64 on SM100 and SM103. That the nonzero column shift is
-        # the hardware cause is a hypothesis; the bound is the same for every
-        # dtype.
+        # Narrow N tiles (8/16/32) read their tokens' scale factors out of the
+        # 128-wide SFB tile through the sub-tile addressing in the mainloop:
+        # the S2T copy's smem source moves by whole token rows inside the
+        # first 32-token group and the MMA's SFB TMEM address moves by one
+        # column per 32 tokens. tcgen05.mma faults with a misaligned address
+        # when that column shift is odd (offsets 1 and 3 fault; the 64-wide
+        # tile's two-column shift is fine), so every sub-tile has to stay in
+        # the first 32-token group: the kernel-N extent is limited to 32 and
+        # the SFB tile is never multicast. Wider N takes the 64-wide or
+        # 128-wide tiles. narrow_tile_ok holds the 32-column bound, shared with
+        # the mm_mxfp8 / mm_fp4 runners' pre-launch re-check of replayed tactics.
         if not cls.narrow_tile_ok(mma_tiler_mn[1], n) or (
             mma_tiler_mn[1] < 64 and cluster_shape_mn[1] > 1
         ):
