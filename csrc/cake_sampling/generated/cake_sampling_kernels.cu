@@ -24,3 +24,7 @@
 // file under the repository size limit; this file is the single translation unit.
 #include "cake_sampling_kernels_part1.cuh"
 #include "cake_sampling_kernels_part2.cuh"
+#include "cake_sampling_kernels_part3.cuh"
+#include "cake_sampling_kernels_part4.cuh"
+#include "cake_sampling_kernels_part5.cuh"
+#include "cake_sampling_kernels_part6.cuh"

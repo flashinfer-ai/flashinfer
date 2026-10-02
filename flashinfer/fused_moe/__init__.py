@@ -234,6 +234,7 @@ from .alphamoe_nvfp4_sm100 import (  # noqa: F401
 
 from .bgmv_moe import (  # noqa: F401
     BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
+    BGMVMoECakePlan as BGMVMoECakePlan,
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
     bgmv_moe_expand as bgmv_moe_expand,
@@ -463,6 +464,7 @@ __all__ = [
     "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
     "bgmv_moe",
     "BGMVMoEBlackwellPlan",
+    "BGMVMoECakePlan",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
     "bgmv_moe_gemm1_lora_delta",

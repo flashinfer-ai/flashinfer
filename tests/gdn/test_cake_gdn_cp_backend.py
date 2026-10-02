@@ -1228,8 +1228,10 @@ def test_explicit_cake_backend_uses_cp_only_when_requested(
     ("capability", "backend"),
     [((10, 0), "cake_gdn"), ((10, 0), "flashinfer"), ((12, 0), "flashinfer")],
 )
-@pytest.mark.parametrize(("max_seqlen", "expected"), [(None, 5), (11, 11)])
-def test_public_dispatch_forwards_max_seqlen_or_balanced_fallback(
+# Without a hint CP falls back to the packed length, the only bound that
+# holds for every batch.
+@pytest.mark.parametrize(("max_seqlen", "expected"), [(None, 17), (11, 11)])
+def test_public_dispatch_forwards_max_seqlen_or_packed_length_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capability: tuple[int, int],
     backend: str,

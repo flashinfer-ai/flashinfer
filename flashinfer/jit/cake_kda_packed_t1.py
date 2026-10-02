@@ -38,7 +38,6 @@ CakeKDAPackedT1Variant = Literal[
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
     "cpasync_tile128_register_pipeline",
-    "cpasync_tile128_ilp2",
 ]
 CakeKDAPackedT1Target = Literal["sm100a", "sm100f"]
 
@@ -54,7 +53,6 @@ CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
     "cpasync_tile128_v_private_prefetch",
     "cpasync_tile128_paired_row_pipeline",
     "cpasync_tile128_register_pipeline",
-    "cpasync_tile128_ilp2",
 )
 
 _CAKE_KDA_PACKED_T1_TARGETS: tuple[CakeKDAPackedT1Target, ...] = (
@@ -164,14 +162,6 @@ CAKE_KDA_PACKED_T1_VARIANT_METADATA: dict[
     "cpasync_tile128_register_pipeline": CakeKDAPackedT1VariantMetadata(
         body="cake_kda_packed_t1_cpasync_tile128_register_pipeline.cu",
         symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile128_register_pipeline",
-        value_tiles=1,
-        threads=128,
-        smem_bytes=20480,
-        requires_aux_vec4=True,
-    ),
-    "cpasync_tile128_ilp2": CakeKDAPackedT1VariantMetadata(
-        body="cake_kda_packed_t1_cpasync_tile128_ilp2.cu",
-        symbol="kernel_flashinfer_packed_kda_t1_cpasync_tile128",
         value_tiles=1,
         threads=128,
         smem_bytes=20480,

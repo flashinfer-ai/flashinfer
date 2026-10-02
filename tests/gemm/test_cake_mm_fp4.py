@@ -41,9 +41,32 @@ def test_default_tactic_rules():
     # Single-wave deep-K rows run three mainloop stages.
     t = cb.default_tactic(8, 18432, 7168, 148)
     assert t["alpha_n"] and t["deep_k"] and t["num_stages"] == 3
-    # Wide-N low-M rows stay unsplit (unlike the cute-dsl rule at K >= 16384).
+    # Deep-K rows whose weight tiles fill at most half the SMs split K in two; the
+    # 8 / 16-token tiles of the deeper rows stay unsplit, as do the wide-N rows.
     t = cb.default_tactic(17, 7168, 16384, 152)
-    assert t["alpha_n"] and t["tile_n"] == 32 and "split_k" not in t
+    assert t["alpha_n"] and t["tile_n"] == 32 and t["split_k"] == 2
+    assert t["a_hint"] == "evict_first" and not t["deep_k"]
+    assert cb.default_tactic(1, 7168, 16384, 148)["split_k"] == 2
+    assert cb.default_tactic(32, 7168, 18432, 148)["split_k"] == 2
+    assert "split_k" not in cb.default_tactic(8, 7168, 18432, 148)
+    assert "split_k" not in cb.default_tactic(32, 18432, 7168, 148)
+    # Three K slices when the whole cluster grid (weight tiles x token tiles) is co-resident:
+    # 7168x1536 M = 17 needs 36 clusters of 3 (capacity 45 on 148 SMs, 46 on 152); the
+    # 48- and 51-cluster launches of M = 32 / N = 2112 keep two slices, as does a part
+    # without a measured capacity table.
+    for sm_count in (148, 152):
+        t = cb.default_tactic(17, 1536, 7168, sm_count)
+        assert t["tile_n"] == 8 and t["split_k"] == 3
+        assert cb.default_tactic(32, 1536, 7168, sm_count)["split_k"] == 2
+        assert cb.default_tactic(17, 2112, 7168, sm_count)["split_k"] == 2
+    assert cb.default_tactic(17, 1536, 7168, 132)["split_k"] == 2
+    assert set(cb.CLUSTER_CAPACITY_BY_SM_COUNT) == {148, 152}
+    # One 128-token tile over one wave of 128-wide weight tiles runs without the L2 promotion on
+    # both parts (7168x18432 M = 128: 144 tiles); the two-wave 8192x28672 row keeps it.
+    for sm_count in (148, 152):
+        t = cb.default_tactic(128, 18432, 7168, sm_count)
+        assert t["tile_n"] == 128 and t["l2_promo"] is None and "two_cta" not in t
+    assert cb.default_tactic(128, 28672, 8192, 148)["l2_promo"] == "l2_256b"
     # More weight tiles than SMs: shallow K; two CTAs per SM on the 8-token tile or on
     # the 152-SM part, one CTA per SM for the 32-token tile on 148 SMs.
     t = cb.default_tactic(8, 28672, 8192, 148)
@@ -73,17 +96,26 @@ def test_default_tactic_rules():
     )
     t = cb.default_tactic(128, 28672, 8192, 152)
     assert t["tile_n"] == 192 and "two_cta" not in t and t["l2_promo"] == "l2_256b"
-    # One token tile, one wave of 128-wide tiles: no L2 promotion on the 152-SM part.
+    # One token tile, one wave of 128-wide tiles: no L2 promotion on either part.
     assert cb.default_tactic(128, 18432, 7168, 152)["l2_promo"] is None
-    assert cb.default_tactic(128, 18432, 7168, 148)["l2_promo"] == "l2_256b"
+    assert cb.default_tactic(128, 18432, 7168, 148)["l2_promo"] is None
     # M > 32: m orientation.  One 128-token tile over a few 64-wide weight tiles takes the
     # 2-CTA 256x64 pair (no grouped raster, no CLC); the weights stay evict_first.
     t = cb.default_tactic(128, 2112, 7168, 148)
-    assert not t["alpha_n"] and t["tile_n"] == 64 and t["two_cta"]
+    assert not t["alpha_n"] and t["tile_n"] == 64 and t["two_cta"] and t["half_m"]
     assert t["a_hint"] is None and t["b_hint"] == "evict_first"
     assert "split_k" not in t and "raster_group" not in t and "sched" not in t
+    # The half-M pair (64 token rows per CTA) holds while its grid fits 1.5 waves of pairs:
+    # 7168x2112 M=128 / 130 (66 / 99 tiles on 74 / 76 pairs) and 7168x1536 M=128 / 130 (48)
+    # yes; 7168x1536 M=257 (120, 1.6 waves) and 7168x2112 M=257 (165, 2.2 waves) no.
     t = cb.default_tactic(130, 2112, 7168, 148)
-    assert t["two_cta"] and t["tile_n"] == 64 and "split_k" not in t
+    assert t["two_cta"] and t["tile_n"] == 64 and t["half_m"] and "split_k" not in t
+    for sm_count in (148, 152):
+        assert cb.default_tactic(130, 1536, 7168, sm_count)["half_m"]
+        for n in (1536, 2112):
+            t = cb.default_tactic(257, n, 7168, sm_count)
+            assert t["two_cta"] and t["tile_n"] == 64 and "half_m" not in t
+        assert "half_m" not in cb.default_tactic(512, 1536, 7168, sm_count)
     # Single-token-tile wide rows keep the scorer's 1-CTA tile (no A-multicast, no split-K).
     t = cb.default_tactic(128, 8192, 8192, 148)
     assert not t["alpha_n"] and t["tile_n"] == 64 and "two_cta" not in t
@@ -104,8 +136,24 @@ def test_default_tactic_rules():
     # and only past one 8-tile group of token tiles.
     assert cb.default_tactic(8192, 8192, 28672, 148)["raster_group"] == 8
     assert cb.default_tactic(8192, 8192, 8192, 152)["raster_group"] == 16
-    assert cb.default_tactic(2048, 8192, 8192, 148)["raster_group"] == 8
     assert cb.default_tactic(8192, 1536, 7168, 148)["raster_group"] == 8
+    # Multi-wave rows re-pick the 2-CTA width from the measured wave model: 3.4 waves of
+    # 256-wide tiles become 5 cheaper waves of 192-wide tiles (43 weight tiles: no group);
+    # 3.03 waves on 148 SMs likewise, while 152 SMs fit the same grid in 3 full waves.
+    for sms in (148, 152):
+        t = cb.default_tactic(2048, 8192, 8192, sms)
+        assert t["two_cta"] and t["tile_n"] == 192 and "raster_group" not in t
+        assert cb.default_tactic(8192, 8192, 8192, sms)["tile_n"] == 256
+    assert cb.default_tactic(2048, 7168, 16384, 148)["tile_n"] == 192
+    assert cb.default_tactic(2048, 7168, 16384, 152)["tile_n"] == 256
+    assert cb.default_tactic(257, 28672, 8192, 148)["tile_n"] == 192
+    assert cb.default_tactic(257, 28672, 8192, 152)["tile_n"] == 256
+    # A grid that fits one wave runs ungrouped (every tile is resident at once).
+    for sms in (148, 152):
+        t = cb.default_tactic(2048, 1536, 7168, sms)
+        assert t["two_cta"] and t["tile_n"] == 192 and "raster_group" not in t
+        assert "raster_group" not in cb.default_tactic(512, 8192, 8192, sms)
+        assert cb.default_tactic(2048, 8192, 28672, sms)["tile_n"] == 192
     t = cb.default_tactic(2048, 18432, 7168, 148)
     assert t["two_cta"] and "raster_group" not in t and "sched" not in t
     t = cb.default_tactic(8192, 18432, 7168, 148)
@@ -124,20 +172,100 @@ def test_gemm_kernel_key_and_plan():
     plan = cb.gemm_plan(1, 2112, 7168, True, "sm_100a", 148)
     assert plan.tok_tile == 8 and plan.w_tile == 128 and plan.num_tiles == 17
     assert plan.grid == 4 * 17
+    # Half-M pairs: 64 token rows per CTA, 128 per pair tile.
     plan = cb.gemm_plan(130, 2112, 7168, False, "sm_100a", 148)
-    assert plan.kernel_key == "gemm:m64_2cta_bf16_bF_l2256b"
+    assert plan.kernel_key == "gemm:m64_2cta_hm_bf16_bF_l2256b"
+    assert plan.tok_tile == 128 and plan.tok_tiles == 2 and plan.num_tiles == 66
     assert plan.grid == 2 * min(74, plan.num_tiles)
     plan = cb.gemm_plan(128, 2112, 7168, False, "sm_100a", 148)
-    assert plan.kernel_key == "gemm:m64_2cta_bf16_bF_l2256b"
+    assert plan.kernel_key == "gemm:m64_2cta_hm_bf16_bF_l2256b"
     assert plan.tok_tiles == 1 and plan.w_tiles == 33 and plan.grid == 2 * 33
+    plan = cb.gemm_plan(257, 2112, 7168, False, "sm_100a", 148)
+    assert plan.kernel_key == "gemm:m64_2cta_bf16_bF_l2256b" and plan.tok_tile == 256
     plan = cb.gemm_plan(128, 18432, 7168, False, "sm_100a", 148)
-    assert plan.kernel_key == "gemm:m128_bf16_bF_l2256b"
+    assert plan.kernel_key == "gemm:m128_bf16_bF"
     assert plan.w_tiles == 144 and plan.amc == 1 and plan.grid == 144
     plan = cb.gemm_plan(8, 28672, 8192, False, "sm_100a", 148)
     assert plan.kernel_key == "gemm:n8_bf16_aF_l2256b_o2"
     assert plan.num_tiles == 224 and plan.grid == 224  # min(2 x 148, 224)
     plan = cb.gemm_plan(8, 18432, 7168, True, "sm_103a", 152)
     assert plan.kernel_key == "gemm:n8_k512_f16_aF_l2256b_s3" and plan.grid == 144
+    # Stream-K tail of the static 2-CTA schedule: each tile of the partial last wave is cut into
+    # equal K slices over consecutive pairs; the plan resolves the slice count into the tactic
+    # (it is baked into the program) and carries the geometry the kernel re-derives.
+    sk_tactic = {**cb.default_tactic(2048, 7168, 16384, 148), "stream_k": True}
+    plan = cb.gemm_plan(2048, 7168, 16384, False, "sm_100a", 148, tactic=sk_tactic)
+    assert plan.num_tiles == 304 and plan.grid == 2 * 74 and plan.stream_k
+    assert (plan.sk_tiles, plan.sk_slices, plan.sk_pairs) == (8, 6, 48)
+    assert plan.tactic["sk_split"] == 6
+    assert plan.kernel_key == "gemm:m192_2cta_skt6_bf16_aL_bL_l2256b"
+    assert (
+        plan.sk_flag_words == 8 * 6 * 2
+        and plan.sk_workspace_floats == 8 * 6 * 2 * 128 * 192
+    )
+    plan = cb.gemm_plan(
+        2048, 7168, 16384, False, "sm_100a", 148, tactic={**sk_tactic, "sk_split": 4}
+    )
+    assert (plan.sk_tiles, plan.sk_slices, plan.sk_pairs) == (8, 4, 32)
+    assert plan.kernel_key == "gemm:m192_2cta_skt4_bf16_aL_bL_l2256b"
+    # fewer than SK_MIN_SLICES slices are not worth the exchange: the plain program
+    plan = cb.gemm_plan(
+        2048, 7168, 16384, False, "sm_100a", 148, tactic={**sk_tactic, "sk_split": 2}
+    )
+    assert not plan.stream_k and "sk_split" not in plan.tactic
+    assert plan.kernel_key == "gemm:m192_2cta_bf16_aL_bL_l2256b"
+    # the default tactic of every static 2-CTA row carries the knob; the key needs the plan
+    assert cb.default_tactic(2048, 7168, 16384, 148)["stream_k"]
+    assert "stream_k" not in cb.default_tactic(128, 1536, 7168, 148)  # half_m pairs
+    # static 2x256 pairs (192 tiles < 10 per pair) vs the CLC scheduler (896 tiles)
+    assert cb.default_tactic(8192, 1536, 7168, 148)["stream_k"]
+    assert "stream_k" not in cb.default_tactic(8192, 7168, 16384, 148)
+    with pytest.raises(ValueError, match="resolved sk_split"):
+        cb.gemm_kernel_key(cb.default_tactic(2048, 7168, 16384, 148), False)
+    plan = cb.gemm_plan(2048, 7168, 16384, False, "sm_100a", 148)
+    assert plan.kernel_key == "gemm:m192_2cta_skt6_bf16_aL_bL_l2256b"
+    # 40 tail tiles over 76 pairs cannot be split: the plain program (tactic loses the knob)
+    plan = cb.gemm_plan(
+        2048,
+        8192,
+        8192,
+        False,
+        "sm_103a",
+        152,
+        tactic={**cb.default_tactic(2048, 8192, 8192, 152), "stream_k": True},
+    )
+    assert plan.num_tiles == 344 and not plan.stream_k and "sk_split" not in plan.tactic
+    assert (plan.sk_tiles, plan.sk_slices, plan.sk_pairs) == (0, 0, 0)
+    assert plan.kernel_key == "gemm:m192_2cta_bf16_aL_bL_l2256b"
+    plan = cb.gemm_plan(
+        2048,
+        2112,
+        7168,
+        False,
+        "sm_100a",
+        148,
+        tactic={**cb.default_tactic(2048, 2112, 7168, 148), "stream_k": True},
+    )
+    assert plan.num_tiles == 72 and not plan.stream_k
+    assert cb.stream_k_tail(344, 76, 32) == (40, 1, 0)
+    assert cb.stream_k_tail(300, 74, 32, 8, 6) == (4, 6, 24)
+    assert cb.stream_k_tail(256, 76, 32, 8, 8) == (
+        28,
+        1,
+        0,
+    )  # two slices fit, below SK_MIN_SLICES
+    assert cb.stream_k_tail(256, 76, 32, 8, 8, min_slices=2) == (28, 2, 56)
+    assert cb.stream_k_tail(152, 76, 32) == (0, 0, 0)
+    with pytest.raises(ValueError, match="static 2-CTA"):
+        cb.gemm_plan(
+            8192,
+            7168,
+            16384,
+            False,
+            "sm_100a",
+            148,
+            tactic={**cb.default_tactic(8192, 7168, 16384, 148), "stream_k": True},
+        )
     with pytest.raises(ValueError, match="1-CTA persistent"):
         cb.gemm_plan(
             8,

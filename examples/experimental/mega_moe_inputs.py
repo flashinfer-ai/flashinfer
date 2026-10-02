@@ -1,4 +1,4 @@
-"""Synthetic packed inputs and independent PyTorch references for SM103a MoE.
+"""Synthetic packed inputs and independent PyTorch references for SM100a/SM103a MoE.
 
 FP4 is low-nibble-first E2M1. All scales have granularity 32 and are powers of
 2; every int32 scale word contains four consecutive UE8M0 exponent bytes.
@@ -54,45 +54,6 @@ def operand(shape, precision, generator, exponent_low=-5):
     return values, scales
 
 
-def smoke_inputs(family, precision, seed=0):
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    tokens, hidden = (17, 256) if family == "source" else (16, 512)
-    experts, top_k, intermediate = 8, 2, 256
-    x, xs = operand((tokens, hidden), "fp8", generator, exponent_low=-1)
-    w1, s1 = operand((experts, 2 * intermediate, hidden), precision, generator)
-    w2, s2 = operand((experts, hidden, intermediate), precision, generator)
-    token = torch.arange(tokens, device="cuda")
-    routes = torch.stack(
-        ((token + seed) % experts, (token + seed + 3) % experts), dim=1
-    ).long()
-    weights = torch.stack(
-        (torch.ones_like(token).float(), torch.where(token % 2 == 0, -0.5, 1.0)), dim=1
-    )
-    inputs = dict(
-        num_tokens=tokens,
-        num_experts=experts,
-        top_k=top_k,
-        hidden=hidden,
-        intermediate=intermediate,
-        routed_weight_dtype=precision,
-        activation_clamp=10.0,
-        x_fp8_packed=x,
-        x_sf_packed=scale_words(xs),
-        topk_idx=routes,
-        topk_weights=weights,
-        w1_sf=s1,
-        w2_sf=s2,
-    )
-    inputs[f"w1_{precision}"] = w1
-    inputs[f"w2_{precision}"] = w2
-    shared = None
-    if family == "source":
-        a, sa = operand((1, 2 * intermediate, hidden), "fp8", generator)
-        b, sb = operand((1, hidden, intermediate), "fp8", generator)
-        shared = (a, sa, b, sb)
-    return inputs, xs, shared
-
-
 def interleave_rows(tensor):
     experts, rows = tensor.shape[:2]
     tail = tensor.shape[2:]
@@ -140,36 +101,6 @@ def _expert(x_rows, first, second, route_weight, width):
     return (dequantized @ second.T).bfloat16().float()
 
 
-def reference(inputs, x_scales, shared=None):
-    """BF16 L1, clamped SwiGLU, FP32 activation quantization, BF16 L2/sum."""
-    precision = inputs["routed_weight_dtype"]
-    x = unpack(inputs["x_fp8_packed"], x_scales, "fp8")
-    w1 = unpack(inputs[f"w1_{precision}"], inputs["w1_sf"], precision)
-    w2 = unpack(inputs[f"w2_{precision}"], inputs["w2_sf"], precision)
-    width = inputs["intermediate"]
-
-    output = torch.zeros_like(x)
-    for slot in range(inputs["top_k"]):
-        for index in range(inputs["num_experts"]):
-            selected = inputs["topk_idx"][:, slot] == index
-            output[selected] += _expert(
-                x[selected],
-                w1[index],
-                w2[index],
-                inputs["topk_weights"][selected, slot],
-                width,
-            )
-    if shared is not None:
-        output += _expert(
-            x,
-            unpack(shared[0], shared[1], "fp8")[0],
-            unpack(shared[2], shared[3], "fp8")[0],
-            torch.ones(x.shape[0], device=x.device),
-            width,
-        )
-    return output.bfloat16()
-
-
 def model_inputs(precision, num_tokens=1, seed=0):
     """Synthetic packed inputs at the catalogued model geometry: 384 experts,
     top-6, hidden 5120, intermediate 2304, clamp 10. Every token routes to six
@@ -210,9 +141,19 @@ def model_inputs(precision, num_tokens=1, seed=0):
     return inputs, xs
 
 
-def model_reference(inputs, x_scales):
-    """``reference`` restricted to the routed experts; dequantizing all 384
-    experts at once would need tens of GiB."""
+def shared_expert(seed=0):
+    """One FP8 shared expert at the model geometry (source family only)."""
+    generator = torch.Generator(device="cuda").manual_seed(seed + 1_000_003)
+    a, sa = operand((1, 2 * 2304, 5120), "fp8", generator)
+    b, sb = operand((1, 5120, 2304), "fp8", generator)
+    return a, sa, b, sb
+
+
+def model_reference(inputs, x_scales, shared=None):
+    """BF16 L1, clamped SwiGLU, FP32 activation quantization, BF16 L2 of the
+    routed experts (only the selected ones are dequantized; all 384 at once
+    would need tens of GiB) plus the shared expert, summed in FP32 and rounded
+    to BF16 once, like the kernels."""
     precision = inputs["routed_weight_dtype"]
     x = unpack(inputs["x_fp8_packed"], x_scales, "fp8")
     width = inputs["intermediate"]
@@ -234,27 +175,39 @@ def model_reference(inputs, x_scales):
                     inputs["topk_weights"][selected, slot],
                     width,
                 )
+    if shared is not None:
+        output += _expert(
+            x,
+            unpack(shared[0], shared[1], "fp8")[0],
+            unpack(shared[2], shared[3], "fp8")[0],
+            torch.ones(x.shape[0], device=x.device),
+            width,
+        )
     return output.bfloat16()
 
 
-def make_smoke(family, precision, seed=0):
-    inputs, xs, shared = smoke_inputs(family, precision, seed)
+def make_model(family, precision, num_tokens=16, seed=0):
+    """Prepared plan of ``family`` on a catalogued model route (both routed
+    precisions exist at 16 tokens; FP4 also at 1, 128 and 512 tokens, and for
+    the source family at 1024 and 4096). Returns (plan, inputs, x_scales, shared)."""
+    inputs, xs = model_inputs(precision, num_tokens=num_tokens, seed=seed)
+    shared = None
     if family == "source":
         from flashinfer.source_mega_moe import prepare_mega_moe
 
+        shared = shared_expert(seed)
         plan = prepare_mega_moe(
             inputs["x_fp8_packed"],
             inputs["x_sf_packed"],
             inputs["topk_idx"],
             inputs["topk_weights"],
             weights=source_weights(inputs, shared),
-            num_experts=8,
-            intermediate=256,
+            num_experts=inputs["num_experts"],
+            intermediate=inputs["intermediate"],
             routed_weight_dtype=precision,
             num_shared_experts=1,
             activation_clamp=10.0,
             fast_math=True,
-            num_sms=2,
         )
     else:
         from flashinfer.mega_moe_v3 import prepare_pipeline

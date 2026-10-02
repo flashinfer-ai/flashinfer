@@ -13,12 +13,37 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
-from flashinfer.jit import cake_trtllm_moe_allreduce
+from flashinfer.jit import cake_trtllm_moe_allreduce_union as union
 
 
 HIDDEN_SIZE = 7168
 MAX_TOKEN_NUM = 2048
 ACTIVE_EXPERTS = 8
+_NO_OUTPUT_ROWS = {(1, ACTIVE_EXPERTS), (64, ACTIVE_EXPERTS), (2048, ACTIVE_EXPERTS)}
+_DTYPE_NAME = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
+
+
+def _reduction_rows(
+    arch: str | None, world_size: int, dtype: torch.dtype
+) -> list[tuple[int, int]]:
+    """(token_num, num_experts) rows: the original rows plus every reviewed union shape.
+
+    T=512 with 8 experts is reviewed nowhere, so it reaches the class program
+    (``generic`` or ``wide_mlp``) of every (world size, dtype, PDL) class.
+    """
+    rows = {
+        (1, ACTIVE_EXPERTS),
+        (64, ACTIVE_EXPERTS),
+        (512, ACTIVE_EXPERTS),
+        (2048, ACTIVE_EXPERTS),
+    }
+    if arch is not None:
+        for key in union._REVIEWED_SPECIALIZATIONS:
+            if key[:3] == (arch, world_size, _DTYPE_NAME[dtype]):
+                rows.add((key[4], key[5]))
+    return sorted(rows)
+
+
 ATOL = 1e-2
 RTOL = 1e-2
 WORKER_TIMEOUT_SECONDS = 20 * 60
@@ -254,7 +279,6 @@ def _reduction_worker(
     ipc_handles = None
     phase_probe_complete = world_size != 8
     try:
-        cake_trtllm_moe_allreduce.load(rank)
         dist.barrier(group=group)
         ipc_handles, workspace_tensor = (
             comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
@@ -266,18 +290,24 @@ def _reduction_worker(
             )
         )
 
-        for token_num in (1, 64, 2048):
+        arch = union.arch_for_capability(torch.cuda.get_device_capability(device))
+        routes_hit: set[tuple] = set()
+        for token_num, active_experts in _reduction_rows(arch, world_size, dtype):
             generator = torch.Generator(device=device).manual_seed(
-                0xCA4E0000 + world_size * 10000 + rank * 100 + token_num
+                0xCA4E0000
+                + world_size * 10000
+                + rank * 100
+                + token_num
+                + (active_experts - ACTIVE_EXPERTS) * 1_000_000
             )
             expert_input = _bounded_rand(
-                (ACTIVE_EXPERTS, token_num, HIDDEN_SIZE),
+                (active_experts, token_num, HIDDEN_SIZE),
                 dtype=dtype,
                 device=device,
                 generator=generator,
             )
             expert_scale = _bounded_rand(
-                (ACTIVE_EXPERTS, token_num),
+                (active_experts, token_num),
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
@@ -307,7 +337,7 @@ def _reduction_worker(
             rms_eps = 1e-5
 
             local = torch.zeros_like(token_input)
-            for expert in range(ACTIVE_EXPERTS):
+            for expert in range(active_experts):
                 contribution = (
                     expert_input[expert].float()
                     * expert_scale[expert].float().unsqueeze(-1)
@@ -326,7 +356,15 @@ def _reduction_worker(
                 * rms_gamma.float()
             ).to(dtype)
 
-            emit_allreduce_options = (True, False) if token_num == 64 else (True,)
+            # Calls without the all-reduce output run the same kernels against
+            # the loader-owned scratch tensor; the rows below cover its first
+            # allocation (one token), reuse and growth up to the largest row,
+            # in eager mode and under CUDA-graph capture.
+            emit_allreduce_options = (
+                (True, False)
+                if (token_num, active_experts) in _NO_OUTPUT_ROWS
+                else (True,)
+            )
             for emit_allreduce in emit_allreduce_options:
                 for launch_with_pdl in (False, True):
                     for mode in ("eager", "graph"):
@@ -348,7 +386,7 @@ def _reduction_worker(
                                 rms_gamma=rms_gamma,
                                 rms_eps=rms_eps,
                                 scale_factor=1.0,
-                                moe_reduction_device_num_experts=ACTIVE_EXPERTS,
+                                moe_reduction_device_num_experts=active_experts,
                                 moe_reduction_scale_input=expert_scale,
                                 moe_reduction_active_experts_token_input=expert_input,
                                 moe_reduction_token_input=token_input,
@@ -361,14 +399,26 @@ def _reduction_worker(
                                 backend="cake",
                             )
 
+                        if emit_allreduce and arch is not None:
+                            routes_hit.add(
+                                union.route_for(
+                                    arch=arch,
+                                    world_size=world_size,
+                                    dtype_name=_DTYPE_NAME[dtype],
+                                    launch_with_pdl=launch_with_pdl,
+                                    token_num=token_num,
+                                    active_experts=active_experts,
+                                )[0]
+                            )
                         case = (
                             f"reduction/tp{world_size}/{dtype}/tokens{token_num}/"
+                            f"experts{active_experts}/"
                             f"pdl{int(launch_with_pdl)}/{mode}/"
                             f"allreduce_out{int(emit_allreduce)}"
                         )
                         if (
                             not phase_probe_complete
-                            and token_num == 1
+                            and (token_num, active_experts) == (1, ACTIVE_EXPERTS)
                             and emit_allreduce
                             and not launch_with_pdl
                             and mode == "eager"
@@ -409,6 +459,17 @@ def _reduction_worker(
                             group=group,
                         )
         assert phase_probe_complete
+        if arch is not None:
+            # Every union route of this (architecture, world size, dtype) was launched.
+            expected_routes = {
+                key
+                for key in union.ROUTES
+                if key[:3] == (arch, world_size, _DTYPE_NAME[dtype])
+            }
+            assert routes_hit == expected_routes, (
+                f"union routes not reached: {sorted(expected_routes - routes_hit)}; "
+                f"unexpected: {sorted(routes_hit - expected_routes)}"
+            )
         dist.barrier(group=group)
     finally:
         if ipc_handles is not None:

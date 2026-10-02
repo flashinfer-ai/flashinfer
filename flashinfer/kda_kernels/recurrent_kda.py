@@ -207,7 +207,7 @@ def _t1_fast_path_mode(
         or not output.is_contiguous()
     ):
         return None
-    if get_compute_capability(q.device) != (10, 0):
+    if get_compute_capability(q.device) not in ((10, 0), (10, 3), (10, 7)):
         return None
     if not is_cuda_version_at_least("12.8"):
         return None
@@ -1301,6 +1301,22 @@ def _tensors_overlap(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     return lhs_begin < rhs_end and rhs_begin < lhs_end
 
 
+@functools.cache
+def _device_multi_processor_count(device_index: int) -> int:
+    """Return the SM count of one CUDA device, queried once per process."""
+
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _multi_processor_count(device) -> int:
+    """Resolve ``device`` to an index before reading the cached SM count."""
+
+    index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    return _device_multi_processor_count(index)
+
+
 def _select_flash_kda_decode_value_split_current(
     num_tokens: int, work: int, sm_count: int
 ) -> int:
@@ -1652,7 +1668,7 @@ def _select_flash_kda_decode_variant(
         return "d128_t3_lower_bound_split4"
 
     work = num_sequences * num_value_heads
-    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    sm_count = _multi_processor_count(q.device)
     if is_t1_unbounded_softplus:
         return _select_cake_kda_unbounded_softplus_t1_variant(work, sm_count)
     value_split = _select_flash_kda_decode_value_split(num_tokens, work, sm_count, arch)
@@ -1751,10 +1767,7 @@ def _run_flash_kda_decode(
         float(lower_bound),
     )
     stream = int(torch.cuda.current_stream(q.device).cuda_stream)
-    if variant in CAKE_KDA_DECODE_DIRECT_VARIANTS:
-        module.run(*common_args, int(beta_is_logit), stream)
-    else:
-        module.run(*common_args, stream)
+    module.run(*common_args, int(beta_is_logit), stream)
 
 
 def run_recurrent_kda(

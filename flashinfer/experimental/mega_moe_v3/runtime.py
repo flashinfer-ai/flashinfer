@@ -32,6 +32,14 @@ def device_arch(device):
     return arch
 
 
+@functools.cache
+def device_sm_count(device_index):
+    """Physical SM count of ``cuda:device_index`` (queried once per process)."""
+    import torch
+
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 def supported_num_sms(arch):
     """SM counts with catalogued routes for ``arch``."""
     routes = _catalog()["arches"][arch]["routes"].values()
@@ -44,13 +52,13 @@ def _nvcc_flags(arch):
     return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
 
 
-@functools.cache
-def load_program(arch, name):
+def jit_spec(arch, name):
+    """JIT spec of catalogued program ``name`` for ``arch`` (not built)."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
 
     record = _catalog()["arches"][arch]["programs"][name]
-    spec = gen_jit_spec(
+    return gen_jit_spec(
         name=name,
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
@@ -64,6 +72,12 @@ def load_program(arch, name):
         extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
         use_fast_math=False,
     )
+
+
+@functools.cache
+def load_program(arch, name):
+    spec = jit_spec(arch, name)
+    record = _catalog()["arches"][arch]["programs"][name]
     return spec.build_and_load(), {
         **record,
         "library_path": str(spec.get_library_path()),
@@ -108,7 +122,7 @@ def _route_arch(route, device):
     import torch
 
     arch = device_arch(device)
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    sms = device_sm_count(torch.device(device).index)
     if sms != route["num_sms"]:
         raise RuntimeError(
             f"The exported {arch} {route['metadata']['surface']} schedule was generated "
@@ -157,23 +171,21 @@ class _Stage:
 
 
 class V3Plan:
-    """Retain operands/workspaces; submit the original reset/repack and compute scope.
+    """Retain operands/workspaces; submit the compute scope of one catalog route.
 
-    A route whose catalog metadata declares ``self_cleaning`` launches exactly one
-    kernel per run(): the kernel zeroes its per-launch workspace words before it
+    Every exported pipeline route is self-cleaning: it launches exactly one
+    kernel per run(), the kernel zeroes its per-launch workspace words before it
     exits and its grid gates are phase-toggling words that no host code resets.
     Such a plan zeroes the caller's counter workspace once, when it is bound
     (never inside run(), so a captured run() holds only the kernel node), and
     rejects reset(). ``self_cleaning`` reports which contract applies.
 
-    Every other route keeps its host resets inside run(): full pipeline model
-    routes zero one original contiguous reset tensor; smoke routes zero their
-    original seven counters. Grouped fused zeroes L1 arrivals. Grouped L2
-    repacks both scale tensors on every invocation before GEMM. run() owns no
-    CUDA graph; callers may capture it after binding. The source comparison's
-    prepared callable has the same workload and is retained by the private
-    fixture. Never time only launch_without_reset for full/fused routes that
-    are not self-cleaning.
+    Grouped fused keeps its host reset inside run(): it zeroes the L1 arrival
+    words before the kernel. Grouped L2 repacks both scale tensors into the
+    group-folded layout once at preparation (and again on ``update_scales()``),
+    so run() launches only the clustered GEMM. run() owns no CUDA graph;
+    callers may capture it after binding. Never time only
+    launch_without_reset for a fused route.
     """
 
     def __init__(
@@ -184,6 +196,7 @@ class V3Plan:
         *,
         reset_storage=None,
         reset_buffers=(),
+        preparation=(),
         owners=(),
     ):
         import torch
@@ -200,21 +213,28 @@ class V3Plan:
         # Declared per architecture by the exported catalog route; absent means
         # the original host-reset lifecycle.
         self.self_cleaning = bool(route["metadata"].get("self_cleaning", False))
-        self.stages = tuple(
-            _Stage(self.arch, s["program"], stage_bindings[s["name"]])
+        stages = {
+            s["name"]: _Stage(self.arch, s["program"], stage_bindings[s["name"]])
             for s in route["stages"]
+        }
+        self.preparation_stages = tuple(stages[name] for name in preparation)
+        self.stages = tuple(
+            stage for name, stage in stages.items() if name not in preparation
         )
         self.owners = owners
+        if torch.cuda.is_current_stream_capturing() and (
+            self.self_cleaning or self.preparation_stages
+        ):
+            # One-time work (counter zero, scale repack) must not become a
+            # graph node: the kernel keeps the words clean afterwards and the
+            # repacked scales are reused by every later launch.
+            raise RuntimeError(
+                "Binding a MegaMoE plan during CUDA stream capture is "
+                "unsupported; bind (and warm up) before capturing run()"
+            )
         if self.self_cleaning:
-            # One-time zero of the counter workspace, stream-ordered before this
-            # plan's first launch. It must not become a graph node: the kernel
-            # keeps the words clean and the gate phase bits consistent afterwards.
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "Binding a self-cleaning MegaMoE plan during CUDA stream "
-                    "capture is unsupported; bind (and warm up) before capturing run()"
-                )
             self._zero_workspace()
+        self.update_scales()
 
     def _zero_workspace(self):
         if self.reset_storage is not None:
@@ -231,6 +251,12 @@ class V3Plan:
                 "do not reset them on the host"
             )
         self._zero_workspace()
+
+    def update_scales(self):
+        """Re-run the route's preparation stages (grouped L2: the scale repack)
+        after the caller changed the natural-layout scale words in place."""
+        for stage in self.preparation_stages:
+            stage.run()
 
     def launch_without_reset(self):
         for stage in self.stages:
@@ -251,6 +277,7 @@ def bind_prepared(
     *,
     reset_storage=None,
     reset_buffers=(),
+    preparation=(),
     owners=(),
 ):
     """Bind explicit packed tensors to a catalog route with its original lifecycle.
@@ -258,7 +285,9 @@ def bind_prepared(
     ``reset_storage``/``reset_buffers`` are the route's counter words. A
     self-cleaning route zeroes them once here (outside any stream capture) and
     never again; the workspace may already have been used by another plan of
-    the same route as long as no launch is in flight on it.
+    the same route as long as no launch is in flight on it. ``preparation``
+    names the route stages that run at bind time (and on ``update_scales()``)
+    instead of inside run().
     """
     import torch
 
@@ -278,6 +307,7 @@ def bind_prepared(
         outputs,
         reset_storage=reset_storage,
         reset_buffers=reset_buffers,
+        preparation=preparation,
         owners=owners,
     )
 
@@ -291,8 +321,8 @@ def prepare_pipeline(inputs):
     and w1_sf/w2_sf (FP32 powers-of-two, granularity32). Gate/up weights are
     logical halves; preparation applies the selected 8-way interleave and
     source-schedule scale permutation. No upstream library is imported. The
-    counter workspace is allocated zeroed; a self-cleaning route never zeroes it
-    again, other routes zero it inside every run().
+    counter workspace is allocated zeroed and the self-cleaning kernel never
+    needs it zeroed again.
     """
     device = inputs["x_fp8_packed"].device
     route = _route(device_arch(device), "pipeline", inputs)
@@ -312,7 +342,7 @@ def prepare_pipeline(inputs):
 def prepare_grouped_l2(
     A, B, SFA, SFB, per_expert_M, *, out=None, packed_a=None, packed_b=None
 ):
-    """Grouped gran32 E4M3 × packed E2M1 -> BF16; scale repack is timed per call."""
+    """Grouped gran32 E4M3 × packed E2M1 -> BF16; scales are repacked at preparation."""
     import torch
 
     e, n, _ = B.shape
@@ -365,6 +395,7 @@ def prepare_grouped_l2(
         args,
         {"scale_layout": repack, "main": main},
         out,
+        preparation=("scale_layout",),
         owners=(A, B, SFA, SFB, packed_a, packed_b),
     )
 

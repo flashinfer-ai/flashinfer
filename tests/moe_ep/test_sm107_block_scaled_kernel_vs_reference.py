@@ -3,9 +3,9 @@
 Drives the vendored ``next_cutedsl_megamoe`` drop's fused inference mega
 kernel (``BlockScaledSwapAbMegaMoeKernel``) through the shim allocator +
 compute entry on ONE Rubin GPU (``MEGA_NO_DIST=1``, world_size 1: every
-"peer" resolves to the local buffer, no NVSHMEM), for BOTH wired quant kinds
-(mxfp8_e4m3 and nvfp4), and compares against the shim's pure-torch reference
-over the SAME staged quantized payloads.
+"peer" resolves to the local buffer, no NVSHMEM), for NVFP4 and MXFP8
+E4M3/E5M2. Layer tests use a reference with canonical weight layouts; direct
+kernel tests use the shim reference over the same staged quantized payloads.
 
 Process isolation: the drop is imported only inside test bodies, this file is
 excluded from ``run_unit``, and runs via ``run_tests.sh oracle_sm107``.
@@ -14,9 +14,9 @@ Direct invocation::
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 python -m pytest \
         tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py -v -m arch_rubin
 
-The torch reference emulates the in-kernel FC2-input requantization but not
-the instruction-exact rcp / E2M1-tie sequences, so comparisons use tolerance
-bands (rel_l2), never bitwise.
+Both references share quantization helpers with preprocessing. Activation
+evaluation, accumulation, and intermediate requantization can round differently
+from the kernel, so output comparisons use relative L2 tolerances.
 """
 
 from __future__ import annotations
@@ -78,8 +78,143 @@ def _single_rank_problem():
     )
 
 
-# The nvfp4 wire is much coarser (4-bit data, per-16 fp8 scales through TWO
-# GEMMs); the mxfp8 band matches the previous GLU-kernel test.
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("early", [True, False])
+@pytest.mark.parametrize(
+    "kind,situ,scaled,prequantized",
+    [(kind, situ, False, True) for kind in QUANT_KINDS for situ in (False, True)]
+    + [(kind, True, False, False) for kind in QUANT_KINDS]
+    + [("nvfp4", situ, True, True) for situ in (False, True)],
+)
+def test_layer_situ_prequantized_weights_and_scaling(
+    monkeypatch, kind, situ, scaled, prequantized, early
+):
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        PrequantizedMoEWeights,
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from tests.moe_ep.sm107_test_utils import (
+        assert_reference,
+        canonical_reference,
+        quantize,
+        weight_pack,
+    )
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    _require_cuda()
+    p = _single_rank_problem()
+    pack, input_norm, scalars = weight_pack(p["w13"], p["w2"], kind, scaled=scaled)
+    if prequantized and situ and early:
+
+        def offset_copy(value):
+            raw = torch.empty(value.numel() + 1, device=value.device, dtype=torch.uint8)
+            view = raw[1:].reshape(value.shape)
+            view.copy_(value.view(torch.uint8))
+            return view.view(value.dtype)
+
+        pack = PrequantizedMoEWeights(
+            *(
+                offset_copy(getattr(pack, name))
+                for name in ("w13", "w2", "w13_scale", "w2_scale")
+            )
+        )
+    kwargs = dict(
+        intermediate_size=p["intermediate"], top_k=p["top_k"], apply_topk_in_fc1=early
+    )
+    if situ:
+        kwargs.update(activation="situ", situ_beta=1.25, situ_linear_beta=0.75)
+    if kind == "nvfp4":
+        cfg = Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            **kwargs, input_norm_const=input_norm, **scalars
+        )
+    else:
+        cfg = Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(**kwargs, kind=kind)
+    xq, xsf = quantize(p["x"], kind, input_norm)
+    reference = canonical_reference(
+        xq,
+        xsf,
+        p["topk_ids"],
+        p["topk_weights"],
+        pack,
+        kind,
+        situ=situ,
+        early=early,
+        scalars=scalars,
+    )
+    layers = []
+    try:
+        for prequantized_input in (False, True):
+            layer = MoEEpLayer(
+                bootstrap=BootstrapConfig(rank=0, world_size=1, auto_bootstrap=False),
+                fleet_params=FleetParams(
+                    num_experts=p["num_experts"],
+                    max_tokens_per_rank=p["max_tokens"],
+                    token_hidden_size=p["hidden"],
+                ),
+                weights=pack if prequantized else MoEWeightPack(p["w13"], p["w2"]),
+                backend=MegaConfig(
+                    megakernel=cfg, quantize_input=not prequantized_input
+                ),
+            )
+            layers.append(layer)
+            t = MoEEpTensors(
+                xq if prequantized_input else p["x"],
+                p["topk_ids"],
+                p["topk_weights"],
+                scales=xsf if prequantized_input else None,
+            )
+            assert_reference(layer.forward(t), reference, kind)
+            if scaled:
+                # Per-call override, then omission: neither cached bindings nor
+                # pooled scalar storage may retain the preceding override.
+                t.fc2_alpha = scalars["fc2_alpha"] * 0.6
+                overridden = canonical_reference(
+                    xq,
+                    xsf,
+                    p["topk_ids"],
+                    p["topk_weights"],
+                    pack,
+                    kind,
+                    situ=situ,
+                    early=early,
+                    scalars=scalars | {"fc2_alpha": t.fc2_alpha},
+                )
+                assert_reference(layer.forward(t), overridden, kind)
+                t.fc2_alpha = None
+                assert_reference(layer.forward(t), reference, kind)
+        assert layers[0]._workspace is layers[1]._workspace
+        if scaled and situ and early:
+            from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+                autotune_sm107_block_scaled_mega_moe,
+            )
+
+            # A real tuning trial must use the staged non-unit scalars and
+            # compare against the SiTU oracle before accepting a candidate.
+            monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+            tuned = torch.empty_like(reference)
+            winner = autotune_sm107_block_scaled_mega_moe(
+                tuned,
+                *layers[-1]._get_transformed_weights(),
+                layers[-1]._workspace,
+                candidates=[{}],
+                warmup_iters=1,
+                timed_iters=1,
+            )
+            assert winner == {}
+            assert_reference(tuned, reference, kind)
+    finally:
+        for layer in layers:
+            layer.destroy()
+
+
+# Relative L2 limits for kernel vs Torch outputs, not per-element error bounds.
 _REL_L2_BAND = {"mxfp8_e4m3": 0.02, "mxfp8_e5m2": 0.02, "nvfp4": 0.06}
 
 
