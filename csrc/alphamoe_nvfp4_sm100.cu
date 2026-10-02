@@ -35003,12 +35003,6 @@ __device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count
 }
 
 
-union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
-};
-
-
 extern "C" {
 
 __global__ __launch_bounds__(192, 1) void
@@ -35853,12 +35847,6 @@ __device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count
     asm volatile("mbarrier.init.b64 [%0], %1;"
         :: "l"(mbar_addr), "r"(count) : "memory");
 }
-
-
-union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
-};
 
 
 extern "C" {

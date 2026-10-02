@@ -475,13 +475,6 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int p
     return token;
 }
 
-__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
-}
-
 __device__ __forceinline__ void tmem_ld_x32(float* dst, int tmem_addr) {
     asm volatile(
         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
