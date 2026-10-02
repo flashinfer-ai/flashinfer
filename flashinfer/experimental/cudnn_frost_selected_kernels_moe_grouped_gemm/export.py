@@ -16,11 +16,6 @@ from typing import Any
 from .activations import ACTIVATIONS, is_gated
 
 
-# Launch-ABI version of new exports. v2 passes first_token_offset as G+1
-# explicit group boundaries; v1 sources inferred the final endpoint from S.
-ABI_VERSION = "v2"
-
-
 def _slug(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value)
 
@@ -117,20 +112,15 @@ def _build_graph(
         )
         return graph.mul(a=tensor, b=alpha, name=f"apply_{name}")
 
-    def boundaries():
-        # G+1 explicit boundaries: group g spans [offset[g], offset[g+1]).
-        # cuDNN Frost no longer infers the final endpoint from the token count.
-        return graph.tensor(
+    token = dequantize(token, "token_scale", token=True)
+    gate = dequantize(gate, "gate_weight_scale")
+    if op == "grouped_gemm2":
+        offsets = graph.tensor(
             name="first_token_offset",
             dim=[groups + 1, 1, 1],
             stride=[1, 1, 1],
             data_type=cudnn.data_type.INT32,
         )
-
-    token = dequantize(token, "token_scale", token=True)
-    gate = dequantize(gate, "gate_weight_scale")
-    if op == "grouped_gemm2":
-        offsets = boundaries()
         output = graph.moe_grouped_matmul(
             token,
             gate,
@@ -152,7 +142,12 @@ def _build_graph(
         data_type=weight_type,
     )
     up = dequantize(up, "up_weight_scale")
-    offsets = boundaries()
+    offsets = graph.tensor(
+        name="first_token_offset",
+        dim=[groups + 1, 1, 1],
+        stride=[1, 1, 1],
+        data_type=cudnn.data_type.INT32,
+    )
     scale = graph.tensor(
         name="scale",
         dim=[1, 1, 1],
@@ -384,6 +379,7 @@ def _export_source(
     output_dir: Path,
     artifact_id: str,
     *,
+    arch: str,
     replace: bool = False,
     template_family: str | None = None,
     swap_ab: bool = False,
@@ -405,11 +401,12 @@ def _export_source(
                 "quantized TMA source templates require a 32-element epilogue"
             )
     digest = hashlib.sha256(source.encode()).hexdigest()
-    # One maintained implementation per family. A producer upgrade replaces the
-    # family explicitly; it must not silently add another historical template.
+    # One maintained implementation per architecture and family. A producer
+    # upgrade explicitly replaces that template instead of adding a historical copy.
     name = _slug(artifact_id if template_family is None else template_family)
-    if "cudnn_frost_" not in name:
+    if not name.startswith("cudnn_frost_"):
         name = f"cudnn_frost_{name}"
+    name = f"{arch_tag(arch)}_{name}"
     path = output_dir / "sources" / f"{name}.py"
     record: dict[str, Any] = {
         "path": path.relative_to(output_dir).as_posix(),
@@ -558,11 +555,9 @@ def _export_compiled(args, compiled, config, arch):
         )
     template = _select_template(compiled.chain, config, args.cta_group, args.scheduler)
     prefix = op if dtype == "bf16" else f"block_scale_{op}"
-    # Kernel names are <arch>_cudnn_frost_<op>...: every architecture's
-    # families share one dtype directory.
-    producer = f"{arch_tag(arch)}_cudnn_frost"
+    # Artifact ids lead with the architecture, like their source templates.
     artifact_id = args.id or _slug(
-        f"{producer}_{prefix}_e{args.experts}_n{args.n}_k{args.k}_"
+        f"{arch_tag(arch)}_cudnn_frost_{prefix}_e{args.experts}_n{args.n}_k{args.k}_"
         f"g{args.groups}_{config.name}_{args.cta_group}cta_{args.scheduler}_"
         f"{actual_store_mode}{'_quantized' if quantize_output else ''}"
     )
@@ -571,8 +566,9 @@ def _export_compiled(args, compiled, config, arch):
         Path(compiled.generated_path),
         output_dir,
         artifact_id,
+        arch=arch,
         replace=args.replace,
-        template_family=f"{producer}_{op}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
+        template_family=f"{op}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
         swap_ab=swap_ab,
     )
     tma_slots: frozenset[int] = getattr(compiled, "tma_slots", frozenset())
@@ -608,7 +604,7 @@ def _export_compiled(args, compiled, config, arch):
         "id": artifact_id,
         "op": prefix,
         "arch": arch,
-        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}_{ABI_VERSION}",
+        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}_v2",
         "source": source,
         "workspace_bytes": int(compiled.workspace_bytes),
         "launch": {"tail": launch_tail},

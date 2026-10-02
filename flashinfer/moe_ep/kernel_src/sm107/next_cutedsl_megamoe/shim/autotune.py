@@ -225,6 +225,9 @@ def autotune_sm107_block_scaled_mega_moe(
         trial.x_sf.view(torch.uint8).copy_(symm_buffer.x_sf.view(torch.uint8))
         trial.topk_idx.copy_(symm_buffer.topk_idx)
         trial.topk_weights.copy_(symm_buffer.topk_weights)
+        if cfg.quant_kind == "nvfp4":
+            for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+                getattr(trial, name).copy_(getattr(symm_buffer, name))
         trial.note_staged_tokens(num_tokens)
         barrier()
         for _ in range(warmup_iters):
@@ -299,6 +302,10 @@ def autotune_sm107_block_scaled_mega_moe(
                 for k in candidates
             ),
             apply_topk_at_fc1=cfg.apply_topk_at_fc1,
+            activation=cfg.activation,
+            situ_beta=cfg.situ_beta,
+            situ_linear_beta=cfg.situ_linear_beta,
+            gate_up_clamp=cfg.gate_up_clamp,
         )
         for score, error, knobs in zip(scores, errors, candidates, strict=False):
             print(

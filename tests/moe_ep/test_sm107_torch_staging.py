@@ -181,6 +181,8 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     )
     ws.topk_idx = torch.zeros(4, 2, device="cuda", dtype=torch.int32)
     ws.topk_weights = torch.ones(4, 2, device="cuda")
+    for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+        setattr(ws, name, torch.ones(4, device="cuda") if kind == "nvfp4" else None)
     ws.output_activation = torch.empty(4, 128, device="cuda", dtype=torch.bfloat16)
     ws.shared_workspace = torch.zeros(4096, device="cuda", dtype=torch.uint8)
     ws.local_workspace = torch.zeros_like(ws.shared_workspace)

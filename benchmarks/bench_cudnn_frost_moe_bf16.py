@@ -875,7 +875,6 @@ def sweep(args, file):
             order = ids.flatten().argsort()
             grouped = x[order // topk].contiguous()
             counts = torch.bincount(ids.flatten().long(), minlength=e)
-            # G+1 explicit group boundaries, ending at the routed row count.
             offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0))).int()
             offsets_cpu = offsets.tolist()
             emit(file, dict(kind="inputs", **case, offsets=offsets_cpu))

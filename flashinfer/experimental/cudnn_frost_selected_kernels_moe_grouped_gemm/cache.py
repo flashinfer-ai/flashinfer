@@ -35,8 +35,6 @@ class LRUCache(OrderedDict):
         super().__setitem__(key, value)
         self.move_to_end(key)
         if len(self) > self.maxsize:
-            # Not popitem(): CPython 3.10 pops a subclass item through the
-            # refreshing __getitem__ above, after unlinking its order node.
             del self[next(iter(self))]
 
 

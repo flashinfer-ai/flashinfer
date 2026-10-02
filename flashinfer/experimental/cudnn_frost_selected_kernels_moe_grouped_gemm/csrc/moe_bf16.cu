@@ -38,7 +38,7 @@ __global__ void prefix(const int32_t* counts, int32_t* offsets, int32_t* cursors
     offsets[e] = cursors[e] = start;
     start += counts[e];
   }
-  offsets[experts] = start;  // G+1 explicit boundaries end at the routed row count.
+  offsets[experts] = start;
   scale[0] = 1.f;
   scale[1] = 4.f;
   scale[2] = 25.f;
@@ -66,7 +66,6 @@ __global__ void gather(const __nv_bfloat16* x, const int32_t* ids, int32_t* curs
 
 // Small batches prepare group metadata and materialize rows in one launch.
 // Each CTA computes a stable destination, independently of CTA scheduling.
-// CTA r <= experts also writes boundary r; CTA `experts` counts every row.
 __global__ void route_small(const __nv_bfloat16* x, const int32_t* ids, int32_t* offsets,
                             int32_t* mapping, __nv_bfloat16* grouped, float* scale, int rows,
                             int hidden, int topk, int experts) {
@@ -96,8 +95,9 @@ __global__ void route_small(const __nv_bfloat16* x, const int32_t* ids, int32_t*
   if (threadIdx.x == 0) {
     destination = partial[0][0] + partial[0][1] + partial[0][2] + partial[0][3];
     if (active) mapping[r] = destination;
-    if (r <= experts) offsets[r] = partial[1][0] + partial[1][1] + partial[1][2] + partial[1][3];
+    if (r < experts) offsets[r] = partial[1][0] + partial[1][1] + partial[1][2] + partial[1][3];
     if (r == 0) {
+      offsets[experts] = rows;
       scale[0] = 1.f;
       scale[1] = 4.f;
       scale[2] = 25.f;
@@ -259,7 +259,7 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     auto scratch = reinterpret_cast<int64_t*>(base + scratch_pos_);
     auto expert_ids = static_cast<int32_t*>(ids.data_ptr());
     if (s_ <= 512 && e_ <= 256) {
-      route_small<<<std::max(s_, e_ + 1), 128, 0, stream>>>(
+      route_small<<<std::max(s_, e_), 128, 0, stream>>>(
           static_cast<const __nv_bfloat16*>(x.data_ptr()), expert_ids, offsets, mapping, gx, scale,
           s_, h_, k_, e_);
     } else {

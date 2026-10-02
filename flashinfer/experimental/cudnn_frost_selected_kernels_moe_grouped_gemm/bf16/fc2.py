@@ -16,7 +16,6 @@ from typing import Any
 import torch
 
 from .runtime import (
-    _ABI_VERSIONS,
     _arch_for,
     _artifact_roots,
     _current_custream,
@@ -70,7 +69,7 @@ def discover(roots: tuple[Path, ...] | None = None) -> tuple[Fc2Kernel, ...]:
             if not isinstance(identity, str) or not identity or identity in seen:
                 raise RuntimeError("FC2 artifact ids must be non-empty and unique")
             seen.add(identity)
-            _validate_abi(raw, "grouped_gemm2", _ABI_VERSIONS)
+            _validate_abi(raw, "grouped_gemm2")
             if raw.get("launch") != {"tail": ["output"]}:
                 raise RuntimeError(f"unsupported FC2 ABI: {identity}")
             source_path, digest = _read_source(root, raw)
@@ -88,7 +87,7 @@ def discover(roots: tuple[Path, ...] | None = None) -> tuple[Fc2Kernel, ...]:
                 or contract.get("activation") != "identity"
             ):
                 raise RuntimeError(
-                    "FC2 v1 requires BF16 inputs/output and identity activation"
+                    "FC2 v2 requires BF16 inputs/output and identity activation"
                 )
             result.append(
                 Fc2Kernel(
@@ -122,11 +121,10 @@ def matching_kernels(
 class PreparedFc2:
     """Bind caller-owned tensors outside capture, then launch without allocation.
 
-    Offsets are int32[E+1] group boundaries: they start at zero, are
-    nondecreasing and end at most at S; output rows past the final boundary
-    are unspecified. Empty experts are allowed. Callers may change tensor
-    contents between runs, but must preserve valid offsets and keep this plan
-    alive for graphs. Each concurrent stream needs its own workspace/plan.
+    Offsets are int32[E+1], start at zero, are nondecreasing, and explicitly
+    end at or before S. Empty experts are allowed. Callers may change tensor contents between
+    runs, but must preserve valid offsets and keep this plan alive for graphs.
+    Each concurrent stream needs its own workspace/plan.
     """
 
     def __init__(
@@ -177,13 +175,13 @@ class PreparedFc2:
             raise ValueError("FC2 requires aligned workspace (128B) and data (16B)")
         if len({t.untyped_storage().data_ptr() for t in tensors}) != len(tensors):
             raise ValueError("FC2 input, output and workspace storage must be distinct")
-        bounds = (
+        starts = (
             offsets.tolist()
         )  # Preparation only; never read device offsets at launch.
         if (
-            bounds[0] != 0
-            or any(a > b for a, b in zip(bounds[:-1], bounds[1:], strict=True))
-            or bounds[-1] > s
+            starts[0] != 0
+            or any(a > b for a, b in zip(starts[:-1], starts[1:], strict=True))
+            or starts[-1] > s
         ):
             raise ValueError("FC2 offsets must start at zero and increase within [0,S]")
         self.kernel = kernel

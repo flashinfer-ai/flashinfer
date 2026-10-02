@@ -34,11 +34,6 @@ from ..runtime import (
 
 _artifact_cache_version = 0
 
-# Every BF16 launch passes first_token_offset as G+1 explicit boundaries (v2).
-# v1 sources (SM107, until re-exported) read only the G starts and end the last
-# group at S; rows past the final boundary are unspecified for both versions.
-_ABI_VERSIONS = ("v1", "v2")
-
 
 @dataclass(frozen=True)
 class CudnnFrostGroupedGemm1Kernel:
@@ -103,7 +98,7 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
         activation = contract_activation(raw.get("contract", {}))
         if activation not in ACTIVATIONS or op != f"grouped_gemm1_{activation}":
             raise RuntimeError(f"Invalid FC1 activation contract: {artifact_id}")
-        _validate_abi(raw, op, _ABI_VERSIONS)
+        _validate_abi(raw, op)
         source_path, actual = _read_source(root, raw)
         workspace_bytes = int(raw.get("workspace_bytes", -1))
         if workspace_bytes < 0 or workspace_bytes % 128:
@@ -182,9 +177,9 @@ def _validate_common(
     if first_token_offset.ndim != 1 or first_token_offset.dtype != torch.int32:
         raise ValueError("first_token_offset must be a one-dimensional int32 tensor")
     groups = int(first_token_offset.numel()) - 1
-    if groups < 1:
+    if groups < 1 or e < 1 or groups % e:
         raise ValueError(
-            "first_token_offset must contain G+1 group boundaries, with G >= 1"
+            "first_token_offset must contain G+1 boundaries for a positive multiple of E groups"
         )
     if scale.dtype != torch.float32 or scale.numel() != 1:
         raise ValueError("scale must contain one float32 value")
@@ -204,7 +199,7 @@ def _validate_common(
     if any(not t.is_contiguous() for t in tensors):
         raise ValueError("all grouped GEMM1 tensors must be contiguous")
     if any(t.dtype != torch.bfloat16 for t in tensors[:3]):
-        raise ValueError("the v1 grouped GEMM1 ABI requires BF16 tokens and weights")
+        raise ValueError("the v2 grouped GEMM1 ABI requires BF16 tokens and weights")
     return s, n, k, e, groups
 
 
