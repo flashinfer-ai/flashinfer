@@ -308,6 +308,32 @@ def test_all_invalid_rows(h_q, dtype):
     ref._assert_close(got, inputs.reference_rows(), dtype)
 
 
+@pytest.mark.parametrize(
+    "h_q,dtype",
+    [
+        pytest.param(64, torch.bfloat16, id="bf16-h64-prefill"),
+        pytest.param(32, torch.float8_e4m3fn, id="fp8-h32-prefill"),
+    ],
+)
+def test_same_workspace_serves_different_kv_caches(h_q, dtype):
+    """Two calls with one workspace but different KV caches (consecutive layers).
+
+    The prefill routes of these shapes (``bf16_h64_prefill``,
+    ``fp8_lowhead_prefill``) are the ones whose SM103 bindings read their TMA
+    descriptors from the workspace slab; the slab must follow the call, not the
+    first descriptors uploaded for that workspace.
+    """
+    _skip_unless_cake_gpu()
+    first = _Inputs(*_make_case(h_q, dtype, 257, varlen=True))
+    second = _Inputs(*_make_case(h_q, dtype, 257, varlen=True))
+    workspace = _workspace(first)
+    for inputs in (first, second, first):
+        out = _out_like(inputs)
+        inputs.run(out=out, workspace=workspace)
+        torch.cuda.synchronize()
+        ref._assert_close(_rows(out, inputs), inputs.reference_rows(), dtype)
+
+
 @pytest.mark.parametrize("h_q,dtype,s_q", _CASES)
 def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
     """Capture once, mutate every input in place, replay: equals eager; no allocation."""
