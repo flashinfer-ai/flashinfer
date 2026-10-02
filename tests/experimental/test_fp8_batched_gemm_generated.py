@@ -51,7 +51,11 @@ def test_projection_values_scales_current_stream_graph(tokens, fp8, alpha):
     aq, bq, asf, bsf = _operands(tokens)
     plan = prepare_fp8_batched_gemm((aq, asf), (bq, bsf), output_fp8=fp8, alpha=alpha)
     expected_route = _runtime.route_config(
-        tokens, 8, inner, 1024, torch.cuda.get_device_properties(0).multi_processor_count,
+        tokens,
+        8,
+        inner,
+        1024,
+        torch.cuda.get_device_properties(0).multi_processor_count,
         "fp8" if fp8 else "alpha" if alpha is not None else "bf16",
     )
     assert plan.config == expected_route
@@ -113,7 +117,9 @@ def test_projection_values_scales_current_stream_graph(tokens, fp8, alpha):
 def test_unexported_schedule_raises_at_preparation(tokens, fp8, alpha):
     _skip_unless_exported()
     aq, bq, asf, bsf = _operands(tokens)
-    with pytest.raises(NotImplementedError, match="general schedule .* is not exported"):
+    with pytest.raises(
+        NotImplementedError, match="general schedule .* is not exported"
+    ):
         prepare_fp8_batched_gemm((aq, asf), (bq, bsf), output_fp8=fp8, alpha=alpha)
 
 

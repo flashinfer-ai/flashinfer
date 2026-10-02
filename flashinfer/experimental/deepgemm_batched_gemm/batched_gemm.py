@@ -174,7 +174,9 @@ def device_arch(device):
     import torch
 
     device = torch.device(device)
-    catalogued = sorted({arch for record in PROGRAMS.values() for arch in record["arches"]})
+    catalogued = sorted(
+        {arch for record in PROGRAMS.values() for arch in record["arches"]}
+    )
     if device.type != "cuda":
         raise RuntimeError("Batched FP8 projection requires a CUDA device")
     capability = tuple(torch.cuda.get_device_capability(device))
@@ -204,20 +206,34 @@ def _source_layout(tokens, num_heads, inner, width, num_sms):
         return None
     best_key, best_layout = None, None
     for swap_ab in (False, True):
-        block_ms = range(16, 257, 16) if swap_ab else (32 if tokens <= 32 else 64 if tokens <= 64 else 128,)
+        block_ms = (
+            range(16, 257, 16)
+            if swap_ab
+            else (32 if tokens <= 32 else 64 if tokens <= 64 else 128,)
+        )
         block_ns = (128,) if swap_ab else (16, *range(32, 257, 32))
         for cluster_m in (1, 2):
             if swap_ab and cluster_m == 2:
                 continue
             for cluster_n in (1, 2):
                 cluster_size = cluster_m * cluster_n
-                if cluster_size > 2 or (not swap_ab and cluster_n == 2) or num_sms % cluster_size:
+                if (
+                    cluster_size > 2
+                    or (not swap_ab and cluster_n == 2)
+                    or num_sms % cluster_size
+                ):
                     continue
                 for block_m in block_ms:
-                    if block_m // cluster_n % 8 or ((tokens + block_m - 1) // block_m) % cluster_m:
+                    if (
+                        block_m // cluster_n % 8
+                        or ((tokens + block_m - 1) // block_m) % cluster_m
+                    ):
                         continue
                     for block_n in block_ns:
-                        if block_n // cluster_m % 8 or ((width + block_n - 1) // block_n) % cluster_n:
+                        if (
+                            block_n // cluster_m % 8
+                            or ((width + block_n - 1) // block_n) % cluster_n
+                        ):
                             continue
                         sf_cols = ((block_m + 127) // 128 + (block_n + 127) // 128) * 4
                         if (block_m if swap_ab else block_n) + sf_cols > 512:
@@ -225,26 +241,51 @@ def _source_layout(tokens, num_heads, inner, width, num_sms):
                         store_n = (
                             128
                             if swap_ab
-                            else next(value for value in (128, 64, 32, 16) if block_n % value == 0)
+                            else next(
+                                value
+                                for value in (128, 64, 32, 16)
+                                if block_n % value == 0
+                            )
                         )
                         if store_n % 32:
                             continue
                         blocks = (
-                            ((tokens + block_m - 1) // block_m) * ((width + block_n - 1) // block_n) * num_heads
+                            ((tokens + block_m - 1) // block_m)
+                            * ((width + block_n - 1) // block_n)
+                            * num_heads
                         )
                         waves = (blocks + num_sms - 1) // num_sms
                         utilization = blocks % num_sms or num_sms
-                        key = (waves != 1, -cluster_size, waves, -utilization, block_m + block_n, block_m * block_n)
+                        key = (
+                            waves != 1,
+                            -cluster_size,
+                            waves,
+                            -utilization,
+                            block_m + block_n,
+                            block_m * block_n,
+                        )
                         if best_key is None or key < best_key:
                             best_key = key
-                            best_layout = (swap_ab, block_m, block_n, cluster_m, cluster_n)
-    if best_layout not in ((False, 128, 256, 2, 1), (True, 16, 128, 1, 2), (True, 64, 128, 1, 2)):
+                            best_layout = (
+                                swap_ab,
+                                block_m,
+                                block_n,
+                                cluster_m,
+                                cluster_n,
+                            )
+    if best_layout not in (
+        (False, 128, 256, 2, 1),
+        (True, 16, 128, 1, 2),
+        (True, 64, 128, 1, 2),
+    ):
         return None
     swap_ab, block_m, block_n, cluster_m, cluster_n = best_layout
     smem_cd = (16 * block_n if swap_ab else min(128, block_m) * 128) * 2
     smem_extra = smem_cd + 32 * 8 * 3 + 2 * 8 * 3 + 8 + 4
     smem_per_stage = (block_m // cluster_n + block_n // cluster_m) * 128
-    smem_per_stage += (((block_m + 127) // 128 + (block_n + 127) // 128) * 128) * 128 // 32
+    smem_per_stage += (
+        (((block_m + 127) // 128 + (block_n + 127) // 128) * 128) * 128 // 32
+    )
     stages = min((232448 - smem_extra) // smem_per_stage, 32)
     return swap_ab, block_m, block_n, stages
 
@@ -371,7 +412,8 @@ class BatchedGemmPlan:
     ):
         import torch
 
-        del descriptor_workspace  # accepted for signature stability; tensor maps travel by value
+        # accepted for signature stability; tensor maps travel by value
+        del descriptor_workspace
 
         aq, asf = a
         bq, bsf = b
