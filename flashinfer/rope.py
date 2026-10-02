@@ -36,6 +36,9 @@ from .trace.templates.rope import (
     rope_quantize_fp8_trace,
 )
 from .jit.rope import gen_rope_module
+from .cake_fused_qk_rope_append import (  # noqa: F401  (re-exported Cake fused route)
+    cake_fused_qk_rmsnorm_rope_append_paged_kv_cache,
+)
 from .utils import register_custom_op, register_fake_op
 
 
