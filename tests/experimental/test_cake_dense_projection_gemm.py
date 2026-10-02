@@ -741,7 +741,9 @@ def test_epilogue_rules():
             "dense_proj_gemm_kn_n256_g8_q",
         ),
         (
-            dict(a_mn=False, b_mn=True, group_m=8, stages=6, epi="reg", quad_store=True),
+            dict(
+                a_mn=False, b_mn=True, group_m=8, stages=6, epi="reg", quad_store=True
+            ),
             "dense_proj_gemm_kn_n256_g8_q_s6",
         ),
         (
@@ -758,11 +760,32 @@ def test_quad_store_knob_normalisation():
     # only the row-major bf16 register epilogue carries the quad-store knob: fp32 output, the TMA-store
     # epilogue and the transposed store drop it from the key (and the symbol)
     assert instance_key(a_mn=False, b_mn=True, epi="reg", quad_store=True)[16] is True
-    assert instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", quad_store=True)[16] is False
-    assert instance_key(a_mn=False, b_mn=True, epi="tma", slots=1, quad_store=True)[16] is False
-    assert instance_key(a_mn=True, b_mn=True, out_t=True, epi="reg", quad_store=True)[16] is False
-    assert instance_key(a_mn=False, b_mn=True, block_n=128, epi="reg", quad_store=True)[16] is True
-    assert instance_symbol(instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", quad_store=True)) == "dense_proj_gemm_kn_n256_f32"
+    assert (
+        instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", quad_store=True)[
+            16
+        ]
+        is False
+    )
+    assert (
+        instance_key(a_mn=False, b_mn=True, epi="tma", slots=1, quad_store=True)[16]
+        is False
+    )
+    assert (
+        instance_key(a_mn=True, b_mn=True, out_t=True, epi="reg", quad_store=True)[16]
+        is False
+    )
+    assert (
+        instance_key(a_mn=False, b_mn=True, block_n=128, epi="reg", quad_store=True)[16]
+        is True
+    )
+    assert (
+        instance_symbol(
+            instance_key(
+                a_mn=False, b_mn=True, out_f32=True, epi="reg", quad_store=True
+            )
+        )
+        == "dense_proj_gemm_kn_n256_f32"
+    )
 
 
 def test_default_stages_by_tile_shape():

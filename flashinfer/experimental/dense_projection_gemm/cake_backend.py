@@ -433,7 +433,8 @@ def instance_key(
         and (not out_f32)
         and epi == "reg"
         and not out_t
-        and (block_n * 4 // 8) % 64 == 0,  # bf16 row-major register epilogue: quad-transposed 32-byte row segments (round 7)
+        # bf16 row-major register epilogue: quad-transposed 32-byte row segments (round 7)
+        and (block_n * 4 // 8) % 64 == 0,
     )
 
 
