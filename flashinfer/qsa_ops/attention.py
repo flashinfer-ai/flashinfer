@@ -39,11 +39,8 @@ from ..topk import WORKSPACE_ALIGNMENT
 KV_CACHE_FORMATS = ("dense", "fp8_e4m3", "nvfp4")
 
 
-#: The rung a decode step lands on. Decode batches are small and the padding is
-#: masked off, so one rung well under a chunk keeps them off the wide plan.
-_DECODE_BUCKET = 128
-#: What the rungs above it step by. A caller's captured shapes tend to come in
-#: multiples of this, so each gets a rung of its own.
+#: What the rungs above the powers of two step by. A caller's captured shapes
+#: tend to come in multiples of this, so each gets a rung of its own.
 _ROW_GRANULARITY = 1024
 #: What the sizing query is asked with. The plan's size does not depend on it,
 #: and the real one is not known until there is a cache.
@@ -53,18 +50,22 @@ _SIZING_PAGE_SIZE = 16
 def row_buckets(max_rows: int, max_plans: int = 16) -> Tuple[int, ...]:
     """Row counts to keep a plan for, for a caller that may send ``max_rows``.
 
-    A step pads up to one of these and the padding rows are masked off, so a
-    batch whose size moves never replans -- and a batch past the widest rung
-    has no plan at all, so the widest rung is ``max_rows``. A rung costs only
-    its plan's integer workspace: the buffers that scale with rows are shared
-    by every rung.
+    A step pads up to one of these, so a batch whose size moves never replans --
+    and a batch past the widest rung has no plan at all, so the widest rung is
+    ``max_rows``. Padding is not free: a padding row is masked off, but the plan
+    still attends over its whole route, so it costs what a real row does. The
+    rungs are the powers of two and the multiples of the granularity above
+    them, which keep a batch under twice its size -- unless they outnumber
+    ``max_plans`` and the ladder is thinned, which trades that bound for the
+    plan count. A rung costs only its plan's integer workspace: the buffers
+    that scale with rows are shared by every rung.
     """
     if max_rows < 1:
         raise ValueError(f"max_rows must be positive, got {max_rows}")
     if max_plans < 1:
         raise ValueError(f"max_plans must be positive, got {max_plans}")
-    decode = min(_DECODE_BUCKET, max_rows)
-    rungs = {decode, max_rows}
+    rungs = {max_rows}
+    rungs.update(1 << k for k in range(max_rows.bit_length()) if 1 << k < max_rows)
     rungs.update(range(_ROW_GRANULARITY, max_rows, _ROW_GRANULARITY))
     if len(rungs) > max_plans:
         # Thin geometrically rather than dropping the bottom: what a rung is
@@ -72,10 +73,10 @@ def row_buckets(max_rows: int, max_plans: int = 16) -> Tuple[int, ...]:
         # evenly spaced on a log scale bound it evenly. Dropping the low ones
         # would leave a decode batch padded to a chunk.
         steps = max_plans - 1
-        rungs = {decode, max_rows}
+        rungs = {max_rows}
         if steps > 0:
-            ratio = (max_rows / decode) ** (1.0 / steps)
-            rungs.update(round(decode * ratio**step) for step in range(1, steps))
+            ratio = max_rows ** (1.0 / steps)
+            rungs.update(round(ratio**step) for step in range(steps))
     return tuple(sorted(rungs))
 
 

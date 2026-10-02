@@ -27,6 +27,7 @@ import torch
 import flashinfer
 import flashinfer.qsa_ops as qsa
 from flashinfer.qsa_ops import capabilities
+from flashinfer.qsa_ops.attention import row_buckets
 
 from .test_kernels import BF16, DEV, FP8, Z, _capture, _exact, _expand_ref, _need_sm80
 from .test_kernels import INT, _scores_ref
@@ -386,6 +387,18 @@ def test_attention_graphs_replay_together():
         out.zero_()
     _replay_on_streams(graphs[1:])
     _exact([c[1] for c in calls[1:]], [c[2] for c in calls[1:]])
+
+
+@pytest.mark.parametrize(
+    "max_rows,plans,full",
+    [(2048, 16, True), (300, 16, True), (1 << 16, 16, False), (5, 1, False)],
+)
+def test_row_buckets_keep_a_batch_within_twice_its_size(max_rows, plans, full):
+    """A padding row costs what a real one does, so no batch pads to twice itself."""
+    rungs = row_buckets(max_rows, plans)
+    assert len(rungs) <= plans and rungs[-1] == max_rows
+    if full:  # thinned ladders trade the bound for the plan count
+        assert all(min(r for r in rungs if r >= n) < 2 * n for n in range(1, max_rows))
 
 
 _BAD_BUILDS = [
