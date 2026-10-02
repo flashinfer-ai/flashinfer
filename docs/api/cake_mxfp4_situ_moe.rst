@@ -74,7 +74,7 @@ with ``w2_scale`` ``[L, H, I_shard/32]`` (``uint8``).
 
 Rows the plan refuses (``decision.supported`` is ``False``) name the hand-written
 selection that is not built by this chain: the dense grouped-GEMM path above
-``swapab_max_tokens``, the wide 192-row form, the hybrid, mixed and split forms,
+``swapab_max_tokens``, the wide 192-row form, the mixed and split forms,
 the two-stage finalize (MoE-TP rows above 16 tokens) and the generic
 ``moe_sort`` routing above the fused-routing cap.  ``plan`` raises
 ``NotImplementedError`` with that reason.
@@ -147,6 +147,18 @@ not on a contract row).
      - gemm1_swapab
      - cake, cake_cute
      - ``e2e_registry``
+   * - ``gemm1_swapab_situ_n16``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_swapab_situ_n64_rowgroup``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_swapab_situ_n192_2cta_rowgroup``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``e2e_registry``
    * - ``gemm2_dense_finalize_n192``
      - gemm2_dense
      - cake, cake_cute
@@ -175,6 +187,10 @@ not on a contract row).
      - gemm2_dense
      - cake, cake_cute
      - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_rg_early``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
    * - ``gemm1_dense_situ_m128_n256``
      - gemm1_dense
      - cake, cake_cute
@@ -192,6 +208,14 @@ not on a contract row).
      - cake, cake_cute
      - ``e2e_registry``
    * - ``gemm1_dense_situ_m256_n256_2cta_zero_fill_secondary``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n256_rowgroup_early``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n128_rowgroup_early``
      - gemm1_dense
      - cake, cake_cute
      - ``e2e_registry``
@@ -263,10 +287,6 @@ not on a contract row).
      - finalize
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``gemm1_swapab_situ_n16``
-     - gemm1_swapab
-     - cake, cake_cute
-     - ``plan_gate``
    * - ``gemm2_swapab_finalize_n8_m2``
      - gemm2_swapab
      - cake, cake_cute
@@ -279,11 +299,47 @@ not on a contract row).
      - gemm2_swapab
      - cake, cake_cute
      - ``plan_gate``
-   * - ``gemm2_swapab_finalize_n16_k8``
+   * - ``gemm2_swapab_finalize_n32_k8``
      - gemm2_swapab
      - cake, cake_cute
      - ``plan_gate``
-   * - ``gemm2_swapab_finalize_n32_k8``
+   * - ``gemm1_swapab_situ_n8_k8_nodp``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_swapab_situ_n16_nodp``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_swapab_situ_n32_nodp``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm2_swapab_partial_n8_m2_nodp``
+     - gemm2_swapab_partial
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm2_swapab_partial_n16_m2_nodp``
+     - gemm2_swapab_partial
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm2_swapab_partial_n32_m2_nodp``
+     - gemm2_swapab_partial
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_swapab_situ_n16_nol2``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_swapab_situ_n32_nol2``
+     - gemm1_swapab
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm2_swapab_finalize_n16_k8_nol2``
+     - gemm2_swapab
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm2_swapab_finalize_n32_k8_nol2``
      - gemm2_swapab
      - cake, cake_cute
      - ``plan_gate``
@@ -363,15 +419,39 @@ not on a contract row).
      - route_preprocess
      - cake, cake_cute
      - ``plan_gate``
+   * - ``route_preprocess_separate_bf16_noclear``
+     - route_preprocess
+     - cake, cake_cute
+     - ``plan_gate``
    * - ``finalize_top16_split``
      - finalize
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``dispatch_wide_narrow_lists``
+     - dispatch
      - cake, cake_cute
      - ``plan_gate``
    * - ``gemm1_dense_situ_m128_n256_nopdl``
      - gemm1_dense
      - cake, cake_cute
      - ``plan_gate``
+   * - ``gemm1_dense_situ_m128_n256_zero_fill_nopdl``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_dense_situ_m256_n256_2cta_zero_fill_secondary_nopdl``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm2_dense_finalize_n192_c12_nopdl``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``plan_gate``
    * - ``gemm2_dense_finalize_n192_nopdl``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm2_dense_finalize_n256_2cta_nopdl``
      - gemm2_dense
      - cake, cake_cute
      - ``plan_gate``
@@ -379,7 +459,19 @@ not on a contract row).
      - gemm2_dense
      - cake, cake_cute
      - ``plan_gate``
+   * - ``gemm2_dense_finalize_n256_nopdl``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``moe_sort_coop_t896_bounded_dual_nopdl``
+     - moe_sort_coop
+     - cake
+     - ``plan_gate``
    * - ``moe_sort_coop_t896_bounded_nopdl``
+     - moe_sort_coop
+     - cake
+     - ``plan_gate``
+   * - ``moe_sort_coop_t896_dual_nopdl``
      - moe_sort_coop
      - cake
      - ``plan_gate``

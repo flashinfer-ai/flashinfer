@@ -339,16 +339,57 @@ def find_kernel(**form: Any) -> Kernel:
     return _load_form(**form)
 
 
-def select_gemm1(n_tile: int, kbps: int) -> Kernel:
-    """The swap-AB GEMM1 SiTU form the plan selected."""
-    return _load_form(kind="gemm1_swapab", n_tile=int(n_tile), kbps=int(kbps))
+def select_gemm1(
+    n_tile: int,
+    kbps: int,
+    row_group_list: bool = False,
+    *,
+    pdl_trigger_after_wait: bool | None = None,
+    weight_l2_hint: bool | None = None,
+) -> Kernel:
+    """The swap-AB GEMM1 SiTU form the plan selected.
+
+    ``row_group_list`` selects the ``_rowgroup`` list forms; ``pdl_trigger_after_wait``
+    is the module's griddepcontrol placement (the plan's ``pdl and dep_prefetch``) --
+    the split chain's narrow forms exist under both placements; ``weight_l2_hint`` is
+    the module's weight-stream L2 policy (the plan's ``swap_weight_l2_hint``) -- the
+    n16 / n32 forms exist under both.
+    """
+    form: dict[str, Any] = dict(
+        kind="gemm1_swapab",
+        n_tile=int(n_tile),
+        kbps=int(kbps),
+        row_group_list=bool(row_group_list),
+    )
+    if pdl_trigger_after_wait is not None:
+        form["pdl_trigger_after_wait"] = bool(pdl_trigger_after_wait)
+    if weight_l2_hint is not None:
+        form["weight_l2_hint"] = bool(weight_l2_hint)
+    return _load_form(**form)
 
 
-def select_gemm2(n_tile: int, kbps: int, m_group: int) -> Kernel:
-    """The swap-AB GEMM2 finalize form the plan selected."""
-    return _load_form(
+def select_gemm2(
+    n_tile: int,
+    kbps: int,
+    m_group: int,
+    *,
+    late_dep_wait: bool | None = None,
+    weight_l2_hint: bool | None = None,
+) -> Kernel:
+    """The swap-AB GEMM2 finalize form the plan selected.
+
+    ``late_dep_wait`` is the module's griddepcontrol placement (the plan's
+    ``pdl and dep_prefetch``); ``weight_l2_hint`` its weight-stream L2 policy (the
+    plan's ``swap_weight_l2_hint``; the n16 / n32 forms exist under both).
+    """
+    form: dict[str, Any] = dict(
         kind="gemm2_swapab", n_tile=int(n_tile), kbps=int(kbps), m_group=int(m_group)
     )
+    if late_dep_wait is not None:
+        form["late_dep_wait"] = bool(late_dep_wait)
+    if weight_l2_hint is not None:
+        form["weight_l2_hint"] = bool(weight_l2_hint)
+    return _load_form(**form)
 
 
 def select_routing(config: Any) -> Kernel:

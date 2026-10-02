@@ -221,6 +221,20 @@ def test_decision_table_pins_the_hand_written_plan(
         ),
         (TP8, 128, "split_two_stage", None),
         (TP8, 1024, "split_two_stage", None),
+        (
+            TP8,
+            2048,
+            "hybrid",
+            (
+                "route_preprocess",
+                "moe_sort_init",
+                "moe_sort_coop",
+                "dispatch",
+                "gemm1_swapab_situ",
+                "gemm1_dense",
+                "gemm2_dense_finalize",
+            ),
+        ),
     ],
 )
 def test_decision_served_rows_outside_the_executable_chain(layout, T, path, launches):
@@ -244,9 +258,18 @@ def test_decision_served_rows_outside_the_executable_chain(layout, T, path, laun
     if chain == "plain" and path != "plain":
         # The plain chain runs on this row: its launch forms are the swap-AB closure, not the traced split plan.
         launch_forms = {
-            kernels.select_gemm1(decision.gemm1.n_tile, decision.gemm1.kbps).stage,
+            kernels.select_gemm1(
+                decision.gemm1.n_tile,
+                decision.gemm1.kbps,
+                pdl_trigger_after_wait=decision.gemm1.pdl_trigger_after_wait,
+                weight_l2_hint=decision.gemm1.weight_l2_hint is not None,
+            ).stage,
             kernels.select_gemm2(
-                decision.gemm2.n_tile, decision.gemm2.kbps, decision.gemm2.m_group
+                decision.gemm2.n_tile,
+                decision.gemm2.kbps,
+                decision.gemm2.m_group,
+                late_dep_wait=decision.gemm2.late_dep_wait,
+                weight_l2_hint=decision.gemm2.weight_l2_hint is not None,
             ).stage,
         }
     else:
@@ -282,11 +305,8 @@ def test_decision_served_rows_outside_the_executable_chain(layout, T, path, laun
 @pytest.mark.parametrize(
     "layout, T, needle",
     [
-        (EP8, 8192, "dense dual-tile chain not executable"),
-        (EP8, 16384, "dense dual-tile chain not executable"),
-        (TP8, 1025, "hybrid form"),
-        (TP8, 2048, "hybrid form"),
         (TP8, 8192, "mixed192"),
+        (TP8, 16384, "mixed192"),
     ],
 )
 def test_refused_rows_carry_the_hand_written_reason(layout, T, needle):
@@ -296,15 +316,17 @@ def test_refused_rows_carry_the_hand_written_reason(layout, T, needle):
     assert needle in decision.reason
     # The refused row still carries the hand-written launch plan.  Either a launch has no traced form and names
     # the missing IR form (never substituted), or every launch is traced and the chain itself is named missing
-    # (the dense dual-tile alternates and the dense two-stage finalize: traced, not enqueued by the Cake runner);
-    # ``plan`` refuses with the reason.
+    # (the dense two-stage finalize: traced, not enqueued by the Cake runner); ``plan`` refuses with the reason.
     assert decision.path != "plain" and decision.launches and decision.missing_forms
     untraced = [launch for launch in decision.launch_plan if not launch.traced]
     assert all(launch.missing for launch in untraced)
     if not untraced:
-        assert decision.path == "dense" and decision.dense is not None
-        assert decision.dense.dual is not None or decision.dense.two_stage
-        assert decision.missing_forms == (plan.DENSE_DUAL_CHAIN_MISSING,)
+        assert (
+            decision.path == "dense"
+            and decision.dense is not None
+            and decision.dense.two_stage
+        )
+        assert decision.missing_forms == (plan.DENSE_TWO_STAGE_CHAIN_MISSING,)
         assert plan.DENSE_CHAIN_EXECUTABLE is True
     assert "missing IR forms" in decision.reason
 
@@ -326,7 +348,7 @@ def test_dense_chain_kernels_are_rendered_for_both_launch_attributes(enable_pdl)
     served = set(contract["forms"]) | set(contract["sibling_backend_forms"])
     for name in (plan.init_form_name(sort), plan.coop_form_name(sort)):
         assert plan._k6_stage(name, sort.pdl) in served, name
-    tile_m, n1, zero_fill, secondary, row_group = cfg["gemm1"]
+    tile_m, n1, zero_fill, secondary, row_group, early = cfg["gemm1"]
     gemm1 = kernels.find_form(
         kind="gemm1_dense",
         tile_m=tile_m,
@@ -334,6 +356,7 @@ def test_dense_chain_kernels_are_rendered_for_both_launch_attributes(enable_pdl)
         zero_fill=zero_fill,
         zero_fill_secondary=secondary,
         row_group_list=row_group,
+        pdl_trigger_early=early,
         use_pdl=enable_pdl,
     )
     n2, cluster_n = cfg["gemm2"]
@@ -343,6 +366,7 @@ def test_dense_chain_kernels_are_rendered_for_both_launch_attributes(enable_pdl)
         cta_group=1,
         cluster_n=cluster_n,
         row_group=False,
+        pdl_trigger_early=False,
         use_pdl=enable_pdl,
     )
     for item in (gemm1, gemm2):
@@ -435,8 +459,38 @@ def test_every_plan_selection_resolves_to_a_module():
     seen = set()
     for runner, decision in _served_decisions():
         g1, g2 = decision.gemm1, decision.gemm2
-        seen.add(kernels.select_gemm1(g1.n_tile, g1.kbps).stage)
-        seen.add(kernels.select_gemm2(g2.n_tile, g2.kbps, g2.m_group).stage)
+        # The griddepcontrol placement and the weight-stream L2 policy are part of the module identity: the
+        # split chain's narrow forms exist under both placements (the registry's prefetch placement and the
+        # ``_nodp`` constructor default), the n16 / n32 forms under both policies (EVICT_FIRST and ``_nol2``).
+        seen.add(
+            kernels.select_gemm1(
+                g1.n_tile,
+                g1.kbps,
+                pdl_trigger_after_wait=g1.pdl_trigger_after_wait,
+                weight_l2_hint=g1.weight_l2_hint is not None,
+            ).stage
+        )
+        if decision.two_stage:
+            seen.add(
+                kernels.find_kernel(
+                    kind="gemm2_swapab_partial",
+                    n_tile=g2.n_tile,
+                    kbps=g2.kbps,
+                    m_group=g2.m_group,
+                    late_dep_wait=g2.late_dep_wait,
+                    weight_l2_hint=g2.weight_l2_hint is not None,
+                ).stage
+            )
+        else:
+            seen.add(
+                kernels.select_gemm2(
+                    g2.n_tile,
+                    g2.kbps,
+                    g2.m_group,
+                    late_dep_wait=g2.late_dep_wait,
+                    weight_l2_hint=g2.weight_l2_hint is not None,
+                ).stage
+            )
         for mode in MODES:
             cfg = plan.routing_config(runner.policy, decision, mode=mode)
             kernel = kernels.select_routing(cfg)
@@ -456,10 +510,35 @@ def test_gemm_forms_carry_the_trace_time_constants():
     assert kernel.block[0] == form["threads"]
     assert form["smem_bytes"] <= kernel.dynamic_smem_bytes <= form["smem_bytes"] + 4096
     assert kernel.use_pdl is True
-    situ = kernels.select_gemm1(8, 8).form
+    situ = kernels.select_gemm1(8, 8, pdl_trigger_after_wait=True).form
     assert (
         situ["kind"] == "gemm1_swapab" and situ["is_situ"] is True and situ["kbps"] == 8
     )
+    assert situ["pdl_trigger_after_wait"] is True and situ["late_dep_wait"] is False
+    assert situ["weight_l2_hint"] is True
+    nodp = kernels.select_gemm1(8, 8, pdl_trigger_after_wait=False).form
+    assert nodp["pdl_trigger_after_wait"] is False and nodp["late_dep_wait"] is False
+    with pytest.raises(KeyError, match="ambiguous"):
+        kernels.select_gemm1(8, 8)
+    # The expert-parallel 17..255 rows' n16 / n32 forms load the weights without the EVICT_FIRST policy
+    # (``_nol2``). The n16 kbps-8 finalize GEMM2 exists only in that form (the registry's n16 finalize is kbps 4),
+    # so its selection is unambiguous and the EVICT_FIRST sibling is not in the package; the n32 kbps-8 pair
+    # carries both policies.
+    nol2 = kernels.select_gemm2(16, 8, 1, weight_l2_hint=False).form
+    assert nol2["weight_l2_hint"] is False and nol2["late_dep_wait"] is True
+    assert kernels.select_gemm2(16, 8, 1).form["weight_l2_hint"] is False
+    with pytest.raises(KeyError, match="not in this package"):
+        kernels.select_gemm2(16, 8, 1, weight_l2_hint=True)
+    assert (
+        kernels.select_gemm2(32, 8, 1, weight_l2_hint=True).form["weight_l2_hint"]
+        is True
+    )
+    assert (
+        kernels.select_gemm2(32, 8, 1, weight_l2_hint=False).form["weight_l2_hint"]
+        is False
+    )
+    with pytest.raises(KeyError, match="ambiguous"):
+        kernels.select_gemm2(32, 8, 1)
 
 
 # --- GPU -----------------------------------------------------------------------------
@@ -1067,11 +1146,13 @@ def test_executable_path_rows_match_the_gate_oracle(row, record_property):
         # Hand-written enqueue order: split routing, wide row-group GEMM1 / finalize GEMM2, narrow swap-AB SiTU
         # GEMM1 / partial GEMM2, finalize rows (accumulate).
         assert len(stages) == 6 and stages[0].startswith("routing_")
+        # The split chain's two wide dense launches carry the hand-written ``pdl_trigger_early`` placement
+        # (``_early`` forms); the hybrid chain keeps the footer-trigger ``_rowgroup`` / ``_rg`` siblings.
         assert stages[1].startswith("gemm1_dense_situ_m") and stages[1].endswith(
-            "_rowgroup"
+            "_rowgroup_early"
         )
         assert stages[2].startswith("gemm2_dense_finalize_n") and stages[2].endswith(
-            "_rg"
+            "_rg_early"
         )
         assert stages[3].startswith("gemm1_swapab_situ_n")
         assert stages[4].startswith("gemm2_swapab_partial_n")
