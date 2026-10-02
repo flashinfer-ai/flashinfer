@@ -110,7 +110,17 @@ def test_cake_vsa_against_dense_reference(
     v = torch.randn((N, num_kv_heads, head_dim), dtype=dtype, device=device)
     workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
     wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
-    _plan(wrapper, M, N, block_size, num_qo_heads, num_kv_heads, head_dim, dtype, block_mask=mask)
+    _plan(
+        wrapper,
+        M,
+        N,
+        block_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        block_mask=mask,
+    )
     result = wrapper.run(q, k, v, return_lse=return_lse)
     output, lse = result if return_lse else (result, None)
 
@@ -182,7 +192,17 @@ def test_fp16_gqa_replan_replaces_direct_metadata():
     wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
 
     first_mask = _strided_mask(hq, mb, nb, 2, device)
-    _plan(wrapper, M, N, block_size, hq, hkv, head_dim, torch.float16, block_mask=first_mask)
+    _plan(
+        wrapper,
+        M,
+        N,
+        block_size,
+        hq,
+        hkv,
+        head_dim,
+        torch.float16,
+        block_mask=first_mask,
+    )
     first_plan = wrapper._cake_vsa_plan
     assert first_plan["fp16_direct"]["topk"] == 2
     first = wrapper.run(q, k, v)
@@ -193,7 +213,17 @@ def test_fp16_gqa_replan_replaces_direct_metadata():
     second_mask = torch.zeros((hq, mb, nb), dtype=torch.bool, device=device)
     second_mask[:4, :, [1, 5, 6]] = True
     second_mask[4:, :, [0, 3, 7]] = True
-    _plan(wrapper, M, N, block_size, hq, hkv, head_dim, torch.float16, block_mask=second_mask)
+    _plan(
+        wrapper,
+        M,
+        N,
+        block_size,
+        hq,
+        hkv,
+        head_dim,
+        torch.float16,
+        block_mask=second_mask,
+    )
     second_plan = wrapper._cake_vsa_plan
     assert second_plan is not first_plan
     assert second_plan["fp16_direct"]["topk"] == 3
@@ -221,7 +251,16 @@ def test_custom_sm_scale_reaches_every_route():
         v = torch.randn((N, hkv, head_dim), dtype=dtype, device=device)
         wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
         _plan(
-            wrapper, M, N, block_size, hq, hkv, head_dim, dtype, block_mask=mask, sm_scale=scale
+            wrapper,
+            M,
+            N,
+            block_size,
+            hq,
+            hkv,
+            head_dim,
+            dtype,
+            block_mask=mask,
+            sm_scale=scale,
         )
         output = wrapper.run(q, k, v)
         reference, _ = _dense_reference(q, k, v, mask, block_size, scale=scale)
@@ -241,7 +280,17 @@ def test_blk64_direct_rejects_invalid_output_shape(bad_shape):
     v = torch.randn_like(k)
     workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
     wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
-    _plan(wrapper, M, N, 64, num_heads, num_heads, head_dim, torch.bfloat16, block_mask=mask)
+    _plan(
+        wrapper,
+        M,
+        N,
+        64,
+        num_heads,
+        num_heads,
+        head_dim,
+        torch.bfloat16,
+        block_mask=mask,
+    )
     plan = wrapper._cake_vsa_plan
     assert plan is not None
     assert plan["blk64_profile"] == "blk64_persistent"

@@ -184,9 +184,7 @@ def get_csrc_dir() -> Path:
     if (checkout / _BINDING_SOURCE).is_file():
         return checkout
     raise FileNotFoundError(
-        "Cake VSA sources were not found. Checked:\n"
-        f"  - {installed}\n"
-        f"  - {checkout}"
+        f"Cake VSA sources were not found. Checked:\n  - {installed}\n  - {checkout}"
     )
 
 
@@ -243,7 +241,9 @@ def _nvcc() -> Path:
     return Path(found).resolve()
 
 
-def prepare_cake_vsa_cubin(build_dir: Path, *, profile: str, arch: str) -> Mapping[str, Path]:
+def prepare_cake_vsa_cubin(
+    build_dir: Path, *, profile: str, arch: str
+) -> Mapping[str, Path]:
     """Compile the profile cubin for ``arch`` into ``build_dir`` for Ninja embedding.
 
     The cubin is rebuilt when it is missing or older than its device source;

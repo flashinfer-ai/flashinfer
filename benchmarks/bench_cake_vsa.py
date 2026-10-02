@@ -145,7 +145,7 @@ def main() -> None:
     device = torch.device("cuda")
     workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
     results = []
-    print(f"| row | median_ms |\n|---|---|")
+    print("| row | median_ms |\n|---|---|")
     for row in rows:
         median_ms = bench_row(row, device, workspace)
         results.append({**asdict(row), "label": row.label, "median_ms": median_ms})
