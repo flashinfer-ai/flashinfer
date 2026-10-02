@@ -1062,7 +1062,11 @@ def plan_dense_projection_gemm(
         # A caller-forced tile family (sweeps, the registrations of the tall / 64-row families): the rule's knobs
         # that belong to its own family (tile width, stage count, staging slots, epilogue mode) do not carry over
         # (a 160-column rule of the 256-row family is not a valid 64-row tile).  [Cake L1271-L1279]
-        rule = {k: v for k, v in rule.items() if k not in ("block_n", "stages", "slots", "epi")}
+        rule = {
+            k: v
+            for k, v in rule.items()
+            if k not in ("block_n", "stages", "slots", "epi")
+        }
     if block_n is None:
         block_n = rule.get("block_n", default_block_n(N, b_mn))
     if stages is None:
