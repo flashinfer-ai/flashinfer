@@ -364,10 +364,11 @@ def instance_key(
     hints: tuple = ("none", "none"),
     group_m: int = 16,
     f32_v8: bool = False,
+    quad_store: bool = False,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
-    promo, hints, group_m)``.  Diagnostic (attribution) instances are not exported.
+    promo, hints, group_m, f32_v8, quad_store)``.  Diagnostic (attribution) instances are not exported.
     [Cake ``instance_key`` L690-L713]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf, group_m = int(block_n), int(cta_rows), int(pf), int(group_m)
@@ -428,6 +429,11 @@ def instance_key(
         and out_f32
         and epi == "reg"
         and not out_t,  # only the row-major fp32 register epilogue has the knob
+        bool(quad_store)
+        and (not out_f32)
+        and epi == "reg"
+        and not out_t
+        and (block_n * 4 // 8) % 64 == 0,  # bf16 row-major register epilogue: quad-transposed 32-byte row segments (round 7)
     )
 
 
@@ -455,6 +461,7 @@ def instance_symbol(key: tuple) -> str:
         hints,
         group_m,
         f32_v8,
+        quad_store,
     ) = key
     return (
         "dense_proj_gemm_"
@@ -468,6 +475,7 @@ def instance_symbol(key: tuple) -> str:
         + (f"_g{group_m}" if group_m != 16 else "")
         + ("_f32" if out_f32 else "")
         + ("_v8" if f32_v8 else "")
+        + ("_q" if quad_store else "")
         + ("_t" if out_t else "")
         + (f"_{epi}{slots}" if epi != "reg" else "")
         + (f"_s{stages}" if stages != default_stages(slots, cta_rows, block_n) else "")
@@ -495,10 +503,10 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256, "group_m": 8},
     ('sm_100a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
     ('sm_100a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
-    ('sm_100a', False, False, False, False, True, 256, 512, None): {"promo": 'l2_256b'},
+    ('sm_100a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
     ('sm_100a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 256},
     ('sm_100a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 256},
-    ('sm_100a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "stages": 6},
+    ('sm_100a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "stages": 6, "quad_store": True},
     ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8},
     ('sm_100a', False, True, False, False, True, 512, 256, None): {"cta_rows": 256},
@@ -533,11 +541,11 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, False, False, False, False, 576, 6144, None): {"cta_rows": 256, "hints": ('evict_first', 'none'), "stages": 5},
     ('sm_107a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
     ('sm_107a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
-    ('sm_107a', False, False, False, False, True, 256, 512, None): {"promo": 'l2_256b'},
+    ('sm_107a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, True, 512, 256, None): {"promo": 'l2_256b'},
     ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 256},
     ('sm_107a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 256},
-    ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8},
+    ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "quad_store": True},
     ('sm_107a', False, True, False, False, False, 12288, 6144, None): {"hints": ('none', 'evict_first')},
     ('sm_107a', False, True, False, False, False, 16384, 6144, None): {"cta_rows": 256, "group_m": 8},
     ('sm_107a', False, True, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
@@ -888,6 +896,7 @@ def plan_dense_projection_gemm(
     hints: Optional[tuple] = None,
     group_m: Optional[int] = None,
     f32_v8: Optional[bool] = None,
+    quad_store: Optional[bool] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -922,6 +931,7 @@ def plan_dense_projection_gemm(
         hints=hints,
         group_m=group_m,
         f32_v8=f32_v8,
+        quad_store=quad_store,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -990,6 +1000,8 @@ def plan_dense_projection_gemm(
         sk = rule["sk"]
     if f32_v8 is None:
         f32_v8 = rule.get("f32_v8", False)
+    if quad_store is None:
+        quad_store = rule.get("quad_store", False)
     m_tiles = _ceil_div(M, cta_rows)
     m_tiles += m_tiles % CTA_GROUP
     n_tiles = _ceil_div(N, block_n)
@@ -1043,6 +1055,7 @@ def plan_dense_projection_gemm(
         hints=hints,
         group_m=group_m,
         f32_v8=f32_v8,
+        quad_store=quad_store,
     )
     plan = GemmPlan(
         L=L,
@@ -1320,6 +1333,7 @@ def prepare_dense_projection_gemm(
     hints: Optional[tuple] = None,
     group_m: Optional[int] = None,
     f32_v8: Optional[bool] = None,
+    quad_store: Optional[bool] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs, the slice counters and the
@@ -1352,6 +1366,7 @@ def prepare_dense_projection_gemm(
         hints=hints,
         group_m=group_m,
         f32_v8=f32_v8,
+        quad_store=quad_store,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)

@@ -78,7 +78,7 @@ stream-K split, raster group, wave working set) and the L2 size (hint gate);
 | operand layout | `operand_view`: the contraction axis contiguous -> K-major, else the M/N axis contiguous -> MN-major |
 | `BLOCK_N` | `default_block_n`: 128 when `N <= 128`, else 256 |
 | `CTA_ROWS` | `default_cta_rows`: 128 (the 256-row tall-tile family is an opt-in `cta_rows=256`) |
-| epilogue | `epi_mode`: transposed output -> register stores (`reg`); row-major fp32 -> TMA stores (`tma`; `epi="reg"` is an opt-in float4 register path); row-major bf16 -> `tma` when `K <= 1024`, else `reg` |
+| epilogue | `epi_mode`: transposed output -> register stores (`reg`); row-major fp32 -> TMA stores (`tma`; `epi="reg"` is an opt-in float4 register path); row-major bf16 -> `tma` when `K <= 1024`, else `reg`; `quad_store` (rule-selected, `_q`) is the bf16 `reg` variant that transposes 32-byte row segments across lane quads so each lane issues one 256-bit store per 4-row group |
 | staging slots | `epi_slots`: 1 with the TMA-store epilogue (2 only when `K <= K_TWO_SLOTS = 0`), 0 otherwise |
 | stages | `default_stages(slots, cta_rows, block_n)`: 7 / 6 / 5 for 0 / 1 / 2 slots at `BLOCK_N = 256`, 9 / 8 / 6 at `BLOCK_N = 128`, 4 / 4 / 3 for tall (256-row) tiles |
 | raster group | `default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)`: 16 CTA row tiles per cluster-launch-control raster group (even, so the two CTAs of a pair are the row halves of one 256-row tile) on every row; a 4-row group for one-to-two-wave weight-gradient rows measured no gain in the production configuration and is not applied.  A non-default group would carry the symbol suffix `_g<n>` |
