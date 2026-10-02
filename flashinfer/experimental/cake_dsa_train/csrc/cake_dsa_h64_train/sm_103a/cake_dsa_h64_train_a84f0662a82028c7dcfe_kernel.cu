@@ -66,7 +66,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128, 1) void
-kernel_cake_dsa_h64_train_44e6567b736f319834ea(int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ key_scratch, int* __restrict__ pass_counts, int num_tokens, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, int pass_lo, int pass_hi)
+kernel_cake_dsa_h64_train_a84f0662a82028c7dcfe(int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ key_scratch, int* __restrict__ pass_counts, int num_tokens, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, int pass_lo, int pass_hi)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

@@ -86,7 +86,11 @@ D_ROPE = 64
 D_QK = D_LATENT + D_ROPE
 LOG2E = 1.4426950408889634
 WORKSPACE_ALIGN = 256
-SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+SUPPORTED_COMPUTE_CAPABILITIES = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
 
 # Host binding profiles.  ``ABI_CONTRACT`` is the keyword set of the native
 # training kernels (the names below are what the host provides; a kernel's
@@ -122,6 +126,12 @@ CONTRACT_TENSORS = (
     "dk_rope",
     "dkv_latent_fp32",  # bwd_cast: natural-layout FP32 outputs of the dkv_fp32 mode (out_f32 = 1); otherwise a placeholder
     "dk_rope_fp32",
+    # bwd_cast packed-accumulate mode (accumulate = 1; flashinfer-ai/flashinfer#5675): the caller's FP32 [S_dst, >= 576]
+    # rows the un-permuted dK/dV gradients are ADDED into (``dst_packed``: latent columns 0:512, rope columns 512:576) and
+    # the optional int32 [S] destination-row map (``dst_map``, ``has_dst_map``).  Inert placeholders of the right dtypes
+    # otherwise (_inert_cast_values): the FP32 accumulator and the indices storage.
+    "dkv_acc",
+    "dkv_dst_map",
     # Key-range passes (bwd_compact / bwd_main_pass): the FP32 dQ partials, the per-pass compacted keys and their
     # counts, carved from the workspace when the plan has more than one pass.  The single-pass kernel (bwd_main) never
     # reads them and receives, like its production launcher, ``delta`` and the indices storage as inert placeholders
@@ -162,6 +172,9 @@ CONTRACT_SCALARS = (
     "pass_hi",
     "dq_mode",
     "num_tokens",  # bwd_compact: tokens of the launch (= num_queries: passes run over the whole row)
+    "dst_row_stride",  # bwd_cast: elements per dkv_acc row (>= 576, a multiple of 4); 0 when accumulate = 0
+    "has_dst_map",  # bwd_cast: 1 when dkv_dst_map is given
+    "accumulate",  # bwd_cast: 1 = add the gradients into dkv_acc (no BF16 / FP32 dK/dV outputs); 0 = fresh natural outputs
 )
 # FP32 dK/dV accumulator layouts a backward record declares (``dkv_acc_layout``).
 DKV_ACC_LAYOUTS = ("natural", "permuted")
@@ -312,6 +325,8 @@ CONTRACT_ALIASES = {
     "dst_rope": "dk_rope",
     "dst_latent_f32": "dkv_latent_fp32",
     "dst_rope_f32": "dk_rope_fp32",
+    "dst_packed": "dkv_acc",
+    "dst_map": "dkv_dst_map",
     "do": "dout",
     "d_out": "dout",
 }
@@ -340,7 +355,7 @@ def record_for(device: Optional[torch.device] = None) -> tuple[str, dict[str, An
     arch = arch_for(device)
     if arch is None:
         raise ValueError(
-            "DSA sparse-attention training requires compute capability 10.0 or 10.3"
+            "DSA sparse-attention training requires compute capability 10.0, 10.3 or 10.7"
         )
     name = select_module(arch)
     return name, MODULES[name]
@@ -383,25 +398,78 @@ def record_dkv_acc_layout(record: dict[str, Any]) -> str:
     return str(layout)
 
 
+# Operands a ``bwd_cast`` argument plan declares when the cast can add the un-permuted dK/dV gradients into a
+# caller-provided packed FP32 buffer with an optional destination-row map (``dkv_acc`` / ``dkv_dst_map``).
+CAST_ACCUMULATE_OPERANDS = (
+    "dst_packed",
+    "dst_row_stride",
+    "dst_map",
+    "has_dst_map",
+    "accumulate",
+)
+
+
+def record_cast_accumulates(record: dict[str, Any]) -> bool:
+    """True when the record's ``bwd_cast`` plan declares :data:`CAST_ACCUMULATE_OPERANDS`, i.e. the program serves
+    ``dkv_acc`` / ``dkv_dst_map``; a program exported from an older cast does not."""
+    physical = record.get("bwd_cast")
+    if physical is None:
+        return False
+    names = {name for _, name in physical["arg_plan"]}
+    return set(CAST_ACCUMULATE_OPERANDS) <= names
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
 
+# Layout rules of the model operands (packed / strided trainer inputs, flashinfer-ai/flashinfer#5675).
+#
+# The head-dimension operands (q_latent, q_rope, dout, dq_*) reach the kernels through 4-D TMA descriptors whose
+# global strides are the tensor's own head stride and token stride (the generated ``EncodeTma_*`` reads
+# ``t.stride(ndim - 2)`` / ``t.stride(ndim - 3)`` of the TensorView); the key operands are 2-D TMA gather maps over the
+# row stride (kv_latent, and k_rope in the backward) or 16-byte ``cp.async`` row loads at ``base + offset + row *
+# stride`` (k_rope in the forward).  ``cuTensorMapEncodeTiled`` requires every global stride to be a positive
+# multiple of 16 bytes below 2^40 and the global address to be 16-byte aligned; for BF16 that is a multiple of 8
+# elements.  Nothing else is assumed about the layout: a head stride of 576 (a packed [T, 64, 576] query), 256 (the
+# 192:256 rope channels of the [T, 64, 256] pre-absorption query) or any other admissible value and key row strides
+# of 576 or 704 (a frozen 128-channel indexer key stored alongside) are consumed in place, without a host copy.
+TMA_STRIDE_ELEMENTS = 8  # 16 bytes of BF16: the descriptor stride granule
+TMA_ADDRESS_ALIGN = 16  # bytes: the descriptor's global address
+
+
 def _check_head_tensor(t: torch.Tensor, name: str, last: int) -> None:
+    """``[T, 64, last]`` BF16 with a unit channel stride, TMA-admissible head and token strides and base address."""
     if t.ndim != 3 or t.shape[1] != NUM_HEADS or t.shape[2] != last:
         raise ValueError(f"{name} must be a BF16 [T, {NUM_HEADS}, {last}] tensor")
     if t.dtype != torch.bfloat16:
         raise ValueError(f"{name} must be bfloat16")
-    # Heads are ``last`` apart in a contiguous tensor and ``D_QK`` apart in a view of a packed [T, 64, 576] tensor.
-    if t.stride(2) != 1 or t.stride(1) not in (last, D_QK):
+    if t.stride(2) != 1:
         raise ValueError(
-            f"{name} must be contiguous within a token row (a view of a packed "
-            f"[T, {NUM_HEADS}, {D_QK}] tensor is allowed)"
+            f"{name} must be contiguous along its last dimension, got strides {tuple(t.stride())}"
+        )
+    head, token = int(t.stride(1)), int(t.stride(0))
+    if head < last or head % TMA_STRIDE_ELEMENTS:
+        raise ValueError(
+            f"{name} head stride must be >= {last} elements and a multiple of {TMA_STRIDE_ELEMENTS} elements "
+            f"(16 bytes: TMA descriptor stride), got {head}; slices of a packed [T, {NUM_HEADS}, {D_QK}] query "
+            f"or of the [T, {NUM_HEADS}, 256] pre-absorption query are admitted"
+        )
+    if token <= 0 or token % TMA_STRIDE_ELEMENTS:
+        raise ValueError(
+            f"{name} token stride must be a positive multiple of {TMA_STRIDE_ELEMENTS} elements "
+            f"(16 bytes: TMA descriptor stride), got {token}"
+        )
+    if t.data_ptr() % TMA_ADDRESS_ALIGN:
+        raise ValueError(
+            f"{name} base address must be {TMA_ADDRESS_ALIGN}-byte aligned (TMA global address), "
+            f"got {t.data_ptr() % TMA_ADDRESS_ALIGN} bytes past an aligned address"
         )
 
 
 def _check_key_tensor(t: torch.Tensor, name: str, last: int) -> None:
+    """``[S, last]`` BF16 with a unit column stride, a TMA-admissible row stride and base address."""
     if t.ndim != 2 or t.shape[1] != last:
         raise ValueError(f"{name} must be a BF16 [S, {last}] tensor")
     if t.dtype != torch.bfloat16:
@@ -409,6 +477,18 @@ def _check_key_tensor(t: torch.Tensor, name: str, last: int) -> None:
     if t.stride(1) != 1:
         raise ValueError(
             f"{name} rows must be contiguous (a view of a packed [S, {D_QK}] tensor is allowed)"
+        )
+    row = int(t.stride(0))
+    if row < last or row % TMA_STRIDE_ELEMENTS:
+        raise ValueError(
+            f"{name} row stride must be >= {last} elements and a multiple of {TMA_STRIDE_ELEMENTS} elements "
+            f"(16 bytes: TMA gather descriptor stride / 16-byte rope loads), got {row}; column slices of a "
+            f"packed [S, {D_QK}] or [S, 704] row are admitted"
+        )
+    if t.data_ptr() % TMA_ADDRESS_ALIGN:
+        raise ValueError(
+            f"{name} base address must be {TMA_ADDRESS_ALIGN}-byte aligned (TMA global address), "
+            f"got {t.data_ptr() % TMA_ADDRESS_ALIGN} bytes past an aligned address"
         )
 
 
@@ -423,10 +503,12 @@ def validate_dsa_train_inputs(
     dout: Optional[torch.Tensor] = None,
     allow_empty_queries: bool = False,
 ) -> tuple[int, int, int]:
-    """Shape / dtype validation shared by the entry points.
+    """Shape / dtype / layout validation shared by the entry points.
 
     Returns ``(T, S, topk)``.  Device placement is checked separately so this
-    runs on host tensors.  Zero key rows (``S == 0``) are rejected: the
+    runs on host tensors.  Layouts: see :func:`_check_head_tensor` and
+    :func:`_check_key_tensor` (strided query slices and packed key rows are
+    consumed in place); ``indices`` and ``topk_length`` are contiguous.  Zero key rows (``S == 0``) are rejected: the
     kernels index at least one key row and the FP32 dK/dV accumulators would
     be empty.  Zero query rows (``T == 0``) are rejected unless
     ``allow_empty_queries``: the launch grids clamp to one CTA that would read
@@ -471,6 +553,11 @@ def validate_dsa_train_inputs(
         _check_head_tensor(dout, "dout", D_LATENT)
         if int(dout.shape[0]) != num_queries:
             raise ValueError("dout must have T rows")
+        # ``bwd_delta`` addresses dout as a flat pointer of T * 64 contiguous 512-element rows (one (token, head)
+        # row per warp, 16-byte vector loads at row * 512 + column), so a strided dout would be mis-read there;
+        # it therefore stays contiguous although the main stage reads it through a TMA descriptor.  The eager
+        # ``backward`` and the autograd Function call ``dout.contiguous()`` before validating; only
+        # ``prepare_dsa_train`` callers see this error.
         if not dout.is_contiguous():
             raise ValueError("dout must be contiguous (call .contiguous() first)")
     return num_queries, num_kv, topk
@@ -483,6 +570,70 @@ def _check_output(t: Optional[torch.Tensor], name: str, shape: tuple, dtype) -> 
         raise ValueError(
             f"{name} must be a contiguous {dtype} tensor of shape {tuple(shape)}"
         )
+
+
+def _check_dkv_acc(
+    dkv_acc: torch.Tensor, dkv_dst_map: Optional[torch.Tensor], num_kv: int
+) -> tuple[torch.Tensor, int]:
+    """Validate the caller's packed FP32 dK/dV accumulator and its optional destination-row map.
+
+    ``dkv_acc``: FP32, 2-D ``[S_dst, >= 576]`` (the latent gradient is added into columns ``0:512``, the rope gradient
+    into ``512:576``; further columns are never touched), ``stride(1) == 1``, row stride >= 576 elements and a multiple
+    of 4 (16-byte vectors), 16-byte-aligned base; without a map at least ``num_kv`` rows.  ``dkv_dst_map``: ``None``
+    (identity) or a contiguous int32 ``[num_kv]`` tensor on the device of ``dkv_acc`` -- the destination row of every
+    source key row, values in ``[0, S_dst)``, duplicates allowed.  The kernel does not range-check the map (a value
+    outside ``[0, S_dst)`` would add into memory outside ``dkv_acc``); the caller owns that invariant.  Setting the
+    environment variable ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1`` validates the values on every call (a device
+    synchronization) and raises ``ValueError`` on a violation.  Returns ``(operand,
+    row_stride)``: the raw-pointer operand of ``bwd_cast`` (``dkv_acc`` itself when contiguous, else a flat stride-1
+    alias from its first element over ``(S_dst - 1) * row_stride + cols`` elements -- the FFI boundary takes contiguous
+    tensors only, and the kernel addresses ``row * row_stride + col``) and the row stride.  Device placement is checked
+    by the callers, so this runs on host tensors.
+    """
+    if not isinstance(dkv_acc, torch.Tensor) or dkv_acc.dtype != torch.float32:
+        raise ValueError("dkv_acc must be a float32 tensor")
+    if dkv_acc.ndim != 2 or int(dkv_acc.shape[1]) < D_QK:
+        raise ValueError(
+            f"dkv_acc must be a 2-D [S_dst, >= {D_QK}] tensor (latent columns 0:{D_LATENT}, "
+            f"rope columns {D_LATENT}:{D_QK}), got shape {tuple(dkv_acc.shape)}"
+        )
+    if dkv_acc.stride(1) != 1:
+        raise ValueError(
+            f"dkv_acc rows must be contiguous (stride(1) == 1), got strides {tuple(dkv_acc.stride())}"
+        )
+    row_stride = int(dkv_acc.stride(0))
+    if row_stride < D_QK or row_stride % 4:
+        raise ValueError(
+            f"dkv_acc row stride must be >= {D_QK} elements and a multiple of 4 (16-byte vectors), got {row_stride}"
+        )
+    if dkv_acc.data_ptr() % 16:
+        raise ValueError("dkv_acc must start at a 16-byte-aligned address")
+    if dkv_dst_map is None:
+        if int(dkv_acc.shape[0]) < int(num_kv):
+            raise ValueError(
+                f"dkv_acc needs at least S = {num_kv} rows without a destination map, got {dkv_acc.shape[0]}"
+            )
+    elif (
+        not isinstance(dkv_dst_map, torch.Tensor)
+        or dkv_dst_map.dtype != torch.int32
+        or tuple(dkv_dst_map.shape) != (int(num_kv),)
+        or not dkv_dst_map.is_contiguous()
+        or dkv_dst_map.device != dkv_acc.device
+    ):
+        raise ValueError(
+            f"dkv_dst_map must be a contiguous int32 [S] tensor (S = {num_kv}) on the device of dkv_acc"
+        )
+    elif os.environ.get("FLASHINFER_CAKE_DSA_CHECK_DST_MAP", "0") not in ("", "0"):
+        num_rows = int(dkv_acc.shape[0])
+        if bool(((dkv_dst_map < 0) | (dkv_dst_map >= num_rows)).any().item()):
+            raise ValueError(
+                f"dkv_dst_map values must lie in [0, {num_rows}) (the rows of dkv_acc); "
+                f"got min {int(dkv_dst_map.min())}, max {int(dkv_dst_map.max())}"
+            )
+    if dkv_acc.is_contiguous():
+        return dkv_acc, row_stride
+    span = (int(dkv_acc.shape[0]) - 1) * row_stride + int(dkv_acc.shape[1])
+    return dkv_acc.as_strided((span,), (1,), dkv_acc.storage_offset()), row_stride
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +765,7 @@ def offset_gather_kv_indices(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     *,
+    causal: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Turn per-document key indices into global key rows.
@@ -621,8 +773,18 @@ def offset_gather_kv_indices(
     ``gather_kv_indices [T, topk]`` holds, for query row ``t`` of document
     ``d``, key positions relative to the document's first key
     (``cu_seqlens_k[d]``); ``-1`` or a position ``>= seqlen_k[d]`` is invalid.
-    The result addresses the packed ``kv_*`` tensors; invalid slots become
-    ``-1``.  Runs on device without a host synchronization.
+    Query and key lengths of a document may differ: the query segment is the
+    tail of its key prefix, query ``local_q = t - cu_seqlens_q[d]`` sitting at
+    key position ``(seqlen_k[d] - seqlen_q[d]) + local_q``.  With
+    ``causal=True`` a slot is also invalid when it selects a key after that
+    position (``idx <= (seqlen_k[d] - seqlen_q[d]) + local_q`` is required);
+    the rule is the one of the Cake facade (``globalize_topk_indices``).  The
+    default ``causal=False`` is the plain offsetting of the first release: the
+    index row is taken as is and only ``-1`` / out-of-range slots are dropped.
+    The result
+    addresses the packed ``kv_*`` tensors; invalid slots become ``-1``.  A
+    zero-length query segment contributes no rows.  Runs on device without a
+    host synchronization.
     """
     if gather_kv_indices.ndim != 2 or gather_kv_indices.dtype != torch.int32:
         raise ValueError("gather_kv_indices must be an int32 [T, topk] tensor")
@@ -646,6 +808,13 @@ def offset_gather_kv_indices(
     ]
     local = gather_kv_indices.to(torch.int64)
     valid = (local >= 0) & (local < key_len)
+    if causal:
+        # Own key position of row t: (seqlen_k[d] - seqlen_q[d]) + (t - cu_seqlens_q[d]).
+        query_base = cu_seqlens_q[:-1].to(torch.int64)[doc_of_row]
+        own_position = (key_len[:, 0] - seqlens_q[doc_of_row]) + (
+            torch.arange(total_q, device=device, dtype=torch.int64) - query_base
+        )
+        valid &= local <= own_position[:, None]
     result = torch.where(valid, local + key_base, torch.full_like(local, -1)).to(
         torch.int32
     )
@@ -849,6 +1018,9 @@ class DSATrainRunner:
     # Key-range passes of the backward main stage (1 = the single-pass stage) and the backward launch keys in order.
     key_passes: int = 1
     backward_order: tuple = ()
+    # True when bwd_cast adds the dK/dV gradients into the caller's packed FP32 rows (``dkv_acc``): backward() then
+    # returns None for dkv_latent / dk_rope.
+    accumulate_dkv: bool = False
     _tma_prepared: bool = False
 
     @property
@@ -903,7 +1075,11 @@ class DSATrainRunner:
             lse.masked_fill_(t["lse_mask"], float("-inf"))
         return t["out"], t["lse"], t.get("o_lo")
 
-    def backward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def backward(
+        self,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
+    ]:
         if not self.has_backward:
             raise NotImplementedError(
                 "the registered DSA training program has no backward stages "
@@ -913,6 +1089,9 @@ class DSATrainRunner:
         t["dkv_latent_acc"].zero_()
         t["dk_rope_acc"].zero_()
         self._run(self.backward_order)
+        if self.accumulate_dkv:
+            # the cast added the gradients into the caller's dkv_acc rows: no dK/dV output tensors
+            return t["dq_latent"], t["dq_rope"], None, None
         if self.dkv_fp32:
             if (
                 self.dkv_acc_permuted
@@ -968,6 +1147,18 @@ def _inert_pass_values(values: dict[str, Any], num_kv: int) -> dict[str, Any]:
     return values
 
 
+def _inert_cast_values(values: dict[str, Any]) -> dict[str, Any]:
+    """Packed-accumulate operands of ``bwd_cast`` a call does not use: never-dereferenced placeholders of the right
+    dtypes -- the FP32 accumulator for ``dst_packed`` (``accumulate = 0``) and the indices storage for ``dst_map``
+    (``has_dst_map = 0``) -- as the production launcher passes them.  A call with ``dkv_acc`` keeps its own value; the
+    map placeholder stands in for an absent ``dkv_dst_map``."""
+    if values.get("dkv_acc") is None and values.get("dkv_latent_acc") is not None:
+        values["dkv_acc"] = values["dkv_latent_acc"]
+    if values.get("dkv_dst_map") is None and values.get("indices_storage") is not None:
+        values["dkv_dst_map"] = values["indices_storage"]
+    return values
+
+
 def _pass_values(
     values: dict[str, Any], index: int, passes: int, key_range: tuple[int, int]
 ) -> dict[str, Any]:
@@ -1010,6 +1201,11 @@ def _contract_values(
     values["num_tokens"] = int(
         scalars["num_queries"]
     )  # bwd_compact: the whole row per pass
+    # bwd_cast packed-accumulate scalars (0 / 0 / 0 unless the binding accumulates into dkv_acc)
+    values["dst_row_stride"] = int(scalars.get("dst_row_stride", 0))
+    values["has_dst_map"] = int(scalars.get("has_dst_map", 0))
+    values["accumulate"] = int(scalars.get("accumulate", 0))
+    _inert_cast_values(values)
     if int(key_passes) > 1:
         return values  # dq_partial / key_scratch / pass_counts are the carved regions; pass_lo/hi and dq_mode per launch
     return _inert_pass_values(values, int(scalars["num_kv"]))
@@ -1058,6 +1254,8 @@ def prepare_dsa_train(
     dkv_fp32: bool = False,
     backward: Optional[bool] = None,
     key_passes: Optional[int] = None,
+    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_dst_map: Optional[torch.Tensor] = None,
     backend: str = "cake",
 ) -> DSATrainRunner:
     """Validate one binding and prepare its launches.
@@ -1070,7 +1268,13 @@ def prepare_dsa_train(
     natural-layout FP32 dK/dV gradients (see :func:`record_dkv_acc_layout`).
     ``key_passes`` overrides the record's key-range-pass policy for the
     backward (``None`` = policy, 1 = the single-pass stage; see
-    :func:`plan_key_passes`).
+    :func:`plan_key_passes`).  ``dkv_acc`` (FP32 ``[S_dst, >= 576]``, see
+    :func:`_check_dkv_acc`) makes ``backward()`` ADD the dK/dV gradients into
+    it -- latent columns ``0:512``, rope columns ``512:576`` of row
+    ``dkv_dst_map[s]`` (optional int32 ``[S]``; identity by default; repeated
+    rows sum) -- and return ``None`` for ``dkv_latent`` / ``dk_rope``; the caller
+    owns zeroing.  It requires a program whose cast declares
+    :data:`CAST_ACCUMULATE_OPERANDS` and excludes ``dkv_fp32``.
     """
     if backend != "cake":
         raise ValueError("DSA sparse-attention training supports backend='cake'")
@@ -1096,6 +1300,8 @@ def prepare_dsa_train(
             dq_rope,
             dkv_latent,
             dk_rope,
+            dkv_acc,
+            dkv_dst_map,
         )
         if t is not None
     ]
@@ -1119,6 +1325,30 @@ def prepare_dsa_train(
             f"program {module_name!r} accumulates dK/dV in a permuted layout and registers no cast stage; "
             "dkv_fp32 outputs are unavailable"
         )
+    accumulate = dkv_acc is not None
+    dkv_acc_operand: Optional[torch.Tensor] = None
+    dst_row_stride = 0
+    if accumulate:
+        if not backward:
+            raise ValueError(
+                "dkv_acc belongs to the backward: prepare the binding with dout (backward=True)"
+            )
+        if dkv_fp32:
+            raise ValueError(
+                "dkv_acc accumulates the dK/dV gradients in place; dkv_fp32 outputs are not produced with it"
+            )
+        if dkv_latent is not None or dk_rope is not None:
+            raise ValueError(
+                "dkv_acc accumulates in place: no dkv_latent / dk_rope output tensors are written with it"
+            )
+        if "bwd_cast" not in stages or not record_cast_accumulates(record):
+            raise NotImplementedError(
+                f"program {module_name!r} registers no bwd_cast stage declaring the packed-accumulate operands "
+                f"{CAST_ACCUMULATE_OPERANDS}; dkv_acc / dkv_dst_map need a program exported from a cast that declares them"
+            )
+        dkv_acc_operand, dst_row_stride = _check_dkv_acc(dkv_acc, dkv_dst_map, num_kv)
+    elif dkv_dst_map is not None:
+        raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
     passes = (
@@ -1226,7 +1456,18 @@ def prepare_dsa_train(
                 (num_queries, NUM_HEADS, D_ROPE), dtype=torch.bfloat16, device=device
             )
         )
-        if not dkv_fp32:
+        if accumulate:
+            # the cast adds into the caller's rows (accumulate = 1): its BF16 / FP32 output pointers are not dereferenced
+            t["dkv_acc"] = dkv_acc_operand
+            if dkv_dst_map is not None:
+                t["dkv_dst_map"] = dkv_dst_map
+            t["dkv_latent"] = torch.empty((0,), dtype=torch.bfloat16, device=device)
+            t["dk_rope"] = torch.empty((0,), dtype=torch.bfloat16, device=device)
+            t["dkv_latent_fp32"], t["dk_rope_fp32"] = (
+                t["dkv_latent_acc"],
+                t["dk_rope_acc"],
+            )
+        elif not dkv_fp32:
             t["dkv_latent"] = (
                 dkv_latent
                 if dkv_latent is not None
@@ -1288,6 +1529,9 @@ def prepare_dsa_train(
         softmax_scale=float(softmax_scale),
         has_topk_length=has_topk_length,
         out_f32=int(bool(backward and dkv_fp32 and permuted)),
+        dst_row_stride=int(dst_row_stride),
+        has_dst_map=int(accumulate and dkv_dst_map is not None),
+        accumulate=int(accumulate),
     )
     values = (
         _seed_values(t, scalars)
@@ -1349,6 +1593,7 @@ def prepare_dsa_train(
         dkv_acc_permuted=bool(permuted),
         key_passes=int(passes),
         backward_order=tuple(backward_order),
+        accumulate_dkv=bool(accumulate),
     )
 
 
@@ -1424,10 +1669,14 @@ def backward_binding_key(
     softmax_scale: float,
     dkv_fp32: bool,
     key_passes: Optional[int] = None,
+    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_dst_map: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Cache key of a backward binding: the forward key's inputs plus the saved
-    forward outputs, ``dout``, the ``dkv_fp32`` option and the ``key_passes``
-    override (``None`` = policy)."""
+    forward outputs, ``dout``, the ``dkv_fp32`` option, the ``key_passes``
+    override (``None`` = policy) and the packed accumulator / destination map
+    (``None`` when absent; their row stride and presence are baked into the
+    cast's launch)."""
     return (
         "bwd",
         _meta(q_latent),
@@ -1443,6 +1692,8 @@ def backward_binding_key(
         float(softmax_scale),
         bool(dkv_fp32),
         None if key_passes is None else int(key_passes),
+        None if dkv_acc is None else _meta(dkv_acc),
+        None if dkv_dst_map is None else _meta(dkv_dst_map),
     )
 
 
@@ -1480,6 +1731,9 @@ class _Binding:
     dkv_acc_permuted: bool = False
     key_passes: int = 1
     backward_order: tuple = ()
+    accumulate_dkv: bool = (
+        False  # the cast adds into the caller's dkv_acc rows (re-supplied per call)
+    )
 
     @classmethod
     def from_runner(cls, runner: DSATrainRunner) -> "_Binding":
@@ -1491,8 +1745,8 @@ class _Binding:
         owned = {name: torch.empty_like(t[name]) for name in _OWNED_VALUES if name in t}
         if not runner.has_topk_length:
             owned["topk_length"] = t["topk_length"].clone()
-        if runner.dkv_fp32 and runner.dkv_acc_permuted:
-            # zero-element BF16 placeholders of the cast (not dereferenced when out_f32 = 1)
+        if runner.accumulate_dkv or (runner.dkv_fp32 and runner.dkv_acc_permuted):
+            # zero-element BF16 placeholders of the cast (not dereferenced when out_f32 = 1 or accumulate = 1)
             for name in ("dkv_latent", "dk_rope"):
                 owned[name] = t[name]
         return cls(
@@ -1510,6 +1764,7 @@ class _Binding:
             dkv_acc_permuted=runner.dkv_acc_permuted,
             key_passes=runner.key_passes,
             backward_order=runner.backward_order,
+            accumulate_dkv=runner.accumulate_dkv,
         )
 
     def holds_no_tensor(self) -> bool:
@@ -1531,6 +1786,7 @@ class _Binding:
         values["k_rope_storage"], values["k_rope_offset"] = _pointer_alias(
             current["k_rope"]
         )
+        _inert_cast_values(values)
         if self.key_passes > 1:
             return values  # the owned dq_partial / key_scratch / pass_counts regions; pass scalars are baked per launch
         return _inert_pass_values(values, self.num_kv)
@@ -1581,6 +1837,8 @@ class _Binding:
         lse,
         dout,
         topk_length,
+        dkv_acc=None,
+        dkv_dst_map=None,
     ):
         T, S, device = self.num_queries, self.num_kv, self.device
         dq_latent = torch.empty(
@@ -1621,6 +1879,19 @@ class _Binding:
                 (T, self.topk), dtype=torch.int32, device=device
             )
             current["pass_counts"] = torch.empty((T,), dtype=torch.int32, device=device)
+        if self.accumulate_dkv:
+            if dkv_acc is None:
+                raise RuntimeError(
+                    "this binding accumulates the dK/dV gradients into dkv_acc and the call provides none"
+                )
+            # the same binding key implies the validated shape / stride / dtype; the alias is rebuilt per call
+            current["dkv_acc"], _row_stride = _check_dkv_acc(dkv_acc, dkv_dst_map, S)
+            if dkv_dst_map is not None:
+                current["dkv_dst_map"] = dkv_dst_map
+            # the cast's FP32 output pointers are not dereferenced when accumulate = 1: alias the accumulators
+            current["dkv_latent_fp32"], current["dk_rope_fp32"] = acc_latent, acc_rope
+            self._launch(current, self.backward_order)
+            return dq_latent, dq_rope, None, None
         if self.dkv_fp32:
             if (
                 self.dkv_acc_permuted
@@ -1857,7 +2128,9 @@ def backward(
     softmax_scale: Optional[float] = None,
     dkv_fp32: bool = False,
     key_passes: Optional[int] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_dst_map: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward pass from the saved forward outputs: ``(dq_latent, dq_rope, dkv_latent, dk_rope)``.
 
     Validates and binds once per input binding like :func:`forward`.  With
@@ -1866,15 +2139,25 @@ def backward(
     overrides the key-range-pass policy of the main stage (``None`` = the
     registered policy; see :func:`plan_key_passes`).  A call without query
     rows returns empty ``dq`` and zero ``dkv`` gradients without binding or
-    launching.
+    launching.  ``dkv_acc`` (FP32 ``[S_dst, >= 576]``) receives the dK/dV
+    gradients in place instead -- latent columns ``0:512``, rope ``512:576`` of
+    row ``dkv_dst_map[s]`` (optional int32 ``[S]``, identity by default,
+    repeated rows sum); the caller owns zeroing and the result is
+    ``(dq_latent, dq_rope, None, None)`` (see :func:`prepare_dsa_train`).
     """
     if o_lo is None:
         raise NotImplementedError(
             "the forward produced no output residual (placeholder program); backward is unavailable"
         )
+    if dkv_acc is not None and dkv_fp32:
+        raise ValueError(
+            "dkv_acc accumulates the dK/dV gradients in place; dkv_fp32 outputs are not produced with it"
+        )
+    if dkv_dst_map is not None and dkv_acc is None:
+        raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
     dout = dout.contiguous()
     if _no_query_rows(q_latent):
-        return _empty_backward(
+        empty = _empty_backward(
             q_latent,
             q_rope,
             kv_latent,
@@ -1887,6 +2170,12 @@ def backward(
             topk_length,
             dkv_fp32,
         )
+        if dkv_acc is None:
+            return empty
+        _check_dkv_acc(
+            dkv_acc, dkv_dst_map, int(kv_latent.shape[0])
+        )  # nothing to accumulate
+        return empty[0], empty[1], None, None
     scale = (
         float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
     )
@@ -1907,6 +2196,8 @@ def backward(
             scale,
             dkv_fp32,
             key_passes,
+            dkv_acc,
+            dkv_dst_map,
         )
         binding = cache.lookup(key)
         if binding is not None:
@@ -1921,6 +2212,8 @@ def backward(
                 lse,
                 dout,
                 topk_length,
+                dkv_acc=dkv_acc,
+                dkv_dst_map=dkv_dst_map,
             )
     _check_output(out, "out", (q_latent.shape[0], NUM_HEADS, D_LATENT), torch.bfloat16)
     _check_output(
@@ -1942,6 +2235,8 @@ def backward(
         dkv_fp32=dkv_fp32,
         backward=True,
         key_passes=key_passes,
+        dkv_acc=dkv_acc,
+        dkv_dst_map=dkv_dst_map,
     )
     result = runner.backward()
     if key is not None and runner.abi == ABI_CONTRACT:
@@ -1950,7 +2245,11 @@ def backward(
 
 
 class DSASparseAttentionFunction(torch.autograd.Function):
-    """Autograd wrapper: saves ``out``, ``o_lo``, ``lse`` and the inputs for the backward."""
+    """Autograd wrapper: saves ``out``, ``o_lo``, ``lse`` and the inputs for the backward.
+
+    ``dkv_acc`` / ``dkv_dst_map`` (see :func:`backward`): the backward accumulates the dK/dV gradients into the
+    caller's packed FP32 buffer and returns no gradient for ``kv_latent`` / ``k_rope``.
+    """
 
     @staticmethod
     def forward(
@@ -1963,6 +2262,8 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         topk_length,
         softmax_scale,
         key_passes=None,
+        dkv_acc=None,
+        dkv_dst_map=None,
     ):
         out, lse, o_lo = forward(
             q_latent,
@@ -1979,6 +2280,10 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.key_passes = key_passes
         ctx.has_topk_length = topk_length is not None
+        # The packed accumulator is mutated in place by the backward (+=), so it is kept on ctx rather than saved: a
+        # saved tensor's version check would reject that mutation when the graph is retained for another backward.
+        ctx.dkv_acc = dkv_acc
+        ctx.dkv_dst_map = dkv_dst_map
         saved = [q_latent, q_rope, kv_latent, k_rope, indices, out, lse]
         saved.append(o_lo if o_lo is not None else out.new_empty(0))
         saved.append(topk_length if topk_length is not None else indices.new_empty(0))
@@ -1993,7 +2298,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
                 "gradients through lse are not supported; only out is differentiable"
             )
         if dout is None:  # out unused downstream
-            return None, None, None, None, None, None, None, None
+            return (None,) * 10
         q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo, topk_length = (
             ctx.saved_tensors
         )
@@ -2014,8 +2319,22 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             topk_length=topk_length if ctx.has_topk_length else None,
             softmax_scale=ctx.softmax_scale,
             key_passes=ctx.key_passes,
+            dkv_acc=ctx.dkv_acc,
+            dkv_dst_map=ctx.dkv_dst_map,
         )
-        return dq_latent, dq_rope, dkv_latent, dk_rope, None, None, None, None
+        # dkv_latent / dk_rope are None when the gradients went into dkv_acc; no gradient for the six other inputs
+        return (
+            dq_latent,
+            dq_rope,
+            dkv_latent,
+            dk_rope,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def dsa_sparse_attention(
@@ -2029,12 +2348,20 @@ def dsa_sparse_attention(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
+    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_dst_map: Optional[torch.Tensor] = None,
 ):
     """Differentiable sparse attention over global key indices (see the module docstring).
 
-    Inputs are validated on the first call for a binding (see :class:`BindingCache`).
-    ``key_passes`` overrides the backward's key-range-pass policy (``None`` =
-    the registered policy, 1 = single pass; see :func:`plan_key_passes`).
+    Inputs are validated on the first call for a binding (see :class:`BindingCache`);
+    strided query slices and packed key rows are consumed in place (see
+    :func:`_check_head_tensor` / :func:`_check_key_tensor`).  ``key_passes``
+    overrides the backward's key-range-pass policy (``None`` = the registered
+    policy, 1 = single pass; see :func:`plan_key_passes`).  ``dkv_acc`` (caller
+    FP32 ``[S_dst, >= 576]`` accumulated in place: latent columns ``0:512``,
+    rope ``512:576``) and ``dkv_dst_map`` (int32 ``[S]`` destination row per
+    key row, default identity) are handed to the backward; with ``dkv_acc``
+    the ``kv_latent`` / ``k_rope`` gradients are ``None``.
     """
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
@@ -2047,6 +2374,8 @@ def dsa_sparse_attention(
         topk_length,
         float(softmax_scale),
         key_passes,
+        dkv_acc,
+        dkv_dst_map,
     )
     return (out, lse) if return_lse else out
 
@@ -2062,17 +2391,28 @@ def dsa_sparse_attention_varlen(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     *,
+    causal: bool = False,
     topk_length: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
+    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_dst_map: Optional[torch.Tensor] = None,
 ):
     """Packed multi-document form: per-document ``gather_kv_indices`` are offset by
     ``cu_seqlens_k`` on device (this glue counts in the step time), then the flat
-    kernels run over the packed rows.  ``max_seqlen_q/k`` are accepted for
-    signature parity and not used on the host."""
+    kernels run over the packed rows.  Query and key segment lengths may differ
+    (the query segment is the tail of its key prefix); with ``causal=True`` the
+    offsetting also drops selected keys after the query's own position
+    ``(seqlen_k - seqlen_q) + local_q`` (:func:`offset_gather_kv_indices`); the
+    default ``causal=False`` keeps the index rows as is (the behaviour of the
+    first release).
+    ``max_seqlen_q/k`` are accepted for signature parity and not used on the
+    host.  ``dkv_acc`` / ``dkv_dst_map`` as in :func:`dsa_sparse_attention`."""
     del max_seqlen_q, max_seqlen_k
-    indices = offset_gather_kv_indices(gather_kv_indices, cu_seqlens_q, cu_seqlens_k)
+    indices = offset_gather_kv_indices(
+        gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal=causal
+    )
     return dsa_sparse_attention(
         q_latent,
         q_rope,
@@ -2083,4 +2423,6 @@ def dsa_sparse_attention_varlen(
         softmax_scale=softmax_scale,
         return_lse=return_lse,
         key_passes=key_passes,
+        dkv_acc=dkv_acc,
+        dkv_dst_map=dkv_dst_map,
     )

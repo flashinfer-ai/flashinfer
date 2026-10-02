@@ -1078,7 +1078,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_cake_dsa_h64_train_b919726fbcb4b487a4bb(CakeTensorMap const* q_latent, CakeTensorMap const* q_rope, CakeTensorMap const* kv_latent, __nv_bfloat16* __restrict__ k_rope, CakeTensorMap const* out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int k_rope_stride, int k_rope_offset, int has_topk_length, float scale_log2)
+kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, CakeTensorMap const* q_rope, CakeTensorMap const* kv_latent, __nv_bfloat16* __restrict__ k_rope, CakeTensorMap const* out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int k_rope_stride, int k_rope_offset, int has_topk_length, float scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1086,8 +1086,7 @@ kernel_cake_dsa_h64_train_b919726fbcb4b487a4bb(CakeTensorMap const* q_latent, Ca
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define q_full_addr (mbar_base + 0)

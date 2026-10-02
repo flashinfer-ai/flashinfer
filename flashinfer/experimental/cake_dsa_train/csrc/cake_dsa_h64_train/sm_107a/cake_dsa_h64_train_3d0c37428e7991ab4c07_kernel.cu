@@ -507,7 +507,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(640, 1) void
-kernel_cake_dsa_h64_train_d771b00c49e3bdfa1874(CakeTensorMap const* q_latent, CakeTensorMap const* q_rope, CakeTensorMap const* dout, CakeTensorMap const* dq_latent, CakeTensorMap const* dq_rope, CakeTensorMap const* kv_latent, CakeTensorMap const* k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts)
+kernel_cake_dsa_h64_train_3d0c37428e7991ab4c07(CakeTensorMap const* q_latent, CakeTensorMap const* q_rope, CakeTensorMap const* dout, CakeTensorMap const* dq_latent, CakeTensorMap const* dq_rope, CakeTensorMap const* kv_latent, CakeTensorMap const* k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -534,10 +534,10 @@ kernel_cake_dsa_h64_train_d771b00c49e3bdfa1874(CakeTensorMap const* q_latent, Ca
     #define p_free_addr (mbar_base + 120)
     #define ds_full_addr (mbar_base + 128)
     #define ds_free_addr (mbar_base + 136)
-    #define dkv_a_full_addr (mbar_base + 144)
-    #define dkv_a_drained_addr (mbar_base + 152)
-    #define dkr_full_addr (mbar_base + 160)
-    #define dkr_drained_addr (mbar_base + 168)
+    #define dkr_full_addr (mbar_base + 144)
+    #define dkr_drained_addr (mbar_base + 152)
+    #define dkv_a_full_addr (mbar_base + 160)
+    #define dkv_a_drained_addr (mbar_base + 168)
     #define dkv_b_full_addr (mbar_base + 176)
     #define dkv_b_drained_addr (mbar_base + 184)
 
@@ -642,13 +642,13 @@ kernel_cake_dsa_h64_train_d771b00c49e3bdfa1874(CakeTensorMap const* q_latent, Ca
             mbarrier_init(smem + 128, 128);
             // ds_free: 1 barriers, init_count=1
             mbarrier_init(smem + 136, 1);
-            // dkv_a_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 144, 1);
-            // dkv_a_drained: 1 barriers, init_count=256
-            mbarrier_init(smem + 152, 256);
             // dkr_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 160, 1);
+            mbarrier_init(smem + 144, 1);
             // dkr_drained: 1 barriers, init_count=256
+            mbarrier_init(smem + 152, 256);
+            // dkv_a_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 160, 1);
+            // dkv_a_drained: 1 barriers, init_count=256
             mbarrier_init(smem + 168, 256);
             // dkv_b_full: 1 barriers, init_count=1
             mbarrier_init(smem + 176, 1);
