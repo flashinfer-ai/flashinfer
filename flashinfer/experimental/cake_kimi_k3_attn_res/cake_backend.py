@@ -81,6 +81,7 @@ _SM103_EARLY_CONSUMED_RELEASE_CELLS = frozenset(
         (512, 4),
         (512, 8),
         (1024, 1),
+        (1024, 4),
         (1024, 8),
         (2048, 1),
         (2048, 4),
@@ -98,10 +99,22 @@ _SM103_EARLY_CONSUMED_RELEASE_CELLS = frozenset(
         (16384, 8),
     }
 )
-_SM100_K1_NC2_M = frozenset({1024, 2048, 8192})
+_SM100_K1_NC2_M = frozenset({512, 1024, 2048, 8192})
 _SM103_K1_NC2_M = frozenset({256})
 _SM103_K5_NC4_DEPTH_M = {4096: 3}
-_SM100_RELAXED_PRODUCER_WAIT_CELLS = frozenset({(512, 1)})
+# Cells (M, K) that run three sources per chunk with a depth-3 pipeline.
+_NC3_D3_CELLS = {
+    "sm_100a": frozenset({(2048, 4), (4096, 4), (8192, 4), (16384, 4), (4096, 3), (4096, 5)}),
+    "sm_103a": frozenset({(1024, 4), (2048, 4), (4096, 4)}),
+}
+# sm_100a dense cells that hold the consumed-stage release through the output stats.
+_SM100_HELD_CONSUMED_RELEASE_CELLS = frozenset({(4096, 5)})
+# K = 0 TMA route: grid multiple of the SM count on the promoted mid-M cells.
+_K0_TMA_GRID_MULTIPLIER_M = {
+    "sm_100a": {256: 2, 512: 2, 1024: 2},
+    "sm_103a": {256: 2, 512: 3, 1024: 3},
+}
+_SM100_RELAXED_PRODUCER_WAIT_CELLS: frozenset[tuple[int, int]] = frozenset()
 _SM103_RELAXED_PRODUCER_WAIT_CELLS = frozenset({(4096, 5)})
 _NATIVE_ROUTES = (
     # name, {arch: routed M}, num_blocks, PDL modes, consumed-release policy
@@ -116,7 +129,7 @@ _NATIVE_ROUTES = (
         "m128",
         {
             "sm_100a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 1024}),
-            "sm_103a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 256, 1024}),
+            "sm_103a": frozenset({1, 2, 4, 8, 16, 32, 64, 128, 256}),
         },
         4,
         (False, True),
@@ -131,14 +144,14 @@ _NATIVE_ROUTES = (
     ),
     (
         "k7",
-        {"sm_100a": frozenset({1}), "sm_103a": frozenset()},
+        {"sm_100a": frozenset({1}), "sm_103a": frozenset({1})},
         7,
         (False,),
         "native_all_reader_nofence_before_wait_st",
     ),
     (
         "k8",
-        {"sm_100a": frozenset({1, 2, 4, 8, 32}), "sm_103a": frozenset({256})},
+        {"sm_100a": frozenset({1, 2, 4, 8, 32, 256}), "sm_103a": frozenset({1, 8, 256})},
         8,
         (False, True),
         "native_all_reader_nofence_before_wait_st",
@@ -195,6 +208,8 @@ def _wait_policy(arch: str) -> bool:
 
 def _schedule(arch: str, M: int, K: int) -> tuple[int, int]:
     """``(sources_per_chunk, chunk_depth)`` of the persistent common path."""
+    if (M, K) in _NC3_D3_CELLS[arch]:
+        return 3, 3
     if arch == "sm_100a":
         if K == 0 and M in {1, 2, 16, 32, 64, 512, 2048, 4096, 8192, 16384}:
             return 1, PERSISTENT_CHUNK_DEPTH
@@ -230,7 +245,7 @@ def _grid(M: int, num_sms: int, sources_per_chunk: int) -> tuple[int, str]:
 
 def _early_consumed_release(arch: str, M: int, K: int, grid_x: int) -> bool:
     if arch == "sm_100a":
-        return K > 0 and grid_x < M
+        return K > 0 and grid_x < M and (M, K) not in _SM100_HELD_CONSUMED_RELEASE_CELLS
     return K > 0 and grid_x < M and (M, K) in _SM103_EARLY_CONSUMED_RELEASE_CELLS
 
 
@@ -310,9 +325,13 @@ def plan_route(
             use_pdl,
         )
     if K == 0:
-        grid_x = min(M, num_sms)
+        multiplier = _K0_TMA_GRID_MULTIPLIER_M[arch].get(M)
+        if multiplier is None:
+            grid_x, grid_policy = min(M, num_sms), "token_or_full_sm"
+        else:
+            grid_x, grid_policy = multiplier * num_sms, f"full_sm_x{multiplier}"
         schedule_id = "k0_tma_persistent_ws288_vec128_fp32x2"
-        route_id = f"{schedule_id}.{arch}.none_k0.k0.delta1.write0.norm1.pdl{int(use_pdl)}.token_or_full_sm"
+        route_id = f"{schedule_id}.{arch}.none_k0.k0.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
         return RoutePlan(
             "k0_tma",
             "k0_tma",
