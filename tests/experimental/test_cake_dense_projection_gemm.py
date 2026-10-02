@@ -908,7 +908,15 @@ def test_instance_key_rejects_bad_configurations():
     with pytest.raises(ValueError, match="group_m"):
         instance_key(a_mn=False, b_mn=False, group_m=0)
     key = instance_key(a_mn=False, b_mn=False)
-    assert len(key) == 16 and key[11:] == (0, "none", ("none", "none"), 16, False)
+    # 17 fields since round 7: pf, promo, hints, group_m, f32_v8, quad_store
+    assert len(key) == 17 and key[11:] == (
+        0,
+        "none",
+        ("none", "none"),
+        16,
+        False,
+        False,
+    )
 
 
 @pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
