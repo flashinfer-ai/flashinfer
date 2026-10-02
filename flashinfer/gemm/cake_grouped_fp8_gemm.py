@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Prepared contiguous grouped FP8 GEMM launches on Blackwell SM100a.
+"""Prepared contiguous grouped FP8 GEMM launches on Blackwell (SM100a, SM103a).
 
 This is the generated Cake program family for the same mathematical
 contract as :func:`flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous`:
@@ -10,16 +10,18 @@ b_scale[g_r, :, q]`` with FP8 E4M3 operands, per-row 128-wide K-block A scales,
 Rows are routed to experts by the sorted ``m_indices`` vector.  Unlike the
 CuTe-DSL kernel, internal expert boundaries need not be aligned to 128 rows.
 
-The host side selects one exact kernel route per problem shape and output
-alignment, resolves the launch grid from the device SM count, and binds the
-positional argument plan of the registered program.  Descriptor storage for
-the pointer TMA ABI is private to each prepared launch: the first ``launch()``
-initializes it synchronously and must run outside CUDA Graph capture; later
-launches only submit work on the current stream and may be captured.
+The host side selects one kernel route per problem shape and output
+alignment, resolves the launch grid from the device SM count (queried once per
+device), and binds the positional argument plan of the registered program.
+Tensor maps are encoded by the binding and passed to the kernel by value, so a
+prepared launch owns no descriptor storage: every ``launch()`` submits exactly
+one kernel on the current stream and may be captured into a CUDA graph,
+including the first one.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -28,9 +30,12 @@ import torch
 import tvm_ffi
 
 from ..jit.gemm.cake_grouped_fp8_gemm import (
+    ARG_PLANS,
     MODULES,
+    PROGRAMS,
     ROUTE_GEOMETRY,
     SUPPORTED_COMPUTE_CAPABILITIES,
+    device_arch,
     generated_program_available,
     load_cake_grouped_fp8_gemm_module,
     select_module,
@@ -67,7 +72,7 @@ _CG2_GRID128_SHAPES = frozenset({(4096, 2048, 4096), (4096, 4096, 1024)})
 
 
 def route_for_shape(m: int, n: int, k: int) -> str:
-    """Select the exact kernel route for a 16-byte-aligned BF16 output."""
+    """Select the kernel route for a 16-byte-aligned BF16 output."""
     if (m, n, k) == (4096, 2048, 4096):
         return DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE
     if (m, n, k) == (4096, 4096, 1024):
@@ -132,6 +137,16 @@ def launch_plan(
     return resolve_route_for_grid(route, n, grid), grid
 
 
+@functools.cache
+def device_sm_count(device_index: int) -> int:
+    """Streaming-multiprocessor count of CUDA device ``device_index`` (queried once)."""
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def _device_index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else int(device.index)
+
+
 def _require_tensor(
     tensor: Any,
     name: str,
@@ -157,15 +172,19 @@ def _require_tensor(
 
 
 def _validate_indices(m_indices: torch.Tensor, groups: int) -> None:
-    """Synchronizing check of the routing contract (sorted, in range)."""
+    """Check the routing contract (in range, sorted) with one device-to-host transfer."""
     indices = m_indices.to(torch.int64)
-    lowest = int(indices.min())
-    highest = int(indices.max())
+    unsorted = (
+        (indices[1:] < indices[:-1]).sum()
+        if indices.numel() > 1
+        else torch.zeros((), dtype=torch.int64, device=indices.device)
+    )
+    lowest, highest, unsorted = torch.stack((indices.min(), indices.max(), unsorted)).tolist()
     if lowest < 0 or highest >= groups:
         raise ValueError(
             "m_indices must satisfy 0 <= index < num_groups; -1 padding is unsupported"
         )
-    if indices.numel() > 1 and not bool((indices[1:] >= indices[:-1]).all()):
+    if unsorted:
         raise ValueError("m_indices must be sorted in nondecreasing order")
 
 
@@ -176,8 +195,8 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
     Tensor storage, shapes and dtypes are bound at preparation; tensor
     *contents* may change between launches.  ``launch()`` submits exactly one
     kernel on PyTorch's current stream for the bound device and returns the
-    output tensor.  The first launch initializes private TMA descriptor storage
-    and must run outside CUDA Graph capture.
+    output tensor.  Every launch, including the first, may be captured into a
+    CUDA graph; the prepared object retains no device memory of its own.
     """
 
     route: str
@@ -186,7 +205,6 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
     out: torch.Tensor
     _entry: Callable[..., Any]
     _arguments: tuple[Any, ...]
-    _descriptor_storage: torch.Tensor
 
     def launch(self) -> torch.Tensor:
         with torch.cuda.device(self.out.device), tvm_ffi.use_torch_stream():
@@ -207,6 +225,28 @@ def is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available(
     return device.type == "cuda" and generated_program_available(device)
 
 
+def bind_arguments(
+    arg_plan: list[list[str]],
+    bindings: dict[str, Any],
+    grid: tuple[int, int, int],
+    *,
+    module_name: str,
+) -> tuple[Any, ...]:
+    """Order ``bindings`` by the generated program's positional argument plan."""
+    grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
+    arguments = []
+    for kind, name in arg_plan:
+        if kind == "grid":
+            arguments.append(grid_by_axis[name])
+        elif kind in ("tma_buffer", "buffer", "parameter") and name in bindings:
+            arguments.append(bindings[name])
+        else:
+            raise RuntimeError(
+                f"generated program {module_name} binds {kind} {name!r}, which this host plan does not declare"
+            )
+    return tuple(arguments)
+
+
 def prepare_group_gemm_fp8_nt_groupwise_contiguous(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -217,7 +257,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
     *,
     validate_indices: bool = False,
 ) -> PreparedGroupGemmFp8NtGroupwiseContiguous:
-    r"""Prepare a contiguous grouped FP8 GEMM launch on SM100a.
+    r"""Prepare a contiguous grouped FP8 GEMM launch on SM100a / SM103a.
 
     Parameters
     ----------
@@ -240,7 +280,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         A 2-byte-aligned output whose address is not a multiple of 16 selects
         the scalar-store route.
     validate_indices : bool
-        Check index range and sortedness with a device synchronization.
+        Check index range and sortedness (one device-to-host transfer).
 
     Returns
     -------
@@ -249,21 +289,24 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
 
     Notes
     -----
-    Requires an SM100a (compute capability 10.0) device and a registered
-    generated program for the selected route.  All tensors must live on the
-    same CUDA device and, except ``out``, be 16-byte aligned.  Index values are
-    unchecked unless ``validate_indices=True``; violating the routing contract
-    is undefined behavior.
+    Requires an SM100a (compute capability 10.0) or SM103a (10.3) device and a
+    registered generated program for the selected route.  All tensors must
+    live on the same CUDA device and, except ``out``, be 16-byte aligned.
+    Preparation performs no device work: the SM count of the device is read
+    once per process, and the first launch is as graph-capturable as every
+    later one.  Index values are unchecked unless ``validate_indices=True``;
+    violating the routing contract is undefined behavior.
     """
     if not isinstance(a, torch.Tensor) or a.device.type != "cuda":
         raise ValueError("a must be a CUDA torch.Tensor")
     device = a.device
-    capability = torch.cuda.get_device_capability(device)
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
+    device_index = _device_index(device)
+    arch = device_arch(device_index)
     if arch is None:
         raise NotImplementedError(
-            "prepared contiguous grouped FP8 GEMM requires an SM100a device "
-            f"(compute capability 10.0); got {capability}"
+            "prepared contiguous grouped FP8 GEMM requires an SM100a or SM103a device "
+            f"(compute capability {sorted(SUPPORTED_COMPUTE_CAPABILITIES)}); "
+            f"got {torch.cuda.get_device_capability(device_index)}"
         )
     if a.ndim != 2 or b.ndim != 3:
         raise ValueError("a must have shape (M, K) and b must have shape (G, N, K)")
@@ -301,12 +344,13 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         _validate_indices(m_indices, groups)
 
     scalar_output = bool(int(out.data_ptr()) % 16)
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    route, grid = launch_plan(m, n, k, sm_count=sm_count, scalar_output=scalar_output)
+    route, grid = launch_plan(
+        m, n, k, sm_count=device_sm_count(device_index), scalar_output=scalar_output
+    )
     module_name = select_module(arch, route)
-    record = MODULES[module_name]
+    program = PROGRAMS[MODULES[module_name]["program"]]
     module = load_cake_grouped_fp8_gemm_module(module_name)
-    entry = getattr(module, record["ffi_entry"])
+    entry = getattr(module, program["ffi_entry"])
 
     # The scalar-store route never reads its output tensor map; the validated
     # A tensor provides an aligned BF16 view with a compatible descriptor.
@@ -324,36 +368,22 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         "K": k,
         "G": groups,
     }
-    workspace_bytes = int(record["tma_workspace_bytes"])
-    descriptor_storage = torch.empty(
-        max(workspace_bytes, 128), dtype=torch.uint8, device=device
-    )
-    grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
-    arguments = []
-    for kind, name in record["arg_plan"]:
-        if kind == "grid":
-            arguments.append(grid_by_axis[name])
-        elif kind == "workspace":
-            arguments.append(descriptor_storage)
-        elif name in bindings:
-            arguments.append(bindings[name])
-        else:
-            raise RuntimeError(
-                f"generated program {module_name} binds {name!r}, which this host plan does not declare"
-            )
     return PreparedGroupGemmFp8NtGroupwiseContiguous(
         route=route,
         module_name=module_name,
         grid=grid,
         out=out,
         _entry=entry,
-        _arguments=tuple(arguments),
-        _descriptor_storage=descriptor_storage,
+        _arguments=bind_arguments(
+            ARG_PLANS[program["arg_plan"]], bindings, grid, module_name=module_name
+        ),
     )
 
 
 __all__ = [
     "PreparedGroupGemmFp8NtGroupwiseContiguous",
+    "bind_arguments",
+    "device_sm_count",
     "is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available",
     "launch_plan",
     "prepare_group_gemm_fp8_nt_groupwise_contiguous",
