@@ -62,8 +62,8 @@ def device_arch(device) -> str:
 
 
 @functools.cache
-def load_program(arch: str, name: str):
-    """Compile ``name`` for the exact architecture of the attached device; returns ``(module, spec)``."""
+def program_spec(arch: str, name: str):
+    """JIT spec of program ``name`` for architecture ``arch`` (one of the program's exported architectures)."""
     from ...jit import env
     from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
@@ -71,7 +71,7 @@ def load_program(arch: str, name: str):
     if arch not in record["arches"]:
         raise RuntimeError(f"program {name} is not exported for {arch}")
     flags = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
-    spec = gen_jit_spec(
+    return gen_jit_spec(
         name=f"{name}_{arch}",
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
@@ -85,6 +85,11 @@ def load_program(arch: str, name: str):
         extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
         use_fast_math=False,  # Only the program's own compile flags select fast math.
     )
+
+
+def load_program(arch: str, name: str):
+    """Compile ``name`` for the exact architecture of the attached device; returns ``(module, spec)``."""
+    spec = program_spec(arch, name)
     return spec.build_and_load(), spec
 
 
