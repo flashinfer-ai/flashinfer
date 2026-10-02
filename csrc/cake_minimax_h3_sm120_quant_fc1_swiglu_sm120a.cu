@@ -6219,9 +6219,9 @@ using minimax_h3_sm120::EncodeByteTile;
 
 struct DeviceTag {};
 
-int ConfigureKernels() {
+int ConfigureKernels(int device_id) {
   return minimax_h3_sm120::DeviceConfig<DeviceTag, int>::Get(
-      "MiniMax-H3 SM120 quantized FC1+SwiGLU", [](const cudaDeviceProp& properties) {
+      "MiniMax-H3 SM120 quantized FC1+SwiGLU", device_id, [](const cudaDeviceProp& properties) {
         for (const auto& variant : kGemmVariants) {
           minimax_h3_sm120::OptInDynamicSmem(variant.kernel, variant.dynamic_smem_bytes);
         }
@@ -6263,7 +6263,7 @@ CommonArgs CheckCommon(const TensorView& x, const TensorView& x_norm_weight, con
   CheckTensor(adaln_index, "adaln_index", args.device, dl_int32, {args.rows});
   CheckTensor(out, "out", args.device, dl_bfloat16, {args.rows, kFfn});
   args.out = static_cast<unsigned int*>(out.data_ptr());
-  args.num_sms = ConfigureKernels();
+  args.num_sms = ConfigureKernels(args.device.device_id);
   args.stream = get_stream(args.device);
   args.plan = MakeLaunchPlan(args.rows, args.num_sms);
   return args;

@@ -7190,9 +7190,9 @@ using minimax_h3_sm120::EncodeByteTile;
 
 struct DeviceTag {};
 
-int ConfigureKernels() {
+int ConfigureKernels(int device_id) {
   return minimax_h3_sm120::DeviceConfig<DeviceTag, int>::Get(
-      "MiniMax-H3 SM120 quantized pre-attention", [](const cudaDeviceProp& properties) {
+      "MiniMax-H3 SM120 quantized pre-attention", device_id, [](const cudaDeviceProp& properties) {
         for (const auto& row : kGemmVariants) {
           for (const auto& variant : row) {
             minimax_h3_sm120::OptInDynamicSmem(variant.kernel, variant.dynamic_smem_bytes);
@@ -7280,7 +7280,7 @@ CommonArgs CheckCommon(const TensorView& x, const TensorView& x_norm_weight, con
   args.q_out = static_cast<unsigned int*>(q.data_ptr());
   args.k_out = static_cast<unsigned int*>(k.data_ptr());
   args.v_out = static_cast<unsigned int*>(v.data_ptr());
-  args.num_sms = ConfigureKernels();
+  args.num_sms = ConfigureKernels(args.device.device_id);
   args.stream = get_stream(args.device);
   args.plan = MakeLaunchPlan(args.rows, args.num_sms);
   return args;

@@ -2780,9 +2780,9 @@ struct DeviceInfo {
 
 struct DeviceTag {};
 
-DeviceInfo ConfigureKernels() {
+DeviceInfo ConfigureKernels(int device_id) {
   return minimax_h3_sm120::DeviceConfig<DeviceTag, DeviceInfo>::Get(
-      "MiniMax-H3 SM120 FP8 varlen attention", [](const cudaDeviceProp& properties) {
+      "MiniMax-H3 SM120 FP8 varlen attention", device_id, [](const cudaDeviceProp& properties) {
         minimax_h3_sm120::OptInDynamicSmem(
             h3_varlen_attention_fp8_sm120a::kernel_minimax_h3_sm120_varlen_attention_fp8, kAttentionSmemBytes);
         return DeviceInfo{properties.multiProcessorCount};
@@ -2868,7 +2868,7 @@ void minimax_h3_sm120_varlen_attention_fp8(TensorView q, TensorView k, TensorVie
 
   ffi::CUDADeviceGuard device_guard(device.device_id);
   const cudaStream_t stream = get_stream(device);
-  const DeviceInfo info = ConfigureKernels();
+  const DeviceInfo info = ConfigureKernels(device.device_id);
   if (tokens == 0 || num_units == 0) return;  // no rows to write (all segments empty)
   const int cta_cap = 4 * info.num_sms;
   const int heads_i = static_cast<int>(heads);

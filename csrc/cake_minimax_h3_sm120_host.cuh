@@ -146,30 +146,29 @@ inline void OptInDynamicSmem(Kernel* kernel, int bytes) {
 
 // Per-device configuration, resolved once per (module, device): the GB202 check, the module's dynamic
 // shared memory opt-ins and whatever ``init`` derives from the device properties (SM count, occupancy).
+// ``device_id`` is the device of the operator's tensors; the lookup, the property query and the opt-ins run
+// under a guard for that device, so the active device at call time does not matter.
 // ``Tag`` is a type private to the including translation unit, so every module owns its own cache: the
 // opt-ins are per module and must not be skipped because another module configured the device.
 template <class Tag, class Info>
 struct DeviceConfig {
   template <class Init>
-  static Info Get(const char* what, Init&& init) {
+  static Info Get(const char* what, int device_id, Init&& init) {
     static std::mutex mutex;
     static std::vector<std::pair<int, Info>> configured;
-    int device = -1;
-    cudaError_t status = cudaGetDevice(&device);
-    TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-        << "failed to get the active CUDA device: " << cudaGetErrorString(status);
     std::lock_guard<std::mutex> lock(mutex);
     for (const auto& entry : configured) {
-      if (entry.first == device) return entry.second;
+      if (entry.first == device_id) return entry.second;
     }
+    ffi::CUDADeviceGuard device_guard(device_id);
     cudaDeviceProp properties{};
-    status = cudaGetDeviceProperties(&properties, device);
+    cudaError_t status = cudaGetDeviceProperties(&properties, device_id);
     TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
         << "failed to query CUDA device properties: " << cudaGetErrorString(status);
     TVM_FFI_CHECK(properties.major == 12, RuntimeError)
         << what << " requires compute capability 12.x (GB202); got " << properties.major << "." << properties.minor;
     Info info = init(properties);
-    configured.emplace_back(device, info);
+    configured.emplace_back(device_id, info);
     return info;
   }
 };
