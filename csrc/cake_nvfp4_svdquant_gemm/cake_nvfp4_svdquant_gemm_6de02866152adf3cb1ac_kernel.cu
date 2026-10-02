@@ -26,12 +26,9 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -40,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128-byte aligned");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -72,10 +68,7 @@ static_assert(alignof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128-byt
 #define SMEM_SMEM_OUT_OFF 203776
 #define SMEM_SMEM_OUT_STAGE_BYTES 8192
 #define SMEM_SMEM_OUT_STRIDE 8192
-#define SMEM_SMEM_BIAS_PAIRS_OFF 220160
-#define SMEM_SMEM_BIAS_PAIRS_STAGE_BYTES 256
-#define SMEM_SMEM_BIAS_PAIRS_STRIDE 256
-#define SMEM_TOTAL 220416
+#define SMEM_TOTAL 220160
 #define THREADS 256
 
 #include <math_constants.h>
@@ -99,169 +92,23 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
-}
 
 
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-// Match CUTLASS ClusterBarrier::wait: a large suspendTimeHint lets the hardware
-// take the blocking phase-check slowpath instead of spinning on TRYWAIT misses.
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT:\n\t"
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
+        " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
 }
 
 
@@ -281,28 +128,36 @@ __device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs(
 }
 
 
+__device__ __forceinline__ void tcgen05_mma_f16(
+    int taddr, uint64_t a_desc, uint64_t b_desc,
+    uint32_t i_desc, int enable_input_d) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t"
+        "}\n"
+        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
+           "r"(i_desc), "r"(enable_input_d)
+         : "memory");
+}
+
+
 __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
     return (x & 0x3FFFFULL) >> 4ULL;
 }
 
 
-__device__ __forceinline__ void mma_ss_step(
-    int a_lo, int b_lo, int taddr, uint32_t i_desc, int enable_d,
-    uint32_t a_dhi, uint32_t b_dhi) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader, p;\n\t"
-        ".reg .b32 adhi, bdhi;\n\t"
-        ".reg .b64 da, db;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "mov.b32 adhi, %5;\n\t"
-        "mov.b32 bdhi, %6;\n\t"
-        "mov.b64 da, {%0, adhi};\n\t"
-        "mov.b64 db, {%1, bdhi};\n\t"
-        "@leader tcgen05.mma.cta_group::1.kind::mxf4nvf4 [%2], da, db, %3, p;\n\t"
-        "}\n"
-        :: "r"(a_lo), "r"(b_lo), "r"(taddr), "r"(i_desc), "r"(enable_d), "r"(a_dhi), "r"(b_dhi));
+union MmaSmemDesc {
+    uint64_t u64;
+    uint32_t u32[2];
+};
+
+__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
+    MmaSmemDesc tmp;
+    tmp.u64 = smem_desc;
+    tmp.u32[0] += offset;
+    smem_desc = tmp.u64;
 }
 
 
@@ -318,12 +173,6 @@ __device__ __forceinline__ void elect_commit(int mbar_addr) {
 }
 
 
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
 
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
     asm volatile(
@@ -332,36 +181,7 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
-__device__ __forceinline__ void tmem_ld_x32(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7,"
-        "  %8, %9, %10, %11, %12, %13, %14, %15,"
-        "  %16, %17, %18, %19, %20, %21, %22, %23,"
-        "  %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
-          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
-          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15]),
-          "=f"(dst[16]), "=f"(dst[17]), "=f"(dst[18]), "=f"(dst[19]),
-          "=f"(dst[20]), "=f"(dst[21]), "=f"(dst[22]), "=f"(dst[23]),
-          "=f"(dst[24]), "=f"(dst[25]), "=f"(dst[26]), "=f"(dst[27]),
-          "=f"(dst[28]), "=f"(dst[29]), "=f"(dst[30]), "=f"(dst[31])
-        : "r"(tmem_addr));
-}
 
-
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-
-__device__ __forceinline__ uint64_t make_sf_cp_desc_sbo256(int addr) {
-    const int SBO = 256;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL);
-}
 
 
 __device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo256(int lo) {
@@ -379,14 +199,6 @@ __device__ __forceinline__ void tcgen05_cp_32x128b_warpx4(
         :: "r"(taddr), "l"(s_desc));
 }
 
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
 
 
 __device__ __forceinline__ void tma_3d_gmem2smem(
@@ -431,13 +243,6 @@ __device__ __forceinline__ void tma_store_2d(
 }
 
 
-__device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
@@ -449,16 +254,20 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(256, 1) void
-kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* SFA, CakeTensorMap const* SFB, CakeTensorMap const* D, CakeTensorMap const* L1, float* __restrict__ alpha, __nv_bfloat16* __restrict__ bias, CakeTensorMap const* out, int M, int N, int K_tiles, int rank_tiles, int grid_n, int has_bias)
+kernel_cake_nvfp4_svdquant_gemm_6de02866152adf3cb1ac(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap D, const __grid_constant__ CUtensorMap L1, float* __restrict__ alpha, __nv_bfloat16* __restrict__ bias, const __grid_constant__ CUtensorMap out, int M, int N, int K_tiles, int rank_tiles, int grid_n, int has_bias)
 {
     const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    uint32_t lane;
-    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -467,18 +276,8 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 184);
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(SFA)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(SFB)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(D)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(L1)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(out)) : "memory");
-    }
-    __syncthreads();
 
+    const int cta_rank = 0;
 
     // Kernel setup ops
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
@@ -495,8 +294,6 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
     const int smem_l1_addr = smem + 9216;
     __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 203776);
     const int smem_out_addr = smem + 203776;
-    unsigned int* smem_bias_pairs = reinterpret_cast<unsigned int*>(smem_raw + 220160);
-    const int smem_bias_pairs_addr = smem + 220160;
 
     // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 23 barriers)
     // Mbarriers at smem_raw[0..184)
@@ -539,14 +336,16 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
     __syncwarp();
 
     // TMEM alloc (256 columns, 144 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 184);
     if (warp == 0) {
         int _tmem_hold = smem + 184;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
     __syncthreads();
-    asm volatile("tcgen05.fence::after_thread_sync;");
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];
 
@@ -607,30 +406,18 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 int _mma_a_lo_2 = make_warp_uniform((((smem_d_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
                 int _mma_b_lo_2 = make_warp_uniform((((smem_l1_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x80004020;\n\t"
-                    "mov.b32 bdhi, 0x80004020;\n\t"
-                    "mov.b32 id, 136316048;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_accum), "r"(1));
+                {
+                    uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
+                    uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_mma_b_lo_2);
+                    if (elect_sync()) {
+                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                    }
+                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                    if (elect_sync()) {
+                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                    }
+                }
                 elect_commit(tma_empty_addr + (mma_stage) * 8);
                 mma_stage += 1;
                 if (mma_stage == 11) { mma_stage = 0; _phase_tma_full ^= 1; }
@@ -642,12 +429,12 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
     if (warp == 1) {
         { // mainloop_prefetch_main
             if (elect_sync()) {
-                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(A)) : "memory");
-                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(B)) : "memory");
-                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(SFA)) : "memory");
-                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(SFB)) : "memory");
-                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(D)) : "memory");
-                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(L1)) : "memory");
+                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory");
+                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B))) : "memory");
+                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFA))) : "memory");
+                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFB))) : "memory");
+                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&D))) : "memory");
+                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&L1))) : "memory");
             }
         }
     }
@@ -665,10 +452,10 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
                 for (unsigned int k_tile = 0; k_tile < K_tiles; k_tile++) {
                     mbarrier_wait(tma_empty_addr + (load_stage) * 8, _phase_tma_empty);
                     mbarrier_arrive_expect_tx(tma_full_addr + (load_stage) * 8, 18432);
-                    tma_3d_gmem2smem(smem_a_addr + load_stage * 18432, A, 0, off_m, k_tile, tma_full_addr + (load_stage) * 8);
-                    tma_3d_gmem2smem(smem_b_addr + load_stage * 18432, B, 0, off_n, k_tile, tma_full_addr + (load_stage) * 8);
-                    tma_5d_gmem2smem(smem_sfa_addr + load_stage * 18432, SFA, 0, 0, 2 * k_tile, 0, bid_m, tma_full_addr + (load_stage) * 8);
-                    tma_5d_gmem2smem(smem_sfb_addr + load_stage * 18432, SFB, 0, 0, 2 * k_tile, 0, bid_n, tma_full_addr + (load_stage) * 8);
+                    tma_3d_gmem2smem(smem_a_addr + load_stage * 18432, (&A), 0, off_m, k_tile, tma_full_addr + (load_stage) * 8);
+                    tma_3d_gmem2smem(smem_b_addr + load_stage * 18432, (&B), 0, off_n, k_tile, tma_full_addr + (load_stage) * 8);
+                    tma_5d_gmem2smem(smem_sfa_addr + load_stage * 18432, (&SFA), 0, 0, 2 * k_tile, 0, bid_m, tma_full_addr + (load_stage) * 8);
+                    tma_5d_gmem2smem(smem_sfb_addr + load_stage * 18432, (&SFB), 0, 0, 2 * k_tile, 0, bid_n, tma_full_addr + (load_stage) * 8);
                     load_stage += 1;
                     if (load_stage == 11) { load_stage = 0; _phase_tma_empty ^= 1; }
                 }
@@ -677,10 +464,10 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
                     int rank_offset = rank_tile * 32;
                     mbarrier_wait(tma_empty_addr + (load_stage) * 8, _phase_tma_empty);
                     mbarrier_arrive_expect_tx(tma_full_addr + (load_stage) * 8, 18432);
-                    tma_2d_gmem2smem(smem_d_addr + load_stage * 18432, D, rank_offset, off_m, tma_full_addr + (load_stage) * 8);
-                    tma_2d_gmem2smem(smem_l1_addr + load_stage * 18432, L1, rank_offset, off_n, tma_full_addr + (load_stage) * 8);
-                    tma_5d_gmem2smem(smem_sfa_addr + load_stage * 18432, SFA, 0, 0, 0, 0, bid_m, tma_full_addr + (load_stage) * 8);
-                    tma_5d_gmem2smem(smem_sfb_addr + load_stage * 18432, SFB, 0, 0, 0, 0, bid_n, tma_full_addr + (load_stage) * 8);
+                    tma_2d_gmem2smem(smem_d_addr + load_stage * 18432, (&D), rank_offset, off_m, tma_full_addr + (load_stage) * 8);
+                    tma_2d_gmem2smem(smem_l1_addr + load_stage * 18432, (&L1), rank_offset, off_n, tma_full_addr + (load_stage) * 8);
+                    tma_5d_gmem2smem(smem_sfa_addr + load_stage * 18432, (&SFA), 0, 0, 0, 0, bid_m, tma_full_addr + (load_stage) * 8);
+                    tma_5d_gmem2smem(smem_sfb_addr + load_stage * 18432, (&SFB), 0, 0, 0, 0, bid_n, tma_full_addr + (load_stage) * 8);
                     load_stage += 1;
                     if (load_stage == 11) { load_stage = 0; _phase_tma_empty ^= 1; }
                 }
@@ -691,7 +478,7 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
     if (warp == 3) {
         { // output_prefetch_main
             if (elect_sync()) {
-                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(out)) : "memory");
+                asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&out))) : "memory");
             }
         }
     }
@@ -703,21 +490,6 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
             int bid_n_1 = bid - bid_m_1 * grid_n;
             int off_m_1 = bid_m_1 * 128;
             int off_n_1 = bid_n_1 * 128;
-            int epi_tid = (unsigned int)(epi_warp * 32) + lane;
-            if (epi_tid < 64) {
-                unsigned int staged_bias_pair = 0;
-                if (has_bias != 0) {
-                    unsigned int _vec_load_0[2];
-                    {
-                        uint32_t _bf16x2_bits_0;
-                        _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(bias + off_n_1 + epi_tid * 2);
-                        _vec_load_0[0] = _bf16x2_bits_0;
-                    }
-                    staged_bias_pair = _vec_load_0[0];
-                }
-                smem_bias_pairs[epi_tid] = staged_bias_pair;
-            }
-            asm volatile("barrier.sync 1, 128;" ::: "memory");
             unsigned int _phase_acc_full_0 = 0;
             mbarrier_wait(acc_full_addr, _phase_acc_full_0);
             _phase_acc_full_0 ^= 1;
@@ -733,20 +505,17 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                     : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31])
                     : "r"(tmem_addr));
-                unsigned int bias_pairs[16];
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[0])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(0) + 3]))
-                    : "r"(smem_bias_pairs_addr + (unsigned int)(subtile * 16 * 4)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[4])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(4) + 3]))
-                    : "r"(smem_bias_pairs_addr + (unsigned int)((subtile * 16 + 4) * 4)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[8])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(8) + 3]))
-                    : "r"(smem_bias_pairs_addr + (unsigned int)((subtile * 16 + 8) * 4)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[12])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&bias_pairs[(12) + 3]))
-                    : "r"(smem_bias_pairs_addr + (unsigned int)((subtile * 16 + 12) * 4)));
-                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                asm volatile("tcgen05.wait::ld.sync.aligned;");
+                unsigned int bias_pair_lane = 0;
+                if (has_bias != 0) {
+                    unsigned int _vec_load_0[2];
+                    {
+                        uint32_t _bf16x2_bits_0;
+                        _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(bias + off_n_1 + subtile * 32 + (lane & 15) * 2);
+                        _vec_load_0[0] = _bf16x2_bits_0;
+                    }
+                    bias_pair_lane = _vec_load_0[0];
+                }
                 float result[32];
                 unsigned int bias_pair = 0;
                 unsigned int bias_lo_bits = 0;
@@ -755,11 +524,14 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
                 float bias_hi = 0.0f;
                 #pragma unroll
                 for (int j = 0; j < 16; j++) {
-                    bias_pair = bias_pairs[j];
-                    bias_lo_bits = bias_pair << 16;
-                    bias_lo = reinterpret_cast<float*>(&bias_lo_bits)[0];
-                    bias_hi_bits = bias_pair & 4294901760;
-                    bias_hi = reinterpret_cast<float*>(&bias_hi_bits)[0];
+                    if (has_bias != 0) {
+                        unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, bias_pair_lane, j);
+                        bias_pair = _shfl_0;
+                        bias_lo_bits = bias_pair << 16;
+                        bias_lo = reinterpret_cast<float*>(&bias_lo_bits)[0];
+                        bias_hi_bits = bias_pair & 4294901760u;
+                        bias_hi = reinterpret_cast<float*>(&bias_hi_bits)[0];
+                    }
                     result[2 * j] = _tmem_load_0[2 * j] * alpha_value + bias_lo;
                     result[2 * j + 1] = _tmem_load_0[2 * j + 1] * alpha_value + bias_hi;
                 }
@@ -774,7 +546,7 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                     if (warp == 4) {
                         if (elect_sync()) {
-                            tma_store_2d(out, off_n_1 + (subtile - 1) * 32, off_m_1, smem_out_addr + store_stage * 8192);
+                            tma_store_2d((&out), off_n_1 + (subtile - 1) * 32, off_m_1, smem_out_addr + store_stage * 8192);
                         }
                     }
                     if (warp == 4) {
@@ -784,7 +556,7 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                     store_stage = store_stage ^ 1;
                 }
-                int out_stage_row = store_stage * 128 + (unsigned int)(epi_warp * 32) + lane;
+                int out_stage_row = store_stage * 128 + (unsigned int)(epi_warp * 32) + (unsigned int)lane;
                 unsigned int out_abs = smem_out_addr + (unsigned int)(out_stage_row * 64);
                 unsigned int out_swz = out_abs / 8 & 48;
                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (0 ^ out_swz)))), "r"(result_bf16[0]), "r"(result_bf16[1]), "r"(result_bf16[2]), "r"(result_bf16[3]) : "memory");
@@ -796,7 +568,7 @@ kernel_cake_nvfp4_svdquant_gemm_sm103a_3c3f5ad40f2109f9f735(CakeTensorMap const*
             asm volatile("barrier.sync 1, 128;" ::: "memory");
             if (warp == 4) {
                 if (elect_sync()) {
-                    tma_store_2d(out, off_n_1 + 96, off_m_1, smem_out_addr + store_stage * 8192);
+                    tma_store_2d((&out), off_n_1 + 96, off_m_1, smem_out_addr + store_stage * 8192);
                 }
             }
             if (warp == 4) {
