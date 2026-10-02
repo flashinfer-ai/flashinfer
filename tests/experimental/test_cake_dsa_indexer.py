@@ -533,6 +533,99 @@ def test_exact_cases_match_closed_form(name):
             )
 
 
+# the scaled geometry of the exact cases, small enough for the sequential CPU reference
+_SCALED_EXACT = dict(num_queries=24, num_keys=1024)
+
+
+@pytest.mark.parametrize("name", list(ref.EXACT_CASES))
+def test_scaled_exact_cases_match_closed_form(name):
+    inputs = ref.make_exact_case(name, "cpu", **_SCALED_EXACT)
+    assert (inputs.seg_q_len, inputs.seg_k_len, inputs.offsets()) == (
+        [24],
+        [1024],
+        [1000],
+    )
+    assert 256 <= inputs.top_k <= 257
+    result = ref.select_reference(inputs, order="sequential")
+    score = ref.exact_closed_form(inputs)
+    ids = result.indices.tolist()
+    s32 = result.scores.tolist()
+    s64 = result.scores_fp64.tolist()
+    visible = result.visible.tolist()
+    for t in range(inputs.num_queries):
+        selected = ids[t][: int(result.selected_count[t])]
+        assert len(selected) == inputs.top_k and all(j >= 0 for j in selected)
+        chosen = [score(t, j) for j in selected]
+        for c, (j, expected) in enumerate(zip(selected, chosen, strict=True)):
+            assert s64[t][c] == expected and s32[t][c] == expected, (name, t, c, j)
+        rest = [score(t, j) for j in range(visible[t]) if j not in set(selected)]
+        if name == "distinct":
+            assert len(set(chosen)) == len(chosen)
+            if visible[t] == 1024:
+                assert len({score(t, j) for j in range(1024)}) == 1024
+        elif name == "cutoff_ties":
+            if visible[t] == 1024:
+                assert min(chosen) == max(rest), "the cut must fall inside a tie group"
+        elif name == "all_equal":
+            assert len(set(chosen)) == 1 and set(rest) == set(chosen)
+        elif name == "negative":
+            assert all((v < 0) if t % 3 == 0 else (v > 0) for v in chosen)
+        elif name == "few_winners_large_tie":
+            base = score(t, 0)
+            winners = {w for w in (3, 232, 511, 512, 1023) if w < visible[t]}
+            assert {j for j in selected if score(t, j) != base} == winners
+            assert all(v == base for v in rest)
+    if name == "signed_zeros":
+        bits = result.scores.view(torch.int32)
+        zero = (result.scores == 0) & (result.indices >= 0)
+        assert bool(zero.any(dim=1).all()), (
+            "zero-score keys must reach the selector boundary on every row"
+        )
+        assert bool((bits[zero] == 0).all())
+        even = torch.arange(inputs.num_queries) % 2 == 0
+        assert bool(zero[even].any()) and bool(zero[~even].any())
+        assert bool(((result.scores > 0) & (result.indices >= 0))[~even].any())
+        assert not bool(((result.scores > 0) & (result.indices >= 0))[even].any())
+
+
+def test_scaled_exact_cases_reject_unusable_geometries():
+    with pytest.raises(ValueError):
+        ref.make_exact_case("distinct", "cpu", num_queries=8)
+    with pytest.raises(ValueError):
+        ref.make_exact_case("distinct", "cpu", num_queries=9, num_keys=8)
+    with pytest.raises(ValueError):
+        ref.make_exact_case("distinct", "cpu", num_queries=8, num_keys=65536)
+    with pytest.raises(
+        ValueError
+    ):  # the first row would see too few keys for the zero boundary
+        ref.make_exact_case("signed_zeros", "cpu", num_queries=1024, num_keys=1024)
+
+
+@pytest.mark.parametrize("name", list(ref.PACKED_GEOMETRIES))
+def test_packed_geometry_extra_segments_keep_the_declared_segments(name):
+    base = ref.make_packed_inputs(name, "cpu")
+    inputs = ref.make_packed_inputs(
+        name, "cpu", extra_segments=2, extra_segment_queries=8, extra_segment_keys=64
+    )
+    n = base.num_segments
+    assert inputs.seg_q_len == base.seg_q_len + [8, 8]
+    assert inputs.seg_k_len == base.seg_k_len + [64, 64]
+    assert (inputs.top_k, inputs.ratio, inputs.softmax_scale) == (
+        base.top_k,
+        base.ratio,
+        base.softmax_scale,
+    )
+    assert inputs.offsets()[:n] == base.offsets()
+    assert inputs.offsets()[n:] == [base.ratio * 64 - 8] * 2
+    assert (inputs.q_causal_offsets is None) == (
+        base.q_causal_offsets is None and base.ratio == 1
+    )
+    visible = ref.visible_rows(inputs, device="cpu").tolist()
+    assert visible[: base.num_queries] == ref.visible_rows(base, device="cpu").tolist()
+    extra = visible[base.num_queries :]
+    assert extra[7] == 64 and extra[15] == 64 and min(extra) >= 56
+
+
 def test_judge_rejects_a_clearly_better_lacking_key_and_bad_bits():
     inputs = ref.make_exact_case("distinct", "cpu")
     reference = ref.select_reference(inputs, order="sequential")

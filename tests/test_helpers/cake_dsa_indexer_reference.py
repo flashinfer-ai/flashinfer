@@ -351,6 +351,11 @@ def make_random_inputs(
 # 1/8`` the head-0 logit is ``a * up_j`` and the head-1 logit ``a * down_j`` (integers <= 1020), so with weights
 # ``w_0``, ``w_1`` in {+-1} the score ``(w_0 * a * up_j + w_1 * a * down_j) / 8`` is exact in FP32 under every
 # reduction order and every other head contributes a signed zero only.
+#
+# Every case has its historical small geometry (the default) and a scaled geometry (``num_queries`` queries at the
+# tail of ``num_keys`` keys, one segment) built by the same rule, so a call runs long enough for benchmark timing to
+# resolve small differences; the scaled ``distinct`` case separates up to 65535 keys exactly through the head-1
+# weight ``2**-8`` (score ``a * (up_j + down_j / 256) / 8``, a multiple of ``2**-11`` below ``2**10``).
 
 UP_DIMS = slice(0, 8)
 DOWN_DIMS = slice(64, 72)
@@ -371,6 +376,31 @@ def negative_weights() -> list[float]:
     w = [-0.25] * NUM_HEADS
     w[0], w[1] = -1.0, -1.0
     return w
+
+
+def distinct_weights() -> list[float]:
+    """Mixed weights with head 1 at ``2**-8``: distinct ``(up, down)`` pairs give distinct exact scores."""
+    w = mixed_weights()
+    w[1] = 2.0**-8
+    return w
+
+
+def _scaled_geometry(num_queries, num_keys) -> Optional[tuple[int, int]]:
+    """``(lq, lk)`` of the scaled single-segment geometry, or ``None`` for a case's historical geometry."""
+    if num_queries is None and num_keys is None:
+        return None
+    if num_queries is None or num_keys is None:
+        raise ValueError("num_queries and num_keys must be given together")
+    lq, lk = int(num_queries), int(num_keys)
+    if lq < 1 or lk < 8 or lq > lk:
+        raise ValueError(
+            "scaled exact cases need 1 <= num_queries <= num_keys and num_keys >= 8"
+        )
+    return lq, lk
+
+
+def _scaled_top_k(lk: int) -> int:
+    return min(DEFAULT_TOP_K, lk // 4)
 
 
 def make_exact_inputs(
@@ -465,38 +495,81 @@ def _shuffled_levels(count: int, seed: int) -> list[int]:
     return levels
 
 
-def _case_distinct(device):
+def _case_distinct(device, *, num_queries=None, num_keys=None):
+    geometry = _scaled_geometry(num_queries, num_keys)
+    if geometry is None:
+        return make_exact_inputs(
+            [
+                {"lq": 8, "up": _shuffled_levels(96, 1)},
+                {"lq": 40, "up": _shuffled_levels(40, 2)},
+            ],
+            top_k=24,
+            device=device,
+            label="exact_distinct",
+        )
+    lq, lk = geometry
+    if lk > 65535:
+        raise ValueError("the scaled distinct case separates at most 65535 keys")
+    # distinct (up, down) pairs: level = up * 256 + down
+    levels = _shuffled_levels(lk, 1)
     return make_exact_inputs(
         [
-            {"lq": 8, "up": _shuffled_levels(96, 1)},
-            {"lq": 40, "up": _shuffled_levels(40, 2)},
+            {
+                "lq": lq,
+                "up": [level // 256 for level in levels],
+                "down": [level % 256 for level in levels],
+                "weights": distinct_weights(),
+            }
         ],
-        top_k=24,
+        top_k=_scaled_top_k(lk),
         device=device,
         label="exact_distinct",
     )
 
 
-def _case_cutoff_ties(device):
-    up = [j // 3 + 1 for j in range(48)]
+def _case_cutoff_ties(device, *, num_queries=None, num_keys=None):
+    geometry = _scaled_geometry(num_queries, num_keys)
+    if geometry is None:
+        up = [j // 3 + 1 for j in range(48)]
+        return make_exact_inputs(
+            [{"lq": 7, "up": up}, {"lq": 30, "up": up[:30]}],
+            top_k=10,
+            device=device,
+            label="exact_cutoff_ties",
+        )
+    lq, lk = geometry
+    group = -(-lk // 255)  # equal-level groups of this size keep every level <= 255
+    top_k = _scaled_top_k(lk)
+    if (lk - top_k) % group == 0:
+        # the selection boundary of the row seeing every key must fall inside a tie group
+        top_k += 1
     return make_exact_inputs(
-        [{"lq": 7, "up": up}, {"lq": 30, "up": up[:30]}],
-        top_k=10,
+        [{"lq": lq, "up": [j // group + 1 for j in range(lk)]}],
+        top_k=top_k,
         device=device,
         label="exact_cutoff_ties",
     )
 
 
-def _case_all_equal(device):
+def _case_all_equal(device, *, num_queries=None, num_keys=None):
+    geometry = _scaled_geometry(num_queries, num_keys)
+    if geometry is None:
+        return make_exact_inputs(
+            [{"lq": 6, "up": [5] * 50}, {"lq": 30, "up": [5] * 30}],
+            top_k=16,
+            device=device,
+            label="exact_all_equal",
+        )
+    lq, lk = geometry
     return make_exact_inputs(
-        [{"lq": 6, "up": [5] * 50}, {"lq": 30, "up": [5] * 30}],
-        top_k=16,
+        [{"lq": lq, "up": [5] * lk}],
+        top_k=_scaled_top_k(lk),
         device=device,
         label="exact_all_equal",
     )
 
 
-def _case_signed_zeros(device):
+def _case_signed_zeros(device, *, num_queries=None, num_keys=None):
     """Zero-score keys (six of every eight ids) with the selection boundary inside the zero group of every row.
 
     Even rows use all-negative head weights (an IEEE sequential head sum of their zero terms would be ``-0.0``;
@@ -504,32 +577,51 @@ def _case_signed_zeros(device):
     odd rows mixed-sign weights.  Segment 0 rows see 49..64 keys, segment 1 rows 21..40; with
     ``top_k = 12`` every mixed-weight row selects its <= 8 positive keys plus some but not all zeros, and every
     all-negative row selects 12 of >= 15 zeros, so the id-descending tie rule and the zero bits are exercised on
-    every row.
+    every row.  The scaled geometry keeps the pattern (levels cycle through 1..255) with ``top_k = num_keys // 4``
+    (at most 2048), which lies between the <= 1/8 positive keys and the >= 3/4 zeros of every row as long as the
+    first row sees enough keys; a geometry breaking that is rejected.
     """
-    n = 64
+    geometry = _scaled_geometry(num_queries, num_keys)
+    n = 64 if geometry is None else geometry[1]
     up, down = [0] * n, [0] * n
     for j in range(n):
         if j % 8 == 6:
-            down[j] = j // 8 + 1
+            down[j] = (j // 8) % 255 + 1
         elif j % 8 == 7:
-            up[j] = j // 8 + 1
+            up[j] = (j // 8) % 255 + 1
 
     def weights(u):
         return negative_weights() if u % 2 == 0 else mixed_weights()
 
+    if geometry is None:
+        return make_exact_inputs(
+            [
+                {"lq": 16, "up": up, "down": down, "weights": weights},
+                {"lq": 20, "up": up[:40], "down": down[:40], "weights": weights},
+            ],
+            top_k=12,
+            device=device,
+            label="exact_signed_zeros",
+        )
+    lq, lk = geometry
+    top_k = _scaled_top_k(lk)
+    for visible in (lk - lq + 1, lk):  # the rows seeing the fewest and the most keys
+        positive, negative = visible // 8, (visible + 1) // 8
+        if not positive < top_k < visible - negative:
+            raise ValueError(
+                "signed_zeros needs #positive < top_k < #positive + #zeros on every row"
+            )
     return make_exact_inputs(
-        [
-            {"lq": 16, "up": up, "down": down, "weights": weights},
-            {"lq": 20, "up": up[:40], "down": down[:40], "weights": weights},
-        ],
-        top_k=12,
+        [{"lq": lq, "up": up, "down": down, "weights": weights}],
+        top_k=top_k,
         device=device,
         label="exact_signed_zeros",
     )
 
 
-def _case_negative(device):
-    n = 100
+def _case_negative(device, *, num_queries=None, num_keys=None):
+    geometry = _scaled_geometry(num_queries, num_keys)
+    n = 100 if geometry is None else geometry[1]
     up, down = [0] * n, [0] * n
     for j in range(n):
         if j % 2 == 0:
@@ -540,30 +632,49 @@ def _case_negative(device):
     def weights(u):
         return negative_weights() if u % 3 == 0 else mixed_weights()
 
+    if geometry is None:
+        return make_exact_inputs(
+            [
+                {"lq": 12, "up": up, "down": down, "weights": weights},
+                {"lq": 36, "up": up[:36], "down": down[:36], "weights": weights},
+            ],
+            top_k=40,
+            device=device,
+            label="exact_negative",
+        )
+    lq, lk = geometry
     return make_exact_inputs(
-        [
-            {"lq": 12, "up": up, "down": down, "weights": weights},
-            {"lq": 36, "up": up[:36], "down": down[:36], "weights": weights},
-        ],
-        top_k=40,
+        [{"lq": lq, "up": up, "down": down, "weights": weights}],
+        top_k=_scaled_top_k(lk),
         device=device,
         label="exact_negative",
     )
 
 
-def _case_few_winners_large_tie(device):
-    up = [1] * 4096
-    for j, level in ((3, 50), (1000, 40), (2047, 30), (2048, 20), (4095, 10)):
+def _case_few_winners_large_tie(device, *, num_queries=None, num_keys=None):
+    geometry = _scaled_geometry(num_queries, num_keys)
+    lq, lk = (6, 4096) if geometry is None else geometry
+    if lk < 128:
+        raise ValueError("few_winners_large_tie needs at least 128 keys")
+    up = [1] * lk
+    # five winners at the relative positions of the 4096-key geometry (ids 3, 1000, 2047, 2048 and 4095 there)
+    for j, level in (
+        (3, 50),
+        (lk // 4 - 24, 40),
+        (lk // 2 - 1, 30),
+        (lk // 2, 20),
+        (lk - 1, 10),
+    ):
         up[j] = level
     return make_exact_inputs(
-        [{"lq": 6, "up": up}],
-        top_k=2048,
+        [{"lq": lq, "up": up}],
+        top_k=2048 if geometry is None else _scaled_top_k(lk),
         device=device,
         label="exact_few_winners_large_tie",
     )
 
 
-EXACT_CASES: dict[str, Callable[[Any], IndexerInputs]] = {
+EXACT_CASES: dict[str, Callable[..., IndexerInputs]] = {
     "distinct": _case_distinct,
     "cutoff_ties": _case_cutoff_ties,
     "all_equal": _case_all_equal,
@@ -573,8 +684,16 @@ EXACT_CASES: dict[str, Callable[[Any], IndexerInputs]] = {
 }
 
 
-def make_exact_case(name: str, device="cuda") -> IndexerInputs:
-    return EXACT_CASES[name](device)
+def make_exact_case(
+    name: str,
+    device="cuda",
+    *,
+    num_queries: Optional[int] = None,
+    num_keys: Optional[int] = None,
+) -> IndexerInputs:
+    """An exactly representable case in its historical geometry or, with both sizes, as one segment of
+    ``num_queries`` queries at the tail of ``num_keys`` keys built by the same rule."""
+    return EXACT_CASES[name](device, num_queries=num_queries, num_keys=num_keys)
 
 
 # -- packed causality ---------------------------------------------------------------------------------------------
@@ -610,11 +729,38 @@ PACKED_GEOMETRIES: dict[str, dict[str, Any]] = {
 
 
 def make_packed_inputs(
-    name: str, device="cuda", *, seed: int = 100, peaked: bool = False
+    name: str,
+    device="cuda",
+    *,
+    seed: int = 100,
+    peaked: bool = False,
+    extra_segments: int = 0,
+    extra_segment_queries: int = 1024,
+    extra_segment_keys: int = 8192,
 ) -> IndexerInputs:
+    """A packed geometry, optionally followed by ``extra_segments`` iid segments of ``extra_segment_queries``
+    queries over ``extra_segment_keys`` keys (same ``top_k`` and ``ratio``; each appended segment sees all of its
+    keys from its last query on, i.e. offset ``ratio * keys - queries``) so a call runs long enough for benchmark
+    timing to resolve small differences while the geometry's own segments stay exactly as declared."""
     spec = dict(PACKED_GEOMETRIES[name])
-    seg_q_len = spec.pop("seg_q_len")
-    seg_k_len = spec.pop("seg_k_len")
+    seg_q_len = list(spec.pop("seg_q_len"))
+    seg_k_len = list(spec.pop("seg_k_len"))
+    extra_segments = int(extra_segments)
+    if extra_segments < 0:
+        raise ValueError("extra_segments must be >= 0")
+    if extra_segments:
+        lq, lk = int(extra_segment_queries), int(extra_segment_keys)
+        if lq < 1 or lk < 1:
+            raise ValueError("extra segments need at least one query and one key")
+        ratio = int(spec.get("ratio", 1))
+        offsets = spec.get("q_causal_offsets")
+        if offsets is not None or ratio != 1:  # the ratio-1 default already is lk - lq
+            spec["q_causal_offsets"] = (
+                effective_offsets(seg_q_len, seg_k_len, offsets, ratio)
+                + [ratio * lk - lq] * extra_segments
+            )
+        seg_q_len += [lq] * extra_segments
+        seg_k_len += [lk] * extra_segments
     return make_random_inputs(
         seg_q_len,
         seg_k_len,
