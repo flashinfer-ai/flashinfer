@@ -39,7 +39,7 @@ Two timed series per point, CUDA events per rank around each call:
 
 Launch (one process per GPU, 4-rank EP; srun+torchrun safe, no interactivity):
 
-    torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
+    torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
 
 Rank 0 prints one ``BENCH_CSV`` row per (scale_mode, layout, tokens) point
 (header once), each carrying the matching drop reference CSV filename.  A
@@ -61,6 +61,8 @@ from statistics import fmean, median
 
 _here = os.path.dirname(os.path.abspath(__file__))
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _here]
+# This file lives in benchmarks/moe_ep/backends/mega/kernel/sm90/.
+_REPO_ROOT = os.path.normpath(os.path.join(_here, *[os.pardir] * 6))
 
 # Drop parity (run_perf_test.sh): multirank Hopper needs NVLS off unless the
 # environment has a working NCCL/NVSHMEM NVLS setup. setdefault so users can
@@ -983,7 +985,7 @@ def main() -> int:
 
             now = _dt.datetime.now()
             csv_path = os.path.join(
-                os.path.dirname(_here),
+                _REPO_ROOT,
                 "flashinfer",
                 "moe_ep",
                 "kernel_src",

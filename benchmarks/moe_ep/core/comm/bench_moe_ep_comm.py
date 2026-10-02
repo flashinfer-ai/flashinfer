@@ -14,11 +14,11 @@ additionally reports per-kernel statistics.
 Launch on one node, for example:
 
     # Sweep local batch sizes 1..1024 (powers of 2) on EP8.
-    torchrun --standalone --nproc-per-node=8 benchmarks/comm/bench_moe_ep_comm.py \\
+    torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py \\
         --backend nvlink_one_sided --profile deepseek_v3 -b 1 -e 1024 -f 2
 
     # Balanced routing, per-kernel breakdown and per-iteration stats, JSON report.
-    torchrun --standalone --nproc-per-node=8 benchmarks/comm/bench_moe_ep_comm.py \\
+    torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py \\
         --backend nvlink_one_sided --profile deepseek_v4_pro --perfect_router \\
         --kernel_breakdown --iter_stats -b 1 -e 1024 -f 2 --output_file out.json
 

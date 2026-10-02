@@ -2,7 +2,7 @@
 
 How the FlashInfer **MoE expert-parallel** API is put together and how to use it, walked
 through the multi-GPU correctness test `tests/moe_ep/test_moe_ep_compute_correctness.py`.
-For container/build/run and benchmark numbers see `benchmarks/MoE_benchmarks.md`.
+For container/build/run and benchmark numbers see `benchmarks/moe_ep/MoE_benchmarks.md`.
 
 `MoEEpLayer` runs one MoE layer split across ranks as **dispatch → per-expert grouped GEMM
 → combine**, over a pluggable transport (`nccl_ep` or `nixl_ep`). The expert GEMM reuses the
@@ -52,7 +52,7 @@ events capture their GPU time; `dispatch` host-syncs internally, which doesn't p
 
 The handle backend (`flashinfer/moe_ep/nccl_ep/handle.py`) is where the three I/O contracts
 live, and where the host-call fast path (`NV_FI_EP_FAST_PATH`) and burn-down probes (`EP_PROFILE_HOST`)
-are wired (see `benchmarks/MoE_benchmarks.md` §3.2).
+are wired (see `benchmarks/moe_ep/MoE_benchmarks.md` §3.2).
 
 ## 3. Algorithm / layout contracts
 
@@ -142,6 +142,6 @@ Related single-GPU tests: `test_compute_bridge.py` (layout-bridge unit tests),
 `smoke_nccl_ep.py` / `smoke_nixl_ep.py`.
 
 ## 6. Pointers
-- Container, how to run, benchmark numbers, the host-call fast path: `benchmarks/MoE_benchmarks.md`.
+- Container, how to run, benchmark numbers, the host-call fast path: `benchmarks/moe_ep/MoE_benchmarks.md`.
 - Backend handle (I/O contracts, fast path, profiling): `flashinfer/moe_ep/nccl_ep/handle.py`.
 - EP→compute bridge: `flashinfer/moe_ep/_compute_bridge.py`; layer: `flashinfer/moe_ep/layer.py`.

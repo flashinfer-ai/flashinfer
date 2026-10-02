@@ -23,7 +23,7 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
 def benchmark_module():
     path = (
         Path(__file__).resolve().parents[2]
-        / "benchmarks/bench_moe_ep_sm107_block_scaled_mega.py"
+        / "benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py"
     )
     spec = importlib.util.spec_from_file_location("sm107_benchmark", path)
     module = importlib.util.module_from_spec(spec)

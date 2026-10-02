@@ -5,8 +5,8 @@ optionally + the expert grouped-GEMM). Two drivers:
 
 | Driver | Measures | Comparable to |
 |---|---|---|
-| `benchmarks/bench_ep_matrix.py` | **comm only** — dispatch + combine, no FFN | the upstream `contrib/nccl_ep/ep_bench` C++ reference |
-| `benchmarks/bench_moe_ep.py` | **full** MoE — dispatch → grouped GEMM → combine | (no external ref; LL has the NCCL-EP README config) |
+| `benchmarks/moe_ep/core/comm/bench_ep_matrix.py` | **comm only** — dispatch + combine, no FFN | the upstream `contrib/nccl_ep/ep_bench` C++ reference |
+| `benchmarks/moe_ep/bench_moe_ep.py` | **full** MoE — dispatch → grouped GEMM → combine | (no external ref; LL has the NCCL-EP README config) |
 
 The headline study is `bench_ep_matrix.py` vs `ep_bench`: it confirms FlashInfer and
 ep_bench launch the **same** kernels with the **same** GPU time, and quantifies (and then
@@ -64,7 +64,7 @@ so `scripts/parse_results.py` parses both. The 28-case driver issues one `srun` 
 # LOGIN_HOST is your cluster login node
 ssh "$LOGIN_HOST" "cd $RW && JOBID=<jid> REMOTE_WORK=$RW \
   IMAGE=$RW/flashinfer-ep-pt2605.sqsh ONE_SCRIPT=run_ep_matrix_one_pt.sh \
-  bash $RW/flashinfer/benchmarks/run_ep_matrix.sh"
+  bash $RW/flashinfer/benchmarks/moe_ep/core/comm/run_ep_matrix.sh"
 ```
 - `run_ep_matrix.sh` drives the matrix: LL `{em,rm}` @128 tok/rank and HT `fl` @4096/8192,
   × {8,16,32,64} GPU, × {IB, MNNVL}; `COMMON="--hidden 7168 --top-k 8 --experts 256
@@ -87,7 +87,7 @@ ssh "$LOGIN_HOST" "cd $RW && JOBID=<jid> REMOTE_WORK=$RW \
 ```bash
 torchrun --nnodes=$N --nproc_per_node=8 --node_rank=$SLURM_NODEID \
   --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 \
-  benchmarks/bench_moe_ep.py --reference --algorithm ll --backend nccl_ep --quant bf16 \
+  benchmarks/moe_ep/bench_moe_ep.py --reference --algorithm ll --backend nccl_ep --quant bf16 \
   --warmup 5 --repeat 20            # --layout rank_major  | --algorithm ht --ep-test-geometry
 ```
 `--reference` selects the ep_bench geometry (hidden 7168, experts 256, top_k 8, 128 tok/rank).
@@ -185,8 +185,8 @@ B200, both `nccl_ep` and `nixl_ep`. Correctness is covered in `docs/design_docs/
 ---
 
 ## 5. Artifacts / reproduce
-- Drivers: `benchmarks/bench_ep_matrix.py`, `benchmarks/bench_moe_ep.py`; SLURM harness
-  `benchmarks/run_ep_matrix.sh` + per-rank `run_ep_matrix_one_pt.sh` (PyTorch image) /
+- Drivers: `benchmarks/moe_ep/core/comm/bench_ep_matrix.py`, `benchmarks/moe_ep/bench_moe_ep.py`; SLURM harness
+  `benchmarks/moe_ep/core/comm/run_ep_matrix.sh` + per-rank `run_ep_matrix_one_pt.sh` (PyTorch image) /
   `run_ep_matrix_one.sh` (legacy CUDA-13.0 image).
 - nsys kernel times: `nsys profile -t cuda … bench_ep_matrix.py` then
   `nsys stats --report cuda_gpu_kern_sum`. Host burn-down: `EP_PROFILE_HOST=1`.
