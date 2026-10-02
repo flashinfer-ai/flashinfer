@@ -1200,8 +1200,10 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
   // The horizontal kernel gives each row 2 lanes of its (DIM / 64) * 4 consumer warps, so it
   // covers exactly DIM rows only when DIM is a multiple of 64.
   constexpr bool kHorizontalSupportsDim = DIM % 64 == 0;
-  // The vertical kernel processes 16 rows per stage (4 rows for each of its 4 consumer warps).
-  constexpr bool kVerticalSupportsDim = DIM % 16 == 0;
+  // The vertical kernel processes 16 rows per stage (4 rows for each of its 4 consumer warps),
+  // and its producer fills all 3 pipeline stages before the first write-back, so it needs at
+  // least 48 rows. With fewer, the producer waits for write-backs that never come.
+  constexpr bool kVerticalSupportsDim = DIM % 16 == 0 && DIM >= 3 * 16;
 #endif
 
   // Common alignment checks for all kernels
@@ -1221,7 +1223,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       int const total_blocks = params.batch * params.nheads;
       int const num_sms = GetCudaMultiProcessorCount();
       if (total_blocks < num_sms * 2 || !kVerticalSupportsDim)
-        // Simple is also the only kernel for DIM not divisible by 16
+        // Simple is also the only kernel for DIM not divisible by 16 or below 48
         algo = SSUAlgorithm::kSimple;
       else if (sm_major < 10)
         algo = SSUAlgorithm::kVertical;
@@ -1277,6 +1279,8 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
     constexpr auto rowsPerStage = 4 * numConsumers;
     FLASHINFER_CHECK(params.dim % rowsPerStage == 0, "dim must be divisible by ", rowsPerStage,
                      " for vertical kernel");
+    FLASHINFER_CHECK(params.dim >= rowsPerStage * numStages, "dim must be at least ",
+                     rowsPerStage * numStages, " for vertical kernel");
 
     // TMA alignment checks for all pointers loaded via memcpy_async_tx
     FLASHINFER_CHECK_TMA_ALIGNED(params.x);
@@ -1346,7 +1350,10 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       scan_func<<<grid, block, smem_size, stream>>>(params, state_tensor);
     };
 
-    dispatchRatio(params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, ratio_launcher);
+    // Instantiate the kernel only for supported dims: below 64 it would have no consumer warps.
+    if constexpr (kHorizontalSupportsDim) {
+      dispatchRatio(params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, ratio_launcher);
+    }
   }
 #endif
   else {
