@@ -74,16 +74,15 @@ def _stage_of(plan):
 # One problem per planner-selectable stage: (route, h, mb, nb, capacity,
 # ragged, seed).  The selection sizes steer ``small_kmax_for`` / ``split_kmax``
 # / ``cluster_variant_for`` to the named variant; the test asserts the stage.
-# ``small_k3s`` is compiled and exported for parity with the CUDA route but
-# ``split_kmax`` never selects it (its modelled chain cost ties KMAX 4, which
-# wins on ties with fewer slices); it is checked by a direct launch below.
+# ``small_k1s`` and ``small_k3s`` are still part of this build but the planner
+# selects neither (``split_kmax`` ranks only the KMAX 4 and 6 split variants);
+# ``small_k3s`` is checked by a direct launch below.
 STAGE_CASES = {
     "attention": ("persistent", 2, 8, 32, 6, True, 11),
     "small_k1": ("small", 4, 4, 4, 1, False, 11),
     "small_k3": ("small", 8, 4, 4, 3, True, 11),
     "small_k4": ("small", 8, 16, 16, 4, True, 11),
     "small_k6": ("small", 2, 8, 32, 6, True, 11),
-    "small_k1s": ("smallsplit", 2, 4, 8, 3, True, 13),
     "small_k4s": ("smallsplit", 1, 1, 8, 6, False, 13),
     "small_k6s": ("smallsplit", 1, 1, 64, 64, False, 13),
     "small_k2c4": ("smallcluster", 1, 1, 8, 8, False, 19),
