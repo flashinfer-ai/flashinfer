@@ -78,6 +78,11 @@ def sampled_reference(
             apply_topk_at_fc1=cfg.apply_topk_at_fc1,
             weight_scales_are_swizzled=True,
             return_fp32=True,
+            situ_beta=cfg.situ_beta,
+            situ_linear_beta=cfg.situ_linear_beta,
+            fc1_alpha=getattr(symm_buffer, "fc1_alpha", None),
+            fc2_alpha=getattr(symm_buffer, "fc2_alpha", None),
+            fc1_norm_const=getattr(symm_buffer, "fc1_norm_const", None),
         )
         if cfg.world_size > 1:
             dist.reduce(

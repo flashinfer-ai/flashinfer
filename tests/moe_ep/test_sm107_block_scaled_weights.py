@@ -1,14 +1,18 @@
 """Host regressions for SM107 quantization layout and bounded preprocessing."""
 
+import math
+
 import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
     concatenate_block_scaled_weights,
+    from_blocked,
     interleave_gate_up_16,
     pack_f32_to_fp4,
     preprocess_block_scaled_weights,
+    preprocess_prequantized_block_scaled_weights,
     quantize_mxfp8_block32,
     quantize_nvfp4_block16,
     to_blocked,
@@ -101,6 +105,29 @@ def test_nvfp4_preprocessing_bounds_fp32_temporaries():
     assert tracker.largest <= rows_per_chunk * max(hidden, intermediate) * 8
 
 
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e8m0fnu])
+@pytest.mark.parametrize("strided", [False, True])
+def test_e8m0_decoder_all_encodings(dtype, strided):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        scale_to_f32,
+    )
+
+    codes = torch.arange(256, dtype=torch.uint8)
+    if strided:
+        codes = torch.stack((codes, codes), dim=-1)[:, 0]
+    scales = codes.view(dtype)
+    expected = torch.tensor(
+        [math.ldexp(1.0, exponent) for exponent in range(-127, 128)],
+        dtype=torch.float32,
+    )
+    actual = scale_to_f32(scales)
+    # Compare bits to distinguish the smallest scale from zero.
+    torch.testing.assert_close(
+        actual[:255].view(torch.int32), expected.view(torch.int32), rtol=0, atol=0
+    )
+    assert torch.isnan(actual[255])
+
+
 def test_fp4_rounding_at_every_midpoint():
     magnitudes = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     midpoints = (magnitudes[:-1] + magnitudes[1:]) / 2
@@ -121,3 +148,110 @@ def test_scale_unswizzle_recovers_logical_plane(rows, cols):
 
     raw = torch.arange(rows * cols).reshape(rows, cols).to(torch.uint8)
     torch.testing.assert_close(from_blocked(to_blocked(raw), rows, cols), raw)
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("storage", ["contiguous", "strided", "unaligned"])
+def test_prequantized_ingestion_preserves_bytes(kind, storage):
+    from importlib import import_module
+
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+
+    hidden, intermediate, experts = 384, 192, 3
+    nvfp4 = kind == "nvfp4"
+    packing, vec = (2, 16) if nvfp4 else (1, 32)
+    dtype = (
+        torch.uint8
+        if nvfp4
+        else torch.float8_e4m3fn
+        if kind == "mxfp8_e4m3"
+        else torch.float8_e5m2
+    )
+    sf_dtype = torch.float8_e4m3fn if nvfp4 else torch.float8_e8m0fnu
+    generator = torch.Generator().manual_seed(731)
+
+    def payload(shape, dtype):
+        # Arbitrary bytes expose accidental numeric conversion, including
+        # float8 NaNs and signed FP4 zero. Only layout changes are permitted.
+        if storage == "unaligned":
+            count = 1
+            for size in shape:
+                count *= size
+            raw = torch.randint(
+                256, (count + 1,), dtype=torch.uint8, generator=generator
+            )
+            return raw[1:].reshape(shape).view(dtype)
+        allocation = torch.randint(
+            256, (*shape[:-1], shape[-1] * 2), dtype=torch.uint8, generator=generator
+        )
+        raw = (
+            allocation[..., ::2]
+            if storage == "strided"
+            else allocation[..., : shape[-1]].contiguous()
+        )
+        return raw.view(dtype)
+
+    w13 = payload((experts, 2 * intermediate, hidden // packing), dtype)
+    w2 = payload((experts, hidden, intermediate // packing), dtype)
+    sf1 = payload((experts, 2 * intermediate, hidden // vec), sf_dtype)
+    sf2 = payload((experts, hidden, intermediate // vec), sf_dtype)
+    backend = "nvfp4_nvfp4_bf16_cutedsl" if nvfp4 else "mxfp8_mxfp8_bf16_cutedsl"
+    mod = import_module(
+        f"flashinfer.moe_ep.backends.mega.kernel.sm107.{backend}.weights"
+    )
+    result = mod.preprocess_mega_weights(
+        PrequantizedMoEWeights(w13, w2, sf1, sf2),
+        intermediate_size=intermediate,
+        hidden_size=hidden,
+        **({} if nvfp4 else {"kind": kind}),
+    )
+    for leg, (weight, scale) in enumerate(result):
+        source, raw_sf = (w13, sf1) if leg == 0 else (w2, sf2)
+        rows, cols = source.shape[1:]
+        order = torch.arange(rows)
+        if leg == 0:
+            order = torch.stack(
+                (
+                    torch.arange(intermediate).reshape(-1, 16),
+                    torch.arange(intermediate, rows).reshape(-1, 16),
+                ),
+                dim=1,
+            ).flatten()
+        expected = source.view(torch.uint8)[:, order]
+        assert weight.stride(1) == 1
+        assert weight.data_ptr() % 16 == 0 and scale.data_ptr() % 16 == 0
+        assert weight.permute(0, 2, 1).is_contiguous()
+        torch.testing.assert_close(weight.permute(0, 2, 1).view(torch.uint8), expected)
+        for expert in range(experts):
+            recovered = from_blocked(
+                scale[expert].view(torch.uint8), rows, raw_sf.shape[-1]
+            )
+            torch.testing.assert_close(
+                recovered, raw_sf[expert].view(torch.uint8)[order]
+            )
+
+
+@pytest.mark.parametrize(
+    "corruption", ["shape", "scale_shape", "data_dtype", "scale_dtype", "device"]
+)
+def test_prequantized_ingestion_rejects_invalid_contract(corruption):
+    tensors = [
+        torch.zeros(2, 128, 64, dtype=torch.uint8),
+        torch.zeros(2, 128, 32, dtype=torch.uint8),
+        torch.zeros(2, 128, 8, dtype=torch.float8_e4m3fn),
+        torch.zeros(2, 128, 4, dtype=torch.float8_e4m3fn),
+    ]
+    if corruption == "shape":
+        tensors[0] = tensors[0][:, :-1]
+    elif corruption == "scale_shape":
+        tensors[2] = tensors[2][:, :, :-1]
+    elif corruption == "data_dtype":
+        tensors[0] = tensors[0].float()
+    elif corruption == "scale_dtype":
+        tensors[2] = tensors[2].view(torch.float8_e5m2)
+    else:
+        tensors[3] = tensors[3].to("meta")
+    with pytest.raises(ValueError):
+        preprocess_prequantized_block_scaled_weights(
+            *tensors, quant_kind="nvfp4", hidden_size=128, intermediate_size=64
+        )
