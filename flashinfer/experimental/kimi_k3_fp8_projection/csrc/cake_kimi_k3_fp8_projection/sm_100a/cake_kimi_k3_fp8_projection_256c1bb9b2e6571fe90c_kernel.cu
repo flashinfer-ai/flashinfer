@@ -1015,7 +1015,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(736) void
-kernel_cake_kimi_k3_fp8_projection_96f7c12736a8f0bf81e4(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
+kernel_cake_kimi_k3_fp8_projection_256c1bb9b2e6571fe90c(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1650,6 +1650,9 @@ kernel_cake_kimi_k3_fp8_projection_96f7c12736a8f0bf81e4(const __grid_constant__ 
                                     : "=r"(*reinterpret_cast<uint32_t*>(&wordsh[4 * ci])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh[(4 * ci) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh[(4 * ci) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh[(4 * ci) + 3]))
                                     : "r"(row_h + (unsigned int)(chunk_h * 16)));
                             }
+                            if (elect_sync()) {
+                                mbarrier_arrive(xb_empty_addr + (xb_q) * 8);
+                            }
                             float amax_h = 0.0f;
                             #pragma unroll
                             for (int ci_1 = 0; ci_1 < 4; ci_1++) {
@@ -1757,9 +1760,6 @@ kernel_cake_kimi_k3_fp8_projection_96f7c12736a8f0bf81e4(const __grid_constant__ 
                                 }
                             }
                         }
-                        if (elect_sync()) {
-                            mbarrier_arrive(xb_empty_addr + (xb_q) * 8);
-                        }
                     }
                     if (qwarp >= 8 && qwarp < 16) {
                         mbarrier_wait(xb_full1_addr + (xb_q) * 8, _phase_xb_full1);
@@ -1777,6 +1777,9 @@ kernel_cake_kimi_k3_fp8_projection_96f7c12736a8f0bf81e4(const __grid_constant__ 
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&wordsh_1[4 * ci_3])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh_1[(4 * ci_3) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh_1[(4 * ci_3) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&wordsh_1[(4 * ci_3) + 3]))
                                     : "r"(row_h_1 + (unsigned int)(chunk_h_1 * 16)));
+                            }
+                            if (elect_sync()) {
+                                mbarrier_arrive(xb_empty1_addr + (xb_q) * 8);
                             }
                             float amax_h_1 = 0.0f;
                             #pragma unroll
@@ -1884,9 +1887,6 @@ kernel_cake_kimi_k3_fp8_projection_96f7c12736a8f0bf81e4(const __grid_constant__ 
                                     }
                                 }
                             }
-                        }
-                        if (elect_sync()) {
-                            mbarrier_arrive(xb_empty1_addr + (xb_q) * 8);
                         }
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

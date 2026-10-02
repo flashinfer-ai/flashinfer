@@ -351,9 +351,13 @@ def test_decode_config_rules(arch):
             # Round-6 continuation 9 (lever XBH): the half-slot ring is a table key of fused ring rows with narrow units.
             assert cfg.xbh == (bool(entry.get("xbh", False)) and cfg.qlanes != 16)
             assert (f"_r{cfg.xb_stages}_xh" in cfg.kernel_key) == cfg.xbh
+            # Round-6 continuation 10 (lever QER): the early half-slot release is a table key of xbh rows only (``_qe`` after ``_xh``).
+            assert cfg.qer == (bool(entry.get("qer", False)) and cfg.xbh)
+            assert ("_xh_qe" in cfg.kernel_key) == cfg.qer
         else:
             assert cfg.xb_stages == 0 and not re.search(r"_r\d", cfg.kernel_key)
             assert not cfg.xbh and "_xh" not in cfg.kernel_key
+            assert not cfg.qer and "_qe" not in cfg.kernel_key
         assert cfg.qlanes in (4, 8, 16)
         assert (2 * cfg.tok) % (cfg.qwarps * (32 // cfg.qlanes)) == 0
         if not (cfg.fused and not cfg.resident) or "qlanes" not in entry:
@@ -391,7 +395,10 @@ def test_decode_config_round3_fused_rows(arch):
     # Round 6 continuation 9 (lever XBH): the BF16 ring is loaded and released per 128-K block (``_xh`` after ``_r3``); the
     # 16 warps split by K block, same units and arithmetic.
     assert cfg.xbh
-    assert cfg.kernel_key == "decode:t64_p2_fused_w16_r3_xh_q4_pf4_pi2"
+    # Round 6 continuation 10 (lever QER): the quantizing warps release each half slot right after their register loads (``_qe``
+    # after ``_xh``); same units, arithmetic and stores.
+    assert cfg.qer
+    assert cfg.kernel_key == "decode:t64_p2_fused_w16_r3_xh_qe_q4_pf4_pi2"
     # 16-token tiles cannot keep eight 4-lane groups busy per stage: the table's 4 lanes widen to 8, coupled staging.
     # Round 5: the 24-tile M = 256 row moves to a 4-CTA cluster split-K route (each CTA owns a quarter of K, FP32 partials
     # are exchanged through distributed shared memory in one round); the small dedicated inbox is used (no aliasing).

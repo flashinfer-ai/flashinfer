@@ -528,6 +528,7 @@ class DecodeConfig:
     pfi: int = 0  # round 6 continuation 7 (lever PI-W): cross-item L2 prefetch of the next work item's first W/SFW stages by the load warp (table key ``pfi``; multi-item rows with pf > 0; 0 = off)
     qwarps: int = DEC_QUANT_WARPS  # round 6 continuation 8 (lever QW16): quantizing warps of the fused instance (table key ``qwarps``; 8 = the round-3 default, 16 on the fused 16384 rows)
     xbh: bool = False  # round 6 continuation 9 (lever XBH): half-slot BF16 ring -- the two 128-K blocks of a stage are loaded and released separately (table key ``xbh``; fused ring rows with narrow units)
+    qer: bool = False  # round 6 continuation 10 (lever QER): early half-slot release -- each quantizing warp frees its BF16 half slot right after its register loads, before the conversion (table key ``qer``; xbh rows only)
 
     @property
     def tok_rows(self) -> int:
@@ -560,6 +561,7 @@ class DecodeConfig:
             pfi=self.pfi,
             qwarps=self.qwarps,
             xbh=self.xbh,
+            qer=self.qer,
         )
 
 
@@ -711,6 +713,9 @@ def decode_config(
         and xb_stages > 0
         and qlanes != 16
     )
+    # Table key ``qer`` (round 6 continuation 10, lever QER): early half-slot release (host mirror of the Cake ``decode_config`` rule:
+    # xbh rows only; the kernel instance validates the one-unit-per-lane-group split).
+    qer = bool(entry.get("qer", False)) and xbh
     # Table key ``tstore`` (round 6, lever E1): the split-1 epilogue stores BF16 through TMA; the instance has no TMA path
     # for the split-K / cluster reductions.
     tstore = bool(entry.get("tstore", False))
@@ -763,6 +768,7 @@ def decode_config(
         pfi=pfi,
         qwarps=qwarps,
         xbh=xbh,
+        qer=qer,
         cs_alias=cs_alias,
     )
 
