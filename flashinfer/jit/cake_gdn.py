@@ -143,7 +143,12 @@ def _cuda_record(record: dict[str, Any], arch: CakeGDNArch) -> dict[str, Any]:
 
 
 def _cubin_path(source: Path, *, arch: CakeGDNArch, digest: str) -> Path:
-    return jit_env.FLASHINFER_JIT_DIR / "cake_gdn" / arch / f"{source.stem}-{digest[:16]}.cubin"
+    return (
+        jit_env.FLASHINFER_JIT_DIR
+        / "cake_gdn"
+        / arch
+        / f"{source.stem}-{digest[:16]}.cubin"
+    )
 
 
 def _compile_cubin(

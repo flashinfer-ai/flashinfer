@@ -17,11 +17,11 @@
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-
-#include "tvm_ffi_utils.h"
 #include <tvm/ffi/extra/cuda/cubin_launcher.h>
 
 #include <cstdint>
+
+#include "tvm_ffi_utils.h"
 
 namespace cake_gdn_host {
 
@@ -32,13 +32,12 @@ class ScopedCudaDevice {
   explicit ScopedCudaDevice(int device_id) {
     cudaError_t error = cudaGetDevice(&previous_device_);
     TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
-        << "cudaGetDevice failed before host-shim launch: cudaError="
-        << static_cast<int>(error);
+        << "cudaGetDevice failed before host-shim launch: cudaError=" << static_cast<int>(error);
     if (previous_device_ != device_id) {
       error = cudaSetDevice(device_id);
       TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
-          << "cudaSetDevice failed before host-shim launch for cuda:"
-          << device_id << ": cudaError=" << static_cast<int>(error);
+          << "cudaSetDevice failed before host-shim launch for cuda:" << device_id
+          << ": cudaError=" << static_cast<int>(error);
       restore_ = true;
     }
   }
@@ -62,28 +61,21 @@ inline void CheckCudaTensor(const TensorView& t, const char* name) {
       << name << " must be a CUDA tensor, got device_type=" << (int)t.device().device_type;
 }
 
-inline void CheckSameCudaDevice(
-    const TensorView& t,
-    const TensorView& reference,
-    const char* name,
-    const char* reference_name) {
+inline void CheckSameCudaDevice(const TensorView& t, const TensorView& reference, const char* name,
+                                const char* reference_name) {
   TVM_FFI_CHECK(t.device().device_id == reference.device().device_id, ValueError)
       << name << " must be on the same CUDA device as " << reference_name
-      << ": got cuda:" << t.device().device_id
-      << " versus cuda:" << reference.device().device_id;
+      << ": got cuda:" << t.device().device_id << " versus cuda:" << reference.device().device_id;
 }
 
-inline void CheckCurrentCudaDevice(
-    const TensorView& reference,
-    const char* reference_name) {
+inline void CheckCurrentCudaDevice(const TensorView& reference, const char* reference_name) {
   int current_device = -1;
   cudaError_t error = cudaGetDevice(&current_device);
   TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
       << "cudaGetDevice failed while validating " << reference_name
       << ": cudaError=" << static_cast<int>(error);
   TVM_FFI_CHECK(current_device == reference.device().device_id, ValueError)
-      << "current CUDA device must match " << reference_name
-      << ": current=cuda:" << current_device
+      << "current CUDA device must match " << reference_name << ": current=cuda:" << current_device
       << ", tensor=cuda:" << reference.device().device_id;
 }
 
@@ -108,8 +100,8 @@ inline void CheckDtype(const TensorView& t, const char* name, int code, int bits
 // MaxSharedMemoryPerBlockOptin ceiling (attribute 97) it sets
 // MAX_DYNAMIC_SHARED_SIZE_BYTES once per device; every Cake GDN kernel
 // stays below that ceiling on SM100a/SM103a, so a larger request fails.
-inline void CakeGDNSetMaxDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_id,
-                                     int smem_bytes, signed char* cache, int cache_len) {
+inline void CakeGDNSetMaxDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_id, int smem_bytes,
+                                     signed char* cache, int cache_len) {
   namespace cuda_api = tvm::ffi::cuda_api;
   TVM_FFI_CHECK(device_id >= 0 && device_id < cache_len, RuntimeError)
       << "dynamic-SMEM opt-in cache does not cover cuda:" << device_id;
@@ -118,11 +110,11 @@ inline void CakeGDNSetMaxDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_i
   }
   auto device = cuda_api::GetDeviceHandle(device_id);
   int optin_max = 0;
-  cuda_api::ResultType err = cuda_api::GetDeviceAttribute(
-      &optin_max,
-      /* CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN /
-         cudaDevAttrMaxSharedMemoryPerBlockOptin */
-      cuda_api::DeviceAttrType(97), device);
+  cuda_api::ResultType err =
+      cuda_api::GetDeviceAttribute(&optin_max,
+                                   /* CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN /
+                                      cudaDevAttrMaxSharedMemoryPerBlockOptin */
+                                   cuda_api::DeviceAttrType(97), device);
   TVM_FFI_CHECK(err == cuda_api::kSuccess, RuntimeError)
       << "querying MaxSharedMemoryPerBlockOptin failed for cuda:" << device_id;
   TVM_FFI_CHECK(smem_bytes <= optin_max, RuntimeError)
