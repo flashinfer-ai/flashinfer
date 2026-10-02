@@ -130,7 +130,7 @@ class Catalog:
         if self.merged:
             routes = self._data["routes"]
             # Either keyed by architecture or shared by every architecture.
-            return routes[arch] if arch in routes else routes
+            return routes.get(arch, routes)
         return self._data["arches"][arch]["routes"]
 
     def route(self, arch: str, key: str, *, options: Any = None) -> Mapping[str, Any]:
@@ -166,11 +166,11 @@ class Catalog:
 
     def arch_for_capability(self, capability: tuple[int, int]) -> str:
         """Exported architecture of ``capability`` (RuntimeError when none is catalogued)."""
-        arch = ARCHES.get(tuple(capability))
+        arch = ARCHES.get(capability)
         if arch is None or arch not in self.arches:
             raise RuntimeError(
                 f"{self.label} has no exported programs for compute capability "
-                f"{tuple(capability)}; catalogued architectures: {list(self.arches)}"
+                f"{capability}; catalogued architectures: {list(self.arches)}"
             )
         return arch
 
@@ -181,9 +181,7 @@ class Catalog:
         device = torch.device(device)
         if device.type != "cuda":
             raise RuntimeError(f"{self.label} requires a CUDA device")
-        return self.arch_for_capability(
-            tuple(torch.cuda.get_device_capability(device))
-        )
+        return self.arch_for_capability(tuple(torch.cuda.get_device_capability(device)))
 
     def device_num_sms(self, device, arch: str | None = None) -> int:
         """The device's physical SM count; ``UnsupportedDevice`` names the SKU when uncatalogued."""

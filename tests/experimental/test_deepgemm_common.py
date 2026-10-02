@@ -59,7 +59,10 @@ def _merged_catalog():
         },
         "routes": {
             "sm_100a": {"a:sm148": {"program": "k_shared"}},
-            "sm_103a": {"a:sm152": {"program": "k_shared"}, "b:sm152": {"program": "k_only_103"}},
+            "sm_103a": {
+                "a:sm152": {"program": "k_shared"},
+                "b:sm152": {"program": "k_only_103"},
+            },
         },
     }
 
@@ -117,15 +120,22 @@ def test_unknown_arch_and_capability_errors_name_the_catalog():
     with pytest.raises(KeyError, match="no architecture 'sm_90a'"):
         catalog.routes("sm_90a")
     assert catalog.arch_for_capability((10, 3)) == "sm_103a"
-    with pytest.raises(RuntimeError, match=r"Unit GEMM has no exported programs for compute capability \(12, 0\)"):
+    with pytest.raises(
+        RuntimeError,
+        match=r"Unit GEMM has no exported programs for compute capability \(12, 0\)",
+    ):
         catalog.arch_for_capability((12, 0))
     with pytest.raises(ValueError, match="no 'schema'"):
         Catalog({"arches": {}}, label="Unit")
 
 
 def test_jit_spec_name_keeps_per_arch_names_and_suffixes_neutral_ones():
-    assert jit_spec_name("deepgemm_x_sm100a_0123", "sm_100a") == "deepgemm_x_sm100a_0123"
-    assert jit_spec_name("deepgemm_x_sm103a_0123", "sm_103a") == "deepgemm_x_sm103a_0123"
+    assert (
+        jit_spec_name("deepgemm_x_sm100a_0123", "sm_100a") == "deepgemm_x_sm100a_0123"
+    )
+    assert (
+        jit_spec_name("deepgemm_x_sm103a_0123", "sm_103a") == "deepgemm_x_sm103a_0123"
+    )
     assert jit_spec_name("deepgemm_x_0123", "sm_103a") == "deepgemm_x_0123_sm_103a"
 
 
@@ -182,8 +192,10 @@ class TestRandomInputs:
         assert torch.equal(unpacked, values)
         assert torch.equal(torch.signbit(unpacked), torch.signbit(values))
         # The analytic constants of the family tests: 0x22 is (1.0, 1.0), 0xAA is (-1.0, -1.0).
-        assert torch.equal(self.h.e2m1_unpack(torch.tensor([0x22, 0xAA], dtype=torch.uint8)),
-                           torch.tensor([1.0, 1.0, -1.0, -1.0]))
+        assert torch.equal(
+            self.h.e2m1_unpack(torch.tensor([0x22, 0xAA], dtype=torch.uint8)),
+            torch.tensor([1.0, 1.0, -1.0, -1.0]),
+        )
         with pytest.raises(ValueError, match="not E2M1-representable"):
             self.h.e2m1_pack(torch.tensor([0.7, 1.0]))
 
@@ -198,8 +210,14 @@ class TestRandomInputs:
 
     def test_fp4_operand_dequantizes_through_its_scales(self):
         torch = self.torch
-        packed, words, dequantized = self.h.random_fp4_operand(16, 256, generator=self.gen, device="cpu")
-        assert packed.shape == (16, 128) and words.shape == (2, 16) and dequantized.shape == (16, 256)
+        packed, words, dequantized = self.h.random_fp4_operand(
+            16, 256, generator=self.gen, device="cpu"
+        )
+        assert (
+            packed.shape == (16, 128)
+            and words.shape == (2, 16)
+            and dequantized.shape == (16, 256)
+        )
         exponents = self.h.ue8m0_unpack_words(words)  # [8, 16]
         scale = torch.exp2(exponents.float() - 127).T.repeat_interleave(32, dim=1)
         assert torch.equal(self.h.e2m1_unpack(packed) * scale, dequantized)
@@ -207,16 +225,25 @@ class TestRandomInputs:
 
     def test_fp8_blockwise_operand_is_exact_under_its_scales(self):
         torch = self.torch
-        fp8, scales, dequantized = self.h.random_fp8_blockwise(8, 512, generator=self.gen, device="cpu")
+        fp8, scales, dequantized = self.h.random_fp8_blockwise(
+            8, 512, generator=self.gen, device="cpu"
+        )
         assert fp8.dtype == torch.float8_e4m3fn and scales.shape == (8, 4)
         rebuilt = fp8.float().reshape(8, 4, 128) * scales.unsqueeze(-1)
         assert torch.equal(rebuilt.reshape(8, 512), dequantized)
 
     def test_fp8_ue8m0_operand_shapes_follow_the_granularity(self):
-        torch = self.torch
-        fp8, words, dequantized = self.h.random_fp8_ue8m0(4, 512, generator=self.gen, device="cpu", gran_k=128)
-        assert words.shape == (1, 4) and fp8.shape == (4, 512) and dequantized.shape == (4, 512)
-        fp8, words, _ = self.h.random_fp8_ue8m0(4, 512, generator=self.gen, device="cpu", gran_k=32)
+        fp8, words, dequantized = self.h.random_fp8_ue8m0(
+            4, 512, generator=self.gen, device="cpu", gran_k=128
+        )
+        assert (
+            words.shape == (1, 4)
+            and fp8.shape == (4, 512)
+            and dequantized.shape == (4, 512)
+        )
+        fp8, words, _ = self.h.random_fp8_ue8m0(
+            4, 512, generator=self.gen, device="cpu", gran_k=32
+        )
         assert words.shape == (4, 4)
 
     def test_reference_gemm_matches_the_analytic_family_constants(self):
@@ -247,7 +274,9 @@ def _gpu_family(module_dir: str, catalog_file: str, label: str):
 class TestRandomInputReferenceChecks:
     """Random operands against a float64 reference on the generated kernels."""
 
-    @pytest.mark.parametrize("m,n,k,alpha", [(256, 128, 256, 1.0), (128, 4608, 5120, -0.75)])
+    @pytest.mark.parametrize(
+        "m,n,k,alpha", [(256, 128, 256, 1.0), (128, 4608, 5120, -0.75)]
+    )
     def test_fp4_gemm_matches_reference_on_random_operands(self, m, n, k, alpha):
         torch = pytest.importorskip("torch")
         from tests.experimental import deepgemm_common as helpers
@@ -267,33 +296,47 @@ class TestRandomInputReferenceChecks:
         helpers.assert_close(plan.output, expected)
 
     @pytest.mark.parametrize("tokens,alpha", [(4, None), (128, 0.5)])
-    def test_fp8_batched_projection_matches_reference_on_random_operands(self, tokens, alpha):
+    def test_fp8_batched_projection_matches_reference_on_random_operands(
+        self, tokens, alpha
+    ):
         torch = pytest.importorskip("torch")
         from tests.experimental import deepgemm_common as helpers
         from flashinfer.fp8_batched_gemm import prepare_fp8_batched_gemm
 
-        _gpu_family("deepgemm_batched_gemm", "batched_gemm_catalog.json", "Batched FP8 projection")
+        _gpu_family(
+            "deepgemm_batched_gemm",
+            "batched_gemm_catalog.json",
+            "Batched FP8 projection",
+        )
         heads, inner, width = 8, 4096, 1024
         gen = helpers.seeded_generator(2026, "cuda")
         aq, asf, a_ref, bq, bsf, b_ref = [], [], [], [], [], []
         for _ in range(heads):
-            q, s, ref = helpers.random_fp8_blockwise(tokens, inner, generator=gen, device="cuda")
+            q, s, ref = helpers.random_fp8_blockwise(
+                tokens, inner, generator=gen, device="cuda"
+            )
             aq.append(q), asf.append(s), a_ref.append(ref)
-            q, s, ref = helpers.random_fp8_block2d(width, inner, generator=gen, device="cuda")
+            q, s, ref = helpers.random_fp8_block2d(
+                width, inner, generator=gen, device="cuda"
+            )
             bq.append(q), bsf.append(s), b_ref.append(ref)
         aq = torch.stack(aq, dim=1).contiguous()  # (tokens, heads, inner)
         asf = torch.stack(asf, dim=1).contiguous()  # (tokens, heads, inner // 128)
         bq = torch.stack(bq).contiguous()  # (heads, width, inner)
         bsf = torch.stack(bsf).contiguous()  # (heads, width // 128, inner // 128)
         try:
-            plan = prepare_fp8_batched_gemm((aq, asf), (bq, bsf), output_fp8=False, alpha=alpha)
+            plan = prepare_fp8_batched_gemm(
+                (aq, asf), (bq, bsf), output_fp8=False, alpha=alpha
+            )
         except NotImplementedError as error:
             pytest.skip(str(error))
         plan.run()
         torch.cuda.synchronize()
         expected = torch.stack(
             [
-                helpers.reference_gemm(a_ref[h], b_ref[h], alpha=1.0 if alpha is None else alpha)
+                helpers.reference_gemm(
+                    a_ref[h], b_ref[h], alpha=1.0 if alpha is None else alpha
+                )
                 for h in range(heads)
             ],
             dim=1,

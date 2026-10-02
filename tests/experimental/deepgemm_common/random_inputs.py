@@ -44,7 +44,24 @@ from __future__ import annotations
 import torch
 
 # E2M1 code -> value (code = sign<<3 | exponent<<1 | mantissa).
-E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+E2M1_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
 
 # Output-dtype tolerances for comparing a kernel against ``reference_gemm`` on
 # operands that are exactly representable (the reference consumes the same
@@ -111,7 +128,9 @@ def ue8m0_pack_words(exponents: torch.Tensor) -> torch.Tensor:
     if torch.any((e < 0) | (e > 255)):
         raise ValueError("UE8M0 exponents must be in [0, 255]")
     groups = e.reshape(e.shape[0] // 4, 4, *e.shape[1:])
-    words = groups[:, 0] | (groups[:, 1] << 8) | (groups[:, 2] << 16) | (groups[:, 3] << 24)
+    words = (
+        groups[:, 0] | (groups[:, 1] << 8) | (groups[:, 2] << 16) | (groups[:, 3] << 24)
+    )
     # Reinterpret the unsigned 32-bit pattern as int32.
     words = torch.where(words >= 2**31, words - 2**32, words)
     return words.to(torch.int32)
@@ -159,14 +178,18 @@ def random_fp4_operand(
     dequantized float32 [rows, k])``.
     """
     if k % 128:
-        raise ValueError("FP4 operands need K to be a multiple of 128 (four 32-element scale blocks per word)")
+        raise ValueError(
+            "FP4 operands need K to be a multiple of 128 (four 32-element scale blocks per word)"
+        )
     raw = torch.randn((rows, k), generator=generator, device=device) * 2.0
     values = _e2m1_round(raw)
     packed = e2m1_pack(values)
     lo, hi = exponent_range
     # One exponent per 128-K-element word, replicated across its four bytes
     # (see the module docstring: the intra-word byte order is unverified).
-    word_exponents = torch.randint(lo, hi, (k // 128, rows), generator=generator, device=device)
+    word_exponents = torch.randint(
+        lo, hi, (k // 128, rows), generator=generator, device=device
+    )
     exponents = word_exponents.repeat_interleave(4, dim=0)
     words = ue8m0_pack_words(exponents)
     scale = _ue8m0_scale(exponents).T.repeat_interleave(32, dim=1)  # [rows, k]
@@ -240,11 +263,15 @@ def random_fp8_ue8m0(
     dequantized float32 [rows, k])``.
     """
     if k % (4 * gran_k):
-        raise ValueError(f"K={k} is not a multiple of four {gran_k}-element scale blocks")
+        raise ValueError(
+            f"K={k} is not a multiple of four {gran_k}-element scale blocks"
+        )
     raw = torch.randn((rows, k), generator=generator, device=device) * 64.0
     fp8 = raw.to(torch.float8_e4m3fn)
     lo, hi = exponent_range
-    exponents = torch.randint(lo, hi, (k // gran_k, rows), generator=generator, device=device)
+    exponents = torch.randint(
+        lo, hi, (k // gran_k, rows), generator=generator, device=device
+    )
     words = ue8m0_pack_words(exponents)
     scale = _ue8m0_scale(exponents).T.repeat_interleave(gran_k, dim=1)
     return fp8, words, fp8.to(torch.float32) * scale
@@ -258,7 +285,9 @@ def reference_gemm(
     return result.to(out_dtype)
 
 
-def assert_close(actual: torch.Tensor, expected: torch.Tensor, *, out_dtype=None) -> None:
+def assert_close(
+    actual: torch.Tensor, expected: torch.Tensor, *, out_dtype=None
+) -> None:
     """``torch.testing.assert_close`` with the tolerance of the kernel's output dtype."""
     dtype = actual.dtype if out_dtype is None else out_dtype
     if dtype not in TOLERANCES:
