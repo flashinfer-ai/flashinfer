@@ -1200,6 +1200,8 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
   // The horizontal kernel gives each row 2 lanes of its (DIM / 64) * 4 consumer warps, so it
   // covers exactly DIM rows only when DIM is a multiple of 64.
   constexpr bool kHorizontalSupportsDim = DIM % 64 == 0;
+  // The vertical kernel processes 16 rows per stage (4 rows for each of its 4 consumer warps).
+  constexpr bool kVerticalSupportsDim = DIM % 16 == 0;
 #endif
 
   // Common alignment checks for all kernels
@@ -1218,7 +1220,8 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
       // for the non-tiled producer-consumer kernels to hide latency).
       int const total_blocks = params.batch * params.nheads;
       int const num_sms = GetCudaMultiProcessorCount();
-      if (total_blocks < num_sms * 2)
+      if (total_blocks < num_sms * 2 || !kVerticalSupportsDim)
+        // Simple is also the only kernel for DIM not divisible by 16
         algo = SSUAlgorithm::kSimple;
       else if (sm_major < 10)
         algo = SSUAlgorithm::kVertical;

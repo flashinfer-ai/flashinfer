@@ -895,3 +895,33 @@ class TestSelectiveStateUpdateVariousNgroups(TestSelectiveStateUpdate):
             inputs["slot_idx"],
             msg_prefix=f"[{algorithm}] ",
         )
+
+
+def test_dim_not_divisible_by_16():
+    """Auto uses the simple kernel at any batch size when the head dim is not divisible
+    by 16, and the multi-token path raises an error instead of leaving the output unwritten."""
+    test = TestSelectiveStateUpdate()
+    # batch * nheads is large enough that auto would otherwise pick a producer-consumer kernel
+    inputs = test.make_inputs(64, 64, 72, 128, torch.bfloat16, torch.float32)
+    y_ref, state_ref = test.make_reference_output(inputs)
+    y_test = test.run_kernel(inputs, algorithm="auto")
+    test.assert_outputs_match(y_ref, y_test)
+    test.assert_states_match(state_ref, inputs["state_cache"], inputs["slot_idx"])
+
+    mtp_inputs = create_test_inputs(
+        64,
+        64,
+        72,
+        128,
+        test.NGROUPS,
+        test.INPUT_DTYPE,
+        weight_dtype=torch.float32,
+        matrixA_dtype=test.MATRIX_A_DTYPE,
+        state_dtype=torch.bfloat16,
+        cache_steps=4,
+        seed=0,
+    )
+    with pytest.raises(
+        RuntimeError, match="Simple MTP kernel requires DIM divisible by"
+    ):
+        test.run_kernel(mtp_inputs)

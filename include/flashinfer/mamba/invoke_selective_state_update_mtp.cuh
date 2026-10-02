@@ -25,7 +25,8 @@ using namespace conversion;
 // (a) CTAS divides kDim and kDim / CTAS is a multiple of kMinRows (compile-time) and
 // (b) ctas_per_head >= CTAS (runtime). Checking only kDim / CTAS >= kMinRows could
 // pick a split whose rows per CTA fail the kernel's static_asserts.
-// The sequence must be in descending order and end with 1 to guarantee a match.
+// The sequence must be in descending order and end with 1. If no CTAS in it gives a valid
+// split, raise an error instead of returning without a launch.
 template <int kDim, int kMinRows, int CTAS, int... Rest, typename F>
 __host__ void dispatchCtasPerHead(int ctas_per_head, F&& launch,
                                   std::integer_sequence<int, CTAS, Rest...>) {
@@ -38,6 +39,9 @@ __host__ void dispatchCtasPerHead(int ctas_per_head, F&& launch,
   if constexpr (sizeof...(Rest) > 0) {
     dispatchCtasPerHead<kDim, kMinRows>(ctas_per_head, std::forward<F>(launch),
                                         std::integer_sequence<int, Rest...>{});
+  } else {
+    FLASHINFER_CHECK(false, "No valid CTAS_PER_HEAD for DIM=", kDim,
+                     ": rows per CTA must be a multiple of ", kMinRows);
   }
 }
 
@@ -263,6 +267,8 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
 
     FLASHINFER_CHECK(params.nheads % params.ngroups == 0, "nheads (", params.nheads,
                      ") must be divisible by ngroups (", params.ngroups, ") for simple algorithm");
+    FLASHINFER_CHECK(DIM % kRowsPerPass == 0, "Simple MTP kernel requires DIM divisible by ",
+                     kRowsPerPass, ", got DIM=", DIM);
     // Determine CTAS_PER_HEAD: split DIM across grid.z for more parallelism at small batch
     int const total_tiles = params.batch * params.nheads;
     int const num_sms = GetCudaMultiProcessorCount();
