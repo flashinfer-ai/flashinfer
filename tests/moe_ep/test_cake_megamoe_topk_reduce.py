@@ -159,11 +159,20 @@ class TestReduceOnDevice:
     @pytest.mark.parametrize(("num_tokens", "capacity"), _SHAPES)
     def test_matches_ordered_reference_and_leaves_idle_rows(self, num_tokens, capacity):
         device = _require_reducer_device()
-        generator = torch.Generator(device=device).manual_seed(num_tokens * 7919 + capacity)
-        partials = torch.randn(
-            capacity, _TOP_K, _HIDDEN, dtype=torch.bfloat16, device=device, generator=generator
+        generator = torch.Generator(device=device).manual_seed(
+            num_tokens * 7919 + capacity
         )
-        out = torch.full((capacity, _HIDDEN), float("nan"), dtype=torch.bfloat16, device=device)
+        partials = torch.randn(
+            capacity,
+            _TOP_K,
+            _HIDDEN,
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        out = torch.full(
+            (capacity, _HIDDEN), float("nan"), dtype=torch.bfloat16, device=device
+        )
         reducer.run_cake_megamoe_topk_reduce(partials, out, num_tokens)
         torch.cuda.synchronize()
         expected = _ordered_reference(partials, num_tokens)
@@ -192,7 +201,9 @@ class TestReduceOnDevice:
     def test_rejects_mismatched_shapes(self):
         device = _require_reducer_device()
         out = torch.zeros(8, _HIDDEN, dtype=torch.bfloat16, device=device)
-        narrow = torch.zeros(8, _TOP_K, _HIDDEN // 2, dtype=torch.bfloat16, device=device)
+        narrow = torch.zeros(
+            8, _TOP_K, _HIDDEN // 2, dtype=torch.bfloat16, device=device
+        )
         with pytest.raises(Exception, match="partials must have shape"):
             reducer.run_cake_megamoe_topk_reduce(narrow, out, 8)
         partials = torch.zeros(8, _TOP_K, _HIDDEN, dtype=torch.bfloat16, device=device)
@@ -208,8 +219,12 @@ class TestReduceOnDevice:
             dtype=torch.bfloat16,
             device=device,
         )
-        partials = storage[: capacity * _TOP_K * _HIDDEN].view(capacity, _TOP_K, _HIDDEN)
+        partials = storage[: capacity * _TOP_K * _HIDDEN].view(
+            capacity, _TOP_K, _HIDDEN
+        )
         # 128-byte aligned window that starts inside ``partials``.
-        out = storage[2 * _HIDDEN : 2 * _HIDDEN + capacity * _HIDDEN].view(capacity, _HIDDEN)
+        out = storage[2 * _HIDDEN : 2 * _HIDDEN + capacity * _HIDDEN].view(
+            capacity, _HIDDEN
+        )
         with pytest.raises(Exception, match="must not overlap"):
             reducer.run_cake_megamoe_topk_reduce(partials, out, capacity)
