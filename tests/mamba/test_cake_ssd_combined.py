@@ -1814,7 +1814,17 @@ def test_source_program_table_names_shipped_sources():
             assert f" {kernel.kernel}(" in source.read_text(encoding="utf-8")
             device_sources.add(source)
         rendered = module._render_host_source(template, program)
-        assert "CAKE_SSD_" not in rendered.replace("CAKE_SSD_TEMPLATE:", "")
+        placeholders = (
+            "CAKE_SSD_PREPROCESS_MODULE",
+            "CAKE_SSD_PREPROCESS_KERNEL",
+            "CAKE_SSD_PREPROCESS_THREADS",
+            "CAKE_SSD_MAIN_MODULE",
+            "CAKE_SSD_MAIN_KERNEL",
+            "CAKE_SSD_STATE_DTYPE_CODE",
+            "CAKE_SSD_MAIN_SMEM_BYTES",
+        )
+        assert all(placeholder in template for placeholder in placeholders)
+        assert not any(placeholder in rendered for placeholder in placeholders)
         assert f"TVM_FFI_EMBED_CUBIN({program.preprocess.module});" in rendered
         assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
         assert f'"{program.main.kernel}"' in rendered
