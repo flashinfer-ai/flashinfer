@@ -94,16 +94,16 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
     assert uri == f"flash_kda_decode_{variant}_{target}"
     assert spec.name == uri
     assert len(spec.sources) == 1
-    assert spec.sources[0] == tmp_path / uri / "flashkda_decode_binding.cu"
+    assert spec.sources[0] == tmp_path / uri / "cake_kda_decode_binding.cu"
     assert spec.sources[0].is_file()
     assert expected_flag in spec.extra_cuda_cflags
     target_defines = [
         flag
         for flag in spec.extra_cuda_cflags
-        if flag.startswith("-DFLASHINFER_FLASH_KDA_DECODE_TARGET_KIND=")
+        if flag.startswith("-DFLASHINFER_CAKE_KDA_DECODE_TARGET_KIND=")
     ]
     assert target_defines == [
-        f"-DFLASHINFER_FLASH_KDA_DECODE_TARGET_KIND={target_kind}"
+        f"-DFLASHINFER_CAKE_KDA_DECODE_TARGET_KIND={target_kind}"
     ]
     assert "-use_fast_math" in spec.extra_cuda_cflags
     assert "--maxrregcount=128" in spec.extra_cuda_cflags
@@ -153,44 +153,47 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
 
     binding_text = spec.sources[0].read_text()
     assert (
-        f'#define FLASHKDA_DECODE_BODY_FILE "flashkda_decode_{variant}.cu"'
+        f'#define CAKE_KDA_DECODE_BODY_FILE "flashkda_decode_{variant}.cu"'
         in binding_text
     )
-    assert f"#define FLASHKDA_DECODE_HEAD_DIM {metadata.head_dim}" in binding_text
-    assert f"#define FLASHKDA_DECODE_TOKENS {metadata.tokens}" in binding_text
-    assert f"#define FLASHKDA_DECODE_GATE_KIND {expected_gate_kind}" in binding_text
-    assert f"#define FLASHKDA_DECODE_VALUE_SPLIT {metadata.value_split}" in binding_text
+    assert f"#define CAKE_KDA_DECODE_HEAD_DIM {metadata.head_dim}" in binding_text
+    assert f"#define CAKE_KDA_DECODE_TOKENS {metadata.tokens}" in binding_text
+    assert f"#define CAKE_KDA_DECODE_GATE_KIND {expected_gate_kind}" in binding_text
+    assert f"#define CAKE_KDA_DECODE_VALUE_SPLIT {metadata.value_split}" in binding_text
     assert (
-        f"#define FLASHKDA_DECODE_LAUNCH_THREADS {metadata.launch_threads}"
+        f"#define CAKE_KDA_DECODE_LAUNCH_THREADS {metadata.launch_threads}"
         in binding_text
     )
+    assert "#define CAKE_KDA_DECODE_WARPS_PER_CTA 1" in binding_text
     assert (
-        "#define FLASHKDA_DECODE_DIRECT_IMPL 1" in binding_text
+        "#define CAKE_KDA_DECODE_DIRECT_IMPL 1" in binding_text
     ) is metadata.direct_impl
-    assert '#include "flashkda_decode_binding.cuh"' in binding_text
+    assert '#include "cake_kda_decode_binding.cuh"' in binding_text
     flash_kda_decode.gen_flash_kda_decode_module.cache_clear()
 
 
 def test_flash_kda_decode_binding_contract():
     csrc_dir = flash_kda_decode._get_csrc_dir()
-    binding = (csrc_dir / "flashkda_decode_binding.cuh").read_text()
-    common = (csrc_dir / "flashkda_decode_binding_common.cuh").read_text()
-    impl = (csrc_dir / "flashkda_decode_binding_impl.cuh").read_text()
-    direct_impl = (csrc_dir / "flashkda_decode_binding_direct_impl.cuh").read_text()
+    binding = (csrc_dir / "cake_kda_decode_binding.cuh").read_text()
+    common = (csrc_dir / "cake_kda_decode_binding_common.cuh").read_text()
+    impl = (csrc_dir / "cake_kda_decode_binding_impl.cuh").read_text()
+    direct_impl = (csrc_dir / "cake_kda_decode_binding_direct_impl.cuh").read_text()
 
-    assert "FLASHKDA_DECODE_BODY_FILE" in binding
-    assert "#include FLASHKDA_DECODE_BODY_FILE" in binding
-    assert "#ifdef FLASHKDA_DECODE_DIRECT_IMPL" in binding
-    assert '#include "flashkda_decode_binding_direct_impl.cuh"' in binding
-    assert "#ifndef FLASHINFER_FLASH_KDA_DECODE_TARGET_KIND" in common
-    assert "kFlashKDADecodeTargetKind == kFlashKDADecodeFamilyTarget" in common
-    assert "kFlashKDADecodeTargetKind == kFlashKDADecodeExactSM100aTarget" in common
-    assert "kFlashKDADecodeTargetKind == kFlashKDADecodeExactSM103aTarget" in common
-    assert "major == 10 && (minor == 0 || minor == 3 || minor == 7)" in common
+    assert "CAKE_KDA_DECODE_BODY_FILE" in binding
+    assert "#include CAKE_KDA_DECODE_BODY_FILE" in binding
+    assert "#ifdef CAKE_KDA_DECODE_DIRECT_IMPL" in binding
+    assert '#include "cake_kda_decode_binding_direct_impl.cuh"' in binding
+    assert '#include "cake_kda_decode_binding_impl.cuh"' in binding
+    assert "#ifndef FLASHINFER_CAKE_KDA_DECODE_TARGET_KIND" in common
+    assert "kCakeKDADecodeTargetKind == kCakeKDADecodeFamilyTarget" in common
+    assert "kCakeKDADecodeTargetKind == kCakeKDADecodeExactSM100aTarget" in common
+    assert "kCakeKDADecodeTargetKind == kCakeKDADecodeExactSM103aTarget" in common
+    assert "major == 10 && (minor == 0 || minor == 3)" in common
     assert "major == 10 && minor == expected_minor" in common
-    assert "CheckFlashKDADecodeTarget(device_id)" in common
+    assert "CheckCakeKDADecodeTarget(device_id)" in common
     assert "struct VariantTraits" in common
     assert "static_assert(Tokens >= 1)" in common
+    assert "GateKind == 0 || GateKind == 1 || GateKind == 2" in common
     assert "ValueSplit == 16" in common
     assert "HeadDim % ValueSplit == 0" in common
     assert "state.stride(0) >= num_value_heads * head_dim * head_dim" in common
@@ -200,14 +203,15 @@ def test_flash_kda_decode_binding_contract():
     assert "lower-bound gate variants require at least H A_log values" in common
     assert "lower-bound gate variants require at least H * D dt_bias values" in common
     assert "finite negative lower_bound" in common
+    assert "only the T1 unbounded-softplus variant accepts beta logits" in common
     assert "torch.cuda.current_stream" not in impl
-    assert "cuda_stream" in impl
-    assert "VALUE_SPLIT" in impl
-    assert "FLASHKDA_DECODE_EXPECTED_SMEM" not in impl
+    assert "int64_t beta_is_logit, int64_t cuda_stream" in impl
+    assert "CAKE_KDA_DECODE_VALUE_SPLIT" in impl
     assert "SMEM_TOTAL > 0" in impl
+    assert "kernel_flashinfer_recurrent_kda_wy_vtile_short" in impl
     assert "kernel_flashinfer_recurrent_kda_t1_direct" in direct_impl
     assert "SMEM_TOTAL" not in direct_impl
-    assert "cuda_stream" in direct_impl
+    assert "int64_t beta_is_logit, int64_t cuda_stream" in direct_impl
 
 
 def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):

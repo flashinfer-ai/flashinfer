@@ -1056,7 +1056,7 @@ def test_frozen_runner_selects_physical_target_and_forwards_ffi_abi_cpu(
 
     assert loaded == [(variant, expected_target)]
     (args,) = module.calls
-    assert len(args) == 15
+    assert len(args) == 16
     assert args[:5] == (
         tensors["q"],
         tensors["k"],
@@ -1074,7 +1074,8 @@ def test_frozen_runner_selects_physical_target_and_forwards_ffi_abi_cpu(
     )
     assert args[12] == tensors["scale"]
     assert args[13] == 0.0
-    assert args[14] == 0xCAFE
+    assert args[14] == 0
+    assert args[15] == 0xCAFE
 
 
 @pytest.mark.parametrize(
@@ -1274,8 +1275,9 @@ def test_t3_frozen_runner_forwards_real_gate_parameters_cpu(monkeypatch):
     assert args[5] is tensors["A_log"]
     assert args[6] is tensors["dt_bias"]
     assert args[13] == tensors["lower_bound"]
-    assert len(args) == 15
-    assert args[14] == 0xFACE
+    assert len(args) == 16
+    assert args[14] == 0
+    assert args[15] == 0xFACE
 
 
 def _padded_slot_state(slots, num_value_heads, device, *, seed):

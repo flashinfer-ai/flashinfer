@@ -16,53 +16,53 @@
 
 #pragma once
 
-#ifndef FLASHKDA_DECODE_VALUE_SPLIT
-#error "FLASHKDA_DECODE_VALUE_SPLIT must be defined by the binding translation unit"
+#ifndef CAKE_KDA_DECODE_VALUE_SPLIT
+#error "CAKE_KDA_DECODE_VALUE_SPLIT must be defined by the binding translation unit"
 #endif
-#ifndef FLASHKDA_DECODE_HEAD_DIM
-#error "FLASHKDA_DECODE_HEAD_DIM must be defined by the binding translation unit"
+#ifndef CAKE_KDA_DECODE_HEAD_DIM
+#error "CAKE_KDA_DECODE_HEAD_DIM must be defined by the binding translation unit"
 #endif
-#ifndef FLASHKDA_DECODE_TOKENS
-#error "FLASHKDA_DECODE_TOKENS must be defined by the binding translation unit"
+#ifndef CAKE_KDA_DECODE_TOKENS
+#error "CAKE_KDA_DECODE_TOKENS must be defined by the binding translation unit"
 #endif
-#ifndef FLASHKDA_DECODE_GATE_KIND
-#error "FLASHKDA_DECODE_GATE_KIND must be defined by the binding translation unit"
+#ifndef CAKE_KDA_DECODE_GATE_KIND
+#error "CAKE_KDA_DECODE_GATE_KIND must be defined by the binding translation unit"
 #endif
-#ifndef FLASHKDA_DECODE_LAUNCH_THREADS
-#error "FLASHKDA_DECODE_LAUNCH_THREADS must be defined by the binding translation unit"
+#ifndef CAKE_KDA_DECODE_LAUNCH_THREADS
+#error "CAKE_KDA_DECODE_LAUNCH_THREADS must be defined by the binding translation unit"
 #endif
 namespace flashinfer {
-namespace flash_kda_decode {
+namespace cake_kda_decode {
 
-using ActiveVariant = VariantTraits<FLASHKDA_DECODE_HEAD_DIM, FLASHKDA_DECODE_TOKENS,
-                                    FLASHKDA_DECODE_GATE_KIND, FLASHKDA_DECODE_VALUE_SPLIT>;
+using ActiveVariant = VariantTraits<CAKE_KDA_DECODE_HEAD_DIM, CAKE_KDA_DECODE_TOKENS,
+                                    CAKE_KDA_DECODE_GATE_KIND, CAKE_KDA_DECODE_VALUE_SPLIT>;
 
 static_assert(THREADS == 256);
 static_assert(SMEM_TOTAL > 0);
-static_assert(GATE_KIND == FLASHKDA_DECODE_GATE_KIND);
+static_assert(GATE_KIND == CAKE_KDA_DECODE_GATE_KIND);
 static_assert(DIRECT_PREFIX_CHECKPOINT == 0);
 static_assert(BLOCK_CHECKPOINT_MMA == 0);
-static_assert(FLASHKDA_DECODE_VALUE_SPLIT == 1 || FLASHKDA_DECODE_VALUE_SPLIT == 2 ||
-              FLASHKDA_DECODE_VALUE_SPLIT == 4 || FLASHKDA_DECODE_VALUE_SPLIT == 8);
-static_assert(FLASHKDA_DECODE_HEAD_DIM % (16 * FLASHKDA_DECODE_VALUE_SPLIT) == 0);
-static_assert(FLASHKDA_DECODE_LAUNCH_THREADS % 32 == 0);
-static_assert(FLASHKDA_DECODE_LAUNCH_THREADS <= THREADS);
+static_assert(CAKE_KDA_DECODE_VALUE_SPLIT == 1 || CAKE_KDA_DECODE_VALUE_SPLIT == 2 ||
+              CAKE_KDA_DECODE_VALUE_SPLIT == 4 || CAKE_KDA_DECODE_VALUE_SPLIT == 8);
+static_assert(CAKE_KDA_DECODE_HEAD_DIM % (16 * CAKE_KDA_DECODE_VALUE_SPLIT) == 0);
+static_assert(CAKE_KDA_DECODE_LAUNCH_THREADS % 32 == 0);
+static_assert(CAKE_KDA_DECODE_LAUNCH_THREADS <= THREADS);
 
 void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta, TensorView A_log,
          TensorView dt_bias, TensorView state, TensorView out, TensorView cu_seqlens,
          TensorView ssm_state_indices, TensorView num_accepted_tokens, double scale,
-         double lower_bound, int64_t cuda_stream) {
+         double lower_bound, int64_t beta_is_logit, int64_t cuda_stream) {
   const LaunchContext ctx = CheckInputs<ActiveVariant>(
       q, k, v, g, beta, A_log, dt_bias, state, out, cu_seqlens, ssm_state_indices,
-      num_accepted_tokens, scale, lower_bound, cuda_stream);
+      num_accepted_tokens, scale, lower_bound, beta_is_logit, cuda_stream);
   ffi::CUDADeviceGuard device_guard(ctx.device_id);
   CheckDynamicSmemCapacity(ctx.device_id, SMEM_TOTAL);
   CheckCuda(cudaFuncSetAttribute(kernel_flashinfer_recurrent_kda_wy_vtile_short,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_TOTAL),
-            "cudaFuncSetAttribute(flashkda decode)");
+            "cudaFuncSetAttribute(cake kda decode)");
 
-  const dim3 grid(ctx.num_value_heads * FLASHKDA_DECODE_VALUE_SPLIT, ctx.num_sequences, 1);
-  const dim3 block(FLASHKDA_DECODE_LAUNCH_THREADS, 1, 1);
+  const dim3 grid(ctx.num_value_heads * CAKE_KDA_DECODE_VALUE_SPLIT, ctx.num_sequences, 1);
+  const dim3 block(CAKE_KDA_DECODE_LAUNCH_THREADS, 1, 1);
   kernel_flashinfer_recurrent_kda_wy_vtile_short<<<grid, block, SMEM_TOTAL, ctx.stream>>>(
       reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),
@@ -77,10 +77,10 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
       reinterpret_cast<int*>(num_accepted_tokens.data_ptr()), static_cast<float>(scale),
       static_cast<float>(lower_bound), ctx.gate_token_stride, ctx.state_slot_stride, ctx.num_heads,
       ctx.num_value_heads, ctx.head_ratio);
-  CheckCuda(cudaGetLastError(), "frozen FlashKDA decode launch");
+  CheckCuda(cudaGetLastError(), "frozen CakeKDA decode launch");
 }
 
-}  // namespace flash_kda_decode
+}  // namespace cake_kda_decode
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::flash_kda_decode::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::cake_kda_decode::Run);

@@ -1767,10 +1767,7 @@ def _run_flash_kda_decode(
         float(lower_bound),
     )
     stream = int(torch.cuda.current_stream(q.device).cuda_stream)
-    if variant in CAKE_KDA_DECODE_DIRECT_VARIANTS:
-        module.run(*common_args, int(beta_is_logit), stream)
-    else:
-        module.run(*common_args, stream)
+    module.run(*common_args, int(beta_is_logit), stream)
 
 
 def run_recurrent_kda(

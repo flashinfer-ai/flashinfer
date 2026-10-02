@@ -167,19 +167,25 @@ def _get_binding_cu(
     variant: FlashKDADecodeVariant,
     metadata: FlashKDADecodeVariantMetadata,
 ) -> str:
-    """Render the generic binding translation unit for one frozen body."""
+    """Render the shared KDA decode binding translation unit for one body.
+
+    The precomputed and lower-bound bodies share the ``cake_kda_decode``
+    binding family with the unbounded-softplus route; their ``run`` entry
+    therefore also takes the ``beta_is_logit`` scalar, which must be zero.
+    """
 
     defines: list[tuple[str, str | int]] = [
-        ("FLASHKDA_DECODE_BODY_FILE", f'"flashkda_decode_{variant}.cu"'),
-        ("FLASHKDA_DECODE_HEAD_DIM", metadata.head_dim),
-        ("FLASHKDA_DECODE_TOKENS", metadata.tokens),
-        ("FLASHKDA_DECODE_GATE_KIND", metadata.gate_kind),
-        ("FLASHKDA_DECODE_VALUE_SPLIT", metadata.value_split),
-        ("FLASHKDA_DECODE_LAUNCH_THREADS", metadata.launch_threads),
+        ("CAKE_KDA_DECODE_BODY_FILE", f'"flashkda_decode_{variant}.cu"'),
+        ("CAKE_KDA_DECODE_HEAD_DIM", metadata.head_dim),
+        ("CAKE_KDA_DECODE_TOKENS", metadata.tokens),
+        ("CAKE_KDA_DECODE_GATE_KIND", metadata.gate_kind),
+        ("CAKE_KDA_DECODE_VALUE_SPLIT", metadata.value_split),
+        ("CAKE_KDA_DECODE_LAUNCH_THREADS", metadata.launch_threads),
+        ("CAKE_KDA_DECODE_WARPS_PER_CTA", 1),
     ]
     if metadata.direct_impl:
-        defines.append(("FLASHKDA_DECODE_DIRECT_IMPL", 1))
-    return render_kda_decode_binding(defines, "flashkda_decode_binding.cuh")
+        defines.append(("CAKE_KDA_DECODE_DIRECT_IMPL", 1))
+    return render_kda_decode_binding(defines, "cake_kda_decode_binding.cuh")
 
 
 @functools.cache
@@ -198,15 +204,15 @@ def gen_flash_kda_decode_module(
     body = csrc_dir / f"flashkda_decode_{variant}.cu"
     if not body.exists():
         raise FileNotFoundError(f"frozen FlashKDA decode body source not found: {body}")
-    binding_header = csrc_dir / "flashkda_decode_binding.cuh"
+    binding_header = csrc_dir / "cake_kda_decode_binding.cuh"
     if not binding_header.exists():
         raise FileNotFoundError(
-            f"generic FlashKDA decode binding header not found: {binding_header}"
+            f"shared KDA decode binding header not found: {binding_header}"
         )
 
     metadata = FLASH_KDA_DECODE_VARIANT_METADATA[variant]
     uri = get_flash_kda_decode_uri(variant, target)
-    binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "flashkda_decode_binding.cu"
+    binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_kda_decode_binding.cu"
     write_if_different(binding, _get_binding_cu(variant, metadata))
 
     spec = gen_kda_jit_spec(
@@ -214,7 +220,7 @@ def gen_flash_kda_decode_module(
         sources=[binding],
         target=target,
         target_define=(
-            "-DFLASHINFER_FLASH_KDA_DECODE_TARGET_KIND="
+            "-DFLASHINFER_CAKE_KDA_DECODE_TARGET_KIND="
             f"{_FLASH_KDA_DECODE_TARGET_KIND[target]}"
         ),
         csrc_dir=csrc_dir,
