@@ -1146,9 +1146,13 @@ def plan_dense_projection_gemm(
     return plan, a_desc, b_desc, O3
 
 
-# Knob variants the registry fallback tries, nearest first (see ``plan_dense_projection_gemm``): the tall tile and the
-# raster groups the measured rules use, the register epilogue (the canonical-T templates), then BLOCK_N = 128.
+# Knob variants the registry fallback tries, nearest first (see ``plan_dense_projection_gemm``): the 256 B L2
+# promotion (same tile walk and store path; round 8 retired the un-promoted sm_107a ``kk_n128`` program when the
+# indexer_hw forward rows took the promotion, so a tail-T ``indexer_k fwd`` instance lands here), the tall tile and
+# the raster groups the measured rules use, the register epilogue (the canonical-T templates), then BLOCK_N = 128.
 _FALLBACK_KNOB_VARIANTS = (
+    dict(promo="l2_256b"),
+    dict(promo="l2_256b", group_m=8),
     dict(cta_rows=256),
     dict(group_m=8),
     dict(cta_rows=256, group_m=8),

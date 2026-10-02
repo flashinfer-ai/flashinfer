@@ -1631,12 +1631,13 @@ def test_sk_parts_rule(pairs):
     else:
         # on B200 the 128-tile row's tail of 54 admits no split: the rule falls back to auto (whole tiles)
         assert sk_parts_plan(128, 254, pairs, 3) == ("auto", None)
-    # the sm_107a rules adopted in round 4 ...
+    # the sm_107a rules adopted in round 4 (round 8 adds the 4-tile raster group to the bf16 indexer_q wgrad rule) ...
     assert ROW_RULES[
         ("sm_107a", True, True, False, False, False, 2048, None, 4096)
     ] == {
         "block_n": 128,
         "sk_parts": 2,
+        "group_m": 4,
     }
     assert ROW_RULES[("sm_107a", True, True, True, False, False, 2048, None, 4096)] == {
         "sk_parts": 3
