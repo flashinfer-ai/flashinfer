@@ -4,7 +4,7 @@
   "compile_flags": [],
   "fused_block_tail_kcap": 1024,
   "fused_tail_kcap": 64,
-  "kernel_count": 91,
+  "kernel_count": 88,
   "kernel_symbols": [
     "kernel_cake_radix_topk_c1_e4",
     "kernel_cake_radix_topk_c1_e8",
@@ -84,19 +84,16 @@
     "kernel_cake_sparse_topp_sample_t128_i2",
     "kernel_cake_sparse_topp_sample_t256_i2",
     "kernel_cake_sparse_topp_sample_t256_i4",
-    "kernel_cake_sparse_topp_sample_t512_i2",
     "kernel_cake_sparse_topp_sample_t32_i2_sel1",
     "kernel_cake_sparse_topp_sample_t64_i2_sel1",
     "kernel_cake_sparse_topp_sample_t128_i2_sel1",
     "kernel_cake_sparse_topp_sample_t256_i2_sel1",
     "kernel_cake_sparse_topp_sample_t256_i4_sel1",
-    "kernel_cake_sparse_topp_sample_t512_i2_sel1",
     "kernel_cake_sparse_topp_sample_t32_i2_int_sel1",
     "kernel_cake_sparse_topp_sample_t64_i2_int_sel1",
     "kernel_cake_sparse_topp_sample_t128_i2_int_sel1",
     "kernel_cake_sparse_topp_sample_t256_i2_int_sel1",
-    "kernel_cake_sparse_topp_sample_t256_i4_int_sel1",
-    "kernel_cake_sparse_topp_sample_t512_i2_int_sel1"
+    "kernel_cake_sparse_topp_sample_t256_i4_int_sel1"
   ],
   "min_compute_capability": [
     9,
@@ -165,12 +162,12 @@
       "sha256": "1a2d13b4f52204c2413e33e2e89765e0ac1f41d1aa1ae94bdec2f1741af22e73"
     },
     {
-      "bytes": 1418110,
+      "bytes": 1262144,
       "path": "cake_sampling_kernels_part9.cuh",
-      "sha256": "893d2aa86f9cfa9b0cc34c024560f754b36c23f7c71416e3ce7d56079aab1e2f"
+      "sha256": "e02cf09e69d3f1d44ebb790c81f6b1524cbe221a728c35e7e7cf467ac4779168"
     }
   ],
-  "source_sha256": "0df0c68387ec4e7b85522136b317c812228b103da69326ce15a0c9bb2fe3942f",
+  "source_sha256": "fb33890887501f1a2278521a2814372f098e5871515f6cdfa9058bdc9c42493a",
   "stage1": [
     {
       "block_threads": 512,
@@ -1320,16 +1317,6 @@
       "variant_flags": 0
     },
     {
-      "block_threads": 512,
-      "capacity": 1024,
-      "dynamic_smem_bytes": 16640,
-      "features": [],
-      "items": 2,
-      "symbol": "kernel_cake_sparse_topp_sample_t512_i2",
-      "threads": 512,
-      "variant_flags": 0
-    },
-    {
       "block_threads": 32,
       "capacity": 64,
       "dynamic_smem_bytes": 1152,
@@ -1387,18 +1374,6 @@
       "items": 4,
       "symbol": "kernel_cake_sparse_topp_sample_t256_i4_sel1",
       "threads": 256,
-      "variant_flags": 2
-    },
-    {
-      "block_threads": 512,
-      "capacity": 1024,
-      "dynamic_smem_bytes": 16640,
-      "features": [
-        "one_cmp_select"
-      ],
-      "items": 2,
-      "symbol": "kernel_cake_sparse_topp_sample_t512_i2_sel1",
-      "threads": 512,
       "variant_flags": 2
     },
     {
@@ -1464,19 +1439,6 @@
       "items": 4,
       "symbol": "kernel_cake_sparse_topp_sample_t256_i4_int_sel1",
       "threads": 256,
-      "variant_flags": 3
-    },
-    {
-      "block_threads": 512,
-      "capacity": 1024,
-      "dynamic_smem_bytes": 16640,
-      "features": [
-        "int_tests",
-        "one_cmp_select"
-      ],
-      "items": 2,
-      "symbol": "kernel_cake_sparse_topp_sample_t512_i2_int_sel1",
-      "threads": 512,
       "variant_flags": 3
     }
   ],
