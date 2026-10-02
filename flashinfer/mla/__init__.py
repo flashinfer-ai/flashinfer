@@ -40,6 +40,18 @@ _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS = frozenset(
     }
 )
 
+_CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS = frozenset(
+    {
+        "cake_sparse_mla_sm120_dsv4_nvfp4_decode",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_format_info",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes",
+        "cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads",
+    }
+)
+
 _CAKE_DSV4_LAZY_EXPORTS = frozenset(
     {
         "cake_dsv4_workspace_layout",
@@ -78,6 +90,12 @@ def __getattr__(name: str):
         value = getattr(_dsv4_nvfp4, name)
         globals()[name] = value
         return value
+    if name in _CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS:
+        from ._sparse_mla_sm120 import _cake_dsv4_nvfp4
+
+        value = getattr(_cake_dsv4_nvfp4, name)
+        globals()[name] = value
+        return value
     if name in _CAKE_DSV4_LAZY_EXPORTS:
         from . import cake_dsv4
 
@@ -100,6 +118,7 @@ def __dir__():
         | _PRIMS_TS_LAZY_EXPORTS
         | _SPARSE_MLA_SM120_LAZY_EXPORTS
         | _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS
+        | _CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS
         | _CAKE_DSV4_LAZY_EXPORTS
         | _CAKE_KIMI_K3_MLA_LAZY_EXPORTS
     )

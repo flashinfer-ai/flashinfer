@@ -186,8 +186,8 @@ def _blocked(scales):
 
 
 def _offsets(offsets, rows):
-    if offsets.ndim != 1 or offsets.dtype != torch.int32 or not offsets.numel():
-        raise ValueError("offsets must be a nonempty int32 vector")
+    if offsets.ndim != 1 or offsets.dtype != torch.int32 or offsets.numel() < 2:
+        raise ValueError("offsets must be an int32 vector with G+1 explicit boundaries")
     starts = offsets.tolist()
     if (
         starts[0] != 0
@@ -214,12 +214,12 @@ def pack_token_scales(scales: torch.Tensor, offsets: torch.Tensor) -> torch.Tens
     rows, cols = scales.shape
     starts = _offsets(offsets, rows)
     result = torch.zeros(
-        segmented_scale_rows(rows, len(starts)) * ((cols + 3) // 4 * 4),
+        segmented_scale_rows(rows, len(starts) - 1) * ((cols + 3) // 4 * 4),
         dtype=torch.uint8,
         device=scales.device,
     )
     pos = 0
-    for begin, end in zip(starts, starts[1:] + [rows], strict=False):
+    for begin, end in zip(starts, starts[1:], strict=False):
         block = _blocked(scales[begin:end])
         result[pos : pos + block.numel()] = block
         pos += block.numel()
@@ -264,7 +264,7 @@ def _launch_arguments(
         s if kernel.swap_ab else n,
         k,
         e,
-        offsets.numel(),
+        offsets.numel() - 1,
         *(v for t in operands for v in t.stride()),
         *out.stride(),
     )
@@ -327,7 +327,10 @@ class PreparedMxfp8GroupedGemm:
         if offsets.device != tokens.device or not offsets.is_contiguous():
             raise ValueError("offsets must be contiguous on the token device")
         starts = _offsets(offsets, s)
-        geometry = dict(s=s, n=n, k=k, experts=e, groups=len(starts))
+        groups = len(starts) - 1
+        if groups % e:
+            raise ValueError("offsets must describe a positive multiple of E groups")
+        geometry = dict(s=s, n=n, k=k, experts=e, groups=groups)
         if kernel.arch != runtime._arch_for(tokens.device) or not all(
             runtime._dimension_matches(v, kernel.contract.get(key))
             for key, v in geometry.items()
@@ -337,7 +340,7 @@ class PreparedMxfp8GroupedGemm:
             raise ValueError("MXFP8 data must be float8_e4m3fn")
         if out.shape != (s, n) or out.dtype != torch.bfloat16:
             raise ValueError("output must be BF16 [S,N]")
-        required_sfa = segmented_scale_rows(s, len(starts)) * (k // 32)
+        required_sfa = segmented_scale_rows(s, groups) * (k // 32)
         required_sfb = e * n * (k // 32)
         for sf, size in (
             (token_scales, required_sfa),

@@ -1734,86 +1734,122 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                         int stats_row_r = slot_tile_base_s * 128 + r_row;
                         int f_r = 64 >> block_end_s;
                         int d0_r = block_begin_s * (4 * f_r) + (128 + sm_tid) % 4 * f_r;
+                        {
+                            d0_r = block_begin_s * (4 * f_r) + (128 + sm_tid) % 4 * 16;
+                        }
                         int o_row_r = slot_tile_base_s * 16384 + r_row * HEAD_DIM + d0_r;
                         int j_r = q_tile_s * 4 + r_row / 16;
                         int h_r = r_row % 16;
                         int q_head_r = kv_head_s * 16 + h_r;
                         int o_idx_r = ((batch_s * q_len + j_r) * num_q_heads + q_head_r) * HEAD_DIM + d0_r;
-                        int n_groups_r = 16 >> block_end_s;
                         int store_lse_r = 0;
                         if ((128 + sm_tid) % 4 == 0 && block_begin_s == 0) {
                             store_lse_r = 1;
                         }
                         int lse_idx_r = (batch_s * q_len + j_r) * num_q_heads + q_head_r;
-                        float acc_f[4];
-                        float out4[4];
-                        int n_pad_r = (n_chunks_s + 7) / 8 * 8;
-                        #pragma unroll 1
-                        for (int g_r = 0; g_r < n_groups_r; g_r++) {
-                            acc_f[0] = 0.0f;
-                            acc_f[1] = 0.0f;
-                            acc_f[2] = 0.0f;
-                            acc_f[3] = 0.0f;
-                            float m_f = -1e+30f;
-                            float l_f = 0.0f;
-                            int o_col_r = o_row_r + g_r * 4;
-                            #pragma unroll 8
-                            for (int c_m = 0; c_m < n_pad_r; c_m++) {
-                                int c_c = c_m;
-                                if (n_chunks_s <= c_m) {
-                                    c_c = n_chunks_s - 1;
-                                }
-                                float m_k = partial_stats[stats_row_r + c_c * stats_stride_r];
-                                float l_k = partial_stats[stats_row_r + 64 + c_c * stats_stride_r];
-                                if (n_chunks_s <= c_m) {
-                                    m_k = -1e+30f;
-                                    l_k = 0.0f;
-                                }
-                                float _max_16 = max_noftz(m_f, m_k);
-                                float m_new = _max_16;
-                                float _exp2_1 = approx_exp2((m_f - m_new) * softmax_scale_log2);
-                                float a_k = _exp2_1;
-                                float _exp2_2 = approx_exp2((m_k - m_new) * softmax_scale_log2);
-                                float b_k = _exp2_2;
-                                float _fma_0 = __fmaf_rn(l_k, b_k, l_f * a_k);
-                                l_f = _fma_0;
-                                float _vec_load_0[4];
-                                {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(partial_o + (o_col_r + c_c * o_stride_r) + 0);
-                                    _vec_load_0[0 + 0] = _v4.x;
-                                    _vec_load_0[0 + 1] = _v4.y;
-                                    _vec_load_0[0 + 2] = _v4.z;
-                                    _vec_load_0[0 + 3] = _v4.w;
-                                }
-                                #pragma unroll
-                                for (int k = 0; k < 4; k++) {
-                                    float _fma_1 = __fmaf_rn(_vec_load_0[k], b_k, acc_f[k] * a_k);
-                                    acc_f[k] = _fma_1;
-                                }
-                                m_f = m_new;
-                            }
-                            float _rcp_12 = approx_rcp(l_f);
-                            float inv_f = ((l_f > 0.0f) ? _rcp_12 * output_scale : 0.0f);
-                            #pragma unroll
-                            for (int k4 = 0; k4 < 4; k4++) {
-                                out4[k4] = acc_f[k4] * inv_f;
-                            }
-                            {
-                                uint2 _pk2;
-                                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                                _pk[0] = __floats2bfloat162_rn(out4[0 + 0], out4[0 + 1]);
-                                _pk[1] = __floats2bfloat162_rn(out4[0 + 2], out4[0 + 3]);
-                                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r + g_r * 4)))[0]) = _pk2;
-                            }
-                            if (store_lse_r != 0) {
-                                if (g_r == 0) {
-                                    float lse_r = -CAKE_INF;
-                                    if (l_f > 0.0f) {
-                                        float _log2_0;
-                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(l_f));
-                                        lse_r = m_f * softmax_scale_log2 + _log2_0 - 0.8073549f;
+                        {
+                            int _max_16 = ((f_r / 16) > (1) ? (f_r / 16) : (1));
+                            int n_span_r = _max_16;
+                            int _min_4 = ((f_r / 4) < (4) ? (f_r / 4) : (4));
+                            int active_r = _min_4;
+                            if (active_r > (128 + sm_tid) % 4) {
+                                #pragma unroll 1
+                                for (int w_r = 0; w_r < n_span_r; w_r++) {
+                                    int store_lse_w = ((w_r == 0) ? store_lse_r : 0);
+                                    float acc_w[16];
+                                    acc_w[0] = 0.0f;
+                                    acc_w[1] = 0.0f;
+                                    acc_w[2] = 0.0f;
+                                    acc_w[3] = 0.0f;
+                                    acc_w[4] = 0.0f;
+                                    acc_w[5] = 0.0f;
+                                    acc_w[6] = 0.0f;
+                                    acc_w[7] = 0.0f;
+                                    acc_w[8] = 0.0f;
+                                    acc_w[9] = 0.0f;
+                                    acc_w[10] = 0.0f;
+                                    acc_w[11] = 0.0f;
+                                    acc_w[12] = 0.0f;
+                                    acc_w[13] = 0.0f;
+                                    acc_w[14] = 0.0f;
+                                    acc_w[15] = 0.0f;
+                                    float m_w = -1e+30f;
+                                    float l_w = 0.0f;
+                                    int n_pad_w = (n_chunks_s + 3) / 4 * 4;
+                                    #pragma unroll 1
+                                    for (int c_b = 0; c_b < n_pad_w; c_b += 4) {
+                                        float m_b[4];
+                                        float l_b[4];
+                                        float o_b[64];
+                                        #pragma unroll
+                                        for (int cb = 0; cb < 4; cb++) {
+                                            int c_c = c_b + cb;
+                                            if (c_c >= n_chunks_s) {
+                                                c_c = n_chunks_s - 1;
+                                            }
+                                            m_b[cb] = partial_stats[stats_row_r + c_c * stats_stride_r];
+                                            l_b[cb] = partial_stats[stats_row_r + 64 + c_c * stats_stride_r];
+                                            #pragma unroll
+                                            for (int g = 0; g < 4; g++) {
+                                                {
+                                                    float4 _v4 = *reinterpret_cast<const float4*>(partial_o + o_row_r + w_r * 64 + g * 4 + c_c * o_stride_r);
+                                                    o_b[cb * 16 + g * 4 + 0] = _v4.x;
+                                                    o_b[cb * 16 + g * 4 + 1] = _v4.y;
+                                                    o_b[cb * 16 + g * 4 + 2] = _v4.z;
+                                                    o_b[cb * 16 + g * 4 + 3] = _v4.w;
+                                                }
+                                            }
+                                        }
+                                        #pragma unroll
+                                        for (int cb2 = 0; cb2 < 4; cb2++) {
+                                            float m_k = m_b[cb2];
+                                            float l_k = l_b[cb2];
+                                            if (n_chunks_s <= c_b + cb2) {
+                                                m_k = -1e+30f;
+                                                l_k = 0.0f;
+                                            }
+                                            float _max_17 = max_noftz(m_w, m_k);
+                                            float m_new = _max_17;
+                                            float _exp2_1 = approx_exp2((m_w - m_new) * softmax_scale_log2);
+                                            float a_k = _exp2_1;
+                                            float _exp2_2 = approx_exp2((m_k - m_new) * softmax_scale_log2);
+                                            float b_k = _exp2_2;
+                                            float _fma_0 = __fmaf_rn(l_k, b_k, l_w * a_k);
+                                            l_w = _fma_0;
+                                            #pragma unroll
+                                            for (int k2 = 0; k2 < 16; k2++) {
+                                                float _fma_1 = __fmaf_rn(o_b[cb2 * 16 + k2], b_k, acc_w[k2] * a_k);
+                                                acc_w[k2] = _fma_1;
+                                            }
+                                            m_w = m_new;
+                                        }
                                     }
-                                    *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r) + (0)) = lse_r;
+                                    float _rcp_12 = approx_rcp(l_w);
+                                    float inv_w = ((l_w > 0.0f) ? _rcp_12 * output_scale : 0.0f);
+                                    float out_w[4];
+                                    #pragma unroll
+                                    for (int g3 = 0; g3 < 4; g3++) {
+                                        #pragma unroll
+                                        for (int k3 = 0; k3 < 4; k3++) {
+                                            out_w[k3] = acc_w[g3 * 4 + k3] * inv_w;
+                                        }
+                                        {
+                                            uint2 _pk2;
+                                            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                                            _pk[0] = __floats2bfloat162_rn(out_w[0 + 0], out_w[0 + 1]);
+                                            _pk[1] = __floats2bfloat162_rn(out_w[0 + 2], out_w[0 + 3]);
+                                            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r + w_r * 64 + g3 * 4)))[0]) = _pk2;
+                                        }
+                                    }
+                                    if (store_lse_w != 0) {
+                                        float lse_w = -CAKE_INF;
+                                        if (l_w > 0.0f) {
+                                            float _log2_0;
+                                            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(l_w));
+                                            lse_w = m_w * softmax_scale_log2 + _log2_0 - 0.8073549f;
+                                        }
+                                        *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r) + (0)) = lse_w;
+                                    }
                                 }
                             }
                         }
@@ -1867,8 +1903,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
             int tok_base_c = half_c * 64 + 32;
             int rows_live_c = ((warp_in_wg_c * 16 < N_ROWS) ? 1 : 0);
             int row_j_c = my_row_c / 16;
-            float _rcp_13 = approx_rcp(softmax_scale_log2);
-            float thr_raw_c = 8.0f * _rcp_13;
+            float _rcp_14 = approx_rcp(softmax_scale_log2);
+            float thr_raw_c = 8.0f * _rcp_14;
             float p_scale_log2_c = 0.8073549f;
             int items_per_chunk_c = num_kv_heads * ((q_len + 4 - 1) / 4);
             unsigned int sm_stage_c = 0;
@@ -1954,10 +1990,10 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                 if (kind_c == 0) {
                     int cnt_c = block_end_c - block_begin_c;
                     int my_slot = slot_tile_base_c + chunk_c * items_per_chunk_c;
-                    int _min_4 = ((q_len - q_tile_c * 4) < (4) ? (q_len - q_tile_c * 4) : (4));
-                    int live_rows = _min_4 * 16;
-                    int _min_5 = ((q_tile_c * 4 + row_j_c) < (q_len - 1) ? (q_tile_c * 4 + row_j_c) : (q_len - 1));
-                    int vis_j_c = _min_5;
+                    int _min_5 = ((q_len - q_tile_c * 4) < (4) ? (q_len - q_tile_c * 4) : (4));
+                    int live_rows = _min_5 * 16;
+                    int _min_6 = ((q_tile_c * 4 + row_j_c) < (q_len - 1) ? (q_tile_c * 4 + row_j_c) : (q_len - 1));
+                    int vis_j_c = _min_6;
                     int back_c = q_len - 1 - vis_j_c - phase_c;
                     int vis_col_c = seqlen_c;
                     if (back_c > 0) {
@@ -1991,8 +2027,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                                 n_vis_c = 0;
                             }
                             if (n_vis_c < 32) {
-                                int _max_17 = ((n_vis_c) > (0) ? (n_vis_c) : (0));
-                                int n_lo_c = _max_17;
+                                int _max_19 = ((n_vis_c) > (0) ? (n_vis_c) : (0));
+                                int n_lo_c = _max_19;
                                 uint32_t _slice_lo_mask_1;
                                 {
                                     int _lim_0 = n_lo_c;
@@ -2059,21 +2095,21 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                             float sv_c_max = row_max_reduce(_reg_reduce_max2_1);
                             lmax_c = sv_c_max;
                             float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, lmax_c, 16);
-                            float _max_18 = max_noftz(lmax_c, _shfl_xor_4);
-                            lmax_c = _max_18;
+                            float _max_20 = max_noftz(lmax_c, _shfl_xor_4);
+                            lmax_c = _max_20;
                             if (half_c == 0) {
                                 smem_xmax[xm_off_c + 64 + my_row_c] = lmax_c;
                             }
                         }
                         asm volatile("barrier.sync 8, 256;" ::: "memory");
                         if (rows_live_c != 0) {
-                            float _max_19 = max_noftz(lmax_c, smem_xmax[xm_off_c + my_row_c]);
-                            lmax_c = _max_19;
+                            float _max_21 = max_noftz(lmax_c, smem_xmax[xm_off_c + my_row_c]);
+                            lmax_c = _max_21;
                             if (lmax_c > row_max_c + thr_raw_c) {
                                 new_max_c = lmax_c;
                                 if (row_max_c > -CAKE_INF) {
-                                    float _exp2_3 = approx_exp2(softmax_scale_log2 * (row_max_c - new_max_c));
-                                    acc_scale_c = _exp2_3;
+                                    float _exp2_5 = approx_exp2(softmax_scale_log2 * (row_max_c - new_max_c));
+                                    acc_scale_c = _exp2_5;
                                 }
                             }
                         }
@@ -2374,8 +2410,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                         if (my_row_c < N_ROWS) {
                             row_sum_c = smem_sum[st_off + my_row_c];
                         }
-                        float _rcp_14 = approx_rcp(row_sum_c);
-                        float inv_c = ((row_sum_c > 0.0f) ? _rcp_14 : 0.0f);
+                        float _rcp_15 = approx_rcp(row_sum_c);
+                        float inv_c = ((row_sum_c > 0.0f) ? _rcp_15 : 0.0f);
                         int store_row_c = ((my_row_c < live_rows) ? 1 : 0);
                         int j_c = q_tile_c * 4 + my_row_c / 16;
                         int h_c = my_row_c % 16;
@@ -2473,9 +2509,9 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                             if (half_c == 0) {
                                 float lse_c = -CAKE_INF;
                                 if (row_sum_c > 0.0f) {
-                                    float _log2_1;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(row_sum_c));
-                                    lse_c = smem_max[st_off + my_row_c] * softmax_scale_log2 + _log2_1 - p_scale_log2_c;
+                                    float _log2_2;
+                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(row_sum_c));
+                                    lse_c = smem_max[st_off + my_row_c] * softmax_scale_log2 + _log2_2 - p_scale_log2_c;
                                 }
                                 *(reinterpret_cast<float*>(LSE_ptr + ((batch_c * q_len + j_c) * num_q_heads + q_head_c)) + (0)) = lse_c;
                             }
@@ -2565,22 +2601,26 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                                     float l_o = partial_stats[other_slot * 128 + 64 + my_row_c];
                                     float m_s = smem_max[st_off + my_row_c];
                                     float l_s = smem_sum[st_off + my_row_c];
-                                    float _max_20 = max_noftz(m_s, m_o);
-                                    float m_row_i = _max_20;
-                                    float _exp2_4 = approx_exp2((m_s - m_row_i) * softmax_scale_log2);
-                                    float w_s = _exp2_4;
-                                    float _exp2_5 = approx_exp2((m_o - m_row_i) * softmax_scale_log2);
-                                    float w_o = _exp2_5;
-                                    float _fma_2 = __fmaf_rn(w_s, l_s, w_o * l_o);
-                                    float den_i = _fma_2;
-                                    float _rcp_15 = approx_rcp(den_i);
-                                    float inv_i = ((den_i > 0.0f) ? _rcp_15 * output_scale : 0.0f);
+                                    float _max_22 = max_noftz(m_s, m_o);
+                                    float m_row_i = _max_22;
+                                    float _exp2_6 = approx_exp2((m_s - m_row_i) * softmax_scale_log2);
+                                    float w_s = _exp2_6;
+                                    float _exp2_7 = approx_exp2((m_o - m_row_i) * softmax_scale_log2);
+                                    float w_o = _exp2_7;
+                                    float _fma_4 = __fmaf_rn(w_s, l_s, w_o * l_o);
+                                    float den_i = _fma_4;
+                                    if (chunk_c != 0) {
+                                        float _fma_5 = __fmaf_rn(w_o, l_o, w_s * l_s);
+                                        den_i = _fma_5;
+                                    }
+                                    float _rcp_16 = approx_rcp(den_i);
+                                    float inv_i = ((den_i > 0.0f) ? _rcp_16 * output_scale : 0.0f);
                                     w_s_c = w_s * inv_i;
                                     w_o_c = w_o * inv_i;
                                     if (den_i > 0.0f) {
-                                        float _log2_2;
-                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(den_i));
-                                        lse_i = m_row_i * softmax_scale_log2 + _log2_2 - p_scale_log2_c;
+                                        float _log2_3;
+                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_3) : "f"(den_i));
+                                        lse_i = m_row_i * softmax_scale_log2 + _log2_3 - p_scale_log2_c;
                                     }
                                 }
                                 int oth_base = other_slot * 16384 + my_row_c * HEAD_DIM + d_g0;
@@ -2610,8 +2650,12 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                                         }
                                         #pragma unroll
                                         for (int c = 0; c < 4; c++) {
-                                            float _fma_3 = __fmaf_rn(_vec_load_1[c], w_s_c, _vec_load_2[c] * w_o_c);
-                                            o_fold[c0 + c] = _fma_3;
+                                            {
+                                                float _fma_6 = __fmaf_rn(_vec_load_1[c], w_s_c, _vec_load_2[c] * w_o_c);
+                                                float _fma_7 = __fmaf_rn(_vec_load_2[c], w_o_c, _vec_load_1[c] * w_s_c);
+                                                float o_det_d1 = ((chunk_c == 0) ? _fma_6 : _fma_7);
+                                                o_fold[c0 + c] = o_det_d1;
+                                            }
                                         }
                                     }
                                     #pragma unroll
@@ -2645,8 +2689,12 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                                         }
                                         #pragma unroll
                                         for (int c2 = 0; c2 < 4; c2++) {
-                                            float _fma_4 = __fmaf_rn(_vec_load_3[c2], w_s_c, _vec_load_4[c2] * w_o_c);
-                                            o_fold[c1 + c2] = _fma_4;
+                                            {
+                                                float _fma_9 = __fmaf_rn(_vec_load_3[c2], w_s_c, _vec_load_4[c2] * w_o_c);
+                                                float _fma_10 = __fmaf_rn(_vec_load_4[c2], w_o_c, _vec_load_3[c2] * w_s_c);
+                                                float o_det_d2 = ((chunk_c == 0) ? _fma_9 : _fma_10);
+                                                o_fold[c1 + c2] = o_det_d2;
+                                            }
                                         }
                                     }
                                     #pragma unroll
@@ -2706,8 +2754,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                     }
                     asm volatile("fence.acquire.gpu;" ::: "memory");
                     int r_row_1 = wg_tid_c / 4;
-                    int _min_6 = ((q_len - q_tile_c * 4) < (4) ? (q_len - q_tile_c * 4) : (4));
-                    int live_rows_r_1 = _min_6 * 16;
+                    int _min_7 = ((q_len - q_tile_c * 4) < (4) ? (q_len - q_tile_c * 4) : (4));
+                    int live_rows_r_1 = _min_7 * 16;
                     if (r_row_1 < live_rows_r_1) {
                         int items_r_1 = num_kv_heads * ((q_len + 4 - 1) / 4);
                         int stats_stride_r_1 = items_r_1 * 128;
@@ -2715,86 +2763,122 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                         int stats_row_r_1 = slot_tile_base_c * 128 + r_row_1;
                         int f_r_1 = 64 >> block_end_c;
                         int d0_r_1 = block_begin_c * (4 * f_r_1) + wg_tid_c % 4 * f_r_1;
+                        {
+                            d0_r_1 = block_begin_c * (4 * f_r_1) + wg_tid_c % 4 * 16;
+                        }
                         int o_row_r_1 = slot_tile_base_c * 16384 + r_row_1 * HEAD_DIM + d0_r_1;
                         int j_r_1 = q_tile_c * 4 + r_row_1 / 16;
                         int h_r_1 = r_row_1 % 16;
                         int q_head_r_1 = kv_head_c * 16 + h_r_1;
                         int o_idx_r_1 = ((batch_c * q_len + j_r_1) * num_q_heads + q_head_r_1) * HEAD_DIM + d0_r_1;
-                        int n_groups_r_1 = 16 >> block_end_c;
                         int store_lse_r_1 = 0;
                         if (wg_tid_c % 4 == 0 && block_begin_c == 0) {
                             store_lse_r_1 = 1;
                         }
                         int lse_idx_r_1 = (batch_c * q_len + j_r_1) * num_q_heads + q_head_r_1;
-                        float acc_f_1[4];
-                        float out4_1[4];
-                        int n_pad_r_1 = (n_chunks_c + 7) / 8 * 8;
-                        #pragma unroll 1
-                        for (int g_r_1 = 0; g_r_1 < n_groups_r_1; g_r_1++) {
-                            acc_f_1[0] = 0.0f;
-                            acc_f_1[1] = 0.0f;
-                            acc_f_1[2] = 0.0f;
-                            acc_f_1[3] = 0.0f;
-                            float m_f_1 = -1e+30f;
-                            float l_f_1 = 0.0f;
-                            int o_col_r_1 = o_row_r_1 + g_r_1 * 4;
-                            #pragma unroll 8
-                            for (int c_m_1 = 0; c_m_1 < n_pad_r_1; c_m_1++) {
-                                int c_c_1 = c_m_1;
-                                if (n_chunks_c <= c_m_1) {
-                                    c_c_1 = n_chunks_c - 1;
-                                }
-                                float m_k_1 = partial_stats[stats_row_r_1 + c_c_1 * stats_stride_r_1];
-                                float l_k_1 = partial_stats[stats_row_r_1 + 64 + c_c_1 * stats_stride_r_1];
-                                if (n_chunks_c <= c_m_1) {
-                                    m_k_1 = -1e+30f;
-                                    l_k_1 = 0.0f;
-                                }
-                                float _max_21 = max_noftz(m_f_1, m_k_1);
-                                float m_new_1 = _max_21;
-                                float _exp2_6 = approx_exp2((m_f_1 - m_new_1) * softmax_scale_log2);
-                                float a_k_1 = _exp2_6;
-                                float _exp2_7 = approx_exp2((m_k_1 - m_new_1) * softmax_scale_log2);
-                                float b_k_1 = _exp2_7;
-                                float _fma_5 = __fmaf_rn(l_k_1, b_k_1, l_f_1 * a_k_1);
-                                l_f_1 = _fma_5;
-                                float _vec_load_5[4];
-                                {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(partial_o + (o_col_r_1 + c_c_1 * o_stride_r_1) + 0);
-                                    _vec_load_5[0 + 0] = _v4.x;
-                                    _vec_load_5[0 + 1] = _v4.y;
-                                    _vec_load_5[0 + 2] = _v4.z;
-                                    _vec_load_5[0 + 3] = _v4.w;
-                                }
-                                #pragma unroll
-                                for (int k_1 = 0; k_1 < 4; k_1++) {
-                                    float _fma_6 = __fmaf_rn(_vec_load_5[k_1], b_k_1, acc_f_1[k_1] * a_k_1);
-                                    acc_f_1[k_1] = _fma_6;
-                                }
-                                m_f_1 = m_new_1;
-                            }
-                            float _rcp_16 = approx_rcp(l_f_1);
-                            float inv_f_1 = ((l_f_1 > 0.0f) ? _rcp_16 * output_scale : 0.0f);
-                            #pragma unroll
-                            for (int k4_1 = 0; k4_1 < 4; k4_1++) {
-                                out4_1[k4_1] = acc_f_1[k4_1] * inv_f_1;
-                            }
-                            {
-                                uint2 _pk2;
-                                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                                _pk[0] = __floats2bfloat162_rn(out4_1[0 + 0], out4_1[0 + 1]);
-                                _pk[1] = __floats2bfloat162_rn(out4_1[0 + 2], out4_1[0 + 3]);
-                                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r_1 + g_r_1 * 4)))[0]) = _pk2;
-                            }
-                            if (store_lse_r_1 != 0) {
-                                if (g_r_1 == 0) {
-                                    float lse_r_1 = -CAKE_INF;
-                                    if (l_f_1 > 0.0f) {
-                                        float _log2_3;
-                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_3) : "f"(l_f_1));
-                                        lse_r_1 = m_f_1 * softmax_scale_log2 + _log2_3 - 0.8073549f;
+                        {
+                            int _max_23 = ((f_r_1 / 16) > (1) ? (f_r_1 / 16) : (1));
+                            int n_span_r_1 = _max_23;
+                            int _min_8 = ((f_r_1 / 4) < (4) ? (f_r_1 / 4) : (4));
+                            int active_r_1 = _min_8;
+                            if (active_r_1 > wg_tid_c % 4) {
+                                #pragma unroll 1
+                                for (int w_r_1 = 0; w_r_1 < n_span_r_1; w_r_1++) {
+                                    int store_lse_w_1 = ((w_r_1 == 0) ? store_lse_r_1 : 0);
+                                    float acc_w_1[16];
+                                    acc_w_1[0] = 0.0f;
+                                    acc_w_1[1] = 0.0f;
+                                    acc_w_1[2] = 0.0f;
+                                    acc_w_1[3] = 0.0f;
+                                    acc_w_1[4] = 0.0f;
+                                    acc_w_1[5] = 0.0f;
+                                    acc_w_1[6] = 0.0f;
+                                    acc_w_1[7] = 0.0f;
+                                    acc_w_1[8] = 0.0f;
+                                    acc_w_1[9] = 0.0f;
+                                    acc_w_1[10] = 0.0f;
+                                    acc_w_1[11] = 0.0f;
+                                    acc_w_1[12] = 0.0f;
+                                    acc_w_1[13] = 0.0f;
+                                    acc_w_1[14] = 0.0f;
+                                    acc_w_1[15] = 0.0f;
+                                    float m_w_1 = -1e+30f;
+                                    float l_w_1 = 0.0f;
+                                    int n_pad_w_1 = (n_chunks_c + 3) / 4 * 4;
+                                    #pragma unroll 1
+                                    for (int c_b_1 = 0; c_b_1 < n_pad_w_1; c_b_1 += 4) {
+                                        float m_b_1[4];
+                                        float l_b_1[4];
+                                        float o_b_1[64];
+                                        #pragma unroll
+                                        for (int cb_1 = 0; cb_1 < 4; cb_1++) {
+                                            int c_c_1 = c_b_1 + cb_1;
+                                            if (c_c_1 >= n_chunks_c) {
+                                                c_c_1 = n_chunks_c - 1;
+                                            }
+                                            m_b_1[cb_1] = partial_stats[stats_row_r_1 + c_c_1 * stats_stride_r_1];
+                                            l_b_1[cb_1] = partial_stats[stats_row_r_1 + 64 + c_c_1 * stats_stride_r_1];
+                                            #pragma unroll
+                                            for (int g_1 = 0; g_1 < 4; g_1++) {
+                                                {
+                                                    float4 _v4 = *reinterpret_cast<const float4*>(partial_o + o_row_r_1 + w_r_1 * 64 + g_1 * 4 + c_c_1 * o_stride_r_1);
+                                                    o_b_1[cb_1 * 16 + g_1 * 4 + 0] = _v4.x;
+                                                    o_b_1[cb_1 * 16 + g_1 * 4 + 1] = _v4.y;
+                                                    o_b_1[cb_1 * 16 + g_1 * 4 + 2] = _v4.z;
+                                                    o_b_1[cb_1 * 16 + g_1 * 4 + 3] = _v4.w;
+                                                }
+                                            }
+                                        }
+                                        #pragma unroll
+                                        for (int cb2_1 = 0; cb2_1 < 4; cb2_1++) {
+                                            float m_k_1 = m_b_1[cb2_1];
+                                            float l_k_1 = l_b_1[cb2_1];
+                                            if (n_chunks_c <= c_b_1 + cb2_1) {
+                                                m_k_1 = -1e+30f;
+                                                l_k_1 = 0.0f;
+                                            }
+                                            float _max_24 = max_noftz(m_w_1, m_k_1);
+                                            float m_new_1 = _max_24;
+                                            float _exp2_8 = approx_exp2((m_w_1 - m_new_1) * softmax_scale_log2);
+                                            float a_k_1 = _exp2_8;
+                                            float _exp2_9 = approx_exp2((m_k_1 - m_new_1) * softmax_scale_log2);
+                                            float b_k_1 = _exp2_9;
+                                            float _fma_12 = __fmaf_rn(l_k_1, b_k_1, l_w_1 * a_k_1);
+                                            l_w_1 = _fma_12;
+                                            #pragma unroll
+                                            for (int k2_1 = 0; k2_1 < 16; k2_1++) {
+                                                float _fma_13 = __fmaf_rn(o_b_1[cb2_1 * 16 + k2_1], b_k_1, acc_w_1[k2_1] * a_k_1);
+                                                acc_w_1[k2_1] = _fma_13;
+                                            }
+                                            m_w_1 = m_new_1;
+                                        }
                                     }
-                                    *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r_1) + (0)) = lse_r_1;
+                                    float _rcp_17 = approx_rcp(l_w_1);
+                                    float inv_w_1 = ((l_w_1 > 0.0f) ? _rcp_17 * output_scale : 0.0f);
+                                    float out_w_1[4];
+                                    #pragma unroll
+                                    for (int g3_1 = 0; g3_1 < 4; g3_1++) {
+                                        #pragma unroll
+                                        for (int k3_1 = 0; k3_1 < 4; k3_1++) {
+                                            out_w_1[k3_1] = acc_w_1[g3_1 * 4 + k3_1] * inv_w_1;
+                                        }
+                                        {
+                                            uint2 _pk2;
+                                            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                                            _pk[0] = __floats2bfloat162_rn(out_w_1[0 + 0], out_w_1[0 + 1]);
+                                            _pk[1] = __floats2bfloat162_rn(out_w_1[0 + 2], out_w_1[0 + 3]);
+                                            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r_1 + w_r_1 * 64 + g3_1 * 4)))[0]) = _pk2;
+                                        }
+                                    }
+                                    if (store_lse_w_1 != 0) {
+                                        float lse_w_1 = -CAKE_INF;
+                                        if (l_w_1 > 0.0f) {
+                                            float _log2_4;
+                                            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_4) : "f"(l_w_1));
+                                            lse_w_1 = m_w_1 * softmax_scale_log2 + _log2_4 - 0.8073549f;
+                                        }
+                                        *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r_1) + (0)) = lse_w_1;
+                                    }
                                 }
                             }
                         }

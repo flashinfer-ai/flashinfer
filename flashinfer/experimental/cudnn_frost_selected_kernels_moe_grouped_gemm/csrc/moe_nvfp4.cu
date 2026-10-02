@@ -93,6 +93,7 @@ __global__ void prefix(const int32_t* counts, int32_t* offsets, int32_t* cursors
     start += counts[e];
     sf_start += (counts[e] + 127) / 128 * 128;
   }
+  offsets[experts] = start;
   scale[0] = 1.f;
   scale[1] = 4.f;
   scale[2] = 25.f;
@@ -173,6 +174,7 @@ __global__ void route_small(const uint8_t* x, const uint8_t* input_sf, const int
       row_experts[destination] = expert;
     }
     if (r == 0) {
+      offsets[experts] = rows;
       scale[0] = 1.f;
       scale[1] = 4.f;
       scale[2] = 25.f;
@@ -284,7 +286,7 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     sf1_pos_ = reserve(fma_ ? 0 : sf_rows_ * h_ / 16);
     sf2_pos_ = reserve(sf_rows_ * i_ / 16);
     counts_pos_ = reserve(fma_ ? 0 : e_ * 4);
-    offsets_pos_ = reserve(fma_ ? 0 : e_ * 4);
+    offsets_pos_ = reserve(fma_ ? 0 : (e_ + 1) * 4);
     sf_offsets_pos_ = reserve(fma_ ? 0 : e_ * 4);
     cursors_pos_ = reserve(fma_ ? 0 : e_ * 4);
     mapping_pos_ = reserve(fma_ ? 0 : s_ * 4);
@@ -436,7 +438,7 @@ class CudnnFrostNvfp4MoePlan final : public tvm::ffi::ModuleObj {
     int64_t sf2shape[]{h_ * i_ / 16, 1, e_}, sf2stride[]{1, 1, h_ * i_ / 16};
     int64_t sfxshape[]{sf_rows_ * h_ / 16, 1, 1}, sfxstride[]{1, 1, 1};
     int64_t sfmshape[]{sf_rows_ * i_ / 16, 1, 1};
-    int64_t eshape[]{e_}, dshape[]{int64_t(scratch1_ / 8)}, unit[]{1};
+    int64_t eshape[]{e_ + 1}, dshape[]{int64_t(scratch1_ / 8)}, unit[]{1};
     int64_t scalar_shape[]{1, 1, 1}, scalar_stride[]{1, 1, 1};
     DLTensor tx{gx, device_, 3, dl_fp4, xshape, xstride, 0};
     DLTensor tm{mid, device_, 3, dl_bfloat16, mshape, mstride, 0};

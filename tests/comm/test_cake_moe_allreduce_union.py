@@ -18,7 +18,6 @@ CPU-only routing tests for the Cake MoE all-reduce union (SM100 and SM103, world
 from __future__ import annotations
 
 import re
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -196,25 +195,18 @@ def test_pdl_is_a_launch_flag_not_a_kernel() -> None:
 
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
 @pytest.mark.parametrize("capability", sorted(_ARCHES.values()))
-def test_route_scope_is_sm100_sm103_with_allreduce_output(
+def test_route_scope_is_sm100_sm103_at_world_sizes_2_4_8(
     world_size: int, capability: tuple[int, int]
 ) -> None:
-    assert union.route_applies(
-        world_size=world_size, device_capability=capability, emit_moe_allreduce=True
-    )
-    assert not union.route_applies(
-        world_size=world_size, device_capability=capability, emit_moe_allreduce=False
-    )
-    assert not union.route_applies(
-        world_size=world_size, device_capability=_SM120, emit_moe_allreduce=True
-    )
+    assert union.route_applies(world_size=world_size, device_capability=capability)
+    assert not union.route_applies(world_size=world_size, device_capability=_SM120)
 
 
 @pytest.mark.parametrize("world_size", (1, 3, 16))
 def test_route_scope_rejects_unexported_world_sizes(world_size: int) -> None:
     for arch, capability in _ARCHES.items():
         assert not union.route_applies(
-            world_size=world_size, device_capability=capability, emit_moe_allreduce=True
+            world_size=world_size, device_capability=capability
         )
         with pytest.raises(ValueError):
             union.route_for(
@@ -319,10 +311,6 @@ def test_run_rejects_unexported_world_sizes_before_touching_the_device() -> None
     with pytest.raises(ValueError):
         union.run_cake_moe_allreduce_union(backend="trtllm", **_union_arguments(4))
     arguments = _union_arguments(4)
-    arguments["moe_allreduce_out"] = None
-    with pytest.raises(ValueError):
-        union.run_cake_moe_allreduce_union(backend="cake", **arguments)
-    arguments = _union_arguments(4)
     arguments["workspace_ptrs"] = torch.zeros(3, dtype=torch.int64)
     with pytest.raises(ValueError):
         union.run_cake_moe_allreduce_union(backend="cake", **arguments)
@@ -359,9 +347,8 @@ def _arguments(world_size: int, *, emit_allreduce: bool) -> dict:
 
 def _isolate_backends(
     monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
-) -> tuple[list, list]:
+) -> list[dict]:
     union_calls: list[dict] = []
-    legacy_calls: list[tuple] = []
     monkeypatch.setattr(trtllm_ar, "_validate_cake_moe_allreduce", lambda **kwargs: 0)
     monkeypatch.setattr(
         torch.cuda, "get_device_capability", lambda device=None: capability
@@ -373,17 +360,10 @@ def _isolate_backends(
     )
     monkeypatch.setattr(
         trtllm_ar,
-        "get_cake_moe_allreduce_module",
-        lambda device_index: SimpleNamespace(
-            run_reduction=lambda *args: legacy_calls.append(args)
-        ),
-    )
-    monkeypatch.setattr(
-        trtllm_ar,
         "get_trtllm_comm_module",
         lambda: pytest.fail("TRT-LLM module must not load for backend='cake'"),
     )
-    return union_calls, legacy_calls
+    return union_calls
 
 
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
@@ -391,12 +371,11 @@ def _isolate_backends(
 def test_cake_backend_routes_sm100_sm103_with_allreduce_output_to_the_union(
     monkeypatch: pytest.MonkeyPatch, world_size: int, capability: tuple[int, int]
 ) -> None:
-    union_calls, legacy_calls = _isolate_backends(monkeypatch, capability)
+    union_calls = _isolate_backends(monkeypatch, capability)
     arguments = _arguments(world_size, emit_allreduce=True)
 
     trtllm_ar.trtllm_moe_allreduce_fusion(**arguments, backend="cake")
 
-    assert legacy_calls == []
     assert len(union_calls) == 1
     call = union_calls[0]
     assert call["backend"] == "cake"
@@ -410,17 +389,107 @@ def test_cake_backend_routes_sm100_sm103_with_allreduce_output_to_the_union(
 
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
 @pytest.mark.parametrize("capability", sorted(_ARCHES.values()))
-def test_cake_backend_keeps_the_legacy_bundle_outside_the_union_scope(
+def test_cake_backend_routes_calls_without_allreduce_output_to_the_union(
     monkeypatch: pytest.MonkeyPatch, world_size: int, capability: tuple[int, int]
 ) -> None:
-    union_calls, legacy_calls = _isolate_backends(monkeypatch, capability)
+    union_calls = _isolate_backends(monkeypatch, capability)
     arguments = _arguments(world_size, emit_allreduce=False)
 
     trtllm_ar.trtllm_moe_allreduce_fusion(**arguments, backend="cake")
 
-    assert union_calls == []
-    assert len(legacy_calls) == 1 and len(legacy_calls[0]) == 18
-    assert legacy_calls[0][0] == world_size
+    assert len(union_calls) == 1
+    call = union_calls[0]
+    assert call["world_size"] == world_size
+    assert call["moe_allreduce_out"] is None
+    assert call["residual_out"] is arguments["residual_out"]
+    assert call["norm_out"] is arguments["norm_out"]
+
+
+def test_scratch_allreduce_output_is_cached_per_device_and_dtype_and_grows() -> None:
+    union._scratch_allreduce_outputs.clear()
+    union._retired_scratch_allreduce_outputs.clear()
+    device = torch.device("cpu")
+    try:
+        first = union.scratch_allreduce_output(device, torch.float16, 4)
+        assert first.shape == (4, union.HIDDEN_DIM)
+        assert first.dtype == torch.float16 and first.is_contiguous()
+        # A smaller request is a view of the same allocation.
+        smaller = union.scratch_allreduce_output(device, torch.float16, 2)
+        assert smaller.data_ptr() == first.data_ptr()
+        assert smaller.shape == (2, union.HIDDEN_DIM) and smaller.is_contiguous()
+        # A larger request grows the cached tensor once (to at least twice the
+        # previous capacity) and retires the replaced tensor instead of freeing it.
+        grown = union.scratch_allreduce_output(device, torch.float16, 5)
+        assert grown.shape == (5, union.HIDDEN_DIM)
+        assert grown.data_ptr() != first.data_ptr()
+        assert (
+            union._scratch_allreduce_outputs[("cpu", None, torch.float16)].shape[0] == 8
+        )
+        assert [t.data_ptr() for t in union._retired_scratch_allreduce_outputs] == [
+            first.data_ptr()
+        ]
+        grown = union.scratch_allreduce_output(device, torch.float16, 8)
+        assert grown.shape == (8, union.HIDDEN_DIM)
+        assert len(union._retired_scratch_allreduce_outputs) == 1
+        assert union.scratch_allreduce_output(device, torch.float16, 8).data_ptr() == (
+            grown.data_ptr()
+        )
+        # Each dtype keeps its own scratch.
+        other = union.scratch_allreduce_output(device, torch.bfloat16, 8)
+        assert other.dtype == torch.bfloat16 and other.data_ptr() != grown.data_ptr()
+        assert set(union._scratch_allreduce_outputs) == {
+            ("cpu", None, torch.float16),
+            ("cpu", None, torch.bfloat16),
+        }
+    finally:
+        union._scratch_allreduce_outputs.clear()
+        union._retired_scratch_allreduce_outputs.clear()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU"
+)
+def test_scratch_allreduce_output_retains_addresses_recorded_by_captured_graphs() -> (
+    None
+):
+    union._scratch_allreduce_outputs.clear()
+    union._retired_scratch_allreduce_outputs.clear()
+    device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        warm = union.scratch_allreduce_output(device, torch.bfloat16, 4)
+        recorded = warm.data_ptr()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            # Large enough cache: the capture records the cached tensor's address.
+            captured = union.scratch_allreduce_output(device, torch.bfloat16, 2)
+            assert captured.data_ptr() == recorded
+            captured.fill_(1.0)
+            # Too small: the fresh tensor belongs to the graph's pool and is not cached.
+            private = union.scratch_allreduce_output(device, torch.bfloat16, 64)
+            assert private.data_ptr() != recorded
+        torch.cuda.current_stream().wait_stream(stream)
+        assert (
+            union._scratch_allreduce_outputs[
+                (device.type, device.index, torch.bfloat16)
+            ].data_ptr()
+            == recorded
+        )
+        # An eager call that grows the cache must keep the recorded storage alive.
+        grown = union.scratch_allreduce_output(device, torch.bfloat16, 16)
+        assert grown.data_ptr() != recorded
+        assert [t.data_ptr() for t in union._retired_scratch_allreduce_outputs] == [
+            recorded
+        ]
+        canary = torch.zeros((4, union.HIDDEN_DIM), dtype=torch.bfloat16, device=device)
+        assert canary.data_ptr() != recorded
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(canary).item() == 0
+    finally:
+        union._scratch_allreduce_outputs.clear()
+        union._retired_scratch_allreduce_outputs.clear()
 
 
 def test_workspace_creation_has_no_pointer_registry() -> None:

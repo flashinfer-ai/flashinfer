@@ -109,7 +109,7 @@ def _build_graph(
     if op == "grouped_gemm2":
         offsets = graph.tensor(
             name="first_token_offset",
-            dim=[groups, 1, 1],
+            dim=[groups + 1, 1, 1],
             stride=[1, 1, 1],
             data_type=cudnn.data_type.INT32,
         )
@@ -136,7 +136,7 @@ def _build_graph(
     up = dequantize(up, "up_weight_scale")
     offsets = graph.tensor(
         name="first_token_offset",
-        dim=[groups, 1, 1],
+        dim=[groups + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
     )
@@ -331,6 +331,7 @@ def _export_source(
     output_dir: Path,
     artifact_id: str,
     *,
+    arch: str,
     replace: bool = False,
     template_family: str | None = None,
     swap_ab: bool = False,
@@ -352,11 +353,12 @@ def _export_source(
                 "quantized TMA source templates require a 32-element epilogue"
             )
     digest = hashlib.sha256(source.encode()).hexdigest()
-    # One maintained implementation per family. A producer upgrade replaces the
-    # family explicitly; it must not silently add another historical template.
+    # One maintained implementation per architecture and family. A producer
+    # upgrade explicitly replaces that template instead of adding a historical copy.
     name = _slug(artifact_id if template_family is None else template_family)
     if not name.startswith("cudnn_frost_"):
         name = f"cudnn_frost_{name}"
+    name = f"{arch.replace('_', '').removesuffix('a')}_{name}"
     path = output_dir / "sources" / f"{name}.py"
     record: dict[str, Any] = {
         "path": path.relative_to(output_dir).as_posix(),
@@ -513,6 +515,7 @@ def _export_compiled(args, compiled, config, arch):
         Path(compiled.generated_path),
         output_dir,
         artifact_id,
+        arch=arch,
         replace=args.replace,
         template_family=f"{op}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
         swap_ab=swap_ab,
@@ -550,7 +553,7 @@ def _export_compiled(args, compiled, config, arch):
         "id": artifact_id,
         "op": prefix,
         "arch": arch,
-        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}_v1",
+        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}_v2",
         "source": source,
         "workspace_bytes": int(compiled.workspace_bytes),
         "launch": {"tail": launch_tail},

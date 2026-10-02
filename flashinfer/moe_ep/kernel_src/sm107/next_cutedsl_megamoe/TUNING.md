@@ -3,8 +3,8 @@
 The active generic kernel is the `1667b47a` upstream export; see
 [VENDOR.md](VENDOR.md) for the full pin and [SKILL.md](SKILL.md) for refreshes.
 The export also includes GenPhase, but the FlashInfer backend/benchmark does not
-yet select it. SiTU and compressed-combine variants remain separate integration
-work. Historical `92dd334` knob profiles are candidate settings for this newer
+yet select it. Compressed-combine variants remain separate integration work.
+Historical `92dd334` knob profiles are candidate settings for this newer
 kernel, not new measurements; tuning caches from that drop are invalidated.
 
 Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
@@ -213,8 +213,18 @@ MAX across ranks before taking the median. Only a candidate passing the
 numerical checks can enter the cache. Runtime failures stop the job;
 relaunch in fresh workers instead of continuing on a failed CUDA context.
 
+Select SiTU with `--activation situ --situ-beta <value>
+--situ-linear-beta <value>`. Both beta parameters must be positive and finite;
+SiTU cannot be combined with `--gate-up-clamp`.
+For NVFP4, `--input-norm-const`, `--fc1-alpha`, `--fc2-alpha`, and
+`--fc1-norm-const` set positive, finite scalars for the generated tuning inputs.
+Each expert uses the same CLI value. These values are passed to the numerical
+reference and every candidate. The layer API also accepts distinct values per
+local expert; see the [normalization contract](../../../../../docs/design_docs/moe_ep_sm107_qualification.md#nvfp4-normalization).
+
 The cache distinguishes the SM107 implementation revision, geometry,
-quantization, early/late routing weights, and nondeterminism permission.
+quantization, activation and beta parameters, gate/up clamp, early/late routing
+weights, and nondeterminism permission.
 Legacy entries from the original PR are ignored. In-kernel reduction is
 excluded by default; `--allow-nondeterministic` opts it into tuning.
 Engine-side cache lookup requires `in_kernel_fc2_reduce=True` to permit

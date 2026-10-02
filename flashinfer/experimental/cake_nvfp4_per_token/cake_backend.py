@@ -506,8 +506,15 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         and (n + 63) // 64 <= TWO_CTA_SINGLE_TILE_MAX_W_TILES
     ):
         # One 128-token tile over a few 64-wide weight tiles: the 2-CTA pair loads the
-        # real token rows once (no grouped raster, no CLC on these short rows).
-        return {**tactic, "two_cta": True, "a_hint": None, "b_hint": "evict_first"}
+        # real token rows once (no grouped raster, no CLC on these short rows), as a
+        # half-M pair (64 token rows per CTA, cta_group::2 M = 128).
+        return {
+            **tactic,
+            "two_cta": True,
+            "a_hint": None,
+            "b_hint": "evict_first",
+            "half_m": True,
+        }
     if (
         m <= BLOCK_M
         and tile_m == BLOCK_M
@@ -543,7 +550,46 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
     tok_tiles = (m + tile_m - 1) // tile_m
     if tok_tiles <= 2:
         tactic["a_hint"], tactic["b_hint"] = None, "evict_first"
+    if _half_m_pair_rows(m, n, tile_n, sm_count, tactic):
+        tactic["half_m"] = True
+    if (
+        tactic.get("two_cta")
+        and not tactic.get("half_m")
+        and tactic.get("sched", "static") == "static"
+    ):
+        # Stream-K tail of the static 2-CTA schedule: the partial last wave's tiles are cut
+        # into equal K slices over consecutive pairs (``stream_k_tail``); ``gemm_plan`` keeps
+        # the knob only where at least SK_MIN_SLICES fit (B200 16384x7168 / 18432x7168
+        # M=2048 1.089 / 1.098, 8192x28672 M=257 / 512 1.017 / 1.023 vs the plain program;
+        # the GB300 perf rows have no shareable tail and run the plain program).
+        tactic["stream_k"] = True
     return tactic
+
+
+def _half_m_pair_rows(
+    m: int, n: int, tile_n: int, sm_count: int, tactic: dict[str, Any]
+) -> bool:
+    """The 64-wide 2-CTA tiles of the narrow-N rows run as half-M pairs (64 token rows per
+    CTA) while the half-M grid fits 1.5 waves of pairs (1.3 waves measured faster alone and
+    in the quantize + GEMM chain, 1.6 waves faster alone but slower in the chain, 2.2 waves
+    slower); the half-M program has no CLC or grouped-raster variant."""
+    if (
+        tile_n != 64
+        or not tactic.get("two_cta")
+        or tactic.get("sched") == "clc"
+        or tactic.get("raster_group")
+    ):
+        return False
+    w_tiles = (n + 63) // 64
+    pairs = max(1, sm_count // 2)
+    return (
+        w_tiles <= TWO_CTA_SINGLE_TILE_MAX_W_TILES
+        and ((m + 63) // 64) * w_tiles <= pairs + pairs // 2
+    )
+
+
+def sched_is_clc(tactic: dict[str, Any]) -> bool:
+    return str(tactic.get("sched", "static")) == "clc"
 
 
 def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
@@ -553,6 +599,15 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append("k512")
     if tactic.get("two_cta"):
         parts.append("2cta")
+    if tactic.get("half_m"):
+        parts.append("hm")
+    if tactic.get("stream_k"):
+        # The slice count is baked into the program; ``gemm_plan`` resolves it into the tactic.
+        if "sk_split" not in tactic:
+            raise ValueError(
+                "stream_k tactic without a resolved sk_split: build the key from gemm_plan(...).tactic"
+            )
+        parts.append(f"skt{int(tactic['sk_split'])}")
     if int(tactic.get("split_k", 1)) > 1:
         parts.append(f"sk{int(tactic['split_k'])}")
     parts.append("f16" if out_f16 else "bf16")
@@ -597,10 +652,28 @@ class GemmPlan:
     w_tiles: int = 0
     num_tiles: int = 0
     grid: int = 0
+    # Stream-K tail of the static 2-CTA schedule (``stream_k`` tactics): the partial last
+    # wave's tiles, the equal K slices each is cut into and the pairs holding them.
+    sk_tiles: int = 0
+    sk_slices: int = 0
+    sk_pairs: int = 0
 
     @property
     def alpha_n(self) -> bool:
         return bool(self.tactic["alpha_n"])
+
+    @property
+    def stream_k(self) -> bool:
+        return bool(self.tactic.get("stream_k", False))
+
+    @property
+    def sk_workspace_floats(self) -> int:
+        """FP32 partials: tail tiles x slices x two CTAs x 128 rows x tile_n columns."""
+        return self.sk_tiles * self.sk_slices * 2 * BLOCK_M * int(self.tactic["tile_n"])
+
+    @property
+    def sk_flag_words(self) -> int:
+        return self.sk_tiles * self.sk_slices * 2
 
     @property
     def two_cta(self) -> bool:
@@ -617,6 +690,40 @@ class GemmPlan:
     @property
     def amc(self) -> int:
         return int(self.tactic.get("amc", 1))
+
+
+# Largest slice count of a stream-K tail tile (host launch rule ``sk_split``; mirrors the Cake
+# default).  The slice count actually used is bounded by the free pairs per tail tile, the
+# tile's output subtiles and its K tiles, and is baked into the program (``skt{S}``).
+SK_MAX_SPLIT = 8
+# Fewest slices worth running: two slices keep half a tile plus the exchange on the critical
+# path (1.005-1.008 where measured); three or more measured 1.017-1.098 on B200.
+SK_MIN_SLICES = 3
+EPI_TILE_N = 32
+
+
+def stream_k_tail(
+    num_tiles: int,
+    pairs: int,
+    k_tiles: int,
+    split: int = SK_MAX_SPLIT,
+    max_slices: int = 6,
+    min_slices: int = SK_MIN_SLICES,
+) -> tuple[int, int, int]:
+    """``(tail_tiles, slices, pairs_used)`` of the stream-K tail of a static 2-CTA grid (the
+    Cake ``stream_k_tail``): the partial last wave's ``R = num_tiles % pairs`` tiles are each
+    cut into ``slices = min(split, pairs // R, max_slices, k_tiles)`` equal K slices held by
+    ``R * slices`` pairs.  ``pairs_used == 0`` means the tail is not run: ``(0, 0, 0)`` without
+    a partial last wave, ``(R, 1, 0)`` when fewer than ``min_slices`` fit."""
+    if split < 1:
+        raise ValueError(f"sk_split must be positive, got {split}")
+    if num_tiles <= pairs or num_tiles % pairs == 0:
+        return 0, 0, 0
+    tail = num_tiles % pairs
+    slices = min(split, pairs // tail, max_slices, k_tiles)
+    if slices < max(2, min_slices):
+        return tail, 1, 0
+    return tail, slices, tail * slices
 
 
 def gemm_plan(
@@ -665,7 +772,22 @@ def gemm_plan(
         raise ValueError("the cluster A-multicast is a 1-CTA m-orientation tactic")
     if amc > 1 and m > BLOCK_M:
         raise ValueError("the cluster A-multicast tactic serves one 128-token tile")
-    tok_tile = tile_n if alpha_n else (2 * BLOCK_M if two_cta else BLOCK_M)
+    half_m = bool(tactic.get("half_m", False))
+    if half_m and (not two_cta or sched_is_clc(tactic) or tactic.get("raster_group")):
+        raise ValueError(
+            "half_m is a 2-CTA program knob without CLC scheduler or grouped raster"
+        )
+    stream_k = bool(tactic.get("stream_k", False))
+    if stream_k and (not two_cta or half_m or sched_is_clc(tactic)):
+        raise ValueError(
+            "stream_k is a knob of the static 2-CTA schedule (no half_m, no CLC scheduler)"
+        )
+    # 2-CTA pairs cover 256 token rows (128 per CTA), half-M pairs 128 (64 per CTA).
+    tok_tile = (
+        tile_n
+        if alpha_n
+        else ((BLOCK_M if half_m else 2 * BLOCK_M) if two_cta else BLOCK_M)
+    )
     w_tile = BLOCK_M if alpha_n else tile_n
     tok_tiles = (m + tok_tile - 1) // tok_tile
     w_tiles = (n + w_tile - 1) // w_tile
@@ -683,6 +805,23 @@ def gemm_plan(
         grid = min(int(sm_count) // amc, (num_tiles + amc - 1) // amc) * amc
     else:
         grid = min(int(sm_count) * blocks_per_sm, num_tiles)
+    sk_tiles = sk_slices = sk_pairs = 0
+    tactic = dict(tactic)
+    if stream_k:
+        sk_tiles, sk_slices, sk_pairs = stream_k_tail(
+            num_tiles,
+            int(sm_count) // 2,
+            k // k_tile,
+            int(tactic.get("sk_split", SK_MAX_SPLIT)),
+            int(tactic["tile_n"]) // EPI_TILE_N,
+        )
+        if sk_pairs == 0:
+            # No partial last wave, or one the pairs cannot share: the plain static program.
+            tactic.pop("stream_k", None)
+            tactic.pop("sk_split", None)
+            sk_tiles = sk_slices = sk_pairs = 0
+        else:
+            tactic["sk_split"] = sk_slices
     return GemmPlan(
         arch=arch,
         sm_count=int(sm_count),
@@ -699,6 +838,9 @@ def gemm_plan(
         w_tiles=w_tiles,
         num_tiles=num_tiles,
         grid=grid,
+        sk_tiles=sk_tiles,
+        sk_slices=sk_slices,
+        sk_pairs=sk_pairs,
     )
 
 
@@ -1020,6 +1162,31 @@ def _flat_u8_scales(sf: torch.Tensor, name: str, rows: int, cols: int) -> torch.
     return sf.reshape(-1)
 
 
+_STREAM_K_WORKSPACE: dict[int, torch.Tensor] = {}
+_STREAM_K_FLAGS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _stream_k_workspace(
+    device: torch.device, floats: int, flags: int, slices: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-device FP32 partial workspace and per-(device, slice count) slot flags of the
+    stream-K tail, grown on demand (never shrunk) and shared by the device's stream-K
+    launches, which the stream orders.  The flags are free-running per-launch generations
+    (every word of a tail tile advances once per launch in which the tile exists, so all
+    words of a tile share one history for a fixed slice count); grown arrays restart from
+    zero.  No per-launch initialisation and nothing is reset."""
+    index = _device_index(device)
+    ws = _STREAM_K_WORKSPACE.get(index)
+    if ws is None or ws.numel() < max(floats, 1):
+        ws = torch.empty(max(floats, 1), dtype=torch.float32, device=device)
+        _STREAM_K_WORKSPACE[index] = ws
+    fl = _STREAM_K_FLAGS.get((index, slices))
+    if fl is None or fl.numel() < max(flags, 1):
+        fl = torch.zeros(max(flags, 1), dtype=torch.uint32, device=device)
+        _STREAM_K_FLAGS[(index, slices)] = fl
+    return ws, fl
+
+
 def prepare_mm_fp4_per_token(
     a_fp4: torch.Tensor,
     a_sf: torch.Tensor,
@@ -1094,6 +1261,23 @@ def prepare_mm_fp4_per_token(
         num_tiles=plan.num_tiles,
         grid=(plan.grid, 1, 1),
     )
+    if plan.tactic.get("two_cta"):
+        # The 2-CTA programs also take the flat u8 scale tensors: the half-M pair gathers
+        # the words of its 64-row halves from them with register-path cp.async.
+        kwargs["SFA_RAW"], kwargs["SFB_RAW"] = a_flat, b_flat
+    if plan.stream_k:
+        # Stream-K tail: FP32 partial workspace, the generation flags (also bound as the plain
+        # u32 pointer the holders read their own word through) and the tail geometry.
+        red_ws, red_flags = _stream_k_workspace(
+            device, plan.sk_workspace_floats, plan.sk_flag_words, plan.sk_slices
+        )
+        kwargs.update(
+            red_ws=red_ws,
+            red_flags=red_flags,
+            red_gen=red_flags,
+            sk_tiles=plan.sk_tiles,
+            sk_pairs=plan.sk_pairs,
+        )
     with torch.cuda.device(_device_index(device)):
         launch = _bind(kernel_module_name(arch, plan.kernel_key), kwargs)
     return NVFP4PerTokenGemmRunner(plan, out, (launch,))
