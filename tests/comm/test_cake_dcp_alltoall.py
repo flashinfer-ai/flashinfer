@@ -215,30 +215,45 @@ def test_generated_dcp_alltoall_cuda_graph(world_size):
 
 
 def test_generated_spec_selection(monkeypatch):
-    """The generated module is selected only for one exact Blackwell target."""
+    """The generated module serves every build that targets SM100 or SM103."""
     from flashinfer.jit import cake_dcp_alltoall
     from flashinfer.jit.comm import gen_dcp_alltoall_module
     from flashinfer.jit.core import current_compilation_context
 
-    monkeypatch.setattr(
-        cake_dcp_alltoall,
-        "GENERATED_SOURCES",
-        {"sm_100a": ["generated/dcp_alltoall/sm_100a/probe_kernel.cu"]},
-    )
-    monkeypatch.setattr(current_compilation_context, "TARGET_CUDA_ARCHS", {(10, "0a")})
-    spec = gen_dcp_alltoall_module()
-    assert spec.name == "dcp_alltoall_sm100a"
+    def select(archs):
+        monkeypatch.setattr(
+            current_compilation_context, "TARGET_CUDA_ARCHS", set(archs)
+        )
+        spec = gen_dcp_alltoall_module()
+        defines = [
+            flag
+            for flag in (spec.extra_cuda_cflags or [])
+            if flag.startswith("-DCAKE_DCP_GENERATED_")
+        ]
+        return spec, defines
+
+    spec, defines = select({(10, "0a")})
+    assert spec.name == cake_dcp_alltoall.MODULE_NAME
     assert any(str(s).endswith("cake_dcp_alltoall_dispatch.cu") for s in spec.sources)
+    assert defines == ["-DCAKE_DCP_GENERATED_SM100A=1"]
 
-    # sm_103a has no sources registered -> portable module.
-    monkeypatch.setattr(current_compilation_context, "TARGET_CUDA_ARCHS", {(10, "3a")})
-    assert gen_dcp_alltoall_module().name == "dcp_alltoall"
+    spec, defines = select({(10, "3a")})
+    assert spec.name == cake_dcp_alltoall.MODULE_NAME
+    assert defines == ["-DCAKE_DCP_GENERATED_SM103A=1"]
 
-    # Multi-target builds keep the portable module.
-    monkeypatch.setattr(
-        current_compilation_context, "TARGET_CUDA_ARCHS", {(9, "0a"), (10, "0a")}
-    )
-    assert gen_dcp_alltoall_module().name == "dcp_alltoall"
+    # Multi-target (AOT) builds carry the generated kernels for both Blackwell
+    # targets next to the portable kernel for every other target.
+    spec, defines = select({(9, "0a"), (10, "0a"), (10, "3a"), (12, "0a")})
+    assert spec.name == cake_dcp_alltoall.MODULE_NAME
+    assert defines == [
+        "-DCAKE_DCP_GENERATED_SM100A=1",
+        "-DCAKE_DCP_GENERATED_SM103A=1",
+    ]
+    assert "-gencode=arch=compute_90a,code=sm_90a" in spec.extra_cuda_cflags
+
+    # Builds without a Blackwell target keep the portable module.
+    spec, _defines = select({(9, "0a")})
+    assert spec.name == "dcp_alltoall"
 
 
 if __name__ == "__main__":
