@@ -69,10 +69,10 @@ _PARTIAL_OFFSET = _COUNTER_OFFSET + _COUNTER_REGION_BYTES
 _MAX_FIXED_SPLITS = 5
 # BF16/H128 SWA-only and topk4x rows with this many metadata tokens or more use
 # the persistent KV-reuse prefill body (mirrors the Cake dispatcher's
-# BF16_H128_PREFILL_MIN_TOKENS, CAKE-624 W11).
+# BF16_H128_PREFILL_MIN_TOKENS).
 _BF16_H128_PREFILL_MIN_TOKENS = 64
 # The two-stage split4 program (4 owners x 2 CTAs per token) runs one wave
-# only up to this many query tokens; wider grids lose to trtllm-gen (CAKE-624 W12).
+# only up to this many query tokens; wider grids lose to trtllm-gen.
 # Mirrors the Cake seed's BF16_TOPK128X_SPLIT_MAX_TOKENS.
 _BF16_TOPK128X_SPLIT_MAX_TOKENS = 16
 # Widths the BF16/H128 four-owner split and row-first producers cover (two or
@@ -89,7 +89,7 @@ _PRIMED_ATTR = "_cake_dsv4_counters_primed"
 
 
 # Work feed of the BF16/H128 persistent prefill body (mirrors the Cake seed's
-# bf16_h128_prefill_uses_snake_feed, CAKE-624 W17).  With C = min(T, SMs // 2)
+# bf16_h128_prefill_uses_snake_feed).  With C = min(T, SMs // 2)
 # clusters the striped feed gives base = T // C strided PREFIX items to the
 # C - T % C regular clusters and base + 1 contiguous SUFFIX items to the T % C
 # tail clusters; when the tail clusters are the majority the few regular
@@ -627,7 +627,7 @@ _RAGGED_ONLY_ROUTES = frozenset(
         "fp8_h64_prefill_source_persistent_m64",
     }
 )
-# CAKE-624 W9: mirrors the Cake seed's LANE_GATHER_MIN_TOKENS. Below it the
+# Mirrors the Cake seed's LANE_GATHER_MIN_TOKENS. Below it the
 # persistent FP8 body runs the program with elected-lane uniform K/V gathers;
 # from 128 tokens on, the lane-issued gathers (several waves per cluster) win.
 _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS = 128
@@ -639,14 +639,14 @@ def _fp8_persistent_program(num_query_tokens: int) -> str:
     return "fp8_h128_prefill_source_persistent"
 
 
-# CAKE-624 W14: mirrors the Cake seed's H64_M64_MIN_TOKENS
+# Mirrors the Cake seed's H64_M64_MIN_TOKENS
 # (portfolio_v34.persistent_program): FP8/H64 rows admitted to the persistent
 # body with at least this many tokens run the H64-specific single-CTA M64 body.
 _FP8_H64_M64_MIN_TOKENS = 128
 
 
 def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bool:
-    """CAKE-624 FP8/H64 rule (Cake seed ``portfolio_v34.uses_persistent_body``)."""
+    """FP8/H64 persistent-body rule (Cake seed ``portfolio_v34.uses_persistent_body``)."""
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
         return full_tiles >= 3
@@ -823,7 +823,7 @@ def _route(
                 or (is_topk4x and sparse_topk == (192 if num_heads == 8 else 256))
             )
         ):
-            # CAKE-624 W18: FP8 port of the 1-CTA SwapsAb body trtllm-gen runs
+            # FP8 port of the 1-CTA SwapsAb body trtllm-gen runs
             # on these rows (heads on the MMA N side, kind::f8f6f4, P e4m3
             # x448); same shape lock as the BF16 source-exact route.  Paired
             # vs trtllm-gen: rows 55/58/67/70 GB300 1.27-1.30x / B200
@@ -833,7 +833,7 @@ def _route(
         if num_heads == 64 and _fp8_h64_uses_persistent_body(
             sparse_topk, num_query_tokens
         ):
-            # Mirrors the Cake seed's H64_PERSISTENT_* rule (CAKE-624 W5 + W10):
+            # Mirrors the Cake seed's H64_PERSISTENT_* rule:
             # 12-token rows with >= 3 complete sparse tiles; every many-token
             # compressed row (>= 2 complete tiles); SWA-only rows from 128
             # tokens.  Same persistent FP8 body as FP8/H128 (heads >= num_heads
@@ -842,7 +842,7 @@ def _route(
             # per-token cluster body and the SWA producer sat at 0.6-0.87x.
             # Evaluated before the SWA-only test on purpose.
             if num_query_tokens >= _FP8_H64_M64_MIN_TOKENS:
-                # CAKE-624 W14: H64-specific single-CTA M64 persistent body (one
+                # H64-specific single-CTA M64 persistent body (one
                 # CTA per token, unified 128-row KV stage, no V gathers): GB300
                 # 1.25-1.55x / B200 1.22-1.44x on the 128-512 token rows where
                 # the FP8/H128 body sat at 0.81-1.13x.
@@ -887,7 +887,7 @@ def _route(
         if is_swa:
             return "bf16_h16_h32_swa128_v44"
         if is_topk4x or is_topk128x:
-            # CAKE-624 W13: the retained-KV body with the last-arriver merge
+            # The retained-KV body with the last-arriver merge
             # beats the topk4x body on the H32 topk4x rows on both targets.
             return "bf16_h32_topk128x_early_v47"
         raise ValueError("BF16 H32 compressed cache requires page size 64 or 2")

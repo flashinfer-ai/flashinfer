@@ -123,7 +123,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
         pytest.param(
             torch.float8_e4m3fn, 64, 3, 5, True, 260, 2, "fp8_lowhead_h64", id="case-08"
         ),
-        # CAKE-624 W14: FP8/H64 rows admitted to the persistent body with >= 128
+        # FP8/H64 rows admitted to the persistent body with >= 128
         # tokens (dense 2 x 64) run the single-CTA M64 program; 127 tokens keep
         # the FP8/H128 persistent program.
         pytest.param(
@@ -1025,9 +1025,9 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
         ),
         # FP8/H64 many-token rows (dense 3 x 64 = 192 query tokens) with
         # >= 2 complete sparse tiles take the persistent FP8 body on both
-        # targets (CAKE-624 W10: the cluster producers sat at 0.19-0.79x
+        # targets (the cluster producers sat at 0.19-0.79x
         # vs trtllm-gen from 64 tokens on); from 128 tokens the H64-specific
-        # single-CTA M64 program (CAKE-624 W14).
+        # single-CTA M64 program.
         pytest.param(
             torch.float8_e4m3fn,
             64,
@@ -2247,7 +2247,7 @@ def test_every_route_result_has_a_registered_kernel(monkeypatch, arch):
 def test_bf16_h128_prefill_snake_feed_predicate(
     clusters, num_query_tokens, sparse_topk, expected
 ):
-    # CAKE-624 W17: mirrors the Cake seed's bf16_h128_prefill_uses_snake_feed.
+    # Mirrors the Cake seed's bf16_h128_prefill_uses_snake_feed.
     assert (
         cake._bf16_h128_prefill_uses_snake_feed(num_query_tokens, sparse_topk, clusters)
         is expected
