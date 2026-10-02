@@ -2,13 +2,20 @@
 
 `from flashinfer.sparse_mqa import prepare_sparse_mqa_metadata, prepare_sparse_mqa_logits`
 prepares the compressed sparse MQA indexer (metadata generation followed by the
-block-scaled logits kernel) on SM100a (148 SMs) and SM103a (152 SMs). Each prepared
-call returns a plan; `plan.run()` submits on the current PyTorch stream.
+block-scaled logits kernel) on SM100a and SM103a. Each prepared call returns a
+plan; `plan.run()` submits on the current PyTorch stream.
 
-The exported routes use 32 heads, D=128, a sparse capacity of 2048 blocks of 8 KV
-tokens, 64-token pages and aligned windows, for MXFP4 and MXFP8 inputs in both the
-contiguous and the paged KV layout (four physical routes per architecture, each a
-metadata program plus a logits program).
+Six generated programs serve both architectures (the loader compiles the shared
+source with the exact flag set of the attached device):
+
+- two metadata programs, one per KV layout (contiguous, paged). The SM count,
+  the sparse index capacity (a multiple of 4 up to `LIMITS["max_sparse_blocks"]`),
+  the split width (640 MXFP4 / 512 MXFP8 KV tokens over the block size), the
+  sparse block size (8 or 16) and the page size (any multiple of the block size)
+  are runtime arguments;
+- four logits programs, one per format x layout (MXFP4 runs five math
+  warpgroups over 640-token splits, MXFP8 four over 512-token splits), with
+  32 heads, D=128, 8-token blocks, 64-token pages and aligned windows.
 
 `prepare_sparse_mqa_metadata(sparse_indices, ...)` binds sorted int32 `[Q, capacity]`
 indices with duplicate padding in unused slots. Contiguous inputs pass `starts`, `ends`
@@ -25,16 +32,18 @@ UE8M0 query scales and BF16 `[Q, 32]` head weights. Contiguous KV is packed rows
 `[K, 64|128]` with int32 `[K]` scales; paged KV is uint8 `[pages, stride]` with each
 page's row bytes followed by its scale bytes, padded to a 512-byte stride (`sf_kv` is
 unused). The output is BF16 `[Q, capacity * 8]`; only selected valid slots are written and
-other slots keep their contents. `plan.run()` submits the complete metadata + logits
-pipeline with launch overhead and without allocation. Operand values may change in place
-between runs; prepare a new plan when shapes, layouts or the window vectors' identity
-change. Do not use one plan's mutable buffers concurrently on different streams.
+other slots keep their contents. A metadata plan prepared with a block or page size the
+logits programs do not implement raises `NotImplementedError` here. `plan.run()` submits
+the complete metadata + logits pipeline with launch overhead and without allocation.
+Operand values may change in place between runs; prepare a new plan when shapes,
+layouts or the window vectors' identity change. Do not use one plan's mutable buffers
+concurrently on different streams.
 
 Generated CUDA and bindings live in `csrc/experimental/deepgemm_sparse_mqa/generated`
-(one directory per architecture). The runtime and the per-architecture route catalog are in
-this directory. The public API is `flashinfer/sparse_mqa.py`; see
-`examples/experimental/sparse_mqa.py`. Build/install FlashInfer with its supported CUDA
-toolchain before running:
+(one device/binding pair per program). The runtime, program registry and route table
+are in `sparse_mqa.py` in this directory. The public API is `flashinfer/sparse_mqa.py`;
+see `examples/experimental/sparse_mqa.py`. Build/install FlashInfer with its supported
+CUDA toolchain before running:
 
 ```bash
 python examples/experimental/sparse_mqa.py
@@ -42,10 +51,10 @@ pytest tests/experimental/test_sparse_mqa_generated.py -q
 ```
 
 The test covers all four routes of the present architecture with exact analytical
-values, native metadata consumption, a non-default stream, changed-input graph replay and
-invalid-slot retention; it skips on devices without catalogued programs or SM counts.
-Performance qualification measures the complete prepared pipeline with prepacked inputs
-over the twenty model rows (contiguous Q=8192 and paged Q=512, KV lengths 4096 to
-1048576, MXFP4 and MXFP8). Per-row exported execution must remain within 3% of its source
-route. Performance results accompany the generated bundle; preparation is excluded from
-both timed arms.
+values at several sparse capacities, metadata decoding at runtime page sizes, block
+sizes and split widths, a non-default stream, changed-input graph replay and
+invalid-slot retention; the native-consumer cross-check runs when DeepGEMM is
+installed. Performance qualification measures the complete prepared pipeline with
+prepacked inputs over the twenty model rows (contiguous Q=8192 and paged Q=512, KV
+lengths 4096 to 1048576, MXFP4 and MXFP8) against the generating source route;
+preparation is excluded from both timed arms.

@@ -1,200 +1,146 @@
 """Prepared compressed sparse MQA metadata and logits on SM100a/SM103a.
 
-Production runtime has no source compiler, quantizer or native oracle dependency.
-Plans bind user tensors once; run() submits on the current PyTorch stream.
+Two generated programs per KV layout serve every architecture: the metadata
+kernel (one per layout; SM count, sparse capacity, split width, block size and
+page size are runtime arguments) and the block-scaled logits kernel (one per
+format and layout).  ``MODULES`` registers each program once with the
+architectures it compiles for; ``ROUTES`` maps a logical kernel key to its
+program; ``LIMITS`` carries the exported geometry.  Plans bind user tensors
+once; ``run()`` submits on the current PyTorch stream without allocations.
 """
 
 from __future__ import annotations
 
 import functools
-import json
-from pathlib import Path
+from typing import Any
 
+import tvm_ffi
+
+# Populated verbatim by the generated-program export; do not edit by hand.
+MODULES: dict[str, dict[str, Any]] = {}
+ROUTES: dict[str, str] = {}
+LIMITS: dict[str, int] = {}
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 
 @functools.cache
-def _catalog():
-    return json.loads(Path(__file__).with_name("sparse_mqa_catalog.json").read_text())
+def device_facts(device_index: int) -> tuple[str, int]:
+    """``(architecture, SM count)`` of CUDA device ``device_index``, resolved once per process."""
+    import torch
+
+    properties = torch.cuda.get_device_properties(device_index)
+    arch = _ARCHES.get((properties.major, properties.minor))
+    if arch is None or not any(arch in record["arches"] for record in MODULES.values()):
+        raise RuntimeError(
+            f"Sparse MQA has no exported programs for compute capability "
+            f"{(properties.major, properties.minor)}; exported architectures: "
+            f"{sorted({a for record in MODULES.values() for a in record['arches']})}"
+        )
+    sms = int(properties.multi_processor_count)
+    if not 1 <= sms <= LIMITS["max_sms"]:
+        raise RuntimeError(
+            f"Sparse MQA metadata schedules cover 1..{LIMITS['max_sms']} SMs, this device has {sms}"
+        )
+    return arch, sms
 
 
-def device_arch(device):
-    """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
+def device_arch(device) -> str:
+    """Generated-program architecture of ``device`` (raises when none is exported)."""
     import torch
 
     device = torch.device(device)
-    catalogued = sorted(_catalog()["arches"])
     if device.type != "cuda":
         raise RuntimeError("Sparse MQA requires a CUDA device")
-    capability = tuple(torch.cuda.get_device_capability(device))
-    arch = _ARCHES.get(capability)
-    if arch is None or arch not in catalogued:
-        raise RuntimeError(
-            f"Sparse MQA has no exported programs for compute capability "
-            f"{capability}; catalogued architectures: {catalogued}"
-        )
-    return arch
-
-
-def supported_num_sms(arch):
-    """SM counts with catalogued routes for ``arch`` (the last route-key field)."""
-    routes = _catalog()["arches"][arch]["routes"]
-    return sorted({int(key.rsplit(":", 1)[1]) for key in routes})
-
-
-def _nvcc_flags(arch):
-    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
-
-    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return device_facts(index)[0]
 
 
 @functools.cache
-def load_program(arch, name):
-    from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec
+def load_program(arch: str, name: str):
+    """Compile ``name`` for the exact architecture of the attached device; returns ``(module, spec)``."""
+    from ...jit import env
+    from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
-    record = _catalog()["arches"][arch]["programs"][name]
+    record = MODULES[name]
+    if arch not in record["arches"]:
+        raise RuntimeError(f"program {name} is not exported for {arch}")
+    flags = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
     spec = gen_jit_spec(
-        name=name,
+        name=f"{name}_{arch}",
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
         ],
         extra_cuda_cflags=[
-            *_nvcc_flags(arch),
+            *flags,
             *record["compile_flags"],
             "--device-entity-has-hidden-visibility=false",
         ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
-        use_fast_math=False,  # Only explicit stage flags select fast math.
+        use_fast_math=False,  # Only the program's own compile flags select fast math.
     )
-    module = spec.build_and_load()
-    return module, {**record, "library_path": str(spec.get_library_path())}
+    return spec.build_and_load(), spec
 
 
-def route_key(config):
-    return ":".join(
-        str(config[key])
-        for key in (
-            "fmt",
-            "paged",
-            "num_max_sparse_blocks",
-            "sparse_block_kv",
-            "page_kv",
-            "use_unaligned_ks",
-            "num_sms",
-        )
+def fast_divmod(divisor: int) -> tvm_ffi.Shape:
+    """Host-precomputed divmod constants of a positive divisor (the generated binding's three-field carrier)."""
+    if not 1 <= divisor <= 0x7FFF_FFFF:
+        raise ValueError(f"divisor must be in [1, 2147483647], got {divisor}")
+    if divisor == 1:
+        return tvm_ffi.Shape((1, 0, 0))
+    p = 31 + (divisor - 1).bit_length()
+    return tvm_ffi.Shape(
+        (divisor, (((1 << p) + divisor - 1) // divisor) & 0xFFFF_FFFF, p - 32)
     )
+
+
+def blocks_per_split(fmt: str, sparse_block_kv: int) -> int:
+    """Sparse blocks per logits split: 640 (MXFP4) or 512 (MXFP8) KV tokens over the block size."""
+    if fmt not in ("mxfp4", "mxfp8"):
+        raise ValueError("fmt must be mxfp4 or mxfp8")
+    if sparse_block_kv not in (8, 16):
+        raise ValueError("sparse_block_kv must be 8 or 16")
+    return (640 if fmt == "mxfp4" else 512) // sparse_block_kv
+
+
+def _ceildiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
 
 def metadata_size_bytes(queries, capacity, *, fmt, sparse_block_kv, paged, num_sms):
-    """Size the public packed split/schedule ABI, including its maximum extent."""
-    blocks_per_split = (640 if fmt == "mxfp4" else 512) // sparse_block_kv
-    ceildiv = lambda a, b: (a + b - 1) // b
+    """Size the packed split/schedule ABI, including its maximum extent."""
+    nb = blocks_per_split(fmt, sparse_block_kv)
     splits = (
-        queries * ceildiv(capacity, blocks_per_split)
+        queries * _ceildiv(capacity, nb)
         if paged
-        else ceildiv(queries, 2) * ceildiv(2 * capacity, blocks_per_split)
+        else _ceildiv(queries, 2) * _ceildiv(2 * capacity, nb)
     )
-    entries = ceildiv(splits, num_sms) * num_sms
-    return 16 + splits * (16 + blocks_per_split * 8) + entries * 16
+    return 16 + splits * (16 + nb * 8) + _ceildiv(splits, num_sms) * num_sms * 16
 
 
 def metadata_workspace_words(queries, capacity, *, fmt, sparse_block_kv, paged):
-    """Return the int32 word count of the metadata kernel workspace.
-
-    Words 0/32/64 are the split, paged-claim and finished-CTA counters, then two
-    words of split info per query. Contiguous routes append one 64-bit owner
-    record (q-block base, split-range end) per possible split.
-    """
+    """int32 words of the metadata workspace: three counters (words 0/32/64), two words of split info
+    per query, and for contiguous rows one 64-bit owner record per possible split."""
     words = 96 + queries * 2
     if not paged:
-        blocks_per_split = (640 if fmt == "mxfp4" else 512) // sparse_block_kv
-        ceildiv = lambda a, b: (a + b - 1) // b
-        words += 2 * ceildiv(queries, 2) * ceildiv(2 * capacity, blocks_per_split)
+        words += (
+            2
+            * _ceildiv(queries, 2)
+            * _ceildiv(2 * capacity, blocks_per_split(fmt, sparse_block_kv))
+        )
     return words
 
 
-def metadata_bindings(
-    sparse_indices,
-    metadata,
-    workspace,
-    *,
-    starts=None,
-    ends=None,
-    num_kv_tokens=0,
-    context_lens=None,
-    block_table=None,
-    request_indices=None,
-    num_sms,
-):
-    import torch
-
-    paged = context_lens is not None
-    queries = sparse_indices.shape[0]
-    placeholder = sparse_indices.view(torch.uint32)
-    ctas = min(queries if paged else (queries + 1) // 2, num_sms * 4)
-    return dict(
-        Starts=starts.view(torch.uint32) if starts is not None else placeholder,
-        Ends=ends.view(torch.uint32) if ends is not None else placeholder,
-        Context=context_lens.view(torch.uint32) if paged else placeholder,
-        BlockTable=block_table.view(torch.uint32) if paged else placeholder,
-        Requests=request_indices.view(torch.uint32) if paged else placeholder,
-        Sparse=placeholder,
-        Metadata=metadata.view(torch.uint32),
-        Workspace=workspace.view(torch.uint32),
-        num_q_tokens=queries,
-        num_kv_tokens=num_kv_tokens,
-        block_table_stride=block_table.stride(0) if paged else 0,
-        num_ctas=ctas,
-        grid_x=ctas,
-        grid_y=1,
-        grid_z=1,
-    )
-
-
-def logits_bindings(
-    q, sf_q, kv, sf_kv, weights, metadata, output, *, fmt, paged, num_sms
-):
-    import torch
-
-    row_bytes = 64 if fmt == "mxfp4" else 128
-    kv_tma = (kv if not paged else q).view(torch.uint8).reshape(-1, row_bytes)
-    sf_tma = (sf_kv if not paged else sf_q).view(torch.int32).reshape(1, -1)
-    return dict(
-        Q=q.view(torch.uint8).reshape(-1, row_bytes),
-        SF_Q=sf_q.view(torch.int32).reshape(-1, 32),
-        Weights=weights.reshape(-1, 32),
-        KV_TMA=kv_tma,
-        SF_KV_TMA=sf_tma,
-        KV=kv.view(torch.uint8),
-        SF_KV=(sf_kv if not paged else sf_q).view(torch.uint32),
-        Metadata=metadata.view(torch.uint32),
-        Logits=output,
-        logits_stride=output.stride(0),
-        kv_page_stride_bytes=kv.stride(0) if paged else 0,
-        num_sms=num_sms,
-        grid_x=num_sms,
-        grid_y=1,
-        grid_z=1,
-    )
-
-
-def _submission(arch, program, bindings, *, stage=None):
-    module, record = load_program(arch, program)
+def _arguments(record, bindings):
     arguments = []
     for kind, key in record["arg_plan"]:
-        if kind == "workspace":
+        if kind not in ("buffer", "tma_buffer", "parameter", "grid"):
             raise NotImplementedError(
-                "Sparse route unexpectedly requires external descriptor storage"
+                f"unsupported argument kind {kind!r} in the exported plan"
             )
-        if stage is None:
-            selected, name = key.split(".", 1)
-        else:
-            selected, name = stage, key
-        arguments.append(bindings[selected][name])
-    return (module[record["ffi_entry"]], tuple(arguments)), (module, record)
+        arguments.append(bindings[key])
+    return tuple(arguments)
 
 
 def _check_tensors(tensors, device):
@@ -205,19 +151,18 @@ def _check_tensors(tensors, device):
 
 
 class SparseMetadataPlan:
-    """Prepare an upstream-compatible metadata buffer for repeated generation.
+    """Prepare the packed metadata of one sparse index set for repeated generation.
 
-    sparse_indices is sorted int32[Q,capacity], with source-format duplicate
-    padding in unused slots. Contiguous inputs use starts/ends int32[Q] and
-    num_kv_tokens. Paged inputs use context_lens and request_indices int32[Q],
-    plus a per-query block table int32[Q,pages]. Packed metadata is uint8; a
-    caller-provided int32 workspace of metadata_workspace_words() entries must
-    initially be zero. The metadata kernel restores its three counters after
-    each submission.
-
-    run() returns the same metadata tensor. Split allocation order may vary;
-    unused bytes and scheduler ordering are not a canonical serialization.
-    Metadata consumers must use this ABI rather than compare raw buffers.
+    ``sparse_indices`` is sorted int32 ``[Q, capacity]`` with duplicate padding in
+    unused slots (capacity a multiple of 4, at most ``LIMITS["max_sparse_blocks"]``).
+    Contiguous inputs pass ``starts``/``ends`` int32 ``[Q]`` and ``num_kv_tokens``;
+    paged inputs pass ``context_lens``/``request_indices`` int32 ``[Q]`` and a
+    per-query ``block_table`` int32 ``[Q, pages]``.  ``sparse_block_kv`` is 8 or 16
+    and ``page_kv`` any multiple of it.  The packed metadata is uint8 of
+    ``metadata_size_bytes()``; the caller-provided int32 workspace of
+    ``metadata_workspace_words()`` entries must initially be zero, and the kernel
+    restores its three counters after every submission.  Split allocation order is
+    not a canonical serialization; consume metadata through this ABI.
     """
 
     def __init__(
@@ -239,13 +184,24 @@ class SparseMetadataPlan:
     ):
         import torch
 
-        arch = device_arch(sparse_indices.device)
         if sparse_indices.dtype != torch.int32 or sparse_indices.ndim != 2:
             raise ValueError("sparse_indices must be int32[Q,capacity]")
         queries, capacity = sparse_indices.shape
-        if queries < 1 or capacity < 1:
-            raise ValueError("positive Q and sparse capacity are required")
+        if (
+            queries < 1
+            or capacity < 1
+            or capacity % 4
+            or capacity > LIMITS["max_sparse_blocks"]
+        ):
+            raise ValueError(
+                f"sparse capacity must be a positive multiple of 4 at most {LIMITS['max_sparse_blocks']}, got {capacity}"
+            )
+        nb = blocks_per_split(fmt, sparse_block_kv)
         paged = context_lens is not None
+        if paged and (use_unaligned_ks or page_kv % sparse_block_kv):
+            raise ValueError(
+                "paged sparse MQA requires aligned blocks dividing the page"
+            )
         vectors = (context_lens, request_indices) if paged else (starts, ends)
         if any(
             t is None or t.dtype != torch.int32 or tuple(t.shape) != (queries,)
@@ -262,10 +218,8 @@ class SparseMetadataPlan:
                 raise ValueError("paged block_table must be int32[Q,pages]")
         elif num_kv_tokens <= 0:
             raise ValueError("contiguous metadata requires positive num_kv_tokens")
-        self.arch = arch
-        self.num_sms = torch.cuda.get_device_properties(
-            sparse_indices.device
-        ).multi_processor_count
+        device = sparse_indices.device
+        self.arch, self.num_sms = device_facts(device.index)
         self.config = dict(
             fmt=fmt,
             paged=paged,
@@ -273,14 +227,13 @@ class SparseMetadataPlan:
             sparse_block_kv=sparse_block_kv,
             page_kv=page_kv,
             use_unaligned_ks=bool(use_unaligned_ks),
-            num_sms=self.num_sms,
         )
-        try:
-            self.route = _catalog()["arches"][arch]["routes"][route_key(self.config)]
-        except KeyError as error:
+        layout = "paged" if paged else "contiguous"
+        if use_unaligned_ks:
             raise NotImplementedError(
-                f"No exported {arch} sparse physical schedule for {self.config}"
-            ) from error
+                "unaligned contiguous windows are not an exported sparse MQA specialization"
+            )
+        self.program = ROUTES[f"metadata:{layout}"]
         size = metadata_size_bytes(
             queries,
             capacity,
@@ -293,13 +246,9 @@ class SparseMetadataPlan:
             queries, capacity, fmt=fmt, sparse_block_kv=sparse_block_kv, paged=paged
         )
         if metadata is None:
-            metadata = torch.empty(
-                size, dtype=torch.uint8, device=sparse_indices.device
-            )
+            metadata = torch.empty(size, dtype=torch.uint8, device=device)
         if workspace is None:
-            workspace = torch.zeros(
-                words, dtype=torch.int32, device=sparse_indices.device
-            )
+            workspace = torch.zeros(words, dtype=torch.int32, device=device)
         if metadata.dtype != torch.uint8 or tuple(metadata.shape) != (size,):
             raise ValueError(
                 "metadata must be a uint8 vector with the required packed extent"
@@ -318,74 +267,98 @@ class SparseMetadataPlan:
             metadata,
             workspace,
         )
-        _check_tensors(self._retained, sparse_indices.device)
-        self.bindings = metadata_bindings(
-            sparse_indices,
-            metadata,
-            workspace,
-            starts=starts,
-            ends=ends,
+        _check_tensors(self._retained, device)
+        placeholder = sparse_indices.view(torch.uint32)
+        ctas = min(queries if paged else (queries + 1) // 2, self.num_sms * 4)
+        blocks_per_page = max(1, page_kv // sparse_block_kv)
+        self.bindings = dict(
+            Starts=starts.view(torch.uint32) if starts is not None else placeholder,
+            Ends=ends.view(torch.uint32) if ends is not None else placeholder,
+            Context=context_lens.view(torch.uint32) if paged else placeholder,
+            BlockTable=block_table.view(torch.uint32) if paged else placeholder,
+            Requests=request_indices.view(torch.uint32) if paged else placeholder,
+            Sparse=placeholder,
+            Metadata=metadata.view(torch.uint32),
+            Workspace=workspace.view(torch.uint32),
+            num_q_tokens=queries,
             num_kv_tokens=num_kv_tokens,
-            context_lens=context_lens,
-            block_table=block_table,
-            request_indices=request_indices,
+            block_table_stride=block_table.stride(0) if paged else 0,
+            num_ctas=ctas,
             num_sms=self.num_sms,
+            num_max_sparse_blocks=capacity,
+            blocks_per_split=nb,
+            split_divmod=fast_divmod(nb),
+            sparse_block_kv=sparse_block_kv,
+            blocks_per_page=blocks_per_page,
+            page_divmod=fast_divmod(blocks_per_page),
+            grid_x=ctas,
+            grid_y=1,
+            grid_z=1,
         )
-        stage = next(
-            stage for stage in self.route["stages"] if stage["name"] == "metadata"
-        )
-        self._submission, self._program = _submission(
-            arch, stage["program"], {"metadata": self.bindings}, stage="metadata"
-        )
+        module, _spec = load_program(self.arch, self.program)
+        self._entry = module[MODULES[self.program]["ffi_entry"]]
+        self._args = _arguments(MODULES[self.program], self.bindings)
         self.metadata, self.workspace = metadata, workspace
         self.queries, self.capacity = queries, capacity
 
     def run(self):
-        import tvm_ffi
-
         with tvm_ffi.use_torch_stream():
-            entry, args = self._submission
-            entry(*args)
+            self._entry(*self._args)
         return self.metadata
 
 
 class SparseMqaPlan:
-    """Bind quantized q/kv and emit compressed BF16 logits, metadata included.
+    """Bind quantized q/kv and emit compressed BF16 logits, metadata generation included.
 
-    q is packed E2M1[Q,32,64] or E4M3[Q,32,128]. sf_q is int32[Q,32]
-    containing four UE8M0 scale bytes per row; weights is BF16[Q,32]. Contiguous
-    kv has packed rows [K,64/128] and sf_kv int32[K]. Paged kv is uint8[pages,
-    stride], with each page's row bytes followed by its scale bytes and padding
-    to 512 bytes; sf_kv is unused. Output is BF16[Q,capacity*sparse_block_kv].
-    Only selected valid slots are written; invalid slots retain their contents.
-    Call run() for the complete metadata + logits pipeline on the current stream.
-    A plan's mutable buffers must not be used concurrently on different streams.
+    ``q`` is packed E2M1 ``[Q, 32, 64]`` or E4M3 ``[Q, 32, 128]``; ``sf_q`` int32
+    ``[Q, 32]`` holds four UE8M0 scale bytes per row; ``weights`` is BF16 ``[Q, 32]``.
+    Contiguous ``kv`` is packed rows ``[K, 64|128]`` with int32 ``[K]`` scales; paged
+    ``kv`` is uint8 ``[pages, stride]`` with each page's row bytes followed by its
+    scale bytes, padded to a 512-byte stride (``sf_kv`` unused).  The exported
+    logits programs use ``LIMITS["sparse_block_kv"]``-token blocks and
+    ``LIMITS["page_kv"]``-token pages.  Output is BF16 ``[Q, capacity * block]``;
+    only selected valid slots are written.  ``run()`` submits metadata then logits
+    on the current stream.  Do not use one plan's mutable buffers concurrently on
+    different streams.
     """
 
     def __init__(self, q, sf_q, kv, sf_kv, weights, metadata_plan, *, output=None):
         import torch
 
         config = metadata_plan.config
+        fmt, paged, block = config["fmt"], config["paged"], config["sparse_block_kv"]
         queries, capacity = metadata_plan.queries, metadata_plan.capacity
-        row = 64 if config["fmt"] == "mxfp4" else 128
-        if tuple(q.shape) != (queries, 32, row):
+        layout = "paged" if paged else "contiguous"
+        if (
+            block != LIMITS["sparse_block_kv"]
+            or config["page_kv"] != LIMITS["page_kv"]
+            or config["use_unaligned_ks"]
+        ):
+            raise NotImplementedError(
+                f"No exported {fmt} {layout} logits program for sparse_block_kv={block}, page_kv={config['page_kv']}, "
+                f"use_unaligned_ks={config['use_unaligned_ks']}; exported: sparse_block_kv={LIMITS['sparse_block_kv']}, "
+                f"page_kv={LIMITS['page_kv']}, aligned windows"
+            )
+        row = 64 if fmt == "mxfp4" else 128
+        heads = LIMITS["heads"]
+        if tuple(q.shape) != (queries, heads, row):
             raise ValueError(
                 "Q shape does not match metadata query count and precision"
             )
         supported_q = (
             (torch.uint8, torch.int8)
-            if config["fmt"] == "mxfp4"
+            if fmt == "mxfp4"
             else (torch.float8_e4m3fn, torch.uint8)
         )
         if (
             q.dtype not in supported_q
             or sf_q.dtype != torch.int32
-            or tuple(sf_q.shape) != (queries, 32)
+            or tuple(sf_q.shape) != (queries, heads)
         ):
             raise ValueError("Q/scales have the wrong precision or packed scale layout")
-        if weights.dtype != torch.bfloat16 or tuple(weights.shape) != (queries, 32):
-            raise ValueError("weights must be BF16[Q,32]")
-        if config["paged"]:
+        if weights.dtype != torch.bfloat16 or tuple(weights.shape) != (queries, heads):
+            raise ValueError(f"weights must be BF16[Q,{heads}]")
+        if paged:
             minimum = (config["page_kv"] * (row + 4) + 511) // 512 * 512
             if (
                 kv.dtype != torch.uint8
@@ -407,13 +380,11 @@ class SparseMqaPlan:
             raise ValueError("contiguous KV/scales have the wrong packed row layout")
         if output is None:
             output = torch.empty(
-                (queries, capacity * config["sparse_block_kv"]),
-                device=q.device,
-                dtype=torch.bfloat16,
+                (queries, capacity * block), device=q.device, dtype=torch.bfloat16
             )
         if output.dtype != torch.bfloat16 or tuple(output.shape) != (
             queries,
-            capacity * config["sparse_block_kv"],
+            capacity * block,
         ):
             raise ValueError("output must be BF16[Q,capacity*sparse_block_kv]")
         self._retained = (
@@ -427,39 +398,38 @@ class SparseMqaPlan:
             metadata_plan.workspace,
         )
         _check_tensors(self._retained, q.device)
-        bindings = {
-            "metadata": metadata_plan.bindings,
-            "logits": logits_bindings(
-                q,
-                sf_q,
-                kv,
-                sf_kv,
-                weights,
-                metadata_plan.metadata,
-                output,
-                fmt=config["fmt"],
-                paged=config["paged"],
-                num_sms=metadata_plan.num_sms,
-            ),
-        }
-        self._submissions, self._programs = [], []
-        route = metadata_plan.route
-        selections = (
-            [(None, route["sequence"])]
-            if route["sequence"]
-            else [(stage["name"], stage["program"]) for stage in route["stages"]]
+        kv_tma = (kv if not paged else q).view(torch.uint8).reshape(-1, row)
+        sf_tma = (sf_kv if not paged else sf_q).view(torch.int32).reshape(1, -1)
+        bindings = dict(
+            Q=q.view(torch.uint8).reshape(-1, row),
+            SF_Q=sf_q.view(torch.int32).reshape(-1, heads),
+            Weights=weights.reshape(-1, heads),
+            KV_TMA=kv_tma,
+            SF_KV_TMA=sf_tma,
+            KV=kv.view(torch.uint8),
+            SF_KV=(sf_kv if not paged else sf_q).view(torch.uint32),
+            Metadata=metadata_plan.metadata.view(torch.uint32),
+            Logits=output,
+            logits_stride=output.stride(0),
+            kv_page_stride_bytes=kv.stride(0) if paged else 0,
+            num_sms=metadata_plan.num_sms,
+            grid_x=metadata_plan.num_sms,
+            grid_y=1,
+            grid_z=1,
         )
-        for name, program in selections:
-            submit, loaded = _submission(
-                metadata_plan.arch, program, bindings, stage=name
-            )
-            self._submissions.append(submit)
-            self._programs.append(loaded)
+        program = ROUTES[f"logits:{fmt}:{layout}"]
+        module, _spec = load_program(metadata_plan.arch, program)
+        self.programs = {"metadata": metadata_plan.program, "logits": program}
+        self._submissions = (
+            (metadata_plan._entry, metadata_plan._args),
+            (
+                module[MODULES[program]["ffi_entry"]],
+                _arguments(MODULES[program], bindings),
+            ),
+        )
         self.metadata_plan, self.output = metadata_plan, output
 
     def run(self):
-        import tvm_ffi
-
         with tvm_ffi.use_torch_stream():
             for entry, args in self._submissions:
                 entry(*args)
