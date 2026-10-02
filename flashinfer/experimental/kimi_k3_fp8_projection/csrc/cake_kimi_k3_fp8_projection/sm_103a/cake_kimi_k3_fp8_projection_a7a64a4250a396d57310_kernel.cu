@@ -454,6 +454,15 @@ __device__ __forceinline__ void tma_2d_gmem2smem(
 }
 
 
+__device__ __forceinline__ void tma_store_2d(
+    const void *tmap, int x, int y, unsigned smem_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+        " [%0, {%1, %2}], [%3];"
+        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr) : "memory");
+}
+
+
 __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
     asm volatile(
         "{\n\t"
@@ -487,7 +496,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fp8_projection_979a103fab969cad6f74(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K)
+kernel_cake_kimi_k3_fp8_projection_a7a64a4250a396d57310(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K, float* __restrict__ sk_partials, unsigned int* __restrict__ sk_flags, int sk_pairs, int sk_rem, int sk_ksplit, int sk_dp)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -650,6 +659,21 @@ kernel_cake_kimi_k3_fp8_projection_979a103fab969cad6f74(const __grid_constant__ 
                     int sfb_tile_row = bid_n * sf_k_tiles;
                     #pragma unroll 1
                     for (int iter_k = 0; iter_k < num_k_iters; iter_k++) {
+                        if (iter_k == 0) {
+                            if (num_k_iters > 0) {
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(0)), "r"((int)(weight_tile0)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFB))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfb_tile_row)) : "memory");
+                            }
+                            if (num_k_iters > 1) {
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(0)), "r"((int)(weight_tile0 + 2)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFB))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfb_tile_row + 2)) : "memory");
+                            }
+                        }
+                        int k_pf = iter_k + 2;
+                        if (k_pf < num_k_iters) {
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(0)), "r"((int)(weight_tile0 + k_pf * 2)) : "memory");
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFB))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfb_tile_row + k_pf * 2)) : "memory");
+                        }
                         mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
                         int k_group = iter_k * 2;
                         tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 68608, (&A), 0, off_m, k_group, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
@@ -821,6 +845,7 @@ kernel_cake_kimi_k3_fp8_projection_979a103fab969cad6f74(const __grid_constant__ 
             const int col_part = (warp - 2) / 4;
             const int local_row = epi_warp * 32 + lane;
             unsigned int this_bid_1 = bid;
+            int sk_lane_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)(col_part * 128);
             unsigned int _phase_mainloop_done = 0;
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
@@ -867,15 +892,15 @@ kernel_cake_kimi_k3_fp8_projection_979a103fab969cad6f74(const __grid_constant__ 
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
                     _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
-                unsigned int ts_base = smem_out_addr + (unsigned int)(col_part * 8192);
-                unsigned int ts_row = ts_base + (unsigned int)(local_row * 64);
+                unsigned int group_base = smem_out_addr + (unsigned int)(col_part * 8192);
                 int swz = local_row >> 1 & 3;
-                int rd_half = local_row & 7;
-                int rd_q = rd_half >> 1;
-                int rd_sub = (rd_half & 1) * 8;
-                int rd_row0 = local_row >> 3;
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
+                    unsigned int ts_base = group_base;
+                    unsigned int ts_row = ts_base + (unsigned int)(local_row * 64);
+                    if ((warp - 2) % 4 == 0) {
+                        asm volatile("cp.async.bulk.wait_group.read 0;");
+                    }
                     asm volatile("barrier.sync %0, 128;" :: "r"(1 + col_part) : "memory");
                     #pragma unroll
                     for (int q = 0; q < 4; q++) {
@@ -883,28 +908,12 @@ kernel_cake_kimi_k3_fp8_projection_979a103fab969cad6f74(const __grid_constant__ 
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
                             "r"(ts_row + (unsigned int)((q ^ swz) * 16)), "r"(*reinterpret_cast<uint32_t*>(&(_tmem_load_0_bf16 + s0)[0])), "r"(*reinterpret_cast<uint32_t*>(&(_tmem_load_0_bf16 + s0)[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&(_tmem_load_0_bf16 + s0)[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&(_tmem_load_0_bf16 + s0)[(0) + 3])));
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync %0, 128;" :: "r"(1 + col_part) : "memory");
-                    int col_c = col_base + c * 32 + rd_half * 4;
-                    #pragma unroll
-                    for (int p = 0; p < 8; p++) {
-                        int row_p = rd_row0 + p * 16;
-                        int swz_p = row_p >> 1 & 3;
-                        unsigned int words[2];
-                        asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&words[0])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 1]))
-                            : "r"(ts_base + (unsigned int)(row_p * 64 + (rd_q ^ swz_p) * 16 + rd_sub)));
-                        int grow = off_m_1 + row_p;
-                        if (grow < M) {
-                            unsigned long long dst_off = (unsigned long long)grow * (unsigned long long)ldo + (unsigned long long)col_c;
-                            if (col_c + 4 <= n_valid) {
-                                {
-                                    int2 _iv2 = make_int2(words[0 + 0], words[0 + 1]);
-                                    *reinterpret_cast<int2*>(out + dst_off + 0) = _iv2;
-                                }
-                            } else if (col_c + 2 <= n_valid) {
-                                unsigned int w0 = words[0];
-                                *(reinterpret_cast<int*>(out + dst_off) + (0)) = w0;
-                            }
+                    if ((warp - 2) % 4 == 0) {
+                        if (elect_sync()) {
+                            tma_store_2d((&OUT), col_base + c * 32, off_m_1, ts_base);
+                            asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
                 }
@@ -947,6 +956,9 @@ kernel_cake_kimi_k3_fp8_projection_979a103fab969cad6f74(const __grid_constant__ 
                     break;
                 }
                 this_bid_1 = _clc_ctaid_2 + (unsigned int)cta_rank;
+            }
+            if ((warp - 2) % 4 == 0) {
+                asm volatile("cp.async.bulk.wait_group 0;");
             }
         }
     }

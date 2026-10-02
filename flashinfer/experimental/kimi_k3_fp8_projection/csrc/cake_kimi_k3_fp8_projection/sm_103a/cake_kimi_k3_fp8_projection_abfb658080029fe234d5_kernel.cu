@@ -496,7 +496,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fp8_projection_000468a624cdb37795e1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K)
+kernel_cake_kimi_k3_fp8_projection_abfb658080029fe234d5(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K, float* __restrict__ sk_partials, unsigned int* __restrict__ sk_flags, int sk_pairs, int sk_rem, int sk_ksplit, int sk_dp)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -659,21 +659,6 @@ kernel_cake_kimi_k3_fp8_projection_000468a624cdb37795e1(const __grid_constant__ 
                     int sfb_tile_row = bid_n * sf_k_tiles;
                     #pragma unroll 1
                     for (int iter_k = 0; iter_k < num_k_iters; iter_k++) {
-                        if (iter_k == 0) {
-                            if (num_k_iters > 0) {
-                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(0)), "r"((int)(weight_tile0)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFB))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfb_tile_row)) : "memory");
-                            }
-                            if (num_k_iters > 1) {
-                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(0)), "r"((int)(weight_tile0 + 2)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFB))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfb_tile_row + 2)) : "memory");
-                            }
-                        }
-                        int k_pf = iter_k + 2;
-                        if (k_pf < num_k_iters) {
-                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&B))), "r"((int)(0)), "r"((int)(0)), "r"((int)(weight_tile0 + k_pf * 2)) : "memory");
-                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFB))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfb_tile_row + k_pf * 2)) : "memory");
-                        }
                         mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
                         int k_group = iter_k * 2;
                         tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 68608, (&A), 0, off_m, k_group, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
@@ -845,6 +830,7 @@ kernel_cake_kimi_k3_fp8_projection_000468a624cdb37795e1(const __grid_constant__ 
             const int col_part = (warp - 2) / 4;
             const int local_row = epi_warp * 32 + lane;
             unsigned int this_bid_1 = bid;
+            int sk_lane_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)(col_part * 128);
             unsigned int _phase_mainloop_done = 0;
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1

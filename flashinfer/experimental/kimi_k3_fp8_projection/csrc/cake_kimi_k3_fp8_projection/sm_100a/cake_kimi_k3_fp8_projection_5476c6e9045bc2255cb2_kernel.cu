@@ -496,7 +496,7 @@ __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fp8_projection_da2a2cb5bf4dd4c0af18(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K)
+kernel_cake_kimi_k3_fp8_projection_5476c6e9045bc2255cb2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K, float* __restrict__ sk_partials, unsigned int* __restrict__ sk_flags, int sk_pairs, int sk_rem, int sk_ksplit, int sk_dp)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -504,7 +504,8 @@ kernel_cake_kimi_k3_fp8_projection_da2a2cb5bf4dd4c0af18(const __grid_constant__ 
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -836,6 +837,7 @@ kernel_cake_kimi_k3_fp8_projection_da2a2cb5bf4dd4c0af18(const __grid_constant__ 
             const int col_part = (warp - 2) / 4;
             const int local_row = epi_warp * 32 + lane;
             unsigned int this_bid_1 = bid;
+            int sk_lane_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)(col_part * 96);
             unsigned int _phase_mainloop_done = 0;
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1

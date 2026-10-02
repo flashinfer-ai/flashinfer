@@ -84,6 +84,10 @@ GPU_ROWS = [
         0,
     ),  # narrow-N large-M row: tabulated fused decode route above DECODE_MAX_M
     ("tp1", "b_proj", 4097, 4),
+    # Round 6 continuation 12 (lever SKO): tabulated ``gemm_sk`` rows inside the stream-K wave window -- the TMA-store
+    # instance on the aligned view and the staged register instance on the 8-byte-aligned padded row stride
+    ("tp8", "q_proj", 4096, 0),
+    ("tp1", "o_proj", 4096, 4),
 ]
 
 
@@ -251,11 +255,17 @@ def test_decode_table_covers_every_family(arch):
                 entry = cb.decode_table_entry(bucket, n_tiles128, num_k_iters, arch)
                 if bucket > DECODE_MAX_M:
                     # Large buckets list only the families measured faster on the decode kernel, plus (round 6,
-                    # lever L5) the GEMM-routed rows that pin the 192-wide N tile.
+                    # lever L5) the GEMM-routed rows that pin the 192-wide N tile and (round 6 continuation 12,
+                    # lever SKO) the GEMM-routed rows that take the ordered stream-K tail.
                     assert (
                         entry is None
                         or entry["route"] == "decode"
-                        or (entry["route"] == "gemm" and entry.get("gemm_bn") == 192)
+                        or (
+                            entry["route"] == "gemm"
+                            and (
+                                entry.get("gemm_bn") == 192 or entry.get("gemm_sk") == 1
+                            )
+                        )
                     )
                     continue
                 assert entry is not None, f"{arch} {tp}:{name} bucket {bucket}"
@@ -562,6 +572,44 @@ def test_decode_config_round6_continuation_rules(arch):
     # the narrow tile is refused when its padded N would read past the stored 256-padded rows
     assert cb.gemm_block_n(4096, 5, 28, arch, 250, 256) == 256
     assert {"gemm_tstore_n192", "gemm_rstaged_n192"} <= required
+    # Round 6 continuation 12 (lever SKO): the tabulated ``gemm_sk`` rows launch the ordered stream-K instance when the
+    # launch has one full wave of CTA pairs plus at most half a wave of tail tiles: the head pair of each tail tile runs
+    # the first K half and hands its FP32 partial to the tail pair, which continues the same accumulation (bit-exact).
+    sk_rows = {k: e for k, e in DECODE_TABLE[arch].items() if "gemm_sk" in e}
+    assert sorted(sk_rows) == ["12,28,4096", "56,48,4096"]
+    assert all(e["route"] == "gemm" and e["gemm_sk"] == 1 for e in sk_rows.values())
+    for key in sk_rows:
+        n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
+        plan = cb.gemm_stream_k_plan(
+            bucket,
+            n_tiles128,
+            num_k_iters,
+            arch,
+            SM_COUNT,
+            cb._m_tiles(bucket),
+            n_tiles128 // 2,
+        )
+        assert (
+            plan is not None
+            and plan.pairs == SM_COUNT // 2
+            and plan.grid == 2 * plan.dp
+        )
+        assert (
+            0 < plan.rem <= plan.pairs - plan.rem
+            and plan.ksplit == (num_k_iters + 1) // 2
+        )
+        assert plan.dp + plan.rem == (cb._m_tiles(bucket) // 2) * (n_tiles128 // 2)
+    # 96 tiles over 74 pairs: 22 tail tiles, head 14 of 28 K iterations; below one wave or untabulated: plain schedule
+    assert cb.gemm_stream_k_plan(4096, 12, 28, arch, 148, cb._m_tiles(4096), 6) == (
+        cb.StreamKPlan(74, 22, 14, 74, 148) if "12,28,4096" in sk_rows else None
+    )
+    # 448 tiles over 74 pairs: 6 full waves (888 CTAs, one pair per data-parallel tile) + 4 tail tiles, head 24 of 48
+    assert cb.gemm_stream_k_plan(4096, 56, 48, arch, 148, cb._m_tiles(4096), 28) == (
+        cb.StreamKPlan(74, 4, 24, 444, 888) if "56,48,4096" in sk_rows else None
+    )
+    assert cb.gemm_stream_k_plan(2048, 12, 28, arch, 148, cb._m_tiles(2048), 6) is None
+    assert cb.gemm_stream_k_plan(4096, 96, 28, arch, 148, cb._m_tiles(4096), 48) is None
+    assert "gemm_tstore_sk" in required and "gemm_rstaged_sk" not in required
 
 
 def test_decode_module_stage_clamp():
@@ -677,18 +725,51 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             if aligned
             else 0
         )
+        # Round 6 continuation 12 (lever SKO): the tabulated ``gemm_sk`` rows inside the stream-K wave window launch the
+        # ``_sk`` instance over 2 x dp CTAs with the hand-off area behind the activation scale tiles.
+        sk = cb.gemm_stream_k_plan(
+            M,
+            _prepared.n_tiles128,
+            _prepared.num_k_iters,
+            plan.arch,
+            plan.sm_count,
+            cb._m_tiles(M),
+            plan.gemm_n_tiles,
+        )
+        sk_key = cb.gemm_kernel_key(
+            expected_kernel + ("_n192" if bn == 192 else "") + "_sk", gpf
+        )
+        if sk is not None and not cb.route_available(plan.arch, (sk_key,)):
+            sk = None  # only the TMA-store stream-K program ships: other views keep the plain program
+        assert plan.gemm_sk == sk
         assert plan.kernels[-1] == cb.gemm_kernel_key(
-            expected_kernel + ("_n192" if bn == 192 else ""), gpf
+            expected_kernel
+            + ("_n192" if bn == 192 else "")
+            + ("_sk" if sk is not None else ""),
+            gpf,
         )
         assert (plan.gemm_bn, plan.gemm_n_tiles) == (
             bn,
             _prepared.n_tiles if bn == 256 else -(-_prepared.n_valid // 192),
         )
-        assert plan.grids[-1] == cb._gemm_grid(cb._m_tiles(M), plan.gemm_n_tiles)
+        assert plan.grids[-1] == (
+            sk.grid
+            if sk is not None
+            else cb._gemm_grid(cb._m_tiles(M), plan.gemm_n_tiles)
+        )
+        if sk is not None:
+            assert (
+                _workspace_sf_numel(runner)
+                >= plan.counters_offset + 512 + sk.rem * cb.GEMM_SK_TILE_BYTES
+            )
     if plan.route == "decode" and plan.decode.fused:
         assert runner.launch_count == 1
     else:
         assert runner.launch_count == 2 and plan.kernels[0].startswith("quant:u")
+
+
+def _workspace_sf_numel(runner) -> int:
+    return int(runner.workspace.sf.numel())
 
 
 def test_allocating_api_matches_reference():
