@@ -190,6 +190,82 @@ def test_gemm_kernel_key_and_plan():
     assert plan.num_tiles == 224 and plan.grid == 224  # min(2 x 148, 224)
     plan = cb.gemm_plan(8, 18432, 7168, True, "sm_103a", 152)
     assert plan.kernel_key == "gemm:n8_k512_f16_aF_l2256b_s3" and plan.grid == 144
+    # Stream-K tail of the static 2-CTA schedule: each tile of the partial last wave is cut into
+    # equal K slices over consecutive pairs; the plan resolves the slice count into the tactic
+    # (it is baked into the program) and carries the geometry the kernel re-derives.
+    sk_tactic = {**cb.default_tactic(2048, 7168, 16384, 148), "stream_k": True}
+    plan = cb.gemm_plan(2048, 7168, 16384, False, "sm_100a", 148, tactic=sk_tactic)
+    assert plan.num_tiles == 304 and plan.grid == 2 * 74 and plan.stream_k
+    assert (plan.sk_tiles, plan.sk_slices, plan.sk_pairs) == (8, 6, 48)
+    assert plan.tactic["sk_split"] == 6
+    assert plan.kernel_key == "gemm:m192_2cta_skt6_bf16_aL_bL_l2256b"
+    assert (
+        plan.sk_flag_words == 8 * 6 * 2
+        and plan.sk_workspace_floats == 8 * 6 * 2 * 128 * 192
+    )
+    plan = cb.gemm_plan(
+        2048, 7168, 16384, False, "sm_100a", 148, tactic={**sk_tactic, "sk_split": 4}
+    )
+    assert (plan.sk_tiles, plan.sk_slices, plan.sk_pairs) == (8, 4, 32)
+    assert plan.kernel_key == "gemm:m192_2cta_skt4_bf16_aL_bL_l2256b"
+    # fewer than SK_MIN_SLICES slices are not worth the exchange: the plain program
+    plan = cb.gemm_plan(
+        2048, 7168, 16384, False, "sm_100a", 148, tactic={**sk_tactic, "sk_split": 2}
+    )
+    assert not plan.stream_k and "sk_split" not in plan.tactic
+    assert plan.kernel_key == "gemm:m192_2cta_bf16_aL_bL_l2256b"
+    # the default tactic of every static 2-CTA row carries the knob; the key needs the plan
+    assert cb.default_tactic(2048, 7168, 16384, 148)["stream_k"]
+    assert "stream_k" not in cb.default_tactic(128, 1536, 7168, 148)  # half_m pairs
+    # static 2x256 pairs (192 tiles < 10 per pair) vs the CLC scheduler (896 tiles)
+    assert cb.default_tactic(8192, 1536, 7168, 148)["stream_k"]
+    assert "stream_k" not in cb.default_tactic(8192, 7168, 16384, 148)
+    with pytest.raises(ValueError, match="resolved sk_split"):
+        cb.gemm_kernel_key(cb.default_tactic(2048, 7168, 16384, 148), False)
+    plan = cb.gemm_plan(2048, 7168, 16384, False, "sm_100a", 148)
+    assert plan.kernel_key == "gemm:m192_2cta_skt6_bf16_aL_bL_l2256b"
+    # 40 tail tiles over 76 pairs cannot be split: the plain program (tactic loses the knob)
+    plan = cb.gemm_plan(
+        2048,
+        8192,
+        8192,
+        False,
+        "sm_103a",
+        152,
+        tactic={**cb.default_tactic(2048, 8192, 8192, 152), "stream_k": True},
+    )
+    assert plan.num_tiles == 344 and not plan.stream_k and "sk_split" not in plan.tactic
+    assert (plan.sk_tiles, plan.sk_slices, plan.sk_pairs) == (0, 0, 0)
+    assert plan.kernel_key == "gemm:m192_2cta_bf16_aL_bL_l2256b"
+    plan = cb.gemm_plan(
+        2048,
+        2112,
+        7168,
+        False,
+        "sm_100a",
+        148,
+        tactic={**cb.default_tactic(2048, 2112, 7168, 148), "stream_k": True},
+    )
+    assert plan.num_tiles == 72 and not plan.stream_k
+    assert cb.stream_k_tail(344, 76, 32) == (40, 1, 0)
+    assert cb.stream_k_tail(300, 74, 32, 8, 6) == (4, 6, 24)
+    assert cb.stream_k_tail(256, 76, 32, 8, 8) == (
+        28,
+        1,
+        0,
+    )  # two slices fit, below SK_MIN_SLICES
+    assert cb.stream_k_tail(256, 76, 32, 8, 8, min_slices=2) == (28, 2, 56)
+    assert cb.stream_k_tail(152, 76, 32) == (0, 0, 0)
+    with pytest.raises(ValueError, match="static 2-CTA"):
+        cb.gemm_plan(
+            8192,
+            7168,
+            16384,
+            False,
+            "sm_100a",
+            148,
+            tactic={**cb.default_tactic(8192, 7168, 16384, 148), "stream_k": True},
+        )
     with pytest.raises(ValueError, match="1-CTA persistent"):
         cb.gemm_plan(
             8,

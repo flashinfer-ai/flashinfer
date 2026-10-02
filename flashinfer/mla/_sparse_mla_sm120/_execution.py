@@ -15,6 +15,7 @@ class Dsv4Nvfp4FormatInfo(TypedDict):
     bytes_per_token: int
     chunk_width: int
     page_size: int
+    runtime_page: bool
     heads: tuple[int, ...]
     topks: tuple[int, ...]
     extra_page_sizes: tuple[int, ...]

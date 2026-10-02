@@ -21,8 +21,8 @@ ported and checked row by row by the export):
 
 | kind | program | when |
 | --- | --- | --- |
-| `native_{k5,k6,k7,k8,m128}` | installed native ports, 148 CTAs x 288 threads, three sources per chunk, depth 2 | the measured cells of the 148-SM parts (`M = 1` for K5 / K6 / K7, `M <= 1024` cells for K4, small `M` / `M = 256` for K8) |
-| `k0_tma` | exact `K = 0` persistent path (bulk-copy fed, no TMEM) | `num_blocks == 0` |
+| `native_{k5,k6,k7,k8,m128}` | installed native ports, 148 CTAs x 288 threads, three sources per chunk, depth 2 | the measured cells of the 148-SM parts (`M = 1` for K5 / K6 / K7, `M <= 256` cells for K4, small `M` / `M = 256` for K8) |
+| `k0_tma` | exact `K = 0` persistent path (bulk-copy fed, no TMEM); grid 2x/3x the SM count at `M` 256-1024 | `num_blocks == 0` |
 | `persistent` | persistent TMEM common path, 288 threads, `nc` sources per chunk (1..5), depth 2 or 3, retraced per cell | every other dense call with `delta` and `output_norm_weight` and no snapshot write |
 | `direct` | one 256-thread CTA per token | no `delta`, snapshot write, no output norm, or row-padded layouts |
 

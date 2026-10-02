@@ -17,7 +17,7 @@ cases and 16 EP4 cases per rank.
 
 ## What the benchmark measures
 
-`benchmarks/bench_moe_ep_sm107_block_scaled_mega.py` reports:
+`benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py` reports:
 
 - `--mode kernel`: a launch over already staged inputs, including the
   required output/reset operations and dispatch, both GEMMs, and combine.
@@ -151,7 +151,7 @@ export CUTE_DSL_ARCH=sm_107a
 mkdir -p "$FI_RESULTS"
 for fi_variant in bf16 ikr; do
   for fi_repeat in 1 2 3; do
-    torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \
+    torchrun --standalone --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py \
       --hidden 7168 --intermediate 2048 --num-experts 256 --topk 8 \
       --quant-kind nvfp4 --routing gaussian --input-profile blackwell \
       --tokens 8 --capacity 64 --variant "$fi_variant" --knobs heuristic \
