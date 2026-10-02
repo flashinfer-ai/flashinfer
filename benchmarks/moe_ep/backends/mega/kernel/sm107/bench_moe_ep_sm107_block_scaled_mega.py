@@ -8,7 +8,7 @@ protocol, resolved knobs, shape, seed, environment, accuracy, and memory.
 A sampled Torch oracle gates every result.
 
 Example (four GPUs in one NVLink domain, CUTE_DSL_ARCH=sm_107a exported):
-    torchrun --standalone --nproc_per_node=4 benchmarks/bench_moe_ep_sm107_block_scaled_mega.py \\
+    torchrun --standalone --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py \\
         --quant-kind all --routing both --mode forward --execution graph --no-l2-flush
 
 See kernel_src/sm107/next_cutedsl_megamoe/TUNING.md for the complete

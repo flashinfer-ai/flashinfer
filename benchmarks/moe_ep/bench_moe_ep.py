@@ -11,7 +11,7 @@ Launch (one process per GPU; 4 GPU/node on GB200 → N nodes = GPUs/4):
 
     # LL, EXPERT_MAJOR (default), reference geometry, 8 GPUs (2 GB200 nodes):
     torchrun --nnodes 2 --nproc_per_node 4 --rdzv_backend c10d \\
-        --rdzv_endpoint $HOST:$PORT benchmarks/bench_moe_ep.py \\
+        --rdzv_endpoint $HOST:$PORT benchmarks/moe_ep/bench_moe_ep.py \\
         --reference --algorithm ll --backend nccl_ep --quant bf16
 
     # LL, RANK_MAJOR variant: add --layout rank_major

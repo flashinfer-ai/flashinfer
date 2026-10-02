@@ -40,7 +40,7 @@ run () {
   local rc=0
   srun --jobid="$JOBID" -N "$N" --ntasks-per-node="$GPUS_PER_NODE" \
     --container-image="$IMAGE" --container-mounts="$MOUNTS" \
-    bash -lc "EP_SYNC=/host/sync_$TAG $FENV bash /host/flashinfer/benchmarks/${ONE_SCRIPT:-run_ep_matrix_one.sh} $*" \
+    bash -lc "EP_SYNC=/host/sync_$TAG $FENV bash /host/flashinfer/benchmarks/moe_ep/core/comm/${ONE_SCRIPT:-run_ep_matrix_one.sh} $*" \
     > "$LOGDIR/$TAG.log" 2>&1 || rc=$?
     if [[ $rc -ne 0 ]]; then echo "  [$TAG] FAILED (rc=$rc) — see $TAG.log"; else echo "  [$TAG] done"; fi
 }
