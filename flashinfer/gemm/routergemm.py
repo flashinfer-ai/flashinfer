@@ -876,7 +876,9 @@ _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 @functools.cache
-def _tinygemm2_sm100_enabled(disabled: str, compute_capability: Tuple[int, int]) -> bool:
+def _tinygemm2_sm100_enabled(
+    disabled: str, compute_capability: Tuple[int, int]
+) -> bool:
     # Evaluated once per (escape-hatch value, compute capability): the CUDA
     # version parsing below is off the per-call path.
     if disabled == "1":

@@ -25,8 +25,8 @@
 // to the same code as the formerly separate per-variant kernel: every
 // STAGES-dependent quantity (shared-memory layout, mbarrier count, ring slot
 // and phase arithmetic, drain-loop trip count) is a constant expression of
-// STAGES, and the PDL griddepcontrol pair sits under `if constexpr (USE_PDL)`. The ring depth is selected in the binding from the
-// problem shape and the device SM count (SelectStages).
+// STAGES, and the PDL griddepcontrol pair sits under `if constexpr (USE_PDL)`. The ring depth is
+// selected in the binding from the problem shape and the device SM count (SelectStages).
 //
 // Both 128-byte TMA descriptors ride in one trailing by-value __grid_constant__
 // pack (TensorMapPack<2>: maps[0] = weight, maps[1] = activation).
@@ -390,7 +390,6 @@ tinygemm2_kernel(__nv_bfloat16* __restrict__ output, __nv_bfloat16* __restrict__
     }
 }
 
-
 // clang-format on
 
 using tvm::ffi::TensorView;
@@ -563,9 +562,10 @@ void LaunchInstance(const LaunchArgs& args) {
   constexpr int kSmemBytes = SmemBytes(STAGES);
   static std::once_flag flags[kMaxDevices];
   std::call_once(DeviceFlag(flags, args.device_id), [] {
-    CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(&tinygemm2_kernel<STAGES, USE_PDL>),
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
-              "cudaFuncSetAttribute(tinygemm2_sm100 dynamic smem)");
+    CheckCuda(
+        cudaFuncSetAttribute(reinterpret_cast<const void*>(&tinygemm2_kernel<STAGES, USE_PDL>),
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
+        "cudaFuncSetAttribute(tinygemm2_sm100 dynamic smem)");
   });
 
   const dim3 grid((args.dims.out_features + kTileM - 1) / kTileM,
