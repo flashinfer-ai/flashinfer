@@ -4851,10 +4851,12 @@ def nvfp4_sparse_mla_decode(
     out : Optional[torch.Tensor]
         ``[num_tokens, 16, 512]`` ``torch.bfloat16`` output; allocated when omitted.
     num_ctas_per_token : Optional[int]
-        Thread-block cluster size per query token, 3 to 8. By default, the largest size whose ``num_tokens``
-        clusters all fit on the device in one wave.
+        Thread-block cluster size per query token: 3 to 8 with ``backend="cuda"``, 1 to 6 or 8 with
+        ``backend="cake"`` (7 is rejected). By default, the largest size whose ``num_tokens`` clusters all fit
+        on the device in one wave.
     backend : str
-        ``"cuda"``, the only backend.
+        ``"cuda"`` (default), the hand-written kernel, or ``"cake"``, the generated program of the same
+        operator (``flashinfer/experimental/nvfp4_sparse_mla_decode/cake_backend.py``).
 
     Returns
     -------
@@ -4867,8 +4869,25 @@ def nvfp4_sparse_mla_decode(
     the kernel and queries its cluster occupancy; later calls can be captured in CUDA graphs. Layout, limits and measurements:
     ``flashinfer/experimental/nvfp4_sparse_mla_decode/README.md``.
     """
+    if backend == "cake":
+        from ..experimental.nvfp4_sparse_mla_decode.cake_backend import (
+            nvfp4_sparse_mla_decode as run_cake,
+        )
+
+        return run_cake(
+            query,
+            kv_cache,
+            indices,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out=out,
+            num_ctas_per_token=num_ctas_per_token,
+            backend="cake",
+        )
     if backend != "cuda":
-        raise ValueError("nvfp4_sparse_mla_decode currently supports backend='cuda'")
+        raise ValueError(
+            "nvfp4_sparse_mla_decode supports backend='cuda' (default) or backend='cake'"
+        )
     from ..experimental.nvfp4_sparse_mla_decode.backend import run
 
     return run(

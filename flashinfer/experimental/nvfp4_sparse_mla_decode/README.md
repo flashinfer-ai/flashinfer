@@ -137,6 +137,54 @@ slower than this one): 15.6 against 17.0 us at 20 tokens, 17.8 against 17.3 at 2
   build with its debug timestamps removed: 2,160 instructions with identical encodings, 128 registers, no spills. The
   packaged tests have not run on a compute capability 10.0 device yet.
 
+## `backend="cake"` (generated program, experimental)
+
+`flashinfer.mla.nvfp4_sparse_mla_decode(..., backend="cake")` serves the same operator, tensor ABI and `-1`
+semantics with a generated program of the same design family: one thread-block cluster of `C` CTAs per query
+token (grid `(T, C, 1)`, cluster `(1, C, 1)`, 448 threads: 8 math warps, 4 softmax warps, 2 loader warps), CTA
+`c` owning keys `[c * keys_per_cta, (c + 1) * keys_per_cta)` in 32-key stages. `C = 1` writes the normalized
+output directly; a cluster merges its fp32 partials `(O, m, l)` through distributed shared memory, rank `G % C`
+owning 8-dim output group `G`. By design every e2m1 x e4m3 product is formed exactly in f16, S and O accumulate
+in fp32 and P is f16; the acceptance run below confirms the tolerance of the tests.
+
+- Cluster sizes 1, 2, 3, 4, 5, 6 and 8: one JIT module per (architecture, `C`), registered in `cake_jit.py`
+  with its sources under `csrc/cake_nvfp4_sparse_mla_decode/{sm_100a,sm_103a}/`. `num_ctas_per_token=7` is
+  rejected (`ValueError`), not re-planned.
+- Plan (`cake_backend.plan_ctas`): the largest of 8, 6, 5, 4, 3, 2 whose `num_tokens` clusters are co-resident
+  in one wave (`cudaOccupancyMaxActiveClusters` of each module, queried once per device), otherwise 2 in several
+  waves; 1 when no split leaves every CTA a full 32-key stage. `keys_per_cta = ceil(topk / C)` rounded up to a
+  multiple of 32, at most 2048. A forced split that leaves a CTA without keys is rejected.
+- Dynamic shared memory 192,064 bytes (`C = 1`) or 226,624 bytes (`C > 1`): one CTA per SM.
+- `cake_backend.prepare_nvfp4_sparse_mla_decode(...)` returns a runner that launches without allocation (CUDA
+  Graph safe); `cake_backend.generated_program_available(device)` reports whether the program is registered in
+  the checkout. The tests and the benchmark skip the arm otherwise.
+
+Cold-L2 microseconds per launch of the generated program (`python benchmarks/bench_nvfp4_sparse_mla_decode.py
+--cold-l2`, 16 heads, request-shaped indices, CUDA-graph replay), to be filled from the acceptance run:
+
+| T | topk | B200 (sm_100a) | GB300 (sm_103a) |
+|---|---|---|---|
+| 5 | 2048 | | |
+| 10 | 2048 | | |
+| 15 | 2048 | | |
+| 20 | 2048 | | |
+| 25 | 2048 | | |
+| 30 | 2048 | | |
+| 35 | 2048 | | |
+| 40 | 2048 | | |
+| 45 | 2048 | | |
+| 5 | 1024 | | |
+| 10 | 1024 | | |
+| 15 | 1024 | | |
+| 20 | 1024 | | |
+| 25 | 1024 | | |
+| 30 | 1024 | | |
+| 35 | 1024 | | |
+| 40 | 1024 | | |
+| 45 | 1024 | | |
+
+Tracking: flashinfer-ai/flashinfer#5716 (DSA NVFP4 sparse MLA decode), tracker #4254.
+
 ## Graduation plan
 
 1. Run the tests and the benchmark on B200/GB200 in CI.
