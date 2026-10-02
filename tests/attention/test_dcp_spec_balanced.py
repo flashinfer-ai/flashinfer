@@ -493,8 +493,9 @@ def test_d256_one_wave_row_tile_regime(arch) -> None:
         "balanced",
         "one_wave_row_tiles",
     )  # 1.071 / 1.064
-    assert (band(16, 5).blocks_per_cta, band(16, 5).route) == (64, "balanced")
-    assert (band(8, 8).blocks_per_cta, band(8, 8).route) == (32, "balanced")
+    # q_len 5 / 8: the last speculative row puts 8193 keys on rank 0 (65 blocks; split 1 / split 2)
+    assert (band(16, 5).blocks_per_cta, band(16, 5).route) == (65, "balanced")
+    assert (band(8, 8).blocks_per_cta, band(8, 8).route) == (33, "balanced")
     assert (band(32, 1).waves, band(32, 1).route) == (
         1,
         "static",
