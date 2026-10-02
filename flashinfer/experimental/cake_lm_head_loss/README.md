@@ -88,9 +88,11 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   `dW = cast(g * (dW_acc + dz_c^T @ X_c))` straight from the GEMM, and the
   separate `scale_cast` pass over `dW` disappears.  The same FP32 operations
   in the same order, so `dW` is bitwise the unfused result.  The last chunk's
-  BF16 `dlogits` rows (`memory_report(...)["saved_dz_bytes"]`) and a view of
-  its rows of `X` (or `X` with the chunk's row index when compacted) are saved
-  for the backward; an in-place write to `X` between the forward and the
+  BF16 `dlogits` rows -- a view of the `[min(T, C), V]` chunk buffer, which
+  therefore stays alive until the backward; `memory_report(...)["saved_dz_bytes"]`
+  counts that whole buffer, and the eager path allocates it on its own from the
+  first call on, so the view keeps nothing else alive -- and a view of its rows of `X` (or `X` with the
+  chunk's row index when compacted) are saved for the backward; an in-place write to `X` between the forward and the
   backward raises PyTorch's saved-tensor version error.  `ForwardResult`
   carries them (`dz_last`, `x_last` / `x_src` + `x_idx`) for the explicit pair
   and `ForwardResult.backward` / `backward_loss(..., dz_last=...)` finish

@@ -2975,8 +2975,8 @@ def test_memory_report_fused_dw_cast():
     four = memory_report(16231, H, V, C, fuse_dw_cast=True)
     assert four["fuse_dw_cast"] and four["accumulators"]["dW_acc"] == V * H * 4
     assert (
-        four["saved_dz_bytes"] == (16231 - 3 * 4096) * V * 2
-    )  # the last chunk's dz rows stay alive
+        four["saved_dz_bytes"] == 4096 * V * 2
+    )  # the last chunk's dz rows are a view of the whole [C, V] chunk buffer, which stays alive
     one = memory_report(4096, H, V, C, fuse_dw_cast=True)
     assert "dW_acc" not in one["accumulators"] and one["saved_dz_bytes"] == 4096 * V * 2
     assert "dW_acc" in memory_report(4096, H, V, C, fuse_dw_cast=False)["accumulators"]
@@ -4170,7 +4170,18 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
         assert (
             fr.x_src is inp.X and fr.x_last is None
         )  # compacted: the chunk's rows are gathered in the backward
-        assert fr.memory["saved_dz_bytes"] == fr.dz_last.numel() * 2
+        # the saved rows are a view of the chunk buffer, the storage that stays alive until the backward: the report
+        # counts that buffer (not the rows), and the first call of a binding retains no more than the later ones
+        saved = int(fr.memory["saved_dz_bytes"])
+        assert saved == min(C, int(fr.memory["valid_rows"])) * inp.V * 2
+        assert int(fr.dz_last.untyped_storage().nbytes()) == saved
+        assert int(fr.dz_last.numel()) * 2 <= saved
+        fr2 = cake_backend.forward_loss(
+            inp.X, inp.W, inp.labels, fuse_dw_cast=True, **kw
+        )  # the remembered binding
+        assert int(fr2.dz_last.untyped_storage().nbytes()) == saved
+        assert int(fr2.memory["saved_dz_bytes"]) == saved
+        del fr2
         if (
             fr.dw_acc is not None
         ):  # the accumulator holds the chunks before the last one

@@ -364,7 +364,7 @@ def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
     m = _STAGE_RE.fullmatch(stage)
     if m is None:
         raise ValueError(f"not a stage name of this backend: {stage!r}")
-    knobs = dict(
+    knobs: dict[str, Any] = dict(
         k_slices=int(m["k"]) if m["k"] else 1,
         tile_n=int(m["tile"]) if m["tile"] else None,
         group_m=int(m["group"]) if m["group"] else None,
@@ -1607,9 +1607,13 @@ def memory_report(
 
     ``fuse_dw_cast`` (default :func:`fuse_dw_cast_default`): the last chunk's
     weight-gradient GEMM runs in the backward with the scale + cast fused, so
-    its BF16 ``dz`` rows of the chunk buffer (``saved_dz_bytes``, part of the
-    ``temporary`` chunk buffer) stay alive until the backward and a one-chunk
-    call has no FP32 ``dW_acc`` at all.
+    the BF16 chunk buffer holding its ``dz`` rows stays alive until the
+    backward -- the saved rows are a view of the whole ``[min(T, C), V]``
+    buffer, never a copy, so ``saved_dz_bytes`` counts that whole buffer (part
+    of the ``temporary`` chunk buffer; the eager entry points allocate it on
+    its own from the first call on, so it is also the only storage the saved
+    view keeps alive, while a prepared runner keeps it inside its workspace) --
+    and a one-chunk call has no FP32 ``dW_acc`` at all.
     """
     compact = valid_rows is not None
     rows = (
@@ -1686,7 +1690,7 @@ def memory_report(
         valid_rows=rows,
         gather_bytes=int(layout["x_c"][1]) if compact else 0,
         fuse_dw_cast=deferred,
-        saved_dz_bytes=chunks[-1][1] * int(vocab) * 2 if deferred else 0,
+        saved_dz_bytes=min(int(chunk), rows) * int(vocab) * 2 if deferred else 0,
     )
 
 
@@ -3329,8 +3333,12 @@ class _Binding:
 def _deferred_operands(plan: Plan, t: dict[str, Any]) -> tuple:
     """``(dz_last, x_last, x_src, x_idx)`` of a deferred plan after its forward: the last chunk's BF16 ``dz`` rows of the
     chunk buffer and its ``X`` rows -- a view of the launched ``X`` (uncompacted) or the ``X`` plus the chunk's int64
-    row index, gathered again in the backward (compacted) -- so no ``[rows, H]`` copy outlives the forward.  All ``None``
-    for an undeferred plan."""
+    row index, gathered again in the backward (compacted) -- so no ``[rows, H]`` copy outlives the forward.  The ``dz``
+    rows are a view too: the whole ``[min(T, C), V]`` chunk buffer stays alive until the backward (what
+    :func:`memory_report` reports as ``saved_dz_bytes``) rather than paying a tail copy per step; the eager entry points
+    launch through the templated binding from the first call on, so that buffer is a per-call allocation of its own and
+    the view pins nothing else (a prepared runner keeps the chunk's ``dz`` inside its workspace).  All ``None`` for an
+    undeferred plan."""
     if not plan.dw_deferred:
         return None, None, None, None
     row0, rows_c = plan.last_chunk
@@ -3517,8 +3525,9 @@ def forward_loss(
     FP32 gradient accumulators ``dx_acc`` / ``dw_acc`` of the trainable inputs.
 
     The first call for an input binding validates and binds through
-    :func:`prepare_lm_head_loss`; later calls with the same binding take the
-    remembered launches (:data:`BINDING_CACHE`).  A call without rows returns
+    :func:`prepare_lm_head_loss` and launches through the templated binding it
+    remembers (:data:`BINDING_CACHE`); later calls with the same binding take
+    the remembered launches directly.  A call without rows returns
     loss 0, an empty ``logp`` and zero accumulators without binding or launching.
     ``compact_rows`` (default :func:`compact_rows_default`) chunks over the valid
     rows only: ``logp`` comes back scattered to ``[T]``, ``dx_acc`` is the compact
@@ -3608,16 +3617,31 @@ def forward_loss(
         fuse_dw_cast=fuse,
         **common,
     )
-    loss, logp = runner.forward()
-    if key is not None:
-        cache.remember(key, _Binding.from_runner(runner))
-    dz_last, x_last, x_src, x_idx = _deferred_operands(runner.plan, runner.tensors)
+    if backend == "cake":
+        # The first call launches through the templated binding too: its per-call temporaries come from the caching
+        # allocator, so the deferred ``dz`` rows keep the chunk buffer alive and nothing else -- a view into the
+        # runner's single workspace allocation would pin the whole workspace until the backward.  The runner (and its
+        # workspace) is dropped here; only the binding survives.
+        binding = _Binding.from_runner(runner)
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+        loss, logp, dx_acc, dw_acc, deferred = binding.forward(
+            X, W, labels, infer_logp, loss_weights, row_index
+        )
+        memory = binding.memory
+    else:
+        loss, logp = runner.forward()
+        dx_acc, dw_acc = runner.dx_acc, runner.dw_acc
+        deferred = _deferred_operands(runner.plan, runner.tensors)
+        memory = runner.memory
+    dz_last, x_last, x_src, x_idx = deferred
     return ForwardResult(
         loss=loss.reshape(()),
         logp=scatter_rows(logp, row_index, T),
-        dx_acc=runner.dx_acc,
-        dw_acc=runner.dw_acc,
-        memory=runner.memory,
+        dx_acc=dx_acc,
+        dw_acc=dw_acc,
+        memory=memory,
         backend=backend,
         row_index=row_index,
         num_rows=T,
