@@ -160,29 +160,62 @@ in fp32 and P is f16; the acceptance run below confirms the tolerance of the tes
   Graph safe); `cake_backend.generated_program_available(device)` reports whether the program is registered in
   the checkout. The tests and the benchmark skip the arm otherwise.
 
-Cold-L2 microseconds per launch of the generated program (`python benchmarks/bench_nvfp4_sparse_mla_decode.py
---cold-l2`, 16 heads, request-shaped indices, CUDA-graph replay), to be filled from the acceptance run:
+Cold-L2 microseconds per launch, CUDA kernel (`backend="cuda"`) against the generated program (`backend="cake"`) on the
+same inputs, 16 heads, request-shaped indices (`suffix` rows: short contexts, the tail of every third token empty), eager
+launches timed from CUPTI activity records with the L2 flushed before every launch (100 ms warm-up and 1,000 ms per slot,
+six interleaved slots per arm, pooled median).  B200 (148 SMs): driver 580.82.07; GB300 (152 SMs): driver 580.159.03;
+torch 2.13.0a0 (CUDA 13.3) on both.  Ratio = cake / cuda; `-` marks a wave-boundary row that exists only on the other
+card's planner table.
+Geomean ratio B200 0.835 (39 rows), GB300 0.840 (40 rows); worst 0.907 (B200) / 0.902 (GB300), both the P row T = 5,
+topk 1024.  Relative error against the exact fp32 reference is 1.9e-3 to 3.5e-3 on every row for both backends.
 
-| T | topk | B200 (sm_100a) | GB300 (sm_103a) |
-|---|---|---|---|
-| 5 | 2048 | | |
-| 10 | 2048 | | |
-| 15 | 2048 | | |
-| 20 | 2048 | | |
-| 25 | 2048 | | |
-| 30 | 2048 | | |
-| 35 | 2048 | | |
-| 40 | 2048 | | |
-| 45 | 2048 | | |
-| 5 | 1024 | | |
-| 10 | 1024 | | |
-| 15 | 1024 | | |
-| 20 | 1024 | | |
-| 25 | 1024 | | |
-| 30 | 1024 | | |
-| 35 | 1024 | | |
-| 40 | 1024 | | |
-| 45 | 1024 | | |
+| row | T | topk | padding | B200 cuda us | B200 cake us | B200 ratio | GB300 cuda us | GB300 cake us | GB300 ratio |
+|---|---|---|---|---|---|---|---|---|---|
+| P | 5 | 2048 | none | 13.41 | 11.90 | 0.888 | 12.61 | 11.07 | 0.878 |
+| P | 10 | 2048 | none | 13.92 | 12.32 | 0.885 | 12.96 | 11.33 | 0.874 |
+| P+W | 15 | 2048 | none | 14.46 | 12.77 | 0.883 | 13.28 | 11.62 | 0.875 |
+| P | 20 | 2048 | none | 17.44 | 15.23 | 0.873 | 16.00 | 13.92 | 0.870 |
+| P | 25 | 2048 | none | 19.81 | 17.06 | 0.861 | 18.11 | 15.55 | 0.859 |
+| P | 30 | 2048 | none | 22.62 | 19.62 | 0.867 | 20.70 | 17.76 | 0.858 |
+| P | 35 | 2048 | none | 28.74 | 24.19 | 0.842 | 20.93 | 17.92 | 0.856 |
+| P | 40 | 2048 | none | 28.99 | 24.45 | 0.843 | 26.50 | 22.82 | 0.861 |
+| P | 45 | 2048 | none | 29.38 | 24.80 | 0.844 | 26.69 | 23.01 | 0.862 |
+| P | 5 | 1024 | none | 9.60 | 8.70 | 0.907 | 9.12 | 8.22 | 0.902 |
+| P | 10 | 1024 | none | 10.05 | 9.02 | 0.898 | 9.41 | 8.45 | 0.898 |
+| P | 15 | 1024 | none | 10.43 | 9.41 | 0.902 | 9.73 | 8.74 | 0.898 |
+| P | 20 | 1024 | none | 12.48 | 11.01 | 0.882 | 11.62 | 10.30 | 0.887 |
+| P | 25 | 1024 | none | 13.82 | 11.97 | 0.866 | 12.77 | 11.04 | 0.865 |
+| P | 30 | 1024 | none | 14.82 | 12.83 | 0.866 | 13.66 | 11.78 | 0.862 |
+| P | 35 | 1024 | none | 17.73 | 15.10 | 0.852 | 13.82 | 11.94 | 0.863 |
+| P | 40 | 1024 | none | 18.02 | 15.33 | 0.851 | 16.58 | 14.40 | 0.869 |
+| P | 45 | 1024 | none | 18.24 | 15.52 | 0.851 | 16.67 | 14.56 | 0.873 |
+| P | 5 | 512 | none | 9.66 | 7.10 | 0.735 | 9.18 | 6.78 | 0.739 |
+| P | 10 | 512 | none | 9.86 | 7.36 | 0.747 | 9.28 | 6.91 | 0.745 |
+| P | 15 | 512 | none | 10.14 | 7.62 | 0.751 | 9.57 | 7.17 | 0.749 |
+| P | 20 | 512 | none | 10.40 | 8.48 | 0.815 | 9.79 | 7.97 | 0.814 |
+| P | 25 | 512 | none | 10.75 | 9.25 | 0.860 | 10.02 | 8.70 | 0.869 |
+| P | 30 | 512 | none | 10.82 | 9.47 | 0.876 | 10.08 | 8.86 | 0.879 |
+| P | 35 | 512 | none | 12.80 | 10.91 | 0.852 | 10.24 | 8.99 | 0.878 |
+| P | 40 | 512 | none | 13.06 | 11.07 | 0.848 | 12.10 | 10.59 | 0.876 |
+| P | 45 | 512 | none | 13.22 | 11.23 | 0.850 | 12.22 | 10.72 | 0.877 |
+| W | 16 | 2048 | none | 17.18 | 14.94 | 0.870 | 15.84 | 13.73 | 0.867 |
+| W | 22 | 2048 | none | 17.73 | 15.49 | 0.874 | - | - | - |
+| W | 23 | 2048 | none | 19.58 | 16.87 | 0.861 | 16.22 | 14.14 | 0.872 |
+| W | 24 | 2048 | none | - | - | - | 18.02 | 15.46 | 0.858 |
+| W | 26 | 2048 | none | 19.97 | 17.22 | 0.862 | - | - | - |
+| W | 27 | 2048 | none | 22.37 | 19.39 | 0.867 | - | - | - |
+| W | 28 | 2048 | none | - | - | - | 18.24 | 15.68 | 0.860 |
+| W | 29 | 2048 | none | - | - | - | 20.67 | 17.76 | 0.859 |
+| W | 33 | 2048 | none | 23.01 | 19.94 | 0.866 | - | - | - |
+| W | 34 | 2048 | none | 28.67 | 24.13 | 0.842 | - | - | - |
+| W | 36 | 2048 | none | - | - | - | 20.90 | 17.95 | 0.859 |
+| W | 37 | 2048 | none | - | - | - | 26.46 | 22.75 | 0.860 |
+| W | 46 | 2048 | none | 54.50 | 32.00 | 0.587 | 26.69 | 23.04 | 0.863 |
+| W | 47 | 2048 | none | - | - | - | 50.46 | 30.30 | 0.601 |
+| W | 64 | 2048 | none | 55.71 | 32.83 | 0.589 | 51.30 | 30.69 | 0.598 |
+| W | 128 | 2048 | none | 83.78 | 64.16 | 0.766 | 76.80 | 59.59 | 0.776 |
+| S | 20 | 2048 | suffix | 17.44 | 15.26 | 0.875 | 16.00 | 13.92 | 0.870 |
+| S | 45 | 2048 | suffix | 29.41 | 24.77 | 0.842 | 26.85 | 22.98 | 0.856 |
 
 Tracking: flashinfer-ai/flashinfer#5716 (DSA NVFP4 sparse MLA decode), tracker #4254.
 

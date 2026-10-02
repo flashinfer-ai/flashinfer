@@ -94,7 +94,7 @@ def main():
     parser.add_argument(
         "--cold-l2",
         action="store_true",
-        help="flush L2 before every timed replay (the backend='cake' tables in the README use this)",
+        help="flush L2 before every timed replay",
     )
     args = parser.parse_args()
     dev = torch.device("cuda")
