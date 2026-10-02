@@ -473,8 +473,8 @@ void Run(TensorView arg_Q_map, TensorView arg_K_map, TensorView arg_V_map, Tenso
   config.blockDim = block;
   config.dynamicSmemBytes = 25600u;
   config.stream = stream;
-  cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(CAKE_SAGE_SM120_KERNEL), kargs);
+  cudaError_t launch_status =
+      cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(CAKE_SAGE_SM120_KERNEL), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
       << "cudaLaunchKernelExC for the SM120 Sage block-sparse attention kernel failed: "
       << cudaGetErrorString(launch_status);
