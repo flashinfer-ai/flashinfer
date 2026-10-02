@@ -7,7 +7,7 @@ retains its existing topology selection, output ownership and NCCL fallback.
 ```python
 from flashinfer.comm import UlyssesCommunicator
 
-with UlyssesCommunicator(group, max_elems=q.numel(), dtype=q.dtype) as comm:
+with UlyssesCommunicator(group, max_bytes=q.nbytes, dtype=q.dtype) as comm:
     q_global = comm.scatter_heads(q)
     k_global = comm.scatter_heads(k)
     v_global = comm.scatter_heads(v)
