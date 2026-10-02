@@ -91,10 +91,14 @@ def _get_csrc_dir() -> Path:
     installed = jit_env.FLASHINFER_CSRC_DIR / "cake_grouped_mxfp8_quantize"
     if installed.exists():
         return installed
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_grouped_mxfp8_quantize"
+    checkout = (
+        Path(__file__).resolve().parents[2] / "csrc" / "cake_grouped_mxfp8_quantize"
+    )
     if checkout.exists():
         return checkout
-    raise FileNotFoundError(f"Cake grouped MXFP8 sources were not found. Checked:\n  - {installed}\n  - {checkout}")
+    raise FileNotFoundError(
+        f"Cake grouped MXFP8 sources were not found. Checked:\n  - {installed}\n  - {checkout}"
+    )
 
 
 def _get_include_dir() -> Path:
@@ -110,7 +114,9 @@ def _get_include_dir() -> Path:
 
 def _device_index(device: torch.device) -> int:
     if device.type != "cuda":
-        raise RuntimeError(f"the Cake grouped MXFP8 backend requires a CUDA device, got {device}")
+        raise RuntimeError(
+            f"the Cake grouped MXFP8 backend requires a CUDA device, got {device}"
+        )
     return torch.cuda.current_device() if device.index is None else device.index
 
 
@@ -149,7 +155,9 @@ def _available(input_name: str, device_index: int) -> bool:
     return True
 
 
-def is_cake_grouped_mxfp8_quantize_available(dtype: torch.dtype, device: torch.device) -> bool:
+def is_cake_grouped_mxfp8_quantize_available(
+    dtype: torch.dtype, device: torch.device
+) -> bool:
     """Whether a generated program serves ``dtype`` on ``device`` (no I/O; cached)."""
     name = _INPUT_NAMES.get(dtype)
     if name is None or device.type != "cuda":
@@ -168,7 +176,9 @@ def gen_cake_grouped_mxfp8_quantize_module(
         raise ValueError(f"unsupported Cake grouped MXFP8 target: {target}")
     record = MODULES[KERNELS[input_name]]
     if _TARGET_ARCH[target] not in record["arches"]:
-        raise ValueError(f"the {input_name} program is not built for {target} ({record['arches']})")
+        raise ValueError(
+            f"the {input_name} program is not built for {target} ({record['arches']})"
+        )
     csrc_dir = _get_csrc_dir()
     # gen_jit_spec's default use_fast_math (True) is left unchanged here,
     # matching the recipe the previously shipped binding used. The scale
@@ -184,7 +194,9 @@ def gen_cake_grouped_mxfp8_quantize_module(
         extra_cuda_cflags=[*_TARGET_FLAGS[target], *record["compile_flags"]],
         extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
     )
-    logger.info("Generated Cake grouped MXFP8 %s %s JIT spec: %s", input_name, target, spec.name)
+    logger.info(
+        "Generated Cake grouped MXFP8 %s %s JIT spec: %s", input_name, target, spec.name
+    )
     return spec
 
 
@@ -199,14 +211,18 @@ def load_cake_grouped_mxfp8_quantize_module(
 
 
 def get_cake_grouped_mxfp8_quantize_module(dtype: torch.dtype, device: torch.device):
-    return load_cake_grouped_mxfp8_quantize_module(_input_name(dtype), cake_grouped_mxfp8_target(device))
+    return load_cake_grouped_mxfp8_quantize_module(
+        _input_name(dtype), cake_grouped_mxfp8_target(device)
+    )
 
 
 @functools.cache
 def _entry(input_name: str, target: str):
     module = load_cake_grouped_mxfp8_quantize_module(input_name, target)
     record = MODULES[KERNELS[input_name]]
-    return getattr(module, record["ffi_entry"]), tuple((kind, argument) for kind, argument in record["arg_plan"])
+    return getattr(module, record["ffi_entry"]), tuple(
+        (kind, argument) for kind, argument in record["arg_plan"]
+    )
 
 
 def cake_grouped_mxfp8_quantize_launch(
