@@ -42,8 +42,8 @@ with fewer than 256 output rows runs the swapped ``X.T @ G`` with the
 transposed store (:func:`projection_wgrad`).
 
 The host selects one traced kernel instance per (A layout, B layout, tile
-width, output kind, epilogue path, raster group, TMA L2 eviction hints) exactly
-as the Cake production launcher does (:func:`instance_symbol`; the raster group
+width, tile height, output kind, epilogue path, raster group, TMA L2 eviction
+hints) exactly as the Cake production launcher does (:func:`instance_symbol`; the raster group
 and the hints follow the device's CTA-pair count and L2 size through
 :func:`default_group_m` and the wave working-set gate of :func:`default_hints`),
 plans the stream-K split from the device's SM count (:func:`stream_k_plan`
@@ -112,42 +112,49 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
 # ---------------------------------------------------------------------------
 
 BLOCK_M = 128  # A rows per MMA instruction per CTA (256 per CTA pair)  [Cake L48]
-BLOCK_K = 64  # K elements per stage (128-byte swizzle rows)  [Cake L54]
+BLOCK_K = 64  # K elements per stage (128-byte swizzle rows)  [Cake L58]
 PANEL_BYTES = (
     BLOCK_K * 128
-)  # one MN-major B panel: 64 K rows x 128 B = 8192  [Cake L56]
-CTA_GROUP = 2  # CTAs per cluster / MMA pair  [Cake L55]
-EPI_WARPS = 8  # [Cake L63]
-WORK_STAGES = 4  # cluster-launch-control work-ring depth  [Cake L64]
-GROUP_M = 16  # CTA row tiles per raster group (even: the two CTAs of a pair are the row halves of one 256-row tile)  [Cake L65]
-SLOT_BYTES = 32 * 128  # one epilogue staging slot (TMA-store epilogue)  [Cake L88]
-SK_MIN_ITERS = 8  # stream-K: fewest K steps per unit  [Cake L68]
-K_TMA_BF16 = 1024  # bf16 rows with K at or below this: TMA-store epilogue  [Cake L93]
-K_TWO_SLOTS = 0  # K at or below this: two staging slots per warp (off)  [Cake L94]
+)  # one MN-major B panel: 64 K rows x 128 B = 8192  [Cake L60]
+CTA_GROUP = 2  # CTAs per cluster / MMA pair  [Cake L59]
+EPI_WARPS = 8  # [Cake L67]
+WORK_STAGES = 4  # cluster-launch-control work-ring depth  [Cake L68]
+GROUP_M = 16  # CTA row tiles per raster group (even: the two CTAs of a pair are the row halves of one 256-row tile)  [Cake L69]
+SLOT_BYTES = 32 * 128  # one epilogue staging slot (TMA-store epilogue)  [Cake L95]
+SK_MIN_ITERS = 8  # stream-K: fewest K steps per unit  [Cake L72]
+K_TMA_BF16 = 1024  # bf16 rows with K at or below this: TMA-store epilogue  [Cake L103]
+K_TWO_SLOTS = 0  # K at or below this: two staging slots per warp (off)  [Cake L104]
 # Stream-K slice counters: the real counters of the tail tiles use [0, tail_tiles * 16); lanes 1..31
 # of a fixup warp fetch-add 0 to private dummy counters at SK_DUMMY_BASE + slice * 32 + lane (slice <
 # 16), so the host asserts tail_tiles * 16 <= SK_DUMMY_BASE and allocates at least
-# SK_DUMMY_BASE + 16 * 32 = 4608 counters (the Cake host allocates max(8192, tail_tiles * 16)).  [Cake L105-L106]
+# SK_DUMMY_BASE + 16 * 32 = 4608 counters (the Cake host allocates max(8192, tail_tiles * 16)).  [Cake L116, L122]
 SK_DUMMY_BASE = 4096
 SK_COUNTERS_MIN = (
-    8192  # ``_sk_counters``: zeros of max(8192, needed) u32  [Cake L1027-L1034]
+    8192  # ``_sk_counters``: zeros of max(8192, needed) u32  [Cake L1395-L1402]
 )
-SMEM_OPT_IN_BYTES = 232448  # 227 KiB dynamic shared memory opt-in  [Cake L711]
+SMEM_OPT_IN = 232448  # 227 KiB dynamic shared memory opt-in per CTA (every architecture)  [Cake L117]
+# CUDA 13.4 oversized shared-memory mode (launch attribute ALLOW_OVERSIZED; the Cake runtime's host shim enables
+# it when a kernel exceeds the standard opt-in): per-architecture ceiling (R200: 334848 B) minus 512 B of headroom.
+# Round 9: deeper pipelines on sm_107a.  [Cake L121]
+SMEM_OVERSIZED = {"sm_107a": 334848 - 512}
 L2_PROMOS = (
     "none",
     "l2_64b",
     "l2_128b",
     "l2_256b",
-)  # TMA descriptor L2 promotion  [Cake L621]
+)  # TMA descriptor L2 promotion  [Cake L772]
 L2_HINTS = (
     "none",
     "evict_normal",
     "evict_first",
     "evict_last",
-)  # TMA load L2 eviction policy  [Cake L622]
-EPI_MODES = ("reg", "tma")  # [Cake L626]
-BLOCK_N_CHOICES = (128, 192, 256)
-CTA_ROWS_CHOICES = (128, 256)
+)  # TMA load L2 eviction policy  [Cake L773]
+EPI_MODES = ("reg", "tma")  # [Cake L785]
+# Round 9 adds BLOCK_N = 160 / 224 (wave-quantization fits: BLOCK_N / 2 must be a multiple of 16 so every warp
+# slice is whole 16-column store chunks) and the 64-row Layout-B tile family (tcgen05 M=128 cta_group::2 pair
+# tiles, four TMEM buffers; symbol suffix ``_m64``).  [Cake L775-L776]
+BLOCK_N_CHOICES = (128, 160, 192, 224, 256)
+CTA_ROWS_CHOICES = (64, 128, 256)
 
 # ---------------------------------------------------------------------------
 # K2 tile configuration (mirror of the Cake router kernel module's constants)
@@ -201,7 +208,7 @@ def device_sm_count(device: torch.device) -> int:
 
 
 def sm_pairs(sm_count: int) -> int:
-    """CTA pairs the persistent grid can hold at once (one pair per two SMs).  [Cake ``_sm_pairs`` L997-L1006]"""
+    """CTA pairs the persistent grid can hold at once (one pair per two SMs).  [Cake ``_sm_pairs`` L1365-L1371]"""
     return max(1, int(sm_count) // CTA_GROUP)
 
 
@@ -212,7 +219,7 @@ def device_l2_bytes(device: torch.device) -> int:
     """L2 size of ``device`` from the driver (no per-SKU table): resolves the hint working-set
     gate exactly as the Cake host's ``_l2_bytes`` does (``torch.cuda.get_device_properties``
     ``L2_cache_size``, falling back to ``cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)``).
-    [Cake ``_l2_bytes`` L1009-L1024]"""
+    [Cake ``_l2_bytes`` L1377-L1392]"""
     key = str(device)
     if key not in _L2_BYTES:
         l2 = getattr(torch.cuda.get_device_properties(device), "L2_cache_size", None)
@@ -244,18 +251,27 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
+def epi_cols(block_n: int, cta_rows: int = 128) -> int:
+    """Accumulator columns per epilogue warp slice: BLOCK_N / 2 (two warps per lane quadrant split
+    the columns), or BLOCK_N / 4 for the 64-row Layout-B family (a quadrant holds one column half of
+    32 rows; its two warps split that half).  [Cake ``epi_cols`` L779-L782]"""
+    return block_n // 4 if cta_rows == 64 else block_n // 2
+
+
 def epi_mode(
     out_f32: bool,
     out_t: bool,
     K: Optional[int] = None,
     epi: Optional[str] = None,
     block_n: int = 256,
+    cta_rows: int = 128,
 ) -> str:
     """Epilogue of an instance: transposed output -> scalar register stores (``"reg"``);
-    row-major fp32 -> per-warp TMA stores (``"tma"``; the float4 register-store path is an
-    opt-in ``epi="reg"``, measured 1-10 % slower on every fp32 row); row-major bf16 -> TMA
-    stores for short K (epilogue-bound tiles), 32-byte register stores otherwise.
-    [Cake ``epi_mode`` L629-L643]"""
+    row-major fp32 -> per-warp TMA stores (``"tma"``) when the warp slice is whole 32-column
+    chunks (the float4 register-store path is an opt-in ``epi="reg"``, measured 1-10 % slower
+    on every fp32 row; a BLOCK_N = 160 / 224 or 64-row BLOCK_N = 192 slice has no TMA-store
+    path); row-major bf16 -> TMA stores for short K (epilogue-bound tiles) when the slice is
+    whole 64-column chunks, 32-byte register stores otherwise.  [Cake ``epi_mode`` L788-L805]"""
     if epi is not None:
         if epi not in EPI_MODES:
             raise ValueError(f"epi must be one of {EPI_MODES}, got {epi!r}")
@@ -265,11 +281,12 @@ def epi_mode(
     if out_t:
         return "reg"
     if out_f32:
-        return "tma"
-    # bf16 chunks are 64 columns: a 96-column (BLOCK_N = 192) warp slice has no whole-chunk TMA-store path
+        return "tma" if epi_cols(block_n, cta_rows) % 32 == 0 else "reg"
+    # bf16 chunks are 64 columns: a 96-column (BLOCK_N = 192) or 32-column (Layout B, BLOCK_N = 128) warp slice has
+    # no whole-chunk TMA-store path
     return (
         "tma"
-        if (K is not None and K <= K_TMA_BF16 and (block_n // 2) % 64 == 0)
+        if (K is not None and K <= K_TMA_BF16 and epi_cols(block_n, cta_rows) % 64 == 0)
         else "reg"
     )
 
@@ -280,13 +297,14 @@ def epi_slots(
     block_n: int,
     K: Optional[int] = None,
     slots: Optional[int] = None,
+    cta_rows: int = 128,
 ) -> int:
     """Staging slots per epilogue warp (0 without the TMA-store epilogue).  The chunk count
     per tile must be a multiple of the slot count so the round-robin rotation restarts at
-    slot 0 on every tile.  [Cake ``epi_slots`` L646-L659]"""
+    slot 0 on every tile.  [Cake ``epi_slots`` L808-L821]"""
     if epi != "tma":
         return 0
-    chunks = (block_n // 2) // (32 if out_f32 else 64)
+    chunks = epi_cols(block_n, cta_rows) // (32 if out_f32 else 64)
     if slots is None:
         slots = 2 if (K is None or K <= K_TWO_SLOTS) else 1
         if chunks % slots:
@@ -300,23 +318,43 @@ def epi_slots(
 
 
 def staging_bytes(slots: int) -> int:
-    # [Cake ``staging_bytes`` L662-L663]
+    # [Cake ``staging_bytes`` L824-L825]
     return EPI_WARPS * slots * SLOT_BYTES
 
 
 def b_stage_bytes(b_mn: bool, block_n: int) -> int:
     """Bytes of one B stage per CTA: K-major = ``BLOCK_N / 2`` 128-byte rows; MN-major = whole
     64-column panels (BLOCK_N = 192 loads two panels per stage, the MMA reads 1.5 of them).
-    [Cake ``b_stage_bytes``]"""
+    [Cake ``b_stage_bytes`` L828-L832]"""
     n_half = block_n // 2
     return (-(-n_half // 64)) * PANEL_BYTES if b_mn else n_half * BLOCK_K * 2
 
 
-def default_stages(slots: int, cta_rows: int = 128, block_n: int = 256) -> int:
+def smem_limit_for(arch: Optional[str]) -> int:
+    """Dynamic SMEM an instance may request on ``arch``: the 227 KiB opt-in, or the architecture's
+    oversized ceiling (``SMEM_OVERSIZED``).  ``None`` = the largest limit of any architecture
+    (instance keys rebuilt from an exported plan, which was validated with its own architecture's
+    limit).  [Cake ``smem_limit_for`` L835-L841]"""
+    if arch is None:
+        return max(SMEM_OPT_IN, *SMEM_OVERSIZED.values())
+    return SMEM_OVERSIZED.get(str(arch), SMEM_OPT_IN)
+
+
+def default_stages(
+    slots: int, cta_rows: int = 128, block_n: int = 256, b_mn: bool = False
+) -> int:
     """Mainloop stages that fit the 227 KiB opt-in with the epilogue staging: 32 KiB stages
     for 128-row tiles (24 KiB at BLOCK_N = 128, where the streaming-bound small-N rows are
     still latency-bound at 7 stages: 9 / 8 / 6 for 0 / 1 / 2 slots), 48 KiB stages for tall
-    (256-row) tiles.  [Cake ``default_stages`` L666-L674]"""
+    (256-row) tiles.  Layout-B tiles (64 rows: 24 KiB stages at BLOCK_N = 256, 16 KiB at 128)
+    take the deepest pipeline that fits beside the staging, at most 12 stages (round 9;
+    ``b_mn`` sizes the MN-major B panels).  [Cake ``default_stages`` L844-L857]"""
+    if cta_rows == 64:
+        stage = 64 * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n)
+        return max(
+            2,
+            min(12, (SMEM_OPT_IN - WORK_STAGES * 16 - staging_bytes(slots)) // stage),
+        )
     if cta_rows != 128:
         return (4, 4, 3)[slots]
     if block_n == 128:
@@ -332,7 +370,7 @@ def box_rows_of(
     cta_rows: int = 128,
 ) -> tuple[int, int]:
     """TMA box heights of the A and B operands: full height unless capped by ``box_rows``.
-    [Cake ``box_rows_of`` L677-L687]"""
+    [Cake ``box_rows_of`` L860-L870]"""
     a_full = BLOCK_K if a_mn else cta_rows
     b_full = BLOCK_K if b_mn else block_n // 2
     if box_rows is None:
@@ -365,11 +403,15 @@ def instance_key(
     group_m: int = 16,
     f32_v8: bool = False,
     quad_store: bool = False,
+    smem_limit: Optional[int] = None,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
-    promo, hints, group_m, f32_v8, quad_store)``.  Diagnostic (attribution) instances are not exported.
-    [Cake ``instance_key`` L690-L713]"""
+    promo, hints, group_m, f32_v8, quad_store)``.  ``smem_limit`` (bytes; default = the largest
+    architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
+    the key, so an instance has one symbol on every architecture (the planner passes
+    ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
+    exported.  [Cake ``instance_key`` L873-L905]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf, group_m = int(block_n), int(cta_rows), int(pf), int(group_m)
     if group_m < 2 or group_m % 2:
@@ -389,25 +431,35 @@ def instance_key(
     box_rows_of(a_mn, b_mn, block_n, box_rows or None, cta_rows)
     if block_n not in BLOCK_N_CHOICES:
         raise ValueError(f"BLOCK_N must be one of {BLOCK_N_CHOICES}, got {block_n}")
-    epi = epi_mode(out_f32, out_t, None, epi, block_n)
-    if epi == "tma" and (block_n // 2) % (32 if out_f32 else 64):
+    cols = epi_cols(block_n, cta_rows)
+    if cols % 16:
+        raise ValueError(
+            f"BLOCK_N={block_n} with CTA_ROWS={cta_rows} gives {cols}-column warp slices; "
+            "slices must be whole 16-column chunks"
+        )
+    epi = epi_mode(out_f32, out_t, None, epi, block_n, cta_rows)
+    if epi == "tma" and cols % (32 if out_f32 else 64):
         raise ValueError(
             f"the TMA-store epilogue needs whole 128-byte column chunks per warp; BLOCK_N={block_n} "
-            f"{'fp32' if out_f32 else 'bf16'} output needs epi='reg'"
+            f"CTA_ROWS={cta_rows} {'fp32' if out_f32 else 'bf16'} output needs epi='reg'"
         )
-    slots = epi_slots(epi, out_f32, block_n, None, slots)
-    stages = default_stages(slots, cta_rows, block_n) if stages is None else int(stages)
+    slots = epi_slots(epi, out_f32, block_n, None, slots, cta_rows)
+    stages = (
+        default_stages(slots, cta_rows, block_n, b_mn)
+        if stages is None
+        else int(stages)
+    )
     diag = tuple(sorted(set(diag)))
     if diag:
         raise ValueError(f"diagnostic instances are not exported: {diag}")
+    limit = smem_limit_for(None) if smem_limit is None else int(smem_limit)
     stage_bytes = cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n)
     if (
         stages < 2
-        or stages * stage_bytes + staging_bytes(slots) + WORK_STAGES * 16
-        > SMEM_OPT_IN_BYTES
+        or stages * stage_bytes + staging_bytes(slots) + WORK_STAGES * 16 > limit
     ):
         raise ValueError(
-            f"{stages} stages at BLOCK_N={block_n}, CTA_ROWS={cta_rows} exceed the 227 KiB SMEM opt-in"
+            f"{stages} stages at BLOCK_N={block_n}, CTA_ROWS={cta_rows} exceed the {limit} B dynamic SMEM limit"
         )
     return (
         a_mn,
@@ -433,18 +485,20 @@ def instance_key(
         and (not out_f32)
         and epi == "reg"
         and not out_t
-        # bf16 row-major register epilogue: quad-transposed 32-byte row segments (round 7)
-        and (block_n * 4 // 8) % 64 == 0,
+        # bf16 row-major register epilogue with whole 64-column groups per warp slice: quad-transposed
+        # 32-byte row segments (round 7)
+        and cols % 64 == 0,
     )
 
 
 def instance_symbol(key: tuple) -> str:
     """Kernel symbol / registry template of an instance key (``dense_proj_gemm_<a><b>_n<N>``
-    followed by ``_m256`` for tall tiles, ``_pf<n>`` for a prefetch distance, ``_<promo>`` for an
+    followed by ``_m256`` for tall tiles / ``_m64`` for the 64-row Layout-B family, ``_pf<n>`` for a
+    prefetch distance, ``_<promo>`` for an
     L2 promotion, ``_h<a><b>`` for non-default (A, B) eviction hints (first letters, e.g.
     ``_hen`` = A evict_first / B none), ``_g<n>`` for a non-default raster group, ``_f32``, ``_v8`` for the 256-bit fp32 register stores, ``_t``,
     ``_<epi><slots>`` for the TMA-store epilogue, ``_s<stages>`` for a non-default stage count and
-    ``_box<rows>``).  [Cake ``instance_symbol`` L716-L720]"""
+    ``_box<rows>``).  [Cake ``instance_symbol`` L908-L912]"""
     (
         a_mn,
         b_mn,
@@ -469,7 +523,7 @@ def instance_symbol(key: tuple) -> str:
         + ("n" if a_mn else "k")
         + ("n" if b_mn else "k")
         + f"_n{block_n}"
-        + ("_m256" if cta_rows == 256 else "")
+        + ("_m256" if cta_rows == 256 else "_m64" if cta_rows == 64 else "")
         + (f"_pf{pf}" if pf else "")
         + (f"_{promo}" if promo != "none" else "")
         + (f"_h{hints[0][0]}{hints[1][0]}" if hints != ("none", "none") else "")
@@ -479,7 +533,11 @@ def instance_symbol(key: tuple) -> str:
         + ("_q" if quad_store else "")
         + ("_t" if out_t else "")
         + (f"_{epi}{slots}" if epi != "reg" else "")
-        + (f"_s{stages}" if stages != default_stages(slots, cta_rows, block_n) else "")
+        + (
+            f"_s{stages}"
+            if stages != default_stages(slots, cta_rows, block_n, b_mn)
+            else ""
+        )
         + (f"_box{box_rows}" if box_rows else "")
         + "".join(f"_{d}" for d in diag)
     )
@@ -488,7 +546,7 @@ def instance_symbol(key: tuple) -> str:
 def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
     """Batched rows with M <= 256 and N >= 2 M (the MLA weight gradients: heads = batch, M = head
     dim, N = latent dim) are computed as the transposed GEMM ``out^T[l] = B[l]^T A[l]^T`` with the
-    transposed store.  [Cake ``swap_small_m``]"""
+    transposed store.  [Cake ``swap_small_m`` L1164-L1167]"""
     return L > 1 and not transposed_out and M <= 256 and N >= 2 * M
 
 
@@ -525,8 +583,8 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', True, True, False, False, False, 6144, None, 12288): {"cta_rows": 256, "group_m": 8},
     ('sm_100a', True, True, False, False, False, 12288, None, 6144): {"cta_rows": 256, "group_m": 8},
     ('sm_100a', True, True, False, False, False, 16384, None, 6144): {"cta_rows": 256, "group_m": 8},
-    ('sm_100a', True, True, False, True, False, 32, None, 6144): {"block_n": 128},
-    ('sm_100a', True, True, False, True, False, 128, None, 6144): {"block_n": 128},
+    ('sm_100a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "cta_rows": 64},
+    ('sm_100a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64},
     ('sm_100a', True, True, False, True, False, 576, None, 6144): {"hints": ('evict_first', 'evict_first')},
     ('sm_100a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256},
     ('sm_100a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256},
@@ -537,16 +595,18 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', True, True, True, False, False, 6144, None, 12288): {"cta_rows": 256},
     ('sm_100a', True, True, True, False, False, 12288, None, 6144): {"cta_rows": 256},
     ('sm_100a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
-    ('sm_100a', True, True, True, True, False, 32, None, 6144): {"block_n": 128},
-    ('sm_100a', True, True, True, True, False, 128, None, 6144): {"block_n": 128},
+    ('sm_100a', True, True, True, True, False, 32, None, 6144): {"block_n": 128, "cta_rows": 64},
+    ('sm_100a', True, True, True, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64},
     ('sm_100a', True, True, True, True, False, 576, None, 6144): {"hints": ('evict_first', 'evict_first')},
+    ('sm_107a', False, False, False, False, False, 32, 6144, None): {"promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, False, 576, 6144, None): {"cta_rows": 256, "hints": ('evict_first', 'none'), "stages": 5},
+    ('sm_107a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256},
     ('sm_107a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
     ('sm_107a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, True, 512, 256, None): {"promo": 'l2_256b'},
-    ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 256},
-    ('sm_107a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 256, "block_n": 128},
+    ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 128, "slots": 2},
+    ('sm_107a', False, True, False, False, False, 6144, 128, None): {"block_n": 128, "cta_rows": 256},
     ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "quad_store": True},
     ('sm_107a', False, True, False, False, False, 12288, 6144, None): {"hints": ('none', 'evict_first')},
     ('sm_107a', False, True, False, False, False, 16384, 6144, None): {"cta_rows": 256, "group_m": 8},
@@ -558,28 +618,26 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 2048, 16384, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', False, True, True, False, False, 6144, 32, None): {"block_n": 128},
     ('sm_107a', False, True, True, False, False, 6144, 128, None): {"block_n": 128},
+    ('sm_107a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b'},
     ('sm_107a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 12288, 6144, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 16384, 6144, None): {"cta_rows": 256},
-    ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 128, "sk_parts": 2, "group_m": 4},
+    ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "group_m": 4, "sk_parts": 2},
     ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "sk_parts": 3},
-    ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "sk_parts": 3},
+    ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_parts": 3},
     ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
     ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first')},
     ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first')},
-    ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"sk_parts": 3},
+    ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "sk_parts": 3},
     ('sm_107a', True, True, True, False, False, 2048, None, 6144): {"cta_rows": 256},
     ('sm_107a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', True, True, True, False, False, 6144, None, 2048): {"cta_rows": 256},
     ('sm_107a', True, True, True, False, False, 6144, None, 12288): {"epi": 'reg', "f32_v8": True},
     ('sm_107a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
     ('sm_107a', True, True, True, True, False, 32, None, 6144): {"block_n": 128, "sk_parts": 3},
-    ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128, "sk_parts": 3},
+    ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_parts": 3},
     ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
-    ('sm_107a', False, False, False, False, False, 32, 6144, None): {"promo": 'l2_256b'},
-    ('sm_107a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b'},
-    ('sm_107a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256},
 }
 # fmt: on
 
@@ -596,7 +654,7 @@ def row_rule(
     M: int,
 ) -> dict:
     """The measured knob overrides of one row identity: the exact (N, K, M) rule, else the
-    ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else empty.  [Cake ``row_rule``]"""
+    ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else empty.  [Cake ``row_rule`` L1153-L1161]"""
     ident = (arch, bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t), bool(batched))
     for tail in (
         (int(N), int(K), int(M)),
@@ -612,7 +670,7 @@ def row_rule(
 def default_block_n(N: int, b_mn: bool) -> int:
     """256 columns per CTA pair unless the whole output fits a 128-column tile; 192 when N is a
     multiple of 192 but not of 256 (N = 576: three exact 192-column tiles instead of
-    256 + 256 + 64; N = 192: one exact tile).  [Cake ``default_block_n``]"""
+    256 + 256 + 64; N = 192: one exact tile).  [Cake ``default_block_n`` L1170-L1176]"""
     if N <= 128:
         return 128
     return 192 if (N % 192 == 0 and N % 256 != 0) else 256
@@ -620,13 +678,13 @@ def default_block_n(N: int, b_mn: bool) -> int:
 
 def default_pf(M: int, N: int, K: int) -> int:
     """Rolling L2 prefetch distance in K steps (0 = off; selected per row class by measurement).
-    [Cake ``default_pf`` L844-L846]"""
+    [Cake ``default_pf`` L1179-L1181]"""
     return 0
 
 
 def default_promo(m_tiles: int, n_tiles: int) -> str:
     """TMA descriptor L2 promotion of the operands (``"none"``; selected by measurement).
-    [Cake ``default_promo`` L849-L851]"""
+    [Cake ``default_promo`` L1184-L1186]"""
     return "none"
 
 
@@ -635,7 +693,7 @@ def wave_working_set(
 ) -> int:
     """Bytes of A and B panels touched by one wave of CTA pairs: with ``group_m`` row tiles per
     raster group a wave covers ``rows`` pair-row panels (256 x K) and ``cols`` column panels
-    (K x 256) of one batch entry.  [Cake ``wave_working_set`` L854-L866]"""
+    (K x 256) of one batch entry.  [Cake ``wave_working_set`` L1189-L1201]"""
     m_pairs = max(1, m_tiles // CTA_GROUP)
     g = max(1, group_m // CTA_GROUP)
     band = g * n_tiles  # pair tiles per raster group
@@ -664,7 +722,7 @@ def default_hints(
     hints on the weight-gradient class measured 0..-4 percent in the production stream-K
     configuration and are not applied; ``a_mn`` / ``b_mn`` stay in the signature so a
     layout-class rule can be re-added without touching the call site.
-    [Cake ``default_hints`` L869-L881]"""
+    [Cake ``default_hints`` L1204-L1216]"""
     if wave_working_set(m_tiles, n_tiles, k_len, group_m, pairs) <= l2_bytes:
         return ("none", "none")
     if n_tiles == 1:
@@ -679,13 +737,15 @@ def default_group_m(
     on every projection row; small groups cost 3..30 percent on the many-wave rows).  A 4-row
     group for one-to-two-wave weight-gradient rows measured 0..+2 percent in the production
     configuration and is not applied.  The knob stays per instance.
-    [Cake ``default_group_m`` L884-L889]"""
+    [Cake ``default_group_m`` L1219-L1224]"""
     return 16
 
 
 def default_cta_rows(M: int, N: int, K: int) -> int:
-    """Output rows per CTA (128 = double-buffered TMEM tiles; 256 is selected per row by
-    measurement).  [Cake ``default_cta_rows`` L892-L895]"""
+    """Output rows per CTA: 128 (double-buffered TMEM tiles) by default; 256 (two MMAs per K step
+    sharing the B stage) and 64 (round 9: 128 x BLOCK_N pair tiles through the M=128 cta_group::2
+    MMA, four TMEM buffers, 24 KiB stages) are selected per row by measurement.
+    [Cake ``default_cta_rows`` L1227-L1231]"""
     return 128
 
 
@@ -695,7 +755,7 @@ def sk_parts_plan(
     """``(sk, sk_max_units)`` for a measured ``sk_parts`` row rule: the tail tiles (the whole
     problem when it is one partial wave) are split ``parts`` ways when ``parts * tail`` units
     fit the CTA pairs and every unit keeps at least ``SK_MIN_ITERS`` K steps; otherwise the row
-    keeps the ``auto`` policy.  [Cake ``sk_parts_plan``]"""
+    keeps the ``auto`` policy.  [Cake ``sk_parts_plan`` L1405-L1412]"""
     tail = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
     if (
         parts < 2
@@ -729,7 +789,7 @@ def stream_k_plan(
       steps; no stream-K when that cannot create more units than tail tiles.
     * ``sk="tiles"``: diagnostic -- the tail tiles go through the unit path as whole tiles.
 
-    [Cake ``stream_k_plan`` L1037-L1066]"""
+    [Cake ``stream_k_plan`` L1415-L1444]"""
     if not sk or pair_tiles == 0:
         return pair_tiles, 0, 0, k_blocks
     tail = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
@@ -761,7 +821,7 @@ def stream_k_plan(
 
 
 def as_batched(t: torch.Tensor, name: str) -> torch.Tensor:
-    # [Cake ``_as_batched`` L812-L817]
+    # [Cake ``_as_batched`` L1019-L1024]
     if t.dim() == 2:
         return t.unsqueeze(0)
     if t.dim() == 3:
@@ -774,7 +834,7 @@ def operand_view(
 ) -> tuple[bool, torch.Tensor]:
     """Classify a ``[L, rows, cols]`` matrix view as K-major (contraction axis contiguous) or
     MN-major and return ``(mn_major, desc)`` with ``desc`` the ``[L, outer, inner]`` view
-    (inner stride 1) the TMA descriptor spans.  [Cake ``_operand_view`` L820-L836]"""
+    (inner stride 1) the TMA descriptor spans.  [Cake ``_operand_view`` L1027-L1043]"""
     mn_axis = 3 - k_axis  # the other matrix axis (1 or 2)
     if t.stride(k_axis) == 1:
         mn_major = False
@@ -897,6 +957,7 @@ def plan_dense_projection_gemm(
     cta_rows: Optional[int] = None,
     pf: Optional[int] = None,
     sk_max_units: Optional[int] = None,
+    sk_parts: Optional[int] = None,
     promo: Optional[str] = None,
     hints: Optional[tuple] = None,
     group_m: Optional[int] = None,
@@ -913,7 +974,10 @@ def plan_dense_projection_gemm(
     through the L2).  Returns ``(plan, a_desc, b_desc, out3)`` with the ``[L, outer, inner]``
     operand views the TMA descriptors span and the batched output view.  The knob defaults
     (``sk="auto"``, ``pf`` / ``promo`` / ``group_m`` / ``hints`` from ``default_*``, resolved in
-    the launcher's order) are the launcher's.  [Cake ``dense_projection_gemm`` L898-L990]
+    the launcher's order) are the launcher's; a caller-forced ``cta_rows`` outside the row's
+    rule (or default) family drops the rule's ``block_n`` / ``stages`` / ``slots`` / ``epi``, ``sk_parts`` is a
+    caller knob over the rule's, and the stage count is bounded by ``smem_limit_for(arch)``.
+    [Cake ``dense_projection_gemm`` L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
     the swapped instance on demand, while this package can only launch the generated programs registered for
@@ -932,6 +996,7 @@ def plan_dense_projection_gemm(
         cta_rows=cta_rows,
         pf=pf,
         sk_max_units=sk_max_units,
+        sk_parts=sk_parts,
         promo=promo,
         hints=hints,
         group_m=group_m,
@@ -991,10 +1056,15 @@ def plan_dense_projection_gemm(
         if _use_rules
         else {}
     )
-    if block_n is None:
-        block_n = rule.get("block_n", default_block_n(N, b_mn))
     if cta_rows is None:
         cta_rows = rule.get("cta_rows", default_cta_rows(M, N, K))
+    elif int(cta_rows) != rule.get("cta_rows", default_cta_rows(M, N, K)):
+        # A caller-forced tile family (sweeps, the registrations of the tall / 64-row families): the rule's knobs
+        # that belong to its own family (tile width, stage count, staging slots, epilogue mode) do not carry over
+        # (a 160-column rule of the 256-row family is not a valid 64-row tile).  [Cake L1271-L1279]
+        rule = {k: v for k, v in rule.items() if k not in ("block_n", "stages", "slots", "epi")}
+    if block_n is None:
+        block_n = rule.get("block_n", default_block_n(N, b_mn))
     if stages is None:
         stages = rule.get("stages")
     if epi is None:
@@ -1013,11 +1083,11 @@ def plan_dense_projection_gemm(
     k_blocks = _ceil_div(K, BLOCK_K)
     pair_tiles = L * (m_tiles // CTA_GROUP) * n_tiles
     pairs = sm_pairs(sm_count)
-    if sk == "auto" and sk_max_units is None and "sk_parts" in rule:
-        # Measured per-row p-way split of the tail wave (Cake round 4, L20).  [Cake L1159-L1163]
-        sk, sk_max_units = sk_parts_plan(
-            pair_tiles, k_blocks, pairs, int(rule["sk_parts"])
-        )
+    parts = rule.get("sk_parts") if sk_parts is None else int(sk_parts)
+    if sk == "auto" and sk_max_units is None and parts:
+        # Measured per-row p-way split of the tail wave (Cake round 4, L20); a caller ``sk_parts`` wins over the
+        # rule's.  [Cake L1296-L1301]
+        sk, sk_max_units = sk_parts_plan(pair_tiles, k_blocks, pairs, int(parts))
     num_full, tail_tiles, sk_units, iters_per_unit = stream_k_plan(
         pair_tiles, k_blocks, pairs, sk, sk_max_units
     )
@@ -1026,8 +1096,8 @@ def plan_dense_projection_gemm(
             f"dense_projection_gemm: {tail_tiles} stream-K tail tiles exceed the {SK_DUMMY_BASE // 16} slice-counter budget"
         )
     out_f32 = out.dtype == torch.float32
-    mode = epi_mode(out_f32, transposed_out, K, epi, block_n)
-    nslots = epi_slots(mode, out_f32, block_n, K, slots)
+    mode = epi_mode(out_f32, transposed_out, K, epi, block_n, cta_rows)
+    nslots = epi_slots(mode, out_f32, block_n, K, slots, cta_rows)
     if pf is None:
         pf = rule.get("pf", default_pf(M, N, K))
     if promo is None:
@@ -1061,6 +1131,7 @@ def plan_dense_projection_gemm(
         group_m=group_m,
         f32_v8=f32_v8,
         quad_store=quad_store,
+        smem_limit=smem_limit_for(arch),
     )
     plan = GemmPlan(
         L=L,
@@ -1338,6 +1409,7 @@ def prepare_dense_projection_gemm(
     cta_rows: Optional[int] = None,
     pf: Optional[int] = None,
     sk_max_units: Optional[int] = None,
+    sk_parts: Optional[int] = None,
     promo: Optional[str] = None,
     hints: Optional[tuple] = None,
     group_m: Optional[int] = None,
@@ -1371,6 +1443,7 @@ def prepare_dense_projection_gemm(
         cta_rows=cta_rows,
         pf=pf,
         sk_max_units=sk_max_units,
+        sk_parts=sk_parts,
         promo=promo,
         hints=hints,
         group_m=group_m,
@@ -1473,7 +1546,7 @@ def wgrad_views(
     """``(A, B, transposed_out)`` of the weight gradient ``G[T, N].T @ X[T, K] -> dW[N, K]``:
     when ``wgrad_swapped`` the swapped GEMM ``X.T @ G`` runs with the transposed store (the
     result lands directly in ``[N, K]``), otherwise ``G.T @ X``.
-    [Cake ``projection_wgrad`` / ``wgrad_swapped``]"""
+    [Cake ``projection_wgrad`` L1507-L1518 / ``wgrad_swapped`` L1496-L1504]"""
     N, K = int(G.shape[1]), int(X.shape[1])
     if wgrad_swapped(N, K):
         return X.t(), G, True
@@ -1484,7 +1557,7 @@ def wgrad_swapped(N: int, K: int) -> bool:
     """Orientation of the weight gradient: swapped when its padded tile work is smaller than the
     direct route's (256-row tiles padded from N rows and ``default_block_n`` column tiles over K,
     against 256-row tiles over K and column tiles padded from N): N < 256 and N = 576 swap.
-    [Cake ``wgrad_swapped``]"""
+    [Cake ``wgrad_swapped`` L1496-L1504]"""
     bk, bn = default_block_n(K, True), default_block_n(N, True)
     direct = _ceil_div(N, 256) * 256 * _ceil_div(K, bk) * bk
     swapped = _ceil_div(K, 256) * 256 * _ceil_div(N, bn) * bn

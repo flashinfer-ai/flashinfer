@@ -23,11 +23,14 @@ import torch
 from flashinfer.experimental.dense_projection_gemm import cake_backend, cake_jit
 from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     BLOCK_K,
+    BLOCK_N_CHOICES,
     CTA_GROUP,
+    CTA_ROWS_CHOICES,
     ROUTER_SPLITS,
     ROW_RULES,
     SK_DUMMY_BASE,
     SK_MIN_ITERS,
+    SMEM_OPT_IN,
     SUPPORTED_COMPUTE_CAPABILITIES,
     bind_launch,
     default_block_n,
@@ -35,6 +38,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     default_hints,
     default_stages,
     device_l2_bytes,
+    epi_cols,
     epi_mode,
     epi_slots,
     generated_program_available,
@@ -49,6 +53,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     router_layout_class,
     row_rule,
     sk_parts_plan,
+    smem_limit_for,
     split_fp32_to_bf16x3_,
     stream_k_plan,
     swap_small_m,
@@ -626,6 +631,35 @@ def test_epilogue_rules():
     )  # any K above K_TWO_SLOTS = 0: one slot
     with pytest.raises(ValueError, match="slots"):
         epi_slots("tma", False, 128, slots=3)
+    # round 9: the warp slice is BLOCK_N / 2 columns, BLOCK_N / 4 on the 64-row Layout-B family
+    assert BLOCK_N_CHOICES == (128, 160, 192, 224, 256) and CTA_ROWS_CHOICES == (
+        64,
+        128,
+        256,
+    )
+    assert [epi_cols(n) for n in BLOCK_N_CHOICES] == [64, 80, 96, 112, 128]
+    assert [epi_cols(n, 64) for n in BLOCK_N_CHOICES] == [32, 40, 48, 56, 64]
+    assert epi_cols(256, 256) == 128
+    # fp32: TMA stores only for whole 32-column slices (160 / 224 and the 64-row 192 fall back to registers)
+    assert epi_mode(True, False, block_n=192) == "tma"
+    assert epi_mode(True, False, block_n=160) == "reg"
+    assert epi_mode(True, False, block_n=224) == "reg"
+    assert epi_mode(True, False, block_n=192, cta_rows=64) == "reg"
+    assert epi_mode(True, False, block_n=128, cta_rows=64) == "tma"
+    # bf16: whole 64-column slices only (192 / 160 / 224 and the 64-row 128 have none)
+    assert epi_mode(False, False, K=1024, block_n=192) == "reg"
+    assert epi_mode(False, False, K=1024, block_n=160) == "reg"
+    assert epi_mode(False, False, K=1024, block_n=256, cta_rows=64) == "tma"
+    assert epi_mode(False, False, K=1024, block_n=128, cta_rows=64) == "reg"
+    assert epi_mode(False, False, K=1024, block_n=128, cta_rows=256) == "tma"
+    assert (
+        epi_slots("tma", False, 256, K=64, cta_rows=64) == 1
+    )  # one 64-column chunk per 64-row slice
+    assert (
+        epi_slots("tma", True, 128, cta_rows=64) == 1
+    )  # one 32-column chunk: the two-slot default falls back to one
+    with pytest.raises(ValueError, match="slots"):
+        epi_slots("tma", False, 256, slots=2, cta_rows=64)
 
 
 @pytest.mark.parametrize(
@@ -770,6 +804,36 @@ def test_epilogue_rules():
             dict(a_mn=False, b_mn=False, promo="l2_256b", epi="reg", quad_store=True),
             "dense_proj_gemm_kk_n256_l2_256b_q",
         ),
+        # round 9: the 64-row Layout-B family (``_m64``); its default is the deepest pipeline that fits
+        # (9 at BLOCK_N = 256): 9 carries no suffix, 6 does
+        (dict(a_mn=False, b_mn=False, cta_rows=64), "dense_proj_gemm_kk_n256_m64"),
+        (dict(a_mn=False, b_mn=True, cta_rows=64), "dense_proj_gemm_kn_n256_m64"),
+        (
+            dict(a_mn=False, b_mn=False, cta_rows=64, stages=9),
+            "dense_proj_gemm_kk_n256_m64",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, cta_rows=64, stages=6),
+            "dense_proj_gemm_kk_n256_m64_s6",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, cta_rows=64, epi="tma", slots=1),
+            "dense_proj_gemm_kk_n256_m64_tma1",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, block_n=128, cta_rows=64, out_f32=True),
+            "dense_proj_gemm_kk_n128_m64_f32_tma1",
+        ),
+        # BLOCK_N = 160 / 224 and the 64-row BLOCK_N = 192: register epilogues (no whole 32 / 64-column chunks)
+        (dict(a_mn=False, b_mn=False, block_n=160), "dense_proj_gemm_kk_n160"),
+        (
+            dict(a_mn=False, b_mn=True, block_n=224, out_f32=True),
+            "dense_proj_gemm_kn_n224_f32",
+        ),
+        (
+            dict(a_mn=False, b_mn=True, block_n=192, cta_rows=64, out_f32=True),
+            "dense_proj_gemm_kn_n192_m64_f32",
+        ),
     ],
 )
 def test_instance_symbols(kwargs, symbol):
@@ -798,6 +862,25 @@ def test_quad_store_knob_normalisation():
         instance_key(a_mn=False, b_mn=True, block_n=128, epi="reg", quad_store=True)[16]
         is True
     )
+    # whole 64-column groups per warp slice: not at BLOCK_N = 160 / 192 / 224 (80 / 96 / 112 columns) nor on
+    # 64-row tiles below BLOCK_N = 256
+    for block_n in (160, 192, 224):
+        assert (
+            instance_key(
+                a_mn=False, b_mn=True, block_n=block_n, epi="reg", quad_store=True
+            )[16]
+            is False
+        )
+    assert (
+        instance_key(a_mn=False, b_mn=True, cta_rows=64, epi="reg", quad_store=True)[16]
+        is True
+    )
+    assert (
+        instance_key(
+            a_mn=False, b_mn=True, block_n=128, cta_rows=64, epi="reg", quad_store=True
+        )[16]
+        is False
+    )
     assert (
         instance_symbol(
             instance_key(
@@ -816,10 +899,22 @@ def test_default_stages_by_tile_shape():
     assert [default_stages(s, 256, 256) for s in (0, 1, 2)] == [4, 4, 3]
     assert [default_stages(s, 256, 128) for s in (0, 1, 2)] == [4, 4, 3]
     assert default_stages(0) == 7 and default_stages(1) == 6
+    assert default_stages(0, 128, 160) == 7 and default_stages(1, 128, 224) == 6
+    # 64-row Layout-B tiles (round 9): the deepest pipeline that fits the 227 KiB opt-in beside the staging
+    # (32 KiB per slot), at most 12: 24 KiB stages at BLOCK_N = 256, 16 KiB at 128, 20 KiB at K-major 192
+    # (MN-major B streams two whole 64-column panels there: 24 KiB)
+    assert [default_stages(s, 64, 256) for s in (0, 1, 2)] == [9, 8, 6]
+    assert [default_stages(s, 64, 128) for s in (0, 1, 2)] == [12, 12, 10]
+    assert [default_stages(s, 64, 192) for s in (0, 1, 2)] == [11, 9, 8]
+    assert [default_stages(s, 64, 192, b_mn=True) for s in (0, 1, 2)] == [9, 8, 6]
+    assert [default_stages(s, 64, 256, b_mn=True) for s in (0, 1, 2)] == [9, 8, 6]
     # the default stage count carries no symbol suffix; anything else does
     assert instance_key(a_mn=False, b_mn=False, block_n=128)[5] == 9
     assert instance_key(a_mn=False, b_mn=False, block_n=128, epi="tma", slots=1)[5] == 8
     assert instance_key(a_mn=False, b_mn=False, cta_rows=256)[5] == 4
+    assert instance_key(a_mn=False, b_mn=False, cta_rows=64)[5] == 9
+    assert instance_key(a_mn=False, b_mn=False, block_n=128, cta_rows=64)[5] == 12
+    assert instance_key(a_mn=False, b_mn=True, block_n=192, cta_rows=64)[5] == 9
 
 
 def test_wave_working_set_and_hint_rule():
@@ -901,13 +996,40 @@ def test_instance_key_rejects_bad_configurations():
     with pytest.raises(ValueError, match="BLOCK_N"):
         instance_key(a_mn=False, b_mn=False, block_n=64)
     with pytest.raises(ValueError, match="cta_rows"):
-        instance_key(a_mn=False, b_mn=False, cta_rows=64)
+        instance_key(a_mn=False, b_mn=False, cta_rows=32)
+    # a warp slice must be whole 16-column chunks: BLOCK_N = 160 / 224 have none on 64-row tiles (40 / 56 columns)
+    with pytest.raises(ValueError, match="16-column"):
+        instance_key(a_mn=False, b_mn=False, block_n=160, cta_rows=64)
+    with pytest.raises(ValueError, match="16-column"):
+        instance_key(a_mn=False, b_mn=False, block_n=224, cta_rows=64)
+    # a forced TMA-store epilogue needs whole 128-byte chunks per warp (64 bf16 / 32 fp32 columns)
+    with pytest.raises(ValueError, match="epi='reg'"):
+        instance_key(a_mn=False, b_mn=False, block_n=192, cta_rows=64, epi="tma")
+    with pytest.raises(ValueError, match="epi='reg'"):
+        instance_key(a_mn=False, b_mn=False, block_n=160, out_f32=True, epi="tma")
+    # the stage bound defaults to the largest architecture limit (sm_107a's 334336 B oversized mode): eight
+    # 32 KiB stages fit there, eleven do not; the planner passes its architecture's limit (the 227 KiB opt-in on
+    # sm_100a / sm_103a), where eight do not.  The limit is not part of the key.
+    assert smem_limit_for(None) == smem_limit_for("sm_107a") == 334848 - 512
+    assert (
+        smem_limit_for("sm_100a") == smem_limit_for("sm_103a") == SMEM_OPT_IN == 232448
+    )
+    assert instance_key(a_mn=False, b_mn=False, stages=8)[5] == 8
+    assert instance_key(a_mn=False, b_mn=False, stages=8) == instance_key(
+        a_mn=False, b_mn=False, stages=8, smem_limit=smem_limit_for("sm_107a")
+    )
     with pytest.raises(ValueError, match="SMEM"):
-        instance_key(a_mn=False, b_mn=False, stages=8)
+        instance_key(a_mn=False, b_mn=False, stages=11)
     with pytest.raises(ValueError, match="SMEM"):
         instance_key(
-            a_mn=False, b_mn=False, block_n=128, stages=10
-        )  # 9 is the deepest 24 KiB pipeline
+            a_mn=False, b_mn=False, stages=8, smem_limit=smem_limit_for("sm_100a")
+        )
+    with pytest.raises(ValueError, match="SMEM"):
+        instance_key(
+            a_mn=False, b_mn=False, block_n=128, stages=10, smem_limit=SMEM_OPT_IN
+        )  # 9 is the deepest 24 KiB pipeline in the opt-in
+    with pytest.raises(ValueError, match="SMEM"):
+        instance_key(a_mn=False, b_mn=False, cta_rows=64, stages=14)
     with pytest.raises(ValueError, match="diagnostic"):
         instance_key(a_mn=False, b_mn=False, diag=("no_mma",))
     with pytest.raises(ValueError, match="promo"):
@@ -1211,7 +1333,8 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     plan.group_m == 16
                 )  # raster-group suffix only away from the default ("_gemm" is not one)
                 assert plan.stages == rule.get(
-                    "stages", default_stages(plan.slots, plan.cta_rows, plan.block_n)
+                    "stages",
+                    default_stages(plan.slots, plan.cta_rows, plan.block_n, plan.b_mn),
                 )
                 if "stages" not in rule and plan.cta_rows == 128:
                     assert (
@@ -1591,6 +1714,45 @@ def test_batched_small_m_swap_and_row_rules():
             cta_rows=128,
         )
         assert pinned.cta_rows == 128 and pinned.group_m == 8
+        # a caller-forced tile family (round 9) keeps the rule's other knobs but drops the family-bound ones
+        # (stages, slots, epi); the 64-row Layout-B family plans like any other
+        ROW_RULES.clear()
+        ROW_RULES[ident + (M, None, N)] = {
+            "cta_rows": 256,
+            "group_m": 8,
+            "stages": 3,
+            "epi": "reg",
+        }
+        ruled, *_ = plan_dense_projection_gemm(
+            Q.permute(1, 2, 0),
+            dL.permute(1, 0, 2),
+            out,
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+            _fallback=False,
+            arch="sm_100a",
+        )
+        assert (ruled.cta_rows, ruled.stages, ruled.group_m) == (256, 3, 8)
+        assert ruled.template == "dense_proj_gemm_nn_n192_m256_g8_t_s3"
+        for rows, template in (
+            (128, "dense_proj_gemm_nn_n192_g8_t"),
+            (64, "dense_proj_gemm_nn_n192_m64_g8_t"),
+        ):
+            forced, *_ = plan_dense_projection_gemm(
+                Q.permute(1, 2, 0),
+                dL.permute(1, 0, 2),
+                out,
+                sm_count=148,
+                l2_bytes=L2_BYTES,
+                _fallback=False,
+                arch="sm_100a",
+                cta_rows=rows,
+            )
+            assert (forced.cta_rows, forced.group_m, forced.epi) == (rows, 8, "reg")
+            assert forced.stages == default_stages(
+                forced.slots, rows, forced.block_n, forced.b_mn
+            )
+            assert forced.template == template
     finally:
         ROW_RULES.clear()
         ROW_RULES.update(saved)
@@ -1715,6 +1877,23 @@ def test_sk_parts_rule(pairs):
                 48,
             )
         )  # sm_100a has no sk_parts rule: its 128-wide tiles keep the auto two-way split
+        forced = plan_dense_projection_gemm(
+            v["A"],
+            v["B"],
+            v["out"],
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+            transposed_out=v["transposed"],
+            arch="sm_100a",
+            _fallback=False,
+            sk_parts=3,
+        )[0]
+        assert (
+            forced.pair_tiles,
+            forced.tail_tiles,
+            forced.sk_units,
+            forced.iters_per_unit,
+        ) == (24, 24, 72, 85)  # ... unless the caller passes ``sk_parts`` (round 9)
 
 
 def test_f32_v8_symbol_only_on_the_fp32_register_epilogue():
