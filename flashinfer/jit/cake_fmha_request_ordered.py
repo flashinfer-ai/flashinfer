@@ -107,7 +107,7 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
     _require(payload.get("contract") == _CONTRACT, "contract")
     modules = payload.get("modules")
     _require(isinstance(modules, list) and bool(modules), "modules")
-    names: set[str] = set()
+    modules_by_name: dict[str, dict[str, Any]] = {}
     for index, module in enumerate(modules):
         _require(isinstance(module, dict), f"modules[{index}]")
         name = module.get("name")
@@ -117,8 +117,7 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
             and name.replace("_", "").isalnum(),
             f"modules[{index}].name",
         )
-        _require(name not in names, f"duplicate module {name}")
-        names.add(name)
+        _require(name not in modules_by_name, f"duplicate module {name}")
         _source(root, module.get("device_path"), f"modules[{index}].device_path")
         _source(root, module.get("binding_path"), f"modules[{index}].binding_path")
         for field in ("module_ident", "kernel_symbol", "ffi_entry"):
@@ -147,11 +146,29 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
             isinstance(module.get("num_split"), int) and module["num_split"] >= 1,
             f"modules[{index}].num_split",
         )
+        expected_defines = {
+            "Q_LEN": module["q_len"],
+            "NUM_SPLIT": module["num_split"],
+            "WRITE_LSE": int(module["write_lse"]),
+        }
+        _require(
+            all(defines[key] == expected_defines[key] for key in defines),
+            f"modules[{index}].defines disagree with q_len/num_split/write_lse",
+        )
+        modules_by_name[name] = module
     routes = payload.get("exact_routes")
     _require(isinstance(routes, list), "exact_routes")
     for index, route in enumerate(routes):
         _require(isinstance(route, dict), f"exact_routes[{index}]")
-        _require(route.get("module") in names, f"exact_routes[{index}].module")
+        _require(
+            route.get("module") in modules_by_name, f"exact_routes[{index}].module"
+        )
+        target = modules_by_name[route["module"]]
+        _require(
+            route.get("q_len") == target["q_len"]
+            and route.get("write_lse") is target["write_lse"],
+            f"exact_routes[{index}] disagrees with module {route['module']}",
+        )
         lengths = route.get("kv_lens")
         _require(
             isinstance(lengths, dict)
