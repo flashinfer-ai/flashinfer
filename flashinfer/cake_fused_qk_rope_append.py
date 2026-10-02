@@ -153,49 +153,98 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
         BF16 ``[T, num_q_heads, 128]`` normalised and rotated queries.
     """
     _check(qk_norm_policy in (0, 1, 2), "qk_norm_policy must be 0, 1 or 2")
-    _check(qkv.dim() == 2 and qkv.dtype == torch.bfloat16, "qkv must be a 2-D bf16 tensor")
+    _check(
+        qkv.dim() == 2 and qkv.dtype == torch.bfloat16, "qkv must be a 2-D bf16 tensor"
+    )
     _check(qkv.is_cuda, "qkv must be a CUDA tensor")
     device = qkv.device
     num_rows = int(qkv.shape[0])
     width = (num_q_heads + 2 * num_kv_heads) * HEAD_DIM
-    _check(int(qkv.shape[1]) == width, f"qkv must have {width} columns for this head configuration")
-    _check(cos_sin.dtype == torch.float32 and cos_sin.dim() == 2 and int(cos_sin.shape[1]) == HEAD_DIM,
-           "cos_sin must be f32 [max_position, 128]")
-    for name, t in (("seq_lens", seq_lens), ("q_indptr", q_indptr), ("page_indices", page_indices)):
+    _check(
+        int(qkv.shape[1]) == width,
+        f"qkv must have {width} columns for this head configuration",
+    )
+    _check(
+        cos_sin.dtype == torch.float32
+        and cos_sin.dim() == 2
+        and int(cos_sin.shape[1]) == HEAD_DIM,
+        "cos_sin must be f32 [max_position, 128]",
+    )
+    for name, t in (
+        ("seq_lens", seq_lens),
+        ("q_indptr", q_indptr),
+        ("page_indices", page_indices),
+    ):
         _check(t.dtype == torch.int32, f"{name} must be int32")
     num_requests = int(seq_lens.shape[0])
-    _check(seq_lens.dim() == 1 and q_indptr.dim() == 1 and int(q_indptr.shape[0]) == num_requests + 1,
-           "q_indptr must be [B + 1] and seq_lens [B]")
-    _check(page_indices.dim() == 2 and int(page_indices.shape[0]) == num_requests,
-           "page_indices must be [B, max_pages]")
+    _check(
+        seq_lens.dim() == 1
+        and q_indptr.dim() == 1
+        and int(q_indptr.shape[0]) == num_requests + 1,
+        "q_indptr must be [B + 1] and seq_lens [B]",
+    )
+    _check(
+        page_indices.dim() == 2 and int(page_indices.shape[0]) == num_requests,
+        "page_indices must be [B, max_pages]",
+    )
     for name, t in (("key_cache", key_cache), ("value_cache", value_cache)):
-        _check(t.dtype == torch.bfloat16 and t.dim() == 4 and int(t.shape[2]) == num_kv_heads
-               and int(t.shape[3]) == HEAD_DIM, f"{name} must be bf16 [num_pages, page_size, num_kv_heads, 128]")
-    _check(tuple(key_cache.shape) == tuple(value_cache.shape), "key_cache and value_cache must have equal shapes")
+        _check(
+            t.dtype == torch.bfloat16
+            and t.dim() == 4
+            and int(t.shape[2]) == num_kv_heads
+            and int(t.shape[3]) == HEAD_DIM,
+            f"{name} must be bf16 [num_pages, page_size, num_kv_heads, 128]",
+        )
+    _check(
+        tuple(key_cache.shape) == tuple(value_cache.shape),
+        "key_cache and value_cache must have equal shapes",
+    )
     page_size = int(key_cache.shape[1])
     if out_q is None:
-        out_q = torch.empty((num_rows, num_q_heads, HEAD_DIM), dtype=torch.bfloat16, device=device)
-    _check(out_q.dtype == torch.bfloat16 and tuple(out_q.shape) == (num_rows, num_q_heads, HEAD_DIM),
-           "out_q must be bf16 [T, num_q_heads, 128]")
+        out_q = torch.empty(
+            (num_rows, num_q_heads, HEAD_DIM), dtype=torch.bfloat16, device=device
+        )
+    _check(
+        out_q.dtype == torch.bfloat16
+        and tuple(out_q.shape) == (num_rows, num_q_heads, HEAD_DIM),
+        "out_q must be bf16 [T, num_q_heads, 128]",
+    )
     for name, t in (("out_k", out_k), ("out_v", out_v)):
         if t is not None:
-            _check(t.dtype == torch.bfloat16 and tuple(t.shape) == (num_rows, num_kv_heads, HEAD_DIM),
-                   f"{name} must be bf16 [T, num_kv_heads, 128]")
+            _check(
+                t.dtype == torch.bfloat16
+                and tuple(t.shape) == (num_rows, num_kv_heads, HEAD_DIM),
+                f"{name} must be bf16 [T, num_kv_heads, 128]",
+            )
     if qk_norm_policy != 0:
-        _check(q_norm_weight is not None and k_norm_weight is not None,
-               "q_norm_weight and k_norm_weight are required when qk_norm_policy != 0")
-    if q_norm_weight is None:
-        q_norm_weight = torch.ones(HEAD_DIM, dtype=torch.float32, device=device)
-    if k_norm_weight is None:
-        k_norm_weight = torch.ones(HEAD_DIM, dtype=torch.float32, device=device)
+        _check(
+            q_norm_weight is not None and k_norm_weight is not None,
+            "q_norm_weight and k_norm_weight are required when qk_norm_policy != 0",
+        )
+    if q_norm_weight is None or k_norm_weight is None:
+        # qk_norm_policy == 0 never reads the weights: hand the kernel an existing f32 [128] row
+        # instead of allocating and filling a tensor on every call (no extra kernel, graph-safe).
+        placeholder = cos_sin[0, :HEAD_DIM]
+        q_norm_weight = placeholder if q_norm_weight is None else q_norm_weight
+        k_norm_weight = placeholder if k_norm_weight is None else k_norm_weight
     for name, w in (("q_norm_weight", q_norm_weight), ("k_norm_weight", k_norm_weight)):
-        _check(w.dtype == torch.float32 and tuple(w.shape) == (HEAD_DIM,), f"{name} must be f32 [128]")
+        _check(
+            w.dtype == torch.float32 and tuple(w.shape) == (HEAD_DIM,),
+            f"{name} must be f32 [128]",
+        )
     tensors = {
-        "qkv": qkv, "cos_sin": cos_sin, "q_indptr": q_indptr, "seq_lens": seq_lens, "page_table": page_indices,
-        "k_cache": key_cache, "v_cache": value_cache, "out_q": out_q,
+        "qkv": qkv,
+        "cos_sin": cos_sin,
+        "q_indptr": q_indptr,
+        "seq_lens": seq_lens,
+        "page_table": page_indices,
+        "k_cache": key_cache,
+        "v_cache": value_cache,
+        "out_q": out_q,
         "out_k": out_k if out_k is not None else key_cache,
         "out_v": out_v if out_v is not None else value_cache,
-        "q_norm_weight": q_norm_weight, "k_norm_weight": k_norm_weight,
+        "q_norm_weight": q_norm_weight,
+        "k_norm_weight": k_norm_weight,
     }
     for name, t in tensors.items():
         _check(t.is_contiguous(), f"{name} must be contiguous")
@@ -204,7 +253,9 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
     stage = stage_for(num_q_heads, num_kv_heads)
     arch = arch_for(get_compute_capability(device))
     module, record = load_cake_fused_qk_rope_append_module(stage, arch)
-    warps_per_row = int(dict(record["route"]).get("specialization", {}).get("WARPS_PER_ROW", 1))
+    warps_per_row = int(
+        dict(record["route"]).get("specialization", {}).get("WARPS_PER_ROW", 1)
+    )
     plan = launch_plan(num_rows, num_requests, page_size, num_kv_heads, warps_per_row)
     scalars = {
         "num_rows": num_rows,
@@ -231,7 +282,9 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
         elif name in scalars:
             args.append(scalars[name])
         else:
-            raise RuntimeError(f"generated module expects unknown argument {name!r} ({kind})")
+            raise RuntimeError(
+                f"generated module expects unknown argument {name!r} ({kind})"
+            )
     import tvm_ffi
 
     with torch.cuda.device(device), tvm_ffi.use_torch_stream():
