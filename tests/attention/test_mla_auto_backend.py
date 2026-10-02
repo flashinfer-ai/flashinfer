@@ -633,7 +633,7 @@ def _cutile_dependency(monkeypatch):
             raise importlib.metadata.PackageNotFoundError(name)
         return state.version
 
-    def available():
+    def available(device):
         state.probes.append("compiler")
         return True
 
@@ -667,11 +667,14 @@ def test_cpu_cutile_minimum_version(_cutile_dependency, version, supported):
 
     _cutile_dependency.version = version
     if supported:
-        assert cutile_backend.get_cutile_mla_decode() is prepare_cutile_mla_decode
+        assert (
+            cutile_backend.get_cutile_mla_decode(torch.device("cpu"))
+            is prepare_cutile_mla_decode
+        )
         assert _cutile_dependency.probes == ["compiler"]
     else:
         with pytest.raises(_BackendPlanUnsupportedError, match="cuda-tile>=1.4"):
-            cutile_backend.get_cutile_mla_decode()
+            cutile_backend.get_cutile_mla_decode(torch.device("cpu"))
         assert _cutile_dependency.probes == []
 
 
@@ -724,7 +727,7 @@ def test_cpu_cutile_version_and_experimental_selection(
 
     def prepare(name, args):
         if name == "cutile":
-            cutile_backend.get_cutile_mla_decode()
+            cutile_backend.get_cutile_mla_decode(torch.device("cpu"))
         elif name != "cutlass" or not cutlass_supported:
             _reject(name, args)
 
