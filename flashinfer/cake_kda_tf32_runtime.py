@@ -10,9 +10,30 @@ from functools import partial
 
 from flashinfer.jit.cake_kda_tf32 import _factory
 from flashinfer.jit.cake_kda_tf32 import device_arch as detect_gpu_arch
+from flashinfer.kda_prefill import (
+    _direct_m128_route,
+    _make_lpt_task_bins,
+    _make_uniform_head_grouped_bins,
+    _make_uniform_piece_task_bins,
+    _persistent_m128_roofline,
+    _should_use_bt16_dense_wavefront,
+    _should_use_bt16_prepare_chain,
+    _should_use_h12_direct_n32,
+    _should_use_independent_dvsplit,
+    _should_use_lpt_persistent,
+    _should_use_scalar_chunk_lpt,
+    _should_use_source_vtile_direct,
+    _should_use_source_vtile_persistent,
+    _uniform_persistent_worker_count,
+    _uses_measured_sm100_persistent_policy,
+    _wave_quantized_bt16_prepare_ctas,
+)
 
 "Canonical semantic and ABI compile axes shared by KDA schedules."
 from enum import Enum
+
+
+_COMPUTE_CAPABILITY = {"sm_100a": (10, 0), "sm_103a": (10, 3)}
 
 
 class KDAGateKind(str, Enum):
@@ -368,20 +389,6 @@ BF16_ROUTE_M64 = "independent_dvsplit_m64"
 BF16_ROUTE_BT16_M64 = "bt16_prepare_chain_m64"
 BF16_ROUTE_SMALL_BH_M128 = "small_bh_owner_helper_m128"
 BF16_ROUTE_AFFINE_SPLIT_M128 = "affine_split_m128"
-
-
-@dataclass(frozen=True)
-class _PersistentM128Roofline:
-    """Resolved occupancy and critical-path lower bounds in nanoseconds."""
-
-    resident_ctas_per_sm: int
-    worker_count: int
-    handoff_count: int
-    chunk_ns: float
-    state_transfer_ns: float
-    task_refill_ns: float
-    direct_ns: float
-    piece_ns: float
 
 
 def _affine_split_policy() -> str:
@@ -1008,25 +1015,6 @@ def _qkv_raw_pointer_arg(tensor, name, carrier_names):
     return tensor
 
 
-def _should_use_independent_dvsplit(
-    *,
-    gpu_arch: str,
-    sm_count: int,
-    fixed_layout: bool,
-    num_seqs: int,
-    num_heads: int,
-    max_seq_len: int,
-) -> bool:
-    """Select M64 when its doubled fixed-layout grid remains one resident wave."""
-    return (
-        gpu_arch in ("sm_100a", "sm_103a")
-        and fixed_layout
-        and (num_seqs == 1)
-        and (max_seq_len >= INDEPENDENT_DVSPLIT_MIN_SEQ_LEN)
-        and (INDEPENDENT_DVSPLIT_CTAS * num_heads <= sm_count)
-    )
-
-
 def _dvsplit_carrier_precision_ok(
     *,
     compute_dtype: str,
@@ -1133,49 +1121,6 @@ def _should_use_h12_active_beta_m64(
     )
 
 
-def _should_use_source_vtile_direct(
-    *,
-    gpu_arch: str,
-    sm_count: int,
-    fixed_layout: bool,
-    num_seqs: int,
-    num_heads: int,
-    uniform_sequences: bool,
-    max_seq_len: int,
-) -> bool:
-    """Select the one-wave M128 schedule for long dense H96 work."""
-    return (
-        gpu_arch == "sm_103a"
-        and fixed_layout
-        and uniform_sequences
-        and (num_heads == 96)
-        and (num_seqs * num_heads <= sm_count)
-        and (max_seq_len >= 4096)
-    )
-
-
-def _should_use_source_vtile_persistent(
-    *,
-    gpu_arch: str,
-    fixed_layout: bool,
-    num_seqs: int,
-    num_heads: int,
-    uniform_sequences: bool,
-    max_seq_len: int,
-) -> bool:
-    """Select the persistent M128 schedule by work-per-CTA bucket."""
-    total_tasks = num_seqs * num_heads
-    return (
-        gpu_arch == "sm_103a"
-        and (not fixed_layout)
-        and uniform_sequences
-        and (num_heads in (64, 96))
-        and (total_tasks % SOURCE_VTILE_PERSISTENT_WORKERS == 0)
-        and (total_tasks // SOURCE_VTILE_PERSISTENT_WORKERS in (4, 6))
-        and (max_seq_len >= 512)
-    )
-
-
 def _bt16_chunks_per_prep_cta(
     *, num_heads: int, total_chunks: int, compute_dtype: str = "tf32"
 ) -> int:
@@ -1195,29 +1140,6 @@ def _bt16_chunks_per_prep_cta(
     if num_heads * total_chunks >= BT16_GENERAL_HIGH_WORK_MIN_CHUNK_HEADS:
         return BT16_GENERAL_HIGH_WORK_CHUNKS_PER_PREP_CTA
     return 6 if compute_dtype == "bf16" else BT16_GENERAL_LOW_WORK_CHUNKS_PER_PREP_CTA
-
-
-def _wave_quantized_bt16_prepare_ctas(
-    *, rectangular_ctas: int, num_heads: int, sm_count: int
-) -> int:
-    """Trim a nearly complete final prepare wave without changing ownership.
-
-    The flattened scheduler balances an arbitrary CTA count independently
-    within every head, so a small reduction only gives a few CTAs one extra
-    chunk.  When at least 98% of the rectangular grid remains, ending on a
-    complete hardware wave is faster than launching the sparse residual wave.
-    Short grids retain their original parallelism.
-    """
-    if rectangular_ctas < BT16_PREP_WAVE_QUANT_MIN_WAVES * sm_count:
-        return rectangular_ctas
-    full_wave_ctas = rectangular_ctas // sm_count * sm_count
-    if (
-        full_wave_ctas < num_heads
-        or full_wave_ctas * 100
-        < rectangular_ctas * BT16_PREP_WAVE_QUANT_MIN_RETAINED_PERCENT
-    ):
-        return rectangular_ctas
-    return full_wave_ctas
 
 
 def _should_use_small_bh_owner_helper(
@@ -1253,81 +1175,6 @@ def _should_use_small_bh_owner_helper(
             else max_seq_len >= SMALL_BH_MIN_SEQ_LEN
         )
         and (SMALL_BH_GROUP_SIZE * total_tasks <= sm_count)
-    )
-
-
-def _should_use_bt16_prepare_chain(
-    *,
-    gpu_arch: str,
-    sm_count: int,
-    num_seqs: int,
-    num_heads: int,
-    max_seq_len: int,
-    n16_alternative: bool = False,
-) -> bool:
-    """Select the decomposed BT16 path beyond measured route crossovers.
-
-    Preparation is chunk parallel, while two independent M64 CTAs own each
-    recurrent state.  Against the pair-packed H12 N16 direct kernel, BT16 wins
-    from 512 tokens while its two value CTAs still fit in the same number of
-    waves as direct M128.  Once the split chain adds a wave, uniform H12 work
-    instead uses the variable-shape N32 direct kernel; nonuniform work retains
-    the measured 3,072-token two-wave crossover.  Beyond two chain waves, N32
-    also takes over at 512 tokens instead of paying the split quantization.
-    Against the fixed/packed general families it wins from 4,096 tokens through
-    32 one-wave tasks.  The existing owner/helper family remains faster below
-    65,536 tokens for at most eight tasks. Partial chunks are admissible: the
-    prepare kernel zero-extends their recurrence factors and the chain drops
-    invalid output rows, so alignment is not a schedule-selection axis.
-    """
-    total_tasks = num_seqs * num_heads
-    if n16_alternative:
-        chain_waves = (BT16_VALUE_SPLITS * total_tasks + sm_count - 1) // sm_count
-        if chain_waves <= 1:
-            min_seq_len = BT16_N16_ONE_CHAIN_WAVE_MIN_SEQ_LEN
-        elif chain_waves == 2:
-            min_seq_len = BT16_N16_TWO_CHAIN_WAVE_MIN_SEQ_LEN
-        else:
-            min_seq_len = BT16_N16_MULTI_WAVE_MIN_SEQ_LEN
-        max_tasks = BT16_N16_MAX_DIRECT_WAVES * sm_count
-    elif total_tasks <= SMALL_BH_MAX_TASKS:
-        min_seq_len = BT16_LONG_MIN_SEQ_LEN
-        max_tasks = SMALL_BH_MAX_TASKS
-    else:
-        min_seq_len = BT16_MID_MIN_SEQ_LEN
-        max_tasks = BT16_MID_MAX_TASKS
-    return (
-        gpu_arch in ("sm_100a", "sm_103a")
-        and 0 < total_tasks <= max_tasks
-        and (max_seq_len >= min_seq_len)
-        and (n16_alternative or BT16_VALUE_SPLITS * total_tasks <= sm_count)
-    )
-
-
-def _should_use_bt16_dense_wavefront(
-    *,
-    gpu_arch: str,
-    sm_count: int,
-    fixed_layout: bool,
-    num_seqs: int,
-    num_heads: int,
-    max_seq_len: int,
-) -> bool:
-    """Select decomposed preparation when its dense chain stays one wave.
-
-    The material schedule change replaces the fused five-stage M64 producer
-    with a chunk-parallel factor kernel and the standalone two-way M64 chain.
-    H60--H64 fills 120--128 of the measured 148/152 SMs without crossing a
-    chain wave; five exact prepare waves then avoid the rectangular-grid
-    quantization cliff at 12 CTAs per head.
-    """
-    return (
-        gpu_arch in ("sm_100a", "sm_103a")
-        and fixed_layout
-        and (num_seqs == 1)
-        and (BT16_DENSE_MIN_HEADS <= num_heads <= BT16_DENSE_MAX_HEADS)
-        and (max_seq_len >= BT16_DENSE_MIN_SEQ_LEN)
-        and (BT16_VALUE_SPLITS * num_heads <= sm_count)
     )
 
 
@@ -1474,25 +1321,6 @@ class _FusedAffineEpilogue:
         )
 
 
-def _uses_measured_sm100_persistent_policy(*, gpu_arch: str, sm_count: int) -> bool:
-    """Return whether an exact measured SM100 persistent policy applies."""
-    return gpu_arch == "sm_100a" and sm_count in (148, 152)
-
-
-def _uniform_persistent_worker_count(total_tasks: int, *, worker_cap: int) -> int:
-    """Choose a nearly full one-wave grid with equal grid-stride trip counts."""
-    if total_tasks <= 0 or worker_cap <= 0:
-        raise ValueError("total_tasks and worker_cap must be positive")
-    if total_tasks <= worker_cap:
-        return total_tasks
-    trips = (total_tasks + worker_cap - 1) // worker_cap
-    if total_tasks % trips == 0:
-        balanced_workers = total_tasks // trips
-        if balanced_workers >= BF16_PERSISTENT_MIN_BALANCED_CTAS:
-            return balanced_workers
-    return worker_cap
-
-
 def _upload_int32_batch(device, host_lists: dict[str, list[int]]):
     """Upload several host int32 lists with one pinned, stream-ordered copy."""
     import torch
@@ -1536,330 +1364,6 @@ def _upload_int_batch(device, host_lists: dict[str, list[int]], dtype):
     return uploads
 
 
-def _make_lpt_task_bins(
-    ordered_seq_lens: tuple[int, ...], *, num_heads: int, worker_count: int
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    """Greedily assign descending-length sequence/head tasks to CTA bins."""
-    total_tasks = len(ordered_seq_lens) * num_heads
-    if not ordered_seq_lens or num_heads <= 0 or (not 0 < worker_count <= total_tasks):
-        raise ValueError("LPT bins require positive sequence/head/task counts")
-    bins: list[list[int]] = [[] for _ in range(worker_count)]
-    loads = [0] * worker_count
-    # Least-loaded worker with the lowest index; a heap keyed on
-    # (load, index) reproduces the linear-scan argmin in O(log W) per task.
-    heap = [(0, index) for index in range(worker_count)]
-    for ordered_seq_idx, seq_len in enumerate(ordered_seq_lens):
-        chunk_count = (seq_len + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK
-        for head_idx in range(num_heads):
-            load, worker_idx = heapq.heappop(heap)
-            bins[worker_idx].append(ordered_seq_idx * num_heads + head_idx)
-            loads[worker_idx] = load + chunk_count
-            heapq.heappush(heap, (load + chunk_count, worker_idx))
-    task_ids: list[int] = []
-    task_offsets = [0]
-    for worker_tasks in bins:
-        task_ids.extend(worker_tasks)
-        task_offsets.append(len(task_ids))
-    return (tuple(task_ids), tuple(task_offsets), tuple(loads))
-
-
-def _make_uniform_head_grouped_bins(
-    *, num_seqs: int, num_heads: int, worker_count: int
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Partition head-major uniform tasks into contiguous balanced CTA bins."""
-    total_tasks = num_seqs * num_heads
-    if num_seqs <= 0 or num_heads <= 0 or (not 0 < worker_count <= total_tasks):
-        raise ValueError("head-grouped bins require positive sequence/head/task counts")
-    task_ids: list[int] = []
-    task_offsets = [0]
-    for worker_idx in range(worker_count):
-        begin = worker_idx * total_tasks // worker_count
-        end = (worker_idx + 1) * total_tasks // worker_count
-        for head_major_idx in range(begin, end):
-            head_idx, ordered_seq_idx = divmod(head_major_idx, num_seqs)
-            task_ids.append(ordered_seq_idx * num_heads + head_idx)
-        task_offsets.append(len(task_ids))
-    return (tuple(task_ids), tuple(task_offsets))
-
-
-def _make_uniform_piece_task_bins(
-    *, num_seqs: int, num_heads: int, seq_len: int, worker_count: int
-) -> tuple[
-    tuple[int, ...],
-    tuple[int, ...],
-    tuple[int, ...],
-    tuple[int, ...],
-    tuple[int, ...],
-    tuple[int, ...],
-    int,
-    tuple[int, ...],
-]:
-    """Split quantization-bound uniform chains across persistent CTA bins.
-
-    Whole-chain LPT leaves ``extra_tasks`` workers with one additional full
-    recurrence chain.  Remove exactly those overflow chains, divide each into
-    as many balanced chunk-aligned pieces as the worker/task geometry permits,
-    and stagger successive pieces one whole chain later in distinct CTA bins.
-    This preserves an acyclic recurrence DAG while reducing the integer
-    makespan.  The same runtime scheduler covers both H64 and H96 uniform work;
-    the resulting piece count is derived from the resolved grid rather than an
-    exact shape guard.
-
-    The four metadata arrays after ``task_offsets`` are per-dispatch-entry
-    token starts/counts and optional source/destination handoff slots.  A
-    negative handoff index denotes the original initial/final state boundary.
-    """
-    total_tasks = num_seqs * num_heads
-    if (
-        num_seqs <= 0
-        or num_heads <= 0
-        or seq_len <= 0
-        or (worker_count <= 0)
-        or (worker_count > total_tasks)
-    ):
-        raise ValueError("uniform piece bins require positive resolved work")
-    chunk_count = (seq_len + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK
-    bins: list[list[tuple[int, int, int, int, int]]] = [[] for _ in range(worker_count)]
-    loads = [0] * worker_count
-    # Uniform whole-chain LPT: task t lands on worker t % W (least loaded,
-    # lowest index), which is exactly the linear-scan argmin result.
-    for task_idx in range(total_tasks):
-        worker_idx = task_idx % worker_count
-        bins[worker_idx].append((task_idx, 0, seq_len, -1, -1))
-        loads[worker_idx] += chunk_count
-    base_tasks, extra_tasks = divmod(total_tasks, worker_count)
-    piece_count = (
-        min(base_tasks, worker_count // extra_tasks, chunk_count) if extra_tasks else 1
-    )
-    if piece_count >= 2:
-        peak_load = (base_tasks + 1) * chunk_count
-        peak_slots = [
-            worker_idx for worker_idx, load in enumerate(loads) if load == peak_load
-        ]
-        if len(peak_slots) != extra_tasks:
-            raise RuntimeError("uniform LPT peak count did not match task remainder")
-        overflow_tasks = []
-        for worker_idx in peak_slots:
-            task = bins[worker_idx].pop()
-            loads[worker_idx] -= chunk_count
-            overflow_tasks.append(task[0])
-        handoff_count = 0
-        chunk_base = chunk_count // piece_count
-        chunk_remainder = chunk_count % piece_count
-        chunk_cuts = [0]
-        for piece_idx in range(piece_count):
-            piece_chunks = chunk_base + int(piece_idx >= piece_count - chunk_remainder)
-            chunk_cuts.append(chunk_cuts[-1] + piece_chunks)
-        for overflow_idx, task_idx in enumerate(overflow_tasks):
-            handoffs = tuple(range(handoff_count, handoff_count + piece_count - 1))
-            handoff_count += piece_count - 1
-            for piece_idx in range(piece_count):
-                chunk_start = chunk_cuts[piece_idx]
-                chunk_end = chunk_cuts[piece_idx + 1]
-                token_start = chunk_start * BF16_M128_CHUNK
-                token_end = min(seq_len, chunk_end * BF16_M128_CHUNK)
-                src = -1 if piece_idx == 0 else handoffs[piece_idx - 1]
-                dst = -1 if piece_idx + 1 == piece_count else handoffs[piece_idx]
-                worker_idx = piece_idx * extra_tasks + overflow_idx
-                insert_at = min(1 + piece_idx, len(bins[worker_idx]))
-                bins[worker_idx].insert(
-                    insert_at,
-                    (task_idx, token_start, token_end - token_start, src, dst),
-                )
-                loads[worker_idx] += chunk_end - chunk_start
-    else:
-        handoff_count = 0
-    task_ids: list[int] = []
-    task_token_starts: list[int] = []
-    task_token_counts: list[int] = []
-    task_state_sources: list[int] = []
-    task_state_destinations: list[int] = []
-    task_offsets = [0]
-    for worker_tasks in bins:
-        for task_idx, token_start, token_count, src, dst in worker_tasks:
-            task_ids.append(task_idx)
-            task_token_starts.append(token_start)
-            task_token_counts.append(token_count)
-            task_state_sources.append(src)
-            task_state_destinations.append(dst)
-        task_offsets.append(len(task_ids))
-    return (
-        tuple(task_ids),
-        tuple(task_offsets),
-        tuple(task_token_starts),
-        tuple(task_token_counts),
-        tuple(task_state_sources),
-        tuple(task_state_destinations),
-        handoff_count,
-        tuple(loads),
-    )
-
-
-def _persistent_m128_roofline(
-    *,
-    gpu_arch: str,
-    sm_count: int,
-    num_seqs: int,
-    num_heads: int,
-    seq_len: int,
-    use_initial_state: bool,
-    store_final_state: bool,
-) -> _PersistentM128Roofline | None:
-    """Resolve occupancy and compare direct/piece roofline critical paths.
-
-    Peak rates and per-SM capacities come from ``hardware.json``.  The
-    physical schedule contract supplies its threads, SMEM, TMEM, tensor FLOPs,
-    streaming bytes, and state footprint.  Equal uniform direct tasks execute
-    in hardware waves; recurrence pieces execute on persistent resident CTAs,
-    so their estimate is the longest path through both CTA-order and state
-    handoff edges.  No input shape is used as a policy identity.
-    """
-    sku = {"sm_100a": "B200", "sm_103a": "B300"}.get(gpu_arch)
-    if sku is None:
-        return None
-    if sm_count <= 0 or num_seqs <= 0 or num_heads <= 0 or (seq_len <= 0):
-        raise ValueError("persistent-M128 roofline requires resolved positive extents")
-    CHUNK_TOKENS = 32
-    PERSISTENT_TASK_REFILL_CHUNKS = 2
-    SMEM_BYTES_PER_CTA = 220672
-    STATE_BYTES = 32768
-    STREAM_BYTES_PER_CHUNK = 41024
-    TENSOR_FLOPS_PER_CHUNK = 3407872
-    THREADS_PER_CTA = 1024
-    TMEM_COLS_PER_CTA = 256
-    spec = gpu_spec_by_sku(sku)
-    if spec is None:
-        raise RuntimeError(f"missing hardware.json roofline entry for {sku}")
-    try:
-        peak_tflops = float(spec["compute"]["tensor_peak_tflops"]["bf16_dense"])
-        peak_gbps = float(spec["hbm"]["peak_bandwidth_gbps"])
-        max_threads_per_sm = int(spec["execution"]["max_threads_per_sm"])
-        smem_per_sm = int(spec["smem"]["kb_per_sm"]) * 1024
-        tmem_cols_per_sm = int(spec["tmem"]["cols_per_sm"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError(
-            f"incomplete persistent-M128 hardware model for {sku}"
-        ) from exc
-    if (
-        min(peak_tflops, peak_gbps, max_threads_per_sm, smem_per_sm, tmem_cols_per_sm)
-        <= 0
-    ):
-        raise RuntimeError(f"non-positive persistent-M128 hardware model for {sku}")
-    resident_ctas_per_sm = min(
-        max_threads_per_sm // THREADS_PER_CTA,
-        smem_per_sm // SMEM_BYTES_PER_CTA,
-        tmem_cols_per_sm // TMEM_COLS_PER_CTA,
-    )
-    if resident_ctas_per_sm <= 0:
-        raise RuntimeError(
-            f"persistent-M128 schedule is not resident on {sku}: threads={THREADS_PER_CTA}, smem={SMEM_BYTES_PER_CTA}, tmem_cols={TMEM_COLS_PER_CTA}"
-        )
-    worker_count = sm_count * resident_ctas_per_sm
-    total_tasks = num_seqs * num_heads
-    if total_tasks <= worker_count:
-        return None
-    (
-        _task_ids,
-        task_offsets,
-        _token_starts,
-        token_counts,
-        state_sources,
-        state_destinations,
-        handoff_count,
-        _loads,
-    ) = _make_uniform_piece_task_bins(
-        num_seqs=num_seqs,
-        num_heads=num_heads,
-        seq_len=seq_len,
-        worker_count=worker_count,
-    )
-    if handoff_count == 0:
-        return None
-    worker_flops_per_ns = peak_tflops * 1000.0 / worker_count
-    worker_bytes_per_ns = peak_gbps / worker_count
-    chunk_ns = max(
-        TENSOR_FLOPS_PER_CHUNK / worker_flops_per_ns,
-        STREAM_BYTES_PER_CHUNK / worker_bytes_per_ns,
-    )
-    state_transfer_ns = STATE_BYTES / worker_bytes_per_ns
-    task_refill_ns = PERSISTENT_TASK_REFILL_CHUNKS * chunk_ns
-    chunks_per_task = (seq_len + CHUNK_TOKENS - 1) // CHUNK_TOKENS
-    direct_task_ns = chunks_per_task * chunk_ns
-    if use_initial_state:
-        direct_task_ns += state_transfer_ns
-    if store_final_state:
-        direct_task_ns += state_transfer_ns
-    direct_ns = (total_tasks + worker_count - 1) // worker_count * direct_task_ns
-    entry_count = len(token_counts)
-    edges: list[set[int]] = [set() for _ in range(entry_count)]
-    indegree = [0] * entry_count
-
-    def add_edge(source: int, destination: int) -> None:
-        if destination not in edges[source]:
-            edges[source].add(destination)
-            indegree[destination] += 1
-
-    for worker_idx in range(worker_count):
-        begin = task_offsets[worker_idx]
-        end = task_offsets[worker_idx + 1]
-        for entry_idx in range(begin + 1, end):
-            add_edge(entry_idx - 1, entry_idx)
-    handoff_producers = {
-        destination: entry_idx
-        for entry_idx, destination in enumerate(state_destinations)
-        if destination >= 0
-    }
-    if len(handoff_producers) != handoff_count:
-        raise RuntimeError("piece roofline did not resolve every handoff producer")
-    for entry_idx, source in enumerate(state_sources):
-        if source >= 0:
-            try:
-                producer = handoff_producers[source]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"piece roofline did not resolve handoff source {source}"
-                ) from exc
-            add_edge(producer, entry_idx)
-    ready = [entry_idx for entry_idx, degree in enumerate(indegree) if degree == 0]
-    heapq.heapify(ready)
-    worker_first_entries = frozenset(task_offsets[:-1])
-    earliest_start = [0.0] * entry_count
-    finish = [0.0] * entry_count
-    visited = 0
-    while ready:
-        entry_idx = heapq.heappop(ready)
-        duration = (
-            (token_counts[entry_idx] + CHUNK_TOKENS - 1) // CHUNK_TOKENS * chunk_ns
-        )
-        if entry_idx not in worker_first_entries:
-            duration += task_refill_ns
-        if state_sources[entry_idx] >= 0 or use_initial_state:
-            duration += state_transfer_ns
-        if state_destinations[entry_idx] >= 0 or store_final_state:
-            duration += state_transfer_ns
-        finish[entry_idx] = earliest_start[entry_idx] + duration
-        visited += 1
-        for successor in edges[entry_idx]:
-            earliest_start[successor] = max(
-                earliest_start[successor], finish[entry_idx]
-            )
-            indegree[successor] -= 1
-            if indegree[successor] == 0:
-                heapq.heappush(ready, successor)
-    if visited != entry_count:
-        raise RuntimeError("piece roofline dependency graph contains a cycle")
-    return _PersistentM128Roofline(
-        resident_ctas_per_sm=resident_ctas_per_sm,
-        worker_count=worker_count,
-        handoff_count=handoff_count,
-        chunk_ns=chunk_ns,
-        state_transfer_ns=state_transfer_ns,
-        task_refill_ns=task_refill_ns,
-        direct_ns=direct_ns,
-        piece_ns=max(finish),
-    )
-
-
 def _should_use_uniform_piece_persistent(
     *,
     gpu_arch: str,
@@ -1875,11 +1379,11 @@ def _should_use_uniform_piece_persistent(
     if not uniform_sequences or max_seq_len <= 0:
         return False
     estimate = _persistent_m128_roofline(
-        gpu_arch=gpu_arch,
+        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
         sm_count=sm_count,
-        num_seqs=num_seqs,
+        num_sequences=num_seqs,
         num_heads=num_heads,
-        seq_len=max_seq_len,
+        sequence_length=max_seq_len,
         use_initial_state=use_initial_state,
         store_final_state=store_final_state,
     )
@@ -2007,71 +1511,6 @@ def _make_direct_sequence_order(
     return order
 
 
-def _lpt_bins_are_balanced(loads: tuple[int, ...]) -> bool:
-    """Return whether static bins are close enough to replace dynamic CTA scheduling."""
-    return (
-        bool(loads)
-        and max(loads) * BF16_LPT_MAX_IMBALANCE_DENOMINATOR * len(loads)
-        <= sum(loads) * BF16_LPT_MAX_IMBALANCE_NUMERATOR
-    )
-
-
-def _should_use_lpt_persistent(
-    *, gpu_arch: str, sm_count: int, num_heads: int, loads: tuple[int, ...]
-) -> bool:
-    """Select the measured H96 LPT route on exact SM100 device classes."""
-    if (
-        not _uses_measured_sm100_persistent_policy(gpu_arch=gpu_arch, sm_count=sm_count)
-        or num_heads != 96
-    ):
-        return False
-    if sm_count == 152:
-        return (
-            bool(loads)
-            and max(loads) * BF16_GB200_LPT_MAX_IMBALANCE_DENOMINATOR * len(loads)
-            <= sum(loads) * BF16_GB200_LPT_MAX_IMBALANCE_NUMERATOR
-        )
-    return _lpt_bins_are_balanced(loads)
-
-
-def _should_use_scalar_chunk_lpt(
-    *,
-    gpu_arch: str,
-    sm_count: int,
-    num_seqs: int,
-    num_heads: int,
-    uniform_sequences: bool,
-    max_seq_len: int,
-) -> bool:
-    """Select the complete-chain LPT schedule on mixed dense work.
-
-    This is one variable-shape physical schedule: the host tile scheduler
-    assigns complete ``(sequence, head)`` recurrence chains to a one-wave CTA
-    grid, while sequence lengths, head count, schedule stride, state slot, and
-    state slot stride remain runtime values.  The range avoids both one-wave
-    inputs, where direct CTAs are already balanced, and very long chains whose
-    per-CTA serial work loses to the direct scheduler.
-    """
-    total_tasks = num_seqs * num_heads
-    return (
-        gpu_arch in ("sm_100a", "sm_103a")
-        and (not uniform_sequences)
-        and (num_heads in (64, 96))
-        and (max_seq_len > 0)
-        and (2 * sm_count <= total_tasks < 1024)
-        and ((max_seq_len + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK < 256)
-    )
-
-
-def _direct_m128_route(*, num_heads: int, max_seq_len: int = 0) -> str:
-    """Resolve the direct tile from head and sequence schedule economics."""
-    return (
-        BF16_ROUTE_DIRECT_M128_N16
-        if num_heads == 12 or 0 < max_seq_len <= BF16_N16_M128_CHUNK
-        else BF16_ROUTE_DIRECT_M128
-    )
-
-
 def _validate_n16_short_four_stage_contract(
     *,
     enabled: bool,
@@ -2100,17 +1539,6 @@ def _validate_n16_short_four_stage_contract(
         raise ValueError("short N16 S4 requires indexed state-pool routing")
     if not in_place_state_pool:
         raise ValueError("short N16 S4 requires one in-place initial/final state pool")
-
-
-def _should_use_h12_direct_n32(
-    *, gpu_arch: str, num_heads: int, max_seq_len: int
-) -> bool:
-    """Select the measured H12 range where two N16 chunks lose to one N32."""
-    return (
-        gpu_arch in ("sm_100a", "sm_103a")
-        and num_heads == 12
-        and (H12_DIRECT_N32_MIN_SEQ_LEN <= max_seq_len <= H12_DIRECT_N32_MAX_SEQ_LEN)
-    )
 
 
 def _constrained_direct_m128_route(
@@ -2149,12 +1577,14 @@ def _constrained_direct_m128_route(
         and (
             preferred_route == BF16_ROUTE_DIRECT_M128
             or _should_use_h12_direct_n32(
-                gpu_arch=gpu_arch, num_heads=num_heads, max_seq_len=max_seq_len
+                compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
+                num_heads=num_heads,
+                max_sequence_length=max_seq_len,
             )
         )
     ):
         return BF16_ROUTE_DIRECT_M128
-    return _direct_m128_route(num_heads=num_heads, max_seq_len=max_seq_len)
+    return _direct_m128_route(num_heads=num_heads, max_sequence_length=max_seq_len)
 
 
 def _requires_exact_n16_recurrence(
@@ -2189,47 +1619,51 @@ def _select_bf16_route(
     store_final_state: bool = True,
 ) -> str:
     """Select one material BF16 schedule family from resolved host metadata."""
-    direct_route = _direct_m128_route(num_heads=num_heads, max_seq_len=max_seq_len)
+    direct_route = _direct_m128_route(
+        num_heads=num_heads, max_sequence_length=max_seq_len
+    )
     if num_heads == 64 and _should_use_independent_dvsplit(
-        gpu_arch=gpu_arch,
+        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
         sm_count=sm_count,
         fixed_layout=fixed_layout,
-        num_seqs=num_seqs,
+        num_sequences=num_seqs,
         num_heads=num_heads,
-        max_seq_len=max_seq_len,
+        max_sequence_length=max_seq_len,
     ):
         return BF16_ROUTE_M64
     if _should_use_source_vtile_direct(
-        gpu_arch=gpu_arch,
+        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
         sm_count=sm_count,
         fixed_layout=fixed_layout,
-        num_seqs=num_seqs,
+        num_sequences=num_seqs,
         num_heads=num_heads,
         uniform_sequences=uniform_sequences,
-        max_seq_len=max_seq_len,
+        max_sequence_length=max_seq_len,
     ):
         return BF16_ROUTE_SOURCE_VTILE_M128
     if _should_use_source_vtile_persistent(
-        gpu_arch=gpu_arch,
+        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
         fixed_layout=fixed_layout,
-        num_seqs=num_seqs,
+        num_sequences=num_seqs,
         num_heads=num_heads,
         uniform_sequences=uniform_sequences,
-        max_seq_len=max_seq_len,
+        max_sequence_length=max_seq_len,
     ):
         return BF16_ROUTE_SOURCE_VTILE_M128
     if _should_use_bt16_dense_wavefront(
-        gpu_arch=gpu_arch,
+        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
         sm_count=sm_count,
         fixed_layout=fixed_layout,
-        num_seqs=num_seqs,
+        num_sequences=num_seqs,
         num_heads=num_heads,
-        max_seq_len=max_seq_len,
+        max_sequence_length=max_seq_len,
     ):
         return BF16_ROUTE_BT16_M64
     if direct_route == BF16_ROUTE_DIRECT_M128_N16:
         if _should_use_h12_direct_n32(
-            gpu_arch=gpu_arch, num_heads=num_heads, max_seq_len=max_seq_len
+            compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
+            num_heads=num_heads,
+            max_sequence_length=max_seq_len,
         ):
             return BF16_ROUTE_DIRECT_M128
         total_tasks = num_seqs * num_heads
@@ -2245,21 +1679,21 @@ def _select_bf16_route(
         if total_tasks > 2 * sm_count and max_seq_len >= 512:
             return BF16_ROUTE_DIRECT_M128
         if _should_use_bt16_prepare_chain(
-            gpu_arch=gpu_arch,
+            compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
             sm_count=sm_count,
-            num_seqs=num_seqs,
+            num_sequences=num_seqs,
             num_heads=num_heads,
-            max_seq_len=max_seq_len,
+            max_sequence_length=max_seq_len,
             n16_alternative=True,
         ):
             return BF16_ROUTE_BT16_M64
         return direct_route
     if _should_use_bt16_prepare_chain(
-        gpu_arch=gpu_arch,
+        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
         sm_count=sm_count,
-        num_seqs=num_seqs,
+        num_sequences=num_seqs,
         num_heads=num_heads,
-        max_seq_len=max_seq_len,
+        max_sequence_length=max_seq_len,
     ):
         return BF16_ROUTE_BT16_M64
     if _should_use_small_bh_owner_helper(
@@ -2279,21 +1713,21 @@ def _select_bf16_route(
     ):
         return BF16_ROUTE_DIRECT_M128_N16
     if _should_use_independent_dvsplit(
-        gpu_arch=gpu_arch,
+        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
         sm_count=sm_count,
         fixed_layout=fixed_layout,
-        num_seqs=num_seqs,
+        num_sequences=num_seqs,
         num_heads=num_heads,
-        max_seq_len=max_seq_len,
+        max_sequence_length=max_seq_len,
     ):
         return BF16_ROUTE_M64
     if _should_use_scalar_chunk_lpt(
-        gpu_arch=gpu_arch,
+        compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
         sm_count=sm_count,
-        num_seqs=num_seqs,
+        num_sequences=num_seqs,
         num_heads=num_heads,
         uniform_sequences=uniform_sequences,
-        max_seq_len=max_seq_len,
+        max_sequence_length=max_seq_len,
     ):
         return BF16_ROUTE_SCALAR_CHUNK_LPT_M128
     total_tasks = num_seqs * num_heads
@@ -2309,7 +1743,9 @@ def _select_bf16_route(
     ):
         return BF16_ROUTE_PIECE_M128
     if (
-        _uses_measured_sm100_persistent_policy(gpu_arch=gpu_arch, sm_count=sm_count)
+        _uses_measured_sm100_persistent_policy(
+            compute_capability=_COMPUTE_CAPABILITY[gpu_arch], sm_count=sm_count
+        )
         and num_heads in (64, 96)
         and uniform_sequences
         and (total_tasks > sm_count)
@@ -2319,7 +1755,10 @@ def _select_bf16_route(
         not uniform_sequences
         and total_tasks > sm_count
         and _should_use_lpt_persistent(
-            gpu_arch=gpu_arch, sm_count=sm_count, num_heads=num_heads, loads=lpt_loads
+            compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
+            sm_count=sm_count,
+            num_heads=num_heads,
+            loads=lpt_loads,
         )
     ):
         return BF16_ROUTE_LPT_M128
@@ -2352,13 +1791,15 @@ def select_bf16_schedule_route(
     total_tasks = num_seqs * num_heads
     lpt_loads: tuple[int, ...] = ()
     if (
-        _uses_measured_sm100_persistent_policy(gpu_arch=gpu_arch, sm_count=sm_count)
+        _uses_measured_sm100_persistent_policy(
+            compute_capability=_COMPUTE_CAPABILITY[gpu_arch], sm_count=sm_count
+        )
         and (not uniform_sequences)
         and (total_tasks > sm_count)
     ):
         ordered_seq_lens = tuple(sorted(sequence_lengths, reverse=True))
         _task_ids, _task_offsets, lpt_loads = _make_lpt_task_bins(
-            ordered_seq_lens, num_heads=num_heads, worker_count=sm_count
+            ordered_seq_lens, num_heads=num_heads, sm_count=sm_count
         )
     return _select_bf16_route(
         gpu_arch=gpu_arch,
@@ -2645,7 +2086,9 @@ class FlashKDABlackwellBF16FusedLaunch:
         handoff_count = 0
         lpt_loads: tuple[int, ...] = ()
         if (
-            _uses_measured_sm100_persistent_policy(gpu_arch=gpu_arch, sm_count=sm_count)
+            _uses_measured_sm100_persistent_policy(
+                compute_capability=_COMPUTE_CAPABILITY[gpu_arch], sm_count=sm_count
+            )
             and (not uniform_sequences)
             and (total_tasks > sm_count)
         ):
@@ -2653,7 +2096,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 (offsets[index + 1] - offsets[index] for index in ordered_sequences)
             )
             host_task_ids, host_task_offsets, lpt_loads = _make_lpt_task_bins(
-                ordered_seq_lens, num_heads=num_heads, worker_count=sm_count
+                ordered_seq_lens, num_heads=num_heads, sm_count=sm_count
             )
         # FP32 intermediate states are carried only by the fused direct M128
         # N32 body (the M64 value split, the N16 tile and the owner/helper
@@ -2860,7 +2303,9 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (not self._state_dtype_is_fp32)
             and (state_indices is not None or has_nondefault_state_slot_stride)
         ):
-            route = _direct_m128_route(num_heads=num_heads, max_seq_len=max_seq_len)
+            route = _direct_m128_route(
+                num_heads=num_heads, max_sequence_length=max_seq_len
+            )
         checkpoint_fits_n32 = (
             checkpoint_every_n_tokens == 0
             or checkpoint_every_n_tokens % BF16_M128_CHUNK == 0
@@ -2990,12 +2435,12 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (not self._active_beta_f32)
             and (num_heads % BF16_BETA_TMA_MIN_HEADS == 0)
             and _should_use_bt16_dense_wavefront(
-                gpu_arch=gpu_arch,
+                compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
                 sm_count=sm_count,
                 fixed_layout=fixed_layout,
-                num_seqs=num_seqs,
+                num_sequences=num_seqs,
                 num_heads=num_heads,
-                max_seq_len=max_seq_len,
+                max_sequence_length=max_seq_len,
             )
         )
         use_bt16_s9_chain = (
@@ -3073,18 +2518,18 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         host_uploads: dict[str, list[int]] = {"seq_order": list(ordered_sequences)}
         persistent_worker_count = _uniform_persistent_worker_count(
-            total_tasks, worker_cap=sm_count
+            total_tasks, sm_count=sm_count
         )
         if use_lpt_persistent_m128:
             persistent_worker_count = min(total_tasks, sm_count)
             host_task_ids, host_task_offsets, lpt_loads = _make_lpt_task_bins(
                 tuple((offsets[i + 1] - offsets[i] for i in ordered_sequences)),
                 num_heads=num_heads,
-                worker_count=persistent_worker_count,
+                sm_count=persistent_worker_count,
             )
         if use_head_grouped_m128:
             host_task_ids, host_task_offsets = _make_uniform_head_grouped_bins(
-                num_seqs=num_seqs,
+                num_sequences=num_seqs,
                 num_heads=num_heads,
                 worker_count=persistent_worker_count,
             )
@@ -3093,11 +2538,11 @@ class FlashKDABlackwellBF16FusedLaunch:
                 persistent_worker_count = min(total_tasks, sm_count)
             else:
                 piece_roofline = _persistent_m128_roofline(
-                    gpu_arch=gpu_arch,
+                    compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
                     sm_count=sm_count,
-                    num_seqs=num_seqs,
+                    num_sequences=num_seqs,
                     num_heads=num_heads,
-                    seq_len=max_seq_len,
+                    sequence_length=max_seq_len,
                     use_initial_state=initial_state is not None,
                     store_final_state=final_state is not None,
                 )
@@ -3116,9 +2561,9 @@ class FlashKDABlackwellBF16FusedLaunch:
                 handoff_count,
                 _piece_loads,
             ) = _make_uniform_piece_task_bins(
-                num_seqs=num_seqs,
+                num_sequences=num_seqs,
                 num_heads=num_heads,
-                seq_len=max_seq_len,
+                sequence_length=max_seq_len,
                 worker_count=persistent_worker_count,
             )
         if state_indices is not None:
@@ -3452,12 +2897,12 @@ class FlashKDABlackwellBF16FusedLaunch:
                     ),
                 )
             if _should_use_bt16_dense_wavefront(
-                gpu_arch=gpu_arch,
+                compute_capability=_COMPUTE_CAPABILITY[gpu_arch],
                 sm_count=sm_count,
                 fixed_layout=fixed_layout,
-                num_seqs=num_seqs,
+                num_sequences=num_seqs,
                 num_heads=num_heads,
-                max_seq_len=max_seq_len,
+                max_sequence_length=max_seq_len,
             ):
                 bt16_prepare_total_ctas = min(
                     num_heads * bt16_total_chunks, BT16_DENSE_PREP_WAVES * sm_count
