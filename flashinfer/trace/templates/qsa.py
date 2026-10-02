@@ -211,6 +211,7 @@ qsa_route_from_logical_trace = TraceTemplate(
         "table_width": Var(),
         "route_width": Var(),
         "mask_bytes": Var(description="num_rows * ceil(route_width / 8)."),
+        "num_indptr": Var(description="num_rows + 1."),
     },
     inputs={
         "logical": Tensor(_ROUTE),
@@ -220,10 +221,18 @@ qsa_route_from_logical_trace = TraceTemplate(
         "out_mask": Tensor(["mask_bytes"]),
         "valid_rows": Scalar("int32", description="Rows past it come out masked."),
         **_PAGING,
+        "out_indptr": Tensor(["num_indptr"], optional=True),
     },
     outputs={
         "out_route": Tensor(_ROUTE, param="out_route", dtype_from="out_route"),
         "out_mask": Tensor(["mask_bytes"], param="out_mask", dtype="uint8"),
+        "out_indptr": Tensor(
+            ["num_indptr"],
+            param="out_indptr",
+            dtype="int32",
+            optional=True,
+            description="min(r, valid_rows) * route_width: padding rows get none.",
+        ),
     },
     tags=["status:verified", "sparse"],
 )

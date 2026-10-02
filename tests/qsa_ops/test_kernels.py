@@ -471,11 +471,19 @@ def _check_route(
     mask = torch.empty(rows * -(-want.shape[1] // 8), dtype=torch.uint8, device=DEV)
     fused = [torch.empty_like(want), torch.empty_like(want), mask]
     two_step = [torch.empty_like(want), torch.empty_like(mask)]
+    indptr = torch.full((rows + 1,), -1, dtype=INT, device=DEV)
     qsa.qsa_route_from_blocks(blocks, pos, lens, t2r, table, *fused, ratio, page, slots)
-    qsa.qsa_route_from_logical(logical, t2r, table, *two_step, valid, page, slots)
+    qsa.qsa_route_from_logical(
+        logical, t2r, table, *two_step, valid, page, slots, out_indptr=indptr
+    )
     got = [qsa.qsa_expand_block_route(blocks, pos, lens, t2r, ratio), *fused, *two_step]
     ref = lambda lg, n: _slot_ref(lg, t2r, table, page, slots, n)
-    _exact(got, [want, want, *ref(want, rows), *ref(logical, valid)])
+    rows_in = (
+        torch.arange(rows + 1, device=DEV).clamp(max=valid) * want.shape[1]
+    ).int()
+    _exact(
+        got + [indptr], [want, want, *ref(want, rows), *ref(logical, valid), rows_in]
+    )
 
 
 def _rcase(rows, topk, cr, page=16, seq=512, nreq=4, valid=None, fill=None, t2r=None):
@@ -551,6 +559,16 @@ def test_route_from_logical_does_not_wrap_a_token(bad):
     _check_route(*_past_i32(0, 0), logical=logical)
 
 
+def test_route_from_logical_writes_the_row_pointers_of_an_empty_step():
+    z = lambda *shape: torch.zeros(shape, dtype=INT, device=DEV)
+    indptr = z(1) - 1  # a sentinel the call has to overwrite
+    route, mask = z(0, 4), z(0).byte()
+    qsa.qsa_route_from_logical(
+        route, z(0), z(1, 1), route, mask, 0, 16, 256, out_indptr=indptr
+    )
+    _exact([indptr], [z(1)])
+
+
 @pytest.mark.parametrize(
     "call,match",
     [
@@ -563,6 +581,7 @@ def test_route_from_logical_does_not_wrap_a_token(bad):
         (lambda a, lg: qsa.qsa_route_from_blocks(*a, 2**32, 16, 256), "32 bits"),
         (lambda a, lg: qsa.qsa_route_from_blocks(*a, 1, 2**32, 256), "32 bits"),
         (lambda a, lg: qsa.qsa_route_from_blocks(*a, 1, 16, 2**32), "32 bits"),
+        (lambda a, lg: qsa.qsa_route_from_logical(*lg, 1, 16, 256, a[3]), "rows \\+ 1"),
     ],
 )
 def test_route_refuses(call, match):

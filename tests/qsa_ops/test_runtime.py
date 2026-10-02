@@ -369,24 +369,25 @@ def test_attention_runs_from_dirty_buffers_without_allocating(monkeypatch):
 
 
 def test_attention_graphs_replay_together():
-    """Two rungs of one attention take turns; two attentions replay at once."""
+    """Rungs of one attention take turns, two batches on one of them; two attentions
+    replay at once."""
     atts = [_attention(rows=256), _attention(rows=256)]
     assert len(atts[0].row_buckets) > 1
     calls = []
-    for att, rows in ((atts[0], 16), (atts[0], 200), (atts[1], 200)):
+    for att, rows in ((atts[0], 16), (atts[0], 256), (atts[0], 200), (atts[1], 200)):
         b = _batch(rows, seed=rows)
         out = _run(att, b)
         call = lambda att=att, b=b, out=out: _run(att, b, out=out)
         calls.append((call, out, out.clone()))
     graphs = [_capture(call) for call, _, _ in calls]
-    for graph, (_, out, want) in [*zip(graphs[:2], calls, strict=False)] * 2:
+    for graph, (_, out, want) in [*zip(graphs[:3], calls, strict=False)] * 2:
         out.zero_()
         graph.replay()
         _exact([out], [want])
     for _, out, _ in calls:
         out.zero_()
-    _replay_on_streams(graphs[1:])
-    _exact([c[1] for c in calls[1:]], [c[2] for c in calls[1:]])
+    _replay_on_streams(graphs[2:])
+    _exact([c[1] for c in calls[2:]], [c[2] for c in calls[2:]])
 
 
 @pytest.mark.parametrize(

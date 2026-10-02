@@ -18,6 +18,7 @@
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
+using tvm::ffi::Optional;
 
 void qsa_expand_block_route(TensorView indexer_block_ids, TensorView query_positions,
                             TensorView seq_lens, TensorView token_to_request, TensorView out,
@@ -178,7 +179,7 @@ void qsa_route_from_blocks(TensorView indexer_block_ids, TensorView query_positi
 
 void qsa_route_from_logical(TensorView logical, TensorView token_to_request, TensorView block_table,
                             TensorView out_route, TensorView out_mask, int64_t valid_rows,
-                            int64_t page_size, int64_t num_slots) {
+                            int64_t page_size, int64_t num_slots, Optional<TensorView> out_indptr) {
   CHECK_DEVICE(logical, out_route);
   CHECK_DEVICE(block_table, out_route);
   CHECK_DEVICE(token_to_request, out_route);
@@ -221,6 +222,18 @@ void qsa_route_from_logical(TensorView logical, TensorView token_to_request, Ten
   TVM_FFI_ICHECK_EQ(out_route.dtype(), logical.dtype());
   TVM_FFI_ICHECK_EQ(block_table.dtype(), logical.dtype());
   TVM_FFI_ICHECK_EQ(token_to_request.dtype(), logical.dtype());
+  int32_t* indptr = nullptr;
+  if (out_indptr.has_value()) {
+    const TensorView& t = out_indptr.value();
+    CHECK_DEVICE(t, out_route);
+    CHECK_CONTIGUOUS(t);
+    CHECK_DIM(1, t);
+    TVM_FFI_ICHECK(t.dtype() == dl_int32) << "out_indptr must be int32";
+    TVM_FFI_ICHECK_EQ(t.size(0), rows + 1) << "out_indptr must hold rows + 1 entries";
+    // Its last entry is rows * width, written as an int32.
+    TVM_FFI_ICHECK_LE(rows * width, 2147483647LL) << "rows * width must fit in an int32 indptr";
+    indptr = static_cast<int32_t*>(t.data_ptr());
+  }
 
   ffi::CUDADeviceGuard device_guard(out_route.device().device_id);
   const cudaStream_t stream = get_stream(out_route.device());
@@ -230,11 +243,12 @@ void qsa_route_from_logical(TensorView logical, TensorView token_to_request, Ten
         static_cast<const c_idtype*>(token_to_request.data_ptr()),
         static_cast<const c_idtype*>(block_table.data_ptr()),
         static_cast<c_idtype*>(out_route.data_ptr()), static_cast<uint8_t*>(out_mask.data_ptr()),
-        static_cast<uint32_t>(logical.stride(0)), static_cast<uint32_t>(block_table.stride(0)),
-        static_cast<uint32_t>(rows), static_cast<uint32_t>(valid_rows),
-        static_cast<uint32_t>(block_table.size(0)), static_cast<uint32_t>(width),
-        static_cast<uint32_t>(block_table.size(1)), static_cast<uint32_t>(page_size),
-        static_cast<uint32_t>(num_slots), static_cast<uint32_t>(mask_bytes), stream);
+        indptr, static_cast<uint32_t>(logical.stride(0)),
+        static_cast<uint32_t>(block_table.stride(0)), static_cast<uint32_t>(rows),
+        static_cast<uint32_t>(valid_rows), static_cast<uint32_t>(block_table.size(0)),
+        static_cast<uint32_t>(width), static_cast<uint32_t>(block_table.size(1)),
+        static_cast<uint32_t>(page_size), static_cast<uint32_t>(num_slots),
+        static_cast<uint32_t>(mask_bytes), stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "QSARouteFromLogical failed: " << cudaGetErrorString(status);
     return true;

@@ -202,8 +202,9 @@ class _Persistent(NamedTuple):
 
     The plans keep byte offsets into the integer arena and read them back when
     they run; the row pointers are read by every plan that was built against
-    them. Neither is rewritten by a call, so neither can live in memory another
-    consumer reuses in the meantime.
+    them. Both outlive a call, so neither can live in memory another consumer
+    reuses in the meantime. A call does rewrite its bucket's row pointers, ahead
+    of the plan that reads them, to give the padding rows no entries.
     """
 
     arena: Tuple[int, int]
@@ -688,6 +689,15 @@ class QSAAttention:
         # through would otherwise leave an object that looks planned and is not.
         wrappers = {}
         for rows, start, end in ranges:
+            # The planner splits the work by the lengths it reads here, so every
+            # row has to have the full width -- a call before this one may have
+            # left its padding rows at none.
+            torch.arange(
+                0,
+                (rows + 1) * self.route_width,
+                self.route_width,
+                out=self._indptr[rows],
+            )
             wrapper = BlockSparseAttentionWrapper(
                 self._float_workspace,
                 backend=self.backend,
@@ -1011,7 +1021,9 @@ class QSAAttention:
             )
 
         # The route for this step, mapped into the plan's own buffers. Rows past
-        # the batch are padding and come out fully masked.
+        # the batch are padding: they come out fully masked, and their row
+        # pointers give them no entries, so the plan's work for them reads
+        # nothing. A padding row costs what a real one does otherwise.
         qsa_route_from_logical(
             route,
             token_to_request,
@@ -1021,6 +1033,7 @@ class QSAAttention:
             rows,
             self.page_size,
             self.num_slots,
+            out_indptr=self._indptr[bucket],
         )
 
         padded_q = self._padded_q[:bucket]

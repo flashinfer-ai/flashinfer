@@ -296,7 +296,8 @@ def qsa_route_from_blocks(
 
 
 @register_custom_op(
-    "flashinfer::qsa_route_from_logical", mutates_args=("out_route", "out_mask")
+    "flashinfer::qsa_route_from_logical",
+    mutates_args=("out_route", "out_mask", "out_indptr"),
 )
 def _qsa_route_from_logical(
     logical: torch.Tensor,
@@ -307,6 +308,7 @@ def _qsa_route_from_logical(
     valid_rows: int,
     page_size: int,
     num_slots: int,
+    out_indptr: Optional[torch.Tensor],
 ) -> None:
     get_qsa_route_module().qsa_route_from_logical(
         logical,
@@ -317,6 +319,7 @@ def _qsa_route_from_logical(
         valid_rows,
         page_size,
         num_slots,
+        out_indptr,
     )
 
 
@@ -330,6 +333,7 @@ def _qsa_route_from_logical_fake(
     valid_rows: int,
     page_size: int,
     num_slots: int,
+    out_indptr: Optional[torch.Tensor],
 ) -> None:
     pass
 
@@ -344,6 +348,7 @@ def qsa_route_from_logical(
     valid_rows: int,
     page_size: int,
     num_slots: int,
+    out_indptr: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Map a logical token route through a block table into physical KV slots.
 
@@ -379,12 +384,17 @@ def qsa_route_from_logical(
         KV entries per physical page.
     num_slots : int
         Total KV entries the cache holds.
+    out_indptr : Optional[torch.Tensor]
+        Receives the row pointers of a block-sparse plan over this route, ``rows + 1``
+        int32: ``min(r, valid_rows) * width``. The rows past ``valid_rows`` are given
+        no entries, so the plan's work for them reads nothing instead of attending
+        over a route that is all masked.
     """
     if out_route.ndim != 2:
         raise ValueError(f"out_route must be 2D [rows, width], got {out_route.ndim}D")
     if page_size < 1:
         raise ValueError(f"page_size must be positive, got {page_size}")
-    if out_route.shape[0] == 0:
+    if out_route.shape[0] == 0 and out_indptr is None:
         return
     _qsa_route_from_logical(
         logical,
@@ -395,4 +405,5 @@ def qsa_route_from_logical(
         valid_rows,
         page_size,
         num_slots,
+        out_indptr,
     )

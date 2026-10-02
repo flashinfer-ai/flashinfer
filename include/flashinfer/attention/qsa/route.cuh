@@ -467,6 +467,12 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
  * because they are read before the mask is applied (see
  * sparse_route::first_valid_slot). A row with no valid entry is fully masked on slot
  * 0 and its output is undefined.
+ *
+ * out_indptr, when given, receives the row pointers of a block-sparse plan laid out
+ * over this route, width entries per row, with the rows past valid_rows given none:
+ * out_indptr[r] = min(r, valid_rows) * width. The plan's work for a padding row then
+ * finds a zero length and reads nothing, where a full length would attend over the
+ * whole of a route that is all masked.
  */
 template <uint32_t TILE, uint32_t THREADS, typename IdType>
 __global__ void __launch_bounds__(THREADS)
@@ -474,15 +480,21 @@ __global__ void __launch_bounds__(THREADS)
                               const IdType* __restrict__ token_to_req,
                               const IdType* __restrict__ block_table,
                               IdType* __restrict__ out_route, uint8_t* __restrict__ out_mask,
-                              uint32_t stride_logical_row, uint32_t stride_table_row, uint32_t rows,
-                              uint32_t valid_rows, uint32_t num_requests, uint32_t width,
-                              uint32_t table_width, uint_fastdiv page_size, uint32_t num_slots,
+                              int32_t* __restrict__ out_indptr, uint32_t stride_logical_row,
+                              uint32_t stride_table_row, uint32_t rows, uint32_t valid_rows,
+                              uint32_t num_requests, uint32_t width, uint32_t table_width,
+                              uint_fastdiv page_size, uint32_t num_slots,
                               uint32_t mask_bytes_per_row) {
   const uint32_t tile_base = blockIdx.x * TILE;
   if (tile_base >= width) return;
   // One grid cannot cover more rows than gridDim.y allows, so the rest are
   // walked by a stride. Every launch that fits takes the loop once.
   for (uint32_t row = blockIdx.y; row < rows; row += gridDim.y) {
+    if (out_indptr != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
+      // The host bounds rows * width to int32.
+      if (row == 0) out_indptr[0] = 0;
+      out_indptr[row + 1] = static_cast<int32_t>(min(row + 1, valid_rows) * width);
+    }
     // Rows past the caller's token count are padding: they carry no request and must
     // come out fully masked.
     // Same range contract as the expansion kernels: an index is bounded in its
@@ -544,12 +556,18 @@ __global__ void __launch_bounds__(THREADS)
 template <typename IdType>
 cudaError_t QSARouteFromLogical(const IdType* logical, const IdType* token_to_req,
                                 const IdType* block_table, IdType* out_route, uint8_t* out_mask,
-                                uint32_t stride_logical_row, uint32_t stride_table_row,
-                                uint32_t rows, uint32_t valid_rows, uint32_t num_requests,
-                                uint32_t width, uint32_t table_width, uint32_t page_size,
-                                uint32_t num_slots, uint32_t mask_bytes_per_row,
+                                int32_t* out_indptr, uint32_t stride_logical_row,
+                                uint32_t stride_table_row, uint32_t rows, uint32_t valid_rows,
+                                uint32_t num_requests, uint32_t width, uint32_t table_width,
+                                uint32_t page_size, uint32_t num_slots, uint32_t mask_bytes_per_row,
                                 cudaStream_t stream) {
-  if (rows == 0 || width == 0) return cudaSuccess;
+  if (rows == 0 || width == 0) {
+    // No row has an entry, so every row pointer is zero -- including the one a
+    // plan over an empty step still reads.
+    if (out_indptr == nullptr) return cudaSuccess;
+    return cudaMemsetAsync(out_indptr, 0, (static_cast<size_t>(rows) + 1) * sizeof(int32_t),
+                           stream);
+  }
   const uint32_t wide_blocks = rows * ceil_div(width, sparse_route::kWideTile);
   bool wide = true;
   // Hoisted into a name: the kernel's own template arguments written inline
@@ -568,13 +586,13 @@ cudaError_t QSARouteFromLogical(const IdType* logical, const IdType* token_to_re
   if (wide) {
     QSARouteFromLogicalKernel<sparse_route::kWideTile, sparse_route::kWideThreads, IdType>
         <<<grid, sparse_route::kWideThreads, 0, stream>>>(
-            logical, token_to_req, block_table, out_route, out_mask, stride_logical_row,
+            logical, token_to_req, block_table, out_route, out_mask, out_indptr, stride_logical_row,
             stride_table_row, rows, valid_rows, num_requests, width, table_width, page_div,
             num_slots, mask_bytes_per_row);
   } else {
     QSARouteFromLogicalKernel<sparse_route::kNarrowTile, sparse_route::kNarrowThreads, IdType>
         <<<grid, sparse_route::kNarrowThreads, 0, stream>>>(
-            logical, token_to_req, block_table, out_route, out_mask, stride_logical_row,
+            logical, token_to_req, block_table, out_route, out_mask, out_indptr, stride_logical_row,
             stride_table_row, rows, valid_rows, num_requests, width, table_width, page_div,
             num_slots, mask_bytes_per_row);
   }
