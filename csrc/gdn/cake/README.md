@@ -17,6 +17,12 @@ with per-variant SASS equivalence checks against the generated originals.
   lowering differences sit behind exact `__CUDA_ARCH__` guards.
   `cuda/gdn_prefill_generated.cuh` and `../cake_gdn_common.cuh` are the
   shared device headers.
+  Two `dvsplit_initial_bf16state` prefill variants
+  (`_135bfa59984f`, `_d8b5b50285af`) keep their own source with in-file
+  defines: compiled from the shared body with `-D`, their sm_103a SASS
+  differs from the original (branch layout shifts by two instructions,
+  deterministic on both sides), so they stay as separate files to keep
+  every variant SASS-identical to its original.
 - `host/` holds one TVM-FFI launcher per variant. The helpers they share
   (device guard, tensor checks, dynamic shared-memory opt-in) live in
   `host/cake_gdn_host_common.h`.
