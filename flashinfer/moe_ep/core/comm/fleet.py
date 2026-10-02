@@ -174,3 +174,9 @@ def create_fleet(
         available = sorted(_BACKEND_REGISTRY)
         raise KeyError(f"unknown backend {name!r}; available: {available}")
     return _BACKEND_REGISTRY[name](bootstrap, params, algo_knobs)
+
+
+def is_fleet_backend(backend: str | object) -> bool:
+    """Whether ``backend`` (a name or config object) names a registered Fleet."""
+    name = getattr(backend, "backend_name", backend)
+    return isinstance(name, str) and name in _BACKEND_REGISTRY

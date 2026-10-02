@@ -57,7 +57,10 @@ backend packs them); the kernel backend computes on this rank's expert shard.
 #### Comm backends (dispatch/combine transports)
 
 Comm backends come in two peer kinds, and `MoEEpSplitLayer` accepts either
-through `SplitConfig(comm=...)`. They differ in object model, not in role:
+through `SplitConfig(comm=...)`. They differ in object model, not in role.
+Inside the split layer each kind runs on its own path (the Fleet/Handle path
+and the MoEEpCommunication path); a backend must be registered as exactly one
+kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 
 - **`MoEEpCommunication`** (`core/comm/communication.py`) is a self-contained
   dispatch/combine object: one long-lived instance per EP group owns its

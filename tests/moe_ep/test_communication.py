@@ -226,11 +226,15 @@ class TestSplitLayerRouting:
         layer = _split_layer(NCCLEPConfig(), layout=EpLayout.EXPERT_MAJOR)
         assert not layer._uses_communication()
 
+    def test_unregistered_backend_is_rejected_at_init(self) -> None:
+        with pytest.raises(MoEEpConfigError, match="registered as neither"):
+            _split_layer("no_such_backend")
+
     def test_communication_backend_requires_rank_major(self, loopback_backend) -> None:
         with pytest.raises(MoEEpConfigError, match="RANK_MAJOR"):
             _split_layer(_LoopbackConfig(), layout=EpLayout.EXPERT_MAJOR)
 
-    def test_round_trip_translates_routing_to_local_ids(
+    def test_communication_path_translates_routing_to_local_ids(
         self, loopback_backend, isolated_single_rank_gloo
     ) -> None:
         layer = _split_layer(_LoopbackConfig())
