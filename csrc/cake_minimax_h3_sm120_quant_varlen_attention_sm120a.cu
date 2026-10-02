@@ -72,6 +72,8 @@ kernel_minimax_h3_sm120_varlen_kv_stats(__nv_bfloat16* __restrict__ K, __nv_bflo
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
+    const int cta_rank = 0;
+
     // Kernel setup ops
     float* red_sum = reinterpret_cast<float*>(smem_raw + 0);
     const int red_sum_addr = smem + 0;
@@ -208,6 +210,8 @@ kernel_minimax_h3_sm120_varlen_kv_stats_finalize(float* __restrict__ partials, i
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
+    const int cta_rank = 0;
+
     // === Task calls (dependency order) ===
     int chan = tid & 127;
     int is_max = tid >> 7;
@@ -276,6 +280,8 @@ kernel_minimax_h3_sm120_varlen_quantize_fp8(__nv_bfloat16* __restrict__ Q, __nv_
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     float* amax_part = reinterpret_cast<float*>(smem_raw + 0);
@@ -681,52 +687,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
@@ -744,136 +704,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "DONE:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
 }
 
 
@@ -905,34 +735,8 @@ __device__ __forceinline__ float approx_rcp(float x) {
 }
 
 
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
 
 
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
-
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
-
-
-__device__ __forceinline__ void tma_3d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
-           "r"(mbar_addr) : "memory");
-}
 
 
 __global__ __launch_bounds__(256, 1) void
@@ -955,6 +759,8 @@ kernel_minimax_h3_sm120_varlen_attention_fp8(const __grid_constant__ CUtensorMap
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     uint8_t* Q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
@@ -2947,10 +2753,10 @@ kernel_minimax_h3_sm120_varlen_attention_fp8(const __grid_constant__ CUtensorMap
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <mutex>
-#include <vector>
 
 #include "tvm_ffi_utils.h"
+
+#include "cake_minimax_h3_sm120_host.cuh"
 
 namespace {
 
@@ -2972,59 +2778,28 @@ struct DeviceInfo {
   int num_sms;
 };
 
+struct DeviceTag {};
+
 DeviceInfo ConfigureKernels() {
-  static std::mutex mutex;
-  static std::vector<std::pair<int, DeviceInfo>> configured;
-  int device = -1;
-  cudaError_t status = cudaGetDevice(&device);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "failed to get the active CUDA device: " << cudaGetErrorString(status);
-  std::lock_guard<std::mutex> lock(mutex);
-  for (const auto& entry : configured) {
-    if (entry.first == device) return entry.second;
-  }
-  cudaDeviceProp properties{};
-  status = cudaGetDeviceProperties(&properties, device);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "failed to query CUDA device properties: " << cudaGetErrorString(status);
-  TVM_FFI_CHECK(properties.major == 12, RuntimeError)
-      << "MiniMax-H3 SM120 FP8 varlen attention requires compute capability 12.x (GB202)";
-  status = cudaFuncSetAttribute(h3_varlen_attention_fp8_sm120a::kernel_minimax_h3_sm120_varlen_attention_fp8,
-                                cudaFuncAttributeMaxDynamicSharedMemorySize, kAttentionSmemBytes);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "failed to opt in to dynamic shared memory: " << cudaGetErrorString(status);
-  DeviceInfo info{properties.multiProcessorCount};
-  configured.emplace_back(device, info);
-  return info;
+  return minimax_h3_sm120::DeviceConfig<DeviceTag, DeviceInfo>::Get(
+      "MiniMax-H3 SM120 FP8 varlen attention", [](const cudaDeviceProp& properties) {
+        minimax_h3_sm120::OptInDynamicSmem(
+            h3_varlen_attention_fp8_sm120a::kernel_minimax_h3_sm120_varlen_attention_fp8, kAttentionSmemBytes);
+        return DeviceInfo{properties.multiProcessorCount};
+      });
 }
 
 void CheckDevice(const TensorView& tensor, const char* name, DLDevice device) {
-  TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError) << name << " must be a CUDA tensor";
-  TVM_FFI_CHECK(tensor.device().device_id == device.device_id, ValueError)
-      << name << " must be on the same CUDA device as q";
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0, ValueError)
-      << name << " must be 16-byte aligned";
+  minimax_h3_sm120::CheckDevice(tensor, name, device, "q");
 }
 
 void CheckThd(const TensorView& tensor, const char* name, int64_t tokens, int64_t heads, DLDevice device) {
-  CheckDevice(tensor, name, device);
-  TVM_FFI_CHECK(encode_dlpack_dtype(tensor.dtype()) == encode_dlpack_dtype(dl_bfloat16), ValueError)
-      << name << " must be bfloat16";
-  TVM_FFI_CHECK(tensor.ndim() == 3 && tensor.size(0) == tokens && tensor.size(1) == heads &&
-                    tensor.size(2) == kHeadDim,
-                ValueError)
-      << name << " must have shape [tokens, heads, 128]";
-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
+  minimax_h3_sm120::CheckThd(tensor, name, tokens, heads, kHeadDim, device, "q");
 }
 
 void CheckFlat(const TensorView& tensor, const char* name, DLDataType dtype, const char* dtype_name,
                int64_t min_numel, DLDevice device) {
-  CheckDevice(tensor, name, device);
-  TVM_FFI_CHECK(encode_dlpack_dtype(tensor.dtype()) == encode_dlpack_dtype(dtype), ValueError)
-      << name << " must be " << dtype_name;
-  TVM_FFI_CHECK(tensor.ndim() == 1 && tensor.IsContiguous() && tensor.size(0) >= min_numel, ValueError)
-      << name << " must be a contiguous 1-D " << dtype_name << " tensor with at least " << min_numel
-      << " elements";
+  minimax_h3_sm120::CheckFlat(tensor, name, dtype, dtype_name, min_numel, device, "q");
 }
 
 // One head's [128 channels x box_rows tokens] E4M3 tile of a [tokens, heads, 128] byte tensor,
@@ -3033,38 +2808,15 @@ void CheckFlat(const TensorView& tensor, const char* name, DLDataType dtype, con
 // those query rows.
 CUtensorMap EncodeRowsTile(const TensorView& rows, int64_t tokens, int64_t heads, uint32_t box_rows,
                            const char* name) {
-  uint64_t global_dim[3] = {static_cast<uint64_t>(kHeadDim), static_cast<uint64_t>(tokens),
-                            static_cast<uint64_t>(heads)};
-  uint64_t global_strides[2] = {static_cast<uint64_t>(heads * kHeadDim), static_cast<uint64_t>(kHeadDim)};
-  uint32_t box_dim[3] = {static_cast<uint32_t>(kHeadDim), box_rows, 1};
-  uint32_t element_strides[3] = {1, 1, 1};
-  CUtensorMap descriptor{};
-  CUresult result = cuTensorMapEncodeTiled(
-      &descriptor, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, rows.data_ptr(), global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "failed to encode the " << name << " tensor map: CUresult=" << static_cast<int>(result);
-  return descriptor;
+  return minimax_h3_sm120::EncodeHeadRowsTile(rows.data_ptr(), kHeadDim, tokens, heads, box_rows,
+                                               CU_TENSOR_MAP_SWIZZLE_128B, name);
 }
 
 // One head's [128 channel rows x 128 keys] tile of the transposed V^T byte tensor [heads, 128,
 // padded_tokens]: 3-D view (padded tokens, channels, heads), 128-byte swizzle.
 CUtensorMap EncodeTransposedTile(const TensorView& vt, int64_t padded_tokens, int64_t heads, const char* name) {
-  uint64_t global_dim[3] = {static_cast<uint64_t>(padded_tokens), static_cast<uint64_t>(kHeadDim),
-                            static_cast<uint64_t>(heads)};
-  uint64_t global_strides[2] = {static_cast<uint64_t>(padded_tokens),
-                                static_cast<uint64_t>(padded_tokens * kHeadDim)};
-  uint32_t box_dim[3] = {static_cast<uint32_t>(kBlockN), static_cast<uint32_t>(kHeadDim), 1};
-  uint32_t element_strides[3] = {1, 1, 1};
-  CUtensorMap descriptor{};
-  CUresult result = cuTensorMapEncodeTiled(
-      &descriptor, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, vt.data_ptr(), global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "failed to encode the " << name << " tensor map: CUresult=" << static_cast<int>(result);
-  return descriptor;
+  return minimax_h3_sm120::EncodeTransposedHeadTile(vt.data_ptr(), padded_tokens, kHeadDim, heads,
+                                                     static_cast<uint32_t>(kBlockN), CU_TENSOR_MAP_SWIZZLE_128B, name);
 }
 
 }  // namespace

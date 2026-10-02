@@ -85,52 +85,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
@@ -148,136 +102,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
 
 __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
     asm volatile(
@@ -293,34 +117,8 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
 
 
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
-
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
-
-
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
 
 
 __device__ __forceinline__ unsigned int __as_u32(float v) {
@@ -356,6 +154,8 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + 1024);
@@ -458,40 +258,32 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
                     #pragma unroll 2
                     for (int j = 0; j < 7; j++) {
                         {
-                            const uint4* _ivptr_0 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j * 2)) * 8) + 0);
-                            uint4 _ivld_0;
-                            _ivld_0 = *_ivptr_0;
-                            qw[0 + 0] = _ivld_0.x;
-                            qw[0 + 1] = _ivld_0.y;
-                            qw[0 + 2] = _ivld_0.z;
-                            qw[0 + 3] = _ivld_0.w;
+                            uint4 _uv4_0 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j * 2)) * 8) + 0);
+                            qw[0 + 0] = _uv4_0.x;
+                            qw[0 + 1] = _uv4_0.y;
+                            qw[0 + 2] = _uv4_0.z;
+                            qw[0 + 3] = _uv4_0.w;
                         }
                         {
-                            const uint4* _ivptr_1 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j * 2)) * 8 + 4) + 0);
-                            uint4 _ivld_1;
-                            _ivld_1 = *_ivptr_1;
-                            qw[4 + 0] = _ivld_1.x;
-                            qw[4 + 1] = _ivld_1.y;
-                            qw[4 + 2] = _ivld_1.z;
-                            qw[4 + 3] = _ivld_1.w;
+                            uint4 _uv4_1 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j * 2)) * 8 + 4) + 0);
+                            qw[4 + 0] = _uv4_1.x;
+                            qw[4 + 1] = _uv4_1.y;
+                            qw[4 + 2] = _uv4_1.z;
+                            qw[4 + 3] = _uv4_1.w;
                         }
                         {
-                            const uint4* _ivptr_2 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j * 2 + 1)) * 8) + 0);
-                            uint4 _ivld_2;
-                            _ivld_2 = *_ivptr_2;
-                            qw[8 + 0] = _ivld_2.x;
-                            qw[8 + 1] = _ivld_2.y;
-                            qw[8 + 2] = _ivld_2.z;
-                            qw[8 + 3] = _ivld_2.w;
+                            uint4 _uv4_2 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j * 2 + 1)) * 8) + 0);
+                            qw[8 + 0] = _uv4_2.x;
+                            qw[8 + 1] = _uv4_2.y;
+                            qw[8 + 2] = _uv4_2.z;
+                            qw[8 + 3] = _uv4_2.w;
                         }
                         {
-                            const uint4* _ivptr_3 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j * 2 + 1)) * 8 + 4) + 0);
-                            uint4 _ivld_3;
-                            _ivld_3 = *_ivptr_3;
-                            qw[12 + 0] = _ivld_3.x;
-                            qw[12 + 1] = _ivld_3.y;
-                            qw[12 + 2] = _ivld_3.z;
-                            qw[12 + 3] = _ivld_3.w;
+                            uint4 _uv4_3 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j * 2 + 1)) * 8 + 4) + 0);
+                            qw[12 + 0] = _uv4_3.x;
+                            qw[12 + 1] = _uv4_3.y;
+                            qw[12 + 2] = _uv4_3.z;
+                            qw[12 + 3] = _uv4_3.w;
                         }
                         float qw_f32[16];
                         #pragma unroll
@@ -636,40 +428,32 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
                     #pragma unroll 2
                     for (int j_1 = 0; j_1 < 7; j_1++) {
                         {
-                            const uint4* _ivptr_4 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j_1 * 2)) * 8) + 0);
-                            uint4 _ivld_4;
-                            _ivld_4 = *_ivptr_4;
-                            qw[0 + 0] = _ivld_4.x;
-                            qw[0 + 1] = _ivld_4.y;
-                            qw[0 + 2] = _ivld_4.z;
-                            qw[0 + 3] = _ivld_4.w;
+                            uint4 _uv4_4 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j_1 * 2)) * 8) + 0);
+                            qw[0 + 0] = _uv4_4.x;
+                            qw[0 + 1] = _uv4_4.y;
+                            qw[0 + 2] = _uv4_4.z;
+                            qw[0 + 3] = _uv4_4.w;
                         }
                         {
-                            const uint4* _ivptr_5 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j_1 * 2)) * 8 + 4) + 0);
-                            uint4 _ivld_5;
-                            _ivld_5 = *_ivptr_5;
-                            qw[4 + 0] = _ivld_5.x;
-                            qw[4 + 1] = _ivld_5.y;
-                            qw[4 + 2] = _ivld_5.z;
-                            qw[4 + 3] = _ivld_5.w;
+                            uint4 _uv4_5 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j_1 * 2)) * 8 + 4) + 0);
+                            qw[4 + 0] = _uv4_5.x;
+                            qw[4 + 1] = _uv4_5.y;
+                            qw[4 + 2] = _uv4_5.z;
+                            qw[4 + 3] = _uv4_5.w;
                         }
                         {
-                            const uint4* _ivptr_6 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j_1 * 2 + 1)) * 8) + 0);
-                            uint4 _ivld_6;
-                            _ivld_6 = *_ivptr_6;
-                            qw[8 + 0] = _ivld_6.x;
-                            qw[8 + 1] = _ivld_6.y;
-                            qw[8 + 2] = _ivld_6.z;
-                            qw[8 + 3] = _ivld_6.w;
+                            uint4 _uv4_6 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j_1 * 2 + 1)) * 8) + 0);
+                            qw[8 + 0] = _uv4_6.x;
+                            qw[8 + 1] = _uv4_6.y;
+                            qw[8 + 2] = _uv4_6.z;
+                            qw[8 + 3] = _uv4_6.w;
                         }
                         {
-                            const uint4* _ivptr_7 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j_1 * 2 + 1)) * 8 + 4) + 0);
-                            uint4 _ivld_7;
-                            _ivld_7 = *_ivptr_7;
-                            qw[12 + 0] = _ivld_7.x;
-                            qw[12 + 1] = _ivld_7.y;
-                            qw[12 + 2] = _ivld_7.z;
-                            qw[12 + 3] = _ivld_7.w;
+                            uint4 _uv4_7 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * (j_1 * 2 + 1)) * 8 + 4) + 0);
+                            qw[12 + 0] = _uv4_7.x;
+                            qw[12 + 1] = _uv4_7.y;
+                            qw[12 + 2] = _uv4_7.z;
+                            qw[12 + 3] = _uv4_7.w;
                         }
                         float qw_f32_1[16];
                         #pragma unroll
@@ -3134,52 +2918,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
@@ -3197,136 +2935,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
 
 __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
     asm volatile(
@@ -3342,34 +2950,8 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
 
 
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
-
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
-
-
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
 
 
 __device__ __forceinline__ unsigned int __as_u32(float v) {
@@ -3405,6 +2987,8 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     uint8_t* A_stage = reinterpret_cast<uint8_t*>(smem_raw + 1024);
@@ -3519,40 +3103,32 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
                     #pragma unroll 2
                     for (int j = 0; j < 7; j++) {
                         {
-                            const uint4* _ivptr_0 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * j) * 16) + 0);
-                            uint4 _ivld_0;
-                            _ivld_0 = *_ivptr_0;
-                            qw[0 + 0] = _ivld_0.x;
-                            qw[0 + 1] = _ivld_0.y;
-                            qw[0 + 2] = _ivld_0.z;
-                            qw[0 + 3] = _ivld_0.w;
+                            uint4 _uv4_0 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * j) * 16) + 0);
+                            qw[0 + 0] = _uv4_0.x;
+                            qw[0 + 1] = _uv4_0.y;
+                            qw[0 + 2] = _uv4_0.z;
+                            qw[0 + 3] = _uv4_0.w;
                         }
                         {
-                            const uint4* _ivptr_1 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * j) * 16 + 4) + 0);
-                            uint4 _ivld_1;
-                            _ivld_1 = *_ivptr_1;
-                            qw[4 + 0] = _ivld_1.x;
-                            qw[4 + 1] = _ivld_1.y;
-                            qw[4 + 2] = _ivld_1.z;
-                            qw[4 + 3] = _ivld_1.w;
+                            uint4 _uv4_1 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * j) * 16 + 4) + 0);
+                            qw[4 + 0] = _uv4_1.x;
+                            qw[4 + 1] = _uv4_1.y;
+                            qw[4 + 2] = _uv4_1.z;
+                            qw[4 + 3] = _uv4_1.w;
                         }
                         {
-                            const uint4* _ivptr_2 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * j) * 16 + 8) + 0);
-                            uint4 _ivld_2;
-                            _ivld_2 = *_ivptr_2;
-                            qw[8 + 0] = _ivld_2.x;
-                            qw[8 + 1] = _ivld_2.y;
-                            qw[8 + 2] = _ivld_2.z;
-                            qw[8 + 3] = _ivld_2.w;
+                            uint4 _uv4_2 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * j) * 16 + 8) + 0);
+                            qw[8 + 0] = _uv4_2.x;
+                            qw[8 + 1] = _uv4_2.y;
+                            qw[8 + 2] = _uv4_2.z;
+                            qw[8 + 3] = _uv4_2.w;
                         }
                         {
-                            const uint4* _ivptr_3 = reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * j) * 16 + 12) + 0);
-                            uint4 _ivld_3;
-                            _ivld_3 = *_ivptr_3;
-                            qw[12 + 0] = _ivld_3.x;
-                            qw[12 + 1] = _ivld_3.y;
-                            qw[12 + 2] = _ivld_3.z;
-                            qw[12 + 3] = _ivld_3.w;
+                            uint4 _uv4_3 = *reinterpret_cast<const uint4*>(attn_out_w + (row * 3584 + (lane + 32 * j) * 16 + 12) + 0);
+                            qw[12 + 0] = _uv4_3.x;
+                            qw[12 + 1] = _uv4_3.y;
+                            qw[12 + 2] = _uv4_3.z;
+                            qw[12 + 3] = _uv4_3.w;
                         }
                         float qw_f32[16];
                         #pragma unroll
@@ -6421,6 +5997,8 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
 
 #include "tvm_ffi_utils.h"
 
+#include "cake_minimax_h3_sm120_host.cuh"
+
 namespace {
 
 constexpr int64_t kHidden = 5376;   // output width N
@@ -6443,10 +6021,7 @@ using GemmKernel = void (*)(CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, 
                             float*, float*, float*, __nv_bfloat16*, int*, __nv_bfloat16*, unsigned int*, unsigned int*,
                             int, int, int, float);
 
-struct GemmVariant {
-  GemmKernel kernel;
-  int dynamic_smem_bytes;
-};
+using GemmVariant = minimax_h3_sm120::GemmVariant<GemmKernel>;
 
 // [quant (0 = fp8, 1 = nvfp4)]
 const GemmVariant kGemmVariants[2] = {
@@ -6456,88 +6031,31 @@ const GemmVariant kGemmVariants[2] = {
 
 void CheckTensor(const TensorView& tensor, const char* name, DLDevice device, DLDataType dtype,
                  std::initializer_list<int64_t> shape) {
-  TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError) << name << " must be a CUDA tensor";
-  TVM_FFI_CHECK(tensor.device().device_id == device.device_id, ValueError)
-      << name << " must be on the same CUDA device as attn_out";
-  TVM_FFI_CHECK(encode_dlpack_dtype(tensor.dtype()) == encode_dlpack_dtype(dtype), ValueError)
-      << name << " has the wrong dtype";
-  TVM_FFI_CHECK(tensor.ndim() == static_cast<int>(shape.size()), ValueError)
-      << name << " must have " << shape.size() << " dimensions";
-  int64_t expected_stride = 1;
-  int dim = tensor.ndim() - 1;
-  for (auto it = std::rbegin(shape); it != std::rend(shape); ++it, --dim) {
-    TVM_FFI_CHECK(tensor.size(dim) == *it, ValueError) << name << " has the wrong shape (dimension " << dim << ")";
-    TVM_FFI_CHECK(tensor.size(dim) == 1 || tensor.stride(dim) == expected_stride, ValueError)
-        << name << " must be contiguous";
-    expected_stride *= *it;
-  }
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0, ValueError)
-      << name << " must be 16-byte aligned";
+  minimax_h3_sm120::CheckTensor(tensor, name, device, dtype, shape, "attn_out");
 }
 
-// 2-D byte tile map: rows of ``inner_bytes`` contiguous bytes, box = ``box_rows`` x ``box_inner`` bytes.
-// Rows beyond the tensor are zero-filled by TMA (partial M tail tiles).
-CUtensorMap EncodeByteTile(const void* base, int64_t inner_bytes, int64_t rows, uint32_t box_inner,
-                           uint32_t box_rows, CUtensorMapSwizzle swizzle, const char* name) {
-  uint64_t global_dim[2] = {static_cast<uint64_t>(inner_bytes), static_cast<uint64_t>(rows)};
-  uint64_t global_strides[1] = {static_cast<uint64_t>(inner_bytes)};
-  uint32_t box_dim[2] = {box_inner, box_rows};
-  uint32_t element_strides[2] = {1, 1};
-  CUtensorMap descriptor{};
-  CUresult result = cuTensorMapEncodeTiled(
-      &descriptor, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(base), global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "failed to encode the " << name << " tensor map: CUresult=" << static_cast<int>(result);
-  return descriptor;
-}
+using minimax_h3_sm120::EncodeByteTile;
+
+struct DeviceTag {};
 
 int ConfigureKernels() {
-  static std::mutex mutex;
-  static std::vector<std::pair<int, int>> configured_devices;
-  int device = -1;
-  cudaError_t status = cudaGetDevice(&device);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "failed to get the active CUDA device: " << cudaGetErrorString(status);
-  std::lock_guard<std::mutex> lock(mutex);
-  for (const auto& entry : configured_devices) {
-    if (entry.first == device) return entry.second;
-  }
-  cudaDeviceProp properties{};
-  status = cudaGetDeviceProperties(&properties, device);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "failed to query CUDA device properties: " << cudaGetErrorString(status);
-  TVM_FFI_CHECK(properties.major == 12, RuntimeError)
-      << "MiniMax-H3 SM120 quantized output projection requires compute capability 12.x (GB202); got "
-      << properties.major << "." << properties.minor;
-  for (const auto& variant : kGemmVariants) {
-    status = cudaFuncSetAttribute(variant.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  variant.dynamic_smem_bytes);
-    TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-        << "failed to opt in to dynamic shared memory: " << cudaGetErrorString(status);
-  }
-  configured_devices.emplace_back(device, properties.multiProcessorCount);
-  return properties.multiProcessorCount;
+  return minimax_h3_sm120::DeviceConfig<DeviceTag, int>::Get(
+      "MiniMax-H3 SM120 quantized output projection", [](const cudaDeviceProp& properties) {
+        for (const auto& variant : kGemmVariants) {
+          minimax_h3_sm120::OptInDynamicSmem(variant.kernel, variant.dynamic_smem_bytes);
+        }
+        return properties.multiProcessorCount;
+      });
 }
 
-struct LaunchPlan {
-  int gemm_grid;
-  int num_m_tiles;
-  int total_tiles;
-};
+using LaunchPlan = minimax_h3_sm120::GemmLaunchPlan;
 
 LaunchPlan MakeLaunchPlan(int64_t rows, int num_sms) {
   // Mirrors the Python launch_plan(): one persistent CTA per SM (ctas_per_sm = 1).  The in-kernel
   // quantization / TMA flag protocol needs every CTA resident, which a grid of at most one CTA per
-  // SM (384 threads, ~92 KB dynamic SMEM) guarantees.
-  const int64_t num_m_tiles = (rows + kBlockM - 1) / kBlockM;
-  const int64_t total_tiles = num_m_tiles * kNTiles;
-  LaunchPlan plan{};
-  plan.gemm_grid = static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(total_tiles, num_sms)));
-  plan.num_m_tiles = static_cast<int>(num_m_tiles);
-  plan.total_tiles = static_cast<int>(total_tiles);
-  return plan;
+  // SM (384 threads, ~92 KB dynamic SMEM) guarantees.  There is no separate quantization launch
+  // (quant_grid is unused).
+  return minimax_h3_sm120::MakeGemmLaunchPlan(rows, num_sms, kBlockM, kNTiles, 1);
 }
 
 struct CommonArgs {
