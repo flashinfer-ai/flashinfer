@@ -589,16 +589,11 @@ def test_auto_declines_cutlass_under_cuda_graph(monkeypatch):
     assert wrapper._backend == "fa2"
 
 
-@requires_cutlass_arch
-def test_explicit_cutlass_refuses_cuda_graph():
-    """An explicit `backend="cutlass"` says so plainly instead of going stale."""
-    dev = torch.device("cuda")
-    batch, s_q, s_kv = 2, 512, 512
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
-    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_q
-    kv_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_kv
-
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+def _graph_cutlass_wrapper(qo_indptr, kv_indptr):
+    workspace = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device=qo_indptr.device
+    )
+    return flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace,
         "NHD",
         use_cuda_graph=True,
@@ -606,18 +601,93 @@ def test_explicit_cutlass_refuses_cuda_graph():
         kv_indptr_buf=kv_indptr.clone(),
         backend="cutlass",
     )
-    with pytest.raises(ValueError, match="not CUDA-graph safe"):
-        wrapper.plan(
-            qo_indptr,
-            kv_indptr,
-            32,
-            32,
-            128,
-            head_dim_vo=128,
-            causal=True,
-            q_data_type=DTYPE,
-            kv_data_type=DTYPE,
-        )
+
+
+@requires_cutlass_arch
+def test_explicit_cutlass_plan_once_then_capture_under_cuda_graph():
+    """Plan once, capture, replay: legal with `use_cuda_graph=True` (as in v0.7.0).
+
+    Nothing has been captured when the first plan() runs, so the buffers it
+    allocates are the ones the graph records. Replays over fresh input values
+    must match an eager CUTLASS run and FA2.
+    """
+    dev = torch.device("cuda")
+    h_qo, h_kv, d = 32, 8, 128
+    # Ragged, uneven lengths so the work list is not trivially uniform.
+    qo_indptr = torch.tensor([0, 300, 812], dtype=torch.int32, device=dev)
+    kv_indptr = torch.tensor([0, 400, 1024], dtype=torch.int32, device=dev)
+    nnz_qo, nnz_kv = int(qo_indptr[-1]), int(kv_indptr[-1])
+    plan_args = (qo_indptr, kv_indptr, h_qo, h_kv, d)
+    plan_kwargs = dict(
+        head_dim_vo=d, causal=True, q_data_type=DTYPE, kv_data_type=DTYPE
+    )
+
+    wrapper = _graph_cutlass_wrapper(qo_indptr, kv_indptr)
+    wrapper.plan(*plan_args, **plan_kwargs)
+    assert wrapper._backend == "cutlass"
+
+    q = torch.empty(nnz_qo, h_qo, d, dtype=DTYPE, device=dev)
+    k = torch.empty(nnz_kv, h_kv, d, dtype=DTYPE, device=dev)
+    v = torch.empty(nnz_kv, h_kv, d, dtype=DTYPE, device=dev)
+
+    def fill(seed):
+        g = torch.Generator(device=dev).manual_seed(seed)
+        for t in (q, k, v):
+            t.copy_(torch.randn(t.shape, generator=g, device=dev, dtype=DTYPE))
+
+    # Warm up (JIT load, first launch) on a side stream before capture.
+    fill(0)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        wrapper.run(q, k, v)
+    torch.cuda.current_stream().wait_stream(s)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_static = wrapper.run(q, k, v)
+
+    eager = _new_wrapper("cutlass")
+    eager.plan(*plan_args, **plan_kwargs)
+    ref_fa2 = _new_wrapper("fa2")
+    ref_fa2.plan(*plan_args, **plan_kwargs)
+    for seed in (1, 2):
+        fill(seed)
+        graph.replay()
+        torch.cuda.synchronize()
+        out_eager = eager.run(q, k, v)
+        out_ref = ref_fa2.run(q, k, v)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out_static, out_eager, rtol=0, atol=0)
+        diff = (out_static.float() - out_ref.float()).abs()
+        rel_max = (diff.max() / out_ref.float().abs().max().clamp_min(1e-6)).item()
+        assert rel_max < 2e-2, f"graph replay diverges from fa2: {rel_max:.3e}"
+
+
+@requires_cutlass_arch
+def test_explicit_cutlass_refuses_replan_under_cuda_graph():
+    """Re-planning would strand a captured graph on the previous plan buffers.
+
+    The refusal comes before plan() touches the registered indptr buffers, so
+    a graph captured against the first plan stays consistent.
+    """
+    dev = torch.device("cuda")
+    batch, s_q, s_kv = 2, 512, 512
+    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_q
+    kv_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_kv
+    plan_kwargs = dict(
+        head_dim_vo=128, causal=True, q_data_type=DTYPE, kv_data_type=DTYPE
+    )
+
+    wrapper = _graph_cutlass_wrapper(qo_indptr, kv_indptr)
+    wrapper.plan(qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
+    plan_info = wrapper._plan_info
+
+    new_qo_indptr = torch.tensor([0, 256, 1024], dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match="re-planning in CUDA-graph mode"):
+        wrapper.plan(new_qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
+    assert torch.equal(wrapper._qo_indptr_buf, qo_indptr)
+    assert wrapper._plan_info is plan_info
 
 
 # ---------------------------------------------------------------------------
