@@ -99,58 +99,59 @@ _EXACT_SMEM_BYTES = 231936
 _SHALLOW_SMEM_BYTES = 149248
 
 
-def _scan(symbol: str, digest: str) -> _Kernel:
-    return _Kernel(
-        f"{symbol}_{digest}", f"kernel_{symbol}", threads=512, fast_math=True
-    )
+def _scan(module: str) -> _Kernel:
+    """The scan kernel of ``generated/device/<module>.cu``."""
+
+    symbol = module.rsplit("_", 1)[0]
+    return _Kernel(module, f"kernel_{symbol}", threads=512, fast_math=True)
 
 
 _PROGRAMS: dict[str, _Program] = {
     "exact_bf16_batched": _Program(
         _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_q_tmem_alias_bf16_batched", "152ad01e4f"),
+        _scan("mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f"),
         _STATE_DTYPE_CODES["bf16"],
         _EXACT_SMEM_BYTES,
     ),
     "exact_f16_batched": _Program(
         _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_q_tmem_alias_f16_batched", "8b5ef7d7eb"),
+        _scan("mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb"),
         _STATE_DTYPE_CODES["f16"],
         _EXACT_SMEM_BYTES,
     ),
     "exact_bf16_varlen": _Program(
         _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_q_tmem_alias_bf16_varlen", "351b79a64d"),
+        _scan("mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d"),
         _STATE_DTYPE_CODES["bf16"],
         _EXACT_SMEM_BYTES,
     ),
     "exact_f16_varlen": _Program(
         _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_q_tmem_alias_f16_varlen", "1895881324"),
+        _scan("mamba_ssd_q_tmem_alias_f16_varlen_1895881324"),
         _STATE_DTYPE_CODES["f16"],
         _EXACT_SMEM_BYTES,
     ),
     "shallow_bf16_varlen": _Program(
         _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen", "c551a2b2f0"),
+        _scan("mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0"),
         _STATE_DTYPE_CODES["bf16"],
         _SHALLOW_SMEM_BYTES,
     ),
     "shallow_f16_varlen": _Program(
         _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen", "ff78ede5d2"),
+        _scan("mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2"),
         _STATE_DTYPE_CODES["f16"],
         _SHALLOW_SMEM_BYTES,
     ),
     "prefix_bf16_varlen": _Program(
         _PREFIX_PREPROCESS,
-        _scan("mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1", "a872ac4eb2"),
+        _scan("mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2"),
         _STATE_DTYPE_CODES["bf16"],
         _SHALLOW_SMEM_BYTES,
     ),
     "prefix_f16_varlen": _Program(
         _PREFIX_PREPROCESS,
-        _scan("mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1", "8c373c2436"),
+        _scan("mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436"),
         _STATE_DTYPE_CODES["f16"],
         _SHALLOW_SMEM_BYTES,
     ),
