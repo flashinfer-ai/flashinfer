@@ -1251,7 +1251,7 @@
           }
         },
         "source_package_file_count": 44,
-        "source_package_sha256": "2a84d7701830dd7eb261eac0d343436433f9b179ff9c02285d87e35383258400",
+        "source_package_sha256": "24c9c97974eb0ac8d898b75a788e85edae07e4bd4ca6f20337fb93bad14eb7e3",
         "balanced_routes": {
           "dcp_spec_bf16_balanced": {
             "arguments": {
@@ -1818,7 +1818,7 @@
     },
     "bindings/cake_fmha_decode_balanced_bf16_hd64_binding.cu": {
       "bytes": 3018,
-      "sha256": "d4511221c96f2656994fc1f7479e0955b2b646f5e881a26af1309a9177117935"
+      "sha256": "f8d82b51363d5f3c0322f06b78b2471a3ae7504debbab4226e418c8d8b1a2321"
     },
     "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu": {
       "bytes": 2917,
@@ -2185,12 +2185,12 @@
       "sha256": "0e5951bb89fa8b4990843bef3b181ea06e99875e5e324aa0dc2f79582a73ebab"
     },
     "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu": {
-      "bytes": 143032,
-      "sha256": "c74e24b05c0dfcc750e956846f20ea3e63645d760c3be427ca3733442844fbf8"
+      "bytes": 143406,
+      "sha256": "ae4d6a0380b538eabd2fd2e95dcb1e0dd686690805899cd43eaca95374aab42d"
     },
     "cuda/decode_balanced_bf16_hd64/sm_103a/default.cu": {
-      "bytes": 142935,
-      "sha256": "277be4f22f253f5a9c0f887917e151aa0ea236bf9ffa69450925756115f1afd3"
+      "bytes": 143309,
+      "sha256": "d56f8b88050bf5fdab6290b01afe3160c53319606f0fbb6f33cf423a4b9e3e94"
     },
     "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu": {
       "bytes": 213603,
@@ -4400,9 +4400,9 @@
       "threads": 512
     },
     "decode_balanced_bf16_hd64": {
-      "binding_sha256": "d4511221c96f2656994fc1f7479e0955b2b646f5e881a26af1309a9177117935",
+      "binding_sha256": "f8d82b51363d5f3c0322f06b78b2471a3ae7504debbab4226e418c8d8b1a2321",
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_binding.cu",
-      "dynamic_shared_memory_bytes": 117760,
+      "dynamic_shared_memory_bytes": 118272,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64",
       "parameters": [
         {
@@ -4502,8 +4502,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "c74e24b05c0dfcc750e956846f20ea3e63645d760c3be427ca3733442844fbf8",
-            "sm_103a": "277be4f22f253f5a9c0f887917e151aa0ea236bf9ffa69450925756115f1afd3"
+            "sm_100a": "ae4d6a0380b538eabd2fd2e95dcb1e0dd686690805899cd43eaca95374aab42d",
+            "sm_103a": "d56f8b88050bf5fdab6290b01afe3160c53319606f0fbb6f33cf423a4b9e3e94"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu",

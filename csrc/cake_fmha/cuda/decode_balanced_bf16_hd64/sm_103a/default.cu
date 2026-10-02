@@ -99,7 +99,7 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define SMEM_SCHED_SEQ_LENS_OFF 113664
 #define SMEM_SCHED_SEQ_LENS_STAGE_BYTES 4096
 #define SMEM_SCHED_SEQ_LENS_STRIDE 4096
-#define SMEM_TOTAL 117760
+#define SMEM_TOTAL 118272
 #define THREADS 512
 #define BLOCK_N 128
 #define HEAD_DIM 64
@@ -900,8 +900,9 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                     float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, hm[0], 1);
                     float _max_9 = max_noftz(hm[0], _shfl_xor_4);
                     hm[0] = _max_9;
+                    int exch_off = (pair & 1) * 29152;
                     if ((lane & 1) == 0) {
-                        my_exch_ptr[warp_in_wg * 16 + (lane >> 1)] = hm[0];
+                        my_exch_ptr[exch_off + warp_in_wg * 16 + (lane >> 1)] = hm[0];
                     }
                     if (is_wg1 != 0) {
                         asm volatile("barrier.sync 9, 128;" ::: "memory");
@@ -909,22 +910,16 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                         asm volatile("barrier.sync 8, 128;" ::: "memory");
                     }
                     float tile_max[16];
-                    if (lane < 16) {
-                        float _max_10 = max_noftz(my_exch_ptr[lane], my_exch_ptr[16 + lane]);
-                        float _max_11 = max_noftz(my_exch_ptr[32 + lane], my_exch_ptr[48 + lane]);
-                        float _max_12 = max_noftz(_max_10, _max_11);
-                        tile_max[lane] = _max_12;
-                    }
+                    int lane_h = lane & 15;
+                    float _max_10 = max_noftz(my_exch_ptr[exch_off + lane_h], my_exch_ptr[exch_off + 16 + lane_h]);
+                    float _max_11 = max_noftz(my_exch_ptr[exch_off + 32 + lane_h], my_exch_ptr[exch_off + 48 + lane_h]);
+                    float _max_12 = max_noftz(_max_10, _max_11);
+                    float my_tile_max = _max_12;
                     #pragma unroll
                     for (int c_5 = 0; c_5 < 16; c_5++) {
                         float _shfl_11;
-                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_11) : "f"(tile_max[c_5]), "r"(c_5));
+                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_11) : "f"(my_tile_max), "r"(c_5));
                         tile_max[c_5] = _shfl_11;
-                    }
-                    if (is_wg1 != 0) {
-                        asm volatile("barrier.sync 9, 128;" ::: "memory");
-                    } else {
-                        asm volatile("barrier.sync 8, 128;" ::: "memory");
                     }
                     float new_max[16];
                     float acc_scale[16];
@@ -999,8 +994,14 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                         _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
                     row_sum[c_9] = _warp_reduce_0;
                 }
+                int epi_off = (num_pairs & 1) * 29152;
+                float rs_lane = row_sum[0];
+                #pragma unroll
+                for (int c_10 = 1; c_10 < 16; c_10++) {
+                    rs_lane = ((lane == c_10) ? row_sum[c_10] : rs_lane);
+                }
                 if (lane < 16) {
-                    my_exch_ptr[warp_in_wg * 16 + lane] = row_sum[lane];
+                    my_exch_ptr[epi_off + warp_in_wg * 16 + lane] = rs_lane;
                 }
                 if (is_wg1 != 0) {
                     asm volatile("barrier.sync 9, 128;" ::: "memory");
@@ -1008,8 +1009,12 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                 }
                 float total_sum[16];
-                if (lane < 16) {
-                    total_sum[lane] = my_exch_ptr[lane] + my_exch_ptr[16 + lane] + my_exch_ptr[32 + lane] + my_exch_ptr[48 + lane];
+                int lane_e = lane & 15;
+                float tsum_lane = my_exch_ptr[epi_off + lane_e] + my_exch_ptr[epi_off + 16 + lane_e] + my_exch_ptr[epi_off + 32 + lane_e] + my_exch_ptr[epi_off + 48 + lane_e];
+                float rm_lane = row_max[0];
+                #pragma unroll
+                for (int c_11 = 1; c_11 < 16; c_11++) {
+                    rm_lane = ((lane == c_11) ? row_max[c_11] : rm_lane);
                 }
                 if (is_wg1 != 0) {
                     asm volatile("barrier.sync 9, 128;" ::: "memory");
@@ -1017,8 +1022,8 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                 }
                 if (warp_in_wg == 0 && lane < 16) {
-                    my_corr_ptr[lane] = total_sum[lane];
-                    my_exch_ptr[lane] = row_max[lane];
+                    my_corr_ptr[lane] = tsum_lane;
+                    my_exch_ptr[lane] = rm_lane;
                 }
                 if (is_wg1 != 0) {
                     mbarrier_arrive(final_stats_1_addr);
@@ -1151,25 +1156,25 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                 float partial_max[16];
                 float partial_sum[16];
                 #pragma unroll
-                for (int c_10 = 0; c_10 < 16; c_10++) {
+                for (int c_12 = 0; c_12 < 16; c_12++) {
                     float _shfl_12;
-                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_12) : "f"(smem_exch0[c_10]), "r"(c_10));
+                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_12) : "f"(smem_exch0[c_12]), "r"(c_12));
                     float _shfl_13;
-                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_13) : "f"(smem_exch1[c_10]), "r"(c_10));
+                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_13) : "f"(smem_exch1[c_12]), "r"(c_12));
                     float _shfl_14;
-                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_14) : "f"(smem_corr0[c_10]), "r"(c_10));
+                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_14) : "f"(smem_corr0[c_12]), "r"(c_12));
                     float _shfl_15;
-                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_15) : "f"(smem_corr1[c_10]), "r"(c_10));
+                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_15) : "f"(smem_corr1[c_12]), "r"(c_12));
                     float _max_14 = max_noftz(_shfl_12, _shfl_13);
                     float fm = _max_14;
-                    partial_max[c_10] = fm;
+                    partial_max[c_12] = fm;
                     float d0 = ((_shfl_12 == -CAKE_FMHA_INF) ? 0.0f : softmax_scale_log2 * (_shfl_12 - fm));
                     float d1 = ((_shfl_13 == -CAKE_FMHA_INF) ? 0.0f : softmax_scale_log2 * (_shfl_13 - fm));
                     float _exp2_2 = approx_exp2(d0);
-                    scale0[c_10] = _exp2_2;
+                    scale0[c_12] = _exp2_2;
                     float _exp2_3 = approx_exp2(d1);
-                    scale1[c_10] = _exp2_3;
-                    partial_sum[c_10] = _shfl_14 * scale0[c_10] + _shfl_15 * scale1[c_10];
+                    scale1[c_12] = _exp2_3;
+                    partial_sum[c_12] = _shfl_14 * scale0[c_12] + _shfl_15 * scale1[c_12];
                 }
                 asm volatile("barrier.sync 10, 128;" ::: "memory");
                 if (elect_sync()) {
@@ -1225,9 +1230,9 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                 if (publish_split == 0) {
                     float inv_total[16];
                     #pragma unroll
-                    for (int c_11 = 0; c_11 < 16; c_11++) {
-                        float _rcp_2 = approx_rcp(partial_sum[c_11]);
-                        inv_total[c_11] = _rcp_2;
+                    for (int c_13 = 0; c_13 < 16; c_13++) {
+                        float _rcp_2 = approx_rcp(partial_sum[c_13]);
+                        inv_total[c_13] = _rcp_2;
                     }
                     float inv_lo0 = inv_total[col_lo];
                     float inv_lo1 = inv_total[col_lo + 1];
