@@ -1,0 +1,22 @@
+{
+  "op": "concat_mla_kv_quant_fp8",
+  "kernel": "fused bf16 -> saturating e4m3 MLA context K/V pack (one HBM pass)",
+  "note": "Dispatch surface of the fused kernel; every call outside it takes the composable torch path (same numerics on torch >= 2.13). num_tokens covers the captured chunked-prefill rows (1..66048 in serving; 1..131072 validated); measured_num_tokens are the timed rows the kernel beat the previous fused implementation on. Head geometry is fixed (DeepSeek/Kimi MLA); the head count is a runtime kernel argument with a fully unrolled variant for 12 local heads (96 heads / TP8, the measured configuration).",
+  "dtypes": {
+    "kv_nope": "bfloat16",
+    "k_pe": "bfloat16",
+    "key": "float8_e4m3fn",
+    "value": "float8_e4m3fn"
+  },
+  "head_geometry": {"nope_dim": 128, "rope_dim": 64, "v_dim": 128},
+  "min_compute_capability": [10, 0],
+  "num_heads": {"min": 1, "max": 128},
+  "unrolled_num_heads": [12],
+  "measured_num_heads": [12],
+  "num_tokens": {"min": 1, "max": 131072},
+  "measured_num_tokens": [
+    66048, 66038, 62592, 62262, 56320, 50688, 34742, 33792, 33206, 31168,
+    30898, 23936, 21312, 18432, 16896, 9344, 5504, 1536
+  ],
+  "correctness_num_tokens": [1, 3, 17, 127, 129]
+}
