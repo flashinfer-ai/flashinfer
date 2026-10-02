@@ -22,8 +22,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "tvm_ffi_utils.h"
-
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -31,6 +29,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "tvm_ffi_utils.h"
 
 namespace cake_dsv4_host_shim {
 
@@ -42,13 +42,12 @@ class ScopedCudaDevice {
   explicit ScopedCudaDevice(int device_id) {
     cudaError_t error = cudaGetDevice(&previous_device_);
     TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
-        << "cudaGetDevice failed before host-shim launch: cudaError="
-        << static_cast<int>(error);
+        << "cudaGetDevice failed before host-shim launch: cudaError=" << static_cast<int>(error);
     if (previous_device_ != device_id) {
       error = cudaSetDevice(device_id);
       TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
-          << "cudaSetDevice failed before host-shim launch for cuda:"
-          << device_id << ": cudaError=" << static_cast<int>(error);
+          << "cudaSetDevice failed before host-shim launch for cuda:" << device_id
+          << ": cudaError=" << static_cast<int>(error);
       restore_ = true;
     }
   }
@@ -72,28 +71,21 @@ inline void CheckCudaTensor(const TensorView& t, const char* name) {
       << name << " must be a CUDA tensor, got device_type=" << (int)t.device().device_type;
 }
 
-inline void CheckSameCudaDevice(
-    const TensorView& t,
-    const TensorView& reference,
-    const char* name,
-    const char* reference_name) {
+inline void CheckSameCudaDevice(const TensorView& t, const TensorView& reference, const char* name,
+                                const char* reference_name) {
   TVM_FFI_CHECK(t.device().device_id == reference.device().device_id, ValueError)
       << name << " must be on the same CUDA device as " << reference_name
-      << ": got cuda:" << t.device().device_id
-      << " versus cuda:" << reference.device().device_id;
+      << ": got cuda:" << t.device().device_id << " versus cuda:" << reference.device().device_id;
 }
 
-inline void CheckCurrentCudaDevice(
-    const TensorView& reference,
-    const char* reference_name) {
+inline void CheckCurrentCudaDevice(const TensorView& reference, const char* reference_name) {
   int current_device = -1;
   cudaError_t error = cudaGetDevice(&current_device);
   TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
       << "cudaGetDevice failed while validating " << reference_name
       << ": cudaError=" << static_cast<int>(error);
   TVM_FFI_CHECK(current_device == reference.device().device_id, ValueError)
-      << "current CUDA device must match " << reference_name
-      << ": current=cuda:" << current_device
+      << "current CUDA device must match " << reference_name << ": current=cuda:" << current_device
       << ", tensor=cuda:" << reference.device().device_id;
 }
 
@@ -123,16 +115,15 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
     return;
   }
   int64_t step = t.stride(outer_last);
-  TVM_FFI_CHECK(step > 0, ValueError)
-      << name << " physical strides must be positive";
+  TVM_FFI_CHECK(step > 0, ValueError) << name << " physical strides must be positive";
   int64_t expected = step;
   for (int axis = outer_last - 1; axis >= 0; --axis) {
     expected *= t.size(axis + 1);
     if (t.size(axis) > 1) {
       TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
           << name << " leading dims are not physically foldable above " << trailing
-          << " trailing dims: stride(" << axis << ")=" << t.stride(axis)
-          << ", expected " << expected;
+          << " trailing dims: stride(" << axis << ")=" << t.stride(axis) << ", expected "
+          << expected;
     }
   }
 }
@@ -141,24 +132,22 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
 // exactly as the production TmaDeviceSlot path. The owner must retain the
 // allocation and must never expose it as mutable scratch or rewrite its bytes.
 template <size_t N>
-static inline void PrepareImmutableCallerTmaWorkspace(
-    const tvm::ffi::Tensor& retained_workspace,
-    const CUtensorMap (&maps)[N], cudaStream_t stream) {
+static inline void PrepareImmutableCallerTmaWorkspace(const tvm::ffi::Tensor& retained_workspace,
+                                                      const CUtensorMap (&maps)[N],
+                                                      cudaStream_t stream) {
   void* workspace = retained_workspace.data_ptr();
   CUcontext context = nullptr;
   CUresult result = cuCtxGetCurrent(&context);
   TVM_FFI_CHECK(result == CUDA_SUCCESS && context != nullptr, RuntimeError)
       << "immutable TMA workspace requires an active CUDA context";
   CUcontext allocation_context = nullptr;
-  result = cuPointerGetAttribute(
-      &allocation_context, CU_POINTER_ATTRIBUTE_CONTEXT,
-      reinterpret_cast<CUdeviceptr>(workspace));
+  result = cuPointerGetAttribute(&allocation_context, CU_POINTER_ATTRIBUTE_CONTEXT,
+                                 reinterpret_cast<CUdeviceptr>(workspace));
   TVM_FFI_CHECK(result == CUDA_SUCCESS && allocation_context == context, RuntimeError)
       << "immutable TMA workspace must belong to the active CUDA context";
   unsigned long long buffer_id = 0;
-  result = cuPointerGetAttribute(
-      &buffer_id, CU_POINTER_ATTRIBUTE_BUFFER_ID,
-      reinterpret_cast<CUdeviceptr>(workspace));
+  result = cuPointerGetAttribute(&buffer_id, CU_POINTER_ATTRIBUTE_BUFFER_ID,
+                                 reinterpret_cast<CUdeviceptr>(workspace));
   TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
       << "querying immutable TMA allocation identity failed";
   std::string key = std::to_string(reinterpret_cast<uintptr_t>(context));
@@ -192,12 +181,11 @@ static inline void PrepareImmutableCallerTmaWorkspace(
   result = cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(workspace), maps, sizeof(maps));
   TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
       << "initializing immutable caller TMA descriptors failed";
-  initialized->emplace(
-      std::move(key), InitializedWorkspace{retained_workspace, std::move(descriptor_bytes)});
+  initialized->emplace(std::move(key),
+                       InitializedWorkspace{retained_workspace, std::move(descriptor_bytes)});
 }
 
-static inline void* CallerTmaWorkspaceSlot(
-    const tvm::ffi::TensorView& workspace, size_t slot) {
+static inline void* CallerTmaWorkspaceSlot(const tvm::ffi::TensorView& workspace, size_t slot) {
   return static_cast<char*>(workspace.data_ptr()) + slot * sizeof(CUtensorMap);
 }
 
