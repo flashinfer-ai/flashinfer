@@ -75,6 +75,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-data]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**"]
+"flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "sources.json", "README.md"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
