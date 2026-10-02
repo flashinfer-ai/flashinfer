@@ -14,7 +14,7 @@ from .communication import (
     create_communication,
     register_communication,
 )
-from .fleet import Fleet, create_fleet
+from .fleet import Fleet, create_fleet, register_fleet
 from .handle import Handle
 
 __all__ = [
@@ -27,4 +27,5 @@ __all__ = [
     "create_communication",
     "create_fleet",
     "register_communication",
+    "register_fleet",
 ]

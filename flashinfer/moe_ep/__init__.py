@@ -153,7 +153,7 @@ from .core.comm.communication import (
     create_communication,
     register_communication,
 )
-from .core.comm.fleet import Fleet, create_fleet
+from .core.comm.fleet import Fleet, create_fleet, register_fleet
 from .core.comm.handle import Handle
 from .core.runtime import (
     bootstrap_moe_ep_runtime,
@@ -307,6 +307,7 @@ __all__ = [
     "preprocess_sm90_pull_fp8_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",
     "register_communication",
+    "register_fleet",
     "run_split_kernel",
     "supports_fault_tolerance",
     "validate_arch_for_backend",

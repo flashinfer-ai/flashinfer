@@ -458,7 +458,7 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 1. **Split kernel** — `backends/split/kernel/<name>/`: subclass `SplitKernelBackend`, `@register_split_kernel`, import in `backends/split/kernel/__init__.py`.
 2. **Mega kernel** — `backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`: subclass `MegaKernelBackend`, implement `compute` / `_allocate_workspace` / `stage_inputs`, override `runtime_requirements()` if needed, `@register_mega_kernel`, import in `backends/mega/kernel/__init__.py`.
-3. **Comm backend** (split only) — `backends/split/comm/<name>/` with `config.py` and `communication.py`: subclass `MoEEpCommunication`, `@register_communication`, import it from `moe_ep.__init__.py`, and add the backend's runtime needs to `split_comm_runtime_requirements`. A transport built on a group / per-step-handle library may instead implement `Fleet` / `Handle` (`fleet.py`, `handle.py`) and wrap them in a `MoEEpCommunication`.
+3. **Comm backend** (split only) — `backends/split/comm/<name>/`, implementing one of the two peer interfaces: a self-contained dispatch/combine object subclasses `MoEEpCommunication` and registers with `@register_communication` (`config.py`, `communication.py`); a transport built on a group / per-step-handle library implements `Fleet` / `Handle` and registers with `@register_fleet` (`fleet.py`, `handle.py`). Import it from `moe_ep.__init__.py` and add the backend's runtime needs to `split_comm_runtime_requirements`.
 
 ## Tests
 
