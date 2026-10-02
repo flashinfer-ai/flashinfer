@@ -93,18 +93,24 @@ static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap ali
 #define PAGE_SIZE 64
 #define NUM_RAW_KV_STAGES 4
 #define NUM_TRANSFORMED_KV_STAGES 2
-#define Q_LEN 6
+#ifndef Q_LEN
+#define Q_LEN 1
+#endif
 #define UNIFORM_KV_LEN 0
 #define USE_REQUEST_ORDER 1
 #define USE_SCALE_POINTERS 1
-#define NUM_SPLIT 2
+#ifndef NUM_SPLIT
+#define NUM_SPLIT 1
+#endif
 #define USE_SEGMENTED_CLC 0
 #define USE_HIGH_BATCH_TWO_WAVE 0
 #define USE_TWO_CTA_REDUCER 0
 #define USE_MMA_LOOP_PEEL 1
 #define USE_PAGE_OFFSET_CPASYNC 0
 #define USE_LEGACY_PAGE_VEC4 0
-#define WRITE_LSE 1
+#ifndef WRITE_LSE
+#define WRITE_LSE 0
+#endif
 
 #include <math_constants.h>
 
@@ -494,7 +500,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227(CakeTensorMap const* Qt, CakeTensorMap const* K, CakeTensorMap const* V, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_LSE, unsigned int* __restrict__ split_completion, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ request_order, int max_pages_per_seq, int page_table_v_offset, float softmax_scale_log2, float output_scale, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int num_q_heads, int num_kv_heads, int batch_size, unsigned int total_tiles)
+kernel_cake_fmha_request_ordered_paged_decode_fallback(CakeTensorMap const* Qt, CakeTensorMap const* K, CakeTensorMap const* V, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_LSE, unsigned int* __restrict__ split_completion, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ request_order, int max_pages_per_seq, int page_table_v_offset, float softmax_scale_log2, float output_scale, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int num_q_heads, int num_kv_heads, int batch_size, unsigned int total_tiles)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1190,11 +1196,22 @@ kernel_cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227(CakeTensorMap
                         int stats_output_row_c = (batch_idx_c * Q_LEN + q_row_idx_c) * num_q_heads + stats_q_head_c;
                         {
                             {
+#if WRITE_LSE  // M2
+#if NUM_SPLIT > 1  // M2
                                 float _log2_3;
                                 asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_3) : "f"(stats_sum_c));
                                 float lse_value_partial = _log2_3 + stats_max_c * bmm1_scale_log2_c;
                                 int partial_lse_idx = stats_output_row_c * NUM_SPLIT + split_idx_c;
                                 *(reinterpret_cast<float*>(partial_LSE + partial_lse_idx) + (0)) = lse_value_partial;
+#else  // M2
+                                {
+                                    float _log2_2;
+                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(stats_sum_c));
+                                    float lse_value_final = _log2_2 + stats_max_c * bmm1_scale_log2_c;
+                                    *(reinterpret_cast<float*>(LSE + stats_output_row_c) + (0)) = lse_value_final;
+                                }
+#endif  // M2
+#endif  // M2
                             }
                         }
                     }
@@ -1227,11 +1244,25 @@ kernel_cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227(CakeTensorMap
                         int output_row = (batch_idx_c * Q_LEN + q_row_idx_c) * num_q_heads + q_head;
                         {
                             {
+#if WRITE_LSE  // M2
+#if NUM_SPLIT > 1  // M2
                                 int partial_row = output_row * NUM_SPLIT + split_idx_c;
                                 int partial_idx_hi = partial_row * HEAD_DIM + d_idx;
                                 int partial_idx_lo = partial_idx_hi + HEAD_DIM_HALF;
                                 *(reinterpret_cast<__nv_bfloat16*>(partial_O + partial_idx_hi) + (0)) = __float2bfloat16_rn(final_o_hi);
                                 *(reinterpret_cast<__nv_bfloat16*>(partial_O + partial_idx_lo) + (0)) = __float2bfloat16_rn(final_o_lo);
+#else  // M2
+                                int out_idx_hi = output_row * HEAD_DIM + d_idx;
+                                int out_idx_lo = out_idx_hi + HEAD_DIM_HALF;
+                                *(reinterpret_cast<__nv_bfloat16*>(O + out_idx_hi) + (0)) = __float2bfloat16_rn(final_o_hi);
+                                *(reinterpret_cast<__nv_bfloat16*>(O + out_idx_lo) + (0)) = __float2bfloat16_rn(final_o_lo);
+#endif  // M2
+#else  // M2
+                                int out_idx_hi = output_row * HEAD_DIM + d_idx;
+                                int out_idx_lo = out_idx_hi + HEAD_DIM_HALF;
+                                *(reinterpret_cast<__nv_bfloat16*>(O + out_idx_hi) + (0)) = __float2bfloat16_rn(final_o_hi);
+                                *(reinterpret_cast<__nv_bfloat16*>(O + out_idx_lo) + (0)) = __float2bfloat16_rn(final_o_lo);
+#endif  // M2
                             }
                         }
                     }
@@ -1311,6 +1342,7 @@ kernel_cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227(CakeTensorMap
                                 split_weights[split1_seg * TILE_Q + reduce_head_seg] = weight1_seg * inv_weight_sum_seg;
                             }
                             if (reduce_lane_seg == 0) {
+#if WRITE_LSE  // M2
                                 {
                                     float merged_lse_seg = -CAKE_INF;
                                     if (weight_sum_seg > 0.0f) {
@@ -1321,6 +1353,7 @@ kernel_cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227(CakeTensorMap
                                     int final_lse_idx_seg = (batch_idx_c * Q_LEN + q_row_idx_c) * num_q_heads + reduce_q_head_seg;
                                     *(reinterpret_cast<float*>(LSE + final_lse_idx_seg) + (0)) = merged_lse_seg;
                                 }
+#endif  // M2
                             }
                         }
                         asm volatile("barrier.sync 9, 128;" ::: "memory");
@@ -1482,6 +1515,7 @@ kernel_cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227(CakeTensorMap
                                 split_weights[split1 * TILE_Q + reduce_head] = weight1 * inv_weight_sum;
                             }
                             if (reduce_lane == 0) {
+#if WRITE_LSE  // M2
                                 {
                                     float merged_lse = -CAKE_INF;
                                     if (weight_sum > 0.0f) {
@@ -1492,6 +1526,7 @@ kernel_cake_fmha_request_ordered_paged_decode_f2cb676bd2e1c46f3227(CakeTensorMap
                                     int final_lse_idx = (batch_idx_c * Q_LEN + q_row_idx_c) * num_q_heads + reduce_q_head;
                                     *(reinterpret_cast<float*>(LSE + final_lse_idx) + (0)) = merged_lse;
                                 }
+#endif  // M2
                             }
                         }
                         asm volatile("barrier.sync 9, 128;" ::: "memory");

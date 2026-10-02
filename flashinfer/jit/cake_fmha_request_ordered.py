@@ -46,6 +46,7 @@ class CakeFmhaRequestOrderedModuleSpec:
     kernel_symbol: str
     ffi_entry: str
     compile_options: tuple[str, ...]
+    defines: tuple[tuple[str, int], ...]
     tma_workspace_bytes: int
 
 
@@ -168,6 +169,13 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
             module.get("tma_workspace_bytes") == 384,
             f"modules[{index}].tma_workspace_bytes",
         )
+        defines = module.get("defines")
+        _require(
+            isinstance(defines, dict)
+            and set(defines) <= {"Q_LEN", "WRITE_LSE", "NUM_SPLIT"}
+            and all(isinstance(value, int) for value in defines.values()),
+            f"modules[{index}].defines",
+        )
     route_names: set[str] = set()
     for index, route in enumerate(routes):
         _require(isinstance(route, dict), f"routes[{index}]")
@@ -213,19 +221,27 @@ def get_cake_fmha_request_ordered_module_spec(
         kernel_symbol=module["kernel_symbol"],
         ffi_entry=module["ffi_entry"],
         compile_options=tuple(module["compile_options"]),
+        defines=tuple(sorted(module["defines"].items())),
         tma_workspace_bytes=module["tma_workspace_bytes"],
     )
     binding = spec.binding_path.read_text(encoding="utf-8")
-    _require(
-        binding.count(f"TVM_FFI_EMBED_CUBIN({spec.module_ident});") == 1,
-        f"module {name} embedded-cubin declaration",
+    shared = "CAKE_RO_EMBED(CAKE_RO_MODULE_IDENT);" in binding
+    embed = (
+        "CAKE_RO_EMBED(CAKE_RO_MODULE_IDENT);"
+        if shared
+        else f"TVM_FFI_EMBED_CUBIN({spec.module_ident});"
     )
     _require(
-        binding.count(
-            f"EmbedCubinModule_{spec.module_ident}::Global()->mod.GetKernel("
-            f'"{spec.kernel_symbol}")'
-        )
-        == 1,
+        binding.count(embed) == 1,
+        f"module {name} embedded-cubin declaration",
+    )
+    module_global = (
+        "CAKE_RO_CONCAT(EmbedCubinModule_, CAKE_RO_MODULE_IDENT)::Global()"
+        if shared
+        else f"EmbedCubinModule_{spec.module_ident}::Global()"
+    )
+    _require(
+        binding.count(f'{module_global}->mod.GetKernel("{spec.kernel_symbol}")') == 1,
         f"module {name} kernel lookup",
     )
     _require(
@@ -285,6 +301,7 @@ def _nvrtc_options(spec: CakeFmhaRequestOrderedModuleSpec) -> tuple[str, ...]:
         if (cccl / "cuda/std").is_dir():
             options.append(f"-I{cccl}")
     options.extend(spec.compile_options)
+    options.extend(f"-D{name}={value}" for name, value in spec.defines)
     return tuple(options)
 
 
@@ -459,7 +476,7 @@ def load_cake_fmha_request_ordered_module(name: str):
             str(root.parents[2] / "include"),
             str(jit_env.FLASHINFER_CSRC_DIR),
         ],
-        extra_cflags=["-O3"],
+        extra_cflags=["-O3", f"-DCAKE_RO_MODULE_IDENT={spec.module_ident}"],
         extra_ldflags=["-lcuda"],
         build_directory=str(build_directory),
     )
