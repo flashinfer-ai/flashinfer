@@ -1448,11 +1448,11 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
     if route == "bf16_h64_compressed_q8_v38":
         num_splits = _ceil_div(topk, _TILE_KV)
         parts = L.partials(num_splits)
-        producer = L.variant(route, grid=(T * num_splits * 2, 1, 1), **parts)
+        compressed = L.variant(route, grid=(T * num_splits * 2, 1, 1), **parts)
         if num_splits > 1:
-            L.run(producer, L.reduce("bf16_h64_compressed_reduce", **parts))
+            L.run(compressed, L.reduce("bf16_h64_compressed_reduce", **parts))
         else:
-            L.run(producer)
+            L.run(compressed)
         return
 
     if route == "bf16_h32_topk128x_early_v47":
