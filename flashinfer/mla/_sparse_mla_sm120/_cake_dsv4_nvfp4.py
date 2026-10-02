@@ -160,6 +160,25 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
     full wave on both; the sub-wave rules are the same on both.
 
     Head counts not divisible by 32 have no two-tile instance.
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+    num_sms : int
+        Streaming multiprocessors of the target device; keys the thresholds on which the two
+        sm_120a SKUs disagree (``torch.cuda.get_device_properties(d).multi_processor_count``).
+
+    Returns
+    -------
+    int
+        ``1`` or ``2`` sixteen-head tiles per decode CTA.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -229,6 +248,29 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
     * at least two chunks per CTA also for a lone CTA (one chunk per CTA is
       4-10 % slower than two);
     * no wave-quantization split on a full grid (16-chunk rows are flat).
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+    num_sms : int
+        Streaming multiprocessors of the target device; keys the thresholds on which the two
+        sm_120a SKUs disagree (``torch.cuda.get_device_properties(d).multi_processor_count``).
+    max_splits : int, optional
+        Upper bound on ``num_splits``.
+    head_tiles : int, optional
+        Sixteen-head tiles per CTA the grid is counted in (``1`` or ``2``).
+
+    Returns
+    -------
+    tuple[int, int]
+        ``(num_splits, chunks_per_block)``.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -329,7 +371,24 @@ def _resolve_plan(
 def cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes(
     num_tokens: int, num_heads: int, topk: int, extra_topk: int = 0
 ) -> int:
-    """Workspace bytes that cover every split plan of this shape (partials + LSE + alignment slack)."""
+    """Workspace bytes that cover every split plan of this shape (partials + LSE + alignment slack).
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+
+    Returns
+    -------
+    int
+        Bytes of caller-owned scratch that cover every split plan of the shape.
+    """
 
     chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
     rows = int(num_tokens) * int(num_heads)
@@ -413,6 +472,25 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
     639 candidates on the large die (RTX PRO 6000), where it is 128 tokens.
     Narrower head counts take their largest instance at every token count: two
     tiles for 32 heads, one tile for 16 and 48 heads.
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+    num_sms : int
+        Streaming multiprocessors of the target device; keys the thresholds on which the two
+        sm_120a SKUs disagree (``torch.cuda.get_device_properties(d).multi_processor_count``).
+
+    Returns
+    -------
+    int
+        ``head_tiles`` for the prefill launch: ``1``, ``2`` or ``4`` sixteen-head tiles per CTA.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -473,6 +551,25 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel(
 
     ``num_sms`` keys the thresholds on which the two sm_120a SKUs disagree
     (the decode split planner's wave structure follows the SM count).
+
+    Parameters
+    ----------
+    num_tokens : int
+        Query tokens in the call (``q.shape[0]``).
+    num_heads : int
+        Query heads per token (``q.shape[1]``).
+    topk : int
+        Candidate slots per token in the main cache (``indices.shape[1]``).
+    extra_topk : int, optional
+        Candidate slots per token in the second (compressed) cache; ``0`` without one.
+    num_sms : int
+        Streaming multiprocessors of the target device; keys the thresholds on which the two
+        sm_120a SKUs disagree (``torch.cuda.get_device_properties(d).multi_processor_count``).
+
+    Returns
+    -------
+    str
+        ``"decode"`` or ``"prefill"``.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -816,6 +913,53 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
     them with ``cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks`` splits to cover
     every plan.  ``head_tiles`` (1 or 2, head counts divisible by 32) and
     ``num_splits`` override the planners.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        ``[T, H, 512]`` contiguous CUDA BF16 queries (448 NoPE dims, then 64 RoPE dims).
+    kv_cache : torch.Tensor
+        Paged NVFP4 cache, ``uint8`` with 384 bytes per token: ``[num_pages, page_size, 384]``,
+        HND ``[num_pages, 1, page_size, 384]`` or NHD ``[num_pages, page_size, 1, 384]``; page size and
+        page stride are read from the view at runtime.
+    indices : torch.Tensor
+        ``[T, topk]`` (or ``[T, 1, topk]``) int32 candidate slots into ``kv_cache``; ``-1`` masks a slot.
+    output : torch.Tensor
+        ``[T, H, 512]`` contiguous BF16 attention output, written in place.
+    out_lse : torch.Tensor
+        ``[T, H]`` contiguous float32, written in place with the base-2 log-sum-exp times ``lse_scale``.
+    sm_scale : float
+        Softmax scale applied to the QK logits.
+    topk_length : torch.Tensor, optional
+        1-D int32 with at least ``T`` entries: valid candidates per token in ``indices``
+        (every slot when omitted).
+    attn_sink : torch.Tensor, optional
+        1-D float32 with at least ``H`` entries: per-head attention-sink value that joins the
+        softmax normalisation.
+    extra_kv_cache : torch.Tensor, optional
+        Second (compressed) cache in the same format; used together with ``extra_indices``.
+    extra_indices : torch.Tensor, optional
+        ``[T, extra_topk]`` int32 slots into ``extra_kv_cache``; required with it.
+    extra_topk_length : torch.Tensor, optional
+        1-D int32 with at least ``T`` entries: valid candidates per token in ``extra_indices``.
+    mid_out : torch.Tensor, optional
+        ``[T, H, >= num_splits, 512]`` contiguous BF16 split partials; required when the plan splits.
+    mid_lse : torch.Tensor, optional
+        ``[T, H, >= num_splits]`` contiguous float32 split log-sum-exps; required with ``mid_out``.
+    lse_scale : float, optional
+        Multiplier applied to the base-2 log-sum-exp written to ``out_lse``.
+    num_splits : int, optional
+        Overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits`.
+    max_splits : int, optional
+        Upper bound for the split planner.
+    head_tiles : int, optional
+        Overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles`: ``1`` or ``2``
+        (head counts divisible by 32).
+
+    Returns
+    -------
+    dict[str, int]
+        The resolved plan ``{"head_tiles", "num_splits", "chunks_per_block"}``.
     """
 
     p = _prepare_inputs(
@@ -928,6 +1072,45 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
     ``{"head_tiles", "num_ctas"}`` (one CTA per (token, head block) item);
     ``head_tiles`` (see :func:`cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles`)
     overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill`.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        ``[T, H, 512]`` contiguous CUDA BF16 queries (448 NoPE dims, then 64 RoPE dims).
+    kv_cache : torch.Tensor
+        Paged NVFP4 cache, ``uint8`` with 384 bytes per token: ``[num_pages, page_size, 384]``,
+        HND ``[num_pages, 1, page_size, 384]`` or NHD ``[num_pages, page_size, 1, 384]``; page size and
+        page stride are read from the view at runtime.
+    indices : torch.Tensor
+        ``[T, topk]`` (or ``[T, 1, topk]``) int32 candidate slots into ``kv_cache``; ``-1`` masks a slot.
+    output : torch.Tensor
+        ``[T, H, 512]`` contiguous BF16 attention output, written in place.
+    out_lse : torch.Tensor
+        ``[T, H]`` contiguous float32, written in place with the base-2 log-sum-exp times ``lse_scale``.
+    sm_scale : float
+        Softmax scale applied to the QK logits.
+    topk_length : torch.Tensor, optional
+        1-D int32 with at least ``T`` entries: valid candidates per token in ``indices``
+        (every slot when omitted).
+    attn_sink : torch.Tensor, optional
+        1-D float32 with at least ``H`` entries: per-head attention-sink value that joins the
+        softmax normalisation.
+    extra_kv_cache : torch.Tensor, optional
+        Second (compressed) cache in the same format; used together with ``extra_indices``.
+    extra_indices : torch.Tensor, optional
+        ``[T, extra_topk]`` int32 slots into ``extra_kv_cache``; required with it.
+    extra_topk_length : torch.Tensor, optional
+        1-D int32 with at least ``T`` entries: valid candidates per token in ``extra_indices``.
+    lse_scale : float, optional
+        Multiplier applied to the base-2 log-sum-exp written to ``out_lse``.
+    head_tiles : int, optional
+        Overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` with one of the head
+        count's instances (see :func:`cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles`).
+
+    Returns
+    -------
+    dict[str, int]
+        The resolved plan ``{"head_tiles", "num_ctas"}``.
     """
 
     p = _prepare_inputs(
