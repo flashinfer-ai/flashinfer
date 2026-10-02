@@ -1617,6 +1617,13 @@ def plan_router_fp32_gemm(
         raise ValueError(
             f"router_fp32_gemm: out must be [{M}, {N}], got {tuple(out.shape)}"
         )
+    if M < 1 or K < 1 or N < 1:
+        # An empty problem (a ragged batch with T = 0 reaches here as M = 0 for the
+        # forward / input gradient or K = 0 for the weight gradient) would otherwise
+        # produce a zero-sized grid or a TMA descriptor with a zero extent.
+        raise ValueError(
+            f"router_fp32_gemm: M, K and N must be >= 1 (M={M}, N={N}, K={K})"
+        )
     a_mn, b_mn = _router_a_layout(A), _router_b_layout(B)
     layout = router_layout_class(a_mn, b_mn)
     swapped = layout == "nn_t"

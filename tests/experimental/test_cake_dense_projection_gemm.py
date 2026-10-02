@@ -25,6 +25,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     BLOCK_K,
     CTA_GROUP,
     ROUTER_SPLITS,
+    ROW_RULES,
     SK_DUMMY_BASE,
     SK_MIN_ITERS,
     SUPPORTED_COMPUTE_CAPABILITIES,
@@ -42,16 +43,15 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     operand_view,
     plan_dense_projection_gemm,
     plan_router_fp32_gemm,
-    ROW_RULES,
-    row_rule,
-    sk_parts_plan,
-    swap_small_m,
     prepare_dense_projection_gemm,
     prepare_projection_wgrad,
     prepare_router_fp32_gemm,
     router_layout_class,
+    row_rule,
+    sk_parts_plan,
     split_fp32_to_bf16x3_,
     stream_k_plan,
+    swap_small_m,
     wave_working_set,
     wgrad_swapped,
     wgrad_views,
@@ -1767,6 +1767,12 @@ def test_router_layout_classification_and_swap():
         )
     with pytest.raises(ValueError, match="unit stride"):
         plan_router_fp32_gemm(torch.empty(T, 2 * K)[:, ::2], W.t(), torch.empty(T, N))
+    # a ragged batch with T = 0: M = 0 for the forward / input gradient, K = 0 for the
+    # weight gradient -- rejected before a zero-sized grid or TMA extent is planned
+    with pytest.raises(ValueError, match="must be >= 1"):
+        plan_router_fp32_gemm(torch.empty(0, K), W.t(), torch.empty(0, N))
+    with pytest.raises(ValueError, match="must be >= 1"):
+        plan_router_fp32_gemm(torch.empty(N, 0), torch.empty(0, K), torch.empty(N, K))
 
 
 def test_split_fp32_to_bf16x3_is_exact_and_allocation_free_in_place():

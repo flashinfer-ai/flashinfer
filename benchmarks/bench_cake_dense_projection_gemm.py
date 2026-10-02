@@ -265,13 +265,19 @@ def measure_row(label, spec, args):
         torch.cuda.synchronize()
         if args.accuracy:
             entry["torch_accuracy"] = accuracy(inp, inp["out"])
+        # Equal-sample comparison: both arms are timed twice in alternating order
+        # (Cake / torch / Cake / torch) and reduced the same way, so neither arm
+        # gets the "best of two medians" advantage.
         cake_a = median_ms(prepared.launch, args.steps)
-        torch_ms = median_ms(baseline, args.steps)
+        torch_a = median_ms(baseline, args.steps)
         cake_b = median_ms(prepared.launch, args.steps)
+        torch_b = median_ms(baseline, args.steps)
         cake_ms = min(cake_a, cake_b)
+        torch_ms = min(torch_a, torch_b)
         entry.update(
             cake_ms=cake_ms,
             cake_ms_pair=[cake_a, cake_b],
+            torch_ms_pair=[torch_a, torch_b],
             torch_ms=torch_ms,
             speedup_vs_torch=torch_ms / cake_ms,
             cake_tflops=inp["flops"] / (cake_ms * 1e-3) / 1e12,
