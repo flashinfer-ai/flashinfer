@@ -34,6 +34,14 @@ def device_arch(device):
     return arch
 
 
+@functools.cache
+def device_sm_count(device_index):
+    """Physical SM count of ``cuda:device_index`` (queried once per process)."""
+    import torch
+
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 def supported_num_sms(arch):
     """SM counts with catalogued routes for ``arch``."""
     routes = _catalog()["arches"][arch]["routes"].values()
@@ -62,13 +70,13 @@ def route_key(args):
     return json.dumps({k: args[k] for k in keys}, sort_keys=True, separators=(",", ":"))
 
 
-@functools.cache
-def load_program(arch, name):
+def jit_spec(arch, name):
+    """JIT spec of catalogued program ``name`` for ``arch`` (not built)."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
 
     record = _catalog()["arches"][arch]["programs"][name]
-    spec = gen_jit_spec(
+    return gen_jit_spec(
         name=name,
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
@@ -82,6 +90,12 @@ def load_program(arch, name):
         extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
         use_fast_math=False,
     )
+
+
+@functools.cache
+def load_program(arch, name):
+    spec = jit_spec(arch, name)
+    record = _catalog()["arches"][arch]["programs"][name]
     return spec.build_and_load(), {
         **record,
         "library_path": str(spec.get_library_path()),
@@ -101,7 +115,10 @@ class MegaMoEPlan:
     Caller-provided workspace is a freshly zero-initialized byte buffer of the
     catalog's exact layout. bind and run never zero counters. The kernel cleans
     its reusable state, so repeated run and CUDA graph replay have no host reset.
-    Initialization/copies happen in preparation. Default plans exclusively own
+    The route is selected by the device's physical SM count; there is no SM
+    count override. Initialization/copies happen in preparation, including the
+    shared-expert scale permutation index that update_inputs() reuses; a
+    refresh is four copies and one scatter. Default plans exclusively own
     private descriptors and run contains one submission. A borrowed descriptor
     workspace remains mutable and is refreshed before every consumer launch.
     Changing tensor addresses/layout requires a new plan; content updates remain
@@ -123,7 +140,6 @@ class MegaMoEPlan:
         num_shared_experts=1,
         activation_clamp=10.0,
         fast_math=True,
-        num_sms=None,
         workspace=None,
         out=None,
         descriptor_workspace=None,
@@ -131,15 +147,14 @@ class MegaMoEPlan:
         import torch
 
         arch = device_arch(x.device)
-        actual_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-        if actual_sms not in supported_num_sms(arch):
+        sms = device_sm_count(x.device.index)
+        if sms not in supported_num_sms(arch):
             raise RuntimeError(
                 f"The exported {arch} catalog covers {supported_num_sms(arch)} "
-                f"physical SMs; this device has {actual_sms}"
+                f"physical SMs; this device has {sms}"
             )
         t, h = x.shape
         tk = topk_idx.shape[1]
-        sms = actual_sms if num_sms is None else int(num_sms)
         args = dict(
             num_tokens=t,
             hidden=h,
@@ -199,6 +214,18 @@ class MegaMoEPlan:
             out,
             config,
         )
+        self._shared_sf_rows = None
+        if config.num_shared_experts:
+            # Shared-expert scale rows in the kernel's 128-row swizzled order;
+            # depends only on the route, so it is computed once here.
+            token = torch.arange(t, device=x.device, dtype=torch.int64)
+            local = token % config.block_m
+            self._shared_sf_rows = (
+                token // config.block_m * ((config.block_m + 127) // 128 * 128)
+                + (local & ~127)
+                + (local & 31) * 4
+                + ((local >> 5) & 3)
+            )
         self.update_inputs(x, x_sf, topk_idx, topk_weights)
         pack = 2 if routed_weight_dtype == "fp4" else 1
         e = num_experts
@@ -303,16 +330,8 @@ class MegaMoEPlan:
             strict=False,
         ):
             self.views[name][:t].copy_(value)
-        if c.num_shared_experts:
-            token = torch.arange(t, device=x.device, dtype=torch.int64)
-            local = token % c.block_m
-            rows = (
-                token // c.block_m * ((c.block_m + 127) // 128 * 128)
-                + (local & ~127)
-                + (local & 31) * 4
-                + ((local >> 5) & 3)
-            )
-            self.views["shared_l1_sf"][:, rows] = x_sf.T
+        if self._shared_sf_rows is not None:
+            self.views["shared_l1_sf"][:, self._shared_sf_rows] = x_sf.T
 
     def run(self):
         import tvm_ffi

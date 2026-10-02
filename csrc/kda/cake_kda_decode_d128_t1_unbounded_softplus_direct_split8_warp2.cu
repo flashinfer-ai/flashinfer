@@ -16,8 +16,6 @@
 
 // clang-format off
 // Frozen Cake recurrent-KDA export; do not edit by hand.
-// Raw generated body SHA256: 9408feb2f856279f21fb283dbe369d81b1e8c16c3874f6f12bf2e1615ce56ff4
-// Normalized generated SHA256: df684b2afe66f118688e219382132b8781e70d6bfb80545c10d9fc49c9859462
 // BEGIN FROZEN GENERATED BODY
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
