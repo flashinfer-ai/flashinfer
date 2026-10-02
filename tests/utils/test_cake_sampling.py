@@ -2533,6 +2533,25 @@ def test_manifest_names_the_source_parts():
         }
 
 
+def test_module_identity_is_sealed_over_its_inputs():
+    """The JIT module name is content-derived (``cake_sampling_`` + 20 hex digits), stable within a process
+    and different as soon as the manifest, the binding header or the rendered binding would differ, so an
+    installed AOT artifact or a JIT build of another bundle revision is never loaded for this one."""
+    import re
+
+    uri = cake_sampling_jit.get_cake_sampling_uri()
+    assert re.fullmatch(r"cake_sampling_[0-9a-f]{20}", uri), uri
+    assert cake_sampling_jit.get_cake_sampling_uri() == uri
+    man = load_manifest()
+    assert cake_sampling_jit._module_identity(man) == uri
+    changed = dict(
+        man,
+        compile_flags=list(man["compile_flags"]) + ["-DCAKE_SAMPLING_IDENTITY_PROBE"],
+    )
+    assert cake_sampling_jit._module_identity(changed) != uri
+    assert cake_sampling_jit.gen_cake_sampling_module().name == uri
+
+
 def test_coarse_push_build_matches_default_build():
     """Round 8, lever L-G(d): the streaming variants whose cluster runs the two-level select ship the pushed-coarse-sums
     form of their default build (`_lg`, launch_flags bit 8 on a two-launch chain).  Each CTA stores its coarse histogram

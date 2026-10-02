@@ -17,6 +17,7 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -179,12 +180,30 @@ def _binding_source(manifest: dict[str, Any]) -> str:
 """
 
 
+def _module_identity(manifest: dict[str, Any]) -> str:
+    """JIT module name, sealed over the frozen source parts (manifest order), the manifest, the
+    binding header and the rendered binding: ``cake_sampling_`` + 20 hex digits.
+
+    FlashInfer resolves installed AOT artifacts by module name before ninja sees the build inputs,
+    so a fixed name could load the artifact of another bundle revision; the content-derived name
+    cannot.  The target architectures are not part of the name:
+    FlashInfer's JIT workspace directory is already keyed by the ``CompilationContext`` target
+    set, so one name maps to one fatbin per target set.
+    """
+    csrc = _get_csrc_dir()
+    digest = hashlib.sha256()
+    for name in manifest["source_files"]:
+        digest.update((csrc / _GENERATED_DIR / name).read_bytes())
+    digest.update(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode())
+    digest.update((csrc / _BINDING_HEADER).read_bytes())
+    digest.update(_binding_source(manifest).encode())
+    return f"{_MODULE_NAME}_{digest.hexdigest()[:20]}"
+
+
+@functools.cache
 def get_cake_sampling_uri() -> str:
-    """JIT module name.  Like every other FlashInfer module the name identifies the module, not a
-    source revision: the build tracks the frozen source, the manifest-rendered binding and the
-    binding header as inputs and rebuilds when any of them changes, and FlashInfer's JIT workspace
-    is keyed by the ``CompilationContext`` target set."""
-    return _MODULE_NAME
+    """Content-derived JIT module name (see :func:`_module_identity`), computed once per process."""
+    return _module_identity(load_manifest())
 
 
 @functools.cache

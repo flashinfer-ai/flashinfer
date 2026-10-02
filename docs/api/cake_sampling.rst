@@ -92,7 +92,10 @@ files in order; every file stays under the repository's 5 MiB limit) plus ``mani
 which records every frozen variant's launch resources and build flags, the capabilities each
 stage-2/3 form is dispatched on, the slab geometry and the file names.
 :mod:`flashinfer.jit.cake_sampling` renders the manifest into the binding's variant tables and
-compiles the unit once into a single fatbin with one ``-gencode`` per build target.
+compiles the unit once into a single fatbin with one ``-gencode`` per build target.  The module
+name is content-derived (``cake_sampling_`` + 20 hex digits sealed over the frozen source parts,
+the manifest, the binding header and the rendered binding, computed once per process), so a JIT
+build or an installed AOT artifact of another bundle revision is never loaded for this one.
 
 Correctness contract
 --------------------
