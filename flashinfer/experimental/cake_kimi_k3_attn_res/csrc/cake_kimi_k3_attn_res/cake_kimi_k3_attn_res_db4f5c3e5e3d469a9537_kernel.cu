@@ -48,25 +48,27 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_CHUNK_PIPE_STAGES 2
+#define TMEM_NCOLS 192
+#define TMEM__TMEM_VALUES_OFFSET 0
+#define NUM_CHUNK_PIPE_STAGES 3
 #define SMEM_V_BUFS_OFF 0
-#define SMEM_V_BUFS_STAGE_BYTES 57344
-#define SMEM_V_BUFS_STRIDE 57344
-#define SMEM_DELTA_BUFS_OFF 114688
+#define SMEM_V_BUFS_STAGE_BYTES 43008
+#define SMEM_V_BUFS_STRIDE 43008
+#define SMEM_DELTA_BUFS_OFF 129024
 #define SMEM_DELTA_BUFS_STAGE_BYTES 14336
 #define SMEM_DELTA_BUFS_STRIDE 14336
-#define SMEM_OUTPUT_NORM_BUF_OFF 143360
+#define SMEM_OUTPUT_NORM_BUF_OFF 172032
 #define SMEM_OUTPUT_NORM_BUF_STAGE_BYTES 14336
 #define SMEM_OUTPUT_NORM_BUF_STRIDE 14336
-#define SMEM_STATS_OFF 157696
-#define SMEM_STATS_STAGE_BYTES 512
-#define SMEM_STATS_STRIDE 512
-#define SMEM_OUTPUT_STATS_OFF 158208
-#define SMEM_OUTPUT_STATS_STAGE_BYTES 64
-#define SMEM_OUTPUT_STATS_STRIDE 64
-#define SMEM_TOTAL 158336
+#define SMEM_STATS_OFF 186368
+#define SMEM_STATS_STAGE_BYTES 576
+#define SMEM_STATS_STRIDE 576
+#define SMEM_OUTPUT_STATS_OFF 186944
+#define SMEM_OUTPUT_STATS_STAGE_BYTES 96
+#define SMEM_OUTPUT_STATS_STRIDE 96
+#define SMEM_TOTAL 187136
 #define THREADS 288
-#define NUM_BLOCKS 1
+#define NUM_BLOCKS 4
 #define DEFER_TMEM_STORE_WAIT 1
 #define EARLY_CONSUMED_RELEASE 1
 
@@ -112,20 +114,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 
 // Source-faithful relaxed CTA wait used only by a typed protocol that does
 // not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
 // Exact source ports may request the PTX suspendTimeHint operand explicitly.
 // The hint is expressed in nanoseconds and is kept separate from the canonical
 // no-hint CTA helper so unrelated schedules retain their existing retry path.
@@ -143,6 +131,34 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
     asm volatile(
         "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
         :: "r"(mbar_addr), "r"(bytes) : "memory");
+}
+
+
+__device__ __forceinline__ void tmem_ld_x4(float* dst, int tmem_addr) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x4.b32"
+        " {%0, %1, %2, %3}, [%4];"
+        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3])
+        : "r"(tmem_addr));
+}
+
+
+__device__ __forceinline__ void tmem_st_x4_f32(int tmem_addr, const float* src) {
+    asm volatile(
+        "tcgen05.st.sync.aligned.32x32b.x4.b32"
+        " [%0], {%1, %2, %3, %4};"
+        :: "r"(tmem_addr),
+           "f"(src[0]), "f"(src[1]), "f"(src[2]), "f"(src[3]));
+}
+
+
+__device__ __forceinline__ void tmem_st_x8_f32(int tmem_addr, const float* src) {
+    asm volatile(
+        "tcgen05.st.sync.aligned.32x32b.x8.b32"
+        " [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+        :: "r"(tmem_addr),
+           "f"(src[0]), "f"(src[1]), "f"(src[2]), "f"(src[3]),
+           "f"(src[4]), "f"(src[5]), "f"(src[6]), "f"(src[7]));
 }
 
 
@@ -199,10 +215,20 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 
 
 
+
+__device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x8.b32"
+        " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]),
+          "=f"(dst[4]), "=f"(dst[5]), "=f"(dst[6]), "=f"(dst[7])
+        : "r"(tmem_addr));
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(288, 1) void
-kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
+kernel_cake_kimi_k3_attn_res_db4f5c3e5e3d469a9537(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -212,10 +238,10 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
-    const int mbar_base = smem + 158272;
+    const int mbar_base = smem + 187040;
     #define ready_addr (mbar_base + 0)
-    #define consumed_addr (mbar_base + 16)
-    #define output_norm_ready_addr (mbar_base + 32)
+    #define consumed_addr (mbar_base + 24)
+    #define output_norm_ready_addr (mbar_base + 48)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -225,38 +251,53 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
     // Kernel setup ops
     __nv_bfloat16* v_bufs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int v_bufs_addr = smem + 0;
-    __nv_bfloat16* delta_bufs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 114688);
-    const int delta_bufs_addr = smem + 114688;
-    __nv_bfloat16* output_norm_buf = reinterpret_cast<__nv_bfloat16*>(smem_raw + 143360);
-    const int output_norm_buf_addr = smem + 143360;
-    float* stats = reinterpret_cast<float*>(smem_raw + 157696);
-    const int stats_addr = smem + 157696;
-    float* output_stats = reinterpret_cast<float*>(smem_raw + 158208);
-    const int output_stats_addr = smem + 158208;
+    __nv_bfloat16* delta_bufs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 129024);
+    const int delta_bufs_addr = smem + 129024;
+    __nv_bfloat16* output_norm_buf = reinterpret_cast<__nv_bfloat16*>(smem_raw + 172032);
+    const int output_norm_buf_addr = smem + 172032;
+    float* stats = reinterpret_cast<float*>(smem_raw + 186368);
+    const int stats_addr = smem + 186368;
+    float* output_stats = reinterpret_cast<float*>(smem_raw + 186944);
+    const int output_stats_addr = smem + 186944;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 5 barriers)
-    // Mbarriers at smem_raw[158272..158312)
+    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 7 barriers)
+    // Mbarriers at smem_raw[187040..187096)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'chunk_pipe' ---
-            // ready: 2 barriers, init_count=1
-            mbarrier_init(smem + 158272, 1);
-            mbarrier_init(smem + 158280, 1);
-            // consumed: 2 barriers, init_count=256
-            mbarrier_init(smem + 158288, 256);
-            mbarrier_init(smem + 158296, 256);
+            // ready: 3 barriers, init_count=1
+            mbarrier_init(smem + 187040, 1);
+            mbarrier_init(smem + 187048, 1);
+            mbarrier_init(smem + 187056, 1);
+            // consumed: 3 barriers, init_count=256
+            mbarrier_init(smem + 187064, 256);
+            mbarrier_init(smem + 187072, 256);
+            mbarrier_init(smem + 187080, 256);
             // output_norm_ready: 1 barriers, init_count=1
-            mbarrier_init(smem + 158304, 1);
+            mbarrier_init(smem + 187088, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
-    // Kernel post-init ops
     __syncwarp();
+
+    // TMEM alloc (256 columns, 192 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 187096);
+    if (warp == 1) {
+        int _tmem_hold = smem + 187096;
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
+        __syncwarp();
+    }
+
     __syncthreads();
-    asm volatile("tcgen05.fence::after_thread_sync;");
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
+    const int taddr = tmem_addr_storage[0];
+
+    // Kernel post-init ops
+    const int tmem__tmem_values = taddr;
 
     // ---- Role: producer ----
     if (warp == 0) {
@@ -269,24 +310,24 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
             #pragma unroll 1
             for (int token = bid; token < M; token += num_bids) {
                 #pragma unroll
-                for (int chunk = 0; chunk < (NUM_BLOCKS + 4) / 4; chunk++) {
-                    const int source_base = chunk * 4;
+                for (int chunk = 0; chunk < (NUM_BLOCKS + 3) / 3; chunk++) {
+                    const int source_base = chunk * 3;
                     const int remaining_sources = NUM_BLOCKS + 1 - source_base;
-                    const int active_rows = ((remaining_sources > 4) ? 4 : remaining_sources);
-                    mbarrier_wait_relaxed(consumed_addr + (producer_stage) * 8, producer_phase ^ 1);
+                    const int active_rows = ((remaining_sources > 3) ? 3 : remaining_sources);
+                    mbarrier_wait(consumed_addr + (producer_stage) * 8, producer_phase ^ 1);
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        const int extra_delta_row = ((chunk == (NUM_BLOCKS + 4) / 4 - 1) ? 1 : 0);
+                        const int extra_delta_row = ((chunk == (NUM_BLOCKS + 3) / 3 - 1) ? 1 : 0);
                         mbarrier_arrive_expect_tx(ready_addr + (producer_stage) * 8, (active_rows + extra_delta_row) * 7168 * 2);
                         #pragma unroll
-                        for (int source_in_chunk = 0; source_in_chunk < 4; source_in_chunk++) {
+                        for (int source_in_chunk = 0; source_in_chunk < 3; source_in_chunk++) {
                             const int source = source_base + source_in_chunk;
                             if (source < NUM_BLOCKS + 1) {
                                 if (source == NUM_BLOCKS) {
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                                         "[%0], [%1], %2, [%3];"
-                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                                        :: "r"(v_bufs_addr + (producer_stage * 3 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                                         : "memory");
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -297,22 +338,24 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                                         "[%0], [%1], %2, [%3];"
-                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + (unsigned long long)source * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                                        :: "r"(v_bufs_addr + (producer_stage * 3 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + (unsigned long long)source * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                                         : "memory");
                                 }
                             }
                         }
-                        if (token == bid) {
-                            mbarrier_arrive_expect_tx(output_norm_ready_addr, 14336);
-                            asm volatile(
-                                "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
-                                "[%0], [%1], %2, [%3];"
-                                :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + ((unsigned long long)0 * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(output_norm_ready_addr)
-                                : "memory");
+                        if (NUM_BLOCKS == 8 && DEFER_TMEM_STORE_WAIT && EARLY_CONSUMED_RELEASE && !0 && !0 && !0 && chunk == 0 || NUM_BLOCKS == 4 && EARLY_CONSUMED_RELEASE && !0 && !0 && !0 && chunk == 0) {
+                            if (token == bid) {
+                                mbarrier_arrive_expect_tx(output_norm_ready_addr, 14336);
+                                asm volatile(
+                                    "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+                                    "[%0], [%1], %2, [%3];"
+                                    :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + ((unsigned long long)0 * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(output_norm_ready_addr)
+                                    : "memory");
+                            }
                         }
                     }
                     producer_stage += 1;
-                    if (producer_stage == 2) { producer_stage = 0; producer_phase ^= 1; }
+                    if (producer_stage == 3) { producer_stage = 0; producer_phase ^= 1; }
                 }
             }
             if (elect_sync()) {
@@ -328,6 +371,7 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
             int consumer_thread = consumer_warp * 32 + lane;
             int group = consumer_warp / 4;
             int thread_in_group = consumer_thread % 128;
+            int group_tmem_base = taddr + (unsigned int)(group * 96);
             float q_cache[28];
             #pragma unroll
             for (int slice_idx = 0; slice_idx < 4; slice_idx++) {
@@ -430,7 +474,7 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                     }
                 }
             }
-            float block_carry[56];
+            float block_carry[28];
             unsigned int consumer_stage = 0;
             unsigned int consumer_phase = 0;
             #pragma unroll 1
@@ -443,16 +487,16 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                 float m_running = -3.4028234663852886e+38f;
                 float s_running = 0.0f;
                 #pragma unroll
-                for (int chunk_1 = 0; chunk_1 < (NUM_BLOCKS + 4) / 4; chunk_1++) {
-                    const int source_base_1 = chunk_1 * 4;
+                for (int chunk_1 = 0; chunk_1 < (NUM_BLOCKS + 3) / 3; chunk_1++) {
+                    const int source_base_1 = chunk_1 * 3;
                     const int remaining_sources_1 = NUM_BLOCKS + 1 - source_base_1;
-                    const int active_rows_1 = ((remaining_sources_1 > 4) ? 4 : remaining_sources_1);
+                    const int active_rows_1 = ((remaining_sources_1 > 3) ? 3 : remaining_sources_1);
                     mbarrier_wait(ready_addr + (consumer_stage) * 8, consumer_phase);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    float2 local_sum_sq[4];
-                    float2 local_dot[4];
+                    float2 local_sum_sq[3];
+                    float2 local_dot[3];
                     #pragma unroll
-                    for (int source_in_chunk_1 = 0; source_in_chunk_1 < 4; source_in_chunk_1++) {
+                    for (int source_in_chunk_1 = 0; source_in_chunk_1 < 3; source_in_chunk_1++) {
                         float2 _f2_4 = make_float2(0.0f, 0.0f);
                         local_sum_sq[source_in_chunk_1] = _f2_4;
                         float2 _f2_5 = make_float2(0.0f, 0.0f);
@@ -464,14 +508,14 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                             int hidden_base_2 = 6144 + group * 512 + thread_in_group * 4;
                             float values[8];
                             #pragma unroll
-                            for (int source_in_chunk_2 = 0; source_in_chunk_2 < 4; source_in_chunk_2++) {
+                            for (int source_in_chunk_2 = 0; source_in_chunk_2 < 3; source_in_chunk_2++) {
                                 const int source_1 = source_base_1 + source_in_chunk_2;
                                 if (source_1 < NUM_BLOCKS + 1) {
                                     unsigned int prefix_words[2];
                                     {
                                         float _v_bufs_reg_0[4];
                                         {
-                                            uint32_t _smem_addr_4 = v_bufs_addr + (consumer_stage * 4 * 7168 + (unsigned int)(source_in_chunk_2 * 7168) + (unsigned int)hidden_base_2) * 2;
+                                            uint32_t _smem_addr_4 = v_bufs_addr + (consumer_stage * 3 * 7168 + (unsigned int)(source_in_chunk_2 * 7168) + (unsigned int)hidden_base_2) * 2;
                                             uint32_t _bf16x2_4[2];
                                             asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];"
                                                 : "=r"(_bf16x2_4[0]), "=r"(_bf16x2_4[1]) : "r"(_smem_addr_4) : "memory");
@@ -549,10 +593,7 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                         local_dot[source_in_chunk_2] = fma_f32x2_rn_ftz(value_pair, q_pair_2, local_dot[source_in_chunk_2]);
                                     }
                                     {
-                                        #pragma unroll
-                                        for (int value_idx_6 = 0; value_idx_6 < 4; value_idx_6++) {
-                                            block_carry[source_in_chunk_2 * 28 + slice_idx_1 * 8 + value_idx_6] = values[value_idx_6];
-                                        }
+                                        tmem_st_x4_f32(group_tmem_base + (slice_idx_1 * 3 + source_in_chunk_2) * 8, values);
                                     }
                                 }
                             }
@@ -561,14 +602,14 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                             int hidden_base_3 = hidden_tile_1 * 1024 + thread_in_group * 8;
                             float values_1[8];
                             #pragma unroll
-                            for (int source_in_chunk_3 = 0; source_in_chunk_3 < 4; source_in_chunk_3++) {
+                            for (int source_in_chunk_3 = 0; source_in_chunk_3 < 3; source_in_chunk_3++) {
                                 const int source_2 = source_base_1 + source_in_chunk_3;
                                 if (source_2 < NUM_BLOCKS + 1) {
                                     unsigned int prefix_words_1[4];
                                     {
                                         float _v_bufs_reg_1[8];
                                         {
-                                            uint32_t _smem_addr_6 = v_bufs_addr + (consumer_stage * 4 * 7168 + (unsigned int)(source_in_chunk_3 * 7168) + (unsigned int)hidden_base_3) * 2;
+                                            uint32_t _smem_addr_6 = v_bufs_addr + (consumer_stage * 3 * 7168 + (unsigned int)(source_in_chunk_3 * 7168) + (unsigned int)hidden_base_3) * 2;
                                             uint32_t _bf16x2_6[4];
                                             asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];"
                                                 : "=r"(_bf16x2_6[0]), "=r"(_bf16x2_6[1]), "=r"(_bf16x2_6[2]), "=r"(_bf16x2_6[3]) : "r"(_smem_addr_6) : "memory");
@@ -602,8 +643,8 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                                 : "r"(_bf16x2_6[3]));
                                         }
                                         #pragma unroll
-                                        for (int value_idx_7 = 0; value_idx_7 < 8; value_idx_7++) {
-                                            values_1[value_idx_7] = _v_bufs_reg_1[value_idx_7];
+                                        for (int value_idx_6 = 0; value_idx_6 < 8; value_idx_6++) {
+                                            values_1[value_idx_6] = _v_bufs_reg_1[value_idx_6];
                                         }
                                     }
                                     if (source_2 == NUM_BLOCKS) {
@@ -644,16 +685,16 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                         }
                                         #pragma unroll
                                         for (int pair_idx_4 = 0; pair_idx_4 < 4; pair_idx_4++) {
-                                            const int value_idx_8 = pair_idx_4 * 2;
-                                            float2 _f2_10 = make_float2(values_1[value_idx_8], values_1[value_idx_8 + 1]);
-                                            float2 _f2_11 = make_float2(_delta_bufs_reg_1[value_idx_8], _delta_bufs_reg_1[value_idx_8 + 1]);
+                                            const int value_idx_7 = pair_idx_4 * 2;
+                                            float2 _f2_10 = make_float2(values_1[value_idx_7], values_1[value_idx_7 + 1]);
+                                            float2 _f2_11 = make_float2(_delta_bufs_reg_1[value_idx_7], _delta_bufs_reg_1[value_idx_7 + 1]);
                                             float2 updated_pair_1 = add_f32x2_noftz(_f2_10, _f2_11);
                                             __nv_bfloat16 _cvt_bf16_2 = __float2bfloat16(updated_pair_1.x);
                                             float _cvt_f32_2 = __bfloat162float(_cvt_bf16_2);
-                                            values_1[value_idx_8] = _cvt_f32_2;
+                                            values_1[value_idx_7] = _cvt_f32_2;
                                             __nv_bfloat16 _cvt_bf16_3 = __float2bfloat16(updated_pair_1.y);
                                             float _cvt_f32_3 = __bfloat162float(_cvt_bf16_3);
-                                            values_1[value_idx_8 + 1] = _cvt_f32_3;
+                                            values_1[value_idx_7 + 1] = _cvt_f32_3;
                                         }
                                         {
                                             __nv_bfloat162 _pk[4];
@@ -666,19 +707,16 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                     }
                                     #pragma unroll
                                     for (int pair_idx_5 = 0; pair_idx_5 < 4; pair_idx_5++) {
-                                        const int value_idx_9 = pair_idx_5 * 2;
-                                        float2 _f2_12 = make_float2(values_1[value_idx_9], values_1[value_idx_9 + 1]);
+                                        const int value_idx_8 = pair_idx_5 * 2;
+                                        float2 _f2_12 = make_float2(values_1[value_idx_8], values_1[value_idx_8 + 1]);
                                         float2 value_pair_1 = _f2_12;
-                                        float2 _f2_13 = make_float2(q_cache[slice_idx_1 * 8 + value_idx_9], q_cache[slice_idx_1 * 8 + value_idx_9 + 1]);
+                                        float2 _f2_13 = make_float2(q_cache[slice_idx_1 * 8 + value_idx_8], q_cache[slice_idx_1 * 8 + value_idx_8 + 1]);
                                         float2 q_pair_3 = _f2_13;
                                         local_sum_sq[source_in_chunk_3] = fma_f32x2_rn_ftz(value_pair_1, value_pair_1, local_sum_sq[source_in_chunk_3]);
                                         local_dot[source_in_chunk_3] = fma_f32x2_rn_ftz(value_pair_1, q_pair_3, local_dot[source_in_chunk_3]);
                                     }
                                     {
-                                        #pragma unroll
-                                        for (int value_idx_10 = 0; value_idx_10 < 8; value_idx_10++) {
-                                            block_carry[source_in_chunk_3 * 28 + slice_idx_1 * 8 + value_idx_10] = values_1[value_idx_10];
-                                        }
+                                        tmem_st_x8_f32(group_tmem_base + (slice_idx_1 * 3 + source_in_chunk_3) * 8, values_1);
                                     }
                                 }
                             }
@@ -688,10 +726,10 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
                     }
-                    unsigned int stats_stage_base = consumer_stage * 64;
+                    unsigned int stats_stage_base = consumer_stage * 48;
                     {
                         #pragma unroll
-                        for (int source_in_chunk_4 = 0; source_in_chunk_4 < 4; source_in_chunk_4++) {
+                        for (int source_in_chunk_4 = 0; source_in_chunk_4 < 3; source_in_chunk_4++) {
                             if (active_rows_1 > source_in_chunk_4) {
                                 float2 _f2_20 = make_float2(local_sum_sq[source_in_chunk_4].x + local_sum_sq[source_in_chunk_4].y, local_dot[source_in_chunk_4].x + local_dot[source_in_chunk_4].y);
                                 float2 reduce_pair = _f2_20;
@@ -725,8 +763,8 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                 peer_pair = reinterpret_cast<float2*>(&peer_packed)[0];
                                 reduce_pair = add_f32x2(reduce_pair, peer_pair);
                                 if (lane == 0) {
-                                    stats[stats_stage_base + (unsigned int)(((0) ? source_in_chunk_4 * 8 + consumer_warp : consumer_warp * 4 + source_in_chunk_4) * 2)] = reduce_pair.x;
-                                    stats[stats_stage_base + (unsigned int)(((0) ? source_in_chunk_4 * 8 + consumer_warp : consumer_warp * 4 + source_in_chunk_4) * 2) + 1] = reduce_pair.y;
+                                    stats[stats_stage_base + (unsigned int)(((0) ? source_in_chunk_4 * 8 + consumer_warp : consumer_warp * 3 + source_in_chunk_4) * 2)] = reduce_pair.x;
+                                    stats[stats_stage_base + (unsigned int)(((0) ? source_in_chunk_4 * 8 + consumer_warp : consumer_warp * 3 + source_in_chunk_4) * 2) + 1] = reduce_pair.y;
                                 }
                             }
                         }
@@ -740,8 +778,8 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                     float total_sum_sq = 0.0f;
                     float total_dot = 0.0f;
                     if (stat_source < active_rows_1) {
-                        total_sum_sq = stats[stats_stage_base + (unsigned int)(((0) ? (int)lane : stat_warp * 4 + stat_source) * 2)];
-                        total_dot = stats[stats_stage_base + (unsigned int)(((0) ? (int)lane : stat_warp * 4 + stat_source) * 2) + 1];
+                        total_sum_sq = stats[stats_stage_base + (unsigned int)(((0) ? (int)lane : stat_warp * 3 + stat_source) * 2)];
+                        total_dot = stats[stats_stage_base + (unsigned int)(((0) ? (int)lane : stat_warp * 3 + stat_source) * 2) + 1];
                     }
                     float _shfl_down_0 = __shfl_down_sync(0xFFFFFFFF, total_sum_sq, 4, 8);
                     total_sum_sq += _shfl_down_0;
@@ -760,9 +798,9 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                         float _rsqrt_0 = rsqrtf(total_sum_sq / 7168.0f + eps);
                         local_logit = total_dot * _rsqrt_0;
                     }
-                    float logits[4];
+                    float logits[3];
                     #pragma unroll
-                    for (int source_in_chunk_5 = 0; source_in_chunk_5 < 4; source_in_chunk_5++) {
+                    for (int source_in_chunk_5 = 0; source_in_chunk_5 < 3; source_in_chunk_5++) {
                         logits[source_in_chunk_5] = 0.0f;
                         if (source_in_chunk_5 < 4) {
                             float _shfl_0;
@@ -770,21 +808,21 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                             logits[source_in_chunk_5] = _shfl_0;
                         }
                     }
-                    if (!EARLY_CONSUMED_RELEASE && chunk_1 != (NUM_BLOCKS + 4) / 4 - 1) {
+                    if (!EARLY_CONSUMED_RELEASE && chunk_1 != (NUM_BLOCKS + 3) / 3 - 1) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
                     }
-                    float weights[4];
+                    float weights[3];
                     float new_max = 0.0f;
                     float correction = 0.0f;
                     float weight_sum = 0.0f;
                     #pragma unroll
-                    for (int source_in_chunk_6 = 0; source_in_chunk_6 < 4; source_in_chunk_6++) {
+                    for (int source_in_chunk_6 = 0; source_in_chunk_6 < 3; source_in_chunk_6++) {
                         weights[source_in_chunk_6] = 0.0f;
                     }
                     float chunk_max = -3.4028234663852886e+38f;
                     #pragma unroll
-                    for (int source_in_chunk_7 = 0; source_in_chunk_7 < 4; source_in_chunk_7++) {
+                    for (int source_in_chunk_7 = 0; source_in_chunk_7 < 3; source_in_chunk_7++) {
                         if (active_rows_1 > source_in_chunk_7) {
                             float _max_0 = max_noftz(chunk_max, logits[source_in_chunk_7]);
                             chunk_max = _max_0;
@@ -795,7 +833,7 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                     float _exp2_0 = approx_exp2((m_running - new_max) * 1.4426950408889634f);
                     correction = _exp2_0;
                     #pragma unroll
-                    for (int source_in_chunk_8 = 0; source_in_chunk_8 < 4; source_in_chunk_8++) {
+                    for (int source_in_chunk_8 = 0; source_in_chunk_8 < 3; source_in_chunk_8++) {
                         if (active_rows_1 > source_in_chunk_8) {
                             float _exp2_1 = approx_exp2((logits[source_in_chunk_8] - new_max) * 1.4426950408889634f);
                             weights[source_in_chunk_8] = _exp2_1;
@@ -819,18 +857,20 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                 acc32[acc_idx + 1] = scaled_pair.y;
                             }
                             #pragma unroll
-                            for (int source_in_chunk_9 = 0; source_in_chunk_9 < 4; source_in_chunk_9++) {
+                            for (int source_in_chunk_9 = 0; source_in_chunk_9 < 3; source_in_chunk_9++) {
                                 if (active_rows_1 > source_in_chunk_9) {
                                     {
-                                        float2 _f2_24 = make_float2(weights[source_in_chunk_9], weights[source_in_chunk_9]);
-                                        float2 weight_pair = _f2_24;
+                                        float _tmem_load_0[4];
+                                        tmem_ld_x4(&_tmem_load_0[0], group_tmem_base + (slice_idx_2 * 3 + source_in_chunk_9) * 8);
+                                        float2 _f2_30 = make_float2(weights[source_in_chunk_9], weights[source_in_chunk_9]);
+                                        float2 weight_pair = _f2_30;
                                         #pragma unroll
                                         for (int pair_idx_7 = 0; pair_idx_7 < 2; pair_idx_7++) {
                                             const int acc_idx_1 = slice_idx_2 * 8 + pair_idx_7 * 2;
-                                            float2 _f2_25 = make_float2(block_carry[source_in_chunk_9 * 28 + acc_idx_1], block_carry[source_in_chunk_9 * 28 + acc_idx_1 + 1]);
-                                            float2 cached_pair = _f2_25;
-                                            float2 _f2_26 = make_float2(acc32[acc_idx_1], acc32[acc_idx_1 + 1]);
-                                            float2 acc_pair_1 = _f2_26;
+                                            float2 _f2_31 = make_float2(_tmem_load_0[pair_idx_7 * 2], _tmem_load_0[pair_idx_7 * 2 + 1]);
+                                            float2 cached_pair = _f2_31;
+                                            float2 _f2_32 = make_float2(acc32[acc_idx_1], acc32[acc_idx_1 + 1]);
+                                            float2 acc_pair_1 = _f2_32;
                                             float2 updated_pair_2 = fma_f32x2_rn_ftz(weight_pair, cached_pair, acc_pair_1);
                                             acc32[acc_idx_1] = updated_pair_2.x;
                                             acc32[acc_idx_1 + 1] = updated_pair_2.y;
@@ -839,13 +879,13 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                 }
                             }
                         } else {
-                            float2 _f2_30 = make_float2(correction, correction);
-                            float2 correction_pair_1 = _f2_30;
+                            float2 _f2_33 = make_float2(correction, correction);
+                            float2 correction_pair_1 = _f2_33;
                             #pragma unroll
                             for (int pair_idx_8 = 0; pair_idx_8 < 4; pair_idx_8++) {
                                 const int acc_idx_2 = slice_idx_2 * 8 + pair_idx_8 * 2;
-                                float2 _f2_31 = make_float2(acc32[acc_idx_2], acc32[acc_idx_2 + 1]);
-                                float2 acc_pair_2 = _f2_31;
+                                float2 _f2_34 = make_float2(acc32[acc_idx_2], acc32[acc_idx_2 + 1]);
+                                float2 acc_pair_2 = _f2_34;
                                 float2 _mul_f32x2_1;
                                 asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_1) : "l"(*(const unsigned long long*)&acc_pair_2), "l"(*(const unsigned long long*)&correction_pair_1));
                                 float2 scaled_pair_1 = _mul_f32x2_1;
@@ -853,18 +893,20 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                 acc32[acc_idx_2 + 1] = scaled_pair_1.y;
                             }
                             #pragma unroll
-                            for (int source_in_chunk_10 = 0; source_in_chunk_10 < 4; source_in_chunk_10++) {
+                            for (int source_in_chunk_10 = 0; source_in_chunk_10 < 3; source_in_chunk_10++) {
                                 if (active_rows_1 > source_in_chunk_10) {
                                     {
-                                        float2 _f2_32 = make_float2(weights[source_in_chunk_10], weights[source_in_chunk_10]);
-                                        float2 weight_pair_1 = _f2_32;
+                                        float _tmem_load_1[8];
+                                        tmem_ld_x8(&_tmem_load_1[0], group_tmem_base + (slice_idx_2 * 3 + source_in_chunk_10) * 8);
+                                        float2 _f2_38 = make_float2(weights[source_in_chunk_10], weights[source_in_chunk_10]);
+                                        float2 weight_pair_1 = _f2_38;
                                         #pragma unroll
                                         for (int pair_idx_9 = 0; pair_idx_9 < 4; pair_idx_9++) {
                                             const int acc_idx_3 = slice_idx_2 * 8 + pair_idx_9 * 2;
-                                            float2 _f2_33 = make_float2(block_carry[source_in_chunk_10 * 28 + acc_idx_3], block_carry[source_in_chunk_10 * 28 + acc_idx_3 + 1]);
-                                            float2 cached_pair_1 = _f2_33;
-                                            float2 _f2_34 = make_float2(acc32[acc_idx_3], acc32[acc_idx_3 + 1]);
-                                            float2 acc_pair_3 = _f2_34;
+                                            float2 _f2_39 = make_float2(_tmem_load_1[pair_idx_9 * 2], _tmem_load_1[pair_idx_9 * 2 + 1]);
+                                            float2 cached_pair_1 = _f2_39;
+                                            float2 _f2_40 = make_float2(acc32[acc_idx_3], acc32[acc_idx_3 + 1]);
+                                            float2 acc_pair_3 = _f2_40;
                                             float2 updated_pair_3 = fma_f32x2_rn_ftz(weight_pair_1, cached_pair_1, acc_pair_3);
                                             acc32[acc_idx_3] = updated_pair_3.x;
                                             acc32[acc_idx_3 + 1] = updated_pair_3.y;
@@ -876,9 +918,9 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                     }
                     s_running = s_running * correction + weight_sum;
                     m_running = new_max;
-                    if (EARLY_CONSUMED_RELEASE || chunk_1 != (NUM_BLOCKS + 4) / 4 - 1) {
+                    if (EARLY_CONSUMED_RELEASE || chunk_1 != (NUM_BLOCKS + 3) / 3 - 1) {
                         consumer_stage += 1;
-                        if (consumer_stage == 2) { consumer_stage = 0; consumer_phase ^= 1; }
+                        if (consumer_stage == 3) { consumer_stage = 0; consumer_phase ^= 1; }
                     }
                 }
                 if (token_1 == bid) {
@@ -886,12 +928,12 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 }
                 float output_norm_first_values[8];
-                float2 _f2_35 = make_float2(0.0f, 0.0f);
-                float2 local_output_sum_pair = _f2_35;
+                float2 _f2_41 = make_float2(0.0f, 0.0f);
+                float2 local_output_sum_pair = _f2_41;
                 #pragma unroll
                 for (int pair_idx_10 = 0; pair_idx_10 < 14; pair_idx_10++) {
-                    float2 _f2_36 = make_float2(acc32[pair_idx_10 * 2], acc32[pair_idx_10 * 2 + 1]);
-                    float2 acc_pair_4 = _f2_36;
+                    float2 _f2_42 = make_float2(acc32[pair_idx_10 * 2], acc32[pair_idx_10 * 2 + 1]);
+                    float2 acc_pair_4 = _f2_42;
                     local_output_sum_pair = fma_f32x2_rn_ftz(acc_pair_4, acc_pair_4, local_output_sum_pair);
                 }
                 float local_output_sum_sq = local_output_sum_pair.x + local_output_sum_pair.y;
@@ -945,16 +987,16 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                 : "=f"((&_output_norm_buf_reg_1[2])[0]), "=f"((&_output_norm_buf_reg_1[2])[1])
                                 : "r"(_bf16x2_8[1]));
                         }
-                        float2 _f2_37 = make_float2(output_rsigma, output_rsigma);
-                        float2 output_rsigma_pair = _f2_37;
+                        float2 _f2_43 = make_float2(output_rsigma, output_rsigma);
+                        float2 output_rsigma_pair = _f2_43;
                         #pragma unroll
                         for (int pair_idx_11 = 0; pair_idx_11 < 2; pair_idx_11++) {
-                            const int value_idx_11 = pair_idx_11 * 2;
-                            const int acc_idx_4 = slice_idx_3 * 8 + value_idx_11;
-                            float2 _f2_38 = make_float2(acc32[acc_idx_4], acc32[acc_idx_4 + 1]);
-                            float2 scaled_pair_2 = mul_f32x2_noftz(_f2_38, output_rsigma_pair);
-                            float2 _f2_39 = make_float2(_output_norm_buf_reg_1[value_idx_11], _output_norm_buf_reg_1[value_idx_11 + 1]);
-                            float2 normalized_pair = mul_f32x2_noftz(scaled_pair_2, _f2_39);
+                            const int value_idx_9 = pair_idx_11 * 2;
+                            const int acc_idx_4 = slice_idx_3 * 8 + value_idx_9;
+                            float2 _f2_44 = make_float2(acc32[acc_idx_4], acc32[acc_idx_4 + 1]);
+                            float2 scaled_pair_2 = mul_f32x2_noftz(_f2_44, output_rsigma_pair);
+                            float2 _f2_45 = make_float2(_output_norm_buf_reg_1[value_idx_9], _output_norm_buf_reg_1[value_idx_9 + 1]);
+                            float2 normalized_pair = mul_f32x2_noftz(scaled_pair_2, _f2_45);
                             acc32[acc_idx_4] = normalized_pair.x;
                             acc32[acc_idx_4 + 1] = normalized_pair.y;
                         }
@@ -1004,16 +1046,16 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                                     : "=f"((&_output_norm_buf_reg_3[6])[0]), "=f"((&_output_norm_buf_reg_3[6])[1])
                                     : "r"(_bf16x2_9[3]));
                             }
-                            float2 _f2_43 = make_float2(output_rsigma, output_rsigma);
-                            float2 output_rsigma_pair_1 = _f2_43;
+                            float2 _f2_49 = make_float2(output_rsigma, output_rsigma);
+                            float2 output_rsigma_pair_1 = _f2_49;
                             #pragma unroll
                             for (int pair_idx_12 = 0; pair_idx_12 < 4; pair_idx_12++) {
-                                const int value_idx_12 = pair_idx_12 * 2;
-                                const int acc_idx_5 = slice_idx_3 * 8 + value_idx_12;
-                                float2 _f2_44 = make_float2(acc32[acc_idx_5], acc32[acc_idx_5 + 1]);
-                                float2 scaled_pair_3 = mul_f32x2_noftz(_f2_44, output_rsigma_pair_1);
-                                float2 _f2_45 = make_float2(_output_norm_buf_reg_3[value_idx_12], _output_norm_buf_reg_3[value_idx_12 + 1]);
-                                float2 normalized_pair_1 = mul_f32x2_noftz(scaled_pair_3, _f2_45);
+                                const int value_idx_10 = pair_idx_12 * 2;
+                                const int acc_idx_5 = slice_idx_3 * 8 + value_idx_10;
+                                float2 _f2_50 = make_float2(acc32[acc_idx_5], acc32[acc_idx_5 + 1]);
+                                float2 scaled_pair_3 = mul_f32x2_noftz(_f2_50, output_rsigma_pair_1);
+                                float2 _f2_51 = make_float2(_output_norm_buf_reg_3[value_idx_10], _output_norm_buf_reg_3[value_idx_10 + 1]);
+                                float2 normalized_pair_1 = mul_f32x2_noftz(scaled_pair_3, _f2_51);
                                 acc32[acc_idx_5] = normalized_pair_1.x;
                                 acc32[acc_idx_5 + 1] = normalized_pair_1.y;
                             }
@@ -1030,6 +1072,10 @@ kernel_cake_kimi_k3_attn_res_fc543ec76ffc003dca2a(__nv_bfloat16* __restrict__ ou
                 }
             }
             asm volatile("barrier.sync 9, 288;" ::: "memory");
+            if (consumer_warp == 0) {
+                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(256));
+            }
         }
     }
 
