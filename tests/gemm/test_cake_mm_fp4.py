@@ -217,8 +217,9 @@ def test_gemm_kernel_key_and_plan():
     # the default tactic of every static 2-CTA row carries the knob; the key needs the plan
     assert cb.default_tactic(2048, 7168, 16384, 148)["stream_k"]
     assert "stream_k" not in cb.default_tactic(128, 1536, 7168, 148)  # half_m pairs
-    assert cb.default_tactic(8192, 1536, 7168, 148)["stream_k"]  # static 2x256 pairs (192 tiles < 10 per pair)
-    assert "stream_k" not in cb.default_tactic(8192, 7168, 16384, 148)  # CLC scheduler (896 tiles >= 10 per pair)
+    # static 2x256 pairs (192 tiles < 10 per pair) vs the CLC scheduler (896 tiles)
+    assert cb.default_tactic(8192, 1536, 7168, 148)["stream_k"]
+    assert "stream_k" not in cb.default_tactic(8192, 7168, 16384, 148)
     with pytest.raises(ValueError, match="resolved sk_split"):
         cb.gemm_kernel_key(cb.default_tactic(2048, 7168, 16384, 148), False)
     plan = cb.gemm_plan(2048, 7168, 16384, False, "sm_100a", 148)
