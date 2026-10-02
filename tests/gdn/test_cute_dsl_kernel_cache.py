@@ -119,7 +119,18 @@ NONTRANSPOSE_BASELINE = {
     "HV": 32,
     "K": 128,
     "V": 128,
-    "dtype": torch.bfloat16,
+    # (h0_source, A_log, a, dt_bias, q, k, v, b, output)
+    "dtype_key": (
+        torch.float32,
+        torch.float32,
+        torch.bfloat16,
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+    ),
     "scale": 0.08838834764831845,
     "use_qk_l2norm": True,
 }
@@ -131,7 +142,16 @@ PRETRANSPOSE_BASELINE = {
     "HV": 32,
     "K": 128,
     "V": 128,
-    "dtype": torch.bfloat16,
+    # q/k/v are pinned to bf16 on this path, so they are absent by design.
+    # (h0_source, A_log, a, dt_bias, b, output)
+    "dtype_key": (
+        torch.float32,
+        torch.float32,
+        torch.bfloat16,
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+    ),
     "scale": 0.08838834764831845,
     "use_qk_l2norm": True,
     "use_pool_indexing": False,
@@ -260,6 +280,18 @@ BF16_STATE_BASELINES = {
 }
 
 
+def _with_dtype(baseline: dict, index: int, dtype) -> tuple:
+    """The baseline dtype key with one operand's dtype changed.
+
+    Varying the whole key would pass even if the name rendered only part of it,
+    and it is a single element -- the caller-supplied ``output`` -- that collided
+    on disk before these keys were completed (GDN-C3b, #4214).
+    """
+    key = list(baseline["dtype_key"])
+    key[index] = dtype
+    return tuple(key)
+
+
 # ---------------------------------------------------------------------------
 # 1. Signature coverage
 # ---------------------------------------------------------------------------
@@ -308,7 +340,21 @@ def test_kernel_name_signature_covers_getter_params(getter, name_fn):
         ("HV", 64),
         ("K", 64),
         ("V", 64),
-        ("dtype", torch.float16),
+        pytest.param(
+            "dtype_key",
+            _with_dtype(NONTRANSPOSE_BASELINE, 8, torch.float16),
+            id="dtype_key-output",
+        ),
+        pytest.param(
+            "dtype_key",
+            _with_dtype(NONTRANSPOSE_BASELINE, 3, torch.bfloat16),
+            id="dtype_key-dt_bias",
+        ),
+        pytest.param(
+            "dtype_key",
+            _with_dtype(NONTRANSPOSE_BASELINE, 2, torch.float16),
+            id="dtype_key-a",
+        ),
         ("scale", 0.0625),
         ("use_qk_l2norm", False),
     ],
@@ -331,7 +377,16 @@ def test_nontranspose_name_varies_with_every_argument(param, alternate):
         ("HV", 64),
         ("K", 64),
         ("V", 64),
-        ("dtype", torch.float16),
+        pytest.param(
+            "dtype_key",
+            _with_dtype(PRETRANSPOSE_BASELINE, 5, torch.float16),
+            id="dtype_key-output",
+        ),
+        pytest.param(
+            "dtype_key",
+            _with_dtype(PRETRANSPOSE_BASELINE, 3, torch.bfloat16),
+            id="dtype_key-dt_bias",
+        ),
         ("scale", 0.0625),
         ("use_qk_l2norm", False),
         ("use_pool_indexing", True),
