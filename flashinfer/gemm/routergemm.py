@@ -13,7 +13,7 @@ from flashinfer.jit import (
 import functools
 import os
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 from flashinfer.utils import (
     get_compute_capability,
@@ -843,11 +843,10 @@ def get_tinygemm2_module():
     )
 
 
-# tinygemm2_sm100: generated SM100/SM103 variants of the same kernel. Loom
-# schedules exactly porting csrc/tinygemm2.cu with bit-identical outputs;
-# selected automatically for the bias path on B200/B300-class devices. Ring
-# depth (stage 4/8/16) is selected inside the binding, mirroring the
-# reference launcher convention.
+# tinygemm2_sm100: generated SM100/SM103 port of the same kernel with
+# bit-identical outputs (csrc/tinygemm2_sm100.cu); selected automatically for
+# the bias path on B200/B300-class devices. Ring depth (stage 4/8/16) is
+# selected inside the binding, mirroring the reference launcher convention.
 
 
 @functools.cache
@@ -876,15 +875,26 @@ def get_tinygemm2_sm100_module():
 _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
-def _use_tinygemm2_sm100(device: torch.device) -> bool:
-    if os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0") == "1":
+@functools.cache
+def _tinygemm2_sm100_enabled(disabled: str, compute_capability: Tuple[int, int]) -> bool:
+    # Evaluated once per (escape-hatch value, compute capability): the CUDA
+    # version parsing below is off the per-call path.
+    if disabled == "1":
         return False
-    compute_capability = get_compute_capability(device)
     if compute_capability not in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES:
         return False
     if compute_capability == (10, 7) and not is_cuda_version_at_least("13.4"):
         return False
     return version_at_least(torch.version.cuda, "12.8")
+
+
+def _use_tinygemm2_sm100(device: torch.device) -> bool:
+    # Keyed by the current FLASHINFER_DISABLE_TINYGEMM2_SM100 value so a
+    # process that toggles the escape hatch at runtime sees the change.
+    return _tinygemm2_sm100_enabled(
+        os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0"),
+        get_compute_capability(device),
+    )
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
