@@ -284,8 +284,11 @@ def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
             flash_kda_decode.get_flash_kda_decode_uri(removed_variant, "sm100f")
     with pytest.raises(ValueError, match="unsupported FlashKDA decode target"):
         flash_kda_decode.get_flash_kda_decode_uri(expected_variants[0], "sm120a")
+    non_direct_variant = next(
+        variant for variant in expected_variants if variant not in direct_variants
+    )
     with pytest.raises(ValueError, match="only retained for direct T=1"):
-        flash_kda_decode.get_flash_kda_decode_uri(expected_variants[0], "sm103a")
+        flash_kda_decode.get_flash_kda_decode_uri(non_direct_variant, "sm103a")
     sentinel = object()
     monkeypatch.setattr(
         flash_kda_decode,
