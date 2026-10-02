@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
 import math
 
 import flashinfer
 import flashinfer.cake_fmha as cake_api
 import flashinfer.cake_fmha_request_ordered as request_ordered_api
+import flashinfer.jit.cake_fmha_request_ordered as request_ordered_jit
 import pytest
 import torch
 
@@ -384,3 +386,52 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
             atol=1e-2,
             rtol=1e-2,
         )
+
+
+def _shipped_manifest_copy(tmp_path) -> dict:
+    """The shipped module table, with empty stand-in sources under ``tmp_path``."""
+
+    root = request_ordered_jit._source_root()
+    payload = json.loads((root / request_ordered_jit._MANIFEST_NAME).read_text())
+    for module in payload["modules"]:
+        for key in ("device_path", "binding_path"):
+            stand_in = tmp_path.joinpath(*module[key].split("/"))
+            stand_in.parent.mkdir(parents=True, exist_ok=True)
+            stand_in.touch()
+    return payload
+
+
+def _validate_manifest(monkeypatch, tmp_path, payload: dict) -> dict:
+    (tmp_path / request_ordered_jit._MANIFEST_NAME).write_text(json.dumps(payload))
+    monkeypatch.setattr(request_ordered_jit, "_source_root", lambda: tmp_path)
+    return request_ordered_jit.get_cake_fmha_request_ordered_manifest.__wrapped__()
+
+
+def test_manifest_validator_accepts_the_shipped_module_table(
+    monkeypatch, tmp_path
+) -> None:
+    payload = _shipped_manifest_copy(tmp_path)
+    assert _validate_manifest(monkeypatch, tmp_path, payload)["modules"]
+
+
+def test_manifest_validator_rejects_defines_that_disagree_with_the_module(
+    monkeypatch, tmp_path
+) -> None:
+    payload = _shipped_manifest_copy(tmp_path)
+    module = next(module for module in payload["modules"] if module["defines"])
+    module["defines"]["Q_LEN"] = 6 if module["q_len"] == 1 else 1
+    with pytest.raises(ValueError, match="defines disagree"):
+        _validate_manifest(monkeypatch, tmp_path, payload)
+
+
+@pytest.mark.parametrize("field", ["q_len", "write_lse"])
+def test_manifest_validator_rejects_exact_routes_that_disagree_with_their_module(
+    monkeypatch, tmp_path, field: str
+) -> None:
+    payload = _shipped_manifest_copy(tmp_path)
+    route = payload["exact_routes"][0]
+    route[field] = (
+        (6 if route[field] == 1 else 1) if field == "q_len" else not route[field]
+    )
+    with pytest.raises(ValueError, match="disagrees with module"):
+        _validate_manifest(monkeypatch, tmp_path, payload)
