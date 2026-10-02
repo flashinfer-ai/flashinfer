@@ -117,7 +117,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_PRIVATE_RESPONSE_STAGE_BYTES 16
 #define SMEM_PRIVATE_RESPONSE_STRIDE 16
 #define SMEM_TOTAL 85120
-#define THREADS 416
+#define THREADS 384
 #define BLOCK_M 128
 #define BLOCK_N 8
 #define BLOCK_K 512
@@ -454,7 +454,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 
 extern "C" {
 
-__global__ __launch_bounds__(416, 2) void
+__global__ __launch_bounds__(384, 2) void
 kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap tmap_b_rows_1, const __grid_constant__ CUtensorMap tmap_b_rows_2, const __grid_constant__ CUtensorMap tmap_b_rows_3, const __grid_constant__ CUtensorMap tmap_b_rows_4, const __grid_constant__ CUtensorMap tmap_b_rows_5, const __grid_constant__ CUtensorMap tmap_b_rows_6, const __grid_constant__ CUtensorMap tmap_b_rows_7, const __grid_constant__ CUtensorMap tmap_b_rows_8, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int M, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ total_tiles)
 {
     const int tid = threadIdx.x;
@@ -534,7 +534,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
     const int work_response_addr = smem + 84992;
     unsigned int* private_response = reinterpret_cast<unsigned int*>(smem_raw + 85008);
     const int private_response_addr = smem + 85008;
-    asm volatile("barrier.sync 0, 416;" ::: "memory");
+    asm volatile("barrier.sync 0, 384;" ::: "memory");
 
     // Mbarrier init (14 pipeline groups, 0 ordered-sequence groups, 23 barriers)
     // Mbarriers at smem_raw[0..184)
@@ -596,7 +596,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
 
     // TMEM alloc (256 columns, 160 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 184);
-    if (warp == 12) {
+    if (warp == 11) {
         int _tmem_hold = smem + 184;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         __syncwarp();
@@ -612,7 +612,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
     const int tmem_accum = taddr;
     const int tmem_sfa = taddr + 32;
     const int tmem_sfb = taddr + 96;
-    if (warp < 11) {
+    if (warp < 10) {
         asm volatile("griddepcontrol.wait;" ::: "memory");
     }
 
@@ -1135,7 +1135,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
         }
     }
     // ---- Role: load_sfb ----
-    if (warp == 10) {
+    if (warp == 9) {
         { // load_sfb_main
             unsigned int stage_4 = 0;
             unsigned int zero[1];
@@ -1197,7 +1197,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
         }
     }
     // ---- Role: load_a ----
-    if (warp == 11) {
+    if (warp == 10) {
         { // load_a_main
             unsigned int stage_5 = 0;
             unsigned int cluster_work_6 = blockIdx.y * 32 + blockIdx.x;
@@ -1235,7 +1235,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
         }
     }
     // ---- Role: load_sfa ----
-    if (warp == 12) {
+    if (warp == 11) {
         { // load_sfa_main
             unsigned int stage_6 = 0;
             unsigned int cluster_work_7 = blockIdx.y * 32 + blockIdx.x;
@@ -1347,7 +1347,7 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
     }
 
     // Kernel teardown ops
-    asm volatile("barrier.sync 0, 416;" ::: "memory");
+    asm volatile("barrier.sync 0, 384;" ::: "memory");
     if (warp == 0) {
         int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(256));

@@ -1068,7 +1068,7 @@
         "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };"
       ],
       "block": [
-        416,
+        384,
         1,
         1
       ],
