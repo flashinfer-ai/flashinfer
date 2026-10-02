@@ -1389,8 +1389,20 @@ def _install_fake_variants(monkeypatch, plans, *, tma_bytes=384):
             else 0,
         }
 
+    class _Sequence:
+        """Stand-in for the run_sequence host helper: calls each launcher in order."""
+
+        @staticmethod
+        def run_sequence(*flat):
+            i = 0
+            while i < len(flat):
+                fn, count = flat[i], flat[i + 1]
+                fn(*flat[i + 2 : i + 2 + count])
+                i += 2 + count
+
     monkeypatch.setattr(jit, "get_cake_dsv4_spec", fake_spec)
     monkeypatch.setattr(cake, "_variant_module", lambda variant, *, arch: recorder)
+    monkeypatch.setattr(cake, "_sequence_module", lambda: _Sequence)
     return recorder
 
 

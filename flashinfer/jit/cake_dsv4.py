@@ -881,8 +881,26 @@ def get_cake_dsv4_module(variant: str, *, arch: str):
     return loaded
 
 
+@functools.cache
+def gen_cake_dsv4_launch_sequence_module() -> JitSpec:
+    """Host-only helper that issues the launches of a multi-kernel route in one FFI call."""
+    csrc_dir = _get_csrc_dir()
+    return gen_jit_spec(
+        name="cake_dsv4_launch_sequence",
+        sources=[csrc_dir / "cake_dsv4_launch_sequence.cc"],
+        extra_include_paths=[_get_include_dir()],
+    )
+
+
+@functools.cache
+def get_cake_dsv4_launch_sequence_module():
+    return gen_cake_dsv4_launch_sequence_module().build_and_load()
+
+
 __all__ = [
+    "gen_cake_dsv4_launch_sequence_module",
     "gen_cake_dsv4_module",
+    "get_cake_dsv4_launch_sequence_module",
     "get_cake_dsv4_module",
     "get_cake_dsv4_spec",
 ]
