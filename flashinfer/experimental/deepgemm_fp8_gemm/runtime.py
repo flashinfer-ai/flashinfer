@@ -90,7 +90,9 @@ def pack_ue8m0_words(scales_u8: torch.Tensor, rows: int) -> torch.Tensor:
 
     Byte 0 of each ``uint32`` is the lowest K block; a trailing partial word is
     zero-padded.  Per-block (128-row) scales are broadcast over their rows.
-    This is the packed scale layout the programs read through TMA.
+    This is the packed scale layout the programs read through TMA.  The row
+    pitch of the returned view is padded to a multiple of four words (16 bytes)
+    so the descriptor accepts any ``rows``; the pad columns are never read.
     """
     if scales_u8.dtype != torch.uint8 or scales_u8.dim() != 2:
         raise TypeError("scales must be a 2-D uint8 tensor of UE8M0 exponent bytes")
@@ -105,12 +107,16 @@ def pack_ue8m0_words(scales_u8: torch.Tensor, rows: int) -> torch.Tensor:
     if padded != k_blocks:
         scales_u8 = torch.nn.functional.pad(scales_u8, (0, padded - k_blocks))
     words = scales_u8.contiguous().view(torch.uint32)
-    # Materialize into a fresh dense [words, rows] buffer: a transposed view of
-    # a single-word column reports stride (1, 1), which TMA rejects as a
-    # 4-byte row pitch, so ``transpose().contiguous()`` is not enough.
-    packed = torch.empty(
-        (padded // SF_WORD_K_BLOCKS, rows), dtype=torch.uint32, device=scales_u8.device
+    # Materialize into a fresh [words, pitch] buffer and return its [:, :rows]
+    # view: a transposed view of a single-word column reports stride (1, 1),
+    # and a dense ``rows * 4``-byte pitch is only TMA-encodable when
+    # ``rows % 4 == 0``.  The descriptor takes the extent from the shape and
+    # the pitch from ``stride(0)``, so the pad columns are never addressed.
+    pitch = (rows + 3) // 4 * 4
+    storage = torch.empty(
+        (padded // SF_WORD_K_BLOCKS, pitch), dtype=torch.uint32, device=scales_u8.device
     )
+    packed = storage[:, :rows]
     packed.copy_(words.transpose(0, 1))
     return packed
 
@@ -155,7 +161,12 @@ def prepare_fp8_gemm_1d1d(a, b, sfa, sfb, out, *, accumulate=False, cache_dir=No
     (``pack_ue8m0_words``).  ``K`` is a multiple of 128; ``M`` and ``N`` are
     arbitrary.  Forward writes BF16 ``out`` ``[M, N]``; accumulation reads and
     updates FP32 ``out`` in place, so restore the initializer before each
-    independent accumulated evaluation.  ``run()`` allocates nothing and can
+    independent accumulated evaluation.  Every operand is read or written
+    through TMA, so it needs a 16-byte aligned base and a row pitch that is a
+    multiple of 16 bytes: a contiguous BF16 ``out`` needs ``N % 8 == 0`` and a
+    contiguous FP32 ``out`` needs ``N % 4 == 0``; for any other ``N`` pass a
+    column slice of a wider buffer (``torch.empty(M, pitch, ...)[:, :N]``),
+    whose pad columns are never written.  ``run()`` allocates nothing and can
     be captured into a CUDA graph.  ``cache_dir`` is accepted for signature
     stability only: programs are built by FlashInfer's JIT.
     """

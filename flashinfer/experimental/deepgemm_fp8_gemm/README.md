@@ -15,10 +15,16 @@ architecture of the device (`sm_100a`, `sm_103a`) through FlashInfer's JIT.
 `[ceil(K/512), M]` and `sfb` `[ceil(K/512), N]` are `uint32` words that pack
 four adjacent K128 UE8M0 scale bytes, stored MN-major (`pack_ue8m0_words`
 builds them from natural `[rows, K/128]` exponent bytes, broadcasting
-per-128-row block scales). `prepare_fp8_gemm_1d1d(...)` returns a plan;
-`plan.run()` submits the launch on the current PyTorch stream without any
-allocation, so it can be captured into a CUDA graph. Restore the FP32
-initializer before each independent accumulated evaluation.
+per-128-row block scales, and padding the row pitch of the packed words to a
+16-byte multiple so any `M` and `N` encode). Every operand moves through TMA,
+so it needs a 16-byte aligned base and a row pitch that is a multiple of 16
+bytes: a contiguous BF16 `out` needs `N % 8 == 0` and a contiguous FP32 `out`
+needs `N % 4 == 0`; for any other `N` pass a column slice of a wider buffer
+(`torch.empty(M, pitch, ...)[:, :N]`), whose pad columns are never written.
+`prepare_fp8_gemm_1d1d(...)` returns a plan; `plan.run()` submits the launch on
+the current PyTorch stream without any allocation, so it can be captured into
+a CUDA graph. Restore the FP32 initializer before each independent accumulated
+evaluation.
 
 Generated sources live in `csrc/experimental/deepgemm_fp8_gemm/`; the runtime
 and loader are in this directory.

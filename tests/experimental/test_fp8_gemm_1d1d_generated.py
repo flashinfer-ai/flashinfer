@@ -64,12 +64,23 @@ def _case(M, N, K, accumulate, seed):
     return a_u8.contiguous(), b_u8.contiguous(), sfa, sfb, reference
 
 
+def _output(M, N, dtype):
+    """``[M, N]`` output with a 16-byte row pitch: contiguous when ``N`` allows it,
+    otherwise the leading columns of a wider buffer (the documented route for
+    ``N`` values whose dense pitch TMA cannot encode)."""
+    per_pitch = 16 // torch.empty((), dtype=dtype).element_size()
+    pitch = (N + per_pitch - 1) // per_pitch * per_pitch
+    return torch.empty(M, pitch, device="cuda", dtype=dtype)[:, :N]
+
+
 SHAPES = [
     (4096, 7168, 4096),  # deployment row
     (1024, 2048, 1024),
     (3000, 4000, 1152),  # ragged M, N not a multiple of 224, 9 K tiles
     (128, 1024, 512),  # single M tile pair
     (300, 7168, 2048),
+    (1, 7168, 512),  # decode row: M % 4 != 0 packs a padded scale pitch
+    (3, 130, 256),  # M and N both off the 4-row pitch; out needs a padded pitch
 ]
 
 
@@ -80,10 +91,11 @@ def test_fp8_gemm_1d1d_matches_dequantized_reference(M, N, K, accumulate):
     a, b, sfa, sfb, reference = _case(M, N, K, accumulate, seed=M * 31 + N * 7 + K)
     if accumulate:
         initial = torch.randn(M, N, device="cuda", dtype=torch.float32) * 32.0
-        out = initial.clone()
+        out = _output(M, N, torch.float32)
+        out.copy_(initial)
         expected = reference + initial
     else:
-        out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+        out = _output(M, N, torch.bfloat16)
         expected = reference
     address = out.data_ptr()
     plan = prepare_fp8_gemm_1d1d(a, b, sfa, sfb, out, accumulate=accumulate)
@@ -143,9 +155,25 @@ def test_fp8_gemm_1d1d_rejects_invalid_operands():
         prepare_fp8_gemm_1d1d(a, b, sfa[:, :128], sfb, out)
     with pytest.raises(ValueError):
         prepare_fp8_gemm_1d1d(a[:, :500], b[:, :500], sfa, sfb, out)
-    # K=512 packs into one word per row; the packed tensor must stay dense.
+    # K=512 packs into one word per row; row counts that are multiples of four
+    # keep a dense pitch, and a 4-byte pitch is rejected.
     assert tuple(sfa.stride()) == (256, 1) and tuple(sfb.stride()) == (448, 1)
     with pytest.raises(ValueError):
         prepare_fp8_gemm_1d1d(
             a, b, sfa.expand(1, 256).as_strided((1, 256), (1, 1)), sfb, out
         )
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 5, 130, 256])
+def test_pack_ue8m0_words_pads_the_row_pitch(rows):
+    _skip_unless_supported()
+    scales = torch.randint(100, 140, (rows, 9), device="cuda", dtype=torch.uint8)
+    packed = pack_ue8m0_words(scales, rows)
+    assert tuple(packed.shape) == (3, rows)
+    assert packed.stride(1) == 1 and packed.stride(0) % 4 == 0
+    assert packed.stride(0) == (rows + 3) // 4 * 4 and packed.data_ptr() % 16 == 0
+    dense = torch.nn.functional.pad(scales, (0, 3)).contiguous().view(torch.uint32)
+    assert torch.equal(
+        packed.contiguous().view(torch.int32),
+        dense.transpose(0, 1).contiguous().view(torch.int32),
+    )
