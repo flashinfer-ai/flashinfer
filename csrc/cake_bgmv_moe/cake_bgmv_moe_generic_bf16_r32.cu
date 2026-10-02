@@ -17,26 +17,9 @@
 // Bundle: Cake BGMV MoE generic-shape shrink and deterministic expand, bf16 rank 32.
 // Target: sm_90a, sm_100a, sm_103a (cp.async, shuffles, atomics, FMA only); compile flags: none.
 // Generated file; do not edit manually.
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-typedef unsigned long long uint64_t;
-typedef signed int int32_t;
-typedef short int int16_t;
-struct __align__(128) BlackwellTensorMap {
-  uint64_t opaque[16];
-};
-template <int N>
-struct __align__(128) BlackwellTensorMapPack {
-  BlackwellTensorMap maps[N];
-};
-
-typedef struct __align__(64) {
-  uint64_t opaque[16];
-} CUtensorMap;
-
 #include <cuda_bf16.h>
+
+#include <cstdint>
 
 __device__ __forceinline__ int make_warp_uniform(int x) {
   int result;
