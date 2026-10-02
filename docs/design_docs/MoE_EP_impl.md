@@ -26,7 +26,7 @@ lives in dispatch/combine).
 `create_fleet(...)` raises `MoEEpNotBuiltError` (with rebuild hint) if the backend extension
 isn't present; `available_backends()` lists what's built.
 
-## 2. Call stack — `MoEEpLayer.forward(t)`
+## 2. Call stack — `MoEEpLayer.forward(t)` (Fleet/Handle path)
 
 ```
 forward(t: MoEEpTensors)                                   # flashinfer/moe_ep/layer.py
@@ -36,7 +36,7 @@ forward(t: MoEEpTensors)                                   # flashinfer/moe_ep/l
 │                  HandleAlgoKnobTopKWeights(weights=t.topk_weights)])#   the chosen Layout
 ├─ handle.dispatch(DispatchInputParams(x=[t.hidden_states]))         # → _dispatch_ll / _dispatch_ll_rank_major
 │      → nccl.ep dispatch + complete  →  DispatchOutput(expert_tensors, recv_topk_idx/weights)  #   / _dispatch_ht
-├─ _inner_compute(d):                                                # the EP→compute bridge
+├─ kernel.compute(_fleet_kernel_context(d)):                         # the EP→compute bridge
 │      EXPERT_MAJOR → build_activation_pack(...)        ┐ flatten 3D recv → token-major
 │      RANK_MAJOR/HT → build_activation_pack_rank_major ┘ pack (selected_experts, final_scales)
 │      → MoELayer(compute_config)(act_pack, weights)     # per-expert grouped GEMM (top_k=1 local)
