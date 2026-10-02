@@ -22,7 +22,7 @@ from flashinfer.jit import blackwell_msa as loader
 
 
 def _routes(target):
-    return loader.ROUTES.get(target, loader.ROUTES)
+    return loader.ROUTES[target]
 
 
 @pytest.mark.parametrize("target", ["sm100a", "sm103a"])

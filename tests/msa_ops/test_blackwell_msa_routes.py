@@ -32,8 +32,7 @@ _DTYPES = {
 
 
 def _route_keys(target):
-    table = loader.ROUTES.get(target, loader.ROUTES)
-    return sorted(table)
+    return sorted(loader.ROUTES[target])
 
 
 def _derive(route):
