@@ -15,7 +15,7 @@
  */
 
 #include <cstdint>
-#include "cake_bf16_bmm_declarations_sm100a.cuh"
+#include "cake_bf16_bmm_declarations.cuh"
 #include <limits>
 
 #include "tvm_ffi_utils.h"
