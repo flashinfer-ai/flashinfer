@@ -1325,8 +1325,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             unsigned int st_stage_s = 0;
             unsigned int st_phase_s = 1;
             float _rcp_13 = approx_rcp(softmax_scale_log2);
-            float thr_raw = 8.0f * _rcp_13;
-            float p_scale_log2 = 0.8073549f;
+            float thr_raw = 7.8073549f * _rcp_13;
+            float p_scale_log2 = 1.0f;
             unsigned int work_stage_s = 0;
             unsigned int _phase_work_full = 0;
             mbarrier_wait(work_full_addr + (work_stage_s) * 8, _phase_work_full);
@@ -1545,6 +1545,17 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 }
                 if (kind_s == 0) {
                     int cnt_s = block_end_s - block_begin_s;
+                    int tail_last_s = 0;
+                    {
+                        int nbt_s = (seqlen_s + BLOCK_N - 1) / BLOCK_N;
+                        if (block_end_s == nbt_s) {
+                            if (seqlen_s - (nbt_s - 1) * BLOCK_N < 64) {
+                                if (cnt_s >= 2) {
+                                    tail_last_s = 1;
+                                }
+                            }
+                        }
+                    }
                     int back_s = q_len - 1 - vis_j - phase_s;
                     int vis_col = seqlen_s;
                     if (back_s > 0) {
@@ -1560,6 +1571,12 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                         if (sm_tid == 0) {
                         }
                         int my_block = block_begin_s + cnt_s - 1 - n;
+                        if (tail_last_s != 0) {
+                            my_block = block_begin_s + cnt_s - 2 - n;
+                            if (n == cnt_s - 1) {
+                                my_block = block_begin_s + cnt_s - 1;
+                            }
+                        }
                         int blk_pos = my_block * BLOCK_N + tok_base;
                         float sv[32];
                         float lmax = -CAKE_INF;
@@ -2022,7 +2039,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                                             if (l_w > 0.0f) {
                                                 float _log2_1;
                                                 asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(l_w));
-                                                lse_w = m_w * softmax_scale_log2 + _log2_1 - 0.8073549f;
+                                                lse_w = m_w * softmax_scale_log2 + _log2_1 - 1.0f;
                                             }
                                             *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r) + (0)) = lse_w;
                                         }
@@ -2098,7 +2115,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                                             if (l_f > 0.0f) {
                                                 float _log2_2;
                                                 asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(l_f));
-                                                lse_r = m_f * softmax_scale_log2 + _log2_2 - 0.8073549f;
+                                                lse_r = m_f * softmax_scale_log2 + _log2_2 - 1.0f;
                                             }
                                             *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r) + (0)) = lse_r;
                                         }
@@ -2158,8 +2175,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             int _min_11 = ((row_j_c) < (q_len - 1) ? (row_j_c) : (q_len - 1));
             int vis_j_c = _min_11;
             float _rcp_18 = approx_rcp(softmax_scale_log2);
-            float thr_raw_c = 8.0f * _rcp_18;
-            float p_scale_log2_c = 0.8073549f;
+            float thr_raw_c = 7.8073549f * _rcp_18;
+            float p_scale_log2_c = 1.0f;
             int live_rows = q_len * 8;
             unsigned int sm_stage_c = 0;
             unsigned int sm_phase_c = 0;
@@ -2416,6 +2433,17 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 }
                 if (kind_c == 0) {
                     int cnt_c = block_end_c - block_begin_c;
+                    int tail_last_c = 0;
+                    {
+                        int nbt_c = (seqlen_c + BLOCK_N - 1) / BLOCK_N;
+                        if (block_end_c == nbt_c) {
+                            if (seqlen_c - (nbt_c - 1) * BLOCK_N < 64) {
+                                if (cnt_c >= 2) {
+                                    tail_last_c = 1;
+                                }
+                            }
+                        }
+                    }
                     int my_slot = slot_tile_base_c + chunk_c * num_kv_heads;
                     int back_c = q_len - 1 - vis_j_c - phase_c;
                     int vis_col_c = seqlen_c;
@@ -2432,6 +2460,12 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                         if (wg_tid_c == 0) {
                         }
                         int my_block_c = block_begin_c + cnt_c - 1 - n_1;
+                        if (tail_last_c != 0) {
+                            my_block_c = block_begin_c + cnt_c - 2 - n_1;
+                            if (n_1 == cnt_c - 1) {
+                                my_block_c = block_begin_c + cnt_c - 1;
+                            }
+                        }
                         int blk_pos_c = my_block_c * BLOCK_N + tok_base_c;
                         float sv_c[32];
                         float lmax_c = -CAKE_INF;
@@ -3165,7 +3199,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                                             if (l_w_1 > 0.0f) {
                                                 float _log2_7;
                                                 asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_7) : "f"(l_w_1));
-                                                lse_w_1 = m_w_1 * softmax_scale_log2 + _log2_7 - 0.8073549f;
+                                                lse_w_1 = m_w_1 * softmax_scale_log2 + _log2_7 - 1.0f;
                                             }
                                             *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r_1) + (0)) = lse_w_1;
                                         }
@@ -3241,7 +3275,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                                             if (l_f_1 > 0.0f) {
                                                 float _log2_8;
                                                 asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_8) : "f"(l_f_1));
-                                                lse_r_1 = m_f_1 * softmax_scale_log2 + _log2_8 - 0.8073549f;
+                                                lse_r_1 = m_f_1 * softmax_scale_log2 + _log2_8 - 1.0f;
                                             }
                                             *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r_1) + (0)) = lse_r_1;
                                         }
@@ -3609,6 +3643,17 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 }
                 if (kind_p == 0) {
                     int cta_n_blocks_p = block_end_p - block_begin_p;
+                    int tail_last_p = 0;
+                    {
+                        int nbt_p = (seqlen_kv_p + BLOCK_N - 1) / BLOCK_N;
+                        if (block_end_p == nbt_p) {
+                            if (seqlen_kv_p - (nbt_p - 1) * BLOCK_N < 64) {
+                                if (cta_n_blocks_p >= 2) {
+                                    tail_last_p = 1;
+                                }
+                            }
+                        }
+                    }
                     int _max_16 = (((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) > (0) ? ((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) : (0));
                     int max_pg_p = _max_16;
                     int pt_base_p = batch_idx_p * max_pages_per_seq;
@@ -3620,7 +3665,14 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                             if (g_cnt_p > 4) {
                                 g_cnt_p = 4;
                             }
-                            int n_block_p = block_begin_p + cta_n_blocks_p - 1 - (ni0_p + pg_blk_p);
+                            int k_p = ni0_p + pg_blk_p;
+                            int n_block_p = block_begin_p + cta_n_blocks_p - 1 - k_p;
+                            if (tail_last_p != 0) {
+                                n_block_p = block_begin_p + cta_n_blocks_p - 2 - k_p;
+                                if (k_p == cta_n_blocks_p - 1) {
+                                    n_block_p = block_begin_p + cta_n_blocks_p - 1;
+                                }
+                            }
                             int page_idx_p = n_block_p * 2 + pg_lane_p;
                             if (page_idx_p > max_pg_p) {
                                 page_idx_p = max_pg_p;

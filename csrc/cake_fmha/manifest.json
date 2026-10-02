@@ -519,8 +519,8 @@
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b",
-                  "sm_103a": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b"
+                  "sm_100a": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396",
+                  "sm_103a": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
@@ -536,8 +536,8 @@
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b",
-                  "sm_103a": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b"
+                  "sm_100a": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396",
+                  "sm_103a": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
@@ -553,8 +553,8 @@
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297",
-                  "sm_103a": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297"
+                  "sm_100a": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e",
+                  "sm_103a": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
@@ -570,8 +570,8 @@
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297",
-                  "sm_103a": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297"
+                  "sm_100a": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e",
+                  "sm_103a": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
@@ -1251,7 +1251,7 @@
           }
         },
         "source_package_file_count": 44,
-        "source_package_sha256": "1de45992aca34b30f823570b2f7d3916cf5956870261e8fd12116be87d2fc64b",
+        "source_package_sha256": "2a84d7701830dd7eb261eac0d343436433f9b179ff9c02285d87e35383258400",
         "balanced_routes": {
           "dcp_spec_bf16_balanced": {
             "arguments": {
@@ -2063,12 +2063,12 @@
       "sha256": "07240d76baaf7adea6ca1929fe354d32a16d9369470c0071ae6d3ad917fafb91"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu": {
-      "bytes": 298551,
-      "sha256": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b"
+      "bytes": 300955,
+      "sha256": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu": {
-      "bytes": 299336,
-      "sha256": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297"
+      "bytes": 301740,
+      "sha256": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu": {
       "bytes": 365643,
