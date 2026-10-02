@@ -80,7 +80,7 @@ def _get_compute_capability(device: torch.device):
     return get_compute_capability(device)
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=32)
 def get_cutile_mla_decode(device: torch.device):
     """Resolve preparation with compiler availability cached for the planned device."""
 
