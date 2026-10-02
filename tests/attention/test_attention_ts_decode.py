@@ -307,14 +307,14 @@ _REQUIRES_PAGE4_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda")),
-    reason="PrimTS page-4 decode requires an SM100a or SM103a GPU",
+    reason="PrimTS page-4 decode requires an SM100a, SM103a or SM107a GPU",
 )
 
 _REQUIRES_BLACKWELL_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda")),
-    reason="PrimTS grouped decode requires an SM100a or SM103a GPU",
+    reason="PrimTS grouped decode requires an SM100a, SM103a or SM107a GPU",
 )
 
 _Q_TOKEN_KV_BLOCK_SPARSE_TP_HEAD_GEOMETRIES = (
