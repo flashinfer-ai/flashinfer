@@ -40,17 +40,25 @@ Host contract (flashinfer#4671 hardening)
   (:func:`cake_dsv4_workspace_reset`, or the first eager call does it for that
   tensor) and the kernels self-reset.
 * **Descriptor storage.** The SM103 bindings that read their TMA descriptors
-  from device memory initialize that storage once, outside CUDA Graph capture,
-  and reject a different descriptor set for the same storage. The host
-  therefore retains one private 1 KiB tensor per descriptor set
-  (:func:`_descriptor_storage`): the first call for a new (variant, TMA source
-  geometry) allocates it, later calls and graph replays reuse it, and
-  successive calls through one workspace (the layers of a model) do not
-  collide. Nothing else allocates device memory.
+  from device memory take a private, host-retained 1 KiB tensor per launch and
+  write the descriptors of the call into it when they differ from what it
+  holds, in stream order and never inside CUDA Graph capture. The host keeps a
+  bounded pool of such tensors per (variant, device)
+  (:func:`_descriptor_storage`, :data:`_DESCRIPTOR_POOL_CAPACITY` for eager
+  launches): a call whose TMA source geometry (pointer, shape, strides, dtype
+  of ``Q`` and the KV caches) was seen recently reuses its storage without a
+  write, a new geometry takes a free or the least recently used storage, and a
+  geometry launched under graph capture keeps its storage for the process
+  lifetime so replays read what they captured. A capture that reaches a
+  geometry not launched eagerly before raises. Successive calls through one
+  workspace (the layers of a model) therefore do not collide, and a stream of
+  fresh query tensors does not grow memory without bound. Nothing else
+  allocates device memory.
 """
 
 from __future__ import annotations
 
+import collections
 import functools
 import threading
 from dataclasses import dataclass
@@ -513,9 +521,41 @@ def _counters(raw: torch.Tensor, merge_groups: int) -> torch.Tensor:
     return raw[_COUNTER_OFFSET : _COUNTER_OFFSET + merge_groups * 4].view(torch.uint32)
 
 
-# One retained 1 KiB tensor per descriptor set, keyed by the TMA source
-# geometry (see the module docstring, "Descriptor storage").
-_DESCRIPTOR_STORAGE: dict[tuple, torch.Tensor] = {}
+# Descriptor storage pools (see the module docstring, "Descriptor storage").
+# Bound on the storages a pool hands to eager launches; descriptor sets that
+# were launched under CUDA Graph capture are retained separately for the
+# process lifetime because their graphs keep reading them.
+_DESCRIPTOR_POOL_CAPACITY = 4096
+_descriptor_lock = threading.Lock()
+_descriptor_pools: dict[tuple[str, str, torch.device], "_DescriptorPool"] = {}
+
+
+@dataclass
+class _DescriptorStorage:
+    tensor: torch.Tensor
+    # Stream of the last launch that read this storage; a launch on another
+    # stream waits for it before the binding may rewrite the descriptors.
+    stream: Optional[torch.cuda.Stream]
+
+
+@dataclass
+class _DescriptorPool:
+    """Descriptor storages of one variant module on one device."""
+
+    # descriptor set -> storage, least recently used first; reassignable
+    live: "collections.OrderedDict[tuple, _DescriptorStorage]"
+    # descriptor sets launched under graph capture: never reassigned
+    captured: dict[tuple, _DescriptorStorage]
+    # storages released by a capacity change, reused before allocating
+    spare: list[_DescriptorStorage]
+
+
+def _new_descriptor_storage(device: torch.device) -> _DescriptorStorage:
+    backing = torch.empty(
+        _DESCRIPTOR_SLAB_BYTES + _ALIGN, dtype=torch.uint8, device=device
+    )
+    offset = (-backing.data_ptr()) % _ALIGN
+    return _DescriptorStorage(backing[offset : offset + _DESCRIPTOR_SLAB_BYTES], None)
 
 
 def _descriptor_storage(
@@ -523,38 +563,69 @@ def _descriptor_storage(
     arch: str,
     num_bytes: int,
     sources: Sequence[tuple[str, torch.Tensor]],
+    *,
+    capturing: bool,
 ) -> torch.Tensor:
     """Private descriptor storage for ``variant`` over these TMA source tensors.
 
     A descriptor set is a pure function of each source tensor's pointer, shape,
-    strides and dtype, so that geometry is the key: the same tensors (or a
-    freed-and-reused allocation of the same geometry) map to the same storage,
-    whose bytes the binding already holds; a different KV cache or query view
-    gets its own storage instead of tripping the binding's immutability check.
+    strides and dtype, so that geometry is the key. The pool of one variant on
+    one device hands out at most :data:`_DESCRIPTOR_POOL_CAPACITY` storages to
+    eager launches: a hit reuses the storage whose bytes the binding already
+    holds, a miss takes a fresh storage until the pool is full and the least
+    recently used one afterwards (the binding rewrites its descriptors in
+    stream order before the launch). A set launched under CUDA Graph capture
+    moves to the pool's retained part and is never reassigned, so replays keep
+    reading the descriptors they captured; a set that is not resident when a
+    capture reaches it is an error, because the binding cannot initialize
+    descriptors inside a capture. The caller holds :data:`_descriptor_lock`
+    from this lookup through the launch, so a storage is never reassigned
+    between the binding's descriptor check and the launch that reads it.
     """
     if num_bytes > _DESCRIPTOR_SLAB_BYTES:
         raise ValueError(
             f"CAKE DSv4 variant needs {num_bytes} TMA descriptor bytes; the "
             f"descriptor storage holds {_DESCRIPTOR_SLAB_BYTES}"
         )
-    key = (
-        variant,
-        arch,
-        tuple(
-            (name, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, t.device)
-            for name, t in sources
-        ),
+    device = sources[0][1].device if sources else torch.device("cpu")
+    key = tuple(
+        (name, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+        for name, t in sources
     )
-    storage = _DESCRIPTOR_STORAGE.get(key)
-    if storage is None:
-        device = sources[0][1].device if sources else torch.device("cpu")
-        backing = torch.empty(
-            _DESCRIPTOR_SLAB_BYTES + _ALIGN, dtype=torch.uint8, device=device
-        )
-        offset = (-backing.data_ptr()) % _ALIGN
-        storage = backing[offset : offset + _DESCRIPTOR_SLAB_BYTES]
-        _DESCRIPTOR_STORAGE[key] = storage
-    return storage
+    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    pool = _descriptor_pools.get((variant, arch, device))
+    if pool is None:
+        pool = _DescriptorPool(collections.OrderedDict(), {}, [])
+        _descriptor_pools[variant, arch, device] = pool
+    storage = pool.captured.get(key)
+    if storage is not None:
+        return storage.tensor
+    storage = pool.live.get(key)
+    if capturing:
+        if storage is None:
+            raise RuntimeError(
+                f"CAKE DSv4 {variant}: the TMA descriptors for these query / "
+                "KV-cache tensors have not been initialised and the current "
+                "stream is capturing a CUDA graph; run one eager call with the "
+                "same tensors (pointers, shapes and strides) before capture"
+            )
+        del pool.live[key]
+        pool.captured[key] = storage
+        return storage.tensor
+    if storage is not None:
+        pool.live.move_to_end(key)
+    else:
+        capacity = max(1, int(_DESCRIPTOR_POOL_CAPACITY))
+        while len(pool.live) >= capacity:
+            pool.spare.append(pool.live.popitem(last=False)[1])
+        storage = pool.spare.pop() if pool.spare else _new_descriptor_storage(device)
+        pool.live[key] = storage
+    if stream is not None and storage.stream is not None and storage.stream != stream:
+        # Order this launch (and a descriptor rewrite the binding may issue
+        # on this stream) after the last launch that read the storage.
+        stream.wait_stream(storage.stream)
+    storage.stream = stream
+    return storage.tensor
 
 
 def cake_dsv4_workspace_reset(workspace_buffer: torch.Tensor) -> None:
@@ -805,15 +876,21 @@ def _launch_variant(
         )
 
     tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
-    storage = None
-    if tma_bytes:
-        sources = [
-            (name, bind(kind, name)) for kind, name in plan if kind == "tma_buffer"
-        ]
-        storage = _descriptor_storage(variant, arch, tma_bytes, sources)
-    bound = [bind(kind, name, storage) for kind, name in plan]
-    # Direct-source bindings use the target FFI current stream.
-    return _variant_module(variant, arch=arch).run(*bound)
+    if not tma_bytes:
+        bound = [bind(kind, name) for kind, name in plan]
+        # Direct-source bindings use the target FFI current stream.
+        return _variant_module(variant, arch=arch).run(*bound)
+    sources = [(name, bind(kind, name)) for kind, name in plan if kind == "tma_buffer"]
+    device = sources[0][1].device if sources else torch.device("cpu")
+    capturing = _is_capturing(device)
+    # Pool bookkeeping, the binding's descriptor check / rewrite and the launch
+    # enqueue form one host-side critical section per process.
+    with _descriptor_lock:
+        storage = _descriptor_storage(
+            variant, arch, tma_bytes, sources, capturing=capturing
+        )
+        bound = [bind(kind, name, storage) for kind, name in plan]
+        return _variant_module(variant, arch=arch).run(*bound)
 
 
 # --------------------------------------------------------------------------- #

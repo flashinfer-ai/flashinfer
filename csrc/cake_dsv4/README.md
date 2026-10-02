@@ -31,7 +31,7 @@ out = trtllm_batch_decode_sparse_mla_dsv4(
 | --- | --- |
 | `sm_100a/`, `sm_103a/` | one `*_kernel.cu` (device code) and one `*_binding.cu` (launcher) per variant and architecture |
 | `common/` | kernels whose source is identical on both architectures (`split_reduce`, `bf16_h64_compressed_reduce`) |
-| `cake_dsv4_host_shim.h` | the launcher helpers shared by every binding (device guard, tensor checks, SM103 descriptor-storage initialization) |
+| `cake_dsv4_host_shim.h` | the launcher helpers shared by every binding (device guard, tensor checks, SM103 descriptor-storage writes) |
 
 `flashinfer/jit/cake_dsv4.py` registers each variant per architecture: its
 sources, nvcc flags, an identity that names the JIT module, and the `arg_plan`
@@ -58,10 +58,14 @@ allocation.
   `get_cake_dsv4_workspace_bytes`. CUDA-graph replays are self-contained once the
   counters were zeroed eagerly.
 * SM103 descriptor storage: the bindings with `tma_workspace_bytes` read their TMA
-  descriptors from a device tensor they initialize once (outside graph capture)
-  and never re-initialize; the host keeps one private 1 KiB tensor per
-  (variant, TMA source geometry), so different KV caches through one workspace
-  each have their own storage.
+  descriptors from a private device tensor the host passes in; the binding writes
+  the descriptors of the call into it when they differ from what it holds (in
+  stream order, never inside graph capture). The host keeps a bounded pool of
+  such tensors per (variant, device), keyed by the TMA source geometry: recent
+  geometries reuse their storage, new ones take a free or the least recently
+  used storage, geometries launched under graph capture keep theirs for the
+  process lifetime, and a capture that reaches a geometry never launched
+  eagerly raises.
 * Query / output / KV pools must be densely packed; the host makes no copies.
 
 ## Tests

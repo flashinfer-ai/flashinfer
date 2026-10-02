@@ -1448,6 +1448,72 @@ def test_launch_variant_binds_by_name_with_fake_arg_plan(monkeypatch):
         values={**values, "compressed_KV_cache": other},
     )
     assert recorder.calls[-1][11] is not slab
+
+
+def test_descriptor_storage_pool_is_bounded_and_capture_safe(monkeypatch):
+    """Eager descriptor sets share a bounded pool; captured sets are retained."""
+    recorder = _install_fake_variants(monkeypatch, {"fake": _FAKE_PLAN})
+    rows, compressed = 3, 132
+    table, lens = _combined_metadata(rows, compressed)
+    meta = resolve_cake_dsv4_sparse_metadata(table, lens, query_rows=rows)
+    q = torch.empty((rows, 64, 512), dtype=torch.bfloat16)
+    swa = torch.empty((16, 512), dtype=torch.bfloat16)
+    base_values = {
+        "Q": q,
+        "SWA_cache": swa,
+        "O": torch.empty((rows, 64, 512), dtype=torch.bfloat16),
+        "num_heads": 64,
+        **meta.kernel_kwargs(),
+    }
+    caches = [torch.empty((32, 512), dtype=torch.bfloat16) for _ in range(5)]
+    pool_key = ("fake", "sm_103a", q.device)
+    cake._descriptor_pools.pop(pool_key, None)
+    monkeypatch.setattr(cake, "_DESCRIPTOR_POOL_CAPACITY", 2)
+    monkeypatch.setattr(cake, "_is_capturing", lambda device: False)
+
+    def launch(cache):
+        cake._launch_variant(
+            "fake",
+            arch="sm_103a",
+            grid=(7, 2, 1),
+            values={**base_values, "compressed_KV_cache": cache},
+        )
+        return recorder.calls[-1][11]
+
+    s0, s1 = launch(caches[0]), launch(caches[1])
+    assert s0.data_ptr() != s1.data_ptr()
+    assert launch(caches[0]) is s0  # hit: no reassignment
+    s2 = launch(
+        caches[2]
+    )  # pool full: the least recently used storage (s1) is reassigned
+    assert s2 is s1
+    assert launch(caches[0]) is s0
+    assert launch(caches[1]) is s2  # cache 2 was least recently used
+    pool = cake._descriptor_pools[pool_key]
+    assert len(pool.live) == 2 and not pool.captured
+    distinct = {s.tensor.data_ptr() for s in pool.live.values()}
+    assert distinct == {s0.data_ptr(), s1.data_ptr()}
+
+    # Capture: a resident set is retained for the process lifetime, a new one is
+    # refused before any allocation or binding call.
+    monkeypatch.setattr(cake, "_is_capturing", lambda device: True)
+    calls = len(recorder.calls)
+    with pytest.raises(RuntimeError, match="before capture"):
+        launch(caches[3])
+    assert len(recorder.calls) == calls and len(pool.live) == 2
+    assert launch(caches[0]) is s0
+    assert set(pool.captured) and len(pool.live) == 1
+    monkeypatch.setattr(cake, "_is_capturing", lambda device: False)
+    churned = {launch(c).data_ptr() for c in caches[1:] for _ in range(2)}
+    assert s0.data_ptr() not in churned  # the captured storage is never reassigned
+    assert len(pool.live) <= 2 and len(pool.captured) == 1
+    assert launch(caches[0]) is s0
+    # The pool allocated exactly capacity + captured storages.
+    all_storages = {s.tensor.data_ptr() for s in pool.live.values()}
+    all_storages |= {s.tensor.data_ptr() for s in pool.captured.values()}
+    all_storages |= {s.tensor.data_ptr() for s in pool.spare}
+    assert len(all_storages) == 3
+    cake._descriptor_pools.pop(pool_key, None)
     assert recorder.calls[-1][11].numel() == cake._DESCRIPTOR_SLAB_BYTES
 
 

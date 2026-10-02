@@ -334,6 +334,85 @@ def test_same_workspace_serves_different_kv_caches(h_q, dtype):
         ref._assert_close(_rows(out, inputs), inputs.reference_rows(), dtype)
 
 
+_SLAB_ROUTES = [
+    pytest.param(64, torch.bfloat16, id="bf16-h64-prefill"),
+    pytest.param(32, torch.float8_e4m3fn, id="fp8-h32-prefill"),
+]
+
+
+@pytest.mark.parametrize("h_q,dtype", _SLAB_ROUTES)
+def test_descriptor_storage_reassignment_matches_reference(h_q, dtype, monkeypatch):
+    """A full descriptor pool reassigns storages: every call still reads its own descriptors.
+
+    With capacity 1 every call on a new descriptor set rewrites the single eager
+    storage in stream order; a cycle over three inputs must match the reference
+    on each call and must not allocate once the pool is full.
+    """
+    _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    monkeypatch.setattr(cake, "_DESCRIPTOR_POOL_CAPACITY", 1)
+    inputs = [_Inputs(*_make_case(h_q, dtype, 257, varlen=True)) for _ in range(3)]
+    workspace = _workspace(inputs[0])
+    for i in inputs:
+        i.run(out=_out_like(i), workspace=workspace)
+    torch.cuda.synchronize()
+    for i in inputs + inputs[::-1]:
+        out = _out_like(i)
+        allocated = torch.cuda.memory_allocated()
+        i.run(out=out, workspace=workspace)
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated, "descriptor pool grew"
+        ref._assert_close(_rows(out, i), i.reference_rows(), dtype)
+
+
+@pytest.mark.parametrize("h_q,dtype", _SLAB_ROUTES)
+def test_captured_descriptor_set_survives_eager_churn(h_q, dtype, monkeypatch):
+    """Graph-captured descriptor storage is never reassigned; a new set during capture raises."""
+    _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    monkeypatch.setattr(cake, "_DESCRIPTOR_POOL_CAPACITY", 1)
+    static = _Inputs(*_make_case(h_q, dtype, 257, varlen=True))
+    others = [_Inputs(*_make_case(h_q, dtype, 257, varlen=True)) for _ in range(2)]
+    workspace = _workspace(static)
+    out = _out_like(static, fill=0.0)
+    static.run(out=out, workspace=workspace)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static.run(out=out, workspace=workspace)
+    torch.cuda.synchronize()
+    expected = static.reference_rows()
+    graph.replay()
+    torch.cuda.synchronize()
+    ref._assert_close(_rows(out, static), expected, dtype)
+    # Eager churn through the (capacity 1) pool with other descriptor sets.
+    for i in others + others:
+        other_out = _out_like(i)
+        i.run(out=other_out, workspace=workspace)
+        torch.cuda.synchronize()
+        ref._assert_close(_rows(other_out, i), i.reference_rows(), dtype)
+    out.fill_(0.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    ref._assert_close(_rows(out, static), expected, dtype)
+    # A descriptor set that was never launched eagerly cannot be captured.
+    fresh = _Inputs(*_make_case(h_q, dtype, 257, varlen=True))
+    fresh_out = _out_like(fresh)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with (
+        pytest.raises(RuntimeError, match="before capture"),
+        torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream),
+    ):
+        fresh.run(out=fresh_out, workspace=workspace)
+    torch.cuda.synchronize()
+    fresh.run(out=fresh_out, workspace=workspace)
+    torch.cuda.synchronize()
+    ref._assert_close(_rows(fresh_out, fresh), fresh.reference_rows(), dtype)
+
+
 @pytest.mark.parametrize("h_q,dtype,s_q", _CASES)
 def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
     """Capture once, mutate every input in place, replay: equals eager; no allocation."""

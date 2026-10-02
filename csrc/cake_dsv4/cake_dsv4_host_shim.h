@@ -128,9 +128,13 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
   }
 }
 
-// Explicit immutable caller storage: initialize once, outside graph capture,
-// exactly as the production TmaDeviceSlot path. The owner must retain the
-// allocation and must never expose it as mutable scratch or rewrite its bytes.
+// Explicit caller descriptor storage. The owner retains the allocation and
+// never writes it; this function alone sets its bytes: the first time
+// synchronously (no launch has read the storage yet, matching the production
+// TmaDeviceSlot path), afterwards only when the descriptors of the call differ,
+// in order on the launching stream so every earlier launch on that stream
+// finished reading the previous descriptors. Neither write may happen inside
+// CUDA Graph capture; the host keeps a storage captured by a graph unchanged.
 template <size_t N>
 static inline void PrepareImmutableCallerTmaWorkspace(const tvm::ffi::Tensor& retained_workspace,
                                                       const CUtensorMap (&maps)[N],
@@ -164,25 +168,33 @@ static inline void PrepareImmutableCallerTmaWorkspace(const tvm::ffi::Tensor& re
   static auto* initialized = new std::unordered_map<std::string, InitializedWorkspace>();
   std::lock_guard<std::mutex> lock(mu);
   auto it = initialized->find(key);
-  if (it != initialized->end()) {
-    TVM_FFI_CHECK(it->second.descriptor_bytes == descriptor_bytes, ValueError)
-        << "immutable TMA descriptors changed; provide new private descriptor storage";
+  if (it != initialized->end() && it->second.descriptor_bytes == descriptor_bytes) {
     return;
   }
   CUstreamCaptureStatus capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
   result = cuStreamIsCapturing(reinterpret_cast<CUstream>(stream), &capture_status);
   TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "querying immutable TMA initialization capture state failed";
+      << "querying TMA descriptor storage capture state failed";
   TVM_FFI_CHECK(capture_status == CU_STREAM_CAPTURE_STATUS_NONE, RuntimeError)
-      << "immutable TMA storage must be initialized before CUDA Graph capture";
-  // Synchronous host-to-device initialization completes before publishing the
-  // slot to any thread/stream, matching TmaDeviceSlot. The consumer retains its
-  // generated tensor-map acquire; the mutable upload's release fence is unchanged.
-  result = cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(workspace), maps, sizeof(maps));
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "initializing immutable caller TMA descriptors failed";
-  initialized->emplace(std::move(key),
-                       InitializedWorkspace{retained_workspace, std::move(descriptor_bytes)});
+      << "TMA descriptor storage must be initialized before CUDA Graph capture";
+  if (it == initialized->end()) {
+    // Synchronous host-to-device initialization completes before publishing the
+    // slot to any thread/stream, matching TmaDeviceSlot. The consumer retains its
+    // generated tensor-map acquire; the mutable upload's release fence is unchanged.
+    result = cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(workspace), maps, sizeof(maps));
+    TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
+        << "initializing caller TMA descriptors failed";
+    initialized->emplace(std::move(key),
+                         InitializedWorkspace{retained_workspace, std::move(descriptor_bytes)});
+    return;
+  }
+  // The host reassigned this storage to another descriptor set: rewrite it in
+  // stream order, after every earlier launch on this stream read the old set.
+  // A pageable source is staged before the call returns.
+  result = cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(workspace), maps, sizeof(maps),
+                             reinterpret_cast<CUstream>(stream));
+  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError) << "rewriting caller TMA descriptors failed";
+  it->second.descriptor_bytes = std::move(descriptor_bytes);
 }
 
 static inline void* CallerTmaWorkspaceSlot(const tvm::ffi::TensorView& workspace, size_t slot) {
