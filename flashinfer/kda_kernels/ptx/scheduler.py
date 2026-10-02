@@ -19,6 +19,7 @@ from itertools import pairwise
 
 import torch
 
+from ...utils import get_device_properties
 from .fallback import prepare_fwd
 from .static_runtime import (
     compiled_stream_m64_fixed,
@@ -556,6 +557,7 @@ class KDAPiecesLaunch:
         cu_seqlens=None,
         allow_approximate_split=False,
         use_expected_norm=False,
+        offsets=None,
     ):
         self.out = out
         self.final_state = final_state
@@ -606,7 +608,9 @@ class KDAPiecesLaunch:
                 self.schedule = f"state_guard_{self._fallback.schedule}"
                 self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
                 return
-        offsets = [int(x) for x in base_args["cu_seqlens"].tolist()]
+        if offsets is None:
+            offsets = base_args["cu_seqlens"].tolist()
+        offsets = [int(x) for x in offsets]
         num_heads = int(base_args["num_heads"])
         self._num_heads = num_heads
         if num_heads not in (64, 96):
@@ -617,7 +621,7 @@ class KDAPiecesLaunch:
             self.schedule = f"unsupported_heads_{self._fallback.schedule}"
             self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
             return
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        num_sms = get_device_properties(q.device).multi_processor_count
         warm_tables = [None] * (len(offsets) - 1)
         rows, has_split, self._windows = plan_pieces(
             offsets,
@@ -1162,6 +1166,7 @@ def prepare_fwd_pieces(
     cu_seqlens=None,
     allow_approximate_split=False,
     use_expected_norm=False,
+    offsets=None,
 ):
     """Create a preallocated KDA forward launch.
 
@@ -1193,6 +1198,7 @@ def prepare_fwd_pieces(
     :type cu_seqlens: torch.Tensor
     :param allow_approximate_split: Reserved; must be False.
     :param use_expected_norm: Reserved; must be False.
+    :param offsets: Host-known packed offsets; read from ``cu_seqlens`` when None.
     :return: Launch object with a launch() method.
     :rtype: KDAPiecesLaunch
 
@@ -1218,6 +1224,7 @@ def prepare_fwd_pieces(
         cu_seqlens=cu_seqlens,
         allow_approximate_split=allow_approximate_split,
         use_expected_norm=use_expected_norm,
+        offsets=offsets,
     )
 
 
