@@ -232,6 +232,152 @@ def test_fused_multi_tile_routing_matches_independent_tiles_at_capacity_boundari
         _assert_routing_metadata_slots_bit_exact(actual, expected)
 
 
+@pytest.mark.parametrize("num_tokens", (2730, 2731, 8192))
+@pytest.mark.parametrize("representation", ("int16", "int32", "packed"))
+@pytest.mark.parametrize("geometry", ((384, 48, 317, 6), (1024, 640, 317, 32)))
+def test_native_da_selector_replays_live_local_histograms(
+    num_tokens: int, representation: str, geometry: tuple[int, int, int, int]
+) -> None:
+    """Real SWITCH bodies follow a CPU oracle across the histogram launch boundary."""
+    from flashinfer.fused_moe.core import (
+        TrtllmDaSwitchCaptureState,
+        _get_trtllm_da_body_capture_lock,
+        _get_trtllm_da_body_capture_stream,
+        get_trtllm_moe_sm100_module,
+    )
+    from flashinfer.fused_moe.da_moe import DAGraphTopology
+
+    require_sm100()
+    runtime = get_trtllm_moe_sm100_module()
+    num_experts, local_experts, offset, top_k = geometry
+    assignments = torch.arange(num_tokens * top_k).reshape(num_tokens, top_k)
+    # Every row has distinct local experts and one remote expert. Include empty local work.
+    routes = []
+    for active in (local_experts, top_k, 2 * top_k):
+        ids = assignments.remainder(active) + offset
+        ids[:, -1] = 0
+        routes.append(ids)
+    routes.append(assignments.remainder(top_k))
+
+    def spectrum(ids):
+        local = ids[(ids >= offset) & (ids < offset + local_experts)] - offset
+        counts = (
+            torch.bincount(local, minlength=local_experts)
+            .double()
+            .sort(descending=True)
+            .values
+        )
+        return torch.nn.functional.pad(counts, (0, num_experts - local_experts))
+
+    reference = torch.stack([spectrum(ids) for ids in routes[:3]])
+    reference = torch.nn.functional.normalize(reference, dim=1)
+    spectra = reference.float().cuda()
+    bodies = torch.tensor([0, 1, 0], dtype=torch.int32, device="cuda")
+    weights = torch.full(
+        (num_tokens, top_k), 1 / top_k, dtype=torch.bfloat16, device="cuda"
+    )
+
+    def encode(ids):
+        if representation == "packed":
+            return (ids.to(device="cuda", dtype=torch.int32) << 16) | (
+                weights.view(torch.int16).to(torch.int32) & 0xFFFF
+            )
+        return ids.to(device="cuda", dtype=getattr(torch, representation))
+
+    live = encode(routes[0])
+    mode = (
+        RoutingInputMode.PackedPrecomputed
+        if representation == "packed"
+        else RoutingInputMode.UnpackedPrecomputed
+    )
+    weight_arg = None if representation == "packed" else weights
+    metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
+        live,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=offset,
+        num_local_experts=local_experts,
+        tile_ns=(8, 64),
+        routing_input_mode=mode,
+        topk_weights=weight_arg,
+    )
+    selected = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    observed = [torch.full_like(selected, -1) for _ in range(2)]
+    executed = [torch.full_like(selected, -1) for _ in range(2)]
+    live_inputs = (live, encode(routes[1]))
+    scratch = runtime.allocate_da_selector_workspace(live, local_experts)
+    device_index = torch.cuda.current_device()
+    stream = _get_trtllm_da_body_capture_stream(device_index)
+    for output, stamp in zip(observed, executed, strict=True):
+        output.copy_(selected)
+        stamp.fill_(0)
+        stamp.fill_(1)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            capture_id, previous_node = 0, 0
+            for ids, output, stamp in zip(live_inputs, observed, executed, strict=True):
+                # Different inputs share one serialized metadata/histogram lane.
+                state = TrtllmDaSwitchCaptureState.from_native(
+                    runtime.begin_da_switch_capture(
+                        ids,
+                        num_experts,
+                        top_k,
+                        offset,
+                        local_experts,
+                        list(metadata.tile_ns),
+                        metadata.flat_tensors(),
+                        int(mode),
+                        weight_arg,
+                        spectra,
+                        bodies,
+                        3,
+                        selected,
+                        scratch,
+                        2,
+                        capture_id,
+                        previous_node,
+                    )
+                )
+                with _get_trtllm_da_body_capture_lock(device_index):
+                    for body, handle in enumerate(state.body_graph_handles):
+                        runtime.begin_da_body_capture(
+                            device_index, stream.handle, handle
+                        )
+                        with torch.cuda.stream(stream.external_stream):
+                            stamp.fill_(body)
+                        runtime.end_da_body_capture(device_index, stream.handle, handle)
+                topology = DAGraphTopology.from_native(
+                    runtime.finish_da_switch_capture(ids, state.to_native())
+                )
+                assert topology.is_selector_preamble_parallelizable
+                assert topology.is_workspace_lane_serialized
+                output.copy_(selected)
+                capture_id = topology.capture_id
+                previous_node = state.conditional_node_handle
+        for ids in (*routes, routes[1], routes[0]):
+            second_ids = routes[0] if torch.equal(ids, routes[1]) else routes[1]
+            expected = []
+            for live_ids, payload in zip(live_inputs, (ids, second_ids), strict=True):
+                exemplar = (reference @ spectrum(payload)).argmax().item()
+                expected.append((0, 1, 0)[exemplar])
+                live_ids.copy_(encode(payload))
+            for _ in range(3):
+                # Poison retained scratch to catch missing writes and stale replay accumulation.
+                scratch.fill_(123456)
+                selected.fill_(-1)
+                for output, stamp in zip(observed, executed, strict=True):
+                    output.fill_(-1)
+                    stamp.fill_(-1)
+                graph.replay()
+                torch.cuda.synchronize()
+                assert [output.item() for output in observed] == expected
+                assert [stamp.item() for stamp in executed] == expected
+    finally:
+        graph.reset()
+
+
 def test_long_multi_tile_routing_handles_local_and_nonlocal_experts() -> None:
     """The extended-capacity permutation pass must ignore a nonlocal route."""
     require_sm100()

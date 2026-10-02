@@ -327,6 +327,8 @@ class TrtllmDaResources:
     body_workspace: TrtllmDaBodyWorkspace
     # Device scalar written by the selector with the replay-selected body index.
     selected_body: torch.Tensor
+    # Per-CTA histograms fully overwritten before each selector reduction in this lane.
+    selector_histograms: torch.Tensor
     # Stable FromLogits router outputs, or None for caller-precomputed routing.
     canonical_routing: Optional[TRTLLMCanonicalRouting] = None
 
@@ -4125,6 +4127,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         allocate_canonical_routing=moe_op.trtllm_moe_allocate_canonical_routing,
         canonicalize_routing=moe_op.trtllm_moe_canonicalize_routing,
         begin_da_switch_capture=moe_op.trtllm_moe_begin_da_switch_capture,
+        allocate_da_selector_workspace=moe_op.trtllm_moe_allocate_da_selector_workspace,
         inspect_da_workspace_lane=moe_op.trtllm_moe_inspect_da_workspace_lane,
         create_da_body_capture_stream=(moe_op.trtllm_moe_create_da_body_capture_stream),
         destroy_da_body_capture_stream=(
@@ -4552,6 +4555,9 @@ class TrtllmDaRuntime:
             selected_body=torch.full(
                 (1,), -1, dtype=torch.int32, device=topk_ids.device
             ),
+            selector_histograms=get_trtllm_moe_sm100_module().allocate_da_selector_workspace(
+                topk_ids, num_local_experts
+            ),
             canonical_routing=canonical_routing,
         )
 
@@ -4627,6 +4633,7 @@ class TrtllmDaRuntime:
                 plan.exemplar_body_indices,
                 plan.num_selector_exemplars,
                 resources.selected_body,
+                resources.selector_histograms,
                 len(plan.bodies),
                 expected_capture_id,
                 previous_conditional_node_handle,
