@@ -1,3 +1,77 @@
+# B200 routed NVFP4 decode: singleton FC2 full32 results
+
+Every T=1..32 passed strict BF16 checks (atol=rtol=0.01). Public and source control singleton implementations beat the named FlashInfer baseline at all 32 shapes and all 192 captures. Public geometric-mean speedup: **1.022889482173x**; source control: **1.023026241466x**. The minimum public speedup is **1.005775565624x at T14**.
+
+NVIDIA B200/sm_100a; H=4096, I=2048, 256 routed experts, top-k=6, clamped SwiGLU limit=10.0. Source control and public arms are the same singleton candidate in their respective source/artifact paths. All arms consume the same cached synthetic physical NVFP4 bank, routes, scales and equivalent activation parameters. Baseline: flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe. This is routed-kernel qualification, not actual-weight or full-model/router/shared-expert execution.
+
+Each latency is the equal-weight geometric mean of six balanced capture medians. Every raw GPU capture uses complete-call CUPTI timing with cold L2, including planner, FC1, FC2 and finalization. Independently verified: 32 strict/eager/graph checks, 7 API/graph cases, 8 routing cases, 192 capture triplets and 576 strict timing postchecks. Six fixed captures describe variation; they are not independent randomized trials or a confidence interval.
+
+FI/source control and FI/public are speedups (larger is faster). Public/source control is a latency ratio; >1 marks a public regression against source control. The source control column is the new candidate's source implementation, not the previously selected kernel.
+
+| T | Source control us | Public us | FlashInfer us | FI/source control | FI/public | Public/source control | Public regression |
+|---:|---:|---:|---:|---:|---:|---:|:---:|
+| 1 | 25.044561 | 25.188729 | 28.804539 | 1.150131534 | 1.143548735 | 1.005756465 | yes |
+| 2 | 41.401838 | 41.290277 | 44.842436 | 1.083102532 | 1.086028931 | 0.997305413 | no |
+| 3 | 56.218293 | 56.069013 | 60.095528 | 1.068967501 | 1.071813553 | 0.997344638 | no |
+| 4 | 67.957299 | 67.807950 | 72.501304 | 1.066865587 | 1.069215393 | 0.997802308 | no |
+| 5 | 79.993980 | 79.951276 | 83.166778 | 1.039662957 | 1.040218262 | 0.999466165 | no |
+| 6 | 91.610808 | 91.797310 | 93.546545 | 1.021129999 | 1.019055404 | 1.002035802 | yes |
+| 7 | 100.820633 | 100.943293 | 103.471130 | 1.026289228 | 1.025042151 | 1.001216611 | yes |
+| 8 | 109.972977 | 109.962252 | 111.530024 | 1.014158448 | 1.014257367 | 0.999902471 | no |
+| 9 | 121.988789 | 121.775413 | 123.145884 | 1.009485253 | 1.011254084 | 0.998250854 | no |
+| 10 | 128.516770 | 128.580440 | 129.396852 | 1.006847998 | 1.006349429 | 1.000495423 | yes |
+| 11 | 135.935966 | 135.850626 | 136.794560 | 1.006316165 | 1.006948326 | 0.999372201 | no |
+| 12 | 145.940651 | 145.822973 | 147.012139 | 1.007341948 | 1.008154864 | 0.999193660 | no |
+| 13 | 155.258301 | 154.986481 | 156.746786 | 1.009587151 | 1.011357796 | 0.998249240 | no |
+| 14 | 161.652757 | 161.604939 | 162.538299 | 1.005478055 | 1.005775566 | 0.999704198 | no |
+| 15 | 169.257827 | 169.251984 | 170.542541 | 1.007590281 | 1.007625060 | 0.999965484 | no |
+| 16 | 179.096940 | 179.107630 | 180.200887 | 1.006163966 | 1.006103911 | 1.000059691 | yes |
+| 17 | 184.904618 | 184.739811 | 187.470448 | 1.013876507 | 1.014780991 | 0.999108691 | no |
+| 18 | 189.150976 | 189.182981 | 192.116111 | 1.015676024 | 1.015504194 | 1.000169206 | yes |
+| 19 | 194.847493 | 194.553800 | 197.642118 | 1.014342626 | 1.015873852 | 0.998492701 | no |
+| 20 | 202.735648 | 202.575892 | 205.639708 | 1.014324368 | 1.015124288 | 0.999211998 | no |
+| 21 | 210.254990 | 210.364321 | 213.417288 | 1.015040298 | 1.014512761 | 1.000519991 | yes |
+| 22 | 221.312138 | 221.552305 | 224.970574 | 1.016530659 | 1.015428720 | 1.001085196 | yes |
+| 23 | 224.964393 | 224.751215 | 228.505460 | 1.015740569 | 1.016704007 | 0.999052391 | no |
+| 24 | 237.188308 | 237.471322 | 240.676411 | 1.014706050 | 1.013496742 | 1.001193204 | yes |
+| 25 | 245.156811 | 245.023331 | 248.154089 | 1.012225960 | 1.012777388 | 0.999455529 | no |
+| 26 | 250.313659 | 250.878976 | 253.281485 | 1.011856431 | 1.009576370 | 1.002258434 | yes |
+| 27 | 255.643139 | 256.336126 | 259.595082 | 1.015458828 | 1.012713603 | 1.002710761 | yes |
+| 28 | 263.646652 | 264.259979 | 267.513252 | 1.014665842 | 1.012310880 | 1.002326323 | yes |
+| 29 | 272.021318 | 271.989299 | 275.311628 | 1.012095778 | 1.012214925 | 0.999882291 | no |
+| 30 | 281.311117 | 281.481991 | 284.196900 | 1.010258332 | 1.009645053 | 1.000607421 | yes |
+| 31 | 285.006727 | 285.582479 | 288.283900 | 1.011498579 | 1.009459338 | 1.002020132 | yes |
+| 32 | 289.639993 | 289.672154 | 293.170821 | 1.012190405 | 1.012078025 | 1.000111038 | yes |
+
+Public-versus-source control captures: 93 wins, 4 ties and 95 losses. Aggregate regressions: 1, 6, 7, 10, 16, 18, 21, 22, 24, 26, 27, 28, 30, 31, 32. All are retained.
+
+Successful measured-shard physical turnaround: **2763.677077s**. Wrapper worker sum: **5557.437188s**; validation worker sum: **5508.673213s**. These include successful-shard scheduling gaps and are distinct from GPU latency. Preparation/JIT/reduction and the preserved earlier argument-only failure are outside that measured-cohort span.
+
+The canonical registered benchmark is a separate cohort and is not substituted here. The earlier controlled 13-shape comparison against the previously selected source control kernel was 1.000541549x, with regressions at T19/T26/T32; cross-cohort geometric means do not establish another causal gain. Hardware-limit evidence and broader promotion remain incomplete. No singleton publication is implied by this report.
+
+The selected OOB FC2 device uses independent CTA-local MMA and work scheduling
+for T=12,14,15,17,18,19,22,24,26,27,28,31,32. Only its generated device and
+associated cluster metadata change. The remaining12 device units, selector,
+route metadata and public ABI are identical to the prior qualification.
+
+112 CPU tests and normal JIT compilation passed. The physical-reference caller
+requires nonzero gate and up clamp counts before each successful shard; exact
+counts were not serialized. Both clamps were therefore exercised with this
+artifact. Separate synccheck and racecheck reached their mandatory20-second
+deadlines and remain SKIPPED. Canonical source GPU e2e and the separate full32
+registered benchmark passed, the latter at1.023009825330x versus FlashInfer.
+Its physical turnaround was3556.888271s and benchmark runtime3426.5s. The saved
+review preserves outer receipt failures caused by an unused analysis-library
+observer; actual GPU commands and raw timing checks passed.
+
+## Preserved earlier paired-CTA evidence
+
+The following complete report belongs to the prior paired-CTA FC2 artifact,
+including its synthetic1.024004388551x and supplemental actual-weight
+1.023640533547x cohorts. These historical results are retained verbatim and do
+not qualify the singleton artifact on actual weights. The actual-weight scope
+and T1–4 baseline-binary association limitation below remain unchanged.
+
 # Packed NVFP4 FC1 scheduling — measured results
 
 Fresh public qualification passed all 32 shapes. Hardware-limit evidence remains incomplete.
