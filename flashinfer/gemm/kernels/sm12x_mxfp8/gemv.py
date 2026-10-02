@@ -12,7 +12,9 @@ A group of LPR lanes owns one weight row; each lane loads 16 contiguous bytes
 per step and every pair of lanes covers one 32-element scale block. Rows are
 dealt to warps round-robin and the next row group is in flight while the
 current one is consumed. With KSPL > 1, KSPL warps split one row group's K
-and sum their partials in shared memory in a fixed order.
+and sum their partials in shared memory in a fixed order. The first weight
+loads are issued before ``griddepcontrol.wait`` (programmatic dependent
+launch), so they overlap the kernel that produced A.
 """
 
 import cutlass
@@ -237,6 +239,9 @@ def _gemv_kernel(
 
     if gw < NRG:
         _load_rows(gw, 0, lane, ksl, mB, mSFB, wbuf, sbuf, N, K, LPR, KS, KSPL)
+    # Programmatic dependent launch: the weights above do not depend on the
+    # previous kernel; activations and outputs do.
+    cute.arch.griddepcontrol_wait()
 
     nh = MB * KB * 2
     d = cute.make_rmem_tensor(cute.make_layout((16,)), F32)
@@ -249,6 +254,7 @@ def _gemv_kernel(
         for q in cutlass.range(NQ, unroll=1):
             _stage_a(q, tidx, M, mA, mSFA, sXv, d, pk, K, MB, W)
     cute.arch.barrier()
+    cute.arch.griddepcontrol_launch_dependents()
 
     # With a K split the trip count must be uniform across the CTA (the
     # reduction has barriers); otherwise each warp walks only its own rows.
@@ -337,4 +343,9 @@ class Sm12xMxfp8Gemv:
             self.grid,
             self.k_split,
             self.out_f16,
-        ).launch(grid=[self.grid, 1, 1], block=[32 * self.warps, 1, 1], stream=stream)
+        ).launch(
+            grid=[self.grid, 1, 1],
+            block=[32 * self.warps, 1, 1],
+            stream=stream,
+            use_pdl=True,
+        )

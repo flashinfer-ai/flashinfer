@@ -7,7 +7,11 @@ F8_128x4 layout, read as given.
 
 - One producer thread. A and B have separate shared-memory rings (SA and SB
   stages) with their own full/empty mbarriers, so the DRAM-streamed weights
-  can run further ahead than the L2-resident activations. Operands use TMA
+  can run further ahead than the activations, which the producers first pull
+  into L2 with bulk prefetches split over the grid. Launched with
+  programmatic dependent launch: launch and barrier setup overlap the previous
+  kernel (typically the activation quantization), and all global memory
+  traffic follows ``griddepcontrol.wait``. Operands use TMA
   (128B or 64B swizzle); each stage's 512-byte scale chunks use a 1D bulk copy.
 - WM x WN consumer warps: ldmatrix + ``mma.sync.m16n8k32`` block-scaled. A
   32-bit scale word holds the four k32 scales of one row of a 128-wide chunk.
@@ -132,11 +136,14 @@ class Sm12xMxfp8Persistent:
         atom_a, ta = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(), a, la, (self.BM, KW)
         )
-        self.kernel(atom_a, ta, atom_b, tb, sfa, sfb, out, ws, cnt, m, sk_tiles).launch(
+        self.kernel(
+            atom_a, ta, atom_b, tb, a, sfa, sfb, out, ws, cnt, m, sk_tiles
+        ).launch(
             grid=(grid, 1, 1),
             block=(self.threads, 1, 1),
             smem=self.smem_bytes,
             stream=stream,
+            use_pdl=True,
         )
 
     def swizzle(self):
@@ -158,6 +165,7 @@ class Sm12xMxfp8Persistent:
         ta: cute.Tensor,
         atom_b: cute.CopyAtom,
         tb: cute.Tensor,
+        a: cute.Tensor,
         sfa: cute.Tensor,
         sfb: cute.Tensor,
         out: cute.Tensor,
@@ -250,6 +258,8 @@ class Sm12xMxfp8Persistent:
         if warp == self.CW:
             if lane == 0:
                 self.producer(
+                    a,
+                    M,
                     atom_a,
                     tAs,
                     tAg,
@@ -273,6 +283,7 @@ class Sm12xMxfp8Persistent:
                     total,
                 )
         else:
+            cute.arch.griddepcontrol_wait()
             self.consumer(
                 sA,
                 sB,
@@ -433,8 +444,30 @@ class Sm12xMxfp8Persistent:
                 )
 
     @cute.jit
+    def prefetch_a(self, a, sfa, M, bid, G):
+        """Pull the activations and their scales into L2, split over the grid.
+
+        The activation ring is only SA stages deep, so with A still in DRAM
+        every refill would expose a full DRAM round trip.
+        """
+        nbytes = M * self.K
+        step = ((nbytes + G - 1) // G + 15) // 16 * 16
+        lo = bid * step
+        if lo < nbytes:
+            ptx.bulk_prefetch_l2(
+                (a.iterator + lo).toint(), cutlass.min(step, nbytes - lo)
+            )
+        sf_bytes = cutlass.min(
+            ((M + 127) // 128) * self.Kc * SF_CHUNK, cute.size(sfa) // 16 * 16
+        )
+        if bid == G - 1 and sf_bytes > 0:
+            ptx.bulk_prefetch_l2(sfa.iterator.toint(), sf_bytes)
+
+    @cute.jit
     def producer(
         self,
+        a,
+        M,
         atom_a,
         tAs,
         tAg,
@@ -457,7 +490,14 @@ class Sm12xMxfp8Persistent:
         sk_a,
         total,
     ):
-        """Single thread. Weight stages run SB - SA iterations ahead of activations."""
+        """Single thread. Weight stages run SB - SA iterations ahead of activations.
+
+        Everything waits for the previous grid (``griddepcontrol.wait``), and
+        the activation prefetch is issued before the first weight load:
+        weight traffic queued ahead of it would delay the first MMA.
+        """
+        cute.arch.griddepcontrol_wait()
+        self.prefetch_a(a, sfa, M, bid, G)
         L = self.SB - self.SA
         for qb in range(cutlass.min(Int32(L), total)):
             self.issue_b(
@@ -510,6 +550,7 @@ class Sm12xMxfp8Persistent:
                 n_dp,
                 sk_a,
             )
+        cute.arch.griddepcontrol_launch_dependents()
 
     # ----------------------------------------------------------- consumer
     @cute.jit

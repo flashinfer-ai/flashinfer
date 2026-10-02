@@ -195,6 +195,31 @@ def persistent_schedule(tactic, m, n, k, dev):
     return min(dev.sms, tiles * k_iters), tiles
 
 
+def _stream_tile(m, n):
+    """Persistent tile for weights that are streamed once at M <= 64.
+
+    A cold weight streams fastest from about 8 to 20 CTAs that each read long
+    contiguous runs of a row: the widest N tile that still leaves about 8
+    tiles, with a K stage of 256 to 512 bytes per row (about 32 KB, double
+    buffered). More CTAs or shorter runs per row lose DRAM locality.
+    """
+    if m > 32:
+        return persistent(64, 128, 2, 4) if n >= 1024 else persistent(64, 64, 2, 2)
+    if n >= 1024:
+        return persistent(32, 128, 1, 4, 2)
+    if n >= 384:
+        return persistent(32, 64, 2, 2, 3)
+    return persistent(32, 32, 2, 1, 4)
+
+
+def _stream_tile_candidates(m, n):
+    out = [_stream_tile(m, n), persistent(32, 128, 1, 4, 2)]
+    out += [persistent(32, 64, 2, 2, 3), persistent(32, 32, 2, 1, 4)]
+    if m > 32:
+        out += [persistent(64, 128, 2, 4), persistent(64, 64, 2, 2)]
+    return out
+
+
 def _persistent_candidates(m, n, k, dev):
     p, sk = persistent, "streamk"
     if m <= 32:
@@ -298,7 +323,9 @@ def valid_tactics(m, n, k, dev):
     out = [default_tactic(m, n, k, dev)]
     if m <= SKINNY_MAX_M:
         out += _decode_candidates(m, n, k)
-    if 2 < m <= 16:
+    if m <= 64:
+        out += _stream_tile_candidates(m, n)
+    if m <= 16:
         out += [persistent(32, 64, 1, 4, 2), persistent(32, 64, 2, 2)]
         out += [persistent(32, 128, 1, 4)]
     if m > 16:
@@ -314,31 +341,37 @@ def default_tactic(m, n, k, dev):
     Chosen from CUPTI kernel timings (CUDA graphs, cold L2) on DGX Spark (GB10)
     over dense layers of recent LLMs (N 96..16384, K 384..8192):
 
-    - M <= 4, tiny or very large weights: GEMV / stream-K kernels.
-    - M 5..8: 32-row persistent tiles on weights under 4M elements, else the
-      stream-K kernel; M 9..32: the 8-warp stream-K kernel from 4M elements.
+    - Tiny or very large weights at M <= 32: GEMV / stream-K kernels.
+    - Weights under 4M elements: the streaming persistent tile up to M = 64,
+      except the GEMV at M <= 4 for rows up to 2048 elements.
+    - M <= 4 otherwise: GEMV. M 5..32: the streaming tile below 8M elements,
+      then the stream-K kernel.
     - Up to M = 64 (M = 256 for tiny weights): 32- or 64-row persistent tiles.
     - Larger M: the 128-row ping-pong kernel.
     """
     nk = n * k
     tiny = nk < 1 << 20
+    small = not tiny and nk < 4 << 20
     if m <= SKINNY_MAX_M:
-        if m <= 4 or tiny or nk > 64 << 20:
+        if tiny or nk > 64 << 20:
             return _decode_default(m, n, k)
+        if small and (m > 4 or k > 2048):
+            return _stream_tile(m, n)
+        if m <= 4:
+            return _decode_default(m, n, k)
+        if nk < 8 << 20:
+            return _stream_tile(m, n)
         if m <= 8:
-            return (
-                persistent(32, 64, 1, 4, 2)
-                if nk < 4 << 20
-                else _decode_default(m, n, k)
-            )
-        if nk >= 4 << 20:
-            t = skinny(32, 1, warps=8, ctas_per_sm=1)
-            if skinny_valid(t, n, k):
-                return t
+            return _decode_default(m, n, k)
+        t = skinny(32, 1, warps=8, ctas_per_sm=1)
+        if skinny_valid(t, n, k):
+            return t
         return persistent(32, 64, 1, 4, 2)
     if tiny and m <= 256:
-        return persistent(32, 64, 1, 4, 2)
+        return persistent(32, 64, 2, 2, 2)
     if m <= 64:
+        if small:
+            return _stream_tile(m, n)
         if 2048 <= n <= 8192:
             return persistent(64, 64, 2, 2)
         return persistent(32, 64, 1, 4, 2)

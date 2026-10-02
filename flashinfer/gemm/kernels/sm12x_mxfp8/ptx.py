@@ -342,6 +342,20 @@ def bulk_g2s(dst_smem, src_gmem, nbytes, bar_smem, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def bulk_prefetch_l2(src_gmem, nbytes, *, loc=None, ip=None):
+    """``cp.async.bulk.prefetch.L2``: pull ``nbytes`` (multiple of 16) into L2."""
+    _asm(
+        None,
+        [src_gmem, nbytes],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        side=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
 # ------------------------------------------------------- register helpers
 @dsl_user_op
 def shfl_bfly(v, lane_mask: int, *, loc=None, ip=None):
