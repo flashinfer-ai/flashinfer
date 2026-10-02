@@ -41,6 +41,8 @@ from flashinfer.jit.cake_kimi_k3_situ import (
     PROGRAM_FLAGS,
     PROGRAMS,
     ROUTES,
+    cake_situ_selector,
+    cake_situ_sequence,
     get_cake_situ_module,
 )
 from flashinfer.tllm_enums import ActivationType, RoutingMethodType
@@ -153,6 +155,24 @@ def test_cake_situ_route_program_keys():
         assert PROGRAM_FLAGS[retained]["num_tokens"] == []
         for num_tokens in (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
             assert _route_flags(arch, num_tokens)["large_c7"] is False
+        # The generated selector and sequence functions must agree with each
+        # other and with the static selection the runtime binds, for every
+        # supported token count.
+        for num_tokens in range(1, 16385):
+            static = _route_flags(arch, num_tokens)
+            args = (
+                arch,
+                static["tile_n"],
+                static["single_token"],
+                static["feature_finalize"],
+                static["m64_claim8"],
+                static["mid_work5fd"],
+                static["n32_claim8"],
+                static["m256_c12"],
+                static["large_c7"],
+            )
+            assert cake_situ_selector(*args) == static["selector"]
+            assert cake_situ_sequence(*args) == static["program_key"]
 
 
 def test_cake_situ_workspace_size_covers_every_pre_shuffled_token_count():
