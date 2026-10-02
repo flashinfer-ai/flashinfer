@@ -624,14 +624,17 @@ def output_mode(output_dtype: str, accumulate: bool) -> str:
     return f"{output_dtype}_acc" if accumulate else output_dtype
 
 
-def schedule_tier(m: int, n: int, num_groups: int, sm_count: int, mode: str, max_k_blocks: int) -> str:
+def schedule_tier(m: int, n: int, num_groups: int, sm_count: int, mode: str, max_k_blocks: int,
+                  swapped: bool = True) -> str:
     """Physical schedule for one problem.
 
     Only the tile counts and the largest group's k-block count enter the
     decision; every schedule reads the group layout itself at runtime.
+    ``swapped=False`` decides as if the BM240 schedule did not exist.
     """
     if (
-        sm_count in (148, 152)
+        swapped
+        and sm_count in (148, 152)
         and (m, n) in _SWAPPED_GEOMETRIES
         and (sm_count == 152 or mode == "fp32")
     ):
@@ -645,20 +648,61 @@ def schedule_tier(m: int, n: int, num_groups: int, sm_count: int, mode: str, max
     return "general"
 
 
-def route_key(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256) -> str:
+def route_candidates(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256) -> list[str]:
+    """Routes for one problem, preferred first.
+
+    The first entry is the schedule the decision chain picks for this SM
+    count; the following entries are the schedules it would pick if the
+    earlier ones did not exist (BM240 -> N256 / BN16 / N128, exact BN16
+    geometry -> runtime BN16, then both N128 store-stage variants). The N128
+    programs serve any problem, so the list always ends in a route every
+    architecture carries.
+    """
     mode = output_mode(output_dtype, accumulate)
     padded_ks = [(k + k_alignment - 1) // k_alignment * k_alignment for k in group_ks]
     max_k_blocks = max((k + 255) // 256 for k in padded_ks)
+    physical_m = (m + 255) // 256 * 256
+    tiers: list[str] = []
     tier = schedule_tier(m, n, len(group_ks), sm_count, mode, max_k_blocks)
-    if tier == "general":
-        k_blocks = sum(padded_ks) // len(group_ks) // 256
-        threshold = {"bf16": 16, "fp32_acc": 24, "fp32": 32}[mode]
-        tier = "general_s1" if k_blocks >= threshold else "general_s2"
+    if tier == "swapped":
+        tiers.append("swapped")
+        tier = schedule_tier(m, n, len(group_ks), sm_count, mode, max_k_blocks, swapped=False)
+    if tier == "n256":
+        tiers.append("n256")
     elif tier == "small":
-        grid_m, grid_n, _grid = launch_geometry(tier, (m + 255) // 256 * 256, n, len(group_ks), sm_count)
+        grid_m, grid_n, _grid = launch_geometry(tier, physical_m, n, len(group_ks), sm_count)
         if (grid_m, grid_n, len(group_ks)) in _SMALL_EXACT_GEOMETRIES:
-            tier = f"small_{grid_m}x{grid_n}x{len(group_ks)}"
-    return f"{tier}:{mode}"
+            tiers.append(f"small_{grid_m}x{grid_n}x{len(group_ks)}")
+        tiers.append("small")
+    k_blocks = sum(padded_ks) // len(group_ks) // 256
+    threshold = {"bf16": 16, "fp32_acc": 24, "fp32": 32}[mode]
+    tiers += ["general_s1", "general_s2"] if k_blocks >= threshold else ["general_s2", "general_s1"]
+    return [f"{tier}:{mode}" for tier in tiers]
+
+
+def route_key(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256) -> str:
+    """The preferred route of one problem (``route_candidates(...)[0]``)."""
+    return route_candidates(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment)[0]
+
+
+def select_route(arch, m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256) -> tuple[str, str]:
+    """``(route, program)`` for one device: the first candidate route whose
+    program the export measured on ``arch``.
+
+    The route table lists, per architecture, the schedules the export reached
+    on the catalog devices (148 SMs on SM100a, 152 SMs on SM103a). A device
+    whose SM count reaches a schedule the export never measured on its
+    architecture (the BM240 schedule in BF16 / FP32-accumulate on a 152-SM
+    SM100a part such as GB200) takes the next schedule of the decision chain
+    instead of failing the lookup.
+    """
+    table = ROUTES.get(arch, ROUTES)
+    candidates = route_candidates(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment)
+    for route in candidates:
+        program = table.get(route)
+        if program is not None:
+            return route, program
+    raise RuntimeError(f"no generated program on {arch} for any of {candidates}")
 
 
 def launch_geometry(tier: str, physical_m: int, n: int, num_groups: int, sm_count: int):
@@ -790,7 +834,7 @@ class GroupedFP4Plan:
         if any(t.device != a.device or not t.is_contiguous() for t in tensors):
             raise ValueError("Operands, scales and output must be contiguous on one CUDA device")
         arch, sm_count = device_facts(a.device.index if a.device.index is not None else torch.cuda.current_device())
-        self.route = route_key(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment)
+        self.route, self.program = select_route(arch, m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment)
         self.storage, self.output = out, out[:, :m]
         self.empty, self.accumulate = total_k == 0, bool(accumulate)
         self.options = dict(
@@ -800,8 +844,6 @@ class GroupedFP4Plan:
         if self.empty:
             self._retained = tensors
             return
-        table = ROUTES.get(arch, ROUTES)
-        self.program = table[self.route]
         tier = self.route.split(":")[0]
         grid_m, grid_n, grid = launch_geometry(tier, physical_m, n, len(group_ks), sm_count)
         self.grid = grid

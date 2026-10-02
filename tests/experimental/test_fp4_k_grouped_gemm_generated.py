@@ -41,6 +41,35 @@ _CASES = [
 ]
 
 
+# (arch, SM count) of the SM100a / SM103a parts the host may run on: the catalog
+# devices (B200, GB300) and GB200, whose 152 SMs reach the BM240 schedule the
+# export never measured on SM100a.
+_DEVICE_PROFILES = {"B200": ("sm_100a", 148), "GB200": ("sm_100a", 152), "GB300": ("sm_103a", 152)}
+_MODES = [("bf16", False), ("fp32", False), ("fp32", True)]
+
+
+@pytest.mark.parametrize("device", sorted(_DEVICE_PROFILES))
+def test_every_device_profile_resolves_a_measured_program(device):
+    """CPU-only: every case in every output mode resolves to a program the export measured on the
+    device's architecture, taking the preferred schedule whenever that architecture carries it."""
+    arch, sm_count = _DEVICE_PROFILES[device]
+    table = _runtime.ROUTES.get(arch, _runtime.ROUTES)
+    assert {route.split(":")[0] for route in table} >= {"general_s1", "general_s2"}
+    seen = set()
+    for case in _CASES:
+        for output_dtype, accumulate in _MODES:
+            args = (case["m"], case["N"], case["group_ks"], sm_count, output_dtype, accumulate, case.get("k_alignment", 256))
+            candidates = _runtime.route_candidates(*args)
+            route, program = _runtime.select_route(arch, *args)
+            assert candidates[0] == _runtime.route_key(*args)
+            assert route == next(candidate for candidate in candidates if candidate in table)
+            assert table[route] == program
+            assert arch in _runtime.MODULES[program]["arches"]
+            assert candidates[-1].split(":")[0].startswith("general_s")
+            seen.add(route.split(":")[0])
+    assert seen >= {"general_s1", "general_s2", "n256", "small", "small_2x8x3"}
+
+
 def _skip_unless_supported():
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
