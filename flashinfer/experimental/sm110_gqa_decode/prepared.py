@@ -19,64 +19,49 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
-import hashlib
-import json
 import math
-from pathlib import Path
 from typing import Any
 
-from .jit import _check_exact_sm110a, load_sm110_gqa_decode_module
+from .jit import (
+    PREPARED_ROUTES,
+    ROUTES,
+    SHORT_CAPACITY_MAX,
+    _check_exact_sm110a,
+    load_sm110_gqa_decode_module,
+)
 
-_ROOT = Path(__file__).resolve().parent / "csrc" / "prepared"
-
-
-@functools.cache
-def _manifest() -> dict[str, Any]:
-    manifest = json.loads((_ROOT / "manifest.json").read_text())
-    if manifest["contract"]["architecture"] != "sm_110a":
-        raise RuntimeError("unexpected prepared decode architecture")
-    for artifact in manifest["files"]:
-        relative = Path(artifact["path"])
-        if relative.is_absolute() or ".." in relative.parts:
-            raise RuntimeError("invalid generated artifact path")
-        payload = (_ROOT / relative).read_bytes()
-        if hashlib.sha256(payload).hexdigest() != artifact["sha256"]:
-            raise RuntimeError(f"generated artifact changed: {relative}")
-    return manifest
+_NUM_Q_HEADS = 32
+_NUM_KV_HEADS = 8
+_HEAD_DIM = 128
+_HEADS_PER_GROUP = _NUM_Q_HEADS // _NUM_KV_HEADS
+_SOFTMAX_SCALE_LOG2 = 1.0 / math.sqrt(_HEAD_DIM) / math.log(2.0)
+_ACCEPTED_SPLITS = (1, 2, 4, 8, 10, 16)
 
 
 @functools.cache
-def _record(key: str) -> dict[str, Any]:
-    records = [r for r in _manifest()["modules"] if r["route"] == key]
-    if len(records) != 1:
-        raise ValueError(f"route stage {key!r} is not uniquely exported")
-    return records[0]
+def _launcher(route: str) -> Any:
+    record = ROUTES[route]
+    module = load_sm110_gqa_decode_module(module=record["module"])
+    return getattr(module, record["ffi_entry"])
 
 
-@functools.cache
-def _module(key: str, device: Any) -> Any:
-    from ...jit.core import gen_jit_spec, sm110a_nvcc_flags
+def _select_route(batch: int, capacity: int, num_splits: int | None) -> str:
+    """Resolve the launch route from host-known shape facts only."""
 
-    record = _record(key)
-    if record["kind"] == "original":
-        return load_sm110_gqa_decode_module(device=device)
-    identity = hashlib.sha256(
-        json.dumps(_manifest(), sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:20]
-    return gen_jit_spec(
-        name=f"sm110_gqa_decode_prepared_{key}_{identity}",
-        sources=[_ROOT / path for path in record["sources"]],
-        extra_cuda_cflags=[*sm110a_nvcc_flags, *record["compile_flags"]],
-        extra_ldflags=["-lcuda"],
-    ).build_and_load()
-
-
-def _stage(key: str, bindings: dict[str, Any], grid: tuple[int, int, int]) -> tuple:
-    record = _record(key)
-    module = _module(key, bindings["Q"].device)
-    values = {**bindings, "grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
-    arguments = tuple(values[name] for _kind, name in record["arg_plan"])
-    return getattr(module, record["ffi_entry"]), arguments, record["kernel_symbol"]
+    if capacity <= SHORT_CAPACITY_MAX:
+        return "short"
+    route = PREPARED_ROUTES.get(f"{batch}:{capacity}", "long")
+    if num_splits is None:
+        return route
+    if num_splits == 1:
+        # The explicit one-split override always selects the original long
+        # kernel, including on the B4/256 direct route.
+        return "long"
+    if ROUTES[route]["num_splits"] != num_splits:
+        if ROUTES[route]["num_splits"] > 1:
+            raise ValueError("the exported fused route has a fixed split count")
+        raise ValueError("shape does not select an exported split tile")
+    return route
 
 
 def prepare_for_launch(
@@ -107,12 +92,16 @@ def prepare_for_launch(
     import torch
 
     q, kv, output, lengths = (inputs[k] for k in ("Q", "KV", "O", "sequence_lengths"))
-    if q.ndim != 3 or tuple(q.shape[1:]) != (32, 128):
+    if q.ndim != 3 or tuple(q.shape[1:]) != (_NUM_Q_HEADS, _HEAD_DIM):
         raise ValueError("Q must have shape [B,32,128]")
     batch = int(q.shape[0])
     if batch < 1 or tuple(output.shape) != tuple(q.shape):
         raise ValueError("O must match nonempty Q")
-    if kv.ndim != 5 or tuple(kv.shape[:3]) != (batch, 2, 8) or kv.shape[-1] != 128:
+    if (
+        kv.ndim != 5
+        or tuple(kv.shape[:3]) != (batch, 2, _NUM_KV_HEADS)
+        or kv.shape[-1] != _HEAD_DIM
+    ):
         raise ValueError("KV must have shape [B,2,8,capacity,128]")
     capacity = int(kv.shape[-2])
     if capacity < 1:
@@ -135,55 +124,49 @@ def prepare_for_launch(
     if not math.isfinite(q_scale) or q_scale <= 0:
         raise ValueError("q_scale must be finite and positive")
     if num_splits is not None and (
-        type(num_splits) is not int or num_splits not in (1, 2, 4, 8, 10, 16)
+        type(num_splits) is not int or num_splits not in _ACCEPTED_SPLITS
     ):
         raise ValueError("num_splits must be None or an integer in {1,2,4,8,10,16}")
-    contract = _manifest()["contract"]
-    single_routes = set(contract["single_routes"])
-    fused_routes = contract["fused_routes"]
-    route = contract["routes"].get(f"{batch}:{capacity}", "long")
-    if capacity <= 64:
-        route = "short"
-    elif num_splits is not None:
-        if route in fused_routes:
-            if num_splits == 1:
-                route = "long"
-            elif num_splits != fused_routes[route]:
-                raise ValueError("the exported fused route has a fixed split count")
-        elif num_splits == 1 and route == "n32_b4_direct":
-            # The default direct route has no scratch or merge. Preserve the
-            # explicit one-split override on the original long implementation.
-            route = "long"
-        elif num_splits > 1:
-            raise ValueError("shape does not select an exported split tile")
-    if route not in single_routes and route not in fused_routes:
-        raise ValueError(f"selected route {route!r} was not exported")
+    route = _select_route(batch, capacity, num_splits)
+    split_count = int(ROUTES[route]["num_splits"])
 
     bindings = {
-        "Q": q.view(batch, 8, 4, 128).transpose(1, 2),
+        "Q": q.view(batch, _NUM_KV_HEADS, _HEADS_PER_GROUP, _HEAD_DIM).transpose(1, 2),
         "K": kv[:, 0],
         "V": kv[:, 1],
         "O": output,
         "sequence_lengths": lengths,
         "kv_capacity": capacity,
-        "softmax_scale_log2": q_scale / math.sqrt(128) / math.log(2),
+        "softmax_scale_log2": q_scale * _SOFTMAX_SCALE_LOG2,
     }
     workspace: tuple[torch.Tensor, ...] = ()
-    if route in single_routes:
-        split_count = 1
-        stages = (_stage(route, bindings, (batch * 8, 1, 1)),)
+    if split_count == 1:
+        arguments = (
+            bindings["Q"],
+            bindings["K"],
+            bindings["V"],
+            output,
+            lengths,
+            bindings["softmax_scale_log2"],
+            batch * _NUM_KV_HEADS,
+            1,
+            1,
+        )
     else:
-        split_count = fused_routes[route]
         partial_o = torch.empty(
-            (batch, 32, split_count, 128), dtype=torch.float32, device=q.device
+            (batch, _NUM_Q_HEADS, split_count, _HEAD_DIM),
+            dtype=torch.float32,
+            device=q.device,
         )
         partial_max = torch.empty(
-            (batch, 32, split_count), dtype=torch.float32, device=q.device
+            (batch, _NUM_Q_HEADS, split_count), dtype=torch.float32, device=q.device
         )
         partial_sum = torch.empty_like(partial_max)
         # The last CTA resets its completion counter after merging. Ordered
         # launches and Graph replays need no additional reset kernel.
-        completed = torch.zeros((batch * 8,), dtype=torch.uint32, device=q.device)
+        completed = torch.zeros(
+            (batch * _NUM_KV_HEADS,), dtype=torch.uint32, device=q.device
+        )
         workspace = (partial_o, partial_max, partial_sum, completed)
         bindings.update(
             partial_O=partial_o,
@@ -191,7 +174,22 @@ def prepare_for_launch(
             partial_sum=partial_sum,
             completed=completed,
         )
-        stages = (_stage(route, bindings, (batch * 8 * split_count, 1, 1)),)
+        arguments = (
+            bindings["Q"],
+            bindings["K"],
+            bindings["V"],
+            partial_o,
+            partial_max,
+            partial_sum,
+            completed,
+            output,
+            lengths,
+            bindings["softmax_scale_log2"],
+            batch * _NUM_KV_HEADS * split_count,
+            1,
+            1,
+        )
+    stages = ((_launcher(route), arguments, ROUTES[route]["kernel_symbol"]),)
     return {
         "route": route,
         "num_splits": split_count,
