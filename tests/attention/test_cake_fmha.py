@@ -2879,7 +2879,7 @@ def test_cake_fmha_decode_native_bf16_hd256_smallm_jit_selects_component(
         "cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu",
     }
     assert any(
-        "decode_native_bf16_hd256_smallm_n64_p64/sm_100a/" in str(s)
+        "decode_native_bf16_hd256_smallm_n64_p64/default.cu" in str(s)
         for s in spec.sources
     )
     assert "-DQ_LEN=8" in spec.extra_cuda_cflags
@@ -3652,7 +3652,7 @@ def test_cake_fmha_decode_balanced_jit_selects_the_q_len_component(
             in spec.extra_cuda_cflags
         )
         assert any(
-            f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources
+            f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
         )
 
 
@@ -3676,7 +3676,9 @@ def test_cake_fmha_decode_balanced_fp8_family_jit_selects_the_q_dtype_component(
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_fp8_jit_binding.cu",
     }
-    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert any(
+        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+    )
     assert f"-DCAKE_FMHA_BALANCED_Q_DTYPE={q_dtype_flag}" in spec.extra_cuda_cflags
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
@@ -3700,7 +3702,9 @@ def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(monkeypatch) -
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_hd64_jit_binding.cu",
     }
-    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert any(
+        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+    )
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
         in spec.extra_cuda_cflags
@@ -3725,7 +3729,9 @@ def test_cake_fmha_decode_balanced_hd256_jit_selects_the_page_size_component(
         f"cake_fmha_{component}_binding.cu",
         "cake_fmha_decode_balanced_hd256_jit_binding.cu",
     }
-    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert any(
+        f"/cuda/{component}/default.cu" in str(source) for source in spec.sources
+    )
     assert f"-DCAKE_FMHA_BALANCED_PAGE_SIZE={page_size}" in spec.extra_cuda_cflags
     assert (
         f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"

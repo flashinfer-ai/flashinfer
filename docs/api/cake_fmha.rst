@@ -15,11 +15,12 @@ as :func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` and
 
 The checked-in source product contains the optimized Cake route portfolio, a
 complete-domain compatibility component, and the DCP speculative-decode
-add-on.  One content-addressed manifest pins all source files, public C ABIs,
-the base capability matrix, and the FlashInfer revision against which the
-matrix was audited.  FlashInfer authenticates every standalone artifact before
-JIT or AOT compilation.  :func:`cake_fmha_manifest` returns a defensive copy
-of that product record.
+add-on.  A plain registry (``csrc/cake_fmha/registry.json``) lists each
+component's sources, public C ABI, launch binding and the base capability
+matrix together with the FlashInfer revision against which the matrix was
+audited; the DCP component keeps its own registry under
+``csrc/cake_fmha/cuda/dcp_spec/``.  :func:`cake_fmha_manifest` returns a
+defensive copy of the core registry.
 
 All 1,798 optimized cells have authenticated high-level adapters for their
 complete component chains.  The selector accepts the pinned matrix's normalized
@@ -56,11 +57,9 @@ accounting do not replace those gates.
 
 The distributed-context-parallel feature remains additive.  Supplying
 ``causal_seqlens_kv_global`` to :func:`cake_batch_decode_with_kv_cache` selects
-the authenticated ``cake_fmha_dcp_spec`` profile; ordinary calls continue to
-select conventional FMHA.  The DCP JIT cache key includes the same root
-manifest digest plus an authenticated FlashInfer-adapter digest and uses exact
-SM100a or SM103a targets, so the add-on cannot silently drift from the base
-package.
+the ``cake_fmha_dcp_spec`` profile; ordinary calls continue to select
+conventional FMHA.  DCP JIT modules use exact SM100a or SM103a targets and the
+same build tag as the base package.
 
 .. currentmodule:: flashinfer.cake_fmha
 
