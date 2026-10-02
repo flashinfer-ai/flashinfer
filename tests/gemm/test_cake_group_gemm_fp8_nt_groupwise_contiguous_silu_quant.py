@@ -1,6 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the generated SM100a fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization program."""
+"""Tests for the generated Blackwell fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization programs."""
+
+import random
 
 import pytest
 import torch
@@ -31,6 +33,9 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     small_m_gemm_backend,
     tail_launch_grid,
 )
+from flashinfer.jit.gemm.cake_grouped_fp8_fused_silu_quant import (
+    SUPPORTED_COMPUTE_CAPABILITIES,
+)
 from flashinfer.quantization import per_token_group_quant_8bit
 
 GROUP_SIZE = 128
@@ -44,8 +49,8 @@ def _require_generated_program():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (10, 0):
-        pytest.skip("generated fused grouped FP8 gate_up programs target SM100a only")
+    if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
+        pytest.skip("generated fused grouped FP8 gate_up programs target SM100a and SM103a")
     if not is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available(
         device
     ):
@@ -616,10 +621,7 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices
     )
-    prepared.launch()  # initializes the private descriptor storage
-    torch.cuda.synchronize()
-    eager_q = prepared.out_q.clone()
-    eager_s = prepared.out_s.clone()
+    # Tensor maps travel by value: the very first launch is captured, no eager warm-up launch.
     stream = torch.cuda.Stream(device=device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
@@ -629,12 +631,154 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     torch.cuda.synchronize()
     graph.replay()
     torch.cuda.synchronize()
+    replay_q = prepared.out_q.clone()
+    replay_s = prepared.out_s.clone()
+    prepared.launch()
+    torch.cuda.synchronize()
     # the replay reproduces the eager launch bit for bit (same kernels, same inputs) ...
-    assert torch.equal(prepared.out_q.view(torch.uint8), eager_q.view(torch.uint8))
-    assert torch.equal(prepared.out_s, eager_s)
+    assert torch.equal(prepared.out_q.view(torch.uint8), replay_q.view(torch.uint8))
+    assert torch.equal(prepared.out_s, replay_s)
     # ... and matches the chain where the chain can run
     ref_q, ref_s = _chain_or_skip(a, b, a_scale, b_scale, m_indices)
     _assert_matches(prepared.out_q, prepared.out_s, ref_q, ref_s)
+
+
+def _random_aligned_counts(rng, groups, max_blocks):
+    """Random rows per expert under the routing contract: 128-row multiples (empties allowed) and
+    one optional partial final block; the total never exceeds ``max_blocks`` blocks."""
+    blocks = [0] * groups
+    for _ in range(rng.randint(1, max_blocks)):
+        blocks[rng.randrange(groups)] += 1
+    counts = [b * 128 for b in blocks]
+    last = max(i for i, c in enumerate(counts) if c)
+    counts[last] -= rng.choice((0, 0, rng.randint(1, 127)))  # partial final block on some rows
+    return counts
+
+
+RANDOM_TOKEN_CASES = [
+    pytest.param(seed, groups, max_blocks, n2, k, id=f"s{seed}_g{groups}_b{max_blocks}_n{n2}_k{k}")
+    for seed, groups, max_blocks, n2, k in (
+        (1, 4, 8, 256, 512),
+        (2, 8, 16, 512, 1024),
+        (3, 16, 24, 2048, 4096),
+        (4, 16, 40, 2048, 4096),
+        (5, 16, 64, 2048, 4096),
+        (6, 6, 12, 768, 2048),
+        (7, 32, 64, 1024, 1024),
+        (8, 16, 33, 2048, 4096),
+    )
+]
+
+
+@pytest.mark.parametrize("seed,groups,max_blocks,n2,k", RANDOM_TOKEN_CASES)
+def test_random_token_counts_match_torch_reference(seed, groups, max_blocks, n2, k):
+    device = torch.device("cuda")
+    rng = random.Random(seed)
+    group_counts = _random_aligned_counts(rng, groups, max_blocks)
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n2, k, seed=670 + seed, device=device, arbitrary_scales=bool(seed % 2)
+    )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
+    out_q, out_s = prepared.launch()
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
+
+
+@pytest.mark.parametrize(
+    "group_counts,n2,k",
+    [
+        pytest.param([256] * 16, 2048, 4096, id="uniform"),
+        pytest.param([384] * 8 + [128] * 8, 2048, 4096, id="all_odd"),
+        pytest.param([128] * 16, 2048, 4096, id="all_one_block"),
+        pytest.param([128, 128, 100], 256, 1024, id="small_m_partial_tail"),
+    ],
+)
+def test_group_counts_route_without_device_work(group_counts, n2, k):
+    """Caller-supplied rows per expert select the routing-aware route without touching m_indices."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n2, k, seed=668, device=device
+    )
+    validated = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
+    from_counts = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, group_counts=group_counts
+    )
+    assert (from_counts.route, from_counts.grid, from_counts.stage_grids) == (
+        validated.route,
+        validated.grid,
+        validated.stage_grids,
+    )
+    both = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, group_counts=group_counts, validate_indices=True
+    )
+    assert both.route == validated.route
+    out_q, out_s = from_counts.launch()
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
+
+
+def test_caller_owned_outputs_and_workspace():
+    device = torch.device("cuda")
+    group_counts, n2, k = [128, 128, 100], 256, 1024
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n2, k, seed=669, device=device
+    )
+    m, h = sum(group_counts), n2 // 2
+    out_q = torch.empty((m, h), dtype=torch.float8_e4m3fn, device=device)
+    out_s = torch.empty((m, h // GROUP_SIZE), dtype=torch.float32, device=device)
+    workspace = torch.empty((m, n2), dtype=torch.bfloat16, device=device)
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, out_q=out_q, out_s=out_s, workspace=workspace
+    )
+    assert prepared.route in ACT_ROUTES
+    q, s = prepared.launch()
+    torch.cuda.synchronize()
+    assert q.data_ptr() == out_q.data_ptr() and s.data_ptr() == out_s.data_ptr()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
+    torch.testing.assert_close(
+        workspace.float(), _reference_gemm(a, b, a_scale, b_scale, m_indices).float(), atol=3e-2, rtol=3e-2
+    )
+
+
+def test_re_preparing_per_step_retains_no_device_memory():
+    """A new routing per step re-prepares the launch on the fused routes; nothing accumulates."""
+    device = torch.device("cuda")
+    rng = random.Random(671)
+    n2, k, groups = 256, 512, 8
+    b = torch.randn((groups, n2, k), device=device).to(torch.float8_e4m3fn)
+    b_scale = torch.ones((groups, n2 // 128, k // 128), device=device)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    baseline = torch.cuda.memory_allocated(device)
+    for _ in range(12):
+        counts = _random_aligned_counts(rng, groups, 32)
+        counts = [c - c % 128 for c in counts]  # fused routes: whole blocks, M >= SMALL_M_MAX
+        while sum(counts) < SMALL_M_MAX:
+            counts[rng.randrange(groups)] += 128
+        m = sum(counts)
+        a = torch.randn((m, k), device=device).to(torch.float8_e4m3fn)
+        a_scale = torch.ones((m, k // 128), device=device)
+        m_indices = torch.repeat_interleave(
+            torch.arange(groups, dtype=torch.int32, device=device),
+            torch.tensor(counts, dtype=torch.int64, device=device),
+        ).contiguous()
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=counts
+        )
+        assert prepared.route in FUSED_ROUTES
+        out_q, out_s = prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.isfinite(out_s).all()
+        del prepared, out_q, out_s, a, a_scale, m_indices
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated(device) == baseline
 
 
 def test_rejects_invalid_inputs():
@@ -669,6 +813,14 @@ def test_rejects_invalid_inputs():
     with pytest.raises(ValueError, match="multiple of 128 rows"):
         prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             a, b, a_scale, b_scale, unaligned, validate_indices=True
+        )
+    with pytest.raises(ValueError, match="group_counts must"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=[100, 156]
+        )
+    with pytest.raises(ValueError, match="disagree with m_indices"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=[256, 0], validate_indices=True
         )
     with pytest.raises(ValueError, match="M must be at most 8192"):
         big_a, big_b, big_as, big_bs, big_idx = _make_inputs(
