@@ -37,9 +37,11 @@ from flashinfer.fused_moe.cake_kimi_k3_situ import (
     _cake_situ_workspace_views,
     _geometry,
     _prepared,
+    _route_flags,
     _workspace_layout,
 )
 from flashinfer.jit.cake_kimi_k3_situ import (
+    PROGRAM_FLAGS,
     PROGRAMS,
     ROUTES,
     _source_path,
@@ -52,6 +54,7 @@ from flashinfer.utils import device_support_pdl
 HIDDEN, INTERMEDIATE, EXPERTS, TOP_K = 3584, 384, 896, 16
 NVFP4_QUANT = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
 ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+LARGE_TOKENS = (8192, 16384)
 
 
 def _small_row_selector(arch, num_tokens):
@@ -169,19 +172,93 @@ def test_cake_situ_workspace_size_holds_every_smaller_shape():
     assert _workspace_size(max_num_tokens=100) >= _workspace_size(max_num_tokens=64)
 
 
+def test_cake_situ_route_program_keys():
+    # GPU-free: every route binds a program whose static facts name that selector
+    # and architecture, the static selection resolves every exported token count
+    # to its program, and the 8192- and 16384-token rows of both architectures
+    # (and no other token count) route to the nine-stage sequence that runs the
+    # scale-factor writer right before FC1.
+    c7_stages = [
+        "route_reset",
+        "quant",
+        "route_histogram",
+        "route_prefix",
+        "route_scatter",
+        "sfb_shuffle",
+        "fc1",
+        "fc2",
+        "finalize",
+    ]
+    assert set(PROGRAM_FLAGS) == set(ROUTES.values())
+    for (arch, selector), key in ROUTES.items():
+        flags = PROGRAM_FLAGS[key]
+        assert PROGRAMS[key]["arch"] == arch == flags["arch"]
+        assert selector in flags["selectors"]
+        bound = {s for (a, s), k in ROUTES.items() if k == key}
+        assert flags["selectors"] == sorted(bound, key=str)
+        assert flags["num_tokens"] == sorted(set(flags["num_tokens"]))
+        # Retained bare tile-size bindings carry no exported token count.
+        assert flags["formal"] == bool(flags["num_tokens"]) == isinstance(selector, str)
+        for num_tokens in flags["num_tokens"]:
+            static = _route_flags(arch, num_tokens)
+            assert static["program_key"] == key
+            assert static["stages"] == flags["stages"]
+            assert static["selector"] in flags["selectors"]
+            for name in (
+                "tile_n",
+                "single_token",
+                "feature_finalize",
+                "fc2_device_workfeed",
+            ):
+                assert static[name] == flags[name]
+            assert static["large_c7"] == (static["selector"] == "large_c7")
+        assert (
+            (flags["stages"] == c7_stages)
+            == (selector == "large_c7")
+            == (flags["selectors"] == ["large_c7"])
+        )
+    for arch in ("sm_100a", "sm_103a"):
+        for num_tokens in LARGE_TOKENS:
+            key = _route_flags(arch, num_tokens)["program_key"]
+            assert key == ROUTES[(arch, "large_c7")]
+            assert PROGRAM_FLAGS[key]["stages"] == c7_stages
+            assert PROGRAM_FLAGS[key]["num_tokens"] == list(LARGE_TOKENS)
+        retained = ROUTES[(arch, 128)]
+        assert PROGRAM_FLAGS[retained]["formal"] is False
+        assert PROGRAM_FLAGS[retained]["num_tokens"] == []
+        for num_tokens in (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
+            assert _route_flags(arch, num_tokens)["large_c7"] is False
+
+
+def test_cake_situ_workspace_size_covers_every_pre_shuffled_token_count():
+    # A workspace sized for max_num_tokens >= t must admit the t-token shape that
+    # carries the pre-shuffled scale-factor images (its layout is larger than the
+    # ordinary layout of the token counts just above it). Size query only.
+    for t in LARGE_TOKENS:
+        at_t = _workspace_size(max_num_tokens=t)
+        for max_tokens in (t, t + 1, t + 128, t + 255, 16384):
+            if max_tokens <= 16384:
+                assert _workspace_size(max_num_tokens=max_tokens) >= at_t
+    for max_tokens in range(65, 16385, 64):
+        assert _workspace_size(max_num_tokens=max_tokens) >= _workspace_size(
+            max_num_tokens=max_tokens - 1
+        )
+
+
 def test_cake_situ_workspace_layout_adds_pre_shuffled_scale_factors():
-    # The 16384-token layout appends the pre-shuffled FC1 scale-factor images
-    # (one 4096-byte image per N-tile and 512-element K-step) as its last
-    # field; every other token count keeps its previous layout.
-    tile_n, _, max_tiles = _geometry(16384)
-    assert (tile_n, max_tiles) == (128, 2937)
-    layout, nbytes = _workspace_layout(16384)
-    offset, size, dtype, shape = layout["sfb_shuffled"]
-    assert size == max_tiles * (HIDDEN // 512) * 4096 == 84_209_664
-    assert dtype == torch.uint8 and shape == (size,)
-    assert offset == max(start for start, _, _, _ in layout.values())
-    assert nbytes >= offset + size
-    assert "sfb_shuffled" not in _workspace_layout(8192)[0]
+    # The 8192- and 16384-token layouts append the pre-shuffled FC1 scale-factor
+    # images (one 4096-byte image per N-tile and 512-element K-step) as their
+    # last field; every other token count keeps its previous layout.
+    for num_tokens, expected_tiles in ((8192, 1913), (16384, 2937)):
+        tile_n, _, max_tiles = _geometry(num_tokens)
+        assert (tile_n, max_tiles) == (128, expected_tiles)
+        layout, nbytes = _workspace_layout(num_tokens)
+        offset, size, dtype, shape = layout["sfb_shuffled"]
+        assert size == max_tiles * (HIDDEN // 512) * 4096
+        assert dtype == torch.uint8 and shape == (size,)
+        assert offset == max(start for start, _, _, _ in layout.values())
+        assert nbytes >= offset + size
+    assert "sfb_shuffled" not in _workspace_layout(4096)[0]
     assert "sfb_shuffled" not in _workspace_layout(2048)[0]
 
 
@@ -430,6 +507,7 @@ def _trtllm_reference(x, ids, route_weights, prepared):
         (256, "uniform"),
         (512, "uniform"),
         (2048, "uniform"),
+        (8192, "uniform"),
         (16384, "uniform"),
         (512, "skew"),
         (1024, "skew"),
@@ -442,6 +520,7 @@ def _trtllm_reference(x, ids, route_weights, prepared):
         "n16",
         "n32",
         "n128",
+        "m8192",
         "m16384",
         "n32_skew",
         "n64_skew",
@@ -748,22 +827,23 @@ def _module_args(program_key, stage):
     ]
 
 
+@pytest.mark.parametrize("num_tokens", LARGE_TOKENS, ids=["m8192", "m16384"])
 @pytest.mark.parametrize(
     "routing", [_uniform_routing, _skewed_routing], ids=["uniform", "skewed"]
 )
-def test_cake_situ_m16384_pre_shuffled_route_matches_previous_fc1_program(
+def test_cake_situ_pre_shuffled_route_matches_previous_fc1_program(
+    num_tokens,
     routing,
     cake_situ_device,
     cake_situ_weights,
     cake_situ_workspace,
 ):
-    # The 16384-token route runs the scale-factor writer and the FC1 program
-    # that loads the pre-shuffled images. Its FC1 outputs (per routed pair),
-    # the FC2 outputs and the complete call must be bitwise identical to the
-    # previous FC1 program, which gathers and shuffles the scale factors
-    # itself. That program is still shipped as the tile-N128 sequence, so it
-    # runs here on the same workspace, inputs and stage bindings.
-    num_tokens = 16384
+    # The 8192- and 16384-token routes run the scale-factor writer and the FC1
+    # program that loads the pre-shuffled images. Their FC1 outputs (per routed
+    # pair), the FC2 outputs and the complete call must be bitwise identical to
+    # the previous FC1 program, which gathers and shuffles the scale factors
+    # itself. That program is retained as the tile-N128 sequence, so it runs
+    # here on the same workspace, inputs and stage bindings.
     device, weights, workspace = (
         cake_situ_device,
         cake_situ_weights,
@@ -851,10 +931,12 @@ def _reference_sfb_shuffle(x_scales, route_map, tile_mn_limit, total_tiles):
     return image.view(total_tiles, k_tiles * 4096)
 
 
+@pytest.mark.parametrize("num_tokens", LARGE_TOKENS, ids=["m8192", "m16384"])
 @pytest.mark.parametrize(
     "routing", [_uniform_routing, _skewed_routing], ids=["uniform", "skewed"]
 )
 def test_cake_situ_sfb_shuffle_writer_matches_reference(
+    num_tokens,
     routing,
     cake_situ_device,
     cake_situ_weights,
@@ -865,7 +947,6 @@ def test_cake_situ_sfb_shuffle_writer_matches_reference(
     # compare its images with a Python shuffle. A sentinel fill shows that
     # padding tiles past the routed tile count are never written and that
     # padding rows of a partial tile are written as zeros.
-    num_tokens = 16384
     device, weights, workspace = (
         cake_situ_device,
         cake_situ_weights,
