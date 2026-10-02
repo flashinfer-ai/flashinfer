@@ -102,9 +102,7 @@ def test_flash_kda_decode_jit_spec_and_frozen_body(
         for flag in spec.extra_cuda_cflags
         if flag.startswith("-DFLASHINFER_CAKE_KDA_DECODE_TARGET_KIND=")
     ]
-    assert target_defines == [
-        f"-DFLASHINFER_CAKE_KDA_DECODE_TARGET_KIND={target_kind}"
-    ]
+    assert target_defines == [f"-DFLASHINFER_CAKE_KDA_DECODE_TARGET_KIND={target_kind}"]
     assert "-use_fast_math" in spec.extra_cuda_cflags
     assert "--maxrregcount=128" in spec.extra_cuda_cflags
     assert sum("-gencode=arch=compute_" in flag for flag in spec.extra_cuda_cflags) == 1

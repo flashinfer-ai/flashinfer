@@ -103,9 +103,9 @@ static_assert(CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 0 ||
               "packed KDA T=1 auxiliary alignment must be boolean");
 static_assert(CAKE_KDA_PACKED_T1_LEGACY_ABI == 0 || CAKE_KDA_PACKED_T1_LEGACY_ABI == 1,
               "packed KDA T=1 legacy ABI switch must be boolean");
-static_assert(CAKE_KDA_PACKED_T1_LEGACY_ABI == 0 || (CAKE_KDA_PACKED_T1_THREADS == 32 &&
-                                                     CAKE_KDA_PACKED_T1_SMEM_BYTES == 0 &&
-                                                     CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 0),
+static_assert(CAKE_KDA_PACKED_T1_LEGACY_ABI == 0 ||
+                  (CAKE_KDA_PACKED_T1_THREADS == 32 && CAKE_KDA_PACKED_T1_SMEM_BYTES == 0 &&
+                   CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 0),
               "legacy packed KDA T=1 bodies run one warp without dynamic shared memory");
 
 inline void CheckCuda(cudaError_t status, const char* operation) {
