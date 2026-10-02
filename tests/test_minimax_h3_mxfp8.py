@@ -368,6 +368,13 @@ def _assert_within_round_points(
     elsewhere.
     """
     difference = (actual.float() - expected.float()).abs()
+    # Derivation of the extra term: a rotated output is n * cos - partner * sin
+    # where the kernel has already rounded n and partner to BF16.  Each rounding
+    # moves its operand by at most half a BF16 ulp, so |n_k * cos - n_r * cos| +
+    # |p_k * sin - p_r * sin| <= ulp(|n cos|) / 2 + ulp(|partner sin|) / 2
+    # <= ulp(|n cos| + |partner sin|); the output BF16 rounding adds at most one
+    # more ulp of the same magnitude.  Hence 2 * bf16_ulp(magnitude), with atol
+    # and rtol covering the approximate rsqrt and the dequantized FP8 error.
     bound = atol + rtol * expected.float().abs() + 2.0 * _bf16_ulp(magnitude)
     excess = difference - bound
     violations = int((excess > 0).sum().item())
