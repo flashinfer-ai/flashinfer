@@ -45,7 +45,7 @@ _FC1_K_STEP = 512
 _FC1_K_TILES = _H // _FC1_K_STEP
 _SFB_IMAGE_BYTES = 128 * (_FC1_K_STEP // 16)
 _SFB_IMAGE_BLOCKS = _SFB_IMAGE_BYTES // 512
-# The 16-token SM103 route runs an FC2 program built for two resident CTAs per
+# The 16-token SM103 and SM100 routes run an FC2 program built for two resident CTAs per
 # SM (four pipeline stages, __launch_bounds__(512, 2)), so its device-workfeed
 # pool holds 2 * SM // (_H // 128) rows: 280 CTAs on a 148-SM part instead of
 # the 140 of the single-CTA FC2 program. The pool size only sets how many CTAs
@@ -53,7 +53,7 @@ _SFB_IMAGE_BLOCKS = _SFB_IMAGE_BYTES // 512
 # every CTA claims its next tile through an atomic increment, exiting once the
 # counter passes the tile count, so a CTA that is not co-resident starts later
 # and takes whatever remains; no CTA waits for another.
-_N8_W2A_M16_ARCHES = ("sm_103a",)
+_N8_W2A_M16_ARCHES = ("sm_103a", "sm_100a")
 _N8_W2A_M16_TOKENS = (16,)
 _N8_W2A_M16_FC2_GRID_N_SM_FACTOR = 2
 

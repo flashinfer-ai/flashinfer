@@ -56,9 +56,9 @@ ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 def _small_row_selector(arch, num_tokens):
     # Route selectors of the small token counts: the two-CTA-per-SM FC2 route
-    # for 16 tokens on SM103, the single-token route for 1 token and the fused
-    # quantization + router route for 8 tokens (and 16 tokens on SM100).
-    if num_tokens == 16 and arch == "sm_103a":
+    # for 16 tokens on both architectures, the single-token route for 1 token
+    # and the fused quantization + router route for 8 tokens.
+    if num_tokens == 16:
         return "n8_w2a_m16"
     if num_tokens == 1:
         return "m1"
@@ -195,15 +195,19 @@ REGISTERS_PER_SM = 65536
 
 
 def test_cake_situ_two_cta_fc2_program_fits_two_ctas_per_sm():
-    # The 16-token SM103 route sizes its FC2 device-workfeed pool as
+    # The 16-token routes size their FC2 device-workfeed pool as
     # _N8_W2A_M16_FC2_GRID_N_SM_FACTOR CTAs per SM. That is only correct if the
     # generated FC2 program really fits that many CTAs per SM, so pin the
-    # program's launch bounds and shared-memory footprint to the host factor.
-    threads, min_blocks, smem_bytes = _fc2_launch_footprint("sm_103a", "n8_w2a_m16")
-    assert (threads, min_blocks) == (512, _N8_W2A_M16_FC2_GRID_N_SM_FACTOR)
-    assert min_blocks * (smem_bytes + SMEM_RESERVED_PER_CTA_BYTES) <= SMEM_PER_SM_BYTES
-    # __launch_bounds__(512, 2) caps ptxas at this many registers per thread.
-    assert REGISTERS_PER_SM // (threads * min_blocks) >= 64
+    # program's launch bounds and shared-memory footprint to the host factor on
+    # both architectures.
+    for arch in ("sm_103a", "sm_100a"):
+        threads, min_blocks, smem_bytes = _fc2_launch_footprint(arch, "n8_w2a_m16")
+        assert (threads, min_blocks) == (512, _N8_W2A_M16_FC2_GRID_N_SM_FACTOR)
+        assert (
+            min_blocks * (smem_bytes + SMEM_RESERVED_PER_CTA_BYTES) <= SMEM_PER_SM_BYTES
+        )
+        # __launch_bounds__(512, 2) caps ptxas at this many registers per thread.
+        assert REGISTERS_PER_SM // (threads * min_blocks) >= 64
     # The single-CTA FC2 program of the other small routes does not fit twice.
     for arch, selector in (("sm_103a", "n8_feature"), ("sm_100a", "n8_feature")):
         threads, min_blocks, smem_bytes = _fc2_launch_footprint(arch, selector)
@@ -236,16 +240,16 @@ def test_cake_situ_program_records_are_consistent():
         assert PROGRAMS[program_key]["arch"] == arch, (arch, program_key)
 
 
-def test_cake_situ_two_cta_fc2_route_is_sixteen_tokens_on_sm103_only():
-    # Only 16 tokens on SM103 reach the two-CTA-per-SM FC2 route: SM100 has no
-    # such route and 8 tokens on SM103 keep the fused-router route.
-    two_cta = ROUTES[("sm_103a", "n8_w2a_m16")]
-    assert ("sm_100a", "n8_w2a_m16") not in ROUTES
-    assert _small_row_selector("sm_100a", 16) == "n8_feature"
-    assert ROUTES[("sm_100a", "n8_feature")] != two_cta
-    assert _small_row_selector("sm_103a", 8) == "n8_feature"
-    assert ROUTES[("sm_103a", "n8_feature")] != two_cta
-    assert two_cta not in (ROUTES[("sm_103a", 8)], ROUTES[("sm_103a", 16)])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_cake_situ_two_cta_fc2_route_is_sixteen_tokens_only(arch):
+    # Only 16 tokens reach the two-CTA-per-SM FC2 route on either architecture:
+    # 8 tokens keep the fused-router route and the larger counts their own.
+    two_cta = ROUTES[(arch, "n8_w2a_m16")]
+    assert PROGRAMS[two_cta]["arch"] == arch
+    assert _small_row_selector(arch, 16) == "n8_w2a_m16"
+    assert _small_row_selector(arch, 8) == "n8_feature"
+    assert ROUTES[(arch, "n8_feature")] != two_cta
+    assert two_cta not in (ROUTES[(arch, 8)], ROUTES[(arch, 16)])
 
 
 @pytest.fixture(scope="module")
@@ -474,9 +478,9 @@ def test_cake_situ_output_workspace_and_external_graph(
         is workspace
     )
     # The prepared shape must select the expected route: the two-CTA-per-SM
-    # FC2 route for 16 tokens on SM103, the single-token and fused-router
-    # routes for the other small counts, and the fused quantization + router
-    # stage exactly for 8 and 16 tokens on both architectures.
+    # FC2 route for 16 tokens, the single-token and fused-router routes for
+    # the other small counts, and the fused quantization + router stage
+    # exactly for 8 and 16 tokens, on both architectures.
     arch = ARCH_BY_CAPABILITY[torch.cuda.get_device_capability(device)]
     prepared_shape = workspace._flashinfer_cake_situ_workspace["shapes"][num_tokens]
     selector = _small_row_selector(arch, num_tokens)
