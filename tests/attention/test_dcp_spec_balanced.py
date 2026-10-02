@@ -653,23 +653,59 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
     for kind in DCP_BALANCED_KINDS:
         variants = dcp_balanced_program_variants(_KIND_FAMILY[kind])
         if variants is None:
-            assert dcp_balanced_program(kind, batch_size=1, num_kv_heads=8, sm_count=148) is None
-            assert dcp_balanced_program(kind, batch_size=256, num_kv_heads=8, sm_count=148) is None
+            assert (
+                dcp_balanced_program(kind, batch_size=1, num_kv_heads=8, sm_count=148)
+                is None
+            )
+            assert (
+                dcp_balanced_program(kind, batch_size=256, num_kv_heads=8, sm_count=148)
+                is None
+            )
             continue
         assert variants["items_lower_bound"] == "batch_size * num_kv_heads"
         below, above = int(variants["below_grid"]), int(variants["at_or_above_grid"])
-        assert {below, above} == set(int(v) for v in variants["values"]) and below != above
+        assert {below, above} == set(
+            int(v) for v in variants["values"]
+        ) and below != above
         for sm in (148, 152):
             # fewer request-head pairs than CTAs: the idle-CTA eight-slice fold can be taken
-            assert dcp_balanced_program(kind, batch_size=1, num_kv_heads=8, sm_count=sm) == below
-            assert dcp_balanced_program(kind, batch_size=8, num_kv_heads=8, sm_count=sm) == below
-            assert dcp_balanced_program(kind, batch_size=(sm - 1) // 8, num_kv_heads=8, sm_count=sm) == below
+            assert (
+                dcp_balanced_program(kind, batch_size=1, num_kv_heads=8, sm_count=sm)
+                == below
+            )
+            assert (
+                dcp_balanced_program(kind, batch_size=8, num_kv_heads=8, sm_count=sm)
+                == below
+            )
+            assert (
+                dcp_balanced_program(
+                    kind, batch_size=(sm - 1) // 8, num_kv_heads=8, sm_count=sm
+                )
+                == below
+            )
             # at least one chunk ticket per pair fills the grid: the fold can never be taken
-            assert dcp_balanced_program(kind, batch_size=-(-sm // 8), num_kv_heads=8, sm_count=sm) == above
-            assert dcp_balanced_program(kind, batch_size=64, num_kv_heads=8, sm_count=sm) == above
-            assert dcp_balanced_program(kind, batch_size=256, num_kv_heads=8, sm_count=sm) == above
-        assert dcp_balanced_program(kind, batch_size=37, num_kv_heads=4, sm_count=148) == above
-        assert dcp_balanced_program(kind, batch_size=36, num_kv_heads=4, sm_count=148) == below
+            assert (
+                dcp_balanced_program(
+                    kind, batch_size=-(-sm // 8), num_kv_heads=8, sm_count=sm
+                )
+                == above
+            )
+            assert (
+                dcp_balanced_program(kind, batch_size=64, num_kv_heads=8, sm_count=sm)
+                == above
+            )
+            assert (
+                dcp_balanced_program(kind, batch_size=256, num_kv_heads=8, sm_count=sm)
+                == above
+            )
+        assert (
+            dcp_balanced_program(kind, batch_size=37, num_kv_heads=4, sm_count=148)
+            == above
+        )
+        assert (
+            dcp_balanced_program(kind, batch_size=36, num_kv_heads=4, sm_count=148)
+            == below
+        )
     with pytest.raises(ValueError, match="sm_count"):
         dcp_balanced_program("fp8_p64", batch_size=1, num_kv_heads=8, sm_count=0)
     with pytest.raises(ValueError, match="kind"):
@@ -683,13 +719,23 @@ def test_fp8_program_row_selection(monkeypatch) -> None:
     if variants is None:
         pytest.skip("the shipped E4M3 head_dim-128 family has one program")
     calls, _launches = _patch_loaders(monkeypatch)
-    for batch, expected in ((8, variants["below_grid"]), (64, variants["at_or_above_grid"])):
+    for batch, expected in (
+        (8, variants["below_grid"]),
+        (64, variants["at_or_above_grid"]),
+    ):
         calls["balanced"].clear()
         inputs = _rank_inputs(
-            "fp8_p64", batch=batch, q_len=4, prefixes=[8192] * batch, cp_world=4, cp_rank=0
+            "fp8_p64",
+            batch=batch,
+            q_len=4,
+            prefixes=[8192] * batch,
+            cp_world=4,
+            cp_rank=0,
         )
         run_dcp_spec_decode(**inputs)
-        assert calls["balanced"] == [("dcp_spec_bf16_fp8_balanced", "sm100a", 32, int(expected))]
+        assert calls["balanced"] == [
+            ("dcp_spec_bf16_fp8_balanced", "sm100a", 32, int(expected))
+        ]
 
 
 # Launch resources and argument order the export pins per family
@@ -713,7 +759,9 @@ _KIND_MANIFEST_BAND = {
 }
 
 
-def test_balanced_families_ship_one_program_per_selector_with_both_packed_instances() -> None:
+def test_balanced_families_ship_one_program_per_selector_with_both_packed_instances() -> (
+    None
+):
     families = get_cake_fmha_manifest()["add_ons"]["cake_fmha_dcp_spec"]["manifest"][
         "families"
     ]
@@ -729,7 +777,9 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
         else:
             # one such program per value of the program selector; the host picks it from launch metadata
             key = variants["key"]
-            assert sorted(variants["values"]) == sorted(int(v) for v in variants["bodies"])
+            assert sorted(variants["values"]) == sorted(
+                int(v) for v in variants["bodies"]
+            )
             assert variants["default"] in variants["values"]
             programs = {
                 int(value): f"cuda/dcp_spec/{family}/kernel_{key}{int(value)}.cu"
@@ -741,7 +791,8 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
                 for n_rows in (32, 64)
             ]
         assert [
-            dict(sorted(member["selector"].items())) for member in entry["source_family"]
+            dict(sorted(member["selector"].items()))
+            for member in entry["source_family"]
         ] == expected_selectors, family
         assert sorted(
             path.name for path in (csrc_dir / "cuda" / "dcp_spec" / family).iterdir()
@@ -750,8 +801,12 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
         for value, program in programs.items():
             assert (csrc_dir / program).is_file(), program
             program_text = (csrc_dir / program).read_text()
-            assert program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n") == 1
-            assert "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)" in program_text
+            assert (
+                program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n") == 1
+            )
+            assert (
+                "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)" in program_text
+            )
             texts[value] = program_text
         assert len(set(texts.values())) == len(texts)  # distinct programs
         for member in entry["source_family"]:
@@ -840,35 +895,41 @@ def test_balanced_jit_selects_the_packed_instance_and_launch_binding(
             variants = jit_dcp.dcp_balanced_program_variants(family)
             programs = [None] if variants is None else list(variants["values"])
             for n_rows in DCP_BALANCED_N_ROWS:
-              for program in programs:
-                spec = jit_dcp.gen_dcp_spec_balanced_module(family, target, n_rows, program)
-                assert (
-                    f"-gencode=arch=compute_{arch},code=sm_{arch}"
-                    in spec.extra_cuda_cflags
-                )
-                assert spec.name == get_dcp_spec_balanced_uri(family, target, n_rows, program)
-                body, launch_binding, api_binding = (
-                    Path(source) for source in spec.sources
-                )
-                expected_body = (
-                    "kernel.cu" if variants is None else f"kernel_{variants['key']}{program}.cu"
-                )
-                assert body.name == expected_body and body.parent.name == family
-                assert body.parent.parent.name == "dcp_spec"
-                assert f"-DN_ROWS={n_rows}" in spec.extra_cuda_cflags
-                assert launch_binding.name == f"cake_fmha_{family}_binding.cu"
-                assert launch_binding.parent.name == "bindings"
-                assert api_binding.name == f"cake_fmha_{family}_jit_binding.cu"
-                assert api_binding.parent.name == "jit"
-                assert (
-                    f"-DCAKE_FMHA_DCP_BALANCED_LAUNCH=cake_fmha_launch_{family}"
-                    in spec.extra_cuda_cflags
-                )
-                assert "-lcuda" in spec.extra_ldflags
-                assert not any(
-                    flag.startswith(("-DQ_LEN", "-DBATCH_SIZE", "-DCP_WORLD"))
-                    for flag in spec.extra_cuda_cflags
-                )
+                for program in programs:
+                    spec = jit_dcp.gen_dcp_spec_balanced_module(
+                        family, target, n_rows, program
+                    )
+                    assert (
+                        f"-gencode=arch=compute_{arch},code=sm_{arch}"
+                        in spec.extra_cuda_cflags
+                    )
+                    assert spec.name == get_dcp_spec_balanced_uri(
+                        family, target, n_rows, program
+                    )
+                    body, launch_binding, api_binding = (
+                        Path(source) for source in spec.sources
+                    )
+                    expected_body = (
+                        "kernel.cu"
+                        if variants is None
+                        else f"kernel_{variants['key']}{program}.cu"
+                    )
+                    assert body.name == expected_body and body.parent.name == family
+                    assert body.parent.parent.name == "dcp_spec"
+                    assert f"-DN_ROWS={n_rows}" in spec.extra_cuda_cflags
+                    assert launch_binding.name == f"cake_fmha_{family}_binding.cu"
+                    assert launch_binding.parent.name == "bindings"
+                    assert api_binding.name == f"cake_fmha_{family}_jit_binding.cu"
+                    assert api_binding.parent.name == "jit"
+                    assert (
+                        f"-DCAKE_FMHA_DCP_BALANCED_LAUNCH=cake_fmha_launch_{family}"
+                        in spec.extra_cuda_cflags
+                    )
+                    assert "-lcuda" in spec.extra_ldflags
+                    assert not any(
+                        flag.startswith(("-DQ_LEN", "-DBATCH_SIZE", "-DCP_WORLD"))
+                        for flag in spec.extra_cuda_cflags
+                    )
     finally:
         jit_dcp.gen_dcp_spec_balanced_module.cache_clear()
 
@@ -964,7 +1025,10 @@ def test_bf16_band_row_launches_the_balanced_program(monkeypatch) -> None:
     )
     run_dcp_spec_decode(**inputs)
     assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, None)]
-    assert dcp_balanced_program("bf16_p16", batch_size=8, num_kv_heads=8, sm_count=148) is None
+    assert (
+        dcp_balanced_program("bf16_p16", batch_size=8, num_kv_heads=8, sm_count=148)
+        is None
+    )
     assert not calls["static"]
     (args,) = launches["balanced"]
     assert (
@@ -1077,7 +1141,12 @@ def test_fp8_band_row_launches_the_e4m3_program_with_both_scales(monkeypatch) ->
     inputs["bmm2_scale"] = 0.25
     run_dcp_spec_decode(**inputs)
     assert calls["balanced"] == [
-        ("dcp_spec_bf16_fp8_balanced", "sm100a", 32, dcp_balanced_program("fp8_p64", batch_size=8, num_kv_heads=8, sm_count=148))
+        (
+            "dcp_spec_bf16_fp8_balanced",
+            "sm100a",
+            32,
+            dcp_balanced_program("fp8_p64", batch_size=8, num_kv_heads=8, sm_count=148),
+        )
     ]
     assert not calls["fp8"]
     (args,) = launches["balanced"]
@@ -1109,7 +1178,16 @@ def test_fp8_two_wave_row_follows_the_architecture_floor(monkeypatch) -> None:
     run_dcp_spec_decode(**inputs)
     assert (
         calls["balanced"]
-        == [("dcp_spec_bf16_fp8_balanced", "sm103a", 32, dcp_balanced_program("fp8_p64", batch_size=8, num_kv_heads=8, sm_count=152))]
+        == [
+            (
+                "dcp_spec_bf16_fp8_balanced",
+                "sm103a",
+                32,
+                dcp_balanced_program(
+                    "fp8_p64", batch_size=8, num_kv_heads=8, sm_count=152
+                ),
+            )
+        ]
         and not calls["fp8"]
     )
 
@@ -1122,7 +1200,14 @@ def test_d256_band_row_launches_the_gqa16_program(monkeypatch) -> None:
     inputs["bmm2_scale"] = 0.5
     run_dcp_spec_decode(**inputs)
     assert calls["balanced"] == [
-        ("dcp_spec_bf16_fp8_d256_balanced", "sm100a", 64, dcp_balanced_program("fp8_p64_d256", batch_size=64, num_kv_heads=1, sm_count=148))
+        (
+            "dcp_spec_bf16_fp8_d256_balanced",
+            "sm100a",
+            64,
+            dcp_balanced_program(
+                "fp8_p64_d256", batch_size=64, num_kv_heads=1, sm_count=148
+            ),
+        )
     ]
     assert not calls["d256"]
     (args,) = launches["balanced"]

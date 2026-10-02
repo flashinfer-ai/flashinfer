@@ -19,7 +19,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal, Mapping, Optional
+from typing import Any, Literal, Optional
 
 from . import env as jit_env
 from .cake_fmha import (
