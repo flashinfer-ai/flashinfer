@@ -7,6 +7,9 @@ import torch
 
 from flashinfer import mm_bf16_fp4, prepare_bf16_fp4_weights
 
+# Smallest M whose 16-row activation-tile count exceeds the CUDA Y grid limit.
+LARGE_M = 65535 * 16 + 16
+
 
 @pytest.fixture(scope="module")
 def blackwell_device():
@@ -59,6 +62,35 @@ def _make_weights(n, k, device, generator):
         .reshape(-1)
     )
     return packed, canonical_scales, reference_weights
+
+
+def _reference(a, reference_weights, alpha_value, out_dtype):
+    previous_precision = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        reference = a.float() @ reference_weights.T
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
+    if alpha_value is not None:
+        reference = reference * alpha_value
+    return reference.to(out_dtype)
+
+
+def _case(device, backend, shape, out_dtype, alpha_value, seed):
+    m, n, k = shape
+    generator = torch.Generator(device=device).manual_seed(seed)
+    a = (
+        torch.randn((m, k), dtype=torch.bfloat16, device=device, generator=generator)
+        * 0.125
+    )
+    packed, scales, reference_weights = _make_weights(n, k, device, generator)
+    alpha = (
+        None
+        if alpha_value is None
+        else torch.tensor([alpha_value], dtype=torch.float32, device=device)
+    )
+    prepared = prepare_bf16_fp4_weights(packed, scales, alpha, backend=backend)
+    return a, prepared, _reference(a, reference_weights, alpha_value, out_dtype)
 
 
 @pytest.mark.parametrize(
@@ -145,29 +177,106 @@ def _make_weights(n, k, device, generator):
             True,
             id="tiled-ragged-m-k48",
         ),
+        # Routes the earlier parametrization never reached.
+        pytest.param(
+            "blackwell-tiled",
+            (33, 128, 16),
+            torch.bfloat16,
+            0.5,
+            False,
+            True,
+            id="tiled-k16-persistent",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (5, 4096, 32),
+            torch.bfloat16,
+            None,
+            True,
+            False,
+            id="tiled-k32",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (40, 256, 256),
+            torch.bfloat16,
+            -0.25,
+            False,
+            True,
+            id="tiled-m64-route",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (17, 64, 80),
+            torch.bfloat16,
+            None,
+            False,
+            False,
+            id="tiled-generic-fallback-k80",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (17, 3072, 3072),
+            torch.bfloat16,
+            0.75,
+            False,
+            True,
+            id="tiled-m32-long-k",
+        ),
+        pytest.param(
+            "blackwell-native",
+            (33, 128, 192),
+            torch.float16,
+            0.5,
+            False,
+            False,
+            id="native-fp16-cp-async-alpha",
+        ),
+        pytest.param(
+            "blackwell-native",
+            (768, 2112, 2048),
+            torch.bfloat16,
+            0.75,
+            False,
+            True,
+            id="native-m768-n2112-k2048",
+        ),
+        pytest.param(
+            "blackwell-native",
+            (1, 4096, 4096),
+            torch.bfloat16,
+            None,
+            False,
+            True,
+            id="native-m1-n4096-k4096",
+        ),
+        pytest.param(
+            "blackwell-native",
+            (LARGE_M, 64, 16),
+            torch.bfloat16,
+            None,
+            False,
+            True,
+            id="native-large-m-flat-grid",
+        ),
+        pytest.param(
+            "blackwell-tiled",
+            (LARGE_M, 64, 80),
+            torch.bfloat16,
+            0.5,
+            False,
+            False,
+            id="tiled-large-m-flat-grid",
+        ),
     ],
 )
 def test_blackwell_bf16_fp4_numerical(
     blackwell_device, backend, shape, out_dtype, alpha_value, caller_out, enable_pdl
 ):
-    m, n, k = shape
-    generator = torch.Generator(device=blackwell_device).manual_seed(42)
-    a = (
-        torch.randn(
-            (m, k),
-            dtype=torch.bfloat16,
-            device=blackwell_device,
-            generator=generator,
-        )
-        * 0.125
+    m, n, _k = shape
+    a, prepared, reference = _case(
+        blackwell_device, backend, shape, out_dtype, alpha_value, 42
     )
-    packed, scales, reference_weights = _make_weights(n, k, blackwell_device, generator)
-    alpha = (
-        None
-        if alpha_value is None
-        else torch.tensor([alpha_value], dtype=torch.float32, device=blackwell_device)
-    )
-    prepared = prepare_bf16_fp4_weights(packed, scales, alpha, backend=backend)
     out = (
         torch.full((m, n), float("nan"), dtype=out_dtype, device=blackwell_device)
         if caller_out
@@ -184,15 +293,70 @@ def test_blackwell_bf16_fp4_numerical(
     if caller_out:
         assert actual is out
 
-    previous_precision = torch.get_float32_matmul_precision()
-    try:
-        torch.set_float32_matmul_precision("highest")
-        reference = a.float() @ reference_weights.T
-    finally:
-        torch.set_float32_matmul_precision(previous_precision)
-    if alpha_value is not None:
-        reference = reference * alpha_value
-
     # Compare to the represented FP4 weights, not to unquantized source weights.
     # Thus the standard BF16/FP16 pointwise tolerance need not include FP4 error.
-    torch.testing.assert_close(actual, reference.to(out_dtype), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual, reference, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("backend", ["blackwell-native", "blackwell-tiled"])
+def test_blackwell_bf16_fp4_many_distinct_activations(blackwell_device, backend):
+    """Every call encodes its own descriptors; distinct activation and output buffers never exhaust a cache."""
+
+    m, n, k = 3, 64, 256
+    generator = torch.Generator(device=blackwell_device).manual_seed(7)
+    packed, scales, reference_weights = _make_weights(n, k, blackwell_device, generator)
+    prepared = prepare_bf16_fp4_weights(packed, scales, None, backend=backend)
+    activations = [
+        torch.randn(
+            (m, k), dtype=torch.bfloat16, device=blackwell_device, generator=generator
+        )
+        * 0.125
+        for _ in range(4200)
+    ]
+    outputs = [mm_bf16_fp4(a, *prepared, backend=backend) for a in activations]
+    torch.cuda.synchronize()
+    for a, actual in zip(activations[::700], outputs[::700], strict=True):
+        torch.testing.assert_close(
+            actual,
+            _reference(a, reference_weights, None, torch.bfloat16),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+
+@pytest.mark.parametrize(
+    "backend,shape",
+    [
+        pytest.param("blackwell-native", (16, 1024, 1024), id="native-m16"),
+        pytest.param("blackwell-tiled", (16, 1024, 1024), id="tiled-m16"),
+        pytest.param("blackwell-native", (1, 4096, 4096), id="native-split-k"),
+        pytest.param("blackwell-native", (768, 2112, 2048), id="native-m768"),
+    ],
+)
+def test_blackwell_bf16_fp4_cuda_graph_capture(blackwell_device, backend, shape):
+    """A first call inside CUDA Graph capture is legal and replays bitwise."""
+
+    m, n, _k = shape
+    a, prepared, reference = _case(
+        blackwell_device, backend, shape, torch.bfloat16, 0.75, 11
+    )
+    out = torch.full(
+        (m, n), float("nan"), dtype=torch.bfloat16, device=blackwell_device
+    )
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        mm_bf16_fp4(a, *prepared, backend=backend, out=out, enable_pdl=True)
+    torch.cuda.synchronize()
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, reference, atol=1e-2, rtol=1e-2)
+    replayed = out.clone()
+    a.copy_(a * 0.5)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.equal(out, replayed)
+    torch.testing.assert_close(
+        out, (reference.float() * 0.5).to(torch.bfloat16), atol=1e-2, rtol=1e-2
+    )
