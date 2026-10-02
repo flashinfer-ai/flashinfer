@@ -375,6 +375,13 @@ def test_sparse_metadata_native_consumer(fmt, paged):
     """The standalone helper retains the cross-library byte ABI of the native consumer."""
     _skip_unless_exported()
     deep_gemm = pytest.importorskip("deep_gemm")
+    native_logits = (
+        "fp8_fp4_paged_sparse_mqa_logits" if paged else "fp8_fp4_sparse_mqa_logits"
+    )
+    if not hasattr(deep_gemm, native_logits):
+        pytest.skip(
+            f"installed deep_gemm has no {native_logits} (sparse MQA indexer not built)"
+        )
     case = analytical_case(fmt, paged)
     metadata, _plan, output = _run_pipeline(case)
     expected = analytical_expected(case, False)
