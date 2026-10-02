@@ -89,7 +89,6 @@ PROFILES: Dict[str, Profile] = {
 def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
     """Benchmarkable backends: name -> factory of its MoEEpCommunication config."""
     from flashinfer.moe_ep import (
-        NCCLEPConfig,
         CakeAlltoAllConfig,
         NVLinkOneSidedConfig,
         NVLinkTwoSidedConfig,
@@ -102,7 +101,6 @@ def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
         ),
         "cake": lambda: CakeAlltoAllConfig(use_low_precision_combine=low_precision),
         "nvlink_two_sided": NVLinkTwoSidedConfig,
-        "nccl_ep": NCCLEPConfig,
     }
 
 
@@ -702,7 +700,6 @@ def parse_args() -> argparse.Namespace:
             "nvlink_one_sided",
             "cake",
             "nvlink_two_sided",
-            "nccl_ep",
         ],
         help="Backend to benchmark (default: every backend available on all ranks).",
     )

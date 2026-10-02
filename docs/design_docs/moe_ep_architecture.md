@@ -79,15 +79,14 @@ through `SplitConfig(comm=...)`. They differ in object model, not in role:
   per-step-handle model and exposes their full surface (EXPERT_MAJOR and HT
   layouts, split send/receive staging, persistent handles for CUDA graphs,
   fault-tolerance masks). `MoEEpSplitLayer` drives `nccl_ep` / `nixl_ep`
-  through it. `NcclEpCommunication` additionally adapts it to the
-  `MoEEpCommunication` contract for LL RANK_MAJOR (not CUDA-graph capturable).
+  through it, and engines integrate them through it directly.
 
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
 | `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back (`flashinfer.comm.MoeAlltoAll`, TRT-LLM kernels) |
 | `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | `nvlink_one_sided` running the generated Cake kernels (`MoeAlltoAll` with `backend="cake"`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`flashinfer.comm.MnnvlMoe`); `num_experts % 4 == 0` |
-| `nccl_ep` | `NcclEpConfig` | Fleet/Handle (also adapted to `MoEEpCommunication`, LL `RANK_MAJOR`) | see below |
+| `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
 | `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
 
 Fleet transports:
@@ -343,15 +342,14 @@ classDiagram
     MoEEpLayer --> MoEEpSplitLayer : SplitConfig
     MoEEpLayer --> MoEEpMegaLayer : MegaConfig
 
-    MoEEpSplitLayer --> MoEEpCommunication : nvlink_*
+    MoEEpSplitLayer --> MoEEpCommunication : nvlink_* / cake
     MoEEpSplitLayer --> Fleet : nccl_ep / nixl_ep
     MoEEpSplitLayer --> SplitKernelBackend
     MoEEpSplitLayer --> Handle : per forward
 
     MoEEpCommunication <|-- NVLinkOneSidedAlltoAll
+    NVLinkOneSidedAlltoAll <|-- CakeAlltoAll
     MoEEpCommunication <|-- NVLinkTwoSidedAlltoAll
-    MoEEpCommunication <|-- NcclEpCommunication
-    NcclEpCommunication --> Fleet
 
     MoEEpMegaLayer --> MegaKernelBackend
 

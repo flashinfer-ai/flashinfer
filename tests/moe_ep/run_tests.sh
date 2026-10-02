@@ -5,7 +5,7 @@
 #   bash tests/moe_ep/run_tests.sh
 #   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
-#   bash tests/moe_ep/run_tests.sh comm          # MoEEpCommunication backends (NVLink one-/two-sided, NCCL-EP)
+#   bash tests/moe_ep/run_tests.sh comm          # MoEEpCommunication backends (NVLink one-sided, Cake, two-sided)
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8x B200 BF16 rank-major GPU regression
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
@@ -163,7 +163,8 @@ run_unit() {
 }
 
 # MoEEpCommunication dispatch/combine on NPROC_MULTIRANK GPUs. Backends that
-# are unavailable on the host (no NVLink fabric, no nccl.ep) skip.
+# are unavailable on the host (no NVLink fabric, or no Cake kernels for the
+# GPU) skip.
 run_comm() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \

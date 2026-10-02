@@ -270,7 +270,6 @@ __all__ = [
     "NVLinkOneSidedConfig",
     "NVLinkTwoSidedAlltoAll",
     "NVLinkTwoSidedConfig",
-    "NcclEpCommunication",
     "NcclEpConfig",
     "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "NvepConfig",
@@ -439,9 +438,6 @@ if _set_build_flags and not available_backends():
 from . import backends as _backends  # noqa: E402,F401
 from .backends.split.comm.nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
 from .backends.split.comm.nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401
-from .backends.split.comm.nccl_ep.communication import (  # noqa: E402
-    NcclEpCommunication,
-)
 from .backends.split.comm.nvlink_one_sided.communication import (  # noqa: E402
     NVLinkOneSidedAlltoAll,
 )

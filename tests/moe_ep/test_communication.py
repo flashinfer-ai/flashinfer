@@ -8,8 +8,6 @@ test_moe_ep_communication_multirank.py.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -18,8 +16,6 @@ from flashinfer.moe_ep import (
     BootstrapConfig,
     CakeAlltoAll,
     CakeAlltoAllConfig,
-    CombineOutput,
-    DispatchOutput,
     EpAlgorithm,
     EpLayout,
     FleetParams,
@@ -31,7 +27,6 @@ from flashinfer.moe_ep import (
     MoEEpSplitLayer,
     MoEEpTensors,
     NCCLEPConfig,
-    NcclEpCommunication,
     NVLinkOneSidedAlltoAll,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedAlltoAll,
@@ -148,23 +143,19 @@ class TestCommParams:
 
 class TestRegistry:
     def test_builtin_backends_are_registered(self) -> None:
-        for name in (
-            "nccl_ep",
-            "nvlink_one_sided",
-            "cake",
-            "nvlink_two_sided",
-        ):
+        for name in ("nvlink_one_sided", "cake", "nvlink_two_sided"):
             assert is_communication_backend(name)
         assert is_communication_backend(NVLinkOneSidedConfig())
         assert is_communication_backend(CakeAlltoAllConfig())
+        # NCCL-EP and NIXL-EP are Fleet/Handle transports.
+        assert not is_communication_backend("nccl_ep")
         assert not is_communication_backend("nixl_ep")
         assert not is_communication_backend(object())
 
     def test_cuda_graph_capability(self) -> None:
         assert NVLinkOneSidedAlltoAll.supports_cuda_graph
+        assert CakeAlltoAll.supports_cuda_graph
         assert NVLinkTwoSidedAlltoAll.supports_cuda_graph
-        # Each NCCL-EP dispatch creates a handle on the host.
-        assert not NcclEpCommunication.supports_cuda_graph
 
     def test_create_by_name_and_by_config(self, loopback_backend) -> None:
         bootstrap = BootstrapConfig(world_size=1, rank=0)
@@ -291,119 +282,6 @@ class TestSplitLayerRouting:
         with pytest.raises(MoEEpConfigError, match="CUDA graph"):
             layer.create_graph_state(t)
         layer.destroy()
-
-
-class _StubFleetHandle:
-    def __init__(self, log, output):
-        self.log = log
-        self.output = output
-        self.destroyed = False
-
-    def dispatch(self, params):
-        self.log["dispatch_x"] = params.x
-        return self.output
-
-    def combine(self, params):
-        self.log["combine_x"] = params.x[0]
-        return CombineOutput(x=params.x[0].sum(dim=0))
-
-    def complete(self):
-        self.log["complete"] = True
-
-    def destroy(self):
-        self.destroyed = True
-
-
-@pytest.fixture
-def stub_nccl_fleet(monkeypatch):
-    from flashinfer.moe_ep.core.comm.fleet import _BACKEND_REGISTRY
-
-    log: dict = {}
-
-    class _StubFleet:
-        def __init__(self, bootstrap, params, algo_knobs):
-            log["fleet_params"] = params
-            self.destroyed = False
-
-        def create_handle(self, params, algo_knobs=()):
-            log["topk_ids"] = params.topk_ids
-            log["knobs"] = list(algo_knobs)
-            handle = _StubFleetHandle(log, log["dispatch_output"])
-            log["handle"] = handle
-            return handle
-
-        def destroy(self):
-            log["fleet_destroyed"] = True
-
-    monkeypatch.setitem(_BACKEND_REGISTRY, "nccl_ep", _StubFleet)
-    monkeypatch.setattr(
-        NcclEpCommunication, "is_platform_supported", classmethod(lambda cls: True)
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "current_stream",
-        lambda *a, **k: SimpleNamespace(cuda_stream=0),
-    )
-    return log
-
-
-def test_nccl_ep_communication_reports_global_ids(stub_nccl_fleet) -> None:
-    log = stub_nccl_fleet
-    # Rank 1 of 2 owns experts {2, 3}; each source rank sends up to 3 tokens.
-    comm = create_communication(
-        BootstrapConfig(world_size=2, rank=1), _params(), NCCLEPConfig()
-    )
-    assert comm.fleet_params.layout is EpLayout.RANK_MAJOR
-    assert comm.fleet_params.algorithm is EpAlgorithm.LOW_LATENCY
-
-    recv_idx = torch.tensor(
-        [[0, -1], [1, 0], [5, 5], [-1, 1], [7, 7], [7, 7]], dtype=torch.int32
-    )
-    log["dispatch_output"] = DispatchOutput(
-        expert_tensors=torch.ones(2, 3, 8),
-        num_tokens=6,
-        recv_topk_idx=recv_idx,
-        recv_topk_weights=torch.ones(6, 2),
-        expert_counts=torch.tensor([2, 1], dtype=torch.int32),
-    )
-    weights = torch.full((2, 2), 0.5)
-    result = comm.dispatch(torch.ones(2, 8), torch.tensor([[2, 0], [3, 1]]), weights)
-
-    assert result.tokens_per_rank == 3
-    assert result.hidden_states.shape == (6, 8)
-    assert result.topk_ids.tolist() == [
-        [2, -1],
-        [3, 2],
-        [-1, -1],  # past source rank 0's two tokens
-        [-1, 3],
-        [-1, -1],  # past source rank 1's single token
-        [-1, -1],
-    ]
-    assert any(getattr(k, "weights", None) is weights for k in log["knobs"])
-
-    with pytest.raises(RuntimeError, match="twice"):
-        comm.dispatch(torch.ones(2, 8), torch.zeros(2, 2), weights)
-
-    out = comm.combine(torch.ones(6, 8))
-    assert log["combine_x"].shape == (2, 3, 8)
-    assert out.shape == (3, 8)
-    assert log["complete"] and log["handle"].destroyed
-    with pytest.raises(RuntimeError, match="before dispatch"):
-        comm.combine(torch.ones(6, 8))
-
-    comm.destroy()
-    assert log["fleet_destroyed"]
-
-
-def test_nccl_ep_communication_rejects_unsupported_inputs(stub_nccl_fleet) -> None:
-    comm = create_communication(
-        BootstrapConfig(world_size=2, rank=0), _params(), NCCLEPConfig()
-    )
-    x, ids = torch.ones(2, 8), torch.zeros(2, 2, dtype=torch.int64)
-    with pytest.raises(ValueError, match="topk_weights"):
-        comm.dispatch(x, ids)
-    with pytest.raises(NotImplementedError, match="scale"):
-        comm.dispatch(x, ids, torch.ones(2, 2), hidden_states_scale=torch.ones(2, 1))
 
 
 class _FakeMoeAlltoAll:
