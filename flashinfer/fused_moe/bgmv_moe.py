@@ -16,7 +16,8 @@ limitations under the License.
 
 import functools
 import threading
-from typing import List, Literal, Optional, Tuple
+import warnings
+from typing import List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -214,8 +215,19 @@ def _cake_dtype_name(dtype: torch.dtype) -> Literal["bfloat16", "float16"]:
     raise ValueError(f"Cake BGMV MoE requires BF16 or FP16, got {dtype}")
 
 
-class BGMVMoECakePlan:
-    """Pointer-stable SM90/SM100/SM103 Cake BGMV MoE shrink+expand execution plan.
+BGMVMoEBackendUsed = Literal["cake", "portable"]
+
+_CAKE_SUPPORTED_HIDDEN_SIZES = (2688, 3072)
+_CAKE_SUPPORTED_RANK = 32
+_CAKE_UNSUPPORTED_DEVICE_MESSAGE = (
+    "Cake BGMV MoE requires an exact SM90, SM100 or SM103 CUDA device; "
+    "got capability={capability}"
+)
+_fallback_reasons_warned: set = set()
+
+
+class _BGMVMoEGraphPlan:
+    """Shared pointer-stable CUDA-Graph replay logic for prepared BGMV MoE plans.
 
     The plan owns caller-visible FP32 accumulation and shrink workspaces. Its
     first eager ``run`` captures the exact launch sequence into a CUDA Graph;
@@ -223,45 +235,22 @@ class BGMVMoECakePlan:
     CUDA Graph is being captured, the constituent kernels are enqueued directly.
     """
 
+    backend_used: BGMVMoEBackendUsed
+
     def __init__(
         self,
-        module,
         *,
         y_accum: torch.Tensor,
         shrink_out: torch.Tensor,
         x: torch.Tensor,
-        lora_a: torch.Tensor,
-        lora_b: torch.Tensor,
-        sorted_token_ids: torch.Tensor,
-        expert_ids: torch.Tensor,
-        lora_indices: torch.Tensor,
-        topk_weights: torch.Tensor,
-        schedule_id: int,
+        bound_tensors: Tuple[torch.Tensor, ...],
     ) -> None:
-        self._module = module
         self.y_accum = y_accum
         self.shrink_out = shrink_out
         self.x = x
-        self.lora_a = lora_a
-        self.lora_b = lora_b
-        self.sorted_token_ids = sorted_token_ids
-        self.expert_ids = expert_ids
-        self.lora_indices = lora_indices
-        self.topk_weights = topk_weights
-        self.schedule_id = schedule_id
+        self._bound_tensors = bound_tensors
         self._bound_signatures = tuple(
-            _cake_tensor_signature(tensor)
-            for tensor in (
-                y_accum,
-                shrink_out,
-                x,
-                lora_a,
-                lora_b,
-                sorted_token_ids,
-                expert_ids,
-                lora_indices,
-                topk_weights,
-            )
+            _cake_tensor_signature(tensor) for tensor in bound_tensors
         )
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._capture_stream: Optional[torch.cuda.Stream] = None
@@ -270,39 +259,16 @@ class BGMVMoECakePlan:
 
     def _validate_binding(self) -> None:
         current = tuple(
-            _cake_tensor_signature(tensor)
-            for tensor in (
-                self.y_accum,
-                self.shrink_out,
-                self.x,
-                self.lora_a,
-                self.lora_b,
-                self.sorted_token_ids,
-                self.expert_ids,
-                self.lora_indices,
-                self.topk_weights,
-            )
+            _cake_tensor_signature(tensor) for tensor in self._bound_tensors
         )
         if current != self._bound_signatures:
             raise RuntimeError(
-                "BGMVMoECakePlan tensor storage, shape, stride, dtype, or "
+                f"{type(self).__name__} tensor storage, shape, stride, dtype, or "
                 "device changed after preparation"
             )
 
-    def _launch(self) -> None:
-        self._module.run(
-            self.y_accum,
-            self.shrink_out,
-            self.x,
-            self.lora_a,
-            self.lora_b,
-            self.sorted_token_ids,
-            self.expert_ids,
-            self.lora_indices,
-            self.topk_weights,
-            self.schedule_id,
-            int(torch.cuda.current_stream(self.x.device).cuda_stream),
-        )
+    def _launch(self) -> None:  # pragma: no cover - implemented by subclasses
+        raise NotImplementedError
 
     def run(self) -> torch.Tensor:
         """Run or replay the prepared zero+shrink+expand pipeline."""
@@ -332,7 +298,7 @@ class BGMVMoECakePlan:
                 self._owner_stream = replay_stream
             elif replay_stream != self._owner_stream:
                 raise RuntimeError(
-                    "BGMVMoECakePlan must replay on its original CUDA stream"
+                    f"{type(self).__name__} must replay on its original CUDA stream"
                 )
             graph.replay()
         return self.y_accum
@@ -352,8 +318,219 @@ class BGMVMoECakePlan:
             self._owner_stream = None
 
 
+class BGMVMoECakePlan(_BGMVMoEGraphPlan):
+    """Pointer-stable SM90/SM100/SM103 Cake BGMV MoE shrink+expand execution plan.
+
+    Runs the generated Cake programs (one owner per output token, no output
+    atomics, bitwise-reproducible replays). ``backend_used`` is ``"cake"``.
+    """
+
+    backend_used: BGMVMoEBackendUsed = "cake"
+
+    def __init__(
+        self,
+        module,
+        *,
+        y_accum: torch.Tensor,
+        shrink_out: torch.Tensor,
+        x: torch.Tensor,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        lora_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        schedule_id: int,
+    ) -> None:
+        self._module = module
+        self.lora_a = lora_a
+        self.lora_b = lora_b
+        self.sorted_token_ids = sorted_token_ids
+        self.expert_ids = expert_ids
+        self.lora_indices = lora_indices
+        self.topk_weights = topk_weights
+        self.schedule_id: Optional[int] = schedule_id
+        super().__init__(
+            y_accum=y_accum,
+            shrink_out=shrink_out,
+            x=x,
+            bound_tensors=(
+                y_accum,
+                shrink_out,
+                x,
+                lora_a,
+                lora_b,
+                sorted_token_ids,
+                expert_ids,
+                lora_indices,
+                topk_weights,
+            ),
+        )
+
+    def _launch(self) -> None:
+        self._module.run(
+            self.y_accum,
+            self.shrink_out,
+            self.x,
+            self.lora_a,
+            self.lora_b,
+            self.sorted_token_ids,
+            self.expert_ids,
+            self.lora_indices,
+            self.topk_weights,
+            self.schedule_id,
+            int(torch.cuda.current_stream(self.x.device).cuda_stream),
+        )
+
+
+class BGMVMoEPortablePlan(_BGMVMoEGraphPlan):
+    """Prepared plan that runs the portable ``bgmv_moe_shrink`` + ``bgmv_moe_expand`` path.
+
+    Returned by :func:`prepare_bgmv_moe` when the inputs are outside the
+    generated Cake support set and ``fallback=True``. Same interface as
+    :class:`BGMVMoECakePlan` (``run`` zeroes the workspaces, runs shrink and
+    expand, and returns the FP32 accumulator; first eager call captures a CUDA
+    Graph). The portable expand accumulates with atomics, so replays are not
+    guaranteed bitwise identical. ``backend_used`` is ``"portable"`` and
+    ``schedule_id`` is ``None``.
+    """
+
+    backend_used: BGMVMoEBackendUsed = "portable"
+
+    def __init__(
+        self,
+        *,
+        y_accum: torch.Tensor,
+        shrink_out: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_weights: List[torch.Tensor],
+        lora_b_weights: List[torch.Tensor],
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        lora_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_experts: int,
+        fallback_reason: str,
+    ) -> None:
+        self.lora_a_weights = list(lora_a_weights)
+        self.lora_b_weights = list(lora_b_weights)
+        self.sorted_token_ids = sorted_token_ids
+        self.expert_ids = expert_ids
+        self.lora_indices = lora_indices
+        self.topk_weights = topk_weights
+        self.num_experts = int(num_experts)
+        self.schedule_id: Optional[int] = None
+        self.fallback_reason = fallback_reason
+        num_slices = len(self.lora_a_weights)
+        device = x.device
+        self._w_ptr_a = torch.zeros(
+            num_slices, self.num_experts, dtype=torch.int64, device=device
+        )
+        self._w_ptr_b = torch.zeros(
+            num_slices, self.num_experts, dtype=torch.int64, device=device
+        )
+        self._lora_stride_a = 0
+        self._lora_stride_b = 0
+        for slice_id in range(num_slices):
+            self._lora_stride_a = fill_w_ptr(
+                self._w_ptr_a, self.lora_a_weights[slice_id], self.num_experts, slice_id
+            )
+            self._lora_stride_b = fill_w_ptr(
+                self._w_ptr_b, self.lora_b_weights[slice_id], self.num_experts, slice_id
+            )
+        self._output_slices = [int(weight.shape[2]) for weight in self.lora_b_weights]
+        starts = [0]
+        for feat_out in self._output_slices[:-1]:
+            starts.append(starts[-1] + feat_out)
+        self._slice_start_loc = torch.tensor(starts, dtype=torch.int64, device=device)
+        super().__init__(
+            y_accum=y_accum,
+            shrink_out=shrink_out,
+            x=x,
+            bound_tensors=(
+                y_accum,
+                shrink_out,
+                x,
+                *self.lora_a_weights,
+                *self.lora_b_weights,
+                sorted_token_ids,
+                expert_ids,
+                lora_indices,
+                topk_weights,
+            ),
+        )
+
+    def _launch(self) -> None:
+        self.shrink_out.zero_()
+        self.y_accum.zero_()
+        bgmv_moe_shrink(
+            self.shrink_out,
+            self.x,
+            self._w_ptr_a,
+            self.sorted_token_ids,
+            self.expert_ids,
+            self.lora_indices,
+            self._lora_stride_a,
+        )
+        bgmv_moe_expand(
+            self.y_accum,
+            self.shrink_out,
+            self._w_ptr_b,
+            self.sorted_token_ids,
+            self.expert_ids,
+            self.topk_weights,
+            self.lora_indices,
+            self._slice_start_loc,
+            self._output_slices,
+            self._lora_stride_b,
+        )
+
+
 # Compatible alias for the name exported by the first release of this backend.
 BGMVMoEBlackwellPlan = BGMVMoECakePlan
+
+BGMVMoEPlan = Union[BGMVMoECakePlan, BGMVMoEPortablePlan]
+
+
+def _cake_unsupported_reason(
+    *,
+    capability: Optional[Tuple[int, int]],
+    arch: Optional[str],
+    num_slices: int,
+    hidden_size: int,
+    rank: int,
+    feat_outs: List[int],
+) -> Optional[str]:
+    """Return why the generated Cake programs cannot serve these inputs, or ``None``."""
+
+    if arch is None:
+        return _CAKE_UNSUPPORTED_DEVICE_MESSAGE.format(capability=capability)
+    if num_slices != 1:
+        return (
+            f"Cake BGMV MoE currently requires exactly one LoRA slice, got {num_slices}"
+        )
+    if hidden_size not in _CAKE_SUPPORTED_HIDDEN_SIZES:
+        return f"Cake BGMV MoE hidden_size must be 2688 or 3072, got {hidden_size}"
+    if rank != _CAKE_SUPPORTED_RANK:
+        return f"Cake BGMV MoE requires LoRA rank {_CAKE_SUPPORTED_RANK}, got {rank}"
+    if feat_outs != [hidden_size]:
+        return (
+            "Cake BGMV MoE requires LoRA-B feat_out == hidden_size, "
+            f"got feat_out={feat_outs[0]} for hidden_size={hidden_size}"
+        )
+    return None
+
+
+def _warn_fallback_once(reason: str) -> None:
+    if reason in _fallback_reasons_warned:
+        return
+    _fallback_reasons_warned.add(reason)
+    warnings.warn(
+        "prepare_bgmv_moe: falling back to the portable bgmv_moe_shrink/"
+        f"bgmv_moe_expand path ({reason}). Pass fallback=False to raise instead.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 @flashinfer_api
@@ -368,38 +545,52 @@ def prepare_bgmv_moe(
     num_experts: int,
     *,
     backend: Literal["cake", "blackwell"] = "cake",
+    fallback: bool = True,
     shrink_out: Optional[torch.Tensor] = None,
     y_accum: Optional[torch.Tensor] = None,
-) -> BGMVMoECakePlan:
-    """Prepare the generated Cake SM90/SM100/SM103 BGMV MoE pipeline for graph replay.
+) -> BGMVMoEPlan:
+    """Prepare a graph-replayable BGMV MoE shrink+expand pipeline.
 
-    This optimized path currently supports one LoRA slice, rank 32, hidden
+    The generated Cake path currently supports one LoRA slice, rank 32, hidden
     sizes 2688 or 3072, BF16/FP16 inputs, and exact SM90 (H100/H200), SM100
     (B200/GB200) or SM103 (B300/GB300) devices; each target runs its own
-    cubin. Routing may
-    be arbitrary; each output has one owner that accumulates routes in fixed
-    input order, so identical prepared replays are bitwise reproducible. The
-    contiguous top-k=2 layout takes the optimized fast path.
+    cubin. Routing may be arbitrary; each output has one owner that accumulates
+    routes in fixed input order, so identical prepared replays are bitwise
+    reproducible. The contiguous top-k=2 layout takes the optimized fast path.
+
+    Inputs outside that support set (other device capabilities, ranks, hidden
+    sizes, multiple slices) are served by a
+    :class:`BGMVMoEPortablePlan` running the portable ``bgmv_moe_shrink`` +
+    ``bgmv_moe_expand`` kernels when ``fallback=True`` (default); one
+    ``RuntimeWarning`` is emitted per distinct reason per process. With
+    ``fallback=False`` such inputs raise ``ValueError`` as before. Invalid
+    inputs (shape mismatches, wrong index dtypes, out-of-range routing indices,
+    non-contiguous or CPU tensors) always raise.
 
     Args:
         x: Input activations with shape ``[num_tokens, hidden_size]``.
-        lora_a_weights: One LoRA-A tensor with shape
-            ``[num_loras, num_experts, 32, hidden_size]``.
-        lora_b_weights: One LoRA-B tensor with shape
-            ``[num_loras, num_experts, hidden_size, 32]``.
+        lora_a_weights: LoRA-A tensors, one per slice, each with shape
+            ``[num_loras, num_experts, rank, hidden_size]``.
+        lora_b_weights: LoRA-B tensors, one per slice, each with shape
+            ``[num_loras, num_experts, feat_out, rank]``.
         sorted_token_ids: Routed token indices with shape ``[num_pairs]``.
         expert_ids: Expert index for each routed pair.
         lora_indices: LoRA index for each input token.
         topk_weights: FP32 routing weight for each routed pair.
-        num_experts: Number of experts in both LoRA tensors.
+        num_experts: Number of experts in the LoRA tensors.
         backend: Backend selector. ``"cake"`` selects the generated Cake
             programs; ``"blackwell"`` is accepted as a compatible alias.
-        shrink_out: Optional pointer-stable FP32 shrink workspace.
-        y_accum: Optional pointer-stable FP32 output accumulator.
+        fallback: Serve unsupported inputs with the portable path instead of
+            raising.
+        shrink_out: Optional pointer-stable shrink workspace with shape
+            ``[num_slices, num_pairs, rank]`` and the weight dtype.
+        y_accum: Optional pointer-stable FP32 output accumulator with shape
+            ``[num_tokens, sum(feat_out)]``.
 
     Returns:
         A reusable graph-backed execution plan whose ``run`` method returns
-        the FP32 accumulated output.
+        the FP32 accumulated output; ``plan.backend_used`` is ``"cake"`` or
+        ``"portable"``.
     """
 
     if backend not in ("cake", "blackwell"):
@@ -417,35 +608,58 @@ def prepare_bgmv_moe(
         if capability is not None
         else None
     )
-    if arch is None:
+    if capability is None:
+        # Neither the generated programs nor the portable kernels run off-GPU.
         raise ValueError(
-            "Cake BGMV MoE requires an exact SM90, SM100 or SM103 CUDA device; "
-            f"got capability={capability}"
+            _CAKE_UNSUPPORTED_DEVICE_MESSAGE.format(capability=capability)
+            + "; the portable fallback also requires CUDA tensors"
         )
-    if len(lora_a_weights) != 1 or len(lora_b_weights) != 1:
-        raise ValueError("Cake BGMV MoE currently requires exactly one LoRA slice")
+    num_slices = len(lora_a_weights)
+    if num_slices == 0 or len(lora_b_weights) != num_slices:
+        raise ValueError(
+            "lora_a_weights and lora_b_weights must be non-empty lists of equal length"
+        )
     if x.ndim != 2:
         raise ValueError(f"x must have shape [tokens, hidden], got {tuple(x.shape)}")
     num_tokens, hidden_size = (int(dim) for dim in x.shape)
-    dtype_name = _cake_dtype_name(x.dtype)
-    lora_a = lora_a_weights[0]
-    lora_b = lora_b_weights[0]
-    if lora_a.ndim != 4 or lora_b.ndim != 4:
-        raise ValueError("LoRA weights must have rank 4")
-    if int(lora_a.shape[0]) != int(lora_b.shape[0]):
-        raise ValueError("LoRA-A and LoRA-B must have the same num_loras dimension")
-    if int(lora_a.shape[1]) != num_experts or int(lora_b.shape[1]) != num_experts:
-        raise ValueError("num_experts must match both LoRA weight tensors")
-    if tuple(lora_a.shape[2:]) != (32, hidden_size):
+    weight_dtype = lora_a_weights[0].dtype
+    for lora_a, lora_b in zip(lora_a_weights, lora_b_weights, strict=True):
+        if lora_a.ndim != 4 or lora_b.ndim != 4:
+            raise ValueError("LoRA weights must have rank 4")
+        if lora_a.dtype != weight_dtype or lora_b.dtype != weight_dtype:
+            raise ValueError("all LoRA weight tensors must have the same dtype")
+    if weight_dtype not in (torch.bfloat16, torch.float16) or x.dtype != weight_dtype:
+        # Neither the generated programs nor the portable kernels accept other
+        # activation/weight dtype combinations.
         raise ValueError(
-            "LoRA-A must have shape [num_loras, num_experts, 32, hidden_size]"
+            "x and the LoRA weights must share one dtype, BF16 or FP16; "
+            f"got x={x.dtype}, weights={weight_dtype}"
         )
-    if tuple(lora_b.shape[2:]) != (hidden_size, 32):
+    num_loras = int(lora_a_weights[0].shape[0])
+    rank = int(lora_a_weights[0].shape[2])
+    feat_outs: List[int] = []
+    for lora_a, lora_b in zip(lora_a_weights, lora_b_weights, strict=True):
+        if int(lora_a.shape[0]) != num_loras or int(lora_b.shape[0]) != num_loras:
+            raise ValueError(
+                "all LoRA weight tensors must have the same num_loras dimension"
+            )
+        if int(lora_a.shape[1]) != num_experts or int(lora_b.shape[1]) != num_experts:
+            raise ValueError("num_experts must match all LoRA weight tensors")
+        if tuple(lora_a.shape[2:]) != (rank, hidden_size):
+            raise ValueError(
+                "LoRA-A must have shape [num_loras, num_experts, rank, hidden_size] "
+                f"with one rank for all slices, got {tuple(lora_a.shape)}"
+            )
+        if int(lora_b.shape[3]) != rank:
+            raise ValueError(
+                "LoRA-B must have shape [num_loras, num_experts, feat_out, rank], "
+                f"got {tuple(lora_b.shape)}"
+            )
+        feat_outs.append(int(lora_b.shape[2]))
+    if len(set(feat_outs)) != 1:
         raise ValueError(
-            "LoRA-B must have shape [num_loras, num_experts, hidden_size, 32]"
+            f"all LoRA-B slices must have the same feat_out, got {feat_outs}"
         )
-    if lora_a.dtype != x.dtype or lora_b.dtype != x.dtype:
-        raise ValueError("x and both LoRA weight tensors must have the same dtype")
     num_pairs = int(sorted_token_ids.numel())
     if sorted_token_ids.ndim != 1 or num_pairs <= 0:
         raise ValueError("sorted_token_ids must be a non-empty rank-1 tensor")
@@ -457,15 +671,17 @@ def prepare_bgmv_moe(
         raise ValueError("lora_indices must have shape [num_tokens]")
     if topk_weights.dtype != torch.float32:
         raise ValueError("topk_weights must have dtype torch.float32")
-    for name, tensor in (
+    named_tensors = [
         ("x", x),
-        ("lora_a", lora_a),
-        ("lora_b", lora_b),
         ("sorted_token_ids", sorted_token_ids),
         ("expert_ids", expert_ids),
         ("lora_indices", lora_indices),
         ("topk_weights", topk_weights),
-    ):
+    ]
+    for slice_id in range(num_slices):
+        named_tensors.append((f"lora_a_weights[{slice_id}]", lora_a_weights[slice_id]))
+        named_tensors.append((f"lora_b_weights[{slice_id}]", lora_b_weights[slice_id]))
+    for name, tensor in named_tensors:
         if not tensor.is_cuda or tensor.device != x.device:
             raise ValueError(f"{name} must be on {x.device}")
         if not tensor.is_contiguous():
@@ -479,18 +695,28 @@ def prepare_bgmv_moe(
             raise ValueError(f"{name} must have dtype torch.int64")
     if bool(((expert_ids < 0) | (expert_ids >= num_experts)).any()):
         raise ValueError("expert_ids values must be in [0, num_experts)")
-    num_loras = int(lora_a.shape[0])
     if bool(((lora_indices < -1) | (lora_indices >= num_loras)).any()):
         raise ValueError("lora_indices values must be -1 or in [0, num_loras)")
 
-    expected_shrink = (1, num_pairs, 32)
+    reason = _cake_unsupported_reason(
+        capability=capability,
+        arch=arch,
+        num_slices=num_slices,
+        hidden_size=hidden_size,
+        rank=rank,
+        feat_outs=feat_outs,
+    )
+    if reason is not None and not fallback:
+        raise ValueError(reason)
+
+    expected_shrink = (num_slices, num_pairs, rank)
     if shrink_out is None:
-        shrink_out = torch.empty(expected_shrink, dtype=x.dtype, device=x.device)
-    if tuple(shrink_out.shape) != expected_shrink or shrink_out.dtype != x.dtype:
+        shrink_out = torch.empty(expected_shrink, dtype=weight_dtype, device=x.device)
+    if tuple(shrink_out.shape) != expected_shrink or shrink_out.dtype != weight_dtype:
         raise ValueError(
-            f"shrink_out must have shape {expected_shrink} and dtype {x.dtype}"
+            f"shrink_out must have shape {expected_shrink} and dtype {weight_dtype}"
         )
-    expected_output = (num_tokens, hidden_size)
+    expected_output = (num_tokens, sum(feat_outs))
     if y_accum is None:
         y_accum = torch.empty(expected_output, dtype=torch.float32, device=x.device)
     if tuple(y_accum.shape) != expected_output or y_accum.dtype != torch.float32:
@@ -505,12 +731,30 @@ def prepare_bgmv_moe(
         ):
             raise ValueError(f"{name} must be a contiguous tensor on {x.device}")
 
+    if reason is not None:
+        _warn_fallback_once(reason)
+        return BGMVMoEPortablePlan(
+            y_accum=y_accum,
+            shrink_out=shrink_out,
+            x=x,
+            lora_a_weights=lora_a_weights,
+            lora_b_weights=lora_b_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            lora_indices=lora_indices,
+            topk_weights=topk_weights,
+            num_experts=num_experts,
+            fallback_reason=reason,
+        )
+
     from ..jit.cake_bgmv_moe import (
         CAKE_BGMV_MOE_SCHEDULE_IDS,
         get_cake_bgmv_moe_module,
         select_cake_bgmv_moe_schedule,
     )
 
+    assert arch is not None
+    dtype_name = _cake_dtype_name(x.dtype)
     schedule = select_cake_bgmv_moe_schedule(hidden_size, num_tokens, arch)
     module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
     return BGMVMoECakePlan(
@@ -518,8 +762,8 @@ def prepare_bgmv_moe(
         y_accum=y_accum,
         shrink_out=shrink_out,
         x=x,
-        lora_a=lora_a,
-        lora_b=lora_b,
+        lora_a=lora_a_weights[0],
+        lora_b=lora_b_weights[0],
         sorted_token_ids=sorted_token_ids,
         expert_ids=expert_ids,
         lora_indices=lora_indices,

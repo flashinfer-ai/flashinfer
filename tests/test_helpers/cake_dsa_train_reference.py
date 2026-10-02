@@ -331,6 +331,42 @@ def reference_fp64(
     return result
 
 
+def globalize_gather_indices_loop(
+    gather_kv_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Plain-Python reference of the varlen index rule (host tensors; loop-sized problems).
+
+    Row ``t`` of document ``d`` (``cu_seqlens_q[d] <= t < cu_seqlens_q[d + 1]``) is the query at key
+    position ``(seqlen_k[d] - seqlen_q[d]) + (t - cu_seqlens_q[d])`` of its document: the query segment
+    is the tail of its key prefix.  Slot ``idx`` is valid when ``0 <= idx < seqlen_k[d]`` and, with
+    ``causal``, ``idx <= that position``; valid slots become ``idx + cu_seqlens_k[d]``, the others ``-1``.
+    A zero-length query segment contributes no rows.
+    """
+    local = gather_kv_indices.cpu().tolist()
+    cu_q = [int(v) for v in cu_seqlens_q.cpu().tolist()]
+    cu_k = [int(v) for v in cu_seqlens_k.cpu().tolist()]
+    rows = []
+    for d in range(len(cu_q) - 1):
+        seqlen_q, seqlen_k = cu_q[d + 1] - cu_q[d], cu_k[d + 1] - cu_k[d]
+        for i in range(seqlen_q):
+            position = (seqlen_k - seqlen_q) + i
+            rows.append(
+                [
+                    idx + cu_k[d]
+                    if 0 <= idx < seqlen_k and (not causal or idx <= position)
+                    else -1
+                    for idx in local[cu_q[d] + i]
+                ]
+            )
+    return torch.tensor(rows, dtype=torch.int32).reshape(
+        len(rows), int(gather_kv_indices.shape[1])
+    )
+
+
 def rel_l2(a: torch.Tensor, ref: torch.Tensor) -> float:
     a = a.double().reshape(-1)
     ref = ref.double().reshape(-1)

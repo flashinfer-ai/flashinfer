@@ -20,12 +20,6 @@
 #include <cuda_runtime.h>
 
 #include <cuda/pipeline>
-
-// Get the current CUDA stream. In TVM-FFI context, the stream is set by the
-// framework before kernel dispatch. We use the default stream (0) which maps
-// to the current stream in per-thread default stream mode.
-#define BGMV_MOE_GET_STREAM() 0
-
 #include <flashinfer/vec_dtypes.cuh>
 
 #include "kernel_config.h"
@@ -391,10 +385,8 @@ void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
                             W_T** __restrict__ w_ptr, const int64_t* sorted_token_ids,
                             const int64_t* expert_ids, const int64_t* lora_indices,
                             int64_t num_pairs, int64_t num_slices, int64_t num_experts,
-                            int64_t num_tokens, int64_t lora_stride, float scale) {
-  // Use the current CUDA stream
-  const cudaStream_t stream = BGMV_MOE_GET_STREAM();
-
+                            int64_t num_tokens, int64_t lora_stride, float scale,
+                            cudaStream_t stream) {
   constexpr int cfg_tx = MoeShrinkKernelConfig::tx;
   constexpr int cfg_ty = MoeShrinkKernelConfig::ty;
   constexpr int RT = MoeShrinkKernelConfig::rank_tile;
@@ -566,9 +558,7 @@ void moe_bgmv_expand_sliced(float* __restrict__ Y, const in_T* __restrict__ X,
                             const float* topk_weights, const int64_t* slice_start_loc,
                             int64_t num_pairs, int64_t num_slices, int64_t num_experts,
                             int64_t total_feat_out, int32_t current_feat_out, int64_t num_tokens,
-                            int64_t lora_stride, float scale) {
-  const cudaStream_t stream = BGMV_MOE_GET_STREAM();  // current CUDA stream
-
+                            int64_t lora_stride, float scale, cudaStream_t stream) {
   // Optimized path: coalesced 128-bit (uint4 = 8xbf16) W loads. Requires feat_in % 8 == 0 (all
   // compiled ranks 8/16/32/64). Faster across shapes and token counts except feat_in == 64 at
   // small batch (num_pairs < 256), where its shuffle-reduction overhead is not amortized; that
@@ -624,19 +614,21 @@ void moe_bgmv_expand_sliced(float* __restrict__ Y, const in_T* __restrict__ X,
 #define INST_MOE_BGMV_SHRINK_SLICED(feat_in, feat_out, in_T, out_T, W_T)                   \
   template void moe_bgmv_shrink_sliced<feat_in, feat_out, in_T, out_T, W_T, false>(        \
       out_T*, const in_T*, W_T**, const int64_t*, const int64_t*, const int64_t*, int64_t, \
-      int64_t, int64_t, int64_t, int64_t, float);                                          \
+      int64_t, int64_t, int64_t, int64_t, float, cudaStream_t);                            \
   template void moe_bgmv_shrink_sliced<feat_in, feat_out, in_T, out_T, W_T, true>(         \
       out_T*, const in_T*, W_T**, const int64_t*, const int64_t*, const int64_t*, int64_t, \
-      int64_t, int64_t, int64_t, int64_t, float);
+      int64_t, int64_t, int64_t, int64_t, float, cudaStream_t);
 
 // Instantiate both FINALIZE values.
 #define INST_MOE_BGMV_EXPAND_SLICED(feat_in, feat_out, in_T, W_T)                               \
   template void moe_bgmv_expand_sliced<feat_in, feat_out, in_T, W_T, true>(                     \
       float*, const in_T*, W_T**, const int64_t*, const int64_t*, const int64_t*, const float*, \
-      const int64_t*, int64_t, int64_t, int64_t, int64_t, int32_t, int64_t, int64_t, float);    \
+      const int64_t*, int64_t, int64_t, int64_t, int64_t, int32_t, int64_t, int64_t, float,     \
+      cudaStream_t);                                                                            \
   template void moe_bgmv_expand_sliced<feat_in, feat_out, in_T, W_T, false>(                    \
       float*, const in_T*, W_T**, const int64_t*, const int64_t*, const int64_t*, const float*, \
-      const int64_t*, int64_t, int64_t, int64_t, int64_t, int32_t, int64_t, int64_t, float);
+      const int64_t*, int64_t, int64_t, int64_t, int64_t, int32_t, int64_t, int64_t, float,     \
+      cudaStream_t);
 
 #define INST_MOE_BGMV_TWOSIDE(in_T, out_T, W_T, narrow, wide) \
   INST_MOE_BGMV_SHRINK_SLICED(wide, narrow, in_T, out_T, W_T) \

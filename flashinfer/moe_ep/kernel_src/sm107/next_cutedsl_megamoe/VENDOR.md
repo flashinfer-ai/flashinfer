@@ -49,7 +49,7 @@ export manifest/log and file hashes with the integration evidence.
 ## Scope of this drop
 
 The generic inference entry point is `RubinInferenceMegaMoE`
-(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's existing NVFP4 and MXFP8 E4M3/E5M2
+(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's NVFP4, MXFP8 E4M3/E5M2, and MXFP4-weight/MXFP8-activation
 backends expose SwiGLU and SiTU with BF16 combine/output, supporting separate
 and in-kernel reduction. They accept canonical prequantized weights; NVFP4
 also supports non-unit normalization and per-expert correction tensors.
@@ -118,3 +118,4 @@ drop comes from upstream's `next/` generation, with relative imports and the
 
 - `backends/mega/kernel/sm107/nvfp4_nvfp4_bf16_cutedsl/`
 - `backends/mega/kernel/sm107/mxfp8_mxfp8_bf16_cutedsl/`
+- `backends/mega/kernel/sm107/mxfp8_mxfp4_bf16_cutedsl/`
