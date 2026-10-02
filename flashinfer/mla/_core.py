@@ -2339,7 +2339,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             sinks=sinks,
             kv_layout=kv_layout,
             kv_cache_format=kv_cache_format,
-            backend=backend,
+            backend="cake" if cake_sm120 else "sparse",
         )
 
     if backend != "cake":

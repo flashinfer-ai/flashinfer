@@ -659,7 +659,7 @@ def functional_run(
         max_splits=16,
         head_tiles=None,
     )
-    requirements = []
+    requirements: list[tuple[tuple[int, ...], torch.dtype]] = []
     if splits > 1:
         requirements.append(((num_tokens, num_heads, splits, _D_V), torch.bfloat16))
         requirements.append(((num_tokens, num_heads, splits), torch.float32))
