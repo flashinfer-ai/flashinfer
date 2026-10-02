@@ -96,11 +96,13 @@ def _ensure_torch_dist(bootstrap: BootstrapConfig) -> bool:
         device = torch.device(f"cuda:{_resolve_local_device(bootstrap)}")
         dist.init_process_group(backend="nccl", device_id=device)
     elif bootstrap.world_size == 1:
+        master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        master_port = os.environ.get("MASTER_PORT", "29500")
         dist.init_process_group(
             backend="gloo",
             rank=bootstrap.rank,
             world_size=bootstrap.world_size,
-            init_method="tcp://127.0.0.1:29500",
+            init_method=f"tcp://{master_addr}:{master_port}",
         )
     else:
         raise RuntimeError(

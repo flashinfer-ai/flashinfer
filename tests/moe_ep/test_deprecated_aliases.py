@@ -51,6 +51,12 @@ ALIAS_ROWS = [
         "Sm90PushFp8MegaMoeConfig",
         "Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig",
     ),
+    (
+        "sm90_push_bf16",
+        "sm90_bf16_bf16_bf16_push_cuda",
+        "Sm90PushBf16MegaMoeConfig",
+        "Sm90_Bf16_Bf16_Bf16_PushCuda_MegaMoeConfig",
+    ),
 ]
 
 IDS = [row[0] for row in ALIAS_ROWS]

@@ -8,6 +8,7 @@
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
+#   bash tests/moe_ep/run_tests.sh sm90_push_bf16 # Hopper push BF16
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_ht     # 4-GPU HT (FLAT) split-path numerics
@@ -114,6 +115,9 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
+    --ignore=tests/moe_ep/test_sm90_push_bf16_backend.py \
+    --ignore=tests/moe_ep/test_sm90_push_bf16_gemm.py \
+    --ignore=tests/moe_ep/test_sm90_push_bf16_persistent_gemm.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
@@ -293,6 +297,36 @@ run_sm90_push() {
     tests/moe_ep/test_sm90_push_fp8_backend.py -v
 }
 
+run_sm90_push_bf16() {
+  local rc=0
+  local archived_tests=()
+
+  for path in \
+    tests/moe_ep/test_sm90_push_bf16_fc1_fused.py \
+    tests/moe_ep/test_sm90_push_bf16_persistent_gemm_contract.py \
+    tests/moe_ep/test_sm90_push_bf16_persistent_gemm.py; do
+    if [[ -f "${path}" ]]; then
+      archived_tests+=("${path}")
+    fi
+  done
+
+  "${PY}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    "${archived_tests[@]}" \
+    tests/moe_ep/test_sm90_push_bf16_gemm.py \
+    tests/moe_ep/test_sm90_push_bf16_grouped_combine.py \
+    tests/moe_ep/test_sm90_push_bf16_tactics_selection.py \
+    tests/moe_ep/test_sm90_push_bf16_backend_cpu.py \
+    tests/moe_ep/test_sm90_push_bf16_backend.py -v || rc=1
+
+  "${TORCHRUN}" --nproc_per_node="${NPROC_SM90_PUSH}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_push_bf16_grouped_combine.py \
+    tests/moe_ep/test_sm90_push_bf16_backend.py -v || rc=1
+
+  return "${rc}"
+}
+
 # Fault tolerance. Split into a pytest half (a STALLED rank -- every process
 # survives, so it runs under torchrun -m pytest) and a smoke half (a rank that
 # really dies). The smoke half cannot be a pytest test: torchrun reports the
@@ -393,11 +427,12 @@ case "${1:-all}" in
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   mega_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90; print_summary ;;
   sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
+  sm90_push_bf16) run_section "SM90 push BF16" run_sm90_push_bf16; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|sm90_push_bf16|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

@@ -104,6 +104,7 @@ classDiagram
     MegaKernelBackend <|-- DeepGemmMegaKernelBackend
     MegaKernelBackend <|-- Nvfp4CutedslMegaKernelBackend
     MegaKernelBackend <|-- Mxfp8CutedslMegaKernelBackend
+    MegaKernelBackend <|-- Sm90PushBf16MegaKernelBackend
 ```
 
 ## Built-in plugins
@@ -117,6 +118,7 @@ classDiagram
 | Mega kernel | `sm100_fp8_fp4_bf16_deepgemm` | `Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `sm100_nvfp4_nvfp4_bf16_cutedsl` | `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `sm100_mxfp8_mxfp8_bf16_cutedsl` | `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
+| Mega kernel | `sm90_bf16_bf16_bf16_push_cuda` | `Sm90_Bf16_Bf16_Bf16_PushCuda_MegaMoeConfig` — BF16 push A2A + grouped CUTLASS GEMM, sm_90 |
 
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
@@ -130,6 +132,13 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 |-------------|---------|
 | `torch_dist` | split comm, all mega kernels |
 | `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
+
+The SM90 push BF16 backend uses BF16 dispatch and combine wires. Its production
+GEMM tactic is a dual M64/M128 cluster 1x1 ping-pong plan. The internal tuning
+selector uses expected expert-M thresholds 64 and 128 to choose M64, M128, or
+dual-family variants, with cluster 1x1 ping-pong for M128. The `grouped_combine`
+and two-wave schedules remain explicit opt-in tactics. The persistent-offset
+GEMM and fused WMMA FC1 engines require `SM90_PUSH_BF16_ENABLE_ARCHIVED=1`.
 
 **Host framework bootstrap (e.g. vLLM):** when the host already initialized `torch.distributed` and EP uses a subgroup, pass `BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank, auto_bootstrap=False)` and call `bootstrap_moe_ep_runtime(bootstrap, reqs)` once per worker after dist init. Mega kernels resolve comm via `bootstrap_comm_group` / `bootstrap_ep_rank_world` (`MegaKernelBackend.bind_ep_bootstrap`).
 

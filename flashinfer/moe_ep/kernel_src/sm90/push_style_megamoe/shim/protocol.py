@@ -38,14 +38,14 @@ __all__ = [
 
 
 class Sm90PushPayload(Enum):
-    """Dispatch payload dtype: FP8 quantizes 1x128 at the source; BF16 is the debug anchor."""
+    """Dispatch payload dtype for source-to-expert traffic."""
 
     FP8 = "fp8"
     BF16 = "bf16"
 
 
 class Sm90PushCombine(Enum):
-    """Combine partial dtype: FP8 halves combine ingress; BF16 is the debug anchor."""
+    """Combine partial dtype for expert-to-source traffic."""
 
     FP8 = "fp8"
     BF16 = "bf16"
@@ -62,6 +62,17 @@ class Sm90PushConfig:
     dedup_dispatch: bool = False
     grouped_combine: bool = False
     fuse_fc1_epilogue: bool = False
+
+
+def _validate_fusion_contract(config: Sm90PushConfig) -> None:
+    if (
+        config.payload_dtype is Sm90PushPayload.FP8
+        and config.fuse_fc1_epilogue
+        and not config.fuse_act
+    ):
+        raise ValueError(
+            "FP8 fuse_fc1_epilogue=True requires the fused activation path"
+        )
 
 
 # Window views carry C++ deleters that must not run during interpreter
@@ -88,9 +99,17 @@ def _drain_live_pipes() -> None:
 atexit.register(_drain_live_pipes)
 
 
+@contextlib.contextmanager
 def _record_stage(name: str, enabled: bool):
-    """Host-side stage range (a few us/round when enabled) for profiling."""
-    return torch.profiler.record_function(name) if enabled else contextlib.nullcontext()
+    """Record an enabled stage for PyTorch and NVTX profilers."""
+    if not enabled:
+        yield
+        return
+    with (
+        torch.profiler.record_function(name),
+        torch.cuda.nvtx.range(f"sm90_push::{name}"),
+    ):
+        yield
 
 
 def _align(x: int, a: int = 128) -> int:
@@ -197,12 +216,11 @@ class Sm90PushPipe:
     ):
         if config is None:
             config = Sm90PushConfig()
-        if comm_backend is None:
-            if ep_size < 1 or ep_size > 32:
-                raise ValueError(f"ep_size must be in [1, 32], got {ep_size}")
-            comm = _default_comm_backend(ep_size)
-        else:
-            comm = comm_backend
+        if ep_size < 1 or ep_size > 32:
+            raise ValueError(f"ep_size must be in [1, 32], got {ep_size}")
+        comm = (
+            comm_backend if comm_backend is not None else _default_comm_backend(ep_size)
+        )
         comm_size, comm_rank = comm.Get_size(), comm.Get_rank()
 
         def _validate_arguments():
@@ -240,12 +258,7 @@ class Sm90PushPipe:
                 raise ValueError(
                     f"capacity_factor must be in (0, 1], got {config.capacity_factor}"
                 )
-            if config.grouped_combine and config.combine_dtype != Sm90PushCombine.FP8:
-                raise ValueError(
-                    "grouped_combine requires combine_dtype=Sm90PushCombine.FP8"
-                )
-            if config.fuse_fc1_epilogue and not config.fuse_act:
-                raise ValueError("fuse_fc1_epilogue=True requires fuse_act=True")
+            _validate_fusion_contract(config)
             return None
 
         argument_fingerprint = (
@@ -332,7 +345,7 @@ class Sm90PushPipe:
         cslots = self.combine_slots
         self.combine_offset = off
         off = _align(
-            off + (0 if fp8_combine else token_capacity * top_k * hidden_size * 2)
+            off + (0 if fp8_combine else token_capacity * cslots * hidden_size * 2)
         )
         self.cfp8_offset = off
         off = _align(
@@ -469,9 +482,9 @@ class Sm90PushPipe:
             if not fp8_combine:
                 self.combine_t = view(
                     self.combine_offset,
-                    token_capacity * top_k * hidden_size * 2,
+                    token_capacity * cslots * hidden_size * 2,
                     torch.bfloat16,
-                ).reshape(token_capacity, top_k, hidden_size)
+                ).reshape(token_capacity, cslots, hidden_size)
             else:
                 self.csc_t = view(
                     self.csc_offset, token_capacity * cslots * nkb * 4, torch.float32
@@ -497,7 +510,7 @@ class Sm90PushPipe:
             )
             self._rows_per_src = torch.empty(eps, dtype=torch.int32, device=dv)
             self._cdone_local = torch.empty(eps, dtype=torch.int32, device=dv)
-            if fp8_combine and config.grouped_combine:
+            if config.grouped_combine:
                 self._grp_cnt = torch.empty(
                     eps * token_capacity, dtype=torch.int32, device=dv
                 )
@@ -675,6 +688,33 @@ class Sm90PushPipe:
             self._next_row,
         )
 
+    def proto_compact_bf16_padded(
+        self,
+        a_bf16: torch.Tensor,
+        meta: torch.Tensor,
+        real_to_padded: torch.Tensor,
+        padded_offsets: torch.Tensor,
+        tile_prefix: torch.Tensor,
+        padded_m: torch.Tensor,
+        token_tile_n: int,
+    ) -> None:
+        self.module.sm90_push_compact_bf16_padded(
+            a_bf16,
+            meta,
+            real_to_padded,
+            padded_offsets,
+            tile_prefix,
+            padded_m,
+            token_tile_n,
+            *self._layout_args(),
+            self._offsets,
+            self._seg_src_base,
+            self._seg_out_base,
+            self._m_dev,
+            self._next_row,
+            self._round,
+        )
+
     def proto_silu_mul_quant(
         self,
         h: torch.Tensor,
@@ -713,6 +753,13 @@ class Sm90PushPipe:
                 self._round,
             )
             return
+        if (
+            self.config.combine_dtype == Sm90PushCombine.BF16
+            and self.config.grouped_combine
+        ):
+            raise RuntimeError(
+                "grouped BF16 combine requires the mapped grouped interface"
+            )
         fn = (
             self.module.sm90_push_combine_fp8
             if self.config.combine_dtype == Sm90PushCombine.FP8
@@ -724,6 +771,48 @@ class Sm90PushPipe:
             *self._layout_args(),
             self._m_dev,
             self._rows_per_src,
+            self._cdone_local,
+            self._round,
+        )
+
+    def proto_combine_mapped(
+        self, y: torch.Tensor, meta: torch.Tensor, row_map: torch.Tensor
+    ) -> None:
+        if self.config.combine_dtype != Sm90PushCombine.BF16:
+            raise RuntimeError("mapped combine supports only BF16 wire output")
+        if self.config.grouped_combine:
+            raise RuntimeError(
+                "grouped BF16 combine requires proto_combine_bf16_grouped_mapped"
+            )
+        self.module.sm90_push_combine_mapped(
+            y,
+            meta,
+            row_map,
+            *self._layout_args(),
+            self._m_dev,
+            self._rows_per_src,
+            self._cdone_local,
+            self._round,
+        )
+
+    def proto_combine_bf16_grouped_mapped(
+        self, y: torch.Tensor, meta: torch.Tensor, row_map: torch.Tensor
+    ) -> None:
+        if self.config.combine_dtype != Sm90PushCombine.BF16:
+            raise RuntimeError("grouped BF16 combine requires BF16 wire output")
+        if not self.config.grouped_combine:
+            raise RuntimeError("grouped BF16 combine requires grouped_combine=True")
+        self.module.sm90_push_combine_bf16_grouped_mapped(
+            y,
+            meta,
+            row_map,
+            *self._layout_args(),
+            self._m_dev,
+            self._grp_cnt,
+            self._grp_rows,
+            self._grp_list,
+            self._n_groups,
+            self._groups_per_src,
             self._cdone_local,
             self._round,
         )
@@ -740,8 +829,24 @@ class Sm90PushPipe:
                 else self.module.sm90_combine_reduce_fp8
             )
         else:
-            fn = self.module.sm90_combine_reduce
+            fn = (
+                self.module.sm90_combine_reduce_bf16_grouped
+                if self.config.grouped_combine
+                else self.module.sm90_combine_reduce
+            )
         fn(output, *self._layout_args(), num_tokens)
+        return output
+
+    def proto_reduce_bf16_grouped(
+        self, output: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        if self.config.combine_dtype != Sm90PushCombine.BF16:
+            raise RuntimeError("grouped BF16 reduce requires BF16 wire output")
+        if not self.config.grouped_combine:
+            raise RuntimeError("grouped BF16 reduce requires grouped_combine=True")
+        self.module.sm90_combine_reduce_bf16_grouped(
+            output, *self._layout_args(), num_tokens
+        )
         return output
 
     def proto_ack(self) -> None:

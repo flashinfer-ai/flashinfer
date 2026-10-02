@@ -58,17 +58,7 @@ class Sm90PushMoERunner:
     ):
         """Full forward executor; weights via Sm90PushWeights bundle or raw tensors."""
         E, H = pipe.E, pipe.H
-        self.pipe = pipe
-        self._state = _RunnerState.IDLE
-        self._staged_tokens: int | None = None
-        self._staged_stream: torch.cuda.Stream | None = None
-        self._staged_stream_capturing = False
-        self._caller_ready_event: torch.cuda.Event | None = None
-        self._round_event: torch.cuda.Event | None = None
-        self._round_stream_id: int | None = None
-        self._bound_weights: Sm90PushWeights | None = None
-        self._validated_weights: dict[int, weakref.ReferenceType[Sm90PushWeights]] = {}
-        self.record_stages = False  # per-stage profiler ranges (see _record_stage)
+        self._init_round_state(pipe)
 
         # weights are per-rank state: form AND content checks run guarded
         def _local_init():
@@ -174,6 +164,19 @@ class Sm90PushMoERunner:
             pipe._comm, getattr(pipe, "rank", 0), "weights+gemm-resources", _local_init
         )
         self._prepare_gemm_jit_collective()
+
+    def _init_round_state(self, pipe: Sm90PushPipe) -> None:
+        self.pipe = pipe
+        self._state = _RunnerState.IDLE
+        self._staged_tokens: int | None = None
+        self._staged_stream: torch.cuda.Stream | None = None
+        self._staged_stream_capturing = False
+        self._caller_ready_event: torch.cuda.Event | None = None
+        self._round_event: torch.cuda.Event | None = None
+        self._round_stream_id: int | None = None
+        self._bound_weights = None
+        self._validated_weights: dict[int, weakref.ReferenceType[Sm90PushWeights]] = {}
+        self.record_stages = False  # per-stage profiler ranges
 
     def _init_gemm_resources(self) -> None:
         """Local (collective-free) resource construction; see __init__."""
@@ -456,6 +459,87 @@ class Sm90PushMoERunner:
         self.w2_sf = weights.w2_sf
         self._bound_weights = weights
 
+    def _round_compact(self) -> None:
+        self.pipe.proto_compact(self.a1, self.sfa1, self.meta, self.row_expert)
+
+    def _round_fc1(self) -> None:
+        pipe = self.pipe
+        if pipe.config.fuse_fc1_epilogue:
+            try:
+                self.runner.moe_gemm_fc1_fused(
+                    self.a2,
+                    self.sfa2,
+                    self.a1.view(torch.float8_e4m3fn),
+                    self.w13_fp8,
+                    pipe._offsets,
+                    2 * self.I,
+                    pipe.H,
+                    self.sfa1,
+                    self.w13_sf,
+                    True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    self._FC1_FUSED_FAIL_HELP + f" Underlying error: {exc}"
+                ) from exc
+            return
+        self.runner.moe_gemm(
+            self.h,
+            self.a1.view(torch.float8_e4m3fn),
+            self.w13_fp8,
+            pipe._offsets,
+            2 * self.I,
+            pipe.H,
+            self.sfa1,
+            self.w13_sf,
+            True,
+        )
+
+    def _round_activation(self) -> None:
+        pipe = self.pipe
+        if pipe.config.fuse_fc1_epilogue:
+            return
+        if pipe.config.fuse_act:
+            pipe.proto_silu_mul_quant(self.h, self.a2, self.sfa2, self.row_expert)
+            return
+        g = self._g_buf()
+        pipe.module.sm90_silu_mul_gated(g, self.h, pipe._m_dev, g.shape[0])
+        pipe.module.sm90_quant_grouped(
+            self.a2,
+            self.sfa2,
+            g,
+            pipe._offsets,
+            pipe._pad_base,
+            pipe._m_dev,
+            pipe._p_dev,
+            self.row_expert,
+            g.shape[0],
+        )
+
+    def _round_activation_stage(self) -> str | None:
+        return None if self.pipe.config.fuse_fc1_epilogue else "act_quant"
+
+    def _round_fc2(self) -> None:
+        pipe = self.pipe
+        self.runner.moe_gemm(
+            self.y,
+            self.a2.view(torch.float8_e4m3fn),
+            self.w2_fp8,
+            pipe._offsets,
+            pipe.H,
+            self.I,
+            self.sfa2,
+            self.w2_sf,
+            True,
+        )
+
+    def _round_combine(self) -> None:
+        self.pipe.proto_combine(self.y, self.meta)
+
+    def _release_resources(self) -> None:
+        self._workspace = None
+        self.runner = None
+
     @property
     def state(self) -> str:
         return self._state.value
@@ -606,74 +690,17 @@ class Sm90PushMoERunner:
                 with _record_stage("wait_prefix", nv):
                     pipe.proto_wait_prefix()
                 with _record_stage("compact", nv):
-                    pipe.proto_compact(self.a1, self.sfa1, self.meta, self.row_expert)
+                    self._round_compact()
                 with _record_stage("fc1", nv):
-                    if pipe.config.fuse_fc1_epilogue:
-                        try:
-                            self.runner.moe_gemm_fc1_fused(
-                                self.a2,
-                                self.sfa2,
-                                self.a1.view(torch.float8_e4m3fn),
-                                self.w13_fp8,
-                                pipe._offsets,
-                                2 * self.I,
-                                pipe.H,
-                                self.sfa1,
-                                self.w13_sf,
-                                True,
-                            )
-                        except Exception as exc:
-                            raise RuntimeError(
-                                self._FC1_FUSED_FAIL_HELP + f" Underlying error: {exc}"
-                            ) from exc
-                    else:
-                        self.runner.moe_gemm(
-                            self.h,
-                            self.a1.view(torch.float8_e4m3fn),
-                            self.w13_fp8,
-                            pipe._offsets,
-                            2 * self.I,
-                            pipe.H,
-                            self.sfa1,
-                            self.w13_sf,
-                            True,
-                        )
-                if not pipe.config.fuse_fc1_epilogue:
-                    with _record_stage("act_quant", nv):
-                        if pipe.config.fuse_act:
-                            pipe.proto_silu_mul_quant(
-                                self.h, self.a2, self.sfa2, self.row_expert
-                            )
-                        else:
-                            g = self._g_buf()
-                            pipe.module.sm90_silu_mul_gated(
-                                g, self.h, pipe._m_dev, g.shape[0]
-                            )
-                            pipe.module.sm90_quant_grouped(
-                                self.a2,
-                                self.sfa2,
-                                g,
-                                pipe._offsets,
-                                pipe._pad_base,
-                                pipe._m_dev,
-                                pipe._p_dev,
-                                self.row_expert,
-                                g.shape[0],
-                            )
+                    self._round_fc1()
+                activation_stage = self._round_activation_stage()
+                if activation_stage is not None:
+                    with _record_stage(activation_stage, nv):
+                        self._round_activation()
                 with _record_stage("fc2", nv):
-                    self.runner.moe_gemm(
-                        self.y,
-                        self.a2.view(torch.float8_e4m3fn),
-                        self.w2_fp8,
-                        pipe._offsets,
-                        pipe.H,
-                        self.I,
-                        self.sfa2,
-                        self.w2_sf,
-                        True,
-                    )
+                    self._round_fc2()
                 with _record_stage("combine", nv):
-                    pipe.proto_combine(self.y, self.meta)
+                    self._round_combine()
                 with _record_stage("wait_combine", nv):
                     pipe.proto_wait_combine()
                 with _record_stage("reduce", nv):
@@ -732,7 +759,6 @@ class Sm90PushMoERunner:
         self._round_event = None
         self._bound_weights = None
         self._validated_weights.clear()
-        self._workspace = None
-        self.runner = None
+        self._release_resources()
 
     __call__ = forward

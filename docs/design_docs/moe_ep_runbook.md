@@ -101,6 +101,7 @@ band, that is a real signal, not marginality.
 | `bash tests/moe_ep/run_tests.sh multirank` | 4 | NCCL-EP (NIXL-EP too if built) |
 | `bash tests/moe_ep/run_tests.sh split_path_correctness_bf16` | 4 | Blackwell |
 | `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + NVFP4 + MXFP8 |
+| `bash tests/moe_ep/run_tests.sh sm90_push_bf16` | 1 or `NPROC_SM90_PUSH` | Hopper sm_90; CUDA 12.0+ and peer-accessible GPUs for multirank |
 
 - **unit** — host-only pytest (mocks + single-GPU). The full run accumulates
   native heap damage somewhere in the GPU/DSL/transport stack: with every
@@ -121,6 +122,8 @@ band, that is a real signal, not marginality.
   single-process `MoELayer` reference.
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity, plus a single-rank
   MXFP8 preprocess-vs-reference check.
+- **sm90_push_bf16** — direct grouped-GEMM oracles, protocol contracts,
+  single-GPU graph replay, and multirank push/combine correctness.
 
 `all` and `smoke` targets also exist. Split-path numerics are **bf16-only** for
 now.

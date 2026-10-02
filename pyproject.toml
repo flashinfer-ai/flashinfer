@@ -87,6 +87,12 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "*.md",
   "src/a2a/*.cu",
   "src/a2a/*.cuh",
+  "src/bf16_fc1_fused/*.cu",
+  "src/bf16_fc1_fused/*.cuh",
+  "src/bf16_gemm/*.cu",
+  "src/bf16_gemm/*.cuh",
+  "src/bf16_persistent_gemm/*.cu",
+  "src/bf16_persistent_gemm/*.cuh",
   "src/fp8_gemm/*.cu",
   "src/fp8_gemm/*.cuh",
 ]
