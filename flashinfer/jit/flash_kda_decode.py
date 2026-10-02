@@ -28,14 +28,8 @@ from .core import JitSpec, logger
 from .utils import write_if_different
 
 FlashKDADecodeVariant = Literal[
-    "d128_t1_precomputed_split1",
-    "d128_t1_precomputed_split2",
-    "d128_t1_precomputed_split4",
-    "d128_t1_precomputed_split8",
     "d128_t1_precomputed_direct_split16",
     "d128_t1_precomputed_direct_split8",
-    "d128_t2_precomputed_split1",
-    "d128_t2_precomputed_split2",
     "d128_t2_precomputed_split4",
     "d128_t2_precomputed_split8",
     "d128_t3_lower_bound_split4",
@@ -70,14 +64,8 @@ _FLASH_KDA_DECODE_TARGET_KIND = {
     "sm103a": 1003,
 }
 FLASH_KDA_DECODE_VARIANTS: tuple[FlashKDADecodeVariant, ...] = (
-    "d128_t1_precomputed_split1",
-    "d128_t1_precomputed_split2",
-    "d128_t1_precomputed_split4",
-    "d128_t1_precomputed_split8",
     "d128_t1_precomputed_direct_split16",
     "d128_t1_precomputed_direct_split8",
-    "d128_t2_precomputed_split1",
-    "d128_t2_precomputed_split2",
     "d128_t2_precomputed_split4",
     "d128_t2_precomputed_split8",
     "d128_t3_lower_bound_split4",
@@ -117,7 +105,7 @@ def _variant_metadata(
     coefficient_gram: bool = False,
     direct_impl: bool = False,
 ) -> FlashKDADecodeVariantMetadata:
-    """Derive the exact launch geometry used by the frozen Loom schedule."""
+    """Derive the exact launch geometry used by the frozen Cake schedule."""
 
     head_dim = 128
     value_rows = head_dim // value_split
@@ -138,14 +126,8 @@ def _variant_metadata(
 FLASH_KDA_DECODE_VARIANT_METADATA: dict[
     FlashKDADecodeVariant, FlashKDADecodeVariantMetadata
 ] = {
-    "d128_t1_precomputed_split1": _variant_metadata(1, 0, 1),
-    "d128_t1_precomputed_split2": _variant_metadata(1, 0, 2),
-    "d128_t1_precomputed_split4": _variant_metadata(1, 0, 4),
-    "d128_t1_precomputed_split8": _variant_metadata(1, 0, 8),
     "d128_t1_precomputed_direct_split16": _variant_metadata(1, 0, 16, direct_impl=True),
     "d128_t1_precomputed_direct_split8": _variant_metadata(1, 0, 8, direct_impl=True),
-    "d128_t2_precomputed_split1": _variant_metadata(2, 0, 1),
-    "d128_t2_precomputed_split2": _variant_metadata(2, 0, 2),
     "d128_t2_precomputed_split4": _variant_metadata(2, 0, 4),
     "d128_t2_precomputed_split8": _variant_metadata(2, 0, 8),
     "d128_t3_lower_bound_split4": _variant_metadata(3, 1, 4),

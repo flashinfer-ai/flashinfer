@@ -27,22 +27,6 @@ from flashinfer.jit import flash_kda_decode
 # The normalization removes only identity-derived temporary suffixes; all
 # schedule-relevant source text remains covered by the stable digest.
 FROZEN_GENERATED_BODY_SHA256 = {
-    "d128_t1_precomputed_split1": (
-        "c50a65997603f729d1558bfd9e14ce8d3415add9dc32aab2f958ab414307a3b4",
-        "a12ff529c81d7dc375e31bf57137d348b1eb39a93a6206d6aacc99515dae26f4",
-    ),
-    "d128_t1_precomputed_split2": (
-        "227b3b95337bb231798e7b5c2509a2d117a7337a6a6279010be6b71d3c8e0fb1",
-        "f0c24746584b0f6a19b5aefa977b71852cb920c9d1a626c73616dbb458ebd13e",
-    ),
-    "d128_t1_precomputed_split4": (
-        "30ff1318b9a7bc9904202e7bed93234378b6a7f231fa67ec00a39d2ae5e98f72",
-        "f7eba8a6b9ac933d7b54bcd333400fd640b90a54bf7dcb12c308f588a6533d6b",
-    ),
-    "d128_t1_precomputed_split8": (
-        "7b613b50ac99df6cc55bb349deb8dc01adf0f49b049636775a486a41df2a77ae",
-        "a38718a0b4383d2f2d2c3ec7eb1746be44e649265b805a3dbcebdd20415612d3",
-    ),
     "d128_t1_precomputed_direct_split16": (
         "9119163b3b5cb6a8760b6a17a7ce01788a0e1c0078f8c812255225f27e5989e5",
         "9119163b3b5cb6a8760b6a17a7ce01788a0e1c0078f8c812255225f27e5989e5",
@@ -50,14 +34,6 @@ FROZEN_GENERATED_BODY_SHA256 = {
     "d128_t1_precomputed_direct_split8": (
         "116612419179c171252cbdfa11b2e531a2c2a12ddf5b8eecb2874ecd2dea396f",
         "116612419179c171252cbdfa11b2e531a2c2a12ddf5b8eecb2874ecd2dea396f",
-    ),
-    "d128_t2_precomputed_split1": (
-        "4eaf6b81491db3bd7969ddd8f41797bd7d5e472c591b4ed6a9a8fd7172eb6047",
-        "ab378468d5b81e203e09405adc49004f30a0e178ec29986f40e31583de1dd291",
-    ),
-    "d128_t2_precomputed_split2": (
-        "3d08321d288f816d21bfffc93bf25b7df4631b9f500799a4a7036a226c4250b2",
-        "54eadc2257ca591d7af94d8176f6562a564b4e72bc90e959a18b85a7a1af597a",
     ),
     "d128_t2_precomputed_split4": (
         "e0cf2ece1b50e851579df8822fa2f03262a3399e25643a6bd3df03c875cc5ea2",
@@ -329,14 +305,8 @@ def test_flash_kda_decode_binding_contract():
 
 def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
     expected_variants = (
-        "d128_t1_precomputed_split1",
-        "d128_t1_precomputed_split2",
-        "d128_t1_precomputed_split4",
-        "d128_t1_precomputed_split8",
         "d128_t1_precomputed_direct_split16",
         "d128_t1_precomputed_direct_split8",
-        "d128_t2_precomputed_split1",
-        "d128_t2_precomputed_split2",
         "d128_t2_precomputed_split4",
         "d128_t2_precomputed_split8",
         "d128_t3_lower_bound_split4",
@@ -363,14 +333,8 @@ def test_flash_kda_decode_variant_validation_and_getter(monkeypatch):
             flash_kda_decode.FLASH_KDA_DECODE_VARIANT_METADATA.items()
         )
     } == {
-        "d128_t1_precomputed_split1": 256,
-        "d128_t1_precomputed_split2": 128,
-        "d128_t1_precomputed_split4": 64,
-        "d128_t1_precomputed_split8": 32,
         "d128_t1_precomputed_direct_split16": 32,
         "d128_t1_precomputed_direct_split8": 32,
-        "d128_t2_precomputed_split1": 256,
-        "d128_t2_precomputed_split2": 128,
         "d128_t2_precomputed_split4": 64,
         "d128_t2_precomputed_split8": 64,
         "d128_t3_lower_bound_split4": 96,
