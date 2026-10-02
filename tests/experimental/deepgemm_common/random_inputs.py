@@ -16,11 +16,25 @@ Conventions (as consumed by the generated programs):
 - UE8M0 scale words: one byte per 32-element K block, four consecutive K
   blocks per ``int32`` word (little-endian, the earliest block in the lowest
   byte), words indexed ``[K // 128, rows]`` i.e. K-major with the row in the
-  trailing dimension. Byte ``0x7F`` is the scale ``2**0``.
+  trailing dimension. Byte ``0x7F`` is the scale ``2**0``. ``random_fp4_operand``
+  draws one exponent per 128-K-element word (not per 32-element sub-block) and
+  replicates it across the word's four bytes: the kernel's TMA descriptor,
+  tensor-shape contract and the K/128-word axis are all confirmed from the
+  generated binding/catalog, but nothing in this read-only tree pins down
+  which of the four bytes a given 32-element sub-block occupies, so a
+  per-sub-block-random exponent would silently depend on an unverified
+  byte-order guess. Rows/words still vary independently per element pair.
 - FP8 E4M3 with float32 per-block scales: one scale per 128 K elements
   (``[rows, K // 128]``, the activation side) or one per 128x128 tile
   (``[rows // 128, K // 128]``, the weight side), as the batched projection
-  family uses.
+  family uses. ``BatchedGemmPlan._pack_scales`` (deepgemm_batched_gemm) builds
+  its packed UE8M0 word by right-shifting the input FP32 scale's bit pattern
+  by 23 and masking to 8 bits -- i.e. it keeps only the IEEE-754 exponent and
+  silently drops the mantissa. The scale must therefore already be an exact
+  power of two going in, or the host-packed word and the float32 scale this
+  helper dequantizes with stop agreeing. ``random_fp8_blockwise`` and
+  ``random_fp8_block2d`` round their per-block amax up to the next power of
+  two for this reason.
 - FP8 E4M3 with UE8M0 scale words at granularity ``gran_k`` (32 or 128 K
   elements per byte), as the mixed FP8xFP4 family uses.
 """
@@ -115,6 +129,22 @@ def _ue8m0_scale(exponents: torch.Tensor) -> torch.Tensor:
     return torch.exp2(exponents.to(torch.float32) - 127.0)
 
 
+def _pow2_ceil_scale(amax: torch.Tensor, finfo_max: float) -> torch.Tensor:
+    """Smallest power-of-two scale with ``amax / scale <= finfo_max``.
+
+    ``BatchedGemmPlan._pack_scales`` reads only the exponent bits of the FP32
+    scale it is given (``(bits >> 23) & 255``); any mantissa is discarded
+    rather than rejected. An arbitrary ``amax / finfo_max`` scale therefore
+    gets silently truncated by the kernel's host-side packer while this
+    helper's dequantized reference keeps the untruncated value, which is
+    exactly the kind of near-100%-mismatch divergence a tolerance cannot
+    paper over. Rounding the scale up to a power of two before quantizing
+    keeps the packed word and the dequantized reference in agreement.
+    """
+    raw_scale = (amax / finfo_max).clamp(min=torch.finfo(torch.float32).tiny)
+    return torch.exp2(torch.ceil(torch.log2(raw_scale)))
+
+
 def random_fp4_operand(
     rows: int,
     k: int,
@@ -134,7 +164,10 @@ def random_fp4_operand(
     values = _e2m1_round(raw)
     packed = e2m1_pack(values)
     lo, hi = exponent_range
-    exponents = torch.randint(lo, hi, (k // 32, rows), generator=generator, device=device)
+    # One exponent per 128-K-element word, replicated across its four bytes
+    # (see the module docstring: the intra-word byte order is unverified).
+    word_exponents = torch.randint(lo, hi, (k // 128, rows), generator=generator, device=device)
+    exponents = word_exponents.repeat_interleave(4, dim=0)
     words = ue8m0_pack_words(exponents)
     scale = _ue8m0_scale(exponents).T.repeat_interleave(32, dim=1)  # [rows, k]
     return packed, words, values * scale
@@ -158,7 +191,7 @@ def random_fp8_blockwise(
     finfo = torch.finfo(torch.float8_e4m3fn)
     blocks = raw.reshape(rows, k // block, block)
     amax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    scales = (amax / finfo.max).to(torch.float32)
+    scales = _pow2_ceil_scale(amax, finfo.max)
     quantized = (blocks / scales).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
     fp8 = quantized.reshape(rows, k)
     dequantized = (quantized.to(torch.float32) * scales).reshape(rows, k)
@@ -185,7 +218,7 @@ def random_fp8_block2d(
     finfo = torch.finfo(torch.float8_e4m3fn)
     tiles = raw.reshape(rows // block_rows, block_rows, k // block_k, block_k)
     amax = tiles.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
-    scales = (amax / finfo.max).to(torch.float32)
+    scales = _pow2_ceil_scale(amax, finfo.max)
     quantized = (tiles / scales).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
     fp8 = quantized.reshape(rows, k)
     dequantized = (quantized.to(torch.float32) * scales).reshape(rows, k)
