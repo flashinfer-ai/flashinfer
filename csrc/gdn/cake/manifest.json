@@ -2836,11 +2836,7 @@
         "--use_fast_math"
       ],
       "cuda_symbol": "kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
-      "defines": {
-        "HEAD_GROUP_LOG2": "0",
-        "IS_GQA": "1",
-        "NUM_O_HEADS_LOG2": "5"
-      },
+      "defines": {},
       "domain": "prefill",
       "dynamic_smem_bytes": 226048,
       "host_binding": {
@@ -2855,7 +2851,7 @@
             "sm_100a",
             "sm_103a"
           ],
-          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io.cu"
+          "path": "cuda/cake_gdn_prefill_dvsplit_initial_f16io_f481beb70ea9.cu"
         }
       ],
       "source_schedule": "flashinfer.cake_gdn.generated.prefill:flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io",
