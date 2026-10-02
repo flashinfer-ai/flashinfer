@@ -407,6 +407,8 @@ _KERNEL_DECLARATION = re.compile(
 _OCCUPANCY_TEMPLATE = """\
 // Occupancy query for the generated cluster kernel {symbol}; rendered by
 // cake_jit.py from the kernel declaration of the generated binding.
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "tvm_ffi_utils.h"
