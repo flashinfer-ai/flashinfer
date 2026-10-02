@@ -31,7 +31,9 @@ allocation. Changing tensor addresses or layouts requires a new plan.
 Operand values may change in place between runs. Do not concurrently reuse one
 plan's output or workspace.
 
-Generated CUDA and bindings live in `csrc/experimental/deepgemm_mixed_gemm/generated/<arch>`.
+Generated CUDA and bindings live in `csrc/experimental/deepgemm_mixed_gemm/generated`;
+each program is one source compiled for SM100a and SM103a (architecture-specific
+lowering sits under exact `__CUDA_ARCH__` guards).
 The runtime and catalog are in this directory. The public API is
 `flashinfer/fp8_fp4_gemm.py`; see `examples/experimental/fp8_fp4_gemm.py`.
 Build/install FlashInfer with its supported CUDA toolchain before running:

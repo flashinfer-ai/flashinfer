@@ -79,14 +79,20 @@ def _nvcc_flags(arch):
     return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
 
 
-@functools.cache
-def load_program(arch, name):
+def jit_spec(arch, name):
+    """JIT spec of one shared program compiled with ``arch``'s exact flags.
+
+    Every program is one source for both architectures; the architecture is
+    part of the spec name so two architectures never share a cached library.
+    """
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
 
-    record = _catalog()["arches"][arch]["programs"][name]
-    spec = gen_jit_spec(
-        name=name,
+    record = _catalog()["programs"][name]
+    if arch not in record["arches"]:
+        raise RuntimeError(f"program {name} is not exported for {arch}")
+    return gen_jit_spec(
+        name=f"{name}_{arch}",
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
         ],
@@ -99,7 +105,13 @@ def load_program(arch, name):
         extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
         use_fast_math=False,
     )
+
+
+@functools.cache
+def load_program(arch, name):
+    spec = jit_spec(arch, name)
     module = spec.build_and_load()
+    record = _catalog()["programs"][name]
     return module, {**record, "library_path": str(spec.get_library_path())}
 
 
