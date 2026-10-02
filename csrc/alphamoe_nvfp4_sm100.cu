@@ -39,13 +39,13 @@ static_assert(sizeof(uint64_t) == 8, "CUDA host ABI requires 64-bit uint64_t");
 
 #include <math_constants.h>
 
-struct __align__(64) LoomTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(LoomTensorMap64) == 128, "Tensor-map copy must retain all descriptor bytes");
-static_assert(alignof(LoomTensorMap64) == 64, "Kernel tensor-map argument alignment must remain 64 bytes");
-static_assert(sizeof(LoomTensorMap64) == sizeof(CUtensorMap), "CUDA tensor-map copy size must match");
+struct __align__(64) AlphamoeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(AlphamoeTensorMap64) == 128, "Tensor-map copy must retain all descriptor bytes");
+static_assert(alignof(AlphamoeTensorMap64) == 64, "Kernel tensor-map argument alignment must remain 64 bytes");
+static_assert(sizeof(AlphamoeTensorMap64) == sizeof(CUtensorMap), "CUDA tensor-map copy size must match");
 
-inline LoomTensorMap64 CopyTensorMap64(const CUtensorMap& descriptor) {
-  LoomTensorMap64 result{};
+inline AlphamoeTensorMap64 CopyTensorMap64(const CUtensorMap& descriptor) {
+  AlphamoeTensorMap64 result{};
   std::memcpy(&result, &descriptor, sizeof(result));
   return result;
 }
@@ -127,7 +127,6 @@ static float* SeedWorkspacePtr(const tvm::ffi::Optional<TensorView>& initial_out
 namespace nvfp4_first_w2_down_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_nvfp4_first_w2_down_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -848,7 +847,6 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace(const __grid_constant__ CUt
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -884,7 +882,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_n32_sequential_up_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_n32_sequential_up_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 112
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 64
@@ -1752,7 +1749,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -1799,7 +1795,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_prepared_g8_up_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_prepared_g8_up_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 80
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 32
@@ -2467,7 +2462,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -2505,7 +2499,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_prepared_g8_down_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_prepared_g8_down_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 128
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 64
@@ -3074,7 +3067,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, co
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -3118,7 +3110,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_g8_word_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_word_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 80
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 32
@@ -3828,7 +3819,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -3866,7 +3856,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_g8_word_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_word_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 128
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 64
@@ -4669,7 +4658,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -4710,7 +4698,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_g8_byte_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_g8_byte_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 80
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 32
@@ -5468,7 +5455,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -5506,7 +5492,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_g8_byte_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_g8_byte_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 128
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 64
@@ -6146,7 +6131,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -6187,7 +6171,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_decode_up2_word_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_word_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -6807,7 +6790,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -6845,7 +6827,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_decode_up2_byte_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_up2_byte_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -7513,7 +7494,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -7551,7 +7531,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_word_g2_word_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_word_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 80
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 32
@@ -8277,7 +8256,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -8315,7 +8293,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_word_g2_word_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_word_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 128
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 64
@@ -9118,7 +9095,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -9159,7 +9135,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_word_g2_byte_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_word_g2_byte_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 80
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 32
@@ -9922,7 +9897,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -9960,7 +9934,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_word_g2_byte_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_word_g2_byte_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 128
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 64
@@ -10600,7 +10573,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -10643,7 +10615,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_split_k4_scale_word_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_split_k4_workspace kernel_alpha_moe_nvfp4_up_split_k4_workspace_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -11122,7 +11093,6 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -11156,7 +11126,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_split_k4_scale_word_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -11875,7 +11844,6 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace(const __grid_constant__ CUt
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -11910,7 +11878,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_split_k4_scale_byte_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_split_k4_workspace kernel_alpha_moe_nvfp4_up_split_k4_workspace_byte
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -12437,7 +12404,6 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -12471,7 +12437,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_split_k4_scale_byte_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace_byte
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -13076,7 +13041,6 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_workspace(const __grid_constant__ CUt
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -13115,7 +13079,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_scale_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_down kernel_alpha_moe_nvfp4_up_down_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 160
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_DOWN_ACC_OFFSET 32
@@ -13170,7 +13133,7 @@ using namespace alphamoe_nvfp4_device;
 extern "C" {
 
 __global__ __launch_bounds__(192, 1) void
-kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ LoomTensorMap64 x, const __grid_constant__ LoomTensorMap64 W1, uint8_t* __restrict__ x_scale, uint8_t* __restrict__ w1_scale, const __grid_constant__ LoomTensorMap64 W2, uint8_t* __restrict__ w2_scale, float* __restrict__ output1_scale_gate_scalar, float* __restrict__ output1_scale_scalar, float* __restrict__ output2_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, float* __restrict__ topk_weights, float* __restrict__ out, int M, int K, int top_k, int route_block_m, float scaling_factor)
+kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ AlphamoeTensorMap64 x, const __grid_constant__ AlphamoeTensorMap64 W1, uint8_t* __restrict__ x_scale, uint8_t* __restrict__ w1_scale, const __grid_constant__ AlphamoeTensorMap64 W2, uint8_t* __restrict__ w2_scale, float* __restrict__ output1_scale_gate_scalar, float* __restrict__ output1_scale_scalar, float* __restrict__ output2_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, float* __restrict__ topk_weights, float* __restrict__ out, int M, int K, int top_k, int route_block_m, float scaling_factor)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -14250,7 +14213,6 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ LoomTensorMap64 x, const 
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_DOWN_ACC_OFFSET
@@ -14310,7 +14272,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_scale_byte {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_down kernel_alpha_moe_nvfp4_up_down_byte
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 160
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_DOWN_ACC_OFFSET 32
@@ -14365,7 +14326,7 @@ using namespace alphamoe_nvfp4_device;
 extern "C" {
 
 __global__ __launch_bounds__(192, 1) void
-kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ LoomTensorMap64 x, const __grid_constant__ LoomTensorMap64 W1, uint8_t* __restrict__ x_scale, uint8_t* __restrict__ w1_scale, const __grid_constant__ LoomTensorMap64 W2, uint8_t* __restrict__ w2_scale, float* __restrict__ output1_scale_gate_scalar, float* __restrict__ output1_scale_scalar, float* __restrict__ output2_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, float* __restrict__ topk_weights, float* __restrict__ out, int M, int K, int top_k, int route_block_m, float scaling_factor)
+kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ AlphamoeTensorMap64 x, const __grid_constant__ AlphamoeTensorMap64 W1, uint8_t* __restrict__ x_scale, uint8_t* __restrict__ w1_scale, const __grid_constant__ AlphamoeTensorMap64 W2, uint8_t* __restrict__ w2_scale, float* __restrict__ output1_scale_gate_scalar, float* __restrict__ output1_scale_scalar, float* __restrict__ output2_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, float* __restrict__ topk_weights, float* __restrict__ out, int M, int K, int top_k, int route_block_m, float scaling_factor)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -15379,7 +15340,6 @@ kernel_alpha_moe_nvfp4_up_down(const __grid_constant__ LoomTensorMap64 x, const 
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_DOWN_ACC_OFFSET
@@ -15449,7 +15409,6 @@ static_assert(nvfp4_scale_word::kGeneratedSmemTotal == nvfp4_scale_byte::kGenera
 namespace nvfp4_split_scale_word_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_split_k2_workspace kernel_alpha_moe_nvfp4_up_split_k2_workspace_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -15928,7 +15887,6 @@ kernel_alpha_moe_nvfp4_up_split_k2_workspace(const __grid_constant__ CUtensorMap
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -15963,7 +15921,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_split_scale_word_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -16678,7 +16635,6 @@ kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace(const __grid_constant__ CUt
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -16714,7 +16670,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_split_scale_byte_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_split_k2_workspace kernel_alpha_moe_nvfp4_up_split_k2_workspace_byte
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -17241,7 +17196,6 @@ kernel_alpha_moe_nvfp4_up_split_k2_workspace(const __grid_constant__ CUtensorMap
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -17276,7 +17230,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_split_scale_byte_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace_byte
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -17877,7 +17830,6 @@ kernel_alpha_moe_nvfp4_down_split_k2_merge_workspace(const __grid_constant__ CUt
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -17913,7 +17865,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_fallback_scale_word_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -18535,7 +18486,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -18573,7 +18523,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_fallback_scale_word_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -19119,7 +19068,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -19152,7 +19100,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_fallback_scale_byte_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_byte
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -19822,7 +19769,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -19860,7 +19806,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_fallback_scale_byte_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_byte
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -20292,7 +20237,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -20890,9 +20834,9 @@ inline void LaunchFusedBatch(const TensorView& hidden_states, const TensorView& 
                    const TensorView& num_tokens_post_padded, const TensorView& topk_weights,
                    const TensorView& accumulator, const ProblemDims& dims,
                    float routed_scaling_factor, cudaStream_t stream) {
-  const LoomTensorMap64 hidden_states_map = CopyTensorMap64(EncodeHiddenStatesTma(hidden_states));
-  const LoomTensorMap64 gemm1_map = CopyTensorMap64(EncodeGemm1WeightsTma(gemm1_weights));
-  const LoomTensorMap64 gemm2_map = CopyTensorMap64(EncodeGemm2WeightsTma(gemm2_weights));
+  const AlphamoeTensorMap64 hidden_states_map = CopyTensorMap64(EncodeHiddenStatesTma(hidden_states));
+  const AlphamoeTensorMap64 gemm1_map = CopyTensorMap64(EncodeGemm1WeightsTma(gemm1_weights));
+  const AlphamoeTensorMap64 gemm2_map = CopyTensorMap64(EncodeGemm2WeightsTma(gemm2_weights));
 
   const dim3 grid(static_cast<unsigned int>(dims.num_route_blocks * (dims.block_m / kRouteSubtile)),
                   static_cast<unsigned int>(dims.n / kRowsPerIntermediateBlock), 1);
@@ -21825,7 +21769,6 @@ inline void LaunchBatchPreparedG8(const TensorView& hidden_states, const TensorV
 namespace nvfp4_small_route_alignment_seed {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_small_route_alignment_seed kernel_alpha_moe_small_route_alignment_seed_public
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 4096
@@ -22024,7 +21967,6 @@ kernel_alpha_moe_small_route_alignment_seed(int* __restrict__ topk_ids, int* __r
 
 constexpr int kAlignmentThreads = THREADS;
 constexpr int kAlignmentSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
@@ -22140,7 +22082,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_align_and_seed_output_op,
 namespace nvfp4_route_alignment_seed {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_route_alignment_seed kernel_alpha_moe_route_alignment_seed_public
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 4096
@@ -22333,7 +22274,6 @@ kernel_alpha_moe_route_alignment_seed(int* __restrict__ topk_ids, int* __restric
 
 constexpr int kAlignmentThreads = THREADS;
 constexpr int kAlignmentSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
@@ -22444,7 +22384,6 @@ void AlignAndSeedOutputGeneral(TensorView topk_ids, int64_t num_experts, int64_t
 namespace nvfp4_decode_rank5_w1_data_up_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_decode_rank5_w1_data_up_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -23094,7 +23033,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -23133,7 +23071,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_decode_first_w2_down_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_decode_first_w2_down_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -23737,7 +23674,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -23770,7 +23706,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_rank5_gate_up_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_rank5_gate_up_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 80
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 32
@@ -24622,7 +24557,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -24660,7 +24594,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_compact_owner_up_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_batch_compact_owner_up_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 112
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 64
@@ -25433,7 +25366,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -25477,7 +25409,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_batch_first_w2_down_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_batch_first_w2_down_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 128
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 64
@@ -26285,7 +26216,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -26333,7 +26263,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 4096
@@ -26583,7 +26512,6 @@ kernel_alpha_moe_route_alignment_seed(int* __restrict__ topk_ids, int* __restric
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
@@ -27461,7 +27389,6 @@ __global__ void moe_align_block_size_kernel(
 namespace nvfp4_qualified_c208_up_byte {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_split_k4_workspace kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_byte
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -27988,7 +27915,6 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 121088;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -28023,7 +27949,6 @@ constexpr int kGeneratedSmemTotal = 121088;
 namespace nvfp4_qualified_c208_up_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_split_k4_workspace kernel_alpha_moe_nvfp4_up_split_k4_workspace_nvfp4_qualified_c208_up_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -28508,7 +28433,6 @@ kernel_alpha_moe_nvfp4_up_split_k4_workspace(const __grid_constant__ CUtensorMap
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 121088;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -28550,7 +28474,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 4096
@@ -28800,7 +28723,6 @@ kernel_alpha_moe_route_alignment_seed(int* __restrict__ topk_ids, int* __restric
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 12416;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
@@ -28831,7 +28753,6 @@ constexpr int kGeneratedSmemTotal = 12416;
 namespace nvfp4_qualified_c248_down_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c248_down_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -29385,7 +29306,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 34304;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -29425,7 +29345,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -29473,7 +29392,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16(float* __restrict__ route_accumulator
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16
@@ -29482,7 +29400,6 @@ constexpr int kGeneratedSmemTotal = 0;
 namespace nvfp4_qualified_c248_up_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c248_up_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -30104,7 +30021,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 121088;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -30142,7 +30058,6 @@ constexpr int kGeneratedSmemTotal = 121088;
 namespace nvfp4_qualified_c266_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c266_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 72
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 24
@@ -30843,7 +30758,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 38912;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -30882,7 +30796,6 @@ constexpr int kGeneratedSmemTotal = 38912;
 namespace nvfp4_qualified_c271_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c271_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 112
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 64
@@ -31697,7 +31610,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 216064;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -31741,7 +31653,6 @@ constexpr int kGeneratedSmemTotal = 216064;
 namespace nvfp4_qualified_c272_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c272_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 72
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 24
@@ -32454,7 +32365,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 38912;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -32493,7 +32403,6 @@ constexpr int kGeneratedSmemTotal = 38912;
 namespace nvfp4_qualified_c275_down_byte {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_byte
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -33108,7 +33017,6 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace(const __grid_constant
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 34560;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -33144,7 +33052,6 @@ constexpr int kGeneratedSmemTotal = 34560;
 namespace nvfp4_qualified_c275_down_word {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace_nvfp4_qualified_c275_down_word
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 40
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -33879,7 +33786,6 @@ kernel_alpha_moe_nvfp4_down_split_k4_merge_route_workspace(const __grid_constant
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 34560;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -33922,7 +33828,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 4096
@@ -34129,7 +34034,6 @@ kernel_alpha_moe_small_route_alignment_seed_init(int* __restrict__ topk_ids, int
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 12672;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
@@ -34157,7 +34061,6 @@ constexpr int kGeneratedSmemTotal = 12672;
 namespace nvfp4_qualified_c284_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c284_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 176
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 128
@@ -35013,7 +34916,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = 320;
 constexpr int kGeneratedSmemTotal = 87552;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -35057,7 +34959,6 @@ constexpr int kGeneratedSmemTotal = 87552;
 namespace nvfp4_s14_c302n_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_s14_c302n_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 112
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 64
@@ -35866,7 +35767,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 49152;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -35911,7 +35811,6 @@ constexpr int kGeneratedSmemTotal = 49152;
 namespace nvfp4_s14_c358n_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst_nvfp4_s14_c358n_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 112
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 64
@@ -36728,7 +36627,6 @@ kernel_alpha_moe_nvfp4_down_workspace_c358_preparedw2_evictfirst(const __grid_co
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 49152;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -36780,7 +36678,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 2048
@@ -37211,7 +37108,6 @@ kernel_alpha_moe_route_alignment_tile_c503c(int* __restrict__ topk_ids, int* __r
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 6272;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
@@ -37243,7 +37139,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 128
 
@@ -37362,7 +37257,6 @@ kernel_alpha_moe_x_sf_tiles_c505d(uint8_t* __restrict__ x_scale, int* __restrict
 
 constexpr int kGeneratedThreads = 128;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_x_sf_tiles_c505d
@@ -37371,7 +37265,6 @@ constexpr int kGeneratedSmemTotal = 0;
 namespace nvfp4_s13_c500ab_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_token_tile_c500ab kernel_alpha_moe_nvfp4_up_token_tile_c500ab_nvfp4_s13_c500ab_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 304
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_X_SF_OFFSET 256
@@ -39757,7 +39650,6 @@ kernel_alpha_moe_nvfp4_up_token_tile_c500ab(const __grid_constant__ CUtensorMap 
 
 constexpr int kGeneratedThreads = 320;
 constexpr int kGeneratedSmemTotal = 222208;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_X_SF_OFFSET
@@ -39793,7 +39685,6 @@ constexpr int kGeneratedSmemTotal = 222208;
 namespace nvfp4_s13_c500y_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_token_tile_c500y kernel_alpha_moe_nvfp4_up_token_tile_c500y_nvfp4_s13_c500y_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 304
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_X_SF_OFFSET 256
@@ -42179,7 +42070,6 @@ kernel_alpha_moe_nvfp4_up_token_tile_c500y(const __grid_constant__ CUtensorMap x
 
 constexpr int kGeneratedThreads = 320;
 constexpr int kGeneratedSmemTotal = 222208;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_X_SF_OFFSET
@@ -42215,7 +42105,6 @@ constexpr int kGeneratedSmemTotal = 222208;
 namespace nvfp4_s13_c502t_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_token_tile_c502t kernel_alpha_moe_nvfp4_down_token_tile_c502t_nvfp4_s13_c502t_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 384
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_ACT_SF0_OFFSET 256
@@ -43198,7 +43087,6 @@ kernel_alpha_moe_nvfp4_down_token_tile_c502t(const __grid_constant__ CUtensorMap
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 214144;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_ACT_SF0_OFFSET
@@ -43250,7 +43138,6 @@ constexpr int kGeneratedSmemTotal = 214144;
 namespace nvfp4_s13_c502u_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_token_tile_c502u kernel_alpha_moe_nvfp4_down_token_tile_c502u_nvfp4_s13_c502u_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 384
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_ACT_SF0_OFFSET 256
@@ -44233,7 +44120,6 @@ kernel_alpha_moe_nvfp4_down_token_tile_c502u(const __grid_constant__ CUtensorMap
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 214144;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_ACT_SF0_OFFSET
@@ -44292,7 +44178,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -44401,7 +44286,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_rowmap_c378(__nv_bfloat16* __restrict
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_rowmap_c378
@@ -44417,7 +44301,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -44546,7 +44429,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_rowmap_seed_c379(__nv_bfloat16* __res
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_rowmap_seed_c379
@@ -44555,7 +44437,6 @@ constexpr int kGeneratedSmemTotal = 0;
 namespace nvfp4_qualified_c304_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace kernel_alpha_moe_nvfp4_down_workspace_nvfp4_qualified_c304_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 72
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 24
@@ -45260,7 +45141,6 @@ kernel_alpha_moe_nvfp4_down_workspace(const __grid_constant__ CUtensorMap W2, ui
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 38912;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -45306,7 +45186,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 4096
@@ -45557,7 +45436,6 @@ kernel_alpha_moe_route_alignment_seed(int* __restrict__ topk_ids, int* __restric
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 12416;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
@@ -45595,7 +45473,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 4096
@@ -45837,7 +45714,6 @@ kernel_alpha_moe_route_alignment_only(int* __restrict__ topk_ids, int* __restric
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 12416;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
@@ -45868,7 +45744,6 @@ constexpr int kGeneratedSmemTotal = 12416;
 namespace nvfp4_qualified_c312_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace kernel_alpha_moe_nvfp4_up_workspace_nvfp4_qualified_c312_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 176
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 128
@@ -46819,7 +46694,6 @@ kernel_alpha_moe_nvfp4_up_workspace(const __grid_constant__ CUtensorMap x, const
 
 constexpr int kGeneratedThreads = 320;
 constexpr int kGeneratedSmemTotal = 87552;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -46870,7 +46744,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -46918,7 +46791,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8(float* __restrict__ ro
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8
@@ -46934,7 +46806,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -47033,7 +46904,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_vector8_seed_float4_unit_scale_fma(__
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_vector8_seed_float4_unit_scale_fma
@@ -47049,7 +46919,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 4096
@@ -47292,7 +47161,6 @@ kernel_alpha_moe_route_alignment_only_map_init(int* __restrict__ topk_ids, int* 
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 12416;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
@@ -47330,7 +47198,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -47412,7 +47279,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_inplace_seed_unit_scale_fma(__nv_bflo
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_inplace_seed_unit_scale_fma
@@ -47428,7 +47294,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -47501,7 +47366,6 @@ kernel_alpha_moe_nvfp4_finalize_fp32_route_inplace_seed_unit_scale_fma(float* __
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_fp32_route_inplace_seed_unit_scale_fma
@@ -47517,7 +47381,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -47573,7 +47436,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma(float* __re
 
 constexpr int kGeneratedThreads = 32;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma
@@ -47589,7 +47451,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -47645,7 +47506,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_bf16_seed(f
 
 constexpr int kGeneratedThreads = 32;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_row32_top8_unit_scale_fma_bf16_seed
@@ -47661,7 +47521,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -47711,7 +47570,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8_bf16_seed(float* __res
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_scalar256_top8_bf16_seed
@@ -47727,7 +47585,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -47777,7 +47634,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_bf16_seed(float* __restrict__ route_a
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_bf16_seed
@@ -47793,7 +47649,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -47841,7 +47696,6 @@ kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_bf16_seed(__nv_bfloat
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_bf16_seed
@@ -47850,7 +47704,6 @@ constexpr int kGeneratedSmemTotal = 0;
 namespace nvfp4_qualified_c332_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace_readback_x8_m128 kernel_alpha_moe_nvfp4_up_workspace_readback_x8_m128_nvfp4_qualified_c332_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 176
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 128
@@ -48807,7 +48660,6 @@ kernel_alpha_moe_nvfp4_up_workspace_readback_x8_m128(const __grid_constant__ CUt
 
 constexpr int kGeneratedThreads = 320;
 constexpr int kGeneratedSmemTotal = 87552;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -48858,7 +48710,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -48960,7 +48811,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_vector_seed_unit_scale_fma(__nv_bfloa
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_vector_seed_unit_scale_fma
@@ -48969,7 +48819,6 @@ constexpr int kGeneratedSmemTotal = 0;
 namespace nvfp4_qualified_c334_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave_nvfp4_qualified_c334_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 112
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 64
@@ -50022,7 +49871,6 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_k64_interleave(const __grid_con
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 216064;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -50076,7 +49924,6 @@ constexpr int kGeneratedSmemTotal = 216064;
 namespace nvfp4_qualified_c338_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1 kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nvfp4_qualified_c338_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 112
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 64
@@ -51129,7 +50976,6 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1(const __grid_const
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -51182,7 +51028,6 @@ constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
 namespace nvfp4_qualified_c346_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_nvfp4_qualified_c346_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 72
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 24
@@ -51891,7 +51736,6 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes(const __grid_constant__ CUt
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -51955,7 +51799,6 @@ kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignmen
 namespace nvfp4_s5_c208v3b_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b_nvfp4_s5_c208v3b_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 16
@@ -52506,7 +52349,6 @@ kernel_alpha_moe_nvfp4_up_split_k4_merge_tail_acqrel_m1_v3b(const __grid_constan
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 122496;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -52563,7 +52405,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SMEM_ACT_OFF 0
 #define SMEM_SMEM_ACT_STAGE_BYTES 8192
@@ -52876,7 +52717,6 @@ kernel_alpha_moe_nvfp4_down_m1_gemv_slot_per_warp_actws_seedbf16_v26(uint8_t* __
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 9088;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_SMEM_ACT_OFF
 #undef SMEM_SMEM_ACT_STAGE_BYTES
@@ -52904,7 +52744,6 @@ constexpr int kGeneratedSmemTotal = 9088;
 namespace nvfp4_s11_c416s_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw1_inkernel_align_maskrank_nvfp4_s11_c416s_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 64
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_COMB_SF_OFFSET 32
@@ -54092,7 +53931,6 @@ kernel_alpha_moe_nvfp4_up_workspace_singleton_n8_prepacked_w1_nsplit64_preparedw
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 207104;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_COMB_SF_OFFSET
@@ -54171,7 +54009,6 @@ constexpr int kGeneratedSmemTotal = 207104;
 namespace nvfp4_s11_c407_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz_nvfp4_s11_c407_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 72
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF_OFFSET 24
@@ -54561,7 +54398,6 @@ kernel_alpha_moe_nvfp4_down_workspace_m8_bf16_routes_persistent_v7fitz(const __g
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 38912;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF_OFFSET
@@ -54603,7 +54439,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -54650,7 +54485,6 @@ kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_noseed(__nv_bfloat16*
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_bf16_routes_scalar256_top8_noseed
@@ -54659,7 +54493,6 @@ constexpr int kGeneratedSmemTotal = 0;
 namespace nvfp4_s12_c360_down {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst_nvfp4_s12_c360_down
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 72
 #define TMEM_DOWN_ACC_OFFSET 0
 #define TMEM_DOWN_W2_SF0_OFFSET 24
@@ -55389,7 +55222,6 @@ kernel_alpha_moe_nvfp4_down_c360_preparedw2_evictfirst(const __grid_constant__ C
 
 constexpr int kGeneratedThreads = 192;
 constexpr int kGeneratedSmemTotal = 38912;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_DOWN_ACC_OFFSET
 #undef TMEM_DOWN_W2_SF0_OFFSET
@@ -55435,7 +55267,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -55535,7 +55366,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_vector_noseed_vecstore(__nv_bfloat16*
 
 constexpr int kGeneratedThreads = 256;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_vector_noseed_vecstore
@@ -55544,7 +55374,6 @@ constexpr int kGeneratedSmemTotal = 0;
 namespace nvfp4_s8_c340el_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1 kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1_nvfp4_s8_c340el_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 176
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 128
@@ -56504,7 +56333,6 @@ kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_c340el_evictlast_w1(const __gri
 
 constexpr int kGeneratedThreads = 320;
 constexpr int kGeneratedSmemTotal = 87552;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET
@@ -56548,7 +56376,6 @@ constexpr int kGeneratedSmemTotal = 87552;
 namespace nvfp4_s8_c336el_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1 kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1_nvfp4_s8_c336el_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 176
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 128
@@ -57514,7 +57341,6 @@ kernel_alpha_moe_nvfp4_up_workspace_prepacked_w1_m128_c336el_evictlast_w1(const 
 
 constexpr int kGeneratedThreads = 320;
 constexpr int kGeneratedSmemTotal = 87552;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET

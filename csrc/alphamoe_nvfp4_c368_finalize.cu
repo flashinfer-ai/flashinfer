@@ -31,7 +31,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
 
@@ -150,7 +149,6 @@ kernel_alpha_moe_nvfp4_finalize_route_bf16_vector_seed_unit_scale_fma_packed_pre
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = 0;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef kernel_alpha_moe_nvfp4_finalize_route_bf16_vector_seed_unit_scale_fma_packed_prefetch4

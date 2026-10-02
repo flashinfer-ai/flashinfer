@@ -25,7 +25,6 @@
 namespace nvfp4_qualified_c386_up {
 using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up_nvfp4_qualified_c386_up
-#define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 176
 #define TMEM_UP_ACC_OFFSET 0
 #define TMEM_UP_GATE_SF_OFFSET 128
@@ -956,7 +955,6 @@ kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up(const __grid_constant__ C
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef TMEM_NCOLS
 #undef TMEM_UP_ACC_OFFSET
 #undef TMEM_UP_GATE_SF_OFFSET

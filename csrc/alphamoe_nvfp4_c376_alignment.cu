@@ -31,7 +31,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_COUNTS_OFF 0
 #define SMEM_COUNTS_STAGE_BYTES 4096
@@ -278,7 +277,6 @@ kernel_alpha_moe_route_alignment_parallel_map_init(int* __restrict__ topk_ids, i
 
 constexpr int kGeneratedThreads = THREADS;
 constexpr int kGeneratedSmemTotal = SMEM_TOTAL;
-#undef LOOM_INF
 #undef NUM_MAIN_STAGES
 #undef SMEM_COUNTS_OFF
 #undef SMEM_COUNTS_STAGE_BYTES
