@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.rope import (
     apply_llama31_rope_inplace_trace,
     apply_llama31_rope_pos_ids_inplace_trace,
@@ -1790,3 +1790,108 @@ def rope_quantize_fp8_append_paged_kv_cache(
     )
 
     return q_rope_out, q_nope_out
+
+
+@flashinfer_experimental_api(feature="fused QK RMSNorm/RoPE/paged KV append")
+def fused_qk_rmsnorm_rope_append_paged_kv_cache(
+    qkv: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    q_indptr: torch.Tensor,
+    page_indices: torch.Tensor,
+    paged_kv_cache: Tuple[torch.Tensor, torch.Tensor],
+    is_prefill: bool,
+    q_norm_weight: Optional[torch.Tensor] = None,
+    k_norm_weight: Optional[torch.Tensor] = None,
+    qk_norm_policy: int = 0,
+    out_q: Optional[torch.Tensor] = None,
+    out_k: Optional[torch.Tensor] = None,
+    out_v: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fuse packed-QKV unpacking, Q/K RMSNorm, NeoX RoPE, and BF16 paged append.
+
+    ``qk_norm_policy`` is 0 (disabled), 1 (RoPE then RMSNorm), or 2
+    (RMSNorm then RoPE). The experimental backend supports head dimension 128,
+    NHD paged caches, and head geometries ``(Hq, Hkv)=(8,1)`` or ``(64,8)``.
+    """
+    from .experimental.fused_qk_rope_append import (
+        fused_qk_norm_rope_append_paged_kv_cache,
+    )
+
+    return fused_qk_norm_rope_append_paged_kv_cache(
+        qkv,
+        cos_sin_cache,
+        seq_lens,
+        q_indptr,
+        page_indices,
+        paged_kv_cache,
+        is_prefill,
+        q_norm_weight,
+        k_norm_weight,
+        qk_norm_policy,
+        out_q,
+        out_k,
+        out_v,
+    )
+
+
+@flashinfer_experimental_api(
+    feature="fused QK RMSNorm/RoPE/FP8 quantize paged KV append"
+)
+def fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
+    qkv: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    q_indptr: torch.Tensor,
+    page_indices: torch.Tensor,
+    paged_kv_cache: Tuple[torch.Tensor, torch.Tensor],
+    is_prefill: bool,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    quant_policy: int,
+    max_seqlen: int = 0,
+    upper_max: float = 448.0,
+    q_scale_inv: Optional[torch.Tensor] = None,
+    q_norm_weight: Optional[torch.Tensor] = None,
+    k_norm_weight: Optional[torch.Tensor] = None,
+    qk_norm_policy: int = 0,
+    out_q: Optional[torch.Tensor] = None,
+    out_k: Optional[torch.Tensor] = None,
+    out_v: Optional[torch.Tensor] = None,
+    q_scale: Optional[torch.Tensor] = None,
+    split_k_flag: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Fuse QK-Norm/RoPE, FP8 quantization, and paged K/V append.
+
+    ``quant_policy=1`` produces dynamic per-token/per-Q-head scales;
+    ``quant_policy=2`` consumes scalar ``q_scale_inv``. Malformed packed-row
+    metadata is reported asynchronously by filling ``split_k_flag`` with -1.
+    See the experimental backend README for the complete shape contract.
+    """
+    from .experimental.fused_qk_rope_append import (
+        fused_qk_norm_rope_quantize_fp8_append_paged_kv_cache,
+    )
+
+    return fused_qk_norm_rope_quantize_fp8_append_paged_kv_cache(
+        qkv,
+        cos_sin_cache,
+        seq_lens,
+        q_indptr,
+        page_indices,
+        paged_kv_cache,
+        is_prefill,
+        k_scale,
+        v_scale,
+        quant_policy,
+        max_seqlen,
+        upper_max,
+        q_scale_inv,
+        q_norm_weight,
+        k_norm_weight,
+        qk_norm_policy,
+        out_q,
+        out_k,
+        out_v,
+        q_scale,
+        split_k_flag,
+    )
