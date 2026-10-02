@@ -12,7 +12,10 @@ def prepare_fp8_fp4_gemm(a, b, a_scales, b_scales, *, m=None, out=None, gran_k_a
     bytes per int32/uint32 word, packed-K major with the 4-aligned MN extent
     contiguous (``[words, aligned_MN]``). ``gran_k_a`` is the A scale
     granularity (32 or 128 K elements per byte); B scales are per 32.
-    Any ``m`` in ``[1, rows of A]`` is accepted; K must be a multiple of 128.
+    ``m`` must be in ``[1, rows of A]`` and K must be a multiple of 128.
+    M <= 128 needs an even ``ceil(N/128)``; M > 128 needs an even
+    ``ceil(M/128)`` or ``ceil(N/128)``; ``gran_k_a=128`` needs an even
+    ``ceil(M/128)`` and N >= 224. Other shapes raise ``NotImplementedError``.
     Preparation owns allocations and route selection; ``run()`` submits one
     kernel on the current stream without allocating.
     """
