@@ -3,7 +3,7 @@
 flashinfer.cake_fmha
 ====================
 
-``cake_fmha`` is the versioned Cake implementation of FlashInfer's conventional
+``cake_fmha`` is the Cake implementation of FlashInfer's conventional
 TensorRT-LLM paged FMHA decode and context contracts.  It is an explicit
 Blackwell backend: importing FlashInfer or calling the existing APIs without a
 backend continues to select the existing FlashInfer implementation.
@@ -22,7 +22,7 @@ audited; the DCP component keeps its own registry under
 ``csrc/cake_fmha/cuda/dcp_spec/``.  :func:`cake_fmha_manifest` returns a
 defensive copy of the core registry.
 
-All 1,798 optimized cells have authenticated high-level adapters for their
+All 1,798 optimized cells have registered high-level adapters for their
 complete component chains.  The selector accepts the pinned matrix's normalized
 NHD context views and device scalar FP8/NVFP4 scales.  Its numerically inert
 ``1e-30`` skip-softmax probe is canonicalized to ordinary softmax only after an
@@ -36,12 +36,12 @@ uniform q257/KV1024 with P1024 separate K/V page tables.  FlashInfer selects
 these bodies only after every semantic and shape guard matches and the four KV
 lengths plus five Q-indptr values confirm the exact uniform lengths.  A
 nonuniform length, a near-miss shape, or CUDA graph capture retains the generic
-authenticated context body; it never reuses a fixed-length specialization.
+context body; it never reuses a fixed-length specialization.
 
 Optimized routes are fail-closed.  In particular, optimized FP8 decode is
 qualified for HND pages, a shared K/V page table, and GQA group size eight;
-other valid FP8 decode shapes remain Cake-owned and use the authenticated
-complete-domain component.
+other valid FP8 decode shapes remain Cake-owned and use the complete-domain
+compatibility component.
 
 The manifest's per-route counts are inventory metadata, not a proof that a
 particular high-level selector revision reproduces the pinned matrix.  The
