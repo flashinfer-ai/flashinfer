@@ -51,16 +51,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_RED_OFF 0
-#define SMEM_RED_STAGE_BYTES 128
-#define SMEM_RED_STRIDE 128
-#define SMEM_VMAX_SMEM_OFF 128
-#define SMEM_VMAX_SMEM_STAGE_BYTES 4096
-#define SMEM_VMAX_SMEM_STRIDE 4096
-#define SMEM_TOTAL 4224
-#define THREADS 256
 
 #include <math_constants.h>
 
@@ -616,7 +606,7 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_sage_block_sparse_attention_7374900a242cff867ec4(__nv_bfloat16* __restrict__ q_in, __nv_bfloat16* __restrict__ k_in, __nv_bfloat16* __restrict__ v_in, uint8_t* __restrict__ q_out, uint8_t* __restrict__ k_out, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_amax, int seqlen_q, int seqlen_k, int num_heads, int num_kv_heads, int grid_heads, int k_scale_groups, int chunks_per_bh, int q_chunks, int k_chunks)
+kernel_cake_sage_block_sparse_attention_e46b194b07d454419fba(__nv_bfloat16* __restrict__ q_in, __nv_bfloat16* __restrict__ k_in, __nv_bfloat16* __restrict__ v_in, uint8_t* __restrict__ q_out, uint8_t* __restrict__ k_out, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_amax, int seqlen_q, int seqlen_k, int num_heads, int num_kv_heads, int grid_heads, int k_scale_groups, int chunks_per_bh, int q_chunks, int k_chunks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -624,7 +614,12 @@ kernel_cake_sage_block_sparse_attention_7374900a242cff867ec4(__nv_bfloat16* __re
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
