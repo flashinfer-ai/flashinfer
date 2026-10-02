@@ -125,16 +125,25 @@ launcher's.
   points.
 * `csrc/cake_dense_projection_gemm/<arch>/` -- generated kernel and binding
   translation units (`.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests).  Empty until the
-  export lands.
+  identity-checked by the registry's closure digests).
 
 ## Status
 
-The registries are empty in this checkout: the generated programs are
-delivered by the Cake exporter (`exports/dense_projection_gemm` of the Cake
-repository) for `sm_100a` and `sm_107a` in a follow-up commit; `sm_103a` is
-compiled from the same sources when a B300 route is exercised.  Every entry
-point raises `NotImplementedError` naming the missing instance until then.
+The registries hold the generated programs of the current export lock: the
+Cake exporter (`exports/dense_projection_gemm` of the Cake repository) emits
+one program per template for `sm_100a` and `sm_107a` (the per-architecture
+template lists are `KERNELS` in `cake_jit.py`; `K1_TEMPLATES` of the exporter
+is the source of truth and is regenerated whenever `ROW_RULES` resolve a new
+instance), and `sm_103a` is compiled from the same sources when a B300 route
+is exercised.  An entry point raises `NotImplementedError` naming the missing
+instance only for a template that no export has generated.
+
+CUDA Graphs: prepare outside capture and replay the prepared launch
+(`prepare_*` once, `launch` many times).  The eager wrappers
+(`dense_projection_gemm`, `projection_wgrad`, `router_fp32_gemm`) prepare a
+new launch — and a new TMA-descriptor workspace — on every call, so they are
+not graph-capturable: the binding refuses to initialise a workspace while the
+stream is capturing.
 
 Tests: `tests/experimental/test_cake_dense_projection_gemm.py` (host-side
 planning tests run everywhere; the GPU tests skip without a registered
