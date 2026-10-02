@@ -328,7 +328,6 @@ def _make_context_kernel(
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
         **paged_kwargs,
     )
-    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
     return fmha
 
 
@@ -1608,7 +1607,11 @@ def _resolve_paged_plan_geometry(
 
 def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     """Dense contiguous MHA or GQA at D=128 with bf16 QK runs the two-CTA UMMA
-    form, which pairs adjacent Q tiles of one head through the grid."""
+    form, which pairs adjacent Q tiles of one head through the grid.
+    The two-CTA launch is non-persistent with heads on grid Y and batch on
+    grid Z. CUDA limits grid Y and Z to 65,535; oversized geometries keep the
+    persistent flattened grid so every otherwise-valid int32 plan stays
+    launchable."""
     return (
         _default_two_cta_umma(geometry.device_index)
         and geometry.head_dim == 128
@@ -1617,6 +1620,10 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
         and not geometry.packed
         and not geometry.head_paired
         and torch.finfo(geometry.qk_dtype).bits == 16
+        and not (
+            geometry.batch_size > _CUDA_GRID_YZ_MAX
+            or geometry.num_qo_heads > _CUDA_GRID_YZ_MAX
+        )
     )
 
 
@@ -1806,6 +1813,7 @@ def _get_compiled_context(
         fmha.cfg.uniform_seq_len_q = max_seq_len_q
         fmha.cfg.uniform_seq_len_k = max_seq_len_k
     fmha.cfg.has_q_offset = has_q_offset
+    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
             "context packed-K specialization assumes kv_tile_n="
@@ -2021,6 +2029,7 @@ def _get_compiled_paged_context(
         fmha.cfg.uniform_seq_len_q = max_seq_len_q
         fmha.cfg.uniform_seq_len_k = max_kv_len
     fmha.cfg.has_q_offset = has_q_offset
+    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
     fmha.cfg.paged_v_tail_is_zero = paged_v_tail_is_zero
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
