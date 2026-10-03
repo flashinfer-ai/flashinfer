@@ -273,6 +273,10 @@ def cake_fused_moe_prepare_workspace(
                 fc2_grid_n = min(
                     max_tiles, 6
                 )  # N16Claim8M256Pool6 (F7) + MidPool6 (inc5): 168 FC2 CTAs on the 148-SM B200 for the sm_100a claim8 rows M32/M64/M128/M256; B300Pool6 (inc7): 168 FC2 CTAs on the 148-SM B300 for the sm_103a claim8 rows M32/M64/M128/M256
+                if arch == "sm_103a":
+                    fc2_grid_n = min(
+                        max_tiles, 12
+                    )  # inc23 (N16 claim8 FC2 2 CTAs/SM, s2b2 v39 program): 336 FC2 CTAs on the 148-SM B300 for the sm_103a claim8 rows M32/M64/M128/M256; sm_100a keeps pool 6
         feature_finalize = num_tokens in (1, 8, 16) or m64_claim8
         program_key = cake_situ_sequence(
             arch,
