@@ -26,16 +26,14 @@ namespace flashinfer {
 template <bool SAME_KV_STRIDES, uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, bool enable_pdl,
-                                                   cudaStream_t stream);
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
+                                                   bool enable_pdl, cudaStream_t stream);
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                    float* tmp_s, bool enable_pdl,
-                                                    cudaStream_t stream);
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
+                                                    bool enable_pdl, cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -192,7 +190,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
 
         ADDITIONAL_PARAMS_SETTER
 
-        DTypeO* tmp_v = nullptr;
+        float* tmp_v = nullptr;
         float* tmp_s = nullptr;
 
         params.request_indices =
@@ -207,7 +205,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         if (plan_info.split_kv) {
           params.merge_indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
-          tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
+          tmp_v = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.v_offset);
           tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
         }
         params.padded_batch_size = plan_info.padded_batch_size;
