@@ -17,11 +17,13 @@ limitations under the License.
 import contextlib
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
 import warnings
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -89,7 +91,7 @@ PRODUCTION_B0 = dict(dX_rel_l2=1.85e-3, dW_rel_l2=1.88e-3, logp_max_abs=4.1e-3)
 # Per-row gate between two BF16 implementations of the same rows (knee test).
 ROW_REL_L2 = 1e-2
 # Host values every stage may name (the kernels' own argument names, see ``stage_values``).
-_GEMM_VALUES = {"A", "B", "C", "STATS_OUT", "M", "m_tiles", "k_iters"}
+_GEMM_VALUES = {"A", "B", "C", "STATS_OUT", "WS", *cake_backend.GEMM_SCALARS}
 _STAGE_VALUES = {
     stage: set(tensors)
     | set(COMMON_TENSORS)
@@ -291,40 +293,24 @@ def test_registry_records_are_well_formed():
     assert cake_jit.STAGES == (
         "gather_rows_bf16",
         "gemm_logits",
-        "gemm_logits_g16",
         "gemm_logits_mcnt",
-        "gemm_logits_mcnt_g16",
         "gemm_logits_nostats",
-        "gemm_logits_nostats_g16",
         "gemm_logits_nostats_mcnt",
-        "gemm_logits_nostats_mcnt_g16",
         "row_finalize",
         "loss_reduce",
         "row_grad",
         "gemm_dx",
-        "gemm_dx_s2",
-        "gemm_dx_s3",
-        "gemm_dx_s4",
+        "gemm_dx_s",
         "gemm_dx_tn256",
-        "gemm_dx_s2_tn256",
-        "gemm_dx_s3_tn256",
-        "gemm_dx_s4_tn256",
+        "gemm_dx_s_tn256",
         "gemm_dx_st3",
-        "gemm_dx_s2_st3",
-        "gemm_dx_s3_st3",
-        "gemm_dx_s4_st3",
+        "gemm_dx_s_st3",
         "slab_sum",
         "gemm_dw_acc",
-        "gemm_dw_acc_g16",
-        "gemm_dw_acc_g32",
-        "gemm_dw_acc_gn12",
+        "gemm_dw_acc_gn",
         "gemm_dw_cast_bf16",
-        "gemm_dw_cast_bf16_g16",
-        "gemm_dw_cast_bf16_g32",
         "gemm_dw_cast_f32",
-        "gemm_dw_cast_f32_g16",
-        "gemm_dw_cast_f32_g32",
-        "gemm_dw_cast_f32_gn12",
+        "gemm_dw_cast_f32_gn",
         "scale_cast_bf16",
         "scale_cast_f32",
         "scale_cast_scatter_bf16",
@@ -355,6 +341,13 @@ def test_registry_records_are_well_formed():
             geometry.hidden is None or geometry.hidden % geometry.hidden_multiple == 0
         )
         assert geometry.vocab is None or geometry.vocab % geometry.vocab_multiple == 0
+        for op in (
+            "logits",
+            "dx",
+            "dw",
+        ):  # the launch-scalar defaults of the record's kernels
+            assert getattr(geometry, f"{op}_group_m") >= 1
+            assert getattr(geometry, f"{op}_item_cols") >= 1
         stages = cake_jit.registered_stages(name)
         assert stages and set(stages) <= set(cake_jit.STAGES)
         for stage in stages:
@@ -378,6 +371,26 @@ def test_registry_records_are_well_formed():
                     )
             assert int(physical.get("tma_workspace_bytes", 0)) >= 0
             assert int(physical.get("workspace_bytes", 0)) >= 0
+            unit = physical["module"].removeprefix("cake_lm_head_loss_")
+            kernel, launch = physical["sources"]
+            # one architecture-neutral translation unit per kernel (no architecture directory)
+            assert kernel == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_kernel.cu"
+            assert launch == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_launch.cu"
+            csrc = Path(cake_jit.__file__).resolve().parent / "csrc"
+            assert (csrc / kernel).is_file() and (csrc / launch).is_file()
+            symbol = f"kernel_{physical['module']}"
+            assert symbol in (csrc / kernel).read_text()
+            stub = (csrc / launch).read_text()
+            assert f"#define CAKE_KERNEL_SYMBOL {symbol}\n" in stub
+            shim = re.search(
+                r'#include "(cake_lm_head_loss/shim/cake_lm_head_loss_shim_[0-9a-f]{12}\.cuh)"',
+                stub,
+            )
+            assert shim is not None and (csrc / shim.group(1)).is_file()
+            assert (
+                "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run,"
+                in (csrc / shim.group(1)).read_text()
+            )
             assert len(physical.get("grid", ["rows_c", 1, 1])) == 3
             launch = physical.get("launch")
             if launch is not None:
@@ -387,6 +400,27 @@ def test_registry_records_are_well_formed():
                 assert len(launch["cluster"]) == 3 and all(
                     int(c) >= 1 for c in launch["cluster"]
                 )
+
+    assert (
+        cake_jit._expand_registry(
+            cake_jit._REGISTRY, cake_jit._ARG_PLANS, cake_jit._LAUNCHES
+        )
+        == cake_jit.MODULES
+    )
+    shim_dir = (
+        Path(cake_jit.__file__).resolve().parent / "csrc" / "cake_lm_head_loss" / "shim"
+    )
+    used = set()
+    for record in cake_jit.MODULES.values():
+        for stage in record["stages"]:
+            used.add(
+                re.search(
+                    r'#include "cake_lm_head_loss/shim/([^"]+)"',
+                    (shim_dir.parent.parent / record[stage]["sources"][1]).read_text(),
+                ).group(1)
+            )
+    if cake_jit.MODULES:
+        assert sorted(p.name for p in shim_dir.glob("*.cuh")) == sorted(used)
 
 
 @pytest.mark.parametrize("C", [4096, 2048, 8192])
@@ -943,13 +977,12 @@ def test_geometry_cluster_ctas():
     )
     assert (
         g.cluster_ctas_of("gemm_dx") == 4
-        and g.cluster_ctas_of("gemm_dx_s3") == 4
-        and g.cluster_ctas_of("gemm_dx_s3_tn256") == 4
+        and g.cluster_ctas_of("gemm_dx_s") == 4
+        and g.cluster_ctas_of("gemm_dx_s_tn256") == 4
         and g.cluster_ctas_of("gemm_dw_acc") == 2
-        and g.cluster_ctas_of("gemm_dw_acc_g32") == 2
-        and g.cluster_ctas_of("gemm_dw_acc_g16") == 2
-        and g.cluster_ctas_of("gemm_logits_g16") == 2
-        and g.cluster_ctas_of("gemm_dw_cast_f32_g32") == 2
+        and g.cluster_ctas_of("gemm_dw_acc_gn") == 2
+        and g.cluster_ctas_of("gemm_logits_mcnt") == 2
+        and g.cluster_ctas_of("gemm_dw_cast_f32_gn") == 2
     )
     assert (
         g.cluster_ctas_of("row_grad") is None
@@ -961,8 +994,36 @@ def test_geometry_cluster_ctas():
         default.dx_cluster_ctas,
         default.dw_cluster_ctas,
     ) == (2, 2, 2)
+    # the per-GEMM work-item columns and default raster heights (launch scalars of the generated kernels): the
+    # reference path's defaults are one 256-column tile per item; a record declares its kernels' widths
+    assert (
+        default.logits_item_cols,
+        default.dx_item_cols,
+        default.dw_item_cols,
+    ) == (256, 256, 256)
+    assert (default.logits_group_m, default.dx_group_m, default.dw_group_m) == (
+        32,
+        16,
+        8,
+    )
+    declared = Geometry.from_record(
+        {"geometry": {"dx_item_cols": 512, "dw_item_cols": 512, "dw_group_m": 2}}
+    )
+    assert (declared.dx_item_cols, declared.dw_item_cols, declared.dw_group_m) == (
+        512,
+        512,
+        2,
+    )
+    assert (
+        cake_backend.gemm_op("gemm_logits_nostats_mcnt"),
+        cake_backend.gemm_op("gemm_dx_s_st3"),
+        cake_backend.gemm_op("gemm_dw_cast_bf16"),
+    ) == ("logits", "dx", "dw")
     with pytest.raises(ValueError):
-        Geometry.from_record({"geometry": {"dx_cluster_ctas": 0}})
+        cake_backend.gemm_op("row_grad")
+    for bad in ({"dx_cluster_ctas": 0}, {"dw_item_cols": 0}, {"logits_group_m": 0}):
+        with pytest.raises(ValueError):
+            Geometry.from_record({"geometry": bad})
 
 
 # --------------------------------------------------------------------------- per-chunk instance variants
@@ -971,160 +1032,281 @@ def test_geometry_cluster_ctas():
 def test_stage_variant_grammar():
     bases = cake_jit.BASE_STAGES
     assert len(bases) == 14 and set(bases) <= set(cake_jit.STAGES)
+    assert cake_backend.STAGE_KNOBS == (
+        "count",
+        "sliced",
+        "tile_n",
+        "stages",
+        "blocked",
+        "epi_store",
+    )
     for stage in cake_jit.STAGES:
         base, knobs = cake_backend.parse_stage(stage)
         assert base in bases and cake_backend.stage_variant(base, **knobs) == stage
-        assert set(knobs) == {
-            "count",
-            "k_slices",
-            "tile_n",
-            "group_m",
-            "epi_store",
-            "stages",
-            "group_n",
-        }
+        assert tuple(knobs) == cake_backend.STAGE_KNOBS
     # the device-count form of the logits GEMMs (the hidden valid-row count's chunk 0), first in the suffix order
     assert cake_backend.stage_variant("gemm_logits", count=True) == "gemm_logits_mcnt"
     assert (
-        cake_backend.stage_variant("gemm_logits_nostats", count=True, group_m=16)
-        == "gemm_logits_nostats_mcnt_g16"
+        cake_backend.stage_variant("gemm_logits_nostats", count=True)
+        == "gemm_logits_nostats_mcnt"
     )
-    assert cake_backend.parse_stage("gemm_logits_mcnt_g16") == (
+    assert cake_backend.parse_stage("gemm_logits_mcnt") == (
         "gemm_logits",
         {
             "count": True,
-            "k_slices": 1,
+            "sliced": False,
             "tile_n": None,
-            "group_m": 16,
-            "epi_store": None,
             "stages": None,
-            "group_n": None,
+            "blocked": False,
+            "epi_store": None,
         },
     )
     assert cake_backend.base_stage("gemm_logits_nostats_mcnt") == "gemm_logits_nostats"
+    # the K-sliced dX GEMM (the slice count is a launch scalar), the narrow tile, the 3-deep ring of the wide tile
+    assert cake_backend.stage_variant("gemm_dx", sliced=True) == "gemm_dx_s"
     assert (
-        cake_backend.stage_variant("gemm_dx", k_slices=3, tile_n=256)
-        == "gemm_dx_s3_tn256"
+        cake_backend.stage_variant("gemm_dx", sliced=True, tile_n=256)
+        == "gemm_dx_s_tn256"
     )
-    assert cake_backend.stage_variant("gemm_dx", k_slices=1, tile_n=512) == "gemm_dx"
-    # the 3-deep ring of the 512-wide dX tile, the 2-D blocked weight-gradient raster
+    assert cake_backend.stage_variant("gemm_dx", tile_n=512) == "gemm_dx"
     assert (
-        cake_backend.stage_variant("gemm_dx", k_slices=3, stages=3) == "gemm_dx_s3_st3"
+        cake_backend.stage_variant("gemm_dx", sliced=True, stages=3) == "gemm_dx_s_st3"
     )
     assert cake_backend.stage_variant("gemm_dx", stages=3, tile_n=512) == "gemm_dx_st3"
     assert (
         cake_backend.stage_variant("gemm_dx", stages=4) == "gemm_dx"
     )  # the table depth
-    assert cake_backend.stage_variant("gemm_dw_acc", group_n=12) == "gemm_dw_acc_gn12"
-    assert cake_backend.stage_variant("gemm_dw_acc", group_n=0) == "gemm_dw_acc"
-    assert (
-        cake_backend.stage_variant("gemm_dw_cast_f32", group_n=12)
-        == "gemm_dw_cast_f32_gn12"
-    )
-    assert cake_backend.parse_stage("gemm_dx_s2_st3") == (
+    assert cake_backend.parse_stage("gemm_dx_s_st3") == (
         "gemm_dx",
         {
             "count": False,
-            "k_slices": 2,
+            "sliced": True,
             "tile_n": None,
-            "group_m": None,
-            "epi_store": None,
             "stages": 3,
-            "group_n": None,
+            "blocked": False,
+            "epi_store": None,
         },
     )
-    assert cake_backend.parse_stage("gemm_dw_cast_f32_gn12")[1]["group_n"] == 12
+    assert cake_backend.parse_stage("gemm_dx_tn256")[1]["tile_n"] == 256
+    # the 2-D blocked weight-gradient raster (the block width is a launch scalar)
+    assert cake_backend.stage_variant("gemm_dw_acc", blocked=True) == "gemm_dw_acc_gn"
+    assert (
+        cake_backend.stage_variant("gemm_dw_cast_f32", blocked=True)
+        == "gemm_dw_cast_f32_gn"
+    )
+    assert cake_backend.parse_stage("gemm_dw_cast_f32_gn") == (
+        "gemm_dw_cast_f32",
+        dict(
+            count=False,
+            sliced=False,
+            tile_n=None,
+            stages=None,
+            blocked=True,
+            epi_store=None,
+        ),
+    )
+    assert cake_backend.stage_variant("gemm_dw_acc", epi_store="redsm") == "gemm_dw_acc"
+    assert (
+        cake_backend.stage_variant("gemm_dw_acc", blocked=True, epi_store="tma")
+        == "gemm_dw_acc_gn_tma"
+    )  # grammar only: no rule selects an epilogue form and no record registers a _tma stage
+    assert (
+        cake_backend.dx_stage(2) == "gemm_dx_s"
+        and cake_backend.dx_stage(4) == "gemm_dx_s"
+        and cake_backend.dx_stage(1, 256) == "gemm_dx_tn256"
+        and cake_backend.dx_stage(3, 512, 3) == "gemm_dx_s_st3"
+        and cake_backend.dx_stage(1) == "gemm_dx"
+    )
+    for bad_k in (0, 5):
+        with pytest.raises(ValueError):
+            cake_backend.dx_stage(bad_k)
     for bad in (
         dict(base="gemm_dx", tile_n=256, stages=3),  # the narrow tile keeps its depth
         dict(base="gemm_dx", stages=5),
         dict(base="gemm_dw_acc", stages=3),
         dict(
-            base="gemm_dw_cast_bf16", group_n=12
+            base="gemm_dw_cast_bf16", blocked=True
         ),  # the bf16 cast keeps the 1-D raster
-        dict(base="gemm_dw_acc", group_n=8),
-        dict(base="gemm_logits", group_n=12),
+        dict(base="gemm_logits", blocked=True),
+        dict(base="gemm_dx", blocked=True),
         dict(
             base="gemm_dx", count=True
         ),  # the device-count form exists for the logits GEMMs only
         dict(base="gemm_dw_acc", count=True),
         dict(base="row_finalize", count=True),
-    ):
-        with pytest.raises(ValueError):
-            cake_backend.stage_variant(**bad)
-    for bad_name in (
-        "gemm_dw_cast_bf16_gn12",
-        "gemm_dx_tn256_st3",
-        "gemm_dx_gn12",
-        "gemm_dx_mcnt",
-        "gemm_logits_g16_mcnt",  # the suffix order
-        "gemm_logits_mcnt_s2",
-    ):
-        with pytest.raises(ValueError):
-            cake_backend.parse_stage(bad_name)
-    assert (
-        cake_backend.stage_variant("gemm_dw_acc", group_m=32, epi_store="tma")
-        == "gemm_dw_acc_g32_tma"
-    )
-    assert (
-        cake_backend.stage_variant("gemm_dw_acc", group_m=16, epi_store="tma")
-        == "gemm_dw_acc_g16_tma"
-    )  # grammar only: no rule selects an epilogue form and no record registers a _tma stage
-    assert cake_backend.stage_variant("gemm_dw_acc", group_m=16) == "gemm_dw_acc_g16"
-    assert (
-        cake_backend.stage_variant("gemm_dw_cast_bf16", group_m=16)
-        == "gemm_dw_cast_bf16_g16"
-    )
-    assert cake_backend.parse_stage("gemm_dw_cast_f32_g16") == (
-        "gemm_dw_cast_f32",
         dict(
-            count=False,
-            k_slices=1,
-            tile_n=None,
-            group_m=16,
-            epi_store=None,
-            stages=None,
-            group_n=None,
-        ),
-    )
-    assert cake_backend.stage_variant("gemm_dw_acc", epi_store="redsm") == "gemm_dw_acc"
-    assert (
-        cake_backend.stage_variant("gemm_dw_cast_f32", group_m=32)
-        == "gemm_dw_cast_f32_g32"
-    )
-    assert (
-        cake_backend.stage_variant("gemm_logits_nostats", group_m=16)
-        == "gemm_logits_nostats_g16"
-    )
-    assert (
-        cake_backend.dx_stage(2) == "gemm_dx_s2"
-        and cake_backend.dx_stage(1, 256) == "gemm_dx_tn256"
-    )
-    assert cake_backend.dx_stage(4, 512) == "gemm_dx_s4"
-    for bad in (
-        dict(base="row_grad", group_m=16),
-        dict(base="gemm_logits", k_slices=2),
+            base="gemm_logits", sliced=True
+        ),  # the K-sliced form exists for the dX GEMM only
+        dict(base="gemm_dw_acc", sliced=True),
         dict(base="gemm_dx", tile_n=128),
-        dict(base="gemm_dx", k_slices=5),
         dict(base="gemm_dw_cast_bf16", epi_store="tma"),
         dict(base="gemm_logits", epi_store="tma"),
         dict(base="gemm_dw_acc", epi_store="cast_bf16"),
+        dict(base="row_grad", tile_n=256),
         dict(base="other"),
     ):
         with pytest.raises(ValueError):
             cake_backend.stage_variant(bad.pop("base"), **bad)
-    for bad in (
-        "gemm_dx_g16",
-        "gemm_logits_s2",
-        "gemm_dw_acc_tma_g32",
+    for bad_name in (
+        "gemm_dw_cast_bf16_gn",
+        "gemm_dx_tn256_st3",
+        "gemm_dx_gn",
+        "gemm_dx_mcnt",
+        "gemm_logits_s",
+        "gemm_logits_mcnt_s",
+        "gemm_dx_s2",  # the slice count is a launch scalar, not a name
+        "gemm_dx_s3_tn256",
+        "gemm_logits_g16",  # so is the raster height
+        "gemm_dw_acc_g32",
+        "gemm_dw_acc_gn12",  # and the block width
+        "gemm_dw_acc_tma_gn",  # the suffix order
+        "gemm_dx_st3_s",
         "gemm_dx_tn128",
-        "row_grad_g16",
+        "row_grad_gn",
         "scale_cast",
         "gemm_dw_cast_bf16_tma",
     ):
         with pytest.raises(ValueError):
-            cake_backend.parse_stage(bad)
+            cake_backend.parse_stage(bad_name)
     with pytest.raises(ValueError):
         cake_backend.base_stage("gemm_dx_s9")
+
+
+def test_gemm_scalars_mirror_the_kernel_contract():
+    """``gemm_scalars``: the launch scalars of a GEMM form from the record geometry, the call geometry and the rules'
+    outputs -- the logits GEMM stores (first_chunk 0) with K = H, the dX GEMM stores its rows (first_chunk 1) with K = V
+    split into ``k_slices`` slices of ``k_slice_iters`` K steps, the weight-gradient GEMM runs K = rows_c and takes the
+    chunk's ``first_chunk``; ``group_m`` defaults to the GEMM's height, ``group_n`` to the whole row of column items (the
+    blocked form takes the block width in column tiles)."""
+    g = Geometry.from_record(
+        {
+            "geometry": {
+                "logits_item_cols": 256,
+                "dx_item_cols": 512,
+                "dw_item_cols": 512,
+                "logits_group_m": 32,
+                "dx_group_m": 16,
+                "dw_group_m": 2,
+            }
+        }
+    )
+    gs = cake_backend.gemm_scalars
+    H, V = 6144, 154880
+    logits = gs("gemm_logits", g, hidden=H, vocab=V, rows_c=4096)
+    assert tuple(logits) == cake_backend.GEMM_SCALARS
+    assert logits == dict(
+        M=4096,
+        m_tiles=32,
+        k_iters=96,
+        first_chunk=0,
+        ws_slab=0,
+        ldc=V,
+        k_slices=1,
+        k_slice_iters=96,
+        group_m=32,
+        group_n=605,
+    )
+    assert gs(
+        "gemm_logits_mcnt", g, hidden=H, vocab=V, rows_c=4096, group_m=16
+    ) == dict(logits, group_m=16)
+    assert gs(
+        "gemm_logits_nostats", g, hidden=H, vocab=V, rows_c=3943, first_chunk=1
+    ) == dict(logits, M=3943, first_chunk=0)  # the logits GEMM never accumulates
+    dx = gs(
+        "gemm_dx_s", g, hidden=H, vocab=V, rows_c=4096, k_slices=4, ws_slab=4096 * H
+    )
+    assert dx == dict(
+        M=4096,
+        m_tiles=32,
+        k_iters=2420,
+        first_chunk=1,
+        ws_slab=4096 * H,
+        ldc=H,
+        k_slices=4,
+        k_slice_iters=605,
+        group_m=16,
+        group_n=12,
+    )
+    assert gs("gemm_dx_tn256", g, hidden=H, vocab=V, rows_c=1) == dict(
+        dx, M=1, m_tiles=2, ws_slab=0, k_slices=1, k_slice_iters=2420
+    )
+    assert gs("gemm_dx_s_st3", g, hidden=H, vocab=V, rows_c=8192, k_slices=3)[
+        "k_slice_iters"
+    ] == -(-2420 // 3)
+    dw = gs("gemm_dw_acc", g, hidden=H, vocab=V, rows_c=4096, first_chunk=0)
+    assert dw == dict(
+        M=V,
+        m_tiles=1210,
+        k_iters=64,
+        first_chunk=0,
+        ws_slab=0,
+        ldc=H,
+        k_slices=1,
+        k_slice_iters=64,
+        group_m=2,
+        group_n=12,
+    )
+    assert gs(
+        "gemm_dw_acc_gn",
+        g,
+        hidden=H,
+        vocab=V,
+        rows_c=4096,
+        group_m=16,
+        group_n=12,
+        first_chunk=0,
+    ) == dict(dw, group_m=16, group_n=6)  # 12 column tiles = 6 two-tile work items
+    assert gs(
+        "gemm_dw_cast_f32_gn",
+        g,
+        hidden=H,
+        vocab=V,
+        rows_c=3943,
+        group_n=12,
+        first_chunk=True,
+    ) == dict(dw, k_iters=62, k_slice_iters=62, first_chunk=1, group_n=6)
+    assert gs(
+        "gemm_dw_cast_bf16", g, hidden=H, vocab=V, rows_c=1, first_chunk=1
+    ) == dict(dw, k_iters=1, k_slice_iters=1, first_chunk=1)
+    # a 4-CTA dX cluster rounds m_tiles up to it
+    g4 = Geometry.from_record({"geometry": {"dx_cluster_ctas": 4, "dx_item_cols": 512}})
+    assert gs("gemm_dx", g4, hidden=H, vocab=V, rows_c=4097)["m_tiles"] == 36
+    for bad in (
+        dict(stage="gemm_dx", k_slices=2),  # the plain form runs one slice
+        dict(stage="gemm_dx_s", k_slices=1),  # the K-sliced form more than one
+        dict(stage="gemm_dx_s", k_slices=5),
+        dict(stage="gemm_logits", k_slices=2),
+        dict(stage="gemm_dw_acc", k_slices=2),
+        dict(stage="gemm_dw_acc", group_n=12),  # the 1-D raster takes no block width
+        dict(stage="gemm_dw_acc_gn"),  # the blocked form needs one
+        dict(stage="gemm_dw_acc_gn", group_n=3),  # whole two-tile work items
+        dict(stage="gemm_dw_acc_gn", group_n=10),  # must divide the 12 column items
+        dict(stage="gemm_dw_acc_gn", group_n=48),  # at most the row of items
+        dict(stage="gemm_logits", group_m=0),
+        dict(
+            stage="gemm_dx_s", k_slices=4, hidden=7168
+        ),  # H % 512 = 0 but V % 512 != 0 -> K steps OK, N OK
+    ):
+        kw = dict(hidden=H, vocab=V, rows_c=4096)
+        kw.update(bad)
+        stage = kw.pop("stage")
+        if stage == "gemm_dx_s" and kw.get("hidden") == 7168:
+            assert gs(stage, g, **kw)["ldc"] == 7168  # admissible: not an error
+            continue
+        with pytest.raises(ValueError):
+            gs(stage, g, **kw)
+    with pytest.raises(ValueError):
+        gs("gemm_dx", g, hidden=6144 + 256, vocab=V, rows_c=4096)  # H % dx_item_cols
+    with pytest.raises(ValueError):
+        gs(
+            "gemm_logits", g, hidden=H, vocab=V + 128, rows_c=4096
+        )  # V % logits_item_cols
+    with pytest.raises(ValueError):
+        gs(
+            "gemm_dx_s", g, hidden=H, vocab=128, rows_c=4096, k_slices=4
+        )  # 4 slices over 2 K steps
+    with pytest.raises(ValueError):
+        gs("row_grad", g, hidden=H, vocab=V, rows_c=4096)
 
 
 def test_instance_rules_mirror_the_launchers():
@@ -1240,12 +1422,6 @@ def test_instance_rules_mirror_the_launchers():
     assert cake_backend.raster_variant(8192, 4096, None) is None
     assert cake_backend.raster_variant(8192, 4096, "sm_90a") is None
     assert cake_backend.raster_variant(6144, 8192, "sm_90a") is None
-    assert cake_backend._dw_raster_groups("sm_103a", 6144) == (None, 16)
-    assert cake_backend._dw_raster_groups("sm_100a", 6144) == (None, 16)
-    assert cake_backend._dw_raster_groups("sm_103a", 7168) == (None, 32)
-    assert cake_backend._dw_raster_groups("sm_103a", None) == (
-        None,
-    ) and cake_backend._dw_raster_groups(None, 6144) == (None,)
     g = Geometry.from_record(None)
     rule = cake_backend.dx_tile_rule
     assert (
@@ -1295,21 +1471,24 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
     for i, (_, rows_c) in enumerate(plan.chunks):
         v = plan.variants_of(i)
         assert (v.logits_group_m, v.dw_group_m, v.dw_epi_store) == (16, 32, None)
-        assert plan.logits_stage(i) == "gemm_logits_g16"
-        assert plan.logits_stage(i, stats=False) == "gemm_logits_nostats_g16"
+        # the raster heights are launch scalars: the base forms run every chunk
+        assert plan.logits_stage(i) == "gemm_logits"
+        assert plan.logits_stage(i, stats=False) == "gemm_logits_nostats"
         k = recommended_k_slices(rows_c, 7168, 148, 4, g, 74)
         tile = cake_backend.dx_tile_rule(rows_c, 7168, 148, k, g)
         assert plan.dx_slices_of(i) == k
         assert plan.dx_stage_of(i) == cake_backend.stage_variant(
-            "gemm_dx", k_slices=k, tile_n=tile
+            "gemm_dx", sliced=k > 1, tile_n=tile
         )
-    assert all(plan.dw_acc_stage(i) == "gemm_dw_acc_g32" for i in range(3))
-    assert plan.dw_cast_stage == "gemm_dw_cast_bf16_g32"
-    assert "gemm_logits" not in plan.stages and "gemm_dw_acc" not in plan.stages
+    assert all(plan.dw_acc_stage(i) == "gemm_dw_acc" for i in range(3))
+    assert plan.dw_cast_stage == "gemm_dw_cast_bf16"
+    assert "gemm_dw_acc_gn" not in plan.stages and "gemm_logits_mcnt" not in plan.stages
+    with pytest.raises(IndexError):
+        plan.logits_stage(4)
     assert {
-        "gemm_logits_g16",
-        "gemm_dw_acc_g32",
-        "gemm_dw_cast_bf16_g32",
+        "gemm_logits",
+        "gemm_dw_acc",
+        "gemm_dw_cast_bf16",
         "row_finalize",
         "loss_reduce",
         "row_grad",
@@ -1321,8 +1500,8 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         for k in cake_backend.forward_keys(plan)
         if k[1] == 0 and k[0].startswith("gemm")
     ]
-    assert first == ["gemm_logits_g16", plan.dx_stage_of(0), "gemm_dw_acc_g32"]
-    assert cake_backend.cast_keys(plan)[-1] == ("gemm_dw_cast_bf16_g32", 3)
+    assert first == ["gemm_logits", plan.dx_stage_of(0), "gemm_dw_acc"]
+    assert cake_backend.cast_keys(plan)[-1] == ("gemm_dw_cast_bf16", 3)
     logprob = cake_backend.make_plan(
         _problem(16231, 7168, 129280, 4096, entry="logprob"),
         need_dx=True,
@@ -1340,10 +1519,11 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         if k[1] == 3 and k[0].startswith("gemm")
     ]
     assert recompute == [
-        "gemm_logits_nostats_g16",
+        "gemm_logits_nostats",
         logprob.dx_stage_of(3),
-        "gemm_dw_cast_bf16_g32",
+        "gemm_dw_cast_bf16",
     ]
+    assert logprob.variants_of(3).dw_group_m == 32
     # the default geometry: the blocked weight-gradient raster at the 4096-row chunk, the default raster elsewhere; a
     # one-row tail takes the K-sliced narrow dX tile
     g0 = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
@@ -1360,26 +1540,26 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
     )
     assert tail.chunks == ((0, 4096), (4096, 1))
     assert (
-        tail.logits_stage(0) == "gemm_logits_g16"  # 32 row tiles: the logits raster
-        and tail.logits_stage(1) == "gemm_logits"
-        and tail.dw_acc_stage(0) == "gemm_dw_acc_gn12"
+        tail.variants_of(0).logits_group_m == 16  # 32 row tiles: the logits raster
+        and tail.variants_of(1).logits_group_m is None
+        and tail.dw_acc_stage(0) == "gemm_dw_acc_gn"
+        and tail.variants_of(0).dw_group_n == 12
     )
     assert tail.dw_cast_stage == "gemm_dw_cast_bf16"
     assert (
-        tail.dx_slices_of(0) == 4 and tail.dx_stage_of(0) == "gemm_dx_s4"
+        tail.dx_slices_of(0) == 4 and tail.dx_stage_of(0) == "gemm_dx_s"
     )  # 16 x 12 x 4 = 768 wide items
     assert (
-        tail.dx_slices_of(1) == 3 and tail.dx_stage_of(1) == "gemm_dx_s3_tn256"
+        tail.dx_slices_of(1) == 3 and tail.dx_stage_of(1) == "gemm_dx_s_tn256"
     )  # 1 x 12 x 3 = 36 < 74 pairs
     assert tail.stages == (
         "gemm_logits",
-        "gemm_logits_g16",
         "row_finalize",
         "loss_reduce",
         "row_grad",
-        "gemm_dx_s4",
-        "gemm_dx_s3_tn256",
-        "gemm_dw_acc_gn12",
+        "gemm_dx_s",
+        "gemm_dx_s_tn256",
+        "gemm_dw_acc_gn",
         "gemm_dw_cast_bf16",
         "scale_cast_bf16",
     )
@@ -1394,7 +1574,8 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
     )
     assert big.chunks == ((0, 8192), (8192, 8192))
     assert (
-        big.dw_acc_stage(0) == "gemm_dw_acc_g32"
+        big.dw_acc_stage(0) == "gemm_dw_acc"
+        and big.variants_of(0).dw_group_m == 32
         and big.dw_cast_stage == "scale_cast_bf16"
     )
     # the default geometry's long chunks (more than 4096 rows): the taller weight-gradient raster (group_m 16) in the
@@ -1409,12 +1590,13 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
     )
     assert long_chunks.chunks == ((0, 8192), (8192, 1))
     assert (
-        long_chunks.dw_acc_stage(0) == "gemm_dw_acc_g16"
-        and long_chunks.dw_acc_stage(1) == "gemm_dw_acc"
+        long_chunks.variants_of(0).dw_group_m == 16
+        and long_chunks.variants_of(1).dw_group_m is None
+        and long_chunks.dw_acc_stage(0) == long_chunks.dw_acc_stage(1) == "gemm_dw_acc"
     )
     assert (
-        long_chunks.logits_stage(0) == "gemm_logits_g16"
-        and long_chunks.logits_stage(1) == "gemm_logits"
+        long_chunks.variants_of(0).logits_group_m == 16
+        and long_chunks.variants_of(1).logits_group_m is None
     )  # the 8192-row chunk takes the logits raster (64 row tiles), the 1-row tail the default
     assert (
         long_chunks.variants_of(0).dw_group_m,
@@ -1429,7 +1611,7 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
             num_sms=160,
             arch="sm_103a",
         ).dw_acc_stage(1)
-        == "gemm_dw_acc_gn12"
+        == "gemm_dw_acc_gn"
     )  # SM103 at the C 4096 chunk: the 2-D blocked raster
     assert (
         cake_backend.make_plan(
@@ -1440,7 +1622,7 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
             num_sms=148,
             arch="sm_100a",
         ).dw_acc_stage(1)
-        == "gemm_dw_acc_gn12"
+        == "gemm_dw_acc_gn"
     )  # SM100 as well: the 2-D blocked raster at the C 4096 chunk
     assert (
         cake_backend.make_plan(
@@ -1450,8 +1632,10 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
             geometry=g0,
             num_sms=148,
             arch="sm_100a",
-        ).dw_acc_stage(0)
-        == "gemm_dw_acc_g16"
+        )
+        .variants_of(0)
+        .dw_group_m
+        == 16
     )  # SM100 too: the long-chunk rule is the same on both architectures
     one = cake_backend.make_plan(
         _problem(8192, 6144, 154880, 8192),
@@ -1463,13 +1647,17 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         arch="sm_103a",
     )
     assert one.stages == (
-        "gemm_logits_g16",
+        "gemm_logits",
         "row_finalize",
         "loss_reduce",
         "row_grad",
-        "gemm_dw_cast_bf16_g16",
+        "gemm_dw_cast_bf16",
     )
-    assert one.dw_cast_stage == "gemm_dw_cast_bf16_g16"
+    assert one.dw_cast_stage == "gemm_dw_cast_bf16"
+    assert (one.variants_of(0).logits_group_m, one.variants_of(0).dw_group_m) == (
+        16,
+        16,
+    )
     deferred_tail = cake_backend.make_plan(
         _problem(16231, 6144, 154880, 8192),
         need_dx=False,
@@ -1481,8 +1669,10 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
     )
     assert deferred_tail.chunks == ((0, 8192), (8192, 8039))
     assert (
-        deferred_tail.dw_acc_stage(0) == "gemm_dw_acc_g16"
-        and deferred_tail.dw_cast_stage == "gemm_dw_cast_bf16_g16"
+        deferred_tail.dw_acc_stage(0) == "gemm_dw_acc"
+        and deferred_tail.variants_of(0).dw_group_m == 16
+        and deferred_tail.dw_cast_stage == "gemm_dw_cast_bf16"
+        and deferred_tail.variants_of(1).dw_group_m == 16
     )
     assert (
         cake_backend.make_plan(
@@ -1493,8 +1683,10 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
             num_sms=148,
             fuse_dw_cast=True,
             arch="sm_100a",
-        ).dw_cast_stage
-        == "gemm_dw_cast_bf16_g16"
+        )
+        .variants_of(0)
+        .dw_group_m
+        == 16
     )  # one chunk of 8192 rows: the long-chunk raster in the fused cast on SM100 as well
     # the default geometry's long chunks with dX: the 3-deep operand ring of the 512-wide tile, both architectures
     for arch, sms, resident in (("sm_103a", 160, 80), ("sm_100a", 148, 74)):
@@ -1514,7 +1706,7 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
             k = recommended_k_slices(rows_c, 6144, sms, 4, g0, resident)
             tile = cake_backend.dx_tile_rule(rows_c, 6144, sms, k, g0, arch)
             assert ring.dx_stage_of(i) == cake_backend.stage_variant(
-                "gemm_dx", k_slices=k, tile_n=tile, stages=3 if tile == 512 else None
+                "gemm_dx", sliced=k > 1, tile_n=tile, stages=3 if tile == 512 else None
             )
             if tile == 512:
                 assert ring.dx_stage_of(i).endswith("_st3")
@@ -1525,7 +1717,7 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
             assert (
                 ring.variants_of(i).dw_group_n is None
             )  # above 4096 rows: the raster rule, not the block
-        assert ring.dw_acc_stage(0) == "gemm_dw_acc_g16"
+        assert ring.variants_of(0).dw_group_m == 16
         pinned_ring = cake_backend.make_plan(
             _problem(16231, 6144, 154880, 8192),
             gemm_tuning={"dx": {"stages": 4}},
@@ -1542,7 +1734,7 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
     # the default geometry's C 4096 chunks on both architectures: the blocked weight-gradient raster in the accumulate
     # and in the fp32 fused cast; the bf16 cast keeps the 1-D raster; a pinned ``group_n`` (0 or null) keeps the default
     for dtype, cast in (
-        (torch.float32, "gemm_dw_cast_f32_gn12"),
+        (torch.float32, "gemm_dw_cast_f32_gn"),
         (torch.bfloat16, "gemm_dw_cast_bf16"),
     ):
         for arch, sms, resident in (("sm_100a", 148, 74), ("sm_103a", 160, 80)):
@@ -1563,7 +1755,7 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
                 (8192, 4096),
                 (12288, 3943),
             )
-            assert all(blocked.dw_acc_stage(i) == "gemm_dw_acc_gn12" for i in range(4))
+            assert all(blocked.dw_acc_stage(i) == "gemm_dw_acc_gn" for i in range(4))
             assert all(blocked.variants_of(i).dw_group_n == 12 for i in range(4))
             assert all(
                 not s.endswith("_st3") for s in blocked.stages
@@ -1653,17 +1845,22 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
     )
     assert (
         pinned.logits_stage(0) == "gemm_logits"
+        and pinned.variants_of(0).logits_group_m is None
         and pinned.dw_acc_stage(0) == "gemm_dw_acc"
+        and pinned.variants_of(0).dw_group_m is None
     )
     assert pinned.dw_cast_stage == "gemm_dw_cast_bf16"
-    assert all(pinned.dx_stage_of(i) == "gemm_dx_s2_tn256" for i in range(4))
+    assert all(
+        pinned.dx_stage_of(i) == "gemm_dx_s_tn256" and pinned.dx_slices_of(i) == 2
+        for i in range(4)
+    )
     partial = cake_backend.make_plan(problem, gemm_tuning={"dx": {"k_slices": 2}}, **kw)
     assert (
-        partial.logits_stage(0) == "gemm_logits_g16"
+        partial.variants_of(0).logits_group_m == 16
     )  # the rules still decide the knobs not named
-    assert partial.dw_acc_stage(0) == "gemm_dw_acc_g32"
-    assert all(
-        s.startswith("gemm_dx_s2") for s in partial.stages if s.startswith("gemm_dx")
+    assert partial.variants_of(0).dw_group_m == 32
+    assert all(partial.dx_slices_of(i) == 2 for i in range(4)) and all(
+        s.startswith("gemm_dx_s") for s in partial.stages if s.startswith("gemm_dx")
     )
     # a present ``null`` pins the default form -- one dX slice, the base ``gemm_dx`` stage -- like every other
     # pinned knob; an absent knob keeps the slice rule
@@ -1675,7 +1872,7 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
         assert one.dx_slices_of(i) == 1
         assert one.dx_stage_of(i) == cake_backend.stage_variant(
             "gemm_dx",
-            k_slices=1,
+            sliced=False,
             tile_n=cake_backend.dx_tile_rule(rows_c, 7168, 148, 1, g, "sm_100a"),
         )
         assert ruled.dx_slices_of(i) == unpinned.dx_slices_of(i)
@@ -1693,14 +1890,18 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
     assert (
         cake_backend.make_plan(
             long_problem, gemm_tuning={"dw": {"group_m": None}}, **long_kw
-        ).dw_acc_stage(0)
-        == "gemm_dw_acc"
+        )
+        .variants_of(0)
+        .dw_group_m
+        is None
     )
     assert (
         cake_backend.make_plan(
             long_problem, gemm_tuning={"dw": {"epi_store": None}}, **long_kw
-        ).dw_acc_stage(0)
-        == "gemm_dw_acc_g16"
+        )
+        .variants_of(0)
+        .dw_group_m
+        == 16
     )
     assert (
         cake_backend.make_plan(
@@ -1711,8 +1912,10 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
     assert (
         cake_backend.make_plan(
             long_problem, gemm_tuning={"dw": {"group_m": 32}}, **long_kw
-        ).dw_acc_stage(0)
-        == "gemm_dw_acc_g32"
+        )
+        .variants_of(0)
+        .dw_group_m
+        == 32
     )
     wide = cake_backend.make_plan(problem, gemm_tuning={"dx": {"tile_n": 512}}, **kw)
     assert all(not s.endswith("_tn256") for s in wide.stages)
@@ -1890,82 +2093,42 @@ def test_reachable_variants_complete_the_rule_closure():
         | set(stages_for_entry("loss", grad_weight_dtype=torch.float32))
         | set(stages_for_entry("logprob"))
     )
-    glm = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
-    wide = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
     rv = cake_backend.reachable_variants
-    dx_all = {
+    dx_forms = {
         "gemm_dx",
-        "gemm_dx_s2",
-        "gemm_dx_s3",
-        "gemm_dx_s4",
+        "gemm_dx_s",
         "gemm_dx_tn256",
-        "gemm_dx_s2_tn256",
-        "gemm_dx_s3_tn256",
-        "gemm_dx_s4_tn256",
+        "gemm_dx_s_tn256",
+        "gemm_dx_st3",
+        "gemm_dx_s_st3",
     }
-    glm_dw = {
-        "gemm_dw_acc",
-        "gemm_dw_acc_g16",
-        "gemm_dw_cast_bf16_g16",
-        "gemm_dw_cast_f32_g16",
-    }
-    glm_dx_st3 = {"gemm_dx_st3", "gemm_dx_s2_st3", "gemm_dx_s3_st3", "gemm_dx_s4_st3"}
-    glm_dw_gn12 = {"gemm_dw_acc_gn12", "gemm_dw_cast_f32_gn12"}
-    glm_logits = {
-        "gemm_logits_g16",
-        "gemm_logits_nostats_g16",
-        # the device-count forms of the hidden valid-row count (the default raster and the rule's height)
-        "gemm_logits_mcnt",
-        "gemm_logits_nostats_mcnt",
-        "gemm_logits_mcnt_g16",
-        "gemm_logits_nostats_mcnt_g16",
-    }  # the 31-row-tile logits raster
+    dw_forms = {"gemm_dw_acc_gn", "gemm_dw_cast_f32_gn"}
+    logits_forms = {"gemm_logits_mcnt", "gemm_logits_nostats_mcnt"}
+    # the forms are structural: the same set on both architectures at every geometry (H / V, the slice count, the
+    # raster height and the block width are launch scalars of these kernels)
+    assert rv(bases, "sm_100a", 4) == dx_forms | dw_forms | logits_forms
+    assert rv(bases, "sm_103a", 4) == rv(bases, "sm_100a", 4)
+    assert rv(bases, "sm_100a", 2) == rv(bases, "sm_100a", 4)
+    # a record without the K-sliced form serves one slice: the plain dX forms only
     assert (
-        rv(bases, "sm_100a", glm, 4)
-        == dx_all | glm_dx_st3 | glm_dw | glm_dw_gn12 | glm_logits
+        rv(bases, "sm_100a", 1)
+        == {"gemm_dx", "gemm_dx_tn256", "gemm_dx_st3"} | dw_forms | logits_forms
     )
-    # the default geometry: the long-chunk raster of the weight-gradient GEMMs, the dX ring rule and the 2-D blocked
-    # weight-gradient raster on both architectures (no epilogue rule)
-    assert rv(bases, "sm_103a", glm, 4) == rv(bases, "sm_100a", glm, 4)
-    assert rv(bases, "sm_100a", wide, 4) - rv(bases, "sm_100a", glm, 4) == {
-        "gemm_dw_acc_g32",
-        "gemm_dw_cast_bf16_g32",
-        "gemm_dw_cast_f32_g32",
-    }
-    assert glm_logits <= rv(
-        bases, "sm_100a", wide, 4
-    )  # the same logits raster forms on both geometry classes
-    assert rv(bases, "sm_103a", wide, 4) == rv(bases, "sm_100a", wide, 4)
+    assert rv({"row_grad", "scale_cast_bf16"}, "sm_103a", 4) == set()
+    # an architecture without the ring / block rules reaches neither form
     assert (
-        rv(bases, "sm_100a", glm, 2)
-        == {
-            "gemm_dx",
-            "gemm_dx_s2",
-            "gemm_dx_tn256",
-            "gemm_dx_s2_tn256",
-            "gemm_dx_st3",
-            "gemm_dx_s2_st3",
-        }
-        | glm_dw
-        | glm_dw_gn12
-        | glm_logits
+        rv(bases, "sm_90a", 4)
+        == {"gemm_dx", "gemm_dx_s", "gemm_dx_tn256", "gemm_dx_s_tn256"} | logits_forms
     )
-    assert rv({"row_grad", "scale_cast_bf16"}, "sm_103a", wide, 4) == set()
-    # every name of STAGES is a base stage or a variant some record can reach
+    # every name of STAGES is a base stage or a form some record can reach
     assert set(cake_jit.STAGES) == set(cake_jit.BASE_STAGES) | rv(
-        bases, "sm_103a", wide, 4
-    ) | rv(bases, "sm_100a", wide, 4) | rv(bases, "sm_103a", glm, 4)
-    assert len(cake_jit.STAGES) == 39
-    unpinned = Geometry.from_record(None)
+        bases, "sm_103a", 4
+    ) | rv(bases, "sm_100a", 4)
+    assert len(cake_jit.STAGES) == 23
     assert (
-        rv(bases, "sm_100a", unpinned, 4)
-        == dx_all
-        | {
-            "gemm_dw_acc",
-            "gemm_logits_mcnt",
-            "gemm_logits_nostats_mcnt",
-        }
-    )  # no pinned H: no raster variants required; the device-count forms at the default raster
+        cake_backend.dx_max_slices(cake_jit.STAGES) == cake_backend.DX_K_SLICES_MAX == 4
+    )
+    assert cake_backend.dx_max_slices(("gemm_dx", "gemm_dx_tn256")) == 1
 
 
 def test_cluster_resident_rule():
@@ -2066,7 +2229,15 @@ def test_stage_values_names():
             v["M"] == rows_c
             and v["m_tiles"] % 2 == 0
             and v["m_tiles"] >= -(-rows_c // 128)
-            and v["k_iters"] == 1
+            and v["k_iters"] == H_HOST // 64
+        )
+        # the launch scalars of the geometry-free kernels (``gemm_scalars``): the output's leading dimension, one K
+        # slice, the default raster height and the whole row of column items
+        assert (
+            v["ldc"] == V_HOST
+            and (v["k_slices"], v["k_slice_iters"]) == (1, v["k_iters"])
+            and v["group_m"] == plan.geometry.logits_group_m
+            and v["group_n"] == V_HOST // plan.geometry.logits_item_cols
         )
         dx = stage_values("gemm_dx", t, plan, index)
         assert dx["A"].data_ptr() == t["logits"].data_ptr() and tuple(
@@ -2077,11 +2248,25 @@ def test_stage_values_names():
             and dx["M"] == rows_c
             and dx["first_chunk"] == 1
         )  # stores its rows
+        assert (
+            (dx["k_iters"], dx["k_slices"], dx["k_slice_iters"])
+            == (V_HOST // 64, 1, V_HOST // 64)
+            and dx["ldc"] == H_HOST
+            and dx["ws_slab"] == 0
+            and (dx["group_m"], dx["group_n"])
+            == (plan.geometry.dx_group_m, H_HOST // plan.geometry.dx_item_cols)
+        )
         dw = stage_values("gemm_dw_acc", t, plan, index)
         assert (
             dw["M"] == V_HOST
             and dw["k_iters"] == -(-rows_c // 64)
             and dw["C"] is t["dw_acc"]
+        )
+        assert (
+            dw["ldc"] == H_HOST
+            and (dw["k_slices"], dw["k_slice_iters"]) == (1, dw["k_iters"])
+            and (dw["group_m"], dw["group_n"])
+            == (plan.geometry.dw_group_m, H_HOST // plan.geometry.dw_item_cols)
         )
         assert dw["first_chunk"] == int(index == 0)
         assert (
@@ -3229,23 +3414,24 @@ def test_hidden_count_plan_keys():
     )
     assert not plain.hidden_count and hidden.hidden_count and hidden.hidden_stats
     assert hidden.chunks == plain.chunks == ((0, 4096), (4096, 4096), (8192, 73))
-    # the buffer extent min(C, T) = 4096 rows takes the long logits raster: the device-count form at g16
+    # the buffer extent min(C, T) = 4096 rows takes the long logits raster: the device-count form with group_m 16 as
+    # a launch scalar
     assert hidden.hidden_logits_group_m == 16
-    assert hidden.hidden_logits_stage() == "gemm_logits_mcnt_g16"
+    assert hidden.hidden_logits_stage() == "gemm_logits_mcnt"
     keys, plain_keys = (
         cake_backend.forward_keys(hidden),
         cake_backend.forward_keys(plain),
     )
     assert plain_keys[:3] == (
         ("gather_rows", 0),
-        ("gemm_logits_g16", 0),
+        ("gemm_logits", 0),
         ("row_finalize", 0),
     )
     assert keys == plain_keys[2:]  # chunk 0's gather and logits GEMM are already queued
-    assert ("gather_rows", 1) in keys and ("gemm_logits_g16", 1) in keys
+    assert ("gather_rows", 1) in keys and ("gemm_logits", 1) in keys
     assert set(hidden.stages) == set(plain.stages) | {
         "gather_rows_bf16",
-        "gemm_logits_mcnt_g16",
+        "gemm_logits_mcnt",
     }
     assert list(hidden.stages) == [s for s in cake_jit.STAGES if s in hidden.stages]
     assert cake_backend.cast_keys(hidden) == cake_backend.cast_keys(plain)
@@ -3263,16 +3449,17 @@ def test_hidden_count_plan_keys():
     assert prk[:3] == (
         ("gather_rows", "d_in"),
         ("gather_rows", 0),
-        ("gemm_logits_nostats_g16", 0),
+        ("gemm_logits_nostats", 0),
     )
     assert rk == prk[:1] + prk[3:]
-    assert lp.hidden_logits_stage() == "gemm_logits_nostats_mcnt_g16"
-    assert "gemm_logits_nostats_mcnt_g16" in lp.stages
+    assert lp.hidden_logits_stage() == "gemm_logits_nostats_mcnt"
+    assert "gemm_logits_nostats_mcnt" in lp.stages
     # every row valid: the uncompacted plan with chunk 0's GEMM skipped; 1500 rows take the default raster
     full = cake_backend.make_plan(
         _problem(1500, 6144, 154880, 4096), arch="sm_100a", hidden_count=True, **common
     )
     assert not full.compact and full.hidden_logits_stage() == "gemm_logits_mcnt"
+    assert full.hidden_logits_group_m is None  # 1500 rows: the default raster height
     assert cake_backend.forward_keys(full)[0] == ("row_finalize", 0)
     assert cake_backend.forward_keys(replace(full, hidden_count=False))[0] == (
         "gemm_logits",
@@ -3286,7 +3473,8 @@ def test_hidden_count_plan_keys():
 
 def test_hidden_count_eligibility_rules(monkeypatch):
     """A compacted call runs the hidden valid-row count only with a registered program that carries the gather kernel
-    and the device-count form of chunk 0's logits GEMM at the buffer extent's raster, a call of three or more chunks
+    and the device-count form of chunk 0's logits GEMM (its raster height at the buffer extent is a launch scalar), a
+    call of three or more chunks
     (``HIDDEN_COUNT_MIN_CHUNKS``: one- and two-chunk calls cannot hide the path's fixed host cost behind chunk 0's GEMM
     and take the previous path), ``T > 0``, an ``X`` the GEMM reads in place (no contiguous copy, a 16-byte-aligned
     base) and a toolchain whose sm_103a code runs it (not nvcc 13.0.x)."""
@@ -3308,7 +3496,6 @@ def test_hidden_count_eligibility_rules(monkeypatch):
         "row_grad",
         "gather_rows_bf16",
         "gemm_logits_mcnt",
-        "gemm_logits_mcnt_g16",
         "gemm_logits_nostats_mcnt",
     )
     monkeypatch.setitem(cake_jit.MODULES, name, full)
@@ -3316,14 +3503,12 @@ def test_hidden_count_eligibility_rules(monkeypatch):
         16, 6144, dtype=torch.bfloat16
     )  # host tensor: the rule reads the pointer only
     p = _problem(12289, 6144, 154880, 4096)  # four chunks, buffer extent 4096 rows
-    assert elig(p, X, full, name, stats=True)  # the g16 device-count form is registered
-    assert not elig(
-        p, X, full, name, stats=False
-    )  # the long-raster recompute form is missing
+    assert elig(p, X, full, name, stats=True)
+    assert elig(p, X, full, name, stats=False)  # the recompute's device-count form
     short = _problem(
         3100, 6144, 154880, 1024
-    )  # four chunks, buffer extent 1024 rows: the default raster
-    assert elig(short, X, full, name, stats=False)
+    )  # four chunks, buffer extent 1024 rows: the default raster height (a launch scalar of the same form)
+    assert elig(short, X, full, name, stats=True)
     # the chunk rule: a call of fewer than three chunks takes the previous path whatever the program carries
     assert not elig(
         _problem(1500, 6144, 154880, 4096), X, full, name, stats=True
@@ -3352,13 +3537,15 @@ def test_hidden_count_eligibility_rules(monkeypatch):
     assert not elig(p, misaligned, full, name, stats=True)
     aligned = torch.empty(n + 8, dtype=torch.bfloat16)[8 : 8 + n].view(16, 6144)
     assert aligned.data_ptr() % 16 == 0 and elig(p, aligned, full, name, stats=True)
-    without_gather = record("row_grad", "gemm_logits_mcnt", "gemm_logits_mcnt_g16")
+    without_gather = record("row_grad", "gemm_logits_mcnt", "gemm_logits_nostats_mcnt")
     monkeypatch.setitem(cake_jit.MODULES, name, without_gather)
     assert not elig(p, X, without_gather, name, stats=True)
-    without_long = record("row_grad", "gather_rows_bf16", "gemm_logits_mcnt")
-    monkeypatch.setitem(cake_jit.MODULES, name, without_long)
-    assert not elig(p, X, without_long, name, stats=True)
-    assert elig(short, X, without_long, name, stats=True)
+    stats_only = record("row_grad", "gather_rows_bf16", "gemm_logits_mcnt")
+    monkeypatch.setitem(cake_jit.MODULES, name, stats_only)
+    assert elig(p, X, stats_only, name, stats=True)
+    assert not elig(
+        p, X, stats_only, name, stats=False
+    )  # the recompute's device-count form is missing
     sm_103a = dict(full, arch="sm_103a")
     monkeypatch.setitem(cake_jit.MODULES, name, sm_103a)
     assert elig(short, X, sm_103a, name, stats=True)  # the same rules on sm_103a
@@ -5201,7 +5388,7 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
     # the prepared runner: the deferred chunk's dz stays in the workspace between forward() and backward()
     workspace = torch.empty(
         cake_backend.lm_head_loss_workspace_size(
-            inp.T, inp.V, 2048, inp.X.device, compact_rows=True
+            inp.T, inp.V, 2048, inp.X.device, hidden=inp.H, compact_rows=True
         ),
         dtype=torch.uint8,
         device=inp.X.device,
@@ -5473,14 +5660,12 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
         torch.cuda.synchronize()
         assert torch.equal(hc.logits[:n0], runner.tensors["logits"][:n0])
         assert torch.equal(hc.stats_buf[:n0], runner.tensors["stats"][:n0])
-        assert hc.stage == cake_backend.stage_variant(
-            "gemm_logits",
-            count=True,
-            group_m=cake_backend.parse_stage(runner.plan.logits_stage(0))[1]["group_m"]
+        assert hc.stage == "gemm_logits_mcnt"
+        raster0 = cake_backend.raster_variant(DEFAULT_H, hc.rows0, record["arch"])
+        assert hc.group_m == (
+            runner.plan.variants_of(0).logits_group_m
             if n0 == hc.rows0
-            else cake_backend.raster_variant(DEFAULT_H, hc.rows0, record["arch"])[0]
-            if cake_backend.raster_variant(DEFAULT_H, hc.rows0, record["arch"])
-            else None,
+            else (raster0[0] if raster0 else None)
         )
 
 

@@ -192,7 +192,7 @@ GEOMETRY_DEFAULTS: dict[str, Any] = dict(
     hidden_multiple=256,  # H % hidden_multiple == 0
     ld_multiple=8,  # row stride of X in elements (16 B TMA pitch)
     labels_dtype="int64",  # element type the row kernels read (``int32`` = one host cast per call)
-    hidden=None,  # the GEMM instances are specialized to one H (None = any multiple of hidden_multiple)
+    hidden=None,  # a record pinned to one H (None = any multiple of hidden_multiple: the kernels take H as a launch scalar)
     vocab=None,  # ... and one V (None = any multiple of vocab_multiple)
     # CTAs per thread-block cluster of each GEMM (the cluster takes adjacent row tiles, so ``m_tiles`` rounds up to it;
     # 2 = the CTA pair, 4 = two pairs sharing the B operand by multicast).  Checked against the module's launch cluster:
@@ -201,6 +201,16 @@ GEOMETRY_DEFAULTS: dict[str, Any] = dict(
     logits_cluster_ctas=2,
     dx_cluster_ctas=2,
     dw_cluster_ctas=2,
+    # Output columns of one work item of each GEMM (the accumulator tile times the item's column tiles): ``N`` must be a
+    # multiple of it, ``N // item columns`` is the kernel's column-item count and the default ``group_n`` (the 1-D raster).
+    # A record declares its kernels' widths; the defaults (one 256-column tile) are the reference path's geometry.
+    logits_item_cols=256,
+    dx_item_cols=256,
+    dw_item_cols=256,
+    # Default raster height of each GEMM in row tiles (the ``group_m`` launch scalar when no rule or explicit knob sets one).
+    logits_group_m=32,
+    dx_group_m=16,
+    dw_group_m=8,
 )
 LABEL_DTYPES = {"int64": torch.int64, "int32": torch.int32}
 _GEOMETRY_OPTIONAL = ("hidden", "vocab")
@@ -213,10 +223,12 @@ _GEOMETRY_OPTIONAL = ("hidden", "vocab")
 # vectors ``labels`` / ``lse`` / ``logp`` / ``infer_logp`` / ``loss_weights`` /
 # ``d_in`` (indexed by ``row0 + r``), chunk-local ``d`` / ``term`` (``[C]``), the
 # ``loss_acc`` / ``loss_out`` cells and, for the casts, ``acc`` / ``g`` / ``out``.
-# Scalars: ``M`` / ``m_tiles`` / ``k_iters`` / ``first_chunk`` of the GEMMs,
-# ``rows_c`` / ``row0`` / ``V`` / ``num_tiles`` / ``mode`` / ``loss_div`` /
-# ``last_chunk`` / ``d_off`` of the row kernels, ``num_vecs`` of the casts, and
-# ``T`` / ``H`` / ``C`` for grid rules.
+# Scalars: the GEMM launch scalars ``GEMM_SCALARS`` (``M`` / ``m_tiles`` /
+# ``k_iters`` / ``first_chunk`` / ``ws_slab`` and the geometry ``ldc``, the K
+# slicing ``k_slices`` / ``k_slice_iters``, the raster ``group_m`` / ``group_n``:
+# :func:`gemm_scalars`), ``rows_c`` / ``row0`` / ``V`` / ``num_tiles`` / ``mode``
+# / ``loss_div`` / ``last_chunk`` / ``d_off`` of the row kernels, ``num_vecs`` of
+# the casts, and ``T`` / ``H`` / ``C`` for grid rules.
 STAGE_TENSORS = {
     **{stage: ("A", "B", "C", "STATS_OUT", "WS") for stage in GEMM_STAGES},
     "row_finalize": (
@@ -255,14 +267,33 @@ COMMON_SCALARS = (
     "d_off",
     "ws_slab",
 )
-# K-sliced forms of the dX GEMM: ``gemm_dx_s<S>`` runs ``S`` K-slice work items per output tile (a
-# persistent grid with ``S`` x more items fills the last wave); slice 0 writes ``dX_acc``, slice ``s >= 1``
-# writes slab ``s - 1`` of the FP32 workspace ``WS [S - 1, rows, H]`` (``ws_slab`` = elements between
+# Launch scalars of every GEMM stage (:func:`gemm_scalars`): ``M`` / ``m_tiles`` (output rows and their row tiles,
+# rounded up to the cluster), ``k_iters`` (K steps of ``k_block``), ``first_chunk`` (store instead of accumulate),
+# ``ws_slab`` (elements between the K-slice slabs of ``WS``), ``ldc`` (the output's leading dimension: V of the logits
+# GEMM, H of the dX and weight-gradient GEMMs), ``k_slices`` / ``k_slice_iters`` (K-slice work items per tile and the K
+# steps of one), ``group_m`` (raster height in row tiles) and ``group_n`` (raster block width in column ITEMS: the whole
+# row of items for the 1-D raster).  The generated kernels take the call geometry through them, so one record serves
+# every admissible (H, V).
+GEMM_SCALARS = (
+    "M",
+    "m_tiles",
+    "k_iters",
+    "first_chunk",
+    "ws_slab",
+    "ldc",
+    "k_slices",
+    "k_slice_iters",
+    "group_m",
+    "group_n",
+)
+# K-sliced form of the dX GEMM: ``gemm_dx_s`` runs ``k_slices`` K-slice work items per output tile (a
+# persistent grid with ``k_slices`` x more items fills the last wave; the count and the slice length
+# ``k_slice_iters`` are launch scalars, 2 .. ``DX_K_SLICES_MAX``); slice 0 writes ``dX_acc``, slice ``s >= 1``
+# writes slab ``s - 1`` of the FP32 workspace ``WS [k_slices - 1, rows, H]`` (``ws_slab`` = elements between
 # slabs) and the host adds the slabs into ``dX_acc`` in fixed slab order (one RN add per element per
-# slab, no atomics).  A record registers a contiguous prefix of these; the slice count of a chunk is
-# chosen from its row count and the SM count (:func:`recommended_k_slices`).  ``WS`` of the other
-# GEMMs is an unused 16-float dummy (``ws_slab`` 0).
-DX_SLICE_STAGES = ("gemm_dx_s2", "gemm_dx_s3", "gemm_dx_s4")
+# slab, no atomics).  The slice count of a chunk is chosen from its row count and the SM count
+# (:func:`recommended_k_slices`).  ``WS`` of the other GEMMs is an unused 16-float dummy (``ws_slab`` 0).
+DX_SLICED_STAGE = "gemm_dx_s"
 # Fused weight-gradient output: the LAST chunk's ``dz_c^T @ X_c`` GEMM run in the backward (where the upstream scalar
 # gradient ``g`` is known) with the scale and the output cast fused into its epilogue, ``C = cast(g * (WS + tile))`` --
 # or ``cast(g * tile)`` for a one-chunk plan, which then has no FP32 ``[V, H]`` accumulator at all.  ``WS`` is the FP32
@@ -288,32 +319,38 @@ HIDDEN_COUNT_STAGE = "gather_rows_bf16"
 K_SLICE_PENALTY = 0.01  # wave-efficiency score penalty per extra slab (the kernels' fitted per-slab cost share)
 
 # --------------------------------------------------------------------------- per-chunk instance rules
-# The GEMM instances of a record come in VARIANTS, one stage name per rule output, selected per chunk by the same
-# rules the production launchers of the kernel source apply (same thresholds; an explicit knob wins) -- never by the
-# shape itself, so a record built for a geometry carries exactly the variants its rules can reach:
-# * raster height (``_g<group_m>``): at H >= RASTER_RULE_MIN_HIDDEN a chunk of >= RASTER_RULE_MIN_ROWS rows runs the
+# The GEMM instances of a record come in structural FORMS -- one stage name per kernel body the generated program carries
+# (:func:`stage_variant`: the device-count logits GEMM ``_mcnt``, the K-sliced ``_s`` / narrow-tile ``_tn256`` / 3-deep-ring
+# ``_st3`` dX GEMMs, the 2-D blocked ``_gn`` weight-gradient GEMMs) -- and take the call geometry and the rules' numeric
+# outputs as LAUNCH SCALARS (:func:`gemm_scalars`: ``ldc`` / ``k_iters`` from H and V, ``k_slices`` / ``k_slice_iters``,
+# the raster height ``group_m`` and the block width ``group_n``).  The form and the scalars of a chunk are selected by the
+# same rules the production launchers of the kernel source apply (same thresholds; an explicit knob wins) -- never by the
+# shape itself, so a record carries exactly the forms its architecture's rules can reach, at every (H, V):
+# * raster height (``group_m``): at H >= RASTER_RULE_MIN_HIDDEN a chunk of >= RASTER_RULE_MIN_ROWS rows runs the
 #   logits GEMM with the shorter grouped raster and the weight-gradient GEMMs (accumulate and fused cast) with the
 #   taller one (RASTER_WIDE_GROUPS per architecture); below that H, a chunk of >= LOGITS_LONG_RASTER_MIN_ROWS rows (31
-#   row tiles of 128) runs the logits GEMM with the shorter raster (LOGITS_LONG_RASTER_GROUPS per architecture, ``_g16``)
-#   and a chunk of >= DW_LONG_CHUNK_MIN_ROWS rows runs the weight-gradient GEMMs with the long-chunk raster
-#   (DW_LONG_CHUNK_GROUP_M, ``_g16``: the same height on every supported architecture); every other chunk -- the
-#   default geometry's chunks of up to 30 row tiles, short tail chunks -- keeps the default raster.  Bitwise: the raster
-#   changes the tile order only.
+#   row tiles of 128) runs the logits GEMM with the shorter raster (LOGITS_LONG_RASTER_GROUPS per architecture) and a
+#   chunk of >= DW_LONG_CHUNK_MIN_ROWS rows runs the weight-gradient GEMMs with the long-chunk raster
+#   (DW_LONG_CHUNK_GROUP_M: the same height on every supported architecture); every other chunk -- the default
+#   geometry's chunks of up to 30 row tiles, short tail chunks -- keeps the GEMM's default height (the record geometry's
+#   ``<gemm>_group_m``).  Bitwise: the raster changes the tile order only.
 # * dX tile (``_tn256``): the 512-column pair tile unless H % 512 != 0 or the launch's wide work items would not fill
 #   the device's SM pairs (:func:`dx_tile_rule`, evaluated after the K-slice count), or -- on an architecture listed in
 #   DX_WIDE_MIN_EFF -- a one-slice launch below RASTER_RULE_MIN_HIDDEN whose wide items fill the SM pairs' waves below that
-#   floor (the badly quantized chunk tails); the K-slice forms (``_s<k>``) come from :func:`recommended_k_slices` as
-#   before.  Bitwise: the same slice boundaries and per-element K order on both tiles.
+#   floor (the badly quantized chunk tails); the slice count (the ``_s`` form with ``k_slices`` 2 .. DX_K_SLICES_MAX)
+#   comes from :func:`recommended_k_slices` as before.  Bitwise: the same slice boundaries and per-element K order on
+#   both tiles.
 # * dX operand ring (``_st3``): below RASTER_RULE_MIN_HIDDEN a chunk of >= DW_LONG_CHUNK_MIN_ROWS rows runs the 512-wide dX
 #   tile with the 3-deep operand ring (:func:`dx_stages_variant`, DX_LONG_CHUNK_STAGES per architecture); the 256-wide
 #   fallback keeps its depth.  Bitwise: the ring depth only changes when a stage is refilled.
-# * dW 2-D blocked raster (``_gn12``): below RASTER_RULE_MIN_HIDDEN a chunk of DW_BLOCK_MIN_ROWS .. DW_BLOCK_MAX_ROWS rows
-#   runs the weight-gradient accumulate and the fp32 fused cast with column blocks of DW_BLOCK_GROUPS[arch] tiles
-#   (:func:`dw_block_variant`; the bf16 cast keeps the 1-D raster).  Bitwise: a permutation of the same tiles.
+# * dW 2-D blocked raster (``_gn`` with ``group_n``): below RASTER_RULE_MIN_HIDDEN a chunk of DW_BLOCK_MIN_ROWS ..
+#   DW_BLOCK_MAX_ROWS rows runs the weight-gradient accumulate and the fp32 fused cast with column blocks of
+#   DW_BLOCK_GROUPS[arch] tiles (:func:`dw_block_variant`; the bf16 cast keeps the 1-D raster).  Bitwise: a permutation
+#   of the same tiles.
 # ``gemm_tuning`` (:func:`prepare_lm_head_loss`; ``$FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`` as JSON for the eager
 # entry points) pins knobs explicitly per GEMM -- ``{"logits": {"group_m": 16}, "dx": {"tile_n": 256, "k_slices": 2},
-# "dw": {"group_m": 32, "group_n": 0}}``; a knob given as ``None`` pins the default form -- and wins over the
-# rule for the knobs it names.  A variant the record does not register fails closed (``NotImplementedError``).
+# "dw": {"group_m": 32, "group_n": 0}}``; a knob given as ``None`` pins the default -- and wins over the rule for the
+# knobs it names.  A form the record does not register fails closed (``NotImplementedError``).
 RASTER_RULE_MIN_HIDDEN = 7168  # first H whose [rows_c, H] BF16 operand panel no longer stays L2-resident at rows_c >= 2049
 RASTER_RULE_MIN_ROWS = 2049
 RASTER_WIDE_GROUPS = {
@@ -359,7 +396,6 @@ DX_WIDE_MIN_EFF = {
 #    256-wide cluster form runs the chunk (absent = the wide tile stays)
 DX_K_SLICES_MAX = 4
 GEMM_TUNING_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING"
-_RASTER_BASES = ("gemm_logits", "gemm_logits_nostats", "gemm_dw_acc") + DW_CAST_STAGES
 _TUNING_KNOBS = {
     "logits": ("group_m",),
     "dx": ("k_slices", "tile_n", "stages"),
@@ -367,26 +403,29 @@ _TUNING_KNOBS = {
 }
 _STAGE_RE = re.compile(
     r"(?P<base>" + "|".join(sorted(BASE_STAGES, key=len, reverse=True)) + r")"
-    r"(?P<mcnt>_mcnt)?(?:_s(?P<k>[2-9]))?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?:_g(?P<group>\d+))?(?:_gn(?P<group_n>\d+))?(?P<tma>_tma)?"
+    r"(?P<mcnt>_mcnt)?(?P<s>_s)?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?P<gn>_gn)?(?P<tma>_tma)?"
 )
+STAGE_KNOBS = ("count", "sliced", "tile_n", "stages", "blocked", "epi_store")
 
 
 def stage_variant(
     base: str,
     *,
-    k_slices: int = 1,
-    tile_n: Optional[int] = None,
-    group_m: Optional[int] = None,
-    epi_store: Optional[str] = None,
-    stages: Optional[int] = None,
-    group_n: Optional[int] = None,
     count: bool = False,
+    sliced: bool = False,
+    tile_n: Optional[int] = None,
+    stages: Optional[int] = None,
+    blocked: bool = False,
+    epi_store: Optional[str] = None,
 ) -> str:
-    """Stage name of one instance variant of ``base``: the rule outputs that select it, in the fixed suffix order
-    ``_mcnt``, ``_s<k>``, ``_tn256``, ``_st<stages>``, ``_g<group_m>``, ``_gn<group_n>``, ``_tma``; a default output (the
-    host-bound row count, one slice, the wide tile, the table ring depth, no raster override, the 1-D raster, the default
-    epilogue) adds nothing, so ``stage_variant(base)`` is ``base`` itself.  ``count``: the logits GEMM whose valid-row bound
-    is read from device memory (chunk 0 of the hidden valid-row count path)."""
+    """Stage name of one structural form of ``base``: the rule outputs that select a kernel body, in the fixed suffix
+    order ``_mcnt``, ``_s``, ``_tn256``, ``_st<stages>``, ``_gn``, ``_tma``; a default output (the host-bound row count,
+    one slice, the wide tile, the table ring depth, the 1-D raster, the default epilogue) adds nothing, so
+    ``stage_variant(base)`` is ``base`` itself.  ``count``: the logits GEMM whose valid-row bound is read from device
+    memory (chunk 0 of the hidden valid-row count path); ``sliced``: the dX GEMM run as ``k_slices > 1`` K-slice work
+    items per tile; ``blocked``: the weight-gradient accumulate / fp32 fused cast on the 2-D blocked raster
+    (``group_n`` set).  The slice count, the raster height and the block width themselves are launch scalars
+    (:func:`gemm_scalars`), not part of the name."""
     if base not in BASE_STAGES:
         raise ValueError(f"unknown base stage {base!r}")
     name = base
@@ -396,12 +435,12 @@ def stage_variant(
                 f"{base}: the device-count form exists for the logits GEMMs only"
             )
         name += "_mcnt"
-    if int(k_slices) > 1:
-        if base != "gemm_dx" or not 1 <= int(k_slices) <= DX_K_SLICES_MAX:
+    if sliced:
+        if base != "gemm_dx":
             raise ValueError(
-                f"{base}: K slices ({k_slices}) exist for gemm_dx (1 .. {DX_K_SLICES_MAX}) only"
+                f"{base}: the K-slice work-item form exists for gemm_dx only"
             )
-        name += f"_s{int(k_slices)}"
+        name += "_s"
     if tile_n is not None and int(tile_n) != DX_TILE_WIDE:
         if base != "gemm_dx" or int(tile_n) != DX_TILE_NARROW:
             raise ValueError(
@@ -415,21 +454,15 @@ def stage_variant(
             or (tile_n is not None and int(tile_n) != DX_TILE_WIDE)
         ):
             raise ValueError(
-                f"{base}: the only ring-depth variant is the 512-wide dX tile's {sorted(set(DX_LONG_CHUNK_STAGES.values()))}-deep ring, got {stages} (tile {tile_n})"
+                f"{base}: the only ring-depth form is the 512-wide dX tile's {sorted(set(DX_LONG_CHUNK_STAGES.values()))}-deep ring, got {stages} (tile {tile_n})"
             )
         name += f"_st{int(stages)}"
-    if group_m is not None:
-        if base not in _RASTER_BASES:
-            raise ValueError(f"{base}: no raster-height rule")
-        name += f"_g{int(group_m)}"
-    if group_n is not None and int(group_n) != 0:
-        if base not in DW_BLOCK_BASES or int(group_n) not in set(
-            DW_BLOCK_GROUPS.values()
-        ):
+    if blocked:
+        if base not in DW_BLOCK_BASES:
             raise ValueError(
-                f"{base}: the only block-width variant is the weight-gradient accumulate's / fp32 cast's {sorted(set(DW_BLOCK_GROUPS.values()))}, got {group_n}"
+                f"{base}: the 2-D blocked raster exists for the weight-gradient accumulate and the fp32 fused cast only"
             )
-        name += f"_gn{int(group_n)}"
+        name += "_gn"
     if epi_store is not None and epi_store != "redsm":
         if base != "gemm_dw_acc" or epi_store != "tma":
             raise ValueError(
@@ -440,19 +473,18 @@ def stage_variant(
 
 
 def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
-    """``(base, {k_slices, tile_n, group_m, epi_store, stages, group_n, count})`` of a stage name (the inverse of
-    :func:`stage_variant`)."""
+    """``(base, {count, sliced, tile_n, stages, blocked, epi_store})`` of a stage name (the inverse of
+    :func:`stage_variant`; the knob keys are ``STAGE_KNOBS``)."""
     m = _STAGE_RE.fullmatch(stage)
     if m is None:
         raise ValueError(f"not a stage name of this backend: {stage!r}")
     knobs: dict[str, Any] = dict(
         count=bool(m["mcnt"]),
-        k_slices=int(m["k"]) if m["k"] else 1,
+        sliced=bool(m["s"]),
         tile_n=int(m["tile"]) if m["tile"] else None,
-        group_m=int(m["group"]) if m["group"] else None,
-        epi_store="tma" if m["tma"] else None,
         stages=int(m["stages"]) if m["stages"] else None,
-        group_n=int(m["group_n"]) if m["group_n"] else None,
+        blocked=bool(m["gn"]),
+        epi_store="tma" if m["tma"] else None,
     )
     if stage_variant(m["base"], **knobs) != stage:
         raise ValueError(f"not a stage name of this backend: {stage!r}")
@@ -462,6 +494,19 @@ def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
 def base_stage(stage: str) -> str:
     """The base stage a (variant) stage name instantiates."""
     return parse_stage(stage)[0]
+
+
+def gemm_op(stage: str) -> str:
+    """``"logits"`` / ``"dx"`` / ``"dw"``: the GEMM a (variant) stage name instantiates (``ValueError`` for a row
+    kernel)."""
+    base = base_stage(stage)
+    if base in ("gemm_logits", "gemm_logits_nostats"):
+        return "logits"
+    if base == "gemm_dx":
+        return "dx"
+    if base == "gemm_dw_acc" or base in DW_CAST_STAGES:
+        return "dw"
+    raise ValueError(f"{stage!r} is not a GEMM stage")
 
 
 def raster_variant(
@@ -489,21 +534,6 @@ def raster_variant(
     if logits_group is None and dw_group is None:
         return None
     return (logits_group, dw_group)
-
-
-def _dw_raster_groups(
-    arch: Optional[str], hidden: Optional[int]
-) -> tuple[Optional[int], ...]:
-    """The weight-gradient raster heights the rules can select for a record (``None`` = the default first): the wide
-    height at ``hidden >= RASTER_RULE_MIN_HIDDEN``, the long-chunk height below it, the default only for an unpinned
-    geometry or an architecture without a rule."""
-    if hidden is None or arch is None:
-        return (None,)
-    if int(hidden) >= RASTER_RULE_MIN_HIDDEN:
-        groups = RASTER_WIDE_GROUPS.get(arch)
-        return (None,) if groups is None else (None, int(groups[1]))
-    dw_group = DW_LONG_CHUNK_GROUPS.get(arch)
-    return (None,) if dw_group is None else (None, int(dw_group))
 
 
 def dx_stages_variant(
@@ -687,54 +717,30 @@ def chunk_variants(
     )
 
 
-def reachable_variants(bases, arch: str, geometry: "Geometry", dx_max: int) -> set[str]:
-    """Every variant the per-chunk rules can select for a record (its architecture, pinned geometry and registered
-    dX slice depth) from the base GEMM stages ``bases``; a program is complete for an entry when it registers them."""
-    wide = (
-        geometry.hidden is not None
-        and int(geometry.hidden) >= RASTER_RULE_MIN_HIDDEN
-        and arch in RASTER_WIDE_GROUPS
-    )
-    dw_groups = _dw_raster_groups(arch, geometry.hidden)
-    glm = geometry.hidden is not None and int(geometry.hidden) < RASTER_RULE_MIN_HIDDEN
-    g_logits = (
-        RASTER_WIDE_GROUPS.get(arch, (None, None))[0]
-        if wide
-        else (LOGITS_LONG_RASTER_GROUPS.get(arch) if glm else None)
-    )
-    st_long = DX_LONG_CHUNK_STAGES.get(arch) if glm else None
-    gn = _dw_block_group(arch, geometry.hidden)
+def reachable_variants(bases, arch: str, dx_max: int) -> set[str]:
+    """Every structural form the per-chunk rules can select on ``arch`` from the base GEMM stages ``bases`` for a record
+    that serves ``dx_max`` dX slices (:func:`dx_max_slices`); a program is complete for an entry when it registers them.
+    The forms do not depend on the call geometry (``H`` / ``V`` and the rules' numeric outputs are launch scalars), so a
+    record serves every admissible geometry with them."""
+    st_long = DX_LONG_CHUNK_STAGES.get(arch)
+    blocked = arch in DW_BLOCK_GROUPS
     out: set[str] = set()
     for base in bases:
         if base in ("gemm_logits", "gemm_logits_nostats"):
-            if g_logits is not None:
-                out.add(stage_variant(base, group_m=g_logits))
-            # the device-count forms of the hidden valid-row count path (chunk 0 at the buffer extent min(chunk, T): the
-            # default raster and the rule's height)
+            # the device-count form of the hidden valid-row count path (chunk 0 at the buffer extent min(chunk, T))
             out.add(stage_variant(base, count=True))
-            if g_logits is not None:
-                out.add(stage_variant(base, count=True, group_m=g_logits))
         elif base == "gemm_dx":
-            for k in range(1, int(dx_max) + 1):
+            for sliced in (False, True) if int(dx_max) > 1 else (False,):
                 for tile in (DX_TILE_WIDE, DX_TILE_NARROW):
-                    out.add(stage_variant(base, k_slices=k, tile_n=tile))
+                    out.add(stage_variant(base, sliced=sliced, tile_n=tile))
                 if st_long is not None:
                     out.add(
                         stage_variant(
-                            base, k_slices=k, tile_n=DX_TILE_WIDE, stages=st_long
+                            base, sliced=sliced, tile_n=DX_TILE_WIDE, stages=st_long
                         )
                     )
-        elif base == "gemm_dw_acc":
-            for g in dw_groups:
-                out.add(stage_variant(base, group_m=g))
-            if gn is not None:
-                out.add(stage_variant(base, group_n=gn))
-        elif base in DW_CAST_STAGES:
-            for g in dw_groups:
-                if g is not None:
-                    out.add(stage_variant(base, group_m=g))
-            if gn is not None and base in DW_BLOCK_BASES:
-                out.add(stage_variant(base, group_n=gn))
+        elif base in DW_BLOCK_BASES and blocked:
+            out.add(stage_variant(base, blocked=True))
     return out
 
 
@@ -781,6 +787,12 @@ class Geometry:
     logits_cluster_ctas: int = 2
     dx_cluster_ctas: int = 2
     dw_cluster_ctas: int = 2
+    logits_item_cols: int = 256
+    dx_item_cols: int = 256
+    dw_item_cols: int = 256
+    logits_group_m: int = 32
+    dx_group_m: int = 16
+    dw_group_m: int = 8
 
     @classmethod
     def from_record(cls, record: Optional[dict[str, Any]]) -> "Geometry":
@@ -882,22 +894,119 @@ def record_abi(record: dict[str, Any]) -> str:
 def dx_stage(
     k_slices: int, tile_n: Optional[int] = None, stages: Optional[int] = None
 ) -> str:
-    """Stage name of the dX GEMM with ``k_slices`` K-slice work items per output tile (``tile_n`` = the pair tile's
-    column width, ``None`` / ``DX_TILE_WIDE`` = the wide default; ``stages`` = the operand-ring depth, ``None`` = the
-    table depth)."""
+    """Stage name of the dX GEMM run as ``k_slices`` K-slice work items per output tile (the ``_s`` form above one;
+    ``tile_n`` = the pair tile's column width, ``None`` / ``DX_TILE_WIDE`` = the wide default; ``stages`` = the
+    operand-ring depth, ``None`` = the table depth)."""
+    if not 1 <= int(k_slices) <= DX_K_SLICES_MAX:
+        raise ValueError(
+            f"the dX GEMM runs 1 .. {DX_K_SLICES_MAX} K slices per tile, got {k_slices}"
+        )
     return stage_variant(
-        "gemm_dx", k_slices=int(k_slices), tile_n=tile_n, stages=stages
+        "gemm_dx", sliced=int(k_slices) > 1, tile_n=tile_n, stages=stages
     )
 
 
 def dx_max_slices(stages) -> int:
-    """Largest slice count the registered stages serve (``1`` + the contiguous prefix of ``DX_SLICE_STAGES``)."""
-    count = 1
-    for stage in DX_SLICE_STAGES:
-        if stage not in stages:
-            break
-        count += 1
-    return count
+    """Largest slice count the registered stages serve: ``DX_K_SLICES_MAX`` when the K-sliced form ``DX_SLICED_STAGE``
+    is registered (the count is a launch scalar of that one form), else ``1``."""
+    return DX_K_SLICES_MAX if DX_SLICED_STAGE in stages else 1
+
+
+def gemm_scalars(
+    stage: str,
+    geometry: "Geometry",
+    *,
+    hidden: int,
+    vocab: int,
+    rows_c: int,
+    k_slices: int = 1,
+    group_m: Optional[int] = None,
+    group_n: Optional[int] = None,
+    first_chunk: int = 1,
+    ws_slab: int = 0,
+) -> dict[str, int]:
+    """The launch scalars ``GEMM_SCALARS`` of one GEMM stage from the record geometry, the call geometry and the rules'
+    outputs: ``group_m`` (row tiles; ``None`` = the GEMM's default height ``<gemm>_group_m``), ``group_n`` (the
+    weight-gradient block width in column TILES, :func:`dw_block_variant`; ``None`` = the 1-D raster), ``k_slices`` of
+    the dX GEMM.  The logits GEMM always stores (``first_chunk`` 0 = no accumulate), the dX GEMM always stores its chunk's
+    rows (1); ``first_chunk`` / ``ws_slab`` are taken from the arguments for the weight-gradient / dX GEMM only.  The
+    form of ``stage`` must agree with the scalars (the ``_s`` form with ``k_slices > 1``, the ``_gn`` form with a
+    ``group_n``)."""
+    _base, knobs = parse_stage(stage)
+    op = gemm_op(stage)
+    hidden, vocab, rows_c = int(hidden), int(vocab), int(rows_c)
+    item_rows = int(getattr(geometry, f"{op}_cluster_ctas"))
+    item_cols = int(getattr(geometry, f"{op}_item_cols"))
+    ldc = vocab if op == "logits" else hidden
+    if ldc % item_cols:
+        raise ValueError(
+            f"{stage}: N = {ldc} is not a multiple of the {item_cols}-column work item"
+        )
+    n_items = ldc // item_cols
+    gm = int(getattr(geometry, f"{op}_group_m")) if group_m is None else int(group_m)
+    if gm < 1:
+        raise ValueError(f"{stage}: group_m must be positive, got {group_m}")
+    if bool(knobs["blocked"]) != (group_n is not None):
+        raise ValueError(
+            f"{stage}: the 2-D blocked form takes a group_n and the 1-D raster none, got group_n={group_n}"
+        )
+    if group_n is None:
+        gn = n_items
+    else:
+        if op != "dw" or int(group_n) < DW_ITEM_COLS or int(group_n) % DW_ITEM_COLS:
+            raise ValueError(
+                f"{stage}: group_n = {group_n} is not a positive multiple of the {DW_ITEM_COLS}-tile weight-gradient work item"
+            )
+        gn = int(group_n) // DW_ITEM_COLS
+        if gn > n_items or n_items % gn:
+            raise ValueError(
+                f"{stage}: group_n = {group_n} does not divide the {n_items} column items of N = {ldc}"
+            )
+    ks = int(k_slices)
+    if op == "dw":
+        if ks != 1:
+            raise ValueError(f"{stage}: the weight-gradient GEMM is not K-sliced")
+        k_iters = geometry.k_iters(rows_c)
+        return dict(
+            M=vocab,
+            m_tiles=geometry.row_tiles(vocab, item_rows),
+            k_iters=k_iters,
+            first_chunk=int(bool(first_chunk)),
+            ws_slab=0,
+            ldc=ldc,
+            k_slices=1,
+            k_slice_iters=k_iters,
+            group_m=gm,
+            group_n=gn,
+        )
+    k_total = hidden if op == "logits" else vocab
+    k_block = int(geometry.k_block)
+    if k_total % k_block:
+        raise ValueError(
+            f"{stage}: K = {k_total} is not a multiple of the K step {k_block}"
+        )
+    k_iters = k_total // k_block
+    if op == "logits":
+        if ks != 1:
+            raise ValueError(f"{stage}: the logits GEMM is not K-sliced")
+    elif not 1 <= ks <= DX_K_SLICES_MAX or bool(knobs["sliced"]) != (ks > 1):
+        raise ValueError(
+            f"{stage}: the K-sliced form runs 2 .. {DX_K_SLICES_MAX} slices and the plain form one, got k_slices={k_slices}"
+        )
+    if ks > k_iters:
+        raise ValueError(f"{stage}: {ks} K slices over {k_iters} K steps")
+    return dict(
+        M=rows_c,
+        m_tiles=geometry.row_tiles(rows_c, item_rows),
+        k_iters=k_iters,
+        first_chunk=0 if op == "logits" else 1,
+        ws_slab=int(ws_slab) if op == "dx" else 0,
+        ldc=ldc,
+        k_slices=ks,
+        k_slice_iters=-(-k_iters // ks) if ks > 1 else k_iters,
+        group_m=gm,
+        group_n=gn,
+    )
 
 
 def wave_efficiency(
@@ -1223,6 +1332,9 @@ class _HiddenCount:
     rows0: int  # the buffer extent min(chunk, T): rows of the chunk-0 buffers, M of the device-count GEMM
     stats: bool  # the logits GEMM form launched (True: with the row statistics)
     stage: str  # the device-count logits stage launched
+    group_m: Optional[
+        int
+    ]  # the raster rule's height at the buffer extent (a launch scalar; None = the default)
     valid: torch.Tensor  # bool [T]
     idx_full: torch.Tensor  # int64 [T]: the valid rows in order, then T
     count_host: torch.Tensor  # the pinned int32 [1] cell the count is copied into
@@ -1263,7 +1375,8 @@ def hidden_count_eligible(
     stats: bool,
 ) -> bool:
     """Whether a compacted call runs the hidden valid-row count: a registered program with the gather kernel and the
-    device-count form of chunk 0's logits GEMM (the raster rule at the buffer extent ``min(chunk, T)``), a call of
+    device-count form of chunk 0's logits GEMM (its raster height at the buffer extent ``min(chunk, T)`` is a launch
+    scalar), a call of
     :data:`HIDDEN_COUNT_MIN_CHUNKS` chunks or more (``ceil(T / chunk) >= 3``: one- and two-chunk calls cannot hide the
     path's fixed host cost behind chunk 0's logits GEMM and run 5-16 % slower with it), an ``X`` the GEMM reads in
     place -- a 16-byte row pitch (no contiguous copy) and a 16-byte-aligned base -- and a toolchain whose code for the
@@ -1282,13 +1395,7 @@ def hidden_count_eligible(
     if not toolchain_runs_hidden_count(record["arch"]):
         return False
     stages = registered_stages(module_name)
-    rows0 = min(int(problem.chunk), int(problem.num_rows))
-    raster = raster_variant(int(problem.hidden), rows0, record["arch"])
-    stage = stage_variant(
-        "gemm_logits" if stats else "gemm_logits_nostats",
-        count=True,
-        group_m=None if raster is None else raster[0],
-    )
+    stage = stage_variant("gemm_logits" if stats else "gemm_logits_nostats", count=True)
     return HIDDEN_COUNT_STAGE in stages and stage in stages
 
 
@@ -1337,11 +1444,8 @@ def _hidden_count_begin(
     count_dev = pos[T - 1 : T]
     ld = int(Xd.stride(0))
     raster = raster_variant(H, rows0, record["arch"])
-    stage = stage_variant(
-        "gemm_logits" if stats else "gemm_logits_nostats",
-        count=True,
-        group_m=None if raster is None else raster[0],
-    )
+    group_m = None if raster is None else raster[0]
+    stage = stage_variant("gemm_logits" if stats else "gemm_logits_nostats", count=True)
     common: dict[str, Any] = {name: None for name in COMMON_TENSORS}
     common.update({name: 0 for name in COMMON_SCALARS})
     common.update(
@@ -1366,11 +1470,9 @@ def _hidden_count_begin(
         C=logits,
         STATS_OUT=stats_buf,
         WS=count_dev,
-        M=rows0,
-        m_tiles=geometry.row_tiles(rows0, geometry.logits_cluster_ctas),
-        k_iters=1,
-        first_chunk=0,
-        ws_slab=0,
+        **gemm_scalars(
+            stage, geometry, hidden=H, vocab=V, rows_c=rows0, group_m=group_m
+        ),
     )
     keys = ((HIDDEN_COUNT_STAGE, "hidden"), (stage, "hidden"))
     launches = _bind_all(
@@ -1394,6 +1496,7 @@ def _hidden_count_begin(
         rows0=rows0,
         stats=stats,
         stage=stage,
+        group_m=group_m,
         valid=valid,
         idx_full=idx_full,
         count_host=count_host,
@@ -1504,7 +1607,7 @@ def stages_for_entry(
     accumulates the chunks before it and is absent when ``num_chunks`` is given as 1 (unknown: kept).
     ``dx_cast=False`` leaves the flat ``dX`` cast out: the caller finalizes ``dx_acc`` itself (the fused dX finalize of
     a compacted log-probability backward scatters it in one pass, :func:`finalize_dx`).  The ``slab_sum`` kernel of a
-    K-sliced dX GEMM is a per-chunk instance like the ``_s<k>`` forms (:attr:`Plan.stages`), not listed here.
+    K-sliced dX GEMM is a per-chunk instance like the dX GEMM's ``_s`` form (:attr:`Plan.stages`), not listed here.
     """
     if entry not in ENTRIES:
         raise ValueError(f"entry must be one of {ENTRIES}")
@@ -1552,9 +1655,7 @@ def generated_program_available(
     needed = set(stages_for_entry(entry)) | set(
         stages_for_entry(entry, grad_weight_dtype=torch.float32)
     )
-    needed |= reachable_variants(
-        needed, arch, Geometry.from_record(record), dx_max_slices(stages)
-    )
+    needed |= reachable_variants(needed, arch, dx_max_slices(stages))
     if dx_finalize_default():
         needed |= set(DX_FINALIZE_STAGES)
     if hidden_count_default() and toolchain_runs_hidden_count(arch):
@@ -1653,6 +1754,15 @@ def validate_lm_head_inputs(
     if vocab < 1 or vocab % geometry.vocab_multiple:
         raise ValueError(
             f"V must be a positive multiple of {geometry.vocab_multiple}, got {vocab}"
+        )
+    if hidden % geometry.dx_item_cols or hidden % geometry.dw_item_cols:
+        raise ValueError(
+            f"H must be a multiple of the {geometry.dx_item_cols}-column dX and {geometry.dw_item_cols}-column "
+            f"weight-gradient work items, got {hidden}"
+        )
+    if vocab % geometry.logits_item_cols:
+        raise ValueError(
+            f"V must be a multiple of the {geometry.logits_item_cols}-column logits work item, got {vocab}"
         )
     if geometry.hidden is not None and hidden != geometry.hidden:
         raise ValueError(
@@ -1788,33 +1898,30 @@ class Plan:
         return self.variants[index] if self.variants else ChunkVariants()
 
     def hidden_logits_stage(self) -> str:
-        """The device-count logits GEMM variant chunk 0 ran on the hidden valid-row count path."""
+        """The device-count logits GEMM form chunk 0 ran on the hidden valid-row count path (its raster height
+        ``hidden_logits_group_m`` is a launch scalar)."""
         return stage_variant(
-            "gemm_logits" if self.hidden_stats else "gemm_logits_nostats",
-            count=True,
-            group_m=self.hidden_logits_group_m,
+            "gemm_logits" if self.hidden_stats else "gemm_logits_nostats", count=True
         )
 
     def logits_stage(self, index: int, *, stats: bool = True) -> str:
-        """The logits GEMM variant of chunk ``index`` (``stats=False``: the log-probability backward's recompute)."""
-        return stage_variant(
-            "gemm_logits" if stats else "gemm_logits_nostats",
-            group_m=self.variants_of(index).logits_group_m,
-        )
+        """The logits GEMM form of chunk ``index`` (``stats=False``: the log-probability backward's recompute).  One
+        form per entry: the chunk's raster height is a launch scalar (:attr:`ChunkVariants.logits_group_m`)."""
+        self.variants_of(index)  # the chunk exists
+        return stage_variant("gemm_logits" if stats else "gemm_logits_nostats")
 
     def dx_stage_of(self, index: int) -> str:
-        """The dX GEMM variant of chunk ``index`` (its K-slice count and tile)."""
+        """The dX GEMM form of chunk ``index`` (K-sliced or not, its tile and ring depth; the slice count is a launch
+        scalar, :meth:`dx_slices_of`)."""
         v = self.variants_of(index)
         return dx_stage(self.dx_slices_of(index), v.dx_tile_n, v.dx_stages)
 
     def dw_acc_stage(self, index: int) -> str:
-        """The weight-gradient accumulate variant of chunk ``index``."""
+        """The weight-gradient accumulate form of chunk ``index`` (blocked when the block rule set a ``group_n``; the
+        raster height and the block width are launch scalars)."""
         v = self.variants_of(index)
         return stage_variant(
-            "gemm_dw_acc",
-            group_m=v.dw_group_m,
-            epi_store=v.dw_epi_store,
-            group_n=v.dw_group_n,
+            "gemm_dw_acc", blocked=v.dw_group_n is not None, epi_store=v.dw_epi_store
         )
 
     @property
@@ -1906,10 +2013,8 @@ class Plan:
             v = self.variants_of(self.num_chunks - 1)
             return stage_variant(
                 "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
-                group_m=v.dw_group_m,
-                group_n=v.dw_group_n
-                if fp32
-                else None,  # the bf16 cast keeps the 1-D raster
+                blocked=fp32
+                and v.dw_group_n is not None,  # the bf16 cast keeps the 1-D raster
             )
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
 
@@ -2781,10 +2886,14 @@ def stage_values(
             C=logits[:rows_c],
             STATS_OUT=t["stats"],
             WS=t["f32_dummy"],
-            M=int(rows_c),
-            m_tiles=g.row_tiles(rows_c, g.logits_cluster_ctas),
-            k_iters=1,
-            first_chunk=0,
+            **gemm_scalars(
+                stage,
+                g,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                rows_c=rows_c,
+                group_m=plan.variants_of(index).logits_group_m,
+            ),
         )
     elif base == "gemm_dx":
         # every token chunk writes its own rows of dX_acc: the first K chunk of the GEMM always stores (first_chunk=1);
@@ -2802,11 +2911,15 @@ def stage_values(
             C=t["dx_acc"][row0:stop],
             STATS_OUT=t["stats"],
             WS=ws,
-            M=int(rows_c),
-            m_tiles=g.row_tiles(rows_c, g.dx_cluster_ctas),
-            k_iters=1,
-            first_chunk=1,
-            ws_slab=int(ws.stride(0)) if k > 1 else 0,
+            **gemm_scalars(
+                stage,
+                g,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                rows_c=rows_c,
+                k_slices=k,
+                ws_slab=int(ws.stride(0)) if k > 1 else 0,
+            ),
         )
     elif stage == "slab_sum":
         # the fused dX finalize's slab reduction of the K-sliced dX GEMM: one kernel over the chunk's rows of dX_acc
@@ -2835,16 +2948,23 @@ def stage_values(
             raise ValueError(
                 f"chunk {index} plans the weight-gradient accumulate {want!r}; stage {stage!r} was requested"
             )
+        v = plan.variants_of(index)
         values.update(
             A=dz_chunk,
             B=x_chunk,
             C=t["dw_acc"],
             STATS_OUT=t["stats"],
             WS=t["f32_dummy"],
-            M=int(p.vocab),
-            m_tiles=g.row_tiles(p.vocab, g.dw_cluster_ctas),
-            k_iters=g.k_iters(rows_c),
-            first_chunk=first,
+            **gemm_scalars(
+                stage,
+                g,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                rows_c=rows_c,
+                group_m=v.dw_group_m,
+                group_n=v.dw_group_n,
+                first_chunk=first,
+            ),
         )
     elif base in DW_CAST_STAGES:
         # the deferred last chunk (backward): the same GEMM as ``gemm_dw_acc`` with the upstream scale and the output cast
@@ -2858,16 +2978,23 @@ def stage_values(
             raise ValueError(
                 f"plan casts its weight gradient through {plan.dw_cast_stage!r}; stage {stage!r} was requested"
             )
+        v = plan.variants_of(index)
         values.update(
             A=dz_chunk,
             B=x_chunk,
             C=t["dw_out"],
             STATS_OUT=t["grad_scale"] if p.entry == "loss" else t["unit_scale"],
             WS=t["dw_acc"] if plan.num_chunks > 1 else t["f32_dummy"],
-            M=int(p.vocab),
-            m_tiles=g.row_tiles(p.vocab, g.dw_cluster_ctas),
-            k_iters=g.k_iters(rows_c),
-            first_chunk=int(plan.num_chunks == 1),
+            **gemm_scalars(
+                stage,
+                g,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                rows_c=rows_c,
+                group_m=v.dw_group_m,
+                group_n=v.dw_group_n if base == "gemm_dw_cast_f32" else None,
+                first_chunk=int(plan.num_chunks == 1),
+            ),
         )
     elif stage == "row_finalize":
         d = t["d"]
@@ -3125,9 +3252,7 @@ class ReferenceEngine:
     def gemm_dx(values: dict[str, Any]) -> None:
         values["C"].copy_(_mm_fp32(values["A"], values["B"]))
 
-    gemm_dx_s2 = gemm_dx_s3 = gemm_dx_s4 = (
-        gemm_dx  # the reference path never slices K (one product per chunk)
-    )
+    gemm_dx_s = gemm_dx  # the reference path never slices K (one product per chunk)
 
     @staticmethod
     def dx_reduce(values: dict[str, Any]) -> None:
@@ -3915,7 +4040,7 @@ class _Binding:
             plan = replace(
                 plan,
                 hidden_count=True,
-                hidden_logits_group_m=parse_stage(hidden.stage)[1]["group_m"],
+                hidden_logits_group_m=hidden.group_m,
                 hidden_stats=hidden.stats,
             )
             forward_order = forward_keys(plan)
@@ -4757,7 +4882,9 @@ def dw_cast(
         return out
     module_name, record = record_for(device, H, int(V))
     record_abi(record)
-    # the last chunk's variant: the raster rule of the record's architecture on this chunk's rows, or the explicit knob
+    # the last chunk's form and scalars: the raster / block rules of the record's architecture on this chunk's rows, or
+    # the explicit knobs (the block rule and knob apply to the fp32 cast only; the bf16 cast keeps the 1-D raster)
+    fp32 = out_dtype == torch.float32
     dw_tuning = _resolve_gemm_tuning(None).get("dw", {})
     raster = raster_variant(H, int(rows), record["arch"])
     group_m = (
@@ -4765,9 +4892,17 @@ def dw_cast(
         if "group_m" in dw_tuning
         else (raster[1] if raster else None)
     )
+    group_n = None
+    if fp32:
+        group_n = (
+            dw_tuning["group_n"]
+            if "group_n" in dw_tuning
+            else dw_block_variant(int(rows), H, record["arch"])
+        )
+        group_n = None if group_n in (None, 0) else int(group_n)
     stage = stage_variant(
-        "gemm_dw_cast_f32" if out_dtype == torch.float32 else "gemm_dw_cast_bf16",
-        group_m=group_m,
+        "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
+        blocked=group_n is not None,
     )
     if stage not in registered_stages(module_name):
         raise NotImplementedError(
@@ -4783,15 +4918,21 @@ def dw_cast(
         C=out,
         STATS_OUT=g,
         WS=dw_acc if dw_acc is not None else _device_constants(int(index))["f32_dummy"],
-        M=int(V),
-        m_tiles=geometry.row_tiles(V, geometry.dw_cluster_ctas),
-        k_iters=geometry.k_iters(rows),
-        first_chunk=int(dw_acc is None),
         rows_c=int(rows),
         T=int(rows),
         H=H,
         V=int(V),
         loss_div=1.0,
+        **gemm_scalars(
+            stage,
+            geometry,
+            hidden=H,
+            vocab=int(V),
+            rows_c=int(rows),
+            group_m=group_m,
+            group_n=group_n,
+            first_chunk=int(dw_acc is None),
+        ),
     )
     launches = _bind_all(
         record,

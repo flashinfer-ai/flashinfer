@@ -26,11 +26,11 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   multiple of 256; a row pitch that is not a multiple of 16 bytes is copied
   to a contiguous tensor first); `W [V, H]` BF16 contiguous output weight
   (`V` a multiple of 256); `labels [T]` int64 with `-100` marking an ignored
-  row (zero loss, zero gradient, `logp = 0`).  A registered program is built
-  for one `(H, V)` geometry, which its registry record pins; the host selects
-  the record of the inputs' geometry (`cake_jit.select_module`: the default
-  6144 x 154880 record `cake_lm_head_loss_<arch>`, or `..._h<H>_v<V>` for the
-  other registered geometries) and rejects geometries no record serves.
+  row (zero loss, zero gradient, `logp = 0`).  The generated kernels take the
+  call geometry as launch scalars, so one registered program per architecture
+  (`cake_lm_head_loss_<arch>`, `cake_jit.select_module`) serves every `(H, V)`
+  its record's geometry admits: `H` a multiple of the dX / weight-gradient work
+  items' 512 columns, `V` a multiple of the logits work item's 256 columns.
 * Per row `logp_t = z[t, y_t] - logsumexp_v z[t, v]` with `z = X @ W^T`
   computed as a BF16 GEMM (BF16 output of an FP32 accumulation) and promoted
   to FP32 for the max / log-sum-exp / loss arithmetic.
@@ -208,17 +208,16 @@ gather and logits GEMM ran before the count was known, see
   the loss accumulator; the last chunk writes the finished loss.
 * `row_grad`: `dz_c = d_t * (1[v = y_t] - exp(z - lse_t))` in BF16, in place
   over `z_c`; ignored rows become zero.
-* `gemm_dx`: `dX_acc[rows] = fp32(dz_c @ W)`.  A record may also register
-  `gemm_dx_s2` / `gemm_dx_s3` / `gemm_dx_s4`, the same GEMM as 2 / 3 / 4
-  K-slice work items per output tile (the persistent grid fills its last
-  wave; a record registers a contiguous prefix of them): slice 0 writes
-  `dX_acc`, slices `>= 1` write FP32 workspace slabs (`dx_ws`, temporary
-  bucket) that the host adds into `dX_acc` in fixed slab order (one RN add per
-  element per slab, no atomics).  The slice count of a chunk follows from its
-  row count and the SM count (`cake_backend.recommended_k_slices`), so it is
-  deterministic in the shapes.  Each slice form exists with the 512-column
-  pair tile (the default) and the 256-column tile (`_tn256`), see the
-  instance variants below.
+* `gemm_dx`: `dX_acc[rows] = fp32(dz_c @ W)`.  A record also registers
+  `gemm_dx_s`, the same GEMM as `k_slices` (2 .. 4, a launch scalar) K-slice
+  work items per output tile (the persistent grid fills its last wave): slice
+  0 writes `dX_acc`, slices `>= 1` write FP32 workspace slabs (`dx_ws`,
+  temporary bucket) that the host adds into `dX_acc` in fixed slab order (one
+  RN add per element per slab, no atomics).  The slice count of a chunk
+  follows from its row count and the SM count
+  (`cake_backend.recommended_k_slices`), so it is deterministic in the shapes.
+  Both forms exist with the 512-column pair tile (the default) and the
+  256-column tile (`_tn256`), see the structural forms below.
 * `gemm_dw_acc`: `dW_acc = fp32(dz_c^T @ X_c)` on the first chunk,
   `dW_acc += ...` afterwards (the chunk order is the reduction order).
 * `gemm_dw_cast_bf16` / `gemm_dw_cast_f32`: the last chunk's `dz_c^T @ X_c`
@@ -229,7 +228,7 @@ gather and logits GEMM ran before the count was known, see
   accumulators -- the single output cast of `dX` (and of `dW` without
   `fuse_dw_cast`) in the backward, with the upstream gradient `g` read from a
   device scalar.
-* `slab_sum`: after a K-sliced `gemm_dx_s<k>`, `dX_acc[rows] += slab_0 + ...
+* `slab_sum`: after a K-sliced `gemm_dx_s`, `dX_acc[rows] += slab_0 + ...
   + slab_{k-2}` in one launch, one RN add per element per slab in ascending
   slab order (the fused dX finalize; `dx_reduce`, the host's `add_` chain,
   when it is off).
@@ -249,60 +248,68 @@ gather and logits GEMM ran before the count was known, see
   store and statistics write is bounded by `min(count, M)`; bitwise the
   host-bound form per row).
 
-### Instance variants
+### Structural forms and launch scalars
 
-The GEMM stages are registered as instance *variants*, one stage name per
-output of the per-chunk rules the production launchers of the kernel source
-apply -- the host selects by rule output, never by shape
-(`cake_backend.stage_variant` / `parse_stage`; suffixes in this order):
+The GEMM stages are registered as structural *forms* -- one stage name per
+kernel body the program carries, named by the outputs of the per-chunk rules
+the production launchers of the kernel source apply that select a different
+body (`cake_backend.stage_variant` / `parse_stage`; suffixes in this order).
+The call geometry and the rules' numeric outputs are *launch scalars* of every
+form (`cake_backend.gemm_scalars`: `ldc` and `k_iters` from `H` / `V`, the
+K-slice count `k_slices` and slice length `k_slice_iters`, the raster height
+`group_m` in row tiles, the raster block width `group_n` in column items), so
+a record serves every admissible geometry and the host never selects by shape:
 
 * `_mcnt`: the device-count form of the logits GEMMs (`gemm_logits_mcnt`,
-  `gemm_logits_nostats_mcnt`, with `_g16` at the long raster) -- chunk 0 of
-  the hidden valid-row count, whose valid-row bound is read from device
-  memory while `M`, `m_tiles` and the raster rule are evaluated at the buffer
-  extent `min(chunk_size, T)` (`cake_backend.hidden_count_eligible`,
-  `Plan.hidden_logits_stage`); every record registers both heights.  Bitwise:
-  the same per-row arithmetic, rows at and beyond the count are not written;
-* `_s<k>`: the K-slice count of the dX GEMM (`recommended_k_slices`);
+  `gemm_logits_nostats_mcnt`) -- chunk 0 of the hidden valid-row count, whose
+  valid-row bound is read from device memory while `M`, `m_tiles` and the
+  raster height are evaluated at the buffer extent `min(chunk_size, T)`
+  (`cake_backend.hidden_count_eligible`, `Plan.hidden_logits_stage`).
+  Bitwise: the same per-row arithmetic, rows at and beyond the count are not
+  written;
+* `_s`: the K-sliced dX GEMM (`k_slices` 2 .. 4 from `recommended_k_slices`;
+  one slice runs the plain form);
 * `_tn256`: the narrow dX tile, taken when `H % 512 != 0`, when the launch's
   512-wide work items would not fill the device's SM pairs, or -- on SM100
   below `H` 7168 -- when a one-slice launch fills the SM pairs' waves below
-  0.90 (`DX_WIDE_MIN_EFF`: the badly wave-quantized chunk tails such as the
+  0.83 (`DX_WIDE_MIN_EFF`: the badly wave-quantized chunk tails such as the
   3591 / 3663-row tails of `T` 65031 / 32463 at chunk 4096)
   (`cake_backend.dx_tile_rule`, evaluated after the slice count; `dX` is
   bitwise the same on both tiles);
-* `_g<group_m>`: the grouped-raster height of the logits GEMMs (`_g16`) and
-  of the weight-gradient GEMMs (`_g32`, accumulate and fused cast) at
-  `H >= 7168` for chunks of more than 2048 rows (`cake_backend.raster_variant`,
-  `RASTER_WIDE_GROUPS` per architecture); below that `H`, of the logits GEMMs
-  (`_g16`) for chunks of at least 3841 rows (31 row tiles of 128:
-  `LOGITS_LONG_RASTER_GROUPS` / `LOGITS_LONG_RASTER_MIN_ROWS`) and of the
-  weight-gradient GEMMs (`_g16`) for chunks of more than 4096 rows, both on
-  both architectures (`DW_LONG_CHUNK_GROUP_M` / `DW_LONG_CHUNK_MIN_ROWS`);
-  every other chunk -- the default geometry's chunks of up to 30 row tiles,
-  short tail chunks -- keeps the default raster.  Bitwise: only the tile order
-  changes;
 * `_st3`: the 3-deep operand ring of the 512-wide `dX` tile below `H` 7168 for
   chunks of more than 4096 rows on both architectures
   (`cake_backend.dx_stages_variant`, `DX_LONG_CHUNK_STAGES`); the 256-wide
   fallback keeps its depth.  Bitwise: the ring depth only changes when a stage
   is refilled;
-* `_gn12`: the 2-D blocked raster (12 column tiles per block) of the
-  weight-gradient accumulate and the fp32 fused cast below `H` 7168 for chunks
-  of 2049 .. 4096 rows on both architectures (`cake_backend.dw_block_variant`,
-  `DW_BLOCK_GROUPS`); the bf16 cast keeps the 1-D raster.  Bitwise: a
-  permutation of the same tiles.
+* `_gn`: the 2-D blocked raster of the weight-gradient accumulate and the fp32
+  fused cast below `H` 7168 for chunks of 2049 .. 4096 rows on both
+  architectures, with `group_n` = 12 column tiles per block
+  (`cake_backend.dw_block_variant`, `DW_BLOCK_GROUPS`); the bf16 cast keeps the
+  1-D raster.  Bitwise: a permutation of the same tiles.
 
-`make_plan` resolves the variants per chunk (`Plan.variants`,
-`Plan.logits_stage` / `dx_stage_of` / `dw_acc_stage` / `dw_cast_stage`); a
-record carries exactly the variants its geometry and architecture can reach
-(`cake_backend.reachable_variants`, checked by
-`generated_program_available`), and a variant the record lacks fails closed.
+The raster height is a scalar of the base forms: `group_m` 16 for the logits
+GEMMs and 32 for the weight-gradient GEMMs (accumulate and fused cast) at
+`H >= 7168` for chunks of more than 2048 rows (`cake_backend.raster_variant`,
+`RASTER_WIDE_GROUPS` per architecture); below that `H`, 16 for the logits
+GEMMs of chunks of at least 3841 rows (31 row tiles of 128:
+`LOGITS_LONG_RASTER_GROUPS` / `LOGITS_LONG_RASTER_MIN_ROWS`) and 16 for the
+weight-gradient GEMMs of chunks of more than 4096 rows, both on both
+architectures (`DW_LONG_CHUNK_GROUP_M` / `DW_LONG_CHUNK_MIN_ROWS`); every
+other chunk -- the default geometry's chunks of up to 30 row tiles, short tail
+chunks -- takes the GEMM's default height from the record geometry
+(`logits_group_m` / `dx_group_m` / `dw_group_m`).  Bitwise: only the tile
+order changes.
+
+`make_plan` resolves the forms and scalars per chunk (`Plan.variants`,
+`Plan.logits_stage` / `dx_stage_of` / `dw_acc_stage` / `dw_cast_stage`;
+`stage_values` forms the scalars); a record carries exactly the forms its
+architecture's rules can reach (`cake_backend.reachable_variants`, checked by
+`generated_program_available`), and a form the record lacks fails closed.
 `gemm_tuning` (`prepare_lm_head_loss`; `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`
 as a JSON object for the eager entry points) pins knobs explicitly per GEMM --
 `{"logits": {"group_m": 16}, "dx": {"tile_n": 256, "k_slices": 2, "stages": 4},
 "dw": {"group_m": 32, "group_n": 0}}`, a knob given as `null` pins the default
-form -- and wins over the rule for the knobs it names.
+-- and wins over the rule for the knobs it names.
 
 Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
 `row_finalize`, `V/8/1024 x rows_c` for `row_grad`) and are evaluated by the
@@ -325,25 +332,36 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 
 ## Layout of this package
 
-* `cake_jit.py` -- `MODULES` registry (one record per architecture and
-  geometry, filled by the generated-program export), stage names
+* `cake_jit.py` -- `MODULES` registry (one record per architecture, expanded
+  from the compact tables the generated-program export writes between the
+  `generated registry` markers), stage names
   (`STAGES`, `BASE_STAGES`, `GEMM_STAGES`), record selection
   (`select_module`) and the JIT specs.
 * `cake_backend.py` -- validation, chunk plans, workspace layout, memory
   accounting, argument-plan binding, the prepared runner, the torch reference
   path, the autograd `Function`s and the eager entry points.
-* `csrc/cake_lm_head_loss/<arch>/` -- generated kernel and binding
-  translation units (`.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests).
+* `csrc/cake_lm_head_loss/` -- generated kernel translation units
+  (`cake_lm_head_loss_<unit>_kernel.cu`, one architecture-neutral unit per
+  kernel shared by the records of both architectures, the per-architecture
+  lowering under `__CUDA_ARCH__` guards -- except the four logits GEMM forms,
+  whose sm_103a lowering stages the C tile in shared memory for a TMA store
+  behind a six-stage operand pipeline while sm_100a stores from registers
+  behind seven, so each of those has one unit per architecture) and their two-line launch stubs
+  (`..._launch.cu`: `#define CAKE_KERNEL_SYMBOL` + the include of the shared
+  launcher); `csrc/cake_lm_head_loss/shim/` -- the shared tvm-ffi launchers
+  (`cake_lm_head_loss_shim_<digest>.cuh`, one per distinct host contract:
+  descriptor encoders, argument checks, dynamic shared memory and launch
+  geometry).  `.clang-format` disables formatting: the sources are
+  identity-checked by the registry's closure digests.
 
 ## Status
 
-The registry holds one record per architecture (`sm_100a`, `sm_103a`) and
-geometry -- `cake_lm_head_loss_<arch>` pinned to hidden size 6144 and
-vocabulary 154880, `..._h7168_v129280` and `..._h8192_v128256` -- with the
-fourteen base stages above plus the instance variants the record's rules can
-reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot named in
-the pull request.
+The registry holds one record per architecture (`sm_100a`, `sm_103a`),
+`cake_lm_head_loss_<arch>`, geometry-free (`H` / `V` and the rules' outputs are
+launch scalars: every `H` a multiple of 512 and `V` a multiple of 256 runs on
+it), with the fourteen base stages above plus the nine structural forms the
+rules can reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot
+named in the pull request.
 
 Tests: `tests/experimental/test_cake_lm_head_loss.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
