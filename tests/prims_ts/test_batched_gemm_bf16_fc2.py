@@ -258,6 +258,9 @@ class TestBf16Fc2ReferenceCheck:
     def test_tma_store_tile_n32(self):
         _run_bf16_fc2(tile_n=32, use_tma_store=1)
 
+    def test_tma_store_tile_n128(self):
+        _run_bf16_fc2(tile_n=128, pipeline_stages=2, use_tma_store=1)
+
     def test_bias_m_tile_n16(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,

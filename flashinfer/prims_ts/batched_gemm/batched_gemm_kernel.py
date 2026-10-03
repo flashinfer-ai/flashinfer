@@ -21,6 +21,7 @@ Entry points:
 """
 
 import os
+from dataclasses import replace
 from typing import Any
 
 from ..cutlass_dsl import require_cutlass_dsl_experimental, task_scheduling_scope
@@ -144,6 +145,37 @@ def _task_manager_verify_enabled() -> bool:
 
 def _pdl_wait_completed_before_tasks(cfg: BatchedGemmConfig) -> bool:
     return bool(cfg.do_pdl_wait_for_num_non_exiting_ctas)
+
+
+def _register_pipeline_smem_resources(smem_allocator, *resources) -> None:
+    """Register SMEM barriers owned by resources whose data lives elsewhere.
+
+    TMEM and virtual barrier resources have no SMEM data requirements, but their
+    TaskManager pipelines still allocate two 8-byte mbarriers per stage.  They
+    must therefore be registered with the SMEM allocator as well as with their
+    data allocator so the unified allocation and capacity report include those
+    barriers.
+    """
+    for resource in resources:
+        if resource is not None:
+            smem_allocator.add_resource(resource)
+
+
+def _make_tmem_ptr_smem_allocation() -> SmemAllocation:
+    """Create the typed TMEM-pointer slot with explicit barrier alignment.
+
+    Only the first four bytes hold the Int32 TMEM pointer.  The unified SMEM
+    allocator starts its mbarrier region at the next 8-byte boundary, so reserve
+    that padding explicitly.  This keeps TaskManager's reported data size equal
+    to the number of data bytes actually allocated before the barriers.
+    """
+    return SmemAllocation(
+        "tmem_ptr_i32",
+        size_bytes=8,
+        dtype=cutlass.Int32,
+        count=1,
+        alignment=8,
+    )
 
 
 class _ProductionTaskManager(TaskManager):
@@ -1264,6 +1296,16 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
+    _register_pipeline_smem_resources(
+        smem_allocator,
+        tmem_c,
+        tmem_cast_a,
+        tmem_sfa,
+        tmem_sfb,
+        tmem_sfab,
+        proxy_cluster,
+        work_throttle,
+    )
     if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
         # Alias SmemA/B with GmemC scratch to save SMEM when the generated
         # schedule does not require a disjoint epilogue staging window.
@@ -1785,6 +1827,170 @@ def _batched_gemm_kernel_bf16_body(
         name="GmemC",
     )
 
+    # Keep all persistent scheduler storage in the unified dynamic-SMEM block.
+    # A standalone alloc_smem object reserves an additional 1 KiB of static
+    # SMEM and reduces the maximum opt-in dynamic-SMEM capacity.
+    smem_allocator = SmemAllocator()
+    smem_resources: tuple[Any, ...] = (smem_a, smem_b)
+    if cutlass.const_expr(cfg.has_cast_a):
+        smem_resources = smem_resources + (smem_sfa,)
+    if cutlass.const_expr(cfg.has_scale_factors):
+        smem_resources = smem_resources + (smem_sfa, smem_sfb)
+    if cutlass.const_expr(cfg.has_deepseek_fp8):
+        smem_resources = smem_resources + (smem_dsfp8_sfab,)
+    smem_resources = smem_resources + (gmem_c,)
+    for r in smem_resources:
+        smem_allocator.add_resource(r)
+    _register_pipeline_smem_resources(
+        smem_allocator,
+        tmem_c,
+        tmem_cast_a,
+        tmem_sfa,
+        tmem_sfb,
+        tmem_sfab,
+    )
+    if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
+        alloc_a = smem_a._alloc if hasattr(smem_a, "_alloc") else smem_a._alloc_a
+        alloc_b = smem_b._alloc if hasattr(smem_b, "_alloc") else smem_b._alloc_b
+        smem_allocator.add_alias_group(
+            [
+                [alloc_a, alloc_b],
+                [gmem_c._alloc_sc],
+            ]
+        )
+    tmem_ptr_alloc = smem_allocator.add_tmem_ptr(_make_tmem_ptr_smem_allocation())
+    tmem_dealloc_mbar_alloc = None
+    if cutlass.const_expr(cfg.has_cluster):
+        tmem_dealloc_mbar_alloc = smem_allocator.add(
+            SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
+        )
+
+    clc_response_alloc = None
+    workid_barrier_alloc = None
+    work_throttle_barrier_alloc = None
+    proxy_barrier_alloc = None
+    fast_drain_response_alloc = None
+    fast_drain_mbar_alloc = None
+    if cutlass.const_expr(cfg.is_persistent):
+        clc_response_alloc = smem_allocator.add(
+            SmemAllocation(
+                "clc_response",
+                dtype=cutlass.Int128,
+                count=cfg.num_stages_workid,
+                alignment=16,
+            )
+        )
+        workid_barrier_alloc = smem_allocator.add(
+            SmemAllocation(
+                "workid_mbarriers",
+                dtype=cutlass.Int64,
+                count=2 * cfg.num_stages_workid,
+                alignment=8,
+            )
+        )
+        if cutlass.const_expr(cfg.use_work_throttle_barrier):
+            work_throttle_barrier_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "work_throttle_mbarriers",
+                    dtype=cutlass.Int64,
+                    count=2 * cfg.num_stages_workid,
+                    alignment=8,
+                )
+            )
+        if cutlass.const_expr(cfg.use_early_exit and cfg.use_clc_fast_drain):
+            fast_drain_response_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "work_queue_fast_drain_response",
+                    dtype=cutlass.Int128,
+                    count=BatchedGemmWorkQueue.fast_drain_rate,
+                    alignment=16,
+                )
+            )
+            fast_drain_mbar_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "work_queue_fast_drain_mbar",
+                    dtype=cutlass.Int64,
+                    alignment=8,
+                )
+            )
+    if cutlass.const_expr(
+        cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+    ):
+        proxy_barrier_alloc = smem_allocator.add(
+            SmemAllocation(
+                "proxy_cluster_mbarriers",
+                dtype=cutlass.Int64,
+                count=2 * pcfgs["proxy"].num_stages,
+                alignment=8,
+            )
+        )
+    smem_allocator.compute_layout()
+
+    clc_response_ptr = None
+    fast_drain_response_ptr = None
+    fast_drain_mbar_ptr = None
+    if cutlass.const_expr(
+        cfg.is_persistent
+        or (cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0)
+    ):
+        smem_allocator.allocate()
+        smem_base = smem_allocator.smem_base.data_ptr()
+    if cutlass.const_expr(cfg.is_persistent):
+        clc_response_ptr = cute.make_ptr(
+            cutlass.Int128,
+            smem_base + clc_response_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        workid_barrier_ptr = cute.make_ptr(
+            cutlass.Int64,
+            smem_base + workid_barrier_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        pcfgs["workid"] = replace(pcfgs["workid"], barrier_ptr=workid_barrier_ptr)
+        if cutlass.const_expr(cfg.use_work_throttle_barrier):
+            work_throttle_barrier_ptr = cute.make_ptr(
+                cutlass.Int64,
+                smem_base + work_throttle_barrier_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+            pcfgs["work_throttle"] = replace(
+                pcfgs["work_throttle"], barrier_ptr=work_throttle_barrier_ptr
+            )
+        if cutlass.const_expr(cfg.use_early_exit and cfg.use_clc_fast_drain):
+            fast_drain_response_ptr = cute.make_ptr(
+                cutlass.Int128,
+                smem_base + fast_drain_response_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+            fast_drain_mbar_ptr = cute.make_ptr(
+                cutlass.Int64,
+                smem_base + fast_drain_mbar_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+    if cutlass.const_expr(
+        cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+    ):
+        proxy_barrier_ptr = cute.make_ptr(
+            cutlass.Int64,
+            smem_base + proxy_barrier_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        pcfgs["proxy"] = replace(pcfgs["proxy"], barrier_ptr=proxy_barrier_ptr)
+
+    # TMEM allocator
+    tmem_allocator = TmemAllocator()
+    # C first (accumulator at offset 0, matching nvfp4_gemm reference)
+    tmem_allocator.add_resource(tmem_c)
+    if cutlass.const_expr(cfg.has_cast_a):
+        tmem_allocator.add_resource(tmem_cast_a)
+    if cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
+        if cutlass.const_expr(cfg.use_combined_sfab_copy):
+            tmem_allocator.add_resource(tmem_sfab)
+        else:
+            tmem_allocator.add_resource(tmem_sfa)
+            tmem_allocator.add_resource(tmem_sfb)
+    tmem_allocator.compute_layout()
+
     # WorkQueue — CLC persistent or static (non-persistent)
     if cutlass.const_expr(cfg.is_persistent):
         if cutlass.const_expr(
@@ -1797,7 +2003,6 @@ def _batched_gemm_kernel_bf16_body(
             num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
                 idx=Int32(0), vector_size=1
             )[0]
-        clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
         tile_sched_cfg = (
             TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
                 tile_scheduler_params=tile_sched_params,
@@ -1809,6 +2014,8 @@ def _batched_gemm_kernel_bf16_body(
             cfg=cfg,
             num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
             num_non_exiting_ctas_value=num_non_exiting_ctas_value,
+            fast_drain_response_ptr=fast_drain_response_ptr,
+            fast_drain_mbar_ptr=fast_drain_mbar_ptr,
             pipeline_config=pcfgs["workid"],
             name="WorkQueue",
         )
@@ -1827,52 +2034,7 @@ def _batched_gemm_kernel_bf16_body(
             name="WorkThrottle",
         )
 
-    # SMEM allocator
-    smem_allocator = SmemAllocator()
-    smem_resources: tuple[Any, ...] = (smem_a, smem_b)
-    if cutlass.const_expr(cfg.has_cast_a):
-        smem_resources = smem_resources + (smem_sfa,)
-    if cutlass.const_expr(cfg.has_scale_factors):
-        smem_resources = smem_resources + (smem_sfa, smem_sfb)
-    if cutlass.const_expr(cfg.has_deepseek_fp8):
-        smem_resources = smem_resources + (smem_dsfp8_sfab,)
-    if cutlass.const_expr(cfg.is_persistent):
-        smem_resources = smem_resources + (work_queue,)
-    smem_resources = smem_resources + (gmem_c,)
-    for r in smem_resources:
-        smem_allocator.add_resource(r)
-    if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
-        alloc_a = smem_a._alloc if hasattr(smem_a, "_alloc") else smem_a._alloc_a
-        alloc_b = smem_b._alloc if hasattr(smem_b, "_alloc") else smem_b._alloc_b
-        smem_allocator.add_alias_group(
-            [
-                [alloc_a, alloc_b],
-                [gmem_c._alloc_sc],
-            ]
-        )
-    tmem_ptr_alloc = smem_allocator.add_tmem_ptr(
-        SmemAllocation("tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
-    )
-    tmem_dealloc_mbar_alloc = None
-    if cutlass.const_expr(cfg.has_cluster):
-        tmem_dealloc_mbar_alloc = smem_allocator.add(
-            SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
-        )
-    smem_allocator.compute_layout()
-
-    # TMEM allocator
-    tmem_allocator = TmemAllocator()
-    # C first (accumulator at offset 0, matching nvfp4_gemm reference)
-    tmem_allocator.add_resource(tmem_c)
-    if cutlass.const_expr(cfg.has_cast_a):
-        tmem_allocator.add_resource(tmem_cast_a)
-    if cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
-        if cutlass.const_expr(cfg.use_combined_sfab_copy):
-            tmem_allocator.add_resource(tmem_sfab)
-        else:
-            tmem_allocator.add_resource(tmem_sfa)
-            tmem_allocator.add_resource(tmem_sfb)
-    tmem_allocator.compute_layout()
+    proxy_cluster = None
 
     pdl_wait_completed_before_tasks = cutlass.const_expr(
         _pdl_wait_completed_before_tasks(cfg)
@@ -1887,7 +2049,6 @@ def _batched_gemm_kernel_bf16_body(
     )
 
     # Tasks
-    proxy_cluster = None
     if cutlass.const_expr(cfg.has_gather):
         if cutlass.const_expr(cfg.is_swap_ab):
             if cutlass.const_expr(cfg.fuse_operand_sf_loads):
@@ -2982,12 +3143,11 @@ def gemm(
     cluster_shape = (cfg.cluster_m, 1, 1)
 
     if cutlass.const_expr(cfg.is_persistent):
-        clc_raster_along_m = True
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (launch_num_tiles_m, launch_num_tiles_n, 1),
             cluster_shape,
             1,
-            clc_raster_along_m,
+            cfg.raster_along_m,
         )
         grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
     else:
@@ -3062,7 +3222,7 @@ def gemm(
     if cutlass.const_expr(cfg.is_swap_ab and cfg.use_tma_store):
         tma_store_cols = cfg.epi_tile_n
     else:
-        tma_store_cols = min(16, max(8, cfg.tile_n))
+        tma_store_cols = cfg.non_swap_tma_store_cols
     if cutlass.const_expr(cfg.has_epilogue_quant):
         if cutlass.const_expr(cfg.use_tma_store):
             if cutlass.const_expr(cfg.uses_mxfp8_output_quant):
@@ -3120,11 +3280,19 @@ def gemm(
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
             else:
                 tma_c_format = cuda.TensorMapDataFormat.DEFAULT
+            if cutlass.const_expr(
+                cfg.dtype_c_bits == 16
+                and cfg.use_tile256_tmem_overlap
+                and cfg.num_epilogue_warps == 4
+            ):
+                tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(tma_store_cols * 2)
+            else:
+                tma_c_swizzle = cuda.TensorMapSwizzle.none
             tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                 tensor=c_tensor,
                 box_dims=(cfg.tile_m, tma_store_cols),
                 stride_order=(1, 0),
-                swizzle=cuda.TensorMapSwizzle.none,
+                swizzle=tma_c_swizzle,
                 tma_format=tma_c_format,
             )
 
