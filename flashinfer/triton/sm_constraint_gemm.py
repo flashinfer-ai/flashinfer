@@ -3,12 +3,34 @@ from typing import Optional
 import torch
 import triton
 
+from ..utils import get_compute_capability
 from .kernels.sm_constraint_gemm import (
     gemm_kernel,
     gemm_kernel_descriptor_persistent,
     gemm_kernel_persistent,
 )
 from .utils import check_device, check_dim, check_input
+
+
+def _get_num_stages(a, out_dtype, *, descriptor=False, epilogue_subtile=False):
+    """Select pipeline stages that fit SM120's input and epilogue buffers."""
+    if get_compute_capability(a.device) != (12, 0):
+        return 3
+
+    # SM120 has 99 KiB of shared memory per block. Keep the original pipeline
+    # where it fits; reducing stages also slows down some FP8 configurations.
+    if descriptor:
+        if out_dtype == torch.float32 and not epilogue_subtile:
+            # The full FP32 TMA epilogue does not fit even with two stages.
+            return 1
+        if a.dtype in (torch.float16, torch.bfloat16) and (
+            out_dtype == torch.float32
+            or (out_dtype in (torch.float16, torch.bfloat16) and not epilogue_subtile)
+        ):
+            return 2
+    elif a.dtype == torch.float32:
+        return 2
+    return 3
 
 
 def gemm_persistent(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None, num_sms=None):
@@ -91,6 +113,12 @@ def gemm_persistent(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None, num_sms=N
         alpha=alpha,
         beta=beta,
         NUM_SMS=num_sms,
+        BLOCK_SIZE_M=128,
+        BLOCK_SIZE_N=128,
+        BLOCK_SIZE_K=64,
+        GROUP_SIZE_M=8,
+        num_stages=_get_num_stages(a, c.dtype),
+        num_warps=4,
     )
     return c
 
@@ -166,6 +194,12 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None):
         c.stride(1),
         alpha=alpha,
         beta=beta,
+        BLOCK_SIZE_M=128,
+        BLOCK_SIZE_N=128,
+        BLOCK_SIZE_K=64,
+        GROUP_SIZE_M=8,
+        num_stages=_get_num_stages(a, c.dtype),
+        num_warps=4,
     )
     return c
 
@@ -271,7 +305,9 @@ def gemm_descriptor_persistent(
         BLOCK_SIZE_N=128 if dtype != torch.float32 else 64,
         BLOCK_SIZE_K=64,
         GROUP_SIZE_M=8,
-        num_stages=3,
+        num_stages=_get_num_stages(
+            a, c.dtype, descriptor=True, epilogue_subtile=EPILOGUE_SUBTILE
+        ),
         num_warps=8,
         EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
     )
