@@ -58,9 +58,12 @@ _CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS = frozenset(
 
 _CAKE_DSV4_LAZY_EXPORTS = frozenset(
     {
+        "cake_dsv4_nvfp4_lse",
         "cake_dsv4_workspace_layout",
         "cake_dsv4_workspace_reset",
         "get_cake_dsv4_workspace_bytes",
+        "nvfp4_pool_geometry",
+        "resolve_cake_dsv4_nvfp4_metadata",
         "resolve_cake_dsv4_sparse_metadata",
     }
 )

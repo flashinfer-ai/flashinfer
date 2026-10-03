@@ -27,16 +27,37 @@ import torch
 
 from ...api_logging import flashinfer_api
 from ...utils import (
+    get_compute_capability,
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
 )
 
 
+from ._dsv4_nvfp4_policy import _STATIC_FORMAT
 from ._execution import (
     dsv4_nvfp4_format_info,
+    get_dsv4_nvfp4_cache_ops_module,
     get_sparse_mla_dsv4_nvfp4_module,
 )
+
+# Cache ABI constants shared by every architecture. The cache writers must
+# not depend on the compiled SM12x attention module (unavailable on
+# SM100/SM103), so they read the static envelope instead of ``format_info``.
+_QUERY_DIM = _STATIC_FORMAT["query_dim"]
+_BYTES_PER_TOKEN = _STATIC_FORMAT["bytes_per_token"]
+
+
+def _cache_ops_module(device: torch.device):
+    """Select the module exporting the NVFP4 cache writers for ``device``.
+
+    SM100/SM103 use the standalone cache-ops build; SM12x keeps the exports
+    from the unified sparse-MLA module so that path is unchanged.
+    """
+    major, _ = get_compute_capability(device)
+    if major == 10:
+        return get_dsv4_nvfp4_cache_ops_module()
+    return get_sparse_mla_dsv4_nvfp4_module()
 
 
 @functools.cache
@@ -176,13 +197,13 @@ def _check_latent_kv(latent_kv: torch.Tensor, *, expected_rows: int | None) -> i
         raise ValueError(
             f"latent_kv must be 2D, 3D, or 4D, got shape={tuple(latent_kv.shape)}"
         )
-    if latent_kv.shape[-1] != dsv4_nvfp4_format_info()["query_dim"]:
+    if latent_kv.shape[-1] != _QUERY_DIM:
         raise ValueError(
-            f"latent_kv last dimension must be {dsv4_nvfp4_format_info()['query_dim']}, got {latent_kv.shape[-1]}"
+            f"latent_kv last dimension must be {_QUERY_DIM}, got {latent_kv.shape[-1]}"
         )
     if not latent_kv.is_contiguous():
         raise ValueError("latent_kv must be contiguous")
-    rows = latent_kv.numel() // dsv4_nvfp4_format_info()["query_dim"]
+    rows = latent_kv.numel() // _QUERY_DIM
     if expected_rows is not None and rows != expected_rows:
         raise ValueError(
             f"latent_kv contains {rows} rows, expected {expected_rows} rows"
@@ -195,10 +216,7 @@ def _cache_shape(cache: torch.Tensor) -> tuple[int, int, str]:
         raise ValueError(f"cache must be a CUDA tensor, got {cache.device}")
     if cache.dtype != torch.uint8:
         raise ValueError(f"cache must have dtype torch.uint8, got {cache.dtype}")
-    if (
-        cache.ndim not in (3, 4)
-        or cache.shape[-1] != dsv4_nvfp4_format_info()["bytes_per_token"]
-    ):
+    if cache.ndim not in (3, 4) or cache.shape[-1] != _BYTES_PER_TOKEN:
         raise ValueError(
             "cache must be [num_pages, page_size, 384], HND "
             "[num_pages, 1, page_size, 384], or NHD "
@@ -215,15 +233,12 @@ def _cache_shape(cache: torch.Tensor) -> tuple[int, int, str]:
             "cache must have a singleton latent-head dimension at axis 1 or 2"
         )
     page_dim = 1 if cache.ndim == 3 or layout == "NHD" else 2
-    if (
-        cache.stride(-1) != 1
-        or cache.stride(page_dim) != dsv4_nvfp4_format_info()["bytes_per_token"]
-    ):
+    if cache.stride(-1) != 1 or cache.stride(page_dim) != _BYTES_PER_TOKEN:
         raise ValueError(
             "cache entries must be contiguous inside each page with strides "
-            f"(..., {dsv4_nvfp4_format_info()['bytes_per_token']}, 1), got {cache.stride()}"
+            f"(..., {_BYTES_PER_TOKEN}, 1), got {cache.stride()}"
         )
-    if cache.stride(0) < page_size * dsv4_nvfp4_format_info()["bytes_per_token"]:
+    if cache.stride(0) < page_size * _BYTES_PER_TOKEN:
         raise ValueError(
             "cache page stride must cover the logical page payload, got "
             f"stride(0)={cache.stride(0)} for page_size={page_size}"
@@ -231,7 +246,7 @@ def _cache_shape(cache: torch.Tensor) -> tuple[int, int, str]:
     return int(num_pages), int(page_size), layout
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([100, 103, 120, 121])
 @flashinfer_api
 def nvfp4_quantize_pack_sparse_mla_cache(
     latent_kv: torch.Tensor,
@@ -239,6 +254,9 @@ def nvfp4_quantize_pack_sparse_mla_cache(
     kv_layout: str = "HND",
 ) -> torch.Tensor:
     r"""Quantize complete DeepSeek-V4 latent-KV pages to the NVFP4 cache ABI.
+
+    Supported on SM100/SM103 and SM120/SM121; one shared kernel source
+    produces byte-identical caches on every architecture.
 
     Parameters
     ----------
@@ -283,20 +301,20 @@ def nvfp4_quantize_pack_sparse_mla_cache(
 
     _check_latent_kv(latent_kv, expected_rows=int(num_pages) * int(page_size))
     cache_shape = (
-        (num_pages, 1, page_size, dsv4_nvfp4_format_info()["bytes_per_token"])
+        (num_pages, 1, page_size, _BYTES_PER_TOKEN)
         if kv_layout == "HND"
-        else (num_pages, page_size, 1, dsv4_nvfp4_format_info()["bytes_per_token"])
+        else (num_pages, page_size, 1, _BYTES_PER_TOKEN)
     )
     cache = torch.empty(cache_shape, dtype=torch.uint8, device=latent_kv.device)
     if int(num_pages) == 0 or int(page_size) == 0:
         return cache
-    get_sparse_mla_dsv4_nvfp4_module().sparse_mla_sm120_nvfp4_quantize_pack(
+    _cache_ops_module(latent_kv.device).sparse_mla_sm120_nvfp4_quantize_pack(
         latent_kv, cache
     )
     return cache
 
 
-@supported_compute_capability([120, 121])
+@supported_compute_capability([100, 103, 120, 121])
 @flashinfer_api
 def nvfp4_quantize_append_sparse_mla_cache(
     latent_kv: torch.Tensor,
@@ -304,6 +322,9 @@ def nvfp4_quantize_append_sparse_mla_cache(
     cache: torch.Tensor,
 ) -> None:
     r"""Quantize and append DeepSeek-V4 latent KV by physical cache slot.
+
+    Supported on SM100/SM103 and SM120/SM121; one shared kernel source
+    produces byte-identical caches on every architecture.
 
     Parameters
     ----------
@@ -341,7 +362,7 @@ def nvfp4_quantize_append_sparse_mla_cache(
     if num_pages * page_size == 0 and slot_mapping.numel() != 0:
         raise ValueError("cannot append to an empty cache")
 
-    get_sparse_mla_dsv4_nvfp4_module().sparse_mla_sm120_nvfp4_quantize_append(
+    _cache_ops_module(cache.device).sparse_mla_sm120_nvfp4_quantize_append(
         latent_kv, slot_mapping, cache
     )
 

@@ -254,6 +254,19 @@ PageAttention for MLA
 
 .. note::
 
+    With ``backend="cake"`` on SM100/SM103, ``kv_cache_format="nvfp4"`` runs
+    the CAKE DeepSeek-V4 NVFP4 sparse-MLA prefill route on the 384-byte paged
+    cache written by ``nvfp4_quantize_pack_sparse_mla_cache`` /
+    ``nvfp4_quantize_append_sparse_mla_cache`` (both pools, HND or NHD, any
+    page pitch). The metadata takes the SM120 NVFP4 form: ``sparse_indices``
+    is the main table (128 or more columns) with ``swa_topk_lens`` as its
+    active lengths; ``extra_sparse_indices`` / ``extra_sparse_topk_lens`` add
+    an independent compressed segment. The route writes a base-2 LSE per
+    (token, head) into ``workspace_buffer``; read it with
+    ``flashinfer.mla.cake_dsv4_nvfp4_lse``.
+
+.. note::
+
     With ``backend="cute-dsl"``, pass ``hca_swa_indices`` as absolute rows into
     the flattened SWA cache and ``hca_compressed_block_tables`` as physical
     compressed-cache page IDs. The SWA table has shape ``[B * Q, 128]`` and may

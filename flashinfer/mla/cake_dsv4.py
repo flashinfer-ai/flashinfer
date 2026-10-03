@@ -38,6 +38,23 @@ Host contract (flashinfer#4671 hardening)
   with every region 128-byte aligned. No call path allocates device memory:
   callers zero the counter region once (:func:`cake_dsv4_workspace_reset`, or
   the first eager call does it for that tensor) and the kernels self-reset.
+* **NVFP4 cache route** (``kv_cache_format="nvfp4"``, SM100/SM103). The two
+  pools are opaque ``uint8`` DSV4 NVFP4 pages (384 logical bytes per token:
+  ``page_size * 352`` data bytes followed by a ``page_size * 32``-byte scale
+  footer, see :func:`flashinfer.mla.nvfp4_quantize_pack_sparse_mla_cache`),
+  ``[pages, 1, page_size, 384]`` (HND) or ``[pages, page_size, 1, 384]``
+  (NHD) with a free page pitch (a multiple of 32 bytes). The metadata is the
+  two-segment form of the SM120 NVFP4 route: ``sparse_indices [T, K_main]``
+  indexes the main pool with active lengths ``swa_topk_lens [T]``;
+  ``extra_sparse_indices [T, K_extra]`` indexes the compressed pool with
+  independent ``extra_sparse_topk_lens [T]``; ``-1`` entries are masked. The
+  host hands the kernel two overlapping-stride TMA views per pool (the
+  352-byte data rows and the 32-byte footer rows on a 32-byte pitch,
+  :func:`nvfp4_pool_geometry`) and the page geometry scalars; it writes the
+  BF16 output and a base-2 LSE per (token, head) into the workspace region
+  :func:`cake_dsv4_nvfp4_lse` exposes. The route is one persistent two-CTA
+  body for every head count (``num_heads <= 128``); head counts that are not
+  a multiple of 64 run its plain-store epilogue variant.
 """
 
 from __future__ import annotations
@@ -55,6 +72,17 @@ from ..utils import get_compute_capability
 _HEAD_DIM = 512
 _TILE_KV = 128
 _SWA_WIDTH = 128
+# DSV4 NVFP4 paged-cache row (``Dsv4Nvfp4Layout::BYTES_PER_TOKEN``): 224 B
+# packed E2M1 + 128 B BF16 rope + 28 B E4M3 scales + 4 B zero padding.
+_NVFP4_BYTES_PER_TOKEN = 384
+_NVFP4_DATA_BYTES = 352
+_NVFP4_FOOTER_BYTES = 32
+# Row pitch of the two TMA views over a packed NVFP4 pool (one "unit").
+_NVFP4_UNIT_BYTES = 32
+_NVFP4_ROW_UNITS = _NVFP4_DATA_BYTES // _NVFP4_UNIT_BYTES  # 11 units per data row
+_NVFP4_MAX_HEADS = 128
+# Widest sparse selection the NVFP4 body stages (its index ring).
+_NVFP4_MAX_SPARSE_TOPK = _SWA_WIDTH + 1024
 _ALIGN = 128
 
 # Deterministic workspace layout (byte offsets inside workspace_buffer).
@@ -562,6 +590,9 @@ _TMA_SOURCE_ALIASES: Mapping[str, str] = {
     # The FP8 persistent bodies (round 5) store O through a TMA descriptor over
     # the same [tokens, heads, 512] rows the plain ``O`` pointer argument sees.
     "tmap_o": "O",
+    # NVFP4 route: 32-byte scale-footer rows of the two packed pools.
+    "tmap_swa_sf": "SWA_sf",
+    "tmap_compressed_sf": "compressed_KV_sf",
 }
 _SCALAR_ALIASES: Mapping[str, str] = {
     "num_q_heads": "num_heads",
@@ -586,6 +617,11 @@ _TENSOR_VALUE_NAMES = frozenset(
         "sparse_topk_lens",
         # Pre-hardening combined table; bound only for combined metadata.
         "sparse_indices",
+        # NVFP4 route: footer views, final LSE, independent extra-segment lengths.
+        "SWA_sf",
+        "compressed_KV_sf",
+        "LSE",
+        "extra_topk_lens",
     }
 )
 _SCALAR_VALUE_NAMES = frozenset(
@@ -603,6 +639,15 @@ _SCALAR_VALUE_NAMES = frozenset(
         "batch_size",
         "max_q_len",
         "ragged_query",
+        # NVFP4 route: paged-pool geometry (32-byte row units) and segment widths.
+        "swa_page_log2",
+        "swa_pitch_units",
+        "swa_footer_units",
+        "compressed_page_log2",
+        "compressed_pitch_units",
+        "compressed_footer_units",
+        "swa_width",
+        "compressed_width",
     }
 )
 _GRID_NAMES = ("grid_x", "grid_y", "grid_z")
@@ -615,11 +660,30 @@ _RETIRED_ARG_REASONS: Mapping[str, str] = {
 }
 # Producers whose generated ABI reads request boundaries from cum_seq_lens_q
 # only; run_cake_dsv4 synthesizes the dense offsets for them.
+# NVFP4 (384-byte cache) persistent prefill body: the TMA-store epilogue
+# variant for num_heads % 64 == 0 and the plain-store epilogue variant for the
+# thin head counts (8/16/32). Mirrors the Cake seed's variant_alias_for_heads.
+_NVFP4_ROUTE = "nvfp4_h128_prefill_persistent"
+_NVFP4_THIN_HEADS_ROUTE = _NVFP4_ROUTE + "_thin_heads"
+_NVFP4_ROUTES = frozenset({_NVFP4_ROUTE, _NVFP4_THIN_HEADS_ROUTE})
+_NVFP4_TMA_STORE_HEAD_MULTIPLE = 64
+
+
+def _nvfp4_route(num_heads: int) -> str:
+    return (
+        _NVFP4_ROUTE
+        if num_heads % _NVFP4_TMA_STORE_HEAD_MULTIPLE == 0
+        else _NVFP4_THIN_HEADS_ROUTE
+    )
+
+
 _RAGGED_ONLY_ROUTES = frozenset(
     {
         "fp8_h128_prefill_source_persistent",
         "fp8_h128_prefill_source_persistent_uniform",
         "fp8_h64_prefill_source_persistent_m64",
+        _NVFP4_ROUTE,
+        _NVFP4_THIN_HEADS_ROUTE,
     }
 )
 # CAKE-624 W9: mirrors the Cake seed's LANE_GATHER_MIN_TOKENS. Below it the
@@ -689,7 +753,15 @@ def _bind_argument(
     variant: str,
     grid: Mapping[str, int],
     descriptor_slab: Optional[torch.Tensor],
+    buffer_views: Optional[Mapping[str, torch.Tensor]] = None,
 ) -> Any:
+    """Resolve one ``arg_plan`` entry to its host value.
+
+    ``buffer_views`` reinterprets plain pointer arguments (``kind == "buffer"``)
+    whose kernel pointer type differs from the tensor a TMA descriptor of the
+    same host value reads: the NVFP4 body takes ``tmap_q`` over the BF16 query
+    and the same bytes as a ``uint32`` pointer ``Q``.
+    """
     if kind == "grid":
         if name not in grid:
             raise ValueError(
@@ -712,6 +784,13 @@ def _bind_argument(
             f"CAKE DSv4 {variant} binds the retired argument {name!r}: "
             f"{_RETIRED_ARG_REASONS[canonical]}; regenerate the bindings"
         )
+    if kind == "buffer" and buffer_views and canonical in buffer_views:
+        view = buffer_views[canonical]
+        if not isinstance(view, torch.Tensor):
+            raise TypeError(
+                f"CAKE DSv4 {variant} buffer view {name!r} must be a tensor, got {type(view).__name__}"
+            )
+        return view
     if canonical not in values:
         raise ValueError(
             f"CAKE DSv4 {variant} argument {name!r} ({kind}) has no host value; "
@@ -749,6 +828,7 @@ def _launch_variant(
     grid: tuple[int, int, int],
     workspace_raw: torch.Tensor,
     values: Mapping[str, Any],
+    buffer_views: Optional[Mapping[str, torch.Tensor]] = None,
 ):
     """Bind the generated ABI by name through the registration ``arg_plan``."""
     from ..jit.cake_dsv4 import get_cake_dsv4_spec
@@ -759,7 +839,13 @@ def _launch_variant(
     grid_values = _grid_values(grid)
     bound = [
         _bind_argument(
-            values, kind, name, variant=variant, grid=grid_values, descriptor_slab=slab
+            values,
+            kind,
+            name,
+            variant=variant,
+            grid=grid_values,
+            descriptor_slab=slab,
+            buffer_views=buffer_views,
         )
         for kind, name in contract["arg_plan"]
     ]
@@ -821,9 +907,26 @@ def _route(
     batch_size: int,
     compressed_page_size: int,
     num_query_tokens: int,
+    kv_cache_format: Literal["fp8", "nvfp4"] = "fp8",
 ) -> str:
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
+    if kv_cache_format == "nvfp4":
+        # DSV4 384-byte NVFP4 paged cache, BF16 query: one persistent body
+        # for every head count, two compiled epilogue forms (see _nvfp4_route).
+        # The dense routes below read [..., 512] pools of the query dtype and
+        # must not be used for it.
+        if dtype != torch.bfloat16:
+            raise ValueError(
+                f"the CAKE DSv4 NVFP4 route requires a bfloat16 query, got {dtype}"
+            )
+        if not 1 <= num_heads <= _NVFP4_MAX_HEADS:
+            raise ValueError(
+                f"the CAKE DSv4 NVFP4 route serves 1..{_NVFP4_MAX_HEADS} query heads, got {num_heads}"
+            )
+        return _nvfp4_route(num_heads)
+    if kv_cache_format != "fp8":
+        raise ValueError(f"unsupported CAKE DSv4 kv_cache_format: {kv_cache_format!r}")
     is_swa = sparse_topk == 128
     is_topk4x = not is_swa and compressed_page_size == 64
     is_topk128x = not is_swa and compressed_page_size == 2
@@ -1015,6 +1118,245 @@ def _dense_query_offsets(
     return result
 
 
+@dataclass(frozen=True)
+class Nvfp4PoolGeometry:
+    """TMA views and page geometry of one packed DSV4 NVFP4 pool (no copies).
+
+    ``data_map`` is the ``uint8 [rows, 352]`` view of the 352-byte data rows and
+    ``sf_map`` the ``uint8 [units, 32]`` view of the 32-byte footer rows, both
+    on a 32-byte row pitch over the pool bytes (overlapping rows: token ``t`` of
+    page ``p`` is data row ``p * pitch_units + 11 * slot`` and footer row
+    ``p * pitch_units + footer_units + slot`` with ``slot = t & (page_size - 1)``).
+    """
+
+    data_map: torch.Tensor
+    sf_map: torch.Tensor
+    pages: int
+    page_size: int
+    page_log2: int
+    pitch_units: int
+    footer_units: int
+
+
+def nvfp4_pool_geometry(cache: torch.Tensor, name: str) -> Nvfp4PoolGeometry:
+    """Validate an opaque DSV4 NVFP4 paged pool and build its kernel views.
+
+    The pool is ``uint8`` with ``384`` bytes per token: ``[pages, 1, page_size,
+    384]`` (HND), ``[pages, page_size, 1, 384]`` (NHD) or ``[pages, page_size,
+    384]``; tokens are contiguous inside a page (the ``page_size * 352`` data
+    bytes precede the ``page_size * 32`` footer, see
+    :func:`flashinfer.mla.nvfp4_quantize_pack_sparse_mla_cache`), the page
+    size is a power of two of at least 2 and the page pitch is any multiple of
+    32 bytes covering the page. The host makes no copy.
+    """
+    if cache.dtype != torch.uint8:
+        raise ValueError(
+            f"{name} must be uint8 for kv_cache_format='nvfp4', got {cache.dtype}"
+        )
+    if cache.ndim not in (3, 4) or cache.shape[-1] != _NVFP4_BYTES_PER_TOKEN:
+        raise ValueError(
+            f"{name} must be a packed NVFP4 pool [pages, 1, page_size, {_NVFP4_BYTES_PER_TOKEN}], "
+            f"[pages, page_size, 1, {_NVFP4_BYTES_PER_TOKEN}] or [pages, page_size, "
+            f"{_NVFP4_BYTES_PER_TOKEN}] for kv_cache_format='nvfp4', got {tuple(cache.shape)}"
+        )
+    if int(cache.stride(-1)) != 1:
+        raise ValueError(f"{name} must have a unit byte stride")
+    pages = int(cache.shape[0])
+    if cache.ndim == 3:
+        page_size, token_stride = int(cache.shape[1]), int(cache.stride(1))
+    elif int(cache.shape[1]) == 1:
+        page_size, token_stride = int(cache.shape[2]), int(cache.stride(2))
+    elif int(cache.shape[2]) == 1:
+        page_size, token_stride = int(cache.shape[1]), int(cache.stride(1))
+    else:
+        raise ValueError(
+            f"{name} needs a singleton KV-head axis, got {tuple(cache.shape)}"
+        )
+    if pages < 1:
+        raise ValueError(f"{name} must hold at least one page")
+    if page_size < 2 or page_size & (page_size - 1):
+        raise ValueError(
+            f"{name} page size must be a power of two of at least 2, got {page_size}"
+        )
+    if token_stride != _NVFP4_BYTES_PER_TOKEN:
+        raise ValueError(
+            f"NVFP4 {name} entries must be contiguous inside each page "
+            f"({_NVFP4_BYTES_PER_TOKEN}-byte token stride); got strides {tuple(cache.stride())}"
+        )
+    page_bytes = page_size * _NVFP4_BYTES_PER_TOKEN
+    pitch = int(cache.stride(0)) if pages > 1 else page_bytes
+    if pitch < page_bytes or pitch % _NVFP4_UNIT_BYTES:
+        raise ValueError(
+            f"NVFP4 {name} page stride must be a multiple of {_NVFP4_UNIT_BYTES} bytes "
+            f"covering the {page_bytes}-byte page, got {pitch}"
+        )
+    if cache.data_ptr() % 16:
+        raise ValueError(f"{name} base pointer must be 16-byte aligned")
+    total = (pages - 1) * pitch + page_bytes
+    flat = torch.empty(0, dtype=torch.uint8, device=cache.device)
+    flat.set_(cache.untyped_storage(), cache.storage_offset(), (total,), (1,))
+    data_rows = (total - _NVFP4_DATA_BYTES) // _NVFP4_UNIT_BYTES + 1
+    return Nvfp4PoolGeometry(
+        data_map=flat.as_strided(
+            (data_rows, _NVFP4_DATA_BYTES), (_NVFP4_UNIT_BYTES, 1)
+        ),
+        sf_map=flat.as_strided(
+            (total // _NVFP4_UNIT_BYTES, _NVFP4_FOOTER_BYTES), (_NVFP4_UNIT_BYTES, 1)
+        ),
+        pages=pages,
+        page_size=page_size,
+        page_log2=page_size.bit_length() - 1,
+        pitch_units=pitch // _NVFP4_UNIT_BYTES,
+        footer_units=_NVFP4_ROW_UNITS * page_size,
+    )
+
+
+@dataclass(frozen=True)
+class Nvfp4SparseMetadata:
+    """Resolved two-segment metadata of the NVFP4 route (no copies).
+
+    ``main_indices`` / ``extra_indices`` are contiguous spans of the int32 tables
+    (see ``_flat_index_span``); ``extra_indices`` aliases the main span and
+    ``extra_width`` is 0 without a compressed segment. ``extra_lens`` is
+    ``None`` when the caller gave no compressed lengths (every extra column up
+    to ``extra_width`` is active).
+    """
+
+    main_indices: torch.Tensor
+    extra_indices: torch.Tensor
+    main_lens: torch.Tensor
+    extra_lens: Optional[torch.Tensor]
+    main_index_stride: int
+    extra_index_stride: int
+    main_width: int
+    extra_width: int
+    num_query_tokens: int
+
+    @property
+    def sparse_topk(self) -> int:
+        return self.main_width + self.extra_width
+
+
+def _nvfp4_index_table(tensor: torch.Tensor, name: str, *, rows: Optional[int]):
+    table = _int32_table(tensor, name, rows=rows)
+    width = int(table.shape[1])
+    if width < 1:
+        raise ValueError(f"{name} must have at least one column")
+    if width % 4:
+        raise ValueError(
+            f"{name} width must be a multiple of 4 for the NVFP4 route, got {width}"
+        )
+    stride = int(table.stride(0)) if int(table.shape[0]) > 1 else width
+    if stride % 4 or table.data_ptr() % 16:
+        raise ValueError(
+            f"{name} rows must start 16-byte aligned for the NVFP4 route (int32 row "
+            f"stride a multiple of 4, 16-byte aligned base); got stride {stride}"
+        )
+    return table, stride, width
+
+
+def resolve_cake_dsv4_nvfp4_metadata(
+    sparse_indices: torch.Tensor,
+    swa_topk_lens: torch.Tensor,
+    *,
+    extra_sparse_indices: Optional[torch.Tensor] = None,
+    extra_sparse_topk_lens: Optional[torch.Tensor] = None,
+    query_rows: int,
+) -> Nvfp4SparseMetadata:
+    """Resolve the NVFP4 route's two-segment metadata (the SM120 NVFP4 form).
+
+    ``sparse_indices [T, K_main]`` indexes the main pool (flat token ids
+    ``page * page_size + slot``, ``K_main >= 128``, a multiple of 4) and
+    ``swa_topk_lens [T]`` holds its active lengths; ``extra_sparse_indices
+    [T, K_extra]`` indexes the compressed pool with independent
+    ``extra_sparse_topk_lens [T]`` (omitted lengths activate every column).
+    ``-1`` entries inside the active prefix are masked in-kernel. ``T`` may be
+    smaller than ``query_rows`` (padded query).
+    """
+    main, main_stride, main_width = _nvfp4_index_table(
+        sparse_indices, "sparse_indices", rows=None
+    )
+    rows = int(main.shape[0])
+    if rows < 1:
+        raise ValueError("sparse metadata must describe at least one query token")
+    if rows > query_rows:
+        raise ValueError(
+            f"metadata has {rows} rows but the query only has {query_rows}"
+        )
+    if main_width < _SWA_WIDTH:
+        raise ValueError(
+            f"sparse_indices must hold at least the {_SWA_WIDTH}-slot main window, got {main_width}"
+        )
+    main_lens = _int32_lens(swa_topk_lens, "swa_topk_lens", rows=rows)
+    extra_lens = None
+    if extra_sparse_indices is not None:
+        extra, extra_stride, extra_width = _nvfp4_index_table(
+            extra_sparse_indices, "extra_sparse_indices", rows=rows
+        )
+        if extra_sparse_topk_lens is not None:
+            extra_lens = _int32_lens(
+                extra_sparse_topk_lens, "extra_sparse_topk_lens", rows=rows
+            )
+    else:
+        if extra_sparse_topk_lens is not None:
+            raise ValueError("extra_sparse_topk_lens requires extra_sparse_indices")
+        extra, extra_stride, extra_width = main, main_stride, 0
+    if main_width + extra_width > _NVFP4_MAX_SPARSE_TOPK:
+        raise ValueError(
+            f"main + extra selection width {main_width + extra_width} exceeds the NVFP4 "
+            f"route's {_NVFP4_MAX_SPARSE_TOPK} slots"
+        )
+    return Nvfp4SparseMetadata(
+        main_indices=_flat_index_span(main),
+        extra_indices=_flat_index_span(extra),
+        main_lens=main_lens,
+        extra_lens=extra_lens,
+        main_index_stride=main_stride,
+        extra_index_stride=extra_stride,
+        main_width=main_width,
+        extra_width=extra_width,
+        num_query_tokens=rows,
+    )
+
+
+_full_lens_cache: dict[tuple[str, Optional[int], int, int], torch.Tensor] = {}
+
+
+def _full_lens(rows: int, value: int, *, device: torch.device) -> torch.Tensor:
+    """Cached int32 ``[rows]`` constant: every extra column active (no per-call allocation)."""
+    key = (device.type, device.index, rows, value)
+    with _scale_cache_lock:
+        result = _full_lens_cache.get(key)
+        if result is None:
+            result = torch.full((rows,), value, dtype=torch.int32, device=device)
+            _full_lens_cache[key] = result
+    return result
+
+
+def cake_dsv4_nvfp4_lse(
+    workspace_buffer: torch.Tensor, num_query_tokens: int, num_heads: int
+) -> torch.Tensor:
+    """FP32 ``[num_query_tokens, num_heads]`` view of the LSE the NVFP4 route wrote.
+
+    The NVFP4 route stores the base-2 log-sum-exp of every (token, head) row
+    (the sink folded in: ``log2(2^lse + 2^(sink * log2 e))``; ``-inf`` for a row
+    without a valid KV entry and no sink) into the ``partial_lse`` region of the
+    workspace (:func:`cake_dsv4_workspace_layout` with one split). Read it
+    after the call with the same ``num_query_tokens`` (metadata rows) and
+    ``num_heads``; the next launch into this workspace overwrites it.
+    """
+    raw = _workspace_bytes(workspace_buffer)
+    layout = cake_dsv4_workspace_layout(num_query_tokens, num_heads, 1)
+    _require_workspace_bytes(raw, layout.total_bytes)
+    offset = layout.partial_lse[0]
+    elems = num_query_tokens * num_heads
+    return (
+        raw[offset : offset + elems * torch.float32.itemsize]
+        .view(torch.float32)
+        .view(num_query_tokens, num_heads)
+    )
+
+
 def _dense_rows(cache: torch.Tensor, name: str, dtype: torch.dtype) -> torch.Tensor:
     if cache.dtype != dtype:
         raise ValueError(
@@ -1066,13 +1408,21 @@ class _Launcher:
         self.stream = stream
         self.values = values
 
-    def variant(self, name: str, *, grid: tuple[int, int, int], **overrides: Any):
+    def variant(
+        self,
+        name: str,
+        *,
+        grid: tuple[int, int, int],
+        buffer_views: Optional[Mapping[str, torch.Tensor]] = None,
+        **overrides: Any,
+    ):
         return _launch_variant(
             name,
             arch=self.arch,
             grid=grid,
             workspace_raw=self.raw,
             values={**self.values, **overrides},
+            buffer_views=buffer_views,
         )
 
     def program(self, name: str, **overrides: Any) -> None:
@@ -1131,15 +1481,33 @@ def run_cake_dsv4(
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
     sparse_topk_lens_offset: int = 0,
+    kv_cache_format: Literal["fp8", "nvfp4"] = "fp8",
+    swa_topk_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
 
     ``query`` / ``out`` may have more rows than the metadata; only the first
     ``num_query_tokens`` (metadata rows) are read and written. No device memory
     is allocated here; see the module docstring for the workspace contract.
+
+    ``kv_cache_format`` selects the pool ABI: ``"fp8"`` (the public default,
+    also covering BF16 pools) is the dense ``[..., 512]`` row layout of the
+    query dtype with the combined-length metadata (``sparse_topk_lens`` or
+    ``extra_sparse_topk_lens`` + offset); ``"nvfp4"`` is the opaque 384-byte
+    DSV4 NVFP4 paged cache with a BF16 query and the two-segment metadata of
+    the SM120 NVFP4 route: ``sparse_indices`` is the main table with active
+    lengths ``swa_topk_lens`` (``sparse_topk_lens`` must be ``None``), the
+    optional ``extra_sparse_indices`` / ``extra_sparse_topk_lens`` describe the
+    compressed pool independently, ``compressed_kv_cache`` may be ``None``
+    without a compressed segment, and ``sparse_topk_lens_offset`` is added to
+    every main length in-kernel. The NVFP4 route also writes the base-2 LSE of
+    every (token, head) into the workspace (:func:`cake_dsv4_nvfp4_lse`).
     """
     if backend != "cake":
         raise ValueError(f"expected backend='cake', got {backend!r}")
+    if kv_cache_format not in ("fp8", "nvfp4"):
+        raise ValueError(f"unsupported CAKE DSv4 kv_cache_format: {kv_cache_format!r}")
+    is_nvfp4_cache = kv_cache_format == "nvfp4"
     if query.ndim != 3:
         raise ValueError(
             f"query must be [num_tokens, num_heads, {_HEAD_DIM}], got shape {tuple(query.shape)}"
@@ -1149,28 +1517,68 @@ def run_cake_dsv4(
         raise ValueError(f"CAKE DSv4 requires head dim {_HEAD_DIM}, got {head_dim}")
     if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(f"unsupported CAKE DSv4 dtype: {query.dtype}")
+    if is_nvfp4_cache and query.dtype != torch.bfloat16:
+        raise ValueError(
+            f"kv_cache_format='nvfp4' requires a bfloat16 query, got {query.dtype}"
+        )
     if not query.is_contiguous():
         raise ValueError("query must be contiguous; backend='cake' makes no host copy")
     device = query.device
     arch = _target_arch(device)
 
-    meta = resolve_cake_dsv4_sparse_metadata(
-        sparse_indices,
-        sparse_topk_lens,
-        extra_sparse_indices=extra_sparse_indices,
-        extra_sparse_topk_lens=extra_sparse_topk_lens,
-        sparse_topk_lens_offset=sparse_topk_lens_offset,
-        query_rows=query_capacity,
-    )
-    for tensor, name in (
-        (meta.swa_indices, "sparse_indices"),
-        (meta.compressed_indices, "extra_sparse_indices"),
-        (meta.sparse_topk_lens, "sparse_topk_lens"),
-    ):
-        if tensor.device != device:
-            raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    num_query_tokens = meta.num_query_tokens
-    sparse_topk = meta.sparse_topk
+    meta: Optional[SparseMetadata] = None
+    nvfp4_meta: Optional[Nvfp4SparseMetadata] = None
+    if not is_nvfp4_cache:
+        meta = resolve_cake_dsv4_sparse_metadata(
+            sparse_indices,
+            sparse_topk_lens,
+            extra_sparse_indices=extra_sparse_indices,
+            extra_sparse_topk_lens=extra_sparse_topk_lens,
+            sparse_topk_lens_offset=sparse_topk_lens_offset,
+            query_rows=query_capacity,
+        )
+        for tensor, name in (
+            (meta.swa_indices, "sparse_indices"),
+            (meta.compressed_indices, "extra_sparse_indices"),
+            (meta.sparse_topk_lens, "sparse_topk_lens"),
+        ):
+            if tensor.device != device:
+                raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+        num_query_tokens = meta.num_query_tokens
+        sparse_topk = meta.sparse_topk
+    else:
+        if isinstance(sparse_topk_lens_offset, bool) or not isinstance(
+            sparse_topk_lens_offset, int
+        ):
+            raise TypeError("sparse_topk_lens_offset must be an int")
+        if swa_topk_lens is None:
+            raise ValueError(
+                "kv_cache_format='nvfp4' takes the main-segment lengths as swa_topk_lens"
+            )
+        if sparse_topk_lens is not None:
+            raise ValueError(
+                "kv_cache_format='nvfp4' takes swa_topk_lens (active main-segment lengths), "
+                "not the combined sparse_topk_lens: its main table is not a fixed 128-slot window"
+            )
+        if extra_sparse_topk_lens is not None and extra_sparse_indices is None:
+            raise ValueError("extra_sparse_topk_lens requires extra_sparse_indices")
+        nvfp4_meta = resolve_cake_dsv4_nvfp4_metadata(
+            sparse_indices,
+            swa_topk_lens,
+            extra_sparse_indices=extra_sparse_indices,
+            extra_sparse_topk_lens=extra_sparse_topk_lens,
+            query_rows=query_capacity,
+        )
+        for tensor, name in (
+            (nvfp4_meta.main_indices, "sparse_indices"),
+            (nvfp4_meta.extra_indices, "extra_sparse_indices"),
+            (nvfp4_meta.main_lens, "swa_topk_lens"),
+            (nvfp4_meta.extra_lens, "extra_sparse_topk_lens"),
+        ):
+            if tensor is not None and tensor.device != device:
+                raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+        num_query_tokens = nvfp4_meta.num_query_tokens
+        sparse_topk = nvfp4_meta.sparse_topk
 
     if out.dtype != torch.bfloat16:
         raise ValueError(f"out must be bfloat16, got {out.dtype}")
@@ -1187,8 +1595,43 @@ def run_cake_dsv4(
     query_rows = query[:num_query_tokens]
     out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
 
-    swa = _dense_rows(swa_kv_cache, "swa_kv_cache", query.dtype)
-    compressed = _dense_rows(compressed_kv_cache, "compressed_kv_cache", query.dtype)
+    main_pool: Optional[Nvfp4PoolGeometry] = None
+    extra_pool: Optional[Nvfp4PoolGeometry] = None
+    if is_nvfp4_cache:
+        assert nvfp4_meta is not None
+        main_pool = nvfp4_pool_geometry(swa_kv_cache, "swa_kv_cache")
+        if nvfp4_meta.extra_width:
+            if compressed_kv_cache is None:
+                raise ValueError(
+                    "extra_sparse_indices index compressed_kv_cache, which is required"
+                )
+            extra_pool = nvfp4_pool_geometry(compressed_kv_cache, "compressed_kv_cache")
+        else:
+            extra_pool = (
+                main_pool
+                if compressed_kv_cache is None
+                else nvfp4_pool_geometry(compressed_kv_cache, "compressed_kv_cache")
+            )
+        for pool, name in (
+            (main_pool, "swa_kv_cache"),
+            (extra_pool, "compressed_kv_cache"),
+        ):
+            if pool.data_map.device != device:
+                raise ValueError(
+                    f"{name} must be on {device}, got {pool.data_map.device}"
+                )
+        swa = main_pool.data_map
+        compressed = extra_pool.data_map
+    else:
+        if swa_topk_lens is not None:
+            raise ValueError(
+                "swa_topk_lens is the NVFP4 route's main-segment length; dense pools take "
+                "sparse_topk_lens or extra_sparse_topk_lens"
+            )
+        swa = _dense_rows(swa_kv_cache, "swa_kv_cache", query.dtype)
+        compressed = _dense_rows(
+            compressed_kv_cache, "compressed_kv_cache", query.dtype
+        )
     seq_lens = _int32_vector(seq_lens, "seq_lens", device)
     batch_size = seq_lens.numel()
     ragged = cum_seq_lens_q is not None
@@ -1219,8 +1662,13 @@ def run_cake_dsv4(
         ragged=ragged,
         sparse_topk=sparse_topk,
         batch_size=batch_size,
-        compressed_page_size=compressed_kv_cache.shape[-2],
-        num_query_tokens=meta.num_query_tokens,
+        compressed_page_size=(
+            extra_pool.page_size
+            if extra_pool is not None
+            else compressed_kv_cache.shape[-2]
+        ),
+        num_query_tokens=num_query_tokens,
+        kv_cache_format=kv_cache_format,
     )
 
     if cum_seq_lens_q is None and route in _RAGGED_ONLY_ROUTES:
@@ -1238,8 +1686,6 @@ def run_cake_dsv4(
         "sinks": sink_tensor,
         "bmm1_scale": scale1,
         "bmm2_scale": scale2,
-        **meta.kernel_kwargs(),
-        "sparse_indices": meta.legacy_combined_table,
         "num_heads": num_heads,
         "num_head_tiles": _ceil_div(num_heads, 64),
         "has_sinks": has_sinks,
@@ -1249,6 +1695,18 @@ def run_cake_dsv4(
         "num_splits": 1,
         "total_work_items": num_query_tokens,
     }
+    if meta is not None:
+        values.update(meta.kernel_kwargs())
+        values["sparse_indices"] = meta.legacy_combined_table
+    else:
+        assert (
+            nvfp4_meta is not None and main_pool is not None and extra_pool is not None
+        )
+        values.update(
+            _nvfp4_values(
+                nvfp4_meta, main_pool, extra_pool, sparse_topk_lens_offset, device
+            )
+        )
     launcher = _Launcher(
         arch=arch,
         workspace=workspace_buffer,
@@ -1260,11 +1718,68 @@ def run_cake_dsv4(
     return out
 
 
+def _nvfp4_values(
+    meta: Nvfp4SparseMetadata,
+    main_pool: Nvfp4PoolGeometry,
+    extra_pool: Nvfp4PoolGeometry,
+    sparse_topk_lens_offset: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Kernel values of the NVFP4 route (segment tables, footer views, page geometry)."""
+    if meta.extra_width:
+        extra_lens = (
+            meta.extra_lens
+            if meta.extra_lens is not None
+            else _full_lens(meta.num_query_tokens, meta.extra_width, device=device)
+        )
+    else:
+        # Never read (compressed_width == 0); any valid int32 pointer satisfies the binding.
+        extra_lens = meta.main_lens
+    return {
+        "SWA_sf": main_pool.sf_map,
+        "compressed_KV_sf": extra_pool.sf_map,
+        "swa_indices": meta.main_indices,
+        "compressed_indices": meta.extra_indices,
+        "sparse_topk_lens": meta.main_lens,
+        "extra_topk_lens": extra_lens,
+        "swa_index_stride": meta.main_index_stride,
+        "compressed_index_stride": meta.extra_index_stride,
+        "sparse_topk_lens_offset": int(sparse_topk_lens_offset),
+        "sparse_topk": meta.sparse_topk,
+        "num_query_tokens": meta.num_query_tokens,
+        "swa_width": meta.main_width,
+        "compressed_width": meta.extra_width,
+        "swa_page_log2": main_pool.page_log2,
+        "swa_pitch_units": main_pool.pitch_units,
+        "swa_footer_units": main_pool.footer_units,
+        "compressed_page_log2": extra_pool.page_log2,
+        "compressed_pitch_units": extra_pool.pitch_units,
+        "compressed_footer_units": extra_pool.footer_units,
+    }
+
+
 def _dispatch_route(route: str, L: _Launcher) -> None:
     v = L.values
     T = v["num_query_tokens"]
     H = v["num_heads"]
     topk = v["sparse_topk"]
+
+    if route in _NVFP4_ROUTES:
+        # One persistent two-CTA body over T work items (grid = 2 T CTAs); the
+        # final LSE lands in the workspace's partial_lse region (one split) and
+        # the body's unused partial_lse pointer is bound to the same view. The
+        # BF16 query feeds tmap_q; the loaders quantise its NoPE dims through a
+        # uint32 pointer over the same bytes.
+        parts = L.partials(1)
+        L.variant(
+            route,
+            grid=(T * 2, 1, 1),
+            total_work_items=T,
+            LSE=parts["partial_lse"],
+            partial_lse=parts["partial_lse"],
+            buffer_views={"Q": v["Q"].view(torch.uint32)},
+        )
+        return
 
     if route == "bf16_h8_h32":
         # General low-head path outside the specialized profiles.
@@ -1432,13 +1947,18 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
 
 __all__ = [
     "KERNEL_METADATA_PARAMS",
+    "Nvfp4PoolGeometry",
+    "Nvfp4SparseMetadata",
     "SparseMetadata",
     "WorkspaceLayout",
+    "cake_dsv4_nvfp4_lse",
     "cake_dsv4_workspace_layout",
     "cake_dsv4_workspace_reset",
     "canonical_arg_name",
     "get_cake_dsv4_workspace_bytes",
     "is_bindable_arg",
+    "nvfp4_pool_geometry",
+    "resolve_cake_dsv4_nvfp4_metadata",
     "resolve_cake_dsv4_sparse_metadata",
     "run_cake_dsv4",
 ]
