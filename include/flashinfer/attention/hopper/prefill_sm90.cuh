@@ -180,7 +180,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         }
         int num_kv_tiles_outside_items_window = 0;
         int num_kv_tiles_prefix = 0;
-        if constexpr (MULTIITEMSCORING) {
+        // Only compute real MIS skip-window args when the mainloop's load()
+        // actually honors them. The ragged mainloop falls through to the
+        // non-MIS loader; passing real values would desync producer/consumer
+        // tile order (load walks descending, mma jumps via kv_tile_idx_decrement).
+        if constexpr (MULTIITEMSCORING && CollectiveMainloop::kSupportsMISAwareLoad) {
           auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
           auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
           auto valid_items_window_len =
@@ -188,7 +192,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           num_kv_tiles_outside_items_window = valid_items_window_len / CTA_KV;
           num_kv_tiles_prefix = cute::ceil_div(prefix_len, CTA_KV);
         }
-        if constexpr (MULTIITEMSCORING) {
+        if constexpr (MULTIITEMSCORING && CollectiveMainloop::kSupportsMISAwareLoad) {
           collective_mainloop.load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
@@ -265,7 +269,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       }
       int num_kv_tiles_outside_items_window = 0;
       int num_kv_tiles_prefix = 0;
-      if constexpr (MULTIITEMSCORING) {
+      // Mirror the producer-side gate. When the mainloop doesn't support MIS-aware
+      // loading we leave both at 0 so mma_f16's kv_tile_idx_decrement never jumps
+      // (condition fires only at kv_tile_idx == 0, where natural decrement to -1
+      // is the same result as num_kv_tiles_prefix - 1 = -1). The MIS mask logic
+      // inside mma_f16 still applies because MULTIITEMSCORING stays true.
+      if constexpr (MULTIITEMSCORING && CollectiveMainloop::kSupportsMISAwareLoad) {
         auto prefix_len = __ldg(maybe_prefix_len_ptr + batch_idx);
         auto max_item_len = __ldg(maybe_max_item_len_ptr + batch_idx);
         auto valid_items_window_len =
@@ -429,7 +438,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 }
 
 template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
-          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params>
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool MULTIITEMSCORING = false>
 cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
                                                                 cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
@@ -438,7 +447,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   using IdType = typename KernelTraits::IdType;
 
   using CollectiveMainloop =
-      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
+      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL, MULTIITEMSCORING>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
@@ -484,7 +493,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   // Get the ptr to kernel function.
   auto kernel =
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
-                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
+                                      LEFT_SLIDING_WINDOW, CAUSAL, Scheduler, MULTIITEMSCORING>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -553,6 +562,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  constexpr bool MULTIITEMSCORING = MASK_MODE == MaskMode::kMultiItemScoring;
   constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
   BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
@@ -560,7 +570,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
                             typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(params, stream);
   cudaError_t status = cudaGetLastError();
   return status;
 }
