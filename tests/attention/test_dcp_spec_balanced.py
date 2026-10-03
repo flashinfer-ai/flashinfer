@@ -41,12 +41,9 @@ from flashinfer.jit.cake_dcp import (
     DCP_BALANCED_FAMILIES,
     DCP_BALANCED_N_ROWS,
     get_dcp_spec_balanced_uri,
+    get_dcp_spec_registry,
 )
-from flashinfer.jit.cake_fmha import (
-    CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
-    CAKE_FMHA_MANIFEST_SHA256,
-    get_cake_fmha_manifest,
-)
+from flashinfer.jit.cake_fmha import CAKE_FMHA_JIT_TAG
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 _LOG2_E = math.log2(math.e)
@@ -611,8 +608,7 @@ def test_balanced_scratch_sizes_are_shape_independent() -> None:
 
 def test_balanced_uri_names_the_family_instance_and_pins() -> None:
     assert get_dcp_spec_balanced_uri("dcp_spec_bf16_balanced", "sm100a", 32) == (
-        "cake_fmha_dcp_spec_bf16_balanced_n32_sm100a_"
-        f"{CAKE_FMHA_MANIFEST_SHA256[:12]}_{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"cake_fmha_dcp_spec_bf16_balanced_n32_sm100a_{CAKE_FMHA_JIT_TAG}"
     )
     assert get_dcp_spec_balanced_uri(
         "dcp_spec_bf16_fp8_d256_balanced", "sm103a", 64
@@ -652,9 +648,7 @@ _KIND_MANIFEST_BAND = {
 
 
 def test_balanced_families_ship_one_program_with_both_packed_instances() -> None:
-    families = get_cake_fmha_manifest()["add_ons"]["cake_fmha_dcp_spec"]["manifest"][
-        "families"
-    ]
+    families = get_dcp_spec_registry()["families"]
     csrc_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
     header = (csrc_dir / "include" / "cake_fmha.h").read_text()
     for family in DCP_BALANCED_FAMILIES:
@@ -673,7 +667,6 @@ def test_balanced_families_ship_one_program_with_both_packed_instances() -> None
         assert "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)" in program_text
         for member in entry["source_family"]:
             assert member["sources"] == {"sm_100a": program, "sm_103a": program}
-            assert member["sha256"]["sm_100a"] == member["sha256"]["sm_103a"]
             assert member["defines"] == {"N_ROWS": member["selector"]["n_rows"]}
         assert entry["binding_source"] == f"bindings/cake_fmha_{family}_binding.cu"
         assert (csrc_dir / entry["binding_source"]).is_file()
@@ -690,9 +683,7 @@ def test_balanced_families_ship_one_program_with_both_packed_instances() -> None
 
 
 def test_balanced_route_constants_match_the_shipped_manifest() -> None:
-    routes = get_cake_fmha_manifest()["add_ons"]["cake_fmha_dcp_spec"]["manifest"][
-        "balanced_routes"
-    ]
+    routes = get_dcp_spec_registry()["balanced_routes"]
     pins = {
         "bf16_p16": (DCP_BALANCED_BF16_MIN_Q_LEN, DCP_BALANCED_BF16_MAX_Q_LEN, DCP_BALANCED_BF16_MIN_ITEMS, DCP_BALANCED_BF16_LONG_TILE_BLOCKS, None),
         "fp8_p64": (DCP_BALANCED_FP8_MIN_Q_LEN, DCP_BALANCED_FP8_MAX_Q_LEN, DCP_BALANCED_FP8_MIN_ITEMS, DCP_BALANCED_FP8_LONG_TILE_BLOCKS, DCP_BALANCED_FP8_TWO_WAVE_MIN_ITEMS),
