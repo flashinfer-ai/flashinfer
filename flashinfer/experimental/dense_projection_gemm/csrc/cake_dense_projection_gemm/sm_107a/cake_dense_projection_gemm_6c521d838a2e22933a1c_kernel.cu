@@ -425,7 +425,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* OUT32, CakeTensorMap const* OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
+kernel_cake_dense_projection_gemm_6c521d838a2e22933a1c(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* OUT32, CakeTensorMap const* OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -433,8 +433,7 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -598,13 +597,13 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
                         int kend = ((u_0 < 0) ? k_iters : kend_t);
                         int tail_t = ((u_0 < 0) ? -1 : t);
                         int tiles_per_l = m_tiles * n_tiles;
-                        int tiles_per_group = 16 * n_tiles;
+                        int tiles_per_group = 8 * n_tiles;
                         int head = tile_bid / tiles_per_l;
                         int rem = tile_bid - head * tiles_per_l;
                         int group = rem / tiles_per_group;
-                        int first_m = group * 16;
+                        int first_m = group * 8;
                         int remaining = m_tiles - first_m;
-                        int group_size = ((remaining >= 16) ? 16 : remaining);
+                        int group_size = ((remaining >= 8) ? 8 : remaining);
                         int local = rem % tiles_per_group;
                         int bid_m = first_m + local % group_size;
                         int bid_n = local / group_size;
@@ -621,8 +620,11 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
                                 tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 32768 + (unsigned int)(r * 16384), A, k0, off_m + 128 * r, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                             }
                             #pragma unroll
-                            for (int r_1 = 0; r_1 < 1; r_1++) {
-                                tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 32768 + (unsigned int)(r_1 * 16384), B, k0, b_col + 128 * r_1, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            for (int p = 0; p < 2; p++) {
+                                #pragma unroll
+                                for (int kh = 0; kh < 1; kh++) {
+                                    tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 32768 + (unsigned int)(p * 8192 + kh * 8192), B, b_col + 64 * p, k0 + 64 * kh, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                }
                             }
                             asm volatile(
                                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
@@ -718,7 +720,7 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((iter_k_1 == 0) ? 1 : 0);
                             int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2048;
-                            int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2048;
+                            int _mma_b_lo_0 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -730,24 +732,24 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 272630928;\n\t"
+                    "mov.b32 id, 272696464;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -847,13 +849,13 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
                     int kend_2 = ((u_0_2 < 0) ? k_iters : kend_t_2);
                     int tail_t_2 = ((u_0_2 < 0) ? -1 : t_2);
                     int tiles_per_l_1 = m_tiles * n_tiles;
-                    int tiles_per_group_1 = 16 * n_tiles;
+                    int tiles_per_group_1 = 8 * n_tiles;
                     int head_1 = tile_bid_2 / tiles_per_l_1;
                     int rem_1 = tile_bid_2 - head_1 * tiles_per_l_1;
                     int group_1 = rem_1 / tiles_per_group_1;
-                    int first_m_1 = group_1 * 16;
+                    int first_m_1 = group_1 * 8;
                     int remaining_1 = m_tiles - first_m_1;
-                    int group_size_1 = ((remaining_1 >= 16) ? 16 : remaining_1);
+                    int group_size_1 = ((remaining_1 >= 8) ? 8 : remaining_1);
                     int local_1 = rem_1 % tiles_per_group_1;
                     int bid_m_1 = first_m_1 + local_1 % group_size_1;
                     int bid_n_1 = local_1 / group_size_1;
@@ -894,6 +896,7 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
                             _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
+                        unsigned long long row_base_0 = (unsigned long long)bidx * (unsigned long long)out_l + (unsigned long long)global_row * (unsigned long long)ldo + (unsigned long long)(off_n_1 + col0);
                         int qid = lane & 3;
                         unsigned int m0 = (unsigned int)(-(qid & 1));
                         unsigned int m1 = (unsigned int)(-(qid >> 1 & 1));
@@ -952,10 +955,10 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
                                 for (int c_1 = 0; c_1 < 4; c_1++) {
                                     int colc = col_g + c_1 * 16;
                                     if (colc + 16 <= N) {
-                                        reinterpret_cast<int4*>(out + (row_base + (unsigned long long)(g * 64 + c_1 * 16)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16 + (4 * g + c_1) * 8)[0];
-                                        reinterpret_cast<int4*>(out + (row_base + (unsigned long long)(g * 64 + c_1 * 16 + 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16 + (4 * g + c_1) * 8 + 4)[0];
+                                        reinterpret_cast<int4*>(out + (row_base_0 + (unsigned long long)(g * 64 + c_1 * 16)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16 + (4 * g + c_1) * 8)[0];
+                                        reinterpret_cast<int4*>(out + (row_base_0 + (unsigned long long)(g * 64 + c_1 * 16 + 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16 + (4 * g + c_1) * 8 + 4)[0];
                                     } else if (colc + 8 <= N) {
-                                        reinterpret_cast<int4*>(out + (row_base + (unsigned long long)(g * 64 + c_1 * 16)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16 + (4 * g + c_1) * 8)[0];
+                                        reinterpret_cast<int4*>(out + (row_base_0 + (unsigned long long)(g * 64 + c_1 * 16)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16 + (4 * g + c_1) * 8)[0];
                                     }
                                 }
                             }
@@ -1058,6 +1061,7 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
                                 _tmem_load_0_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
+                            unsigned long long row_base_0_1 = (unsigned long long)bidx * (unsigned long long)out_l + (unsigned long long)global_row * (unsigned long long)ldo + (unsigned long long)(off_n_1 + col0);
                             int qid_1 = lane & 3;
                             unsigned int m0_1 = (unsigned int)(-(qid_1 & 1));
                             unsigned int m1_1 = (unsigned int)(-(qid_1 >> 1 & 1));
@@ -1116,10 +1120,10 @@ kernel_cake_dense_projection_gemm_5d84680fa416dc1ddd37(CakeTensorMap const* A, C
                                     for (int c_3 = 0; c_3 < 4; c_3++) {
                                         int colc_1 = col_g_1 + c_3 * 16;
                                         if (colc_1 + 16 <= N) {
-                                            reinterpret_cast<int4*>(out + (row_base_1 + (unsigned long long)(g_3 * 64 + c_3 * 16)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16_1 + (4 * g_3 + c_3) * 8)[0];
-                                            reinterpret_cast<int4*>(out + (row_base_1 + (unsigned long long)(g_3 * 64 + c_3 * 16 + 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16_1 + (4 * g_3 + c_3) * 8 + 4)[0];
+                                            reinterpret_cast<int4*>(out + (row_base_0_1 + (unsigned long long)(g_3 * 64 + c_3 * 16)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16_1 + (4 * g_3 + c_3) * 8)[0];
+                                            reinterpret_cast<int4*>(out + (row_base_0_1 + (unsigned long long)(g_3 * 64 + c_3 * 16 + 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16_1 + (4 * g_3 + c_3) * 8 + 4)[0];
                                         } else if (colc_1 + 8 <= N) {
-                                            reinterpret_cast<int4*>(out + (row_base_1 + (unsigned long long)(g_3 * 64 + c_3 * 16)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16_1 + (4 * g_3 + c_3) * 8)[0];
+                                            reinterpret_cast<int4*>(out + (row_base_0_1 + (unsigned long long)(g_3 * 64 + c_3 * 16)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16_1 + (4 * g_3 + c_3) * 8)[0];
                                         }
                                     }
                                 }
