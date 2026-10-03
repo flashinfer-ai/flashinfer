@@ -43,7 +43,11 @@ from ..jit.attention.modules import (
     batch_prefill_bidirectional_ranges_jit_args,
     get_batch_prefill_bidirectional_ranges_spec,
 )
-from ..jit.utils import filename_safe_dtype_map
+from ..jit.utils import (
+    dtype_map_kv,
+    filename_safe_dtype_map,
+    filename_safe_dtype_map_kv,
+)
 
 
 @functools.cache
@@ -414,6 +418,8 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
     ) -> None:
         # trtllm is separate code path
         assert backend in ["fa2", "fa3", "auto"]
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
         if backend == "auto":
             # dispatch backend before init jit module
             backend = determine_attention_backend(
@@ -427,16 +433,41 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
                 head_dim_vo=head_dim_vo,
             )
 
+        packed_fp4_kv = dtype_map_kv[kv_data_type] == "__nv_fp4x2_e2m1"
+        if packed_fp4_kv and backend != "fa2":
+            raise NotImplementedError(
+                "packed FP4 KV is only supported by the fa2 attention-sink "
+                f"backend, got backend={backend!r}."
+            )
+
+        additional_tensor_names = ["sink"]
+        additional_tensor_dtypes = ["float"]
+        if packed_fp4_kv:
+            # The packed fp4 KV load path reads the block scales through these
+            # exact names; the module URI must also distinguish the fp4 variant.
+            additional_tensor_names += ["maybe_k_cache_sf", "maybe_v_cache_sf"]
+            additional_tensor_dtypes += ["uint8_t", "uint8_t"]
+
+        uri = f"batch_prefill_attention_sink_{filename_safe_dtype_map[q_data_type]}"
+        if packed_fp4_kv:
+            uri += (
+                f"_kv_{filename_safe_dtype_map_kv(kv_data_type)}"
+                f"_head_dim_qk_{head_dim_qk}_head_dim_vo_{head_dim_vo}"
+                f"_posenc_{PosEncodingMode[pos_encoding_mode].value}"
+                f"_f16qk_{use_fp16_qk_reduction}"
+            )
+        uri += f"_swa_{window_left >= 0}_{backend}"
+
         jit_args = [
-            f"batch_prefill_attention_sink_{filename_safe_dtype_map[q_data_type]}_swa_{window_left >= 0}_{backend}",  # uri
+            uri,
             q_data_type,  # dtype_q
             kv_data_type,  # dtype_kv
             q_data_type,  # dtype_o
             torch.int32,  # idtype
             head_dim_qk,  # hidden_dim_qk
             head_dim_vo,  # hidden_dim_vo
-            ["sink"],  # additional_tensor_names
-            ["float"],  # additional_tensor_dtypes
+            additional_tensor_names,
+            additional_tensor_dtypes,
             ["sm_scale"],  # additional_scalar_names
             ["double"],  # additional_scalar_dtypes
             "AttentionSink",
