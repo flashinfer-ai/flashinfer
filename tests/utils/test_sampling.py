@@ -1647,3 +1647,59 @@ if __name__ == "__main__":
     # test_top_k_mask_logits(99, 989, 10)
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
+
+
+@pytest.mark.parametrize("api", ["top_k", "top_k_top_p"])
+@pytest.mark.parametrize("indices_dtype", [None, torch.int32, torch.int64])
+@pytest.mark.parametrize("threshold_dtype", [torch.int32, torch.int64])
+def test_per_request_top_k_with_indices_dtype(api, indices_dtype, threshold_dtype):
+    """Check the threshold element type without relying on a row-remapping fix.
+
+    Each case uses one batched call and identity indices (or no indices), so
+    probability-row and output-position indexing agree even without #5340.
+    """
+    device = "cuda:0"
+    repeats = 1024
+    rows = torch.tensor(
+        [[0.5, 0.25, 0.125, 0.125]] * 3, dtype=torch.float32, device=device
+    )
+    probs = rows.repeat(repeats, 1)
+    top_k = torch.tensor([1, 2, 4], dtype=threshold_dtype, device=device).repeat(
+        repeats
+    )
+    indices = (
+        None
+        if indices_dtype is None
+        else torch.arange(probs.size(0), dtype=indices_dtype, device=device)
+    )
+    before_probs, before_top_k = probs.clone(), top_k.clone()
+    before_indices = None if indices is None else indices.clone()
+    kwargs = dict(indices=indices, seed=20260920, offset=0, return_valid=True)
+    if api == "top_k":
+        out, valid = flashinfer.sampling.top_k_sampling_from_probs(
+            probs, top_k, **kwargs
+        )
+    else:
+        out, valid = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, 1.0, filter_apply_order="joint", **kwargs
+        )
+    output_dtype = torch.int32 if indices is None else indices.dtype
+    assert out.shape == (probs.size(0),) and out.dtype == output_dtype
+    assert valid.shape == out.shape and valid.dtype == torch.bool
+    assert bool(valid.all())
+    assert bool(((out >= 0) & (out < rows.size(1))).all())
+    assert torch.equal(probs, before_probs)
+    assert torch.equal(top_k, before_top_k)
+    if indices is not None:
+        assert torch.equal(indices, before_indices)
+    samples = out.reshape(repeats, 3)
+    expected = [[0], [0, 1], [0, 1, 2, 3]]
+    for lane, support in enumerate(expected):
+        observed = torch.unique(samples[:, lane]).tolist()
+        assert observed == support, (
+            api,
+            indices_dtype,
+            threshold_dtype,
+            lane,
+            observed,
+        )
