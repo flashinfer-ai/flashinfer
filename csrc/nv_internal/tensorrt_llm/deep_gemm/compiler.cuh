@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "cache_file_utils.h"
 #include "jit_utils.cuh"
 #include "nvrtc.h"
 #include "runtime.cuh"
@@ -277,6 +278,15 @@ class Compiler {
       return cachedRuntime;
     }
 
+    // A model server starts one worker per GPU. Serialize a cold build for a
+    // given kernel so workers do not launch several memory-heavy NVCC jobs or
+    // replace the same cache artifact concurrently.
+    CacheFileLock cacheLock(getCacheDir() / (name + ".lock"));
+    cachedRuntime = runtimeCache[path.string()];
+    if (cachedRuntime != nullptr) {
+      return cachedRuntime;
+    }
+
     // Compiler flags
     std::vector<std::string> flags = {"-std=c++17",
                                       "--gpu-architecture=sm_90a",
@@ -369,6 +379,7 @@ class Compiler {
       FILE* pipe = popen(cmd.c_str(), "r");
 #endif
 
+      int compileStatus = -1;
       if (pipe) {
         // Read the output
         while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
@@ -377,9 +388,9 @@ class Compiler {
 
 // Close the pipe
 #ifdef _MSC_VER
-        _pclose(pipe);
+        compileStatus = _pclose(pipe);
 #else
-        pclose(pipe);
+        compileStatus = pclose(pipe);
 #endif
 
         // Output result if debug enabled
@@ -389,6 +400,11 @@ class Compiler {
           TLLM_LOG_INFO("NVCC compilation took %d ms", duration.count());
           TLLM_LOG_INFO("Compilation log:\n%s", result.c_str());
         }
+      }
+
+      if (compileStatus != 0 || !isRegularNonEmptyFile(tmpCubinPath)) {
+        std::filesystem::remove_all(tmpPath);
+        throw std::runtime_error("NVCC compilation failed: " + result);
       }
     } else {
       nvrtcProgram prog;
@@ -449,12 +465,14 @@ class Compiler {
     try {
       // Rename (atomic operation) to final locations
       std::filesystem::rename(tmpCubinPath, cubinPath);
-      if (kJitDebugging) {
-        TLLM_LOG_INFO("Successfully copied kernel files to cache directory: %s",
-                      path.string().c_str());
-      }
-    } catch (std::exception const& e) {
-      TLLM_LOG_ERROR("Warning: Failed to copy kernel files to cache: %s", e.what());
+    } catch (...) {
+      std::error_code ignored;
+      std::filesystem::remove_all(tmpPath, ignored);
+      throw;
+    }
+    if (kJitDebugging) {
+      TLLM_LOG_INFO("Successfully copied kernel files to cache directory: %s",
+                    path.string().c_str());
     }
 
     // Clean up temporary directory after successful compilation
