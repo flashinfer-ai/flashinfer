@@ -74,7 +74,9 @@ only the operator's inputs.
 Tensor maps are encoded by the bindings and passed to the kernels by value, so
 a prepared launch owns no descriptor storage and allocates nothing after
 preparation: every ``launch()``, including the first, only submits work on the
-current stream and may be captured into a CUDA graph.  The GEMM + act routes'
+current stream and may be captured into a CUDA graph (the small-M route's
+CuTe-DSL GEMM is specialized by one eager call at preparation).  The GEMM +
+act routes'
 BF16 ``(M, 2H)`` intermediate may be supplied by the caller (``workspace``) and
 is otherwise allocated once at preparation.
 """
@@ -624,7 +626,9 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
     kernel) on PyTorch's current stream for the bound
     device and returns ``(out_q, out_s)``.
     Every launch, including the first, may be captured into a CUDA graph; the
-    prepared object retains no descriptor storage.  ``grid`` is the grid of the
+    prepared object retains no descriptor storage, and the small-M route's
+    CuTe-DSL GEMM is run once at preparation so that it is specialized before
+    any capture.  ``grid`` is the grid of the
     route's first generated kernel; ``stage_grids`` holds every generated
     kernel's grid by stage name.
     """
@@ -865,6 +869,11 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
                 group_gemm_fp8_nt_groupwise_contiguous(
                     a, b, a_scale, b_scale, m_indices, out=y
                 )
+
+            # The CuTe-DSL kernel is specialized (compiled on a cold cache) by its
+            # first call: run it once here, into the intermediate it owns anyway,
+            # so that every launch() only submits work and may be captured.
+            gemm()
 
         bindings = {"y": gemm_out, "out_q": out_q, "out_s": out_s, "M": m, "H": h}
 

@@ -99,8 +99,18 @@ def route_for_shape(m: int, n: int, k: int) -> str:
 
 
 def resolve_route_for_grid(route: str, n: int, grid: tuple[int, int, int]) -> str:
-    if route == DEEPK_CG2_FOUR_LOAD_ROUTE and n == 4096 and grid == (128, 1, 1):
-        return DEEPK_CG2_FOUR_LOAD_GRID128_ROUTE
+    """Pick the exported program of a route for the grid it will launch with.
+
+    The four-load schedule exists only as its 128-CTA instantiation; a device
+    with fewer than 128 SMs (grid below 128 CTAs) runs the recurrence schedule
+    instead, which has the same tile geometry and an exported program at every
+    grid.
+    """
+    if route == DEEPK_CG2_FOUR_LOAD_ROUTE and n == 4096:
+        if grid == (128, 1, 1):
+            return DEEPK_CG2_FOUR_LOAD_GRID128_ROUTE
+        if grid[0] < 128:
+            return DEEPK_CG2_RECURRENCE_ROUTE
     return route
 
 

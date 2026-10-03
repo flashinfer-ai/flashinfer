@@ -12,9 +12,15 @@ from flashinfer.gemm import (
     prepare_group_gemm_fp8_nt_groupwise_contiguous,
 )
 from flashinfer.gemm.cake_grouped_fp8_gemm import (
+    DEEPK_CG2_FOUR_LOAD_GRID128_ROUTE,
+    DEEPK_CG2_RECURRENCE_ROUTE,
     is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available,
+    launch_plan,
 )
-from flashinfer.jit.gemm.cake_grouped_fp8_gemm import SUPPORTED_COMPUTE_CAPABILITIES
+from flashinfer.jit.gemm.cake_grouped_fp8_gemm import (
+    ROUTES,
+    SUPPORTED_COMPUTE_CAPABILITIES,
+)
 
 ATOL = RTOL = 3e-2
 
@@ -319,6 +325,20 @@ def test_re_preparing_per_step_retains_no_device_memory():
         del prepared, out, a, a_scale, m_indices
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated(device) == baseline
+
+
+def test_launch_plan_below_128_ctas_uses_a_registered_route():
+    """(4096, 4096, 1024) selects the four-load schedule, exported only at 128 CTAs: a device with
+    fewer than 128 SMs plans the same-geometry recurrence schedule instead of an unregistered route."""
+    route, grid = launch_plan(4096, 4096, 1024, sm_count=148, scalar_output=False)
+    assert (route, grid) == (DEEPK_CG2_FOUR_LOAD_GRID128_ROUTE, (128, 1, 1))
+    for sm_count in (2, 64, 96, 127):
+        route, grid = launch_plan(
+            4096, 4096, 1024, sm_count=sm_count, scalar_output=False
+        )
+        assert grid == ((sm_count // 2) * 2, 1, 1)
+        assert route == DEEPK_CG2_RECURRENCE_ROUTE
+        assert route in ROUTES
 
 
 def test_rejects_invalid_inputs():
