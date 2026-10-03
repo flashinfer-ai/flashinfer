@@ -119,11 +119,12 @@ def _ensure_torch_dist(bootstrap: BootstrapConfig) -> bool:
             device = torch.device(f"cuda:{_resolve_local_device(bootstrap)}")
             dist.init_process_group(backend="nccl", device_id=device)
     elif bootstrap.world_size == 1:
+        # Standalone EP1 has no peer processes to discover.
         dist.init_process_group(
             backend="gloo",
             rank=bootstrap.rank,
             world_size=bootstrap.world_size,
-            init_method="tcp://127.0.0.1:29500",
+            store=dist.HashStore(),
         )
     else:
         raise RuntimeError(

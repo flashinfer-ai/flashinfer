@@ -1075,8 +1075,12 @@ kernel_cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define pair_done_addr (mbar_base + 0)
@@ -2749,8 +2753,11 @@ kernel_cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c
                                 }
                             }
                             {
+#if __CUDA_ARCH__ == 1000
                                 const float2 initial_scale_pair = make_float2(3.552713678800501e-15f, 3.552713678800501e-15f);
+#endif
                                 #pragma unroll
+#if __CUDA_ARCH__ == 1000
                                 for (int initial_pair_index = 0; initial_pair_index < 16; initial_pair_index++) {
                                     float2 initial_input_pair = make_float2(initial[initial_pair_index * 2], initial[initial_pair_index * 2 + 1]);
                                     float2 initial_scaled_pair;
@@ -2759,6 +2766,10 @@ kernel_cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c
                                         : "l"(*(const unsigned long long*)&initial_input_pair), "l"(*(const unsigned long long*)&initial_scale_pair));
                                     initial[initial_pair_index * 2] = initial_scaled_pair.x;
                                     initial[initial_pair_index * 2 + 1] = initial_scaled_pair.y;
+#else
+                                for (int word_15 = 0; word_15 < 32; word_15++) {
+                                    initial[word_15] = initial[word_15] * 3.552713678800501e-15f;
+#endif
                                 }
                             }
                             tmem_st_x32_f32(taddr + (unsigned int)tmem_row + (unsigned int)(io_part * 32), initial);
@@ -2960,8 +2971,11 @@ kernel_cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c
                                         if (entering_token % checkpoint_every_n_tokens == 0) {
                                             float cp_unscaled[32];
                                             {
+#if __CUDA_ARCH__ == 1000
                                                 const float2 cp_scale_pair = make_float2(281474976710656.0f, 281474976710656.0f);
+#endif
                                                 #pragma unroll
+#if __CUDA_ARCH__ == 1000
                                                 for (int cp_pair_index = 0; cp_pair_index < 16; cp_pair_index++) {
                                                     float2 cp_input_pair = make_float2(_tmem_load_37[cp_pair_index * 2], _tmem_load_37[cp_pair_index * 2 + 1]);
                                                     float2 cp_scaled_pair;
@@ -2970,6 +2984,10 @@ kernel_cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c
                                                         : "l"(*(const unsigned long long*)&cp_input_pair), "l"(*(const unsigned long long*)&cp_scale_pair));
                                                     cp_unscaled[cp_pair_index * 2] = cp_scaled_pair.x;
                                                     cp_unscaled[cp_pair_index * 2 + 1] = cp_scaled_pair.y;
+#else
+                                                for (int word_16 = 0; word_16 < 32; word_16++) {
+                                                    cp_unscaled[word_16] = _tmem_load_37[word_16] * 281474976710656.0f;
+#endif
                                                 }
                                             }
                                             long long cp_row = checkpoint_cu_starts[seq_idx_1] + (long long)(entering_token / checkpoint_every_n_tokens);
@@ -3355,8 +3373,11 @@ kernel_cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c
                                     : "r"(taddr + (unsigned int)tmem_row + (unsigned int)(state_buffer * 128) + (unsigned int)(io_part_1 * 32)));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                 {
+#if __CUDA_ARCH__ == 1000
                                     const float2 final_scale_pair = make_float2(281474976710656.0f, 281474976710656.0f);
+#endif
                                     #pragma unroll
+#if __CUDA_ARCH__ == 1000
                                     for (int final_pair_index = 0; final_pair_index < 16; final_pair_index++) {
                                         float2 final_input_pair = make_float2(_tmem_load_46[final_pair_index * 2], _tmem_load_46[final_pair_index * 2 + 1]);
                                         float2 final_scaled_pair;
@@ -3365,6 +3386,10 @@ kernel_cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c
                                             : "l"(*(const unsigned long long*)&final_input_pair), "l"(*(const unsigned long long*)&final_scale_pair));
                                         _tmem_load_46[final_pair_index * 2] = final_scaled_pair.x;
                                         _tmem_load_46[final_pair_index * 2 + 1] = final_scaled_pair.y;
+#else
+                                    for (int word_18 = 0; word_18 < 32; word_18++) {
+                                        _tmem_load_46[word_18] = _tmem_load_46[word_18] * 281474976710656.0f;
+#endif
                                     }
                                 }
                                 {

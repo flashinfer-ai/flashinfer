@@ -318,16 +318,77 @@ def test_invalid_routing_indices_rejected(tensor_index, value, message):
         prepare_bgmv_moe(*inputs, backend="cake")
 
 
-def test_blackwell_backend_alias_and_plan_alias():
-    _require_cake_arch()
+def test_plan_alias_kept_and_blackwell_backend_rejected():
     from flashinfer.fused_moe import BGMVMoEBlackwellPlan, BGMVMoECakePlan
 
     assert BGMVMoEBlackwellPlan is BGMVMoECakePlan
-    inputs = _make_inputs(3072, 4, torch.bfloat16)
+    x = torch.empty((1, 2688), dtype=torch.bfloat16)
+    empty_i64 = torch.empty((1,), dtype=torch.int64)
+    empty_f32 = torch.empty((1,), dtype=torch.float32)
+    with pytest.raises(ValueError, match="backend"):
+        prepare_bgmv_moe(
+            x,
+            [],
+            [],
+            empty_i64,
+            empty_i64,
+            empty_i64,
+            empty_f32,
+            1,
+            backend="blackwell",
+        )
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "rank", "variant"),
+    [(2688, 32, "specialized"), (1024, 16, "generic")],
+)
+def test_y_accum_may_be_a_column_slice_of_a_wider_buffer(hidden_size, rank, variant):
+    _require_cake_arch()
+    inputs = _make_inputs(hidden_size, 32, torch.bfloat16, rank=rank)
     expected = _reference(inputs)
-    plan = prepare_bgmv_moe(*inputs, backend="blackwell")
-    assert isinstance(plan, BGMVMoECakePlan)
-    torch.testing.assert_close(plan.run(), expected, atol=1e-2, rtol=1e-2)
+    num_tokens = int(inputs[0].shape[0])
+    wide = torch.full(
+        (num_tokens, hidden_size + 64), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    plan = prepare_bgmv_moe(*inputs, backend="cake", y_accum=wide[:, :hidden_size])
+    assert plan.backend_used == "cake"
+    assert plan.variant == variant
+    first = plan.run().clone()
+    torch.cuda.synchronize()
+    assert plan.y_accum.data_ptr() == wide.data_ptr()
+    torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
+    assert torch.isnan(wide[:, hidden_size:]).all()
+    replay = plan.run().clone()
+    torch.cuda.synchronize()
+    assert torch.equal(replay, first)
+    plan.close()
+    transposed = torch.empty(
+        hidden_size, num_tokens, dtype=torch.float32, device="cuda"
+    ).t()
+    with pytest.raises(ValueError, match="last dimension"):
+        prepare_bgmv_moe(*inputs, backend="cake", y_accum=transposed)
+
+
+def test_portable_fallback_requires_a_contiguous_y_accum():
+    _require_cuda()
+    inputs = _make_inputs(2688, 4, torch.bfloat16, rank=12)
+    num_tokens = int(inputs[0].shape[0])
+    wide = torch.empty(num_tokens, 2688 + 64, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="portable fallback"):
+        prepare_bgmv_moe(*inputs, backend="cake", y_accum=wide[:, :2688])
+
+
+def test_rebinding_check_detects_moved_storage():
+    _require_cake_arch()
+    inputs = _make_inputs(2688, 4, torch.bfloat16)
+    plan = prepare_bgmv_moe(*inputs, backend="cake")
+    plan.run()
+    torch.cuda.synchronize()
+    inputs[0].set_(torch.empty_like(inputs[0]))
+    with pytest.raises(RuntimeError, match="changed after preparation"):
+        plan.run()
+    plan.close()
 
 
 def test_unknown_backend_rejected():

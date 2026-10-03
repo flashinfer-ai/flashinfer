@@ -23,30 +23,7 @@
 
 #include "tvm_ffi_utils.h"
 
-// The generated body redefines the fixed-width integer typedefs and a private
-// tensor-map struct; rename them while it is included so they cannot collide
-// with <cstdint> or CUDA headers.
-#define int8_t cake_bgmv_generated_int8_t
-#define uint8_t cake_bgmv_generated_uint8_t
-#define uint16_t cake_bgmv_generated_uint16_t
-#define uint32_t cake_bgmv_generated_uint32_t
-#define uint64_t cake_bgmv_generated_uint64_t
-#define int32_t cake_bgmv_generated_int32_t
-#define int16_t cake_bgmv_generated_int16_t
-#define BlackwellTensorMap cake_bgmv_generated_BlackwellTensorMap
-#define BlackwellTensorMapPack cake_bgmv_generated_BlackwellTensorMapPack
-#define CUtensorMap cake_bgmv_generated_CUtensorMap
 #include CAKE_BGMV_MOE_BODY_FILE
-#undef int8_t
-#undef uint8_t
-#undef uint16_t
-#undef uint32_t
-#undef uint64_t
-#undef int32_t
-#undef int16_t
-#undef BlackwellTensorMap
-#undef BlackwellTensorMapPack
-#undef CUtensorMap
 
 namespace flashinfer {
 namespace cake_bgmv_moe_generic {
@@ -108,6 +85,8 @@ inline void CheckCompiledArch(int32_t device_id) {
       << minor;
 }
 
+// Called once per loaded module: the device must match the compiled target and
+// the decode shrink needs its opt-in dynamic shared memory.
 void Configure() {
   int32_t device_id = 0;
   CheckCuda(cudaGetDevice(&device_id), "cudaGetDevice");
@@ -133,6 +112,20 @@ inline void CheckCompact(const TensorView& tensor, const char* name) {
       << name << " exceeds the generated kernel's int32 index range";
 }
 
+// The expand kernels take the output row stride at runtime, so the FP32
+// accumulator may be a column slice of a wider row-major buffer: unit column
+// stride, row stride at least the hidden size, and every row offset within
+// the kernels' int32 index range.
+inline int32_t OutputRowStride(const TensorView& y_accum, int64_t num_tokens, int64_t hidden) {
+  TVM_FFI_ICHECK(y_accum.stride(1) == 1) << "y_accum must be contiguous along hidden";
+  const int64_t row_stride = y_accum.stride(0);
+  TVM_FFI_ICHECK(row_stride >= hidden)
+      << "y_accum row stride " << row_stride << " is smaller than hidden " << hidden;
+  TVM_FFI_ICHECK((num_tokens - 1) * row_stride + hidden <= std::numeric_limits<int32_t>::max())
+      << "y_accum exceeds the generated kernel's int32 index range";
+  return static_cast<int32_t>(row_stride);
+}
+
 void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lora_a,
          TensorView lora_b, TensorView sorted_token_ids, TensorView expert_ids,
          TensorView lora_indices, TensorView topk_weights, TensorView route_index,
@@ -140,9 +133,9 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
          int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(x);
-  const int32_t device_id = x.device().device_id;
-  ffi::CUDADeviceGuard device_guard(device_id);
-  CheckCompiledArch(device_id);
+  // The device/module match is checked once in Configure (module load); the
+  // Python side already routes each device to the module compiled for it.
+  ffi::CUDADeviceGuard device_guard(x.device().device_id);
 
   CHECK_CUDA(y_accum);
   CHECK_CUDA(shrink_out);
@@ -202,7 +195,6 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
       << "lora_b must have shape [num_loras, num_experts, " << hidden << ", " << kRank << "]";
 
   CheckCompact(x, "x");
-  CheckCompact(y_accum, "y_accum");
   CheckCompact(shrink_out, "shrink_out");
   CheckCompact(lora_a, "lora_a");
   CheckCompact(lora_b, "lora_b");
@@ -270,7 +262,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   }
   CheckCuda(cudaGetLastError(), "Cake BGMV MoE generic shrink launch");
 
-  const int32_t output_stride = hidden;
+  const int32_t output_stride = OutputRowStride(y_accum, num_tokens, hidden);
   const int32_t output_offset = 0;
   if (schedule == Schedule::kTokenOwnedT64) {
     const dim3 grid(num_tokens, (hidden + 63) / 64, 1);
