@@ -1126,8 +1126,14 @@ def test_attention_sink_varlen(
     )
 
 
+_NVFP4_KV_DTYPES = [torch.uint8] + (
+    [torch.float4_e2m1fn_x2] if hasattr(torch, "float4_e2m1fn_x2") else []
+)
+
+
+@pytest.mark.parametrize("kv_data_type", _NVFP4_KV_DTYPES)
 @pytest.mark.parametrize("window_left", [-1, 128])
-def test_attention_sink_nvfp4_paged_kv(window_left):
+def test_attention_sink_nvfp4_paged_kv(window_left, kv_data_type):
     """BatchAttentionWithAttentionSinkWrapper accepts a packed NVFP4 KV cache.
 
     Regression test for https://github.com/flashinfer-ai/flashinfer/issues/5966:
@@ -1153,6 +1159,9 @@ def test_attention_sink_nvfp4_paged_kv(window_left):
     )
     k_dq = nvfp4_to_float(k_packed, k_sf, k_gs).to(dtype)
     v_dq = nvfp4_to_float(v_packed, v_sf, v_gs).to(dtype)
+    if kv_data_type != torch.uint8:
+        k_packed = k_packed.view(kv_data_type)
+        v_packed = v_packed.view(kv_data_type)
 
     q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=dtype, device=device)
     sink = torch.rand(num_qo_heads, device=device, dtype=torch.float32) * 5
@@ -1187,13 +1196,13 @@ def test_attention_sink_nvfp4_paged_kv(window_left):
             window_left=window_left,
         )
 
-    wrapper_fp4 = make_wrapper(torch.uint8)
+    wrapper_fp4 = make_wrapper(kv_data_type)
     wrapper_fp4.plan(
         *plan_args,
         causal=True,
         window_left=window_left,
         q_data_type=dtype,
-        kv_data_type=torch.uint8,
+        kv_data_type=kv_data_type,
         non_blocking=True,
     )
     o_fp4 = wrapper_fp4.run(
@@ -1220,14 +1229,15 @@ def test_attention_sink_nvfp4_paged_kv(window_left):
     torch.testing.assert_close(o_fp4.float(), o_ref.float(), rtol=2e-2, atol=2e-2)
 
 
-def test_attention_sink_nvfp4_fa3_rejected():
+@pytest.mark.parametrize("kv_data_type", _NVFP4_KV_DTYPES)
+def test_attention_sink_nvfp4_fa3_rejected(kv_data_type):
     """FA3 has no packed-FP4 KV path; the sink wrapper must fail early."""
     with pytest.raises(NotImplementedError, match="only supported by the fa2"):
         flashinfer.BatchAttentionWithAttentionSinkWrapper(
             torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
             kv_layout="HND",
             backend="fa3",
-            kv_data_type=torch.uint8,
+            kv_data_type=kv_data_type,
         )
 
 
