@@ -29,15 +29,16 @@ from ...jit.core import (
 )
 
 # Explicit target-owned registration of the generated GEMM programs.  One
-# record per physical module = one traced kernel instance (``template``) per
-# architecture.  A record carries ``arch``, the instance ``template`` (the
+# record per delivered program = one traced kernel instance (``template``);
+# a program is architecture-neutral (one source pair, compiled per device
+# architecture).  A record carries ``arches``, the instance ``template`` (the
 # symbol the host planner derives from the operand layouts, the tile width,
 # the output kind, the epilogue path and the TMA L2 eviction hints -- see
 # ``cake_backend.instance_symbol`` and ``cake_backend.router_symbol``; the
 # prefetch / L2-promotion / stage-count knobs are part of the symbol too but
 # sit at their defaults in every registered instance), the kernel symbol, the JIT cache name,
 # the translation units, compile flags, the FFI entry, the argument plan the
-# host binds by keyword, the caller-owned descriptor workspace size, the
+# host binds by keyword, the
 # closure identity and the launch geometry baked into the module (block,
 # cluster).  Populated verbatim by the generated-program export; do not edit
 # by hand.
@@ -3788,7 +3789,7 @@ def select_module(arch: str, template: str) -> str:
     record = MODULES.get(name)
     if (
         record is None
-        or record.get("arch") != arch
+        or arch not in record.get("arches", ())
         or record.get("template") != template
     ):
         raise ValueError(
@@ -3813,20 +3814,27 @@ def _header_dirs():
 
 
 @functools.cache
-def gen_cake_dense_projection_gemm_module(name: str):
+def gen_cake_dense_projection_gemm_module(name: str, arch: str):
+    """JIT spec of program ``name`` compiled for ``arch`` (one architecture-neutral source pair
+    per program; the device architecture selects the nvcc flags and the cache entry)."""
     record = MODULES[name]
-    if not toolchain_supports(record["arch"]):
+    if arch not in record["arches"]:
+        raise ValueError(
+            f"generated dense projection GEMM module {name!r} is not registered for {arch} "
+            f"(registered: {list(record['arches'])})"
+        )
+    if not toolchain_supports(arch):
         raise RuntimeError(
-            f"generated dense projection GEMM module {name!r} targets {record['arch']}, "
+            f"generated dense projection GEMM module {name!r} targets {arch}, "
             "which this checkout cannot compile"
         )
     root = Path(__file__).resolve().parent / "csrc"
     sources = [root / relative for relative in record["sources"]]
     return gen_jit_spec(
-        name=f"{record['cache_name']}_" + record["closure_sha256"][:20],
+        name=f"{record['cache_name']}_{arch}_" + record["closure_sha256"][:20],
         sources=sources,
         extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[record["arch"]],
+            *ARCH_NVCC_FLAGS[arch],
             *record["compile_flags"],
         ],
         extra_ldflags=["-lcuda"],
@@ -3836,5 +3844,5 @@ def gen_cake_dense_projection_gemm_module(name: str):
 
 
 @functools.cache
-def load_cake_dense_projection_gemm_module(name: str):
-    return gen_cake_dense_projection_gemm_module(name).build_and_load()
+def load_cake_dense_projection_gemm_module(name: str, arch: str):
+    return gen_cake_dense_projection_gemm_module(name, arch).build_and_load()

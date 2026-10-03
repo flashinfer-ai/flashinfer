@@ -73,10 +73,10 @@ transposed-store ``nn_t`` weight gradient 11).
 Every allocation happens in :func:`prepare_dense_projection_gemm` /
 :func:`prepare_router_fp32_gemm`; the returned prepared launch replays with no
 CUDA allocation and no host synchronization for new values written into the
-bound tensors.  The first ``launch()`` of a prepared GEMM initializes its
-privately owned TMA descriptor workspace synchronously (outside CUDA Graph
-capture); later launches are launch-only, so capture a prepared launch only
-after its first call.  The eager entry points (:func:`dense_projection_gemm`,
+bound tensors.  Every ``launch()`` is launch-only: the generated binding encodes
+the operand tensor maps by value from the bound views on each call (no descriptor
+workspace), so a prepared launch can be captured into a CUDA Graph from its first
+call.  The eager entry points (:func:`dense_projection_gemm`,
 :func:`projection_forward` / :func:`projection_dgrad` / :func:`projection_wgrad`,
 :func:`router_fp32_gemm`, :func:`router_forward` / :func:`router_dgrad` /
 :func:`router_wgrad`) prepare and launch in one call.
@@ -400,24 +400,19 @@ def instance_key(
     pf: int = 0,
     promo: str = "none",
     hints: tuple = ("none", "none"),
-    group_m: int = 16,
     f32_v8: bool = False,
     quad_store: bool = False,
     smem_limit: Optional[int] = None,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
-    promo, hints, group_m, f32_v8, quad_store)``.  ``smem_limit`` (bytes; default = the largest
+    promo, hints, f32_v8, quad_store)``; the raster group width is a launch parameter since round 11.  ``smem_limit`` (bytes; default = the largest
     architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
     the key, so an instance has one symbol on every architecture (the planner passes
     ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
     exported.  [Cake ``instance_key`` L873-L905]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
-    block_n, cta_rows, pf, group_m = int(block_n), int(cta_rows), int(pf), int(group_m)
-    if group_m < 2 or group_m % 2:
-        raise ValueError(
-            f"group_m must be an even number >= 2 (CTA pairs are adjacent row tiles), got {group_m}"
-        )
+    block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
     promo, hints = str(promo), (str(hints[0]), str(hints[1]))
     if promo not in L2_PROMOS or any(h not in L2_HINTS for h in hints):
         raise ValueError(
@@ -476,7 +471,6 @@ def instance_key(
         pf,
         promo,
         hints,
-        group_m,
         bool(f32_v8)
         and out_f32
         and epi == "reg"
@@ -496,7 +490,7 @@ def instance_symbol(key: tuple) -> str:
     followed by ``_m256`` for tall tiles / ``_m64`` for the 64-row Layout-B family, ``_pf<n>`` for a
     prefetch distance, ``_<promo>`` for an
     L2 promotion, ``_h<a><b>`` for non-default (A, B) eviction hints (first letters, e.g.
-    ``_hen`` = A evict_first / B none), ``_g<n>`` for a non-default raster group, ``_f32``, ``_v8`` for the 256-bit fp32 register stores, ``_t``,
+    ``_hen`` = A evict_first / B none), ``_f32``, ``_v8`` for the 256-bit fp32 register stores, ``_t``,
     ``_<epi><slots>`` for the TMA-store epilogue, ``_s<stages>`` for a non-default stage count and
     ``_box<rows>``).  [Cake ``instance_symbol`` L908-L912]"""
     (
@@ -514,7 +508,6 @@ def instance_symbol(key: tuple) -> str:
         pf,
         promo,
         hints,
-        group_m,
         f32_v8,
         quad_store,
     ) = key
@@ -527,7 +520,6 @@ def instance_symbol(key: tuple) -> str:
         + (f"_pf{pf}" if pf else "")
         + (f"_{promo}" if promo != "none" else "")
         + (f"_h{hints[0][0]}{hints[1][0]}" if hints != ("none", "none") else "")
-        + (f"_g{group_m}" if group_m != 16 else "")
         + ("_f32" if out_f32 else "")
         + ("_v8" if f32_v8 else "")
         + ("_q" if quad_store else "")
@@ -1115,6 +1107,11 @@ def plan_dense_projection_gemm(
         group_m = rule.get(
             "group_m", default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)
         )
+    group_m = int(group_m)
+    if group_m < 2 or group_m % 2:
+        raise ValueError(
+            f"dense_projection_gemm: group_m must be an even number >= 2 (CTA pairs are adjacent row tiles), got {group_m}"
+        )
     if hints is None:
         hints = rule.get(
             "hints",
@@ -1137,7 +1134,6 @@ def plan_dense_projection_gemm(
         pf=pf,
         promo=promo,
         hints=hints,
-        group_m=group_m,
         f32_v8=f32_v8,
         quad_store=quad_store,
         smem_limit=smem_limit_for(arch),
@@ -1159,7 +1155,7 @@ def plan_dense_projection_gemm(
         pf=int(pf),
         promo=str(key[12]),
         hints=tuple(key[13]),
-        group_m=int(key[14]),
+        group_m=int(group_m),
         m_tiles=m_tiles,
         n_tiles=n_tiles,
         k_blocks=k_blocks,
@@ -1268,7 +1264,7 @@ class _Launch:
 
 
 def bind_launch(
-    module_name: str, values: dict[str, Any], grid: tuple[int, int, int]
+    module_name: str, values: dict[str, Any], grid: tuple[int, int, int], arch: str
 ) -> _Launch:
     """Order ``values`` by the generated argument plan of ``module_name`` and load its entry.
 
@@ -1294,7 +1290,7 @@ def bind_launch(
                 f"generated module {module_name!r} expects argument {name!r} ({kind}); "
                 f"the host binding provides {sorted(k for k, v in values.items() if v is not None)}"
             )
-    module = load_cake_dense_projection_gemm_module(module_name)
+    module = load_cake_dense_projection_gemm_module(module_name, arch)
     return _Launch(
         module_name, getattr(module, record["ffi_entry"]), tuple(arguments), grid
     )
@@ -1322,15 +1318,6 @@ def _device_index(device: torch.device) -> int:
     return int(
         device.index if device.index is not None else torch.cuda.current_device()
     )
-
-
-def _tma_workspace(module_name: str, device: torch.device) -> Optional[torch.Tensor]:
-    """The caller-owned TMA descriptor storage of a pointer-ABI module: private to one prepared
-    launch, initialized by its first call and never rewritten (a new binding gets new storage)."""
-    nbytes = int(MODULES[module_name].get("tma_workspace_bytes", 0))
-    if nbytes <= 0:
-        return None
-    return torch.empty(nbytes, dtype=torch.uint8, device=device)
 
 
 # Small tensors an instance never dereferences (the operands of the epilogue path it does not
@@ -1374,8 +1361,7 @@ class PreparedGemm:
     """One prepared dense projection GEMM launch.
 
     ``launch()`` writes ``out`` and returns it; it allocates nothing and never synchronizes.
-    The object owns its stream-K workspace, its slice counters and its TMA descriptor
-    workspace; prepare a new one when a shape, dtype, stride or tensor binding changes
+    The object owns its stream-K workspace and its slice counters; prepare a new one when a shape, dtype, stride or tensor binding changes
     (values may change freely).
     """
 
@@ -1426,8 +1412,7 @@ def prepare_dense_projection_gemm(
     quad_store: Optional[bool] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
-    allocations of the K1 backend: the stream-K partial slabs, the slice counters and the
-    descriptor workspace).  See the module docstring for the view contract; the keyword
+    allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
     knobs default to the Cake launcher's choices."""
     device = out.device
     if (
@@ -1487,6 +1472,7 @@ def prepare_dense_projection_gemm(
         N=plan.N,
         m_tiles=plan.m_tiles,
         n_tiles=plan.n_tiles,
+        group_m=plan.group_m,
         k_iters=plan.k_blocks,
         ldo=int(O3.stride(1)),
         out_l=int(O3.stride(0)) if O3.shape[0] > 1 else 0,
@@ -1496,12 +1482,7 @@ def prepare_dense_projection_gemm(
         iters_per_unit=plan.iters_per_unit,
         sk_iters=plan.sk_iters,
     )
-    tma_ws = _tma_workspace(module_name, device)
-    if tma_ws is not None:
-        values["tma_descriptor_workspace"] = tensors["tma_descriptor_workspace"] = (
-            tma_ws
-        )
-    launch = bind_launch(module_name, values, plan.grid)
+    launch = bind_launch(module_name, values, plan.grid, arch)
     return PreparedGemm(
         module_name=module_name,
         arch=arch,
@@ -1827,8 +1808,7 @@ def prepare_router_fp32_gemm(
     splits: Optional[int] = None,
 ) -> PreparedRouterGemm:
     """Validate one fp32 binding, plan it and prepare its launch (the only allocations of the
-    K2 backend: the BF16x3 stack and its fp32 residual scratch, the split-K workspace and the
-    descriptor workspace)."""
+    K2 backend: the BF16x3 stack and its fp32 residual scratch and the split-K workspace)."""
     device = out.device
     if (
         not (A.is_cuda and B.is_cuda and out.is_cuda)
@@ -1872,12 +1852,7 @@ def prepare_router_fp32_gemm(
         out_l=out_l,
         num_cluster_tiles=plan.num_cluster_tiles,
     )
-    tma_ws = _tma_workspace(module_name, device)
-    if tma_ws is not None:
-        values["tma_descriptor_workspace"] = tensors["tma_descriptor_workspace"] = (
-            tma_ws
-        )
-    launch = bind_launch(module_name, values, plan.grid)
+    launch = bind_launch(module_name, values, plan.grid, arch)
     return PreparedRouterGemm(
         module_name=module_name,
         arch=arch,

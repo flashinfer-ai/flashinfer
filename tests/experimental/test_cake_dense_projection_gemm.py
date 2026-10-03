@@ -610,24 +610,30 @@ def test_registry_records_are_well_formed():
         assert arch in cake_jit.ARCH_NVCC_FLAGS
         for template, name in table.items():
             record = cake_jit.MODULES[name]
-            assert record["arch"] == arch and record["template"] == template
+            assert arch in record["arches"] and record["template"] == template
             assert cake_jit.select_module(arch, template) == name
     for name, record in cake_jit.MODULES.items():
-        assert record["arch"] in cake_jit.ARCH_NVCC_FLAGS
-        assert cake_jit.KERNELS[record["arch"]][record["template"]] == name
+        # architecture-neutral programs: one source pair, registered for every arch it serves
+        assert record["arches"] and record["arches"] == sorted(record["arches"])
+        for arch in record["arches"]:
+            assert arch in cake_jit.ARCH_NVCC_FLAGS
+            assert cake_jit.KERNELS[arch][record["template"]] == name
         assert len(record["sources"]) == 2
         assert all(
-            s.startswith("cake_dense_projection_gemm/") for s in record["sources"]
+            s.startswith("cake_dense_projection_gemm/") and "/sm_" not in s
+            for s in record["sources"]
         )
         assert len(record["closure_sha256"]) == 64
         assert (
-            int(record["tma_workspace_bytes"]) > 0
-        )  # pointer TMA ABI: caller-owned descriptors
+            "tma_workspace_bytes" not in record
+        )  # by-value TMA ABI: no descriptor workspace
+        plan_items = [list(item) for item in record["arg_plan"]]
         kinds = {kind for kind, _ in record["arg_plan"]}
         assert kinds <= {"buffer", "tma_buffer", "workspace", "parameter", "grid"}
-        assert ["workspace", "tma_descriptor_workspace"] in [
-            list(item) for item in record["arg_plan"]
-        ]
+        assert ["workspace", "tma_descriptor_workspace"] not in plan_items
+        if record["template"].startswith("dense_proj_gemm_"):
+            # the raster group width is a launch parameter since round 11
+            assert ["parameter", "group_m"] in plan_items
         launch = record["launch"]
         assert list(launch["cluster"]) == [CTA_GROUP, 1, 1]
         assert len(launch["block"]) == 3 and all(int(b) >= 1 for b in launch["block"])
@@ -764,9 +770,7 @@ def test_epilogue_rules():
             "dense_proj_gemm_kk_n256_l2_128b",
         ),
         (dict(a_mn=False, b_mn=False, pf=4), "dense_proj_gemm_kk_n256_pf4"),
-        # raster group: 16 CTA row tiles per group is the default; other even counts carry ``_g<n>``
-        (dict(a_mn=False, b_mn=False, group_m=16), "dense_proj_gemm_kk_n256"),
-        (dict(a_mn=False, b_mn=False, group_m=8), "dense_proj_gemm_kk_n256_g8"),
+        # the raster group width is a launch parameter since round 11: no symbol suffix, not a key field
         (
             dict(
                 a_mn=True,
@@ -774,9 +778,8 @@ def test_epilogue_rules():
                 out_f32=True,
                 slots=1,
                 hints=("evict_first", "none"),
-                group_m=4,
             ),
-            "dense_proj_gemm_nn_n256_hen_g4_f32_tma1",
+            "dense_proj_gemm_nn_n256_hen_f32_tma1",
         ),
         (
             dict(
@@ -823,14 +826,12 @@ def test_epilogue_rules():
         ),
         # round 7: the quad-transposed bf16 register epilogue (``_q``); the pinned stage count keeps its suffix
         (
-            dict(a_mn=False, b_mn=True, group_m=8, epi="reg", quad_store=True),
-            "dense_proj_gemm_kn_n256_g8_q",
+            dict(a_mn=False, b_mn=True, epi="reg", quad_store=True),
+            "dense_proj_gemm_kn_n256_q",
         ),
         (
-            dict(
-                a_mn=False, b_mn=True, group_m=8, stages=6, epi="reg", quad_store=True
-            ),
-            "dense_proj_gemm_kn_n256_g8_q_s6",
+            dict(a_mn=False, b_mn=True, stages=6, epi="reg", quad_store=True),
+            "dense_proj_gemm_kn_n256_q_s6",
         ),
         (
             dict(a_mn=False, b_mn=False, promo="l2_256b", epi="reg", quad_store=True),
@@ -1070,19 +1071,13 @@ def test_instance_key_rejects_bad_configurations():
         instance_key(a_mn=False, b_mn=False, hints=("evict_first", "keep"))
     with pytest.raises(ValueError, match="prefetch"):
         instance_key(a_mn=False, b_mn=False, pf=17)
-    with pytest.raises(ValueError, match="group_m"):
-        instance_key(
-            a_mn=False, b_mn=False, group_m=7
-        )  # CTA pairs are adjacent row tiles: even groups only
-    with pytest.raises(ValueError, match="group_m"):
-        instance_key(a_mn=False, b_mn=False, group_m=0)
     key = instance_key(a_mn=False, b_mn=False)
-    # 17 fields since round 7: pf, promo, hints, group_m, f32_v8, quad_store
-    assert len(key) == 17 and key[11:] == (
+    # 16 fields since round 11 (the raster group width left the key for the launch arguments):
+    # pf, promo, hints, f32_v8, quad_store
+    assert len(key) == 16 and key[11:] == (
         0,
         "none",
         ("none", "none"),
-        16,
         False,
         False,
     )
@@ -2045,7 +2040,7 @@ def test_split_fp32_to_bf16x3_is_exact_and_allocation_free_in_place():
 
 def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
     record = {
-        "arch": "sm_100a",
+        "arches": ["sm_100a"],
         "template": "dense_proj_gemm_kk_n256",
         "kernel": "kernel_fake",
         "cache_name": "fake",
@@ -2055,12 +2050,10 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
         "arg_plan": [
             ["tma_buffer", "A"],
             ["parameter", "M"],
-            ["workspace", "tma_descriptor_workspace"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "tma_workspace_bytes": 512,
         "closure_sha256": "0" * 64,
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
     }
@@ -2073,29 +2066,31 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
     calls = []
     fake = SimpleNamespace(run=lambda *args: calls.append(args))
     monkeypatch.setattr(
-        cake_backend, "load_cake_dense_projection_gemm_module", lambda name: fake
+        cake_backend, "load_cake_dense_projection_gemm_module", lambda name, arch: fake
     )
     A = torch.zeros(1, 8, 64, dtype=torch.bfloat16)
-    ws = torch.zeros(512, dtype=torch.uint8)
     launch = bind_launch(
         "cake_dense_projection_gemm_fake",
-        dict(A=A, M=8, tma_descriptor_workspace=ws),
+        dict(A=A, M=8),
         (4, 1, 1),
+        "sm_100a",
     )
-    assert launch.arguments == (A, 8, ws, 4, 1, 1)
+    assert launch.arguments == (A, 8, 4, 1, 1)
     launch()
-    assert calls == [(A, 8, ws, 4, 1, 1)]
+    assert calls == [(A, 8, 4, 1, 1)]
     with pytest.raises(KeyError, match="'M'"):
         bind_launch(
             "cake_dense_projection_gemm_fake",
-            dict(A=A, tma_descriptor_workspace=ws),
+            dict(A=A),
             (4, 1, 1),
+            "sm_100a",
         )
     with pytest.raises(ValueError, match="cluster"):
         bind_launch(
             "cake_dense_projection_gemm_fake",
-            dict(A=A, M=8, tma_descriptor_workspace=ws),
+            dict(A=A, M=8),
             (3, 1, 1),
+            "sm_100a",
         )
     assert (
         cake_jit.select_module("sm_100a", "dense_proj_gemm_kk_n256")
@@ -2109,7 +2104,7 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
 
 
 def _make_inputs(family, row, op, out_dtype, T, seed, device="cuda"):
-    """Deterministic operands for one row (same distributions as the CAKE-758 eval harness)."""
+    """Deterministic operands for one row (same distributions as the Cake eval harness)."""
     g = torch.Generator(device=device).manual_seed(seed)
     v = _views(family, row, op, out_dtype, T, device=device)
 

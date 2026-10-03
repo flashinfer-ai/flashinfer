@@ -82,7 +82,7 @@ stream-K split, raster group, wave working set) and the L2 size (hint gate);
 | epilogue | `epi_mode`: a warp slice is `epi_cols = BLOCK_N / 2` columns (`BLOCK_N / 4` on 64-row tiles; always a multiple of 16).  Transposed output -> register stores (`reg`); row-major fp32 -> TMA stores (`tma`) when the slice is whole 32-column chunks (`epi="reg"` is an opt-in float4 register path; 160 / 224-wide and 64-row 192-wide slices have no TMA path); row-major bf16 -> `tma` when `K <= 1024` and the slice is whole 64-column chunks (`BLOCK_N = 256` at any height, 128 at 128 / 256 rows), else `reg`; `quad_store` (rule-selected, `_q`) is the bf16 `reg` variant for whole-64-column slices that transposes 32-byte row segments across lane quads so each lane issues one 256-bit store per 4-row group |
 | staging slots | `epi_slots`: 1 with the TMA-store epilogue (2 only when `K <= K_TWO_SLOTS = 0` and the slice's chunk count is even), 0 otherwise |
 | stages | `default_stages(slots, cta_rows, block_n, b_mn)`: 7 / 6 / 5 for 0 / 1 / 2 slots at `BLOCK_N = 160 / 192 / 224 / 256`, 9 / 8 / 6 at `BLOCK_N = 128`, 4 / 4 / 3 for tall (256-row) tiles; 64-row tiles take the deepest pipeline that fits the 227 KiB opt-in beside the staging (32 KiB per slot), at most 12 (9 / 8 / 6 at `BLOCK_N = 256`, 12 / 12 / 10 at 128; `b_mn` sizes the MN-major B panels).  A rule or caller `stages` is bounded by `smem_limit_for(arch)`: the 232448 B opt-in, or 334336 B on `sm_107a` (CUDA 13.4 oversized shared-memory mode, `SMEM_OVERSIZED`); the limit is not part of the instance key, so an instance has one symbol on every architecture |
-| raster group | `default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)`: 16 CTA row tiles per cluster-launch-control raster group (even, so the two CTAs of a pair are the row halves of one 256-row tile) on every row; a 4-row group for one-to-two-wave weight-gradient rows measured no gain in the production configuration and is not applied.  A non-default group would carry the symbol suffix `_g<n>` |
+| raster group | `default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)`: 16 CTA row tiles per cluster-launch-control raster group (a launch parameter since round 11, not an instance-key field) (even, so the two CTAs of a pair are the row halves of one 256-row tile) on every row; a 4-row group for one-to-two-wave weight-gradient rows measured no gain in the production configuration and is not applied.  A non-default group would carry the symbol suffix `_g<n>` |
 | L2 hints | `default_hints(a_mn, b_mn, m_tiles, n_tiles, K, group_m, pairs, l2_bytes)`: no hint while one wave's operand panels fit the L2 (`wave_working_set(m_tiles, n_tiles, K, group_m, pairs) <= l2_bytes`); otherwise `A` streams `evict_first` when there is one column tile (`n_tiles == 1`); every other row gets no hint (reuse-ratio hints on the weight-gradient class measured 0..-4 percent in the production stream-K configuration).  Symbol suffix `_h<a><b>` (first letters): `_hen` = A evict_first, B none |
 | L2 promotion, prefetch | `default_promo` = `none`, `default_pf` = 0 (measured, off); the symbol carries `_<promo>` / `_pf<n>` when set |
 | template | `instance_symbol(instance_key(...))`, e.g. `dense_proj_gemm_kk_n256`, `dense_proj_gemm_kk_n128_hen`, `dense_proj_gemm_kn_n256_f32_tma1`, `dense_proj_gemm_nn_n256_f32_tma1`, `dense_proj_gemm_nn_n128_hen_t`, `dense_proj_gemm_kk_n256_m64` |
@@ -95,7 +95,7 @@ the prepared launch resolves the template
 through `cake_jit.KERNELS[arch][template]`, owns its stream-K partial slabs
 (`(sk_units + tail_tiles) * 2 * CTA_ROWS * BLOCK_N` fp32), its slice counters
 (`max(8192, tail_tiles * 16)` u32: the lane-spread dummy counters above index
-4096 must be addressable) and its TMA descriptor workspace, and binds the
+4096 must be addressable), and binds the
 module's argument plan by keyword (`bind_launch`, fails closed on an unknown
 name).  Given the same device the result is bitwise identical to the Cake
 launcher's.
@@ -118,13 +118,13 @@ launcher's.
 
 ## Layout of this package
 
-* `cake_jit.py` -- `MODULES` (one record per generated instance and
-  architecture) and `KERNELS` (`arch -> template -> module name`), both
+* `cake_jit.py` -- `MODULES` (one record per generated program; `arches` lists
+  the architectures its single source pair serves) and `KERNELS` (`arch -> template -> module name`), both
   filled by the generated-program export, and the JIT specs.
 * `cake_backend.py` -- view validation, instance selection, stream-K
   planning, argument-plan binding, the prepared launches and the eager entry
   points.
-* `csrc/cake_dense_projection_gemm/<arch>/` -- generated kernel and binding
+* `csrc/cake_dense_projection_gemm/` -- generated kernel and binding
   translation units (`.clang-format` disables formatting: the sources are
   identity-checked by the registry's closure digests).
 
@@ -132,7 +132,7 @@ launcher's.
 
 The registries hold the generated programs of the current export lock: the
 Cake exporter (`exports/dense_projection_gemm` of the Cake repository) emits
-one program per template for `sm_100a` and `sm_107a` (the per-architecture
+one program per template, shared by `sm_100a` and `sm_107a` wherever the generated text is the same (the per-architecture
 template lists are `KERNELS` in `cake_jit.py`; `K1_TEMPLATES` of the exporter
 is the source of truth and is regenerated whenever `ROW_RULES` resolve a new
 instance), and `sm_103a` is compiled from the same sources when a B300 route
@@ -142,9 +142,8 @@ instance only for a template that no export has generated.
 CUDA Graphs: prepare outside capture and replay the prepared launch
 (`prepare_*` once, `launch` many times).  The eager wrappers
 (`dense_projection_gemm`, `projection_wgrad`, `router_fp32_gemm`) prepare a
-new launch — and a new TMA-descriptor workspace — on every call, so they are
-not graph-capturable: the binding refuses to initialise a workspace while the
-stream is capturing.
+new launch (a new stream-K workspace and counters) on every call; capture a
+prepared launch object rather than the eager wrappers.
 
 Tests: `tests/experimental/test_cake_dense_projection_gemm.py` (host-side
 planning tests run everywhere; the GPU tests skip without a registered

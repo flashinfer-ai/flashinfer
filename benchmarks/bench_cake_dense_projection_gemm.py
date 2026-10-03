@@ -108,7 +108,7 @@ def row_table(T_values, ops, f32_grads, mla, router):
 
 
 # ---------------------------------------------------------------------------
-# Inputs (the CAKE-758 eval harness distributions)
+# Inputs (the Cake eval harness distributions)
 # ---------------------------------------------------------------------------
 
 
@@ -256,7 +256,7 @@ def measure_row(label, spec, args):
         )
         if spec["family"] == "router":
             entry["splits"] = prepared.splits
-        prepared.launch()  # initializes the descriptor workspace outside the timed region
+        prepared.launch()  # warm-up launch outside the timed region (JIT load, first-call checks)
         torch.cuda.synchronize()
         if args.accuracy:
             entry["cake_accuracy"] = accuracy(inp, inp["out"])
