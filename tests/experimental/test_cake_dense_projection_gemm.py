@@ -576,6 +576,21 @@ def _require_program(template: str):
         pytest.skip(f"generated instance {template!r} not registered for this device")
 
 
+def _registered_knobs(v, *candidates):
+    """The first planner knob set (in order) whose planned instance the export registered for this device.
+    The per-arch export only ships the instances its measured rules route to, so a test that pins a tile
+    family takes whichever family's instance this device has; skips when none is registered."""
+    if not _device_supported():
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
+    templates = [_plan_template(v, **knobs) for knobs in candidates]
+    for knobs, template in zip(candidates, templates, strict=True):
+        if generated_program_available(torch.device("cuda"), template):
+            return knobs
+    pytest.skip(
+        f"none of the generated instances {templates!r} is registered for this device"
+    )
+
+
 def _sm_count() -> int:
     return int(torch.cuda.get_device_properties(0).multi_processor_count)
 
@@ -1158,7 +1173,9 @@ def test_stream_k_plan_rules(pairs):
 
 def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
     # pure planner mirror (_fallback=False): synthetic shapes may name instances the export never generated
-    # the 24-tile swapped weight gradient (indexer_hw, T = 1001): one partial wave, K = 16 steps -> split
+    # the 24-tile swapped weight gradient (indexer_hw, T = 1001): one partial wave, K = 16 steps -> split.  The
+    # round-9 sm_100a rule plans this row's 64-row family (48 pair tiles, which 74 pairs cannot split two ways), so
+    # the 128-row family is forced here to keep the split under test
     v = _views("proj", "indexer_hw", "wgrad", "bf16", 1001)
     plan, *_ = plan_dense_projection_gemm(
         v["A"],
@@ -1168,6 +1185,7 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
         l2_bytes=L2_BYTES,
         _fallback=False,
         transposed_out=v["transposed"],
+        cta_rows=128,
     )
     assert (plan.pair_tiles, plan.k_blocks) == (24, 16)
     assert (plan.num_full, plan.tail_tiles, plan.sk_units, plan.iters_per_unit) == (
@@ -1187,6 +1205,7 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
         l2_bytes=L2_BYTES,
         _fallback=False,
         transposed_out=v["transposed"],
+        cta_rows=128,
         sk=False,
     )
     assert (off.num_full, off.tail_tiles, off.sk_units, off.iters_per_unit) == (
@@ -1358,10 +1377,13 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         == {
                             (256, 0): 7,
                             (256, 1): 6,
+                            (256, 2): 5,
                             (192, 0): 7,
                             (192, 1): 6,
+                            (192, 2): 5,
                             (128, 0): 9,
                             (128, 1): 8,
+                            (128, 2): 6,
                         }[(plan.block_n, plan.slots)]
                     )
                 assert plan.l2_bytes == L2_BYTES
@@ -1810,32 +1832,44 @@ def test_sk_parts_rule(pairs):
         # on B200 the 128-tile row's tail of 54 admits no split: the rule falls back to auto (whole tiles)
         assert sk_parts_plan(128, 254, pairs, 3) == ("auto", None)
     # the sm_107a rules adopted in round 4 (round 8 adds the 4-tile raster group to the bf16 indexer_q wgrad rule) ...
+    # (round 9 moves the indexer_q weight gradients onto 256 x 160 tiles and the N = 128 swapped weight gradient
+    # onto the 64-row family; the sk_parts knobs are unchanged)
     assert ROW_RULES[
         ("sm_107a", True, True, False, False, False, 2048, None, 4096)
     ] == {
-        "block_n": 128,
-        "sk_parts": 2,
+        "block_n": 160,
+        "cta_rows": 256,
         "group_m": 4,
+        "sk_parts": 2,
     }
     assert ROW_RULES[("sm_107a", True, True, True, False, False, 2048, None, 4096)] == {
-        "sk_parts": 3
+        "block_n": 160,
+        "cta_rows": 256,
+        "sk_parts": 3,
     }
     for f32 in (False, True):
-        for n in (32, 128):
-            assert ROW_RULES[
-                ("sm_107a", True, True, f32, True, False, n, None, 6144)
-            ] == {
-                "block_n": 128,
-                "sk_parts": 3,
-            }
+        assert ROW_RULES[("sm_107a", True, True, f32, True, False, 32, None, 6144)] == {
+            "block_n": 128,
+            "sk_parts": 3,
+        }
+        assert ROW_RULES[
+            ("sm_107a", True, True, f32, True, False, 128, None, 6144)
+        ] == {
+            "block_n": 128,
+            "cta_rows": 64,
+            "sk_parts": 3,
+        }
     # ... and their plans through the planner (CPU views; the launch grid is num_full + sk_units pairs)
     if pairs == 106:
         T = 16231
+        # round 9: the indexer_q weight gradients plan 256 x 160 tiles (104 pair tiles = one wave on 106 pairs, so
+        # the sk_parts split does not fit and the row keeps whole tiles) and the N = 128 swapped weight gradient
+        # plans the 64-row family (48 pair tiles; 3 x 48 units do not fit -> the auto two-way split)
         for row, dt, want in (
-            ("indexer_q", "f32", (256, 106, 22, 66, 85)),
-            ("indexer_q", "bf16", (128, 212, 44, 88, 127)),
+            ("indexer_q", "f32", (160, 104, 0, 0, 254)),
+            ("indexer_q", "bf16", (160, 104, 0, 0, 254)),
             ("indexer_hw", "bf16", (128, 0, 24, 72, 85)),
-            ("indexer_k", "f32", (128, 0, 24, 72, 85)),
+            ("indexer_k", "f32", (128, 0, 48, 96, 127)),
         ):
             v = _views("proj", row, "wgrad", dt, T)
             plan = plan_dense_projection_gemm(
@@ -1875,6 +1909,8 @@ def test_sk_parts_rule(pairs):
             48,
             127,
         )
+        # (sm_100a has no sk_parts rule; its round-9 rule plans the 64-row family for this row, so the 128-row
+        # family is forced to keep the auto two-way split of the 24 tiles under test)
         other = plan_dense_projection_gemm(
             v["A"],
             v["B"],
@@ -1884,6 +1920,7 @@ def test_sk_parts_rule(pairs):
             transposed_out=v["transposed"],
             arch="sm_100a",
             _fallback=False,
+            cta_rows=128,
         )[0]
         assert (
             (other.pair_tiles, other.tail_tiles, other.sk_units)
@@ -1902,6 +1939,7 @@ def test_sk_parts_rule(pairs):
             transposed_out=v["transposed"],
             arch="sm_100a",
             _fallback=False,
+            cta_rows=128,
             sk_parts=3,
         )[0]
         assert (
@@ -2115,7 +2153,7 @@ def _check(actual, expected_f64, *, untouched=None):
         assert bool(torch.isnan(untouched.float()).all())
 
 
-def _plan_template(v):
+def _plan_template(v, **knobs):
     plan, *_ = plan_dense_projection_gemm(
         v["A"],
         v["B"],
@@ -2123,6 +2161,7 @@ def _plan_template(v):
         sm_count=_sm_count(),
         l2_bytes=_l2_bytes(),
         transposed_out=v.get("transposed", False),
+        **knobs,
     )
     return plan.template
 
@@ -2195,10 +2234,13 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
         (Nf, K + 8), float("nan"), device=device, dtype=torch.float32
     )
     out_t = out_t_buf[:, :K]
-    _require_program(_plan_template(dict(A=A.t(), B=Gs, out=out_t, transposed=True)))
-    prepared = prepare_projection_wgrad(Gs, A, out_t)
+    # (the 128-row fp32 transposed instance on sm_107a, the 64-row one on sm_100a: round 9 routes the sm_100a
+    # small-N weight gradients to the 64-row family, so only that family's instance is exported there)
+    v_t = dict(A=A.t(), B=Gs, out=out_t, transposed=True)
+    knobs_t = _registered_knobs(v_t, {}, dict(cta_rows=64))
+    prepared = prepare_projection_wgrad(Gs, A, out_t, **knobs_t)
     assert prepared.plan.transposed_out and prepared.template == _plan_template(
-        dict(A=A.t(), B=Gs, out=out_t, transposed=True)
+        v_t, **knobs_t
     )
     assert prepared.template.startswith(
         "dense_proj_gemm_nn_n128"
@@ -2216,21 +2258,32 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
 def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
     if not _device_supported():
         pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
-    # the 24-tile swapped weight gradient: stream-K "auto" two-part split (deterministic in-kernel fixup)
-    v = _make_inputs("proj", "indexer_hw", "wgrad", "bf16", 1001, seed=SEED + 3)
-    _require_program(_plan_template(v))
-    prepared = prepare_projection_wgrad(v["G"], v["X"], v["out"])
+    # a 24-tile swapped weight gradient (N = 32, K = 3072, T = 1001): stream-K "auto" two-part split with the
+    # deterministic in-kernel fixup.  The round-9 rules route the GLM small-N weight gradients to whole tiles on
+    # sm_100a (64-row family: 48 tiles, which 74 pairs cannot split), so the split is pinned on a half-width
+    # synthetic row with whichever of the 64-row / 128-row instances this device's export registered (both plan
+    # 24 pair tiles)
+    device = torch.device("cuda")
+    g = torch.Generator(device=device).manual_seed(SEED + 3)
+    T, K, N = 1001, 3072, 32
+    X = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
+    G = torch.randn(T, N, device=device, generator=g).to(torch.bfloat16)
+    out = torch.empty(N, K, device=device, dtype=torch.bfloat16)
+    v = dict(A=X.t(), B=G, out=out, transposed=True)
+    knobs = _registered_knobs(v, dict(cta_rows=64), dict(cta_rows=128))
+    prepared = prepare_projection_wgrad(G, X, out, **knobs)
     assert prepared.plan.transposed_out and prepared.plan.pair_tiles == 24
     if prepared.plan.sm_pairs >= 48:
         assert (prepared.plan.tail_tiles, prepared.plan.sk_units) == (24, 48)
     first = prepared.launch().clone()
     torch.cuda.synchronize()
+    _check(out.t(), torch.matmul(X.t().double(), G.double()))
     before = torch.cuda.memory_stats()
     prepared.launch()
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
-    assert torch.equal(first, v["out"])
+    assert torch.equal(first, out)
 
 
 def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
