@@ -44,6 +44,8 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
+import functools
+
 import torch
 from cutlass.cute.runtime import from_dlpack
 
