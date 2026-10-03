@@ -28,9 +28,10 @@ import warnings
 import weakref
 from collections import OrderedDict
 from contextlib import suppress
+import dataclasses
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, ClassVar, List, Mapping, Optional
+from typing import Any, ClassVar, List, Literal, Mapping, Optional
 
 import torch
 
@@ -40,6 +41,12 @@ from ..autotuner import (
     DynamicTensorSpec,
     TunableRunner,
     TuningConfig,
+)
+from ..quantization.nvfp4_quantization_utils import (
+    _UNSET,
+    NVFP44Over6Config,
+    nvfp4_4over6_cache_key,
+    resolve_nvfp4_4over6,
 )
 from ..utils import next_positive_power_of_2, round_up
 from .api import (
@@ -53,7 +60,12 @@ from .api import (
     _CUTLASS_W4A16_ARCHS,
     _CUTLASS_W4A8_ARCHS,
     _CUTILE_BF16_ARCHS,
+    _CUTILE_FP8_ARCHS,
+    _CUTILE_MXFP4_ARCHS,
+    _CUTILE_MXFP8_ARCHS,
     _CUTILE_NVFP4_ARCHS,
+    _CUTILE_W4A16_ARCHS,
+    _PRIMS_TS_ARCHS,
     # Typed activation values
     ActivationConfig,
     GELU,
@@ -73,10 +85,12 @@ from .api import (
     MoEWeightPack,
     QuantConfig,
     QuantFormat,
-    QuantVariant,
     RoutingInputMode,
 )
 from .utils import (
+    _CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS,
+    _cutile_max_permuted_rows,
+    _cutile_permute_shape,
     make_hybrid_bucket_mapper,
     map_to_hybrid_bucket,
 )
@@ -96,6 +110,98 @@ _CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
 )
 
 _CUTILE_INT32_INDEX_LIMIT = 1 << 31
+
+
+def _cutile_bucket_compile_token_counts(
+    bucket: int,
+    *,
+    tune_max_num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    block_size: int,
+) -> tuple[int, ...]:
+    """Return the cuTile dispatch-shape representatives for one tune bucket.
+
+    cuTile specializes array arguments by a small set of alignment and shape
+    divisibility facts.  The MoE host code also has a few routing, padding, and
+    quantization regimes. Group token counts by those facts so autotuning also
+    compiles one representative per binary variant, rather than one binary per
+    possible token count.
+
+    This is intentionally independent of precision and activation: it is the
+    conservative union of the BF16, FP4, and FP8 host-side regimes.  New cuTile
+    MoE precisions therefore inherit the same serving behavior by default.
+    """
+    if bucket < 1 or tune_max_num_tokens < bucket:
+        raise ValueError("bucket must be positive and within tune_max_num_tokens.")
+    if map_to_hybrid_bucket(bucket, tune_max_num_tokens) != bucket:
+        raise ValueError(f"{bucket} is not a hybrid token bucket.")
+    if num_experts < 1 or top_k < 1:
+        raise ValueError("num_experts and top_k must be positive.")
+
+    representatives: dict[tuple[Any, ...], int] = {}
+    for num_tokens in range(1, bucket + 1):
+        if map_to_hybrid_bucket(num_tokens, tune_max_num_tokens) != bucket:
+            continue
+        assignments = num_tokens * top_k
+        rows_per_expert = (assignments + num_experts - 1) // num_experts
+
+        padded_rows = _cutile_max_permuted_rows(assignments, num_experts, block_size)
+        num_blocks = (padded_rows + block_size - 1) // block_size
+        block_shape = (
+            padded_rows % 16 == 0,
+            num_blocks % 16 == 0,
+            next_positive_power_of_2(num_blocks),
+            padded_rows * intermediate_size >= 1 << 20,
+        )
+
+        if assignments <= _CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS:
+            routing_regime: tuple[Any, ...] = (
+                "small",
+                next_positive_power_of_2(assignments),
+            )
+        else:
+            routing_regime = (
+                "chunked",
+                *_cutile_permute_shape(assignments, num_experts),
+            )
+
+        # Thresholds below are the conservative union used by the cuTile BF16,
+        # FP4, and FP8 host launchers.  They affect a compile-time tile, fusion
+        # mode, or persistent-grid choice, so both sides must be warmed.
+        regime_flags = (
+            num_tokens <= 64,
+            num_tokens <= 256,
+            assignments < 64,
+            assignments >= 4096,
+            assignments >= 65536,
+            rows_per_expert <= 8,
+            rows_per_expert <= 16,
+            rows_per_expert < 32,
+            rows_per_expert <= 32,
+            rows_per_expert < 64,
+            rows_per_expert <= 64,
+            rows_per_expert <= 128,
+            rows_per_expert >= 192,
+            rows_per_expert >= 256,
+            rows_per_expert < 512,
+            num_tokens * hidden_size >= 1 << 20,
+        )
+        fingerprint = (
+            bucket,
+            num_tokens % 16 == 0,
+            assignments % 16 == 0,
+            routing_regime,
+            block_shape,
+            regime_flags,
+        )
+        representatives.setdefault(fingerprint, num_tokens)
+
+    # The capacity is the autotuner's profiling shape. Remaining values only
+    # populate finite cuTile JIT variants for the already-selected tactic.
+    return tuple(dict.fromkeys((bucket, *representatives.values())))
 
 
 def _validate_cutile_int32_routing(
@@ -474,6 +580,9 @@ class MoERunner(TunableRunner):
     # Cleared by backends whose kernels cannot map global expert ids onto a
     # local shard (local_expert_offset / local_num_experts != num_experts).
     supports_expert_parallelism: ClassVar[bool] = True
+    # Set to True only by runners that thread QuantConfig.nvfp4_4over6 into
+    # their activation quantizer instead of letting it read the environment.
+    supports_nvfp4_4over6: ClassVar[bool] = False
 
     config: MoEConfig
 
@@ -521,27 +630,15 @@ class MoERunner(TunableRunner):
         quant = self.config.quant
         pair = quant.pair
         if pair not in self.supported_quant_variants:
-            variant = quant.variant
-            extra = f" QuantVariant.{variant.name}." if variant is not None else ""
             raise NotImplementedError(
                 f"{type(self).__name__} does not support weight={quant.weight.name}, "
-                f"activation={quant.activation.name}.{extra}"
+                f"activation={quant.activation.name}."
             )
         if quant.output not in self.supported_output_formats:
             names = ", ".join(fmt.name for fmt in self.supported_output_formats)
             raise NotImplementedError(
                 f"{type(self).__name__} does not support output={quant.output.name}; "
                 f"supported outputs are {names}."
-            )
-        if quant.variant is None:
-            # Transitional guard: runner build paths and weight preparation
-            # still dispatch on QuantVariant, so a pair without a legacy
-            # variant would pass capability checks and fail later. Lift this
-            # once dispatch keys on quant.pair (config-merge follow-up).
-            raise NotImplementedError(
-                f"{type(self).__name__}: weight={quant.weight.name}, "
-                f"activation={quant.activation.name} has no QuantVariant mapping; "
-                "runner dispatch is not yet pair-keyed."
             )
         if self.supported_activation_classes_by_quant:
             # Strict lookup: a runner that declares per-quant capabilities must
@@ -573,6 +670,7 @@ class MoERunner(TunableRunner):
             )
         self._assert_shared_experts_supported()
         self._assert_expert_parallelism_supported()
+        self._assert_nvfp4_4over6_supported()
         self._check_activation_parameters()
 
     def _check_activation_parameters(self) -> None:
@@ -586,6 +684,23 @@ class MoERunner(TunableRunner):
                 f"{type(self).__name__} does not support fused shared experts "
                 f"(num_fused_shared_experts={s})."
             )
+
+    def _assert_nvfp4_4over6_supported(self) -> None:
+        """Reject an explicit 4over6 recipe on a backend that has not opted in.
+
+        Only an unset field may pass silently: a pinned recipe the backend
+        would ignore is the failure the field exists to prevent.
+        """
+        setting = self.config.quant.nvfp4_4over6
+        if setting is _UNSET or self.supports_nvfp4_4over6:
+            return
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot honor an explicit "
+            f"QuantConfig.nvfp4_4over6={setting!r}: its activation quantizer "
+            "reads the FLASHINFER_NVFP4_4OVER6* environment variables "
+            "directly. Leave the field unset to use them, or "
+            "select a backend that implements it."
+        )
 
     def _assert_expert_parallelism_supported(self) -> None:
         """Reject EP shards for backends that cannot compute a local expert subset."""
@@ -621,6 +736,23 @@ class MoERunner(TunableRunner):
             raise RuntimeError(
                 f"{type(self).__name__}.build() must be called before execution."
             )
+
+    @functools.cached_property
+    def _nvfp4_4over6_key(self) -> str:
+        """The *resolved* 4over6 recipe as a cache-key token.
+
+        Resolved, because ``ProfilingCacheKey.file_key`` stringifies the extras:
+        an unset field would key identically in two processes with opposite
+        ``FLASHINFER_NVFP4_4OVER6`` settings. Cached because ``__hash__`` runs
+        on every autotuner lookup; flipping the environment mid-process does
+        not re-key. ``"n/a"`` for non-NVFP4 activations, so the environment
+        does not leak into BF16 / FP8 tactic keys.
+        """
+        if self.config.quant.activation is not QuantFormat.NVFP4:
+            return "n/a"
+        return nvfp4_4over6_cache_key(
+            resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
+        )
 
     # Anything the profiled tensor shapes cannot reveal has to be listed here.
     # One stable tuple feeds both __hash__ (in-memory) and the persisted key,
@@ -658,6 +790,9 @@ class MoERunner(TunableRunner):
             # Declared quant flags are keyed before runners begin consuming them.
             self.config.quant.per_token_scale,
             self.config.quant.swizzled_scale_factors,
+            # The 4over6 recipe changes the values a tactic is timed on and
+            # nothing else in this tuple reflects it.
+            self._nvfp4_4over6_key,
         )
 
     def __hash__(self) -> int:
@@ -669,41 +804,61 @@ class MoERunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
-# Cake exact-SM103 NVFP4 warp-decode runner
+# Cake exact-SM100/SM103 NVFP4 warp-decode runner
 # ---------------------------------------------------------------------------
 
 
 class CakeWarpDecodeRunner(MoERunner):
-    """Exact-SM103 Cake runner for two calibrated NVFP4 decode geometries.
+    """Exact-SM100/SM103 Cake runner for calibrated NVFP4 decode geometries.
 
     The runner consumes the physical tensor view produced by
     :class:`TrtllmFp4Config`: packed E2M1 weights and activations, E4M3 block
-    scales, and per-expert FP32 epilogue scales. The generated kernel fixes
-    SwiGLU ``alpha=1`` and ``beta=0``; the compatible ``gemm1_alpha`` field in
-    the TRTLLM view is therefore not a launch argument.
+    scales, and per-expert FP32 epilogue scales. Default SwiGLU geometries fix
+    ``alpha=1`` and ``beta=0``. Parameterized SwiGLU and SiTU use an extended
+    launch entry point that consumes the prepared per-expert activation tensors.
+    Activation is identified by the exact geometry.
     """
 
     backend_key = "cake"
     supported_routing_modes = (RoutingInputMode.UnpackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = (SwiGLU, SiLU, SiTU)
     supports_expert_parallelism = False
 
-    _SUPPORTED_GEOMETRIES: ClassVar[set[tuple[int, int, int, int]]] = {
-        # hidden_size, intermediate_size, num_experts, top_k
-        (2048, 512, 512, 10),
-        (2048, 1536, 60, 4),
+    _SUPPORTED_CONFIGURATIONS: ClassVar[
+        set[tuple[ActivationConfig, int, int, int, int]]
+    ] = {
+        # activation, hidden_size, intermediate_size, num_experts, top_k
+        (SwiGLU(), 2048, 512, 512, 10),
+        (SwiGLU(), 2048, 1536, 60, 4),
+        (SwiGLU(), 2560, 768, 384, 4),
+        (SiLU(), 6144, 1536, 192, 4),
+        (SwiGLU(), 2048, 768, 128, 8),
+        (SwiGLU(), 4096, 1536, 128, 8),
+        (SwiGLU(), 2048, 512, 256, 8),
+        (SwiGLU(), 4096, 1024, 512, 10),
+        (SwiGLU(), 3072, 1536, 256, 8),
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4),
+        (SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16),
     }
     _REQUIRED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = (
         "gemm1_weights",
         "gemm1_weights_scale",
-        "gemm1_alpha",
         "gemm2_weights",
         "gemm2_weights_scale",
         "output1_scale_scalar",
         "output1_scale_gate_scalar",
         "output2_scale_scalar",
     )
+    _GATED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = ("gemm1_alpha",)
+    _ACTIVATION_PARAMETER_KEYS: ClassVar[dict[ActivationConfig, tuple[str, ...]]] = {
+        SwiGLU(alpha=1.702, beta=1.0, limit=7.0): (
+            "gemm1_alpha",
+            "gemm1_beta",
+            "gemm1_clamp_limit",
+        ),
+        SiTU(gate_scale=4.0, linear_scale=25.0): ("gemm1_alpha", "gemm1_beta"),
+    }
     _MAX_STREAM_WORKSPACES: ClassVar[int] = 64
     _MAX_TOPK_VALIDATION_RECEIPTS: ClassVar[int] = 64
 
@@ -744,14 +899,10 @@ class CakeWarpDecodeRunner(MoERunner):
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self._device_arch != 103:
+        if self._device_arch not in (100, 103):
             raise NotImplementedError(
-                f"CakeWarpDecodeRunner requires exact SM103, got SM{self._device_arch}."
-            )
-        if self.config.activation != SwiGLU():
-            raise NotImplementedError(
-                "CakeWarpDecodeRunner supports only default SwiGLU() "
-                "(alpha=1, beta=0, default clamp)."
+                "CakeWarpDecodeRunner requires exact SM100 or SM103, "
+                f"got SM{self._device_arch}."
             )
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("CakeWarpDecodeRunner requires do_finalize=True.")
@@ -780,21 +931,29 @@ class CakeWarpDecodeRunner(MoERunner):
                 "CakeWarpDecodeRunner requires local_expert_offset=0 and "
                 "local_num_experts=num_experts."
             )
-        geometry_without_hidden = (
+        configuration_without_hidden = (
+            self.config.activation,
             experts.intermediate_size,
             local_num_experts,
             routing.top_k,
         )
         supported_without_hidden = {
-            (intermediate_size, num_experts, top_k)
-            for _, intermediate_size, num_experts, top_k in self._SUPPORTED_GEOMETRIES
+            (activation, intermediate_size, num_experts, top_k)
+            for activation, _, intermediate_size, num_experts, top_k in (
+                self._SUPPORTED_CONFIGURATIONS
+            )
         }
-        if geometry_without_hidden not in supported_without_hidden:
+        if configuration_without_hidden not in supported_without_hidden:
             raise NotImplementedError(
-                "CakeWarpDecodeRunner supports only "
-                "(intermediate_size, num_experts, top_k) = (512, 512, 10) "
-                "or (1536, 60, 4); got "
-                f"{geometry_without_hidden}."
+                "CakeWarpDecodeRunner supports only default SwiGLU() with "
+                "(intermediate_size, num_experts, top_k) = (512, 512, 10), "
+                "(1536, 60, 4), (768, 384, 4), (768, 128, 8), "
+                "(1536, 128, 8), (512, 256, 8), (1024, 512, 10), or "
+                "(1536, 256, 8), and SiLU() with "
+                "(1536, 192, 4), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
+                "with (3072, 128, 4), or SiTU(gate_scale=4.0, linear_scale=25.0) "
+                "with (3072, 896, 16); got "
+                f"{configuration_without_hidden}."
             )
 
     def _build(self) -> None:
@@ -802,7 +961,17 @@ class CakeWarpDecodeRunner(MoERunner):
             get_cake_fused_moe_warp_decode_module,
         )
 
-        self._module = get_cake_fused_moe_warp_decode_module(device=self.device)
+        target: Literal["sm100a", "sm103a"]
+        if self._device_arch == 100:
+            target = "sm100a"
+        elif self._device_arch == 103:
+            target = "sm103a"
+        else:
+            raise RuntimeError(
+                "CakeWarpDecodeRunner build requires exact SM100 or SM103, "
+                f"got SM{self._device_arch}."
+            )
+        self._module = get_cake_fused_moe_warp_decode_module(target, device=self.device)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
@@ -1150,18 +1319,26 @@ class CakeWarpDecodeRunner(MoERunner):
         hidden_size = int(act.hidden_states_q.shape[1]) * 2
         routing = self.config.routing
         intermediate_size = self.config.experts.intermediate_size
-        geometry = (
+        configuration = (
+            self.config.activation,
             hidden_size,
             intermediate_size,
             routing.num_experts,
             routing.top_k,
         )
-        if geometry not in self._SUPPORTED_GEOMETRIES:
+        if configuration not in self._SUPPORTED_CONFIGURATIONS:
             raise ValueError(
-                "CakeWarpDecodeRunner supports only "
+                "CakeWarpDecodeRunner supports only default SwiGLU() with "
                 "(hidden_size, intermediate_size, num_experts, top_k) = "
-                "(2048, 512, 512, 10) or (2048, 1536, 60, 4); "
-                f"got {geometry}."
+                "(2048, 512, 512, 10), (2048, 1536, 60, 4), "
+                "(2560, 768, 384, 4), (2048, 768, 128, 8), "
+                "(4096, 1536, 128, 8), (2048, 512, 256, 8), "
+                "(4096, 1024, 512, 10), or (3072, 1536, 256, 8), and SiLU() "
+                "with (6144, 1536, 192, 4), "
+                "SwiGLU(alpha=1.702, beta=1.0, limit=7.0) with (6144, 3072, 128, 4), "
+                "or SiTU(gate_scale=4.0, linear_scale=25.0) "
+                "with (3584, 3072, 896, 16); got "
+                f"{configuration}."
             )
 
         _validate_prerouted_inputs(
@@ -1197,10 +1374,22 @@ class CakeWarpDecodeRunner(MoERunner):
             raise ValueError("CakeWarpDecodeRunner does not consume per_token_scale.")
 
         view = weights.get_view(self.backend_key)
-        missing = [key for key in self._REQUIRED_WEIGHT_KEYS if key not in view]
+        activation = self.config.activation
+        activation_parameter_keys = self._ACTIVATION_PARAMETER_KEYS.get(activation, ())
+        gated_weight_keys = (
+            activation_parameter_keys or self._GATED_WEIGHT_KEYS
+            if activation.is_gated
+            else ()
+        )
+        required_weight_keys = self._REQUIRED_WEIGHT_KEYS + gated_weight_keys
+        missing = [key for key in required_weight_keys if key not in view]
         if missing:
             raise KeyError(f"Cake warp decode weight view is missing {missing}.")
-        allowed = set(self._REQUIRED_WEIGHT_KEYS)
+        if not activation.is_gated and "gemm1_alpha" in view:
+            raise ValueError(
+                "Cake warp decode standalone SiLU weights must not provide gemm1_alpha."
+            )
+        allowed = set(required_weight_keys)
         unexpected = sorted(
             key
             for key, value in view.items()
@@ -1213,7 +1402,7 @@ class CakeWarpDecodeRunner(MoERunner):
             )
 
         num_experts = routing.num_experts
-        gemm1_rows = 2 * intermediate_size
+        gemm1_rows = intermediate_size * (2 if activation.is_gated else 1)
         self._require_tensor(
             view["gemm1_weights"],
             name="gemm1_weights",
@@ -1227,13 +1416,14 @@ class CakeWarpDecodeRunner(MoERunner):
             shape=(num_experts, gemm1_rows, hidden_size // 16),
             device=device,
         )
-        self._require_tensor(
-            view["gemm1_alpha"],
-            name="gemm1_alpha",
-            dtype=torch.float32,
-            shape=(num_experts,),
-            device=device,
-        )
+        for name in gated_weight_keys:
+            self._require_tensor(
+                view[name],
+                name=name,
+                dtype=torch.float32,
+                shape=(num_experts,),
+                device=device,
+            )
         self._require_tensor(
             view["gemm2_weights"],
             name="gemm2_weights",
@@ -1286,7 +1476,7 @@ class CakeWarpDecodeRunner(MoERunner):
         output = torch.empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16, device=device
         )
-        return [
+        inputs = [
             output,
             workspace,
             act.hidden_states_q,
@@ -1301,6 +1491,12 @@ class CakeWarpDecodeRunner(MoERunner):
             view["output1_scale_gate_scalar"],
             view["output2_scale_scalar"],
         ]
+        if activation_parameter_keys:
+            inputs.extend(
+                view.get(name)
+                for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+            )
+        return inputs
 
     def forward(
         self,
@@ -1312,9 +1508,11 @@ class CakeWarpDecodeRunner(MoERunner):
         self._require_built()
         if tactic != -1:
             raise ValueError("CakeWarpDecodeRunner supports only tactic -1.")
-        if len(inputs) != 13:
+        parameterized = self.config.activation in self._ACTIVATION_PARAMETER_KEYS
+        expected_inputs = 16 if parameterized else 13
+        if len(inputs) != expected_inputs:
             raise ValueError(
-                "CakeWarpDecodeRunner expects 13 flattened tensor inputs, "
+                f"CakeWarpDecodeRunner expects {expected_inputs} flattened tensor inputs, "
                 f"got {len(inputs)}."
             )
         geometry = self._geometry_from_inputs(inputs)
@@ -1344,7 +1542,14 @@ class CakeWarpDecodeRunner(MoERunner):
             self._stream_token(stream),
         )
         try:
-            self._module.cake_fused_moe_warp_decode(*launch_inputs, prepared[1], True)
+            if parameterized:
+                self._module.cake_fused_moe_warp_decode_with_activation_params(
+                    *launch_inputs, prepared[1], True
+                )
+            else:
+                self._module.cake_fused_moe_warp_decode(
+                    *launch_inputs, prepared[1], True
+                )
         except Exception:
             finalizer = self._workspace_receipt_finalizers.pop(identity, None)
             if finalizer is not None and finalizer.alive:
@@ -1416,6 +1621,16 @@ class _CutlassRunnerBase(MoERunner):
     _use_mxfp8_act_scaling: ClassVar[bool] = False
     _use_packed_weights: ClassVar[bool] = False
     _use_wfp4afp8_humming: ClassVar[bool] = False
+    # Pre-quantized activations arrive with a per-token block-scale tensor
+    # ``hidden_states_scale`` of shape ``[M, H // _act_sf_vec_size]`` in the
+    # TRTLLM linear layout. ``None`` means the pair carries no block scale.
+    # MXFP8 pairs may instead opt into the flat CUTLASS swizzled 1-D buffer
+    # with ``QuantConfig(swizzled_scale_factors=True)``.
+    _act_sf_vec_size: ClassVar[int | None] = None
+    # Logical hidden elements per storage column of ``hidden_states_q`` (2 for
+    # packed NVFP4 uint8, 1 otherwise). Every hidden_size derivation from the
+    # activation tensor must go through ``_hidden_size_of``.
+    _act_elems_per_column: ClassVar[int] = 1
     _required_weight_keys: ClassVar[tuple[str, ...]]
     _expected_num_inputs: ClassVar[int]
     # Keep the best N tactics per GEMM stage, then return their Cartesian
@@ -1450,12 +1665,19 @@ class _CutlassRunnerBase(MoERunner):
                 f"SM{self._device_arch}; supported architectures are "
                 f"{self._supported_archs}."
             )
-        if self._use_mxfp8_act_scaling and (
-            self.config.quant.swizzled_scale_factors is False
-        ):
+        if self.config.quant.per_token_scale:
+            # The flat CUTLASS ABI has no per-token activation scale input;
+            # packing would silently drop ``act.per_token_scale``.
             raise NotImplementedError(
-                f"{type(self).__name__} requires swizzled MXFP8 input_sf; "
-                "linear scales (swizzled_scale_factors=False) are not supported."
+                f"{type(self).__name__} does not support per_token_scale=True."
+            )
+        if self.config.quant.swizzled_scale_factors is True and self._linear_act_sf:
+            # Only the MXFP8 runners have a swizzled input_sf path; silently
+            # reading a swizzled pack as linear would corrupt the scales.
+            raise NotImplementedError(
+                f"{type(self).__name__} consumes only the linear activation "
+                "block-scale layout; swizzled_scale_factors=True is supported "
+                "by the CUTLASS MXFP8 runners only."
             )
         if self._use_deepseek_fp8_block_scale:
             from ..jit.cpp_ext import is_cuda_version_at_least
@@ -1617,10 +1839,35 @@ class _CutlassRunnerBase(MoERunner):
             params[destination] = tensor
         return params
 
+    def _hidden_size_of(self, hidden_states: torch.Tensor) -> int:
+        return hidden_states.shape[1] * self._act_elems_per_column
+
+    @property
+    def _act_sf_unit_byte(self) -> int:
+        """Byte encoding of a unit block scale: E8M0 1.0 for MXFP8, E4M3 1.0
+        otherwise. Autotune fills synthesized scale buffers with it."""
+        return 127 if self._use_mxfp8_act_scaling else 0x38
+
+    @property
+    def _swizzled_act_sf(self) -> bool:
+        """Activation block scale factor (flat ``input_sf``) is the CUTLASS
+        128x4-swizzled 1-D buffer: MXFP8 with ``swizzled_scale_factors=True``."""
+        return (
+            self._use_mxfp8_act_scaling
+            and self.config.quant.swizzled_scale_factors is True
+        )
+
+    @property
+    def _linear_act_sf(self) -> bool:
+        """Activation block scale factor (flat ``input_sf``) is the canonical
+        row-major ``[M, H // vec]`` tensor: NVFP4 (E4M3, vec 16) always, MXFP8
+        (E8M0, vec 32) unless swizzled. False for pairs without a block scale."""
+        return self._act_sf_vec_size is not None and not self._swizzled_act_sf
+
     def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Populate synthesized routing inputs with a valid balanced pattern."""
         num_tokens = inputs[1].shape[0]
-        self._ensure_workspace(num_tokens, inputs[1].shape[1])
+        self._ensure_workspace(num_tokens, self._hidden_size_of(inputs[1]))
         top_k = self.config.routing.top_k
         num_experts = self.config.routing.num_experts
         token_offsets = torch.arange(
@@ -1631,18 +1878,21 @@ class _CutlassRunnerBase(MoERunner):
         ).unsqueeze(0)
         inputs[2].copy_((token_offsets * top_k + slots) % num_experts)
         inputs[3].fill_(1.0 / top_k)
-        if self._use_mxfp8_act_scaling:
+        if self._swizzled_act_sf:
             hidden_states = inputs[1]
             inputs[-1] = torch.full(
                 (
                     _mxfp8_swizzled_act_sf_numel(
-                        hidden_states.shape[0], hidden_states.shape[1]
+                        hidden_states.shape[0], self._hidden_size_of(hidden_states)
                     ),
                 ),
-                127,
+                self._act_sf_unit_byte,
                 dtype=torch.uint8,
                 device=hidden_states.device,
             )
+        elif self._linear_act_sf:
+            # Autotune buffers hold random bytes; time on unit scales, not NaN.
+            inputs[-1].view(torch.uint8).fill_(self._act_sf_unit_byte)
         return inputs
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
@@ -1754,7 +2004,8 @@ class _CutlassRunnerBase(MoERunner):
             )
         self._validate_activation_scale(act)
 
-        num_tokens, hidden_size = hidden_states.shape
+        num_tokens = hidden_states.shape[0]
+        hidden_size = self._hidden_size_of(hidden_states)
         ceiling = self.config.execution.tune_max_num_tokens
         if num_tokens > ceiling:
             raise ValueError(
@@ -1780,19 +2031,22 @@ class _CutlassRunnerBase(MoERunner):
         scale_inputs = self._pack_activation_scale_inputs(act)
         self._activation_params = self._resolve_activation_params(view)
 
-        # Token-dynamic dims are only the packed prerouted buffers (output,
-        # hidden, topk_ids, topk_weights). Per-tensor FP8 dequant is 0-dim;
-        # MXFP8 input_sf is a swizzled 1-D buffer resized by ConstraintSpec.
-        # Sniffing shape[0] == num_tokens treated a (1,) scale at M=1 as
-        # token-dynamic and let autotune replace it with a bucket-sized tensor.
+        # Token-dynamic dims are the packed prerouted buffers (output, hidden,
+        # topk_ids, topk_weights) plus a linear ``[M, H // vec]`` block scale
+        # when the pair carries one. Weight-view entries are static, even 0-dim
+        # per-tensor scales; swizzled MXFP8 input_sf is a 1-D buffer resized by
+        # ConstraintSpec.
         input_idxs: tuple[int, ...] = (0, 1, 2, 3)
         dim_idxs: tuple[int, ...] = (0, 0, 0, 0)
+        if self._linear_act_sf:
+            input_idxs += (4 + len(weight_inputs),)
+            dim_idxs += (0,)
 
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens
         )
         constraint_specs: tuple[ConstraintSpec, ...] = ()
-        if self._use_mxfp8_act_scaling:
+        if self._swizzled_act_sf:
             constraint_specs = (
                 ConstraintSpec(
                     4 + len(weight_inputs),
@@ -1831,12 +2085,40 @@ class _CutlassRunnerBase(MoERunner):
         ]
 
     def _validate_activation_scale(self, act: MoEActivationPack) -> None:
-        if self._use_mxfp8_act_scaling:
+        if act.per_token_scale is not None:
+            raise ValueError(f"{type(self).__name__} does not consume per_token_scale.")
+        if self._linear_act_sf:
             scale = act.hidden_states_scale
-            num_tokens, hidden_size = act.hidden_states_q.shape
-            expected = _mxfp8_swizzled_act_sf_numel(num_tokens, hidden_size)
+            num_tokens = act.hidden_states_q.shape[0]
+            hidden_size = self._hidden_size_of(act.hidden_states_q)
+            expected_shape = (num_tokens, hidden_size // self._act_sf_vec_size)
             if (
                 scale is None
+                or scale.dtype not in (torch.float8_e4m3fn, torch.uint8)
+                or tuple(scale.shape) != expected_shape
+                or not scale.is_contiguous()
+            ):
+                got = (
+                    None
+                    if scale is None
+                    else (scale.dtype, tuple(scale.shape), scale.is_contiguous())
+                )
+                raise ValueError(
+                    f"{type(self).__name__} requires a contiguous E4M3 (or uint8) "
+                    f"linear hidden_states_scale of shape {expected_shape}; got {got}."
+                )
+            return
+        if self._swizzled_act_sf:
+            scale = act.hidden_states_scale
+            num_tokens = act.hidden_states_q.shape[0]
+            hidden_size = self._hidden_size_of(act.hidden_states_q)
+            expected = _mxfp8_swizzled_act_sf_numel(num_tokens, hidden_size)
+            # ndim == 1 distinguishes the flat swizzled buffer from the
+            # canonical 2-D [M, H // 32] pack, whose numel coincides whenever
+            # M % 128 == 0 and (H // 32) % 4 == 0.
+            if (
+                scale is None
+                or scale.ndim != 1
                 or scale.dtype is not torch.uint8
                 or scale.numel() != expected
                 or not scale.is_contiguous()
@@ -1847,17 +2129,10 @@ class _CutlassRunnerBase(MoERunner):
                     else (scale.dtype, tuple(scale.shape), scale.is_contiguous())
                 )
                 raise ValueError(
-                    f"{type(self).__name__} requires a contiguous uint8 swizzled "
-                    f"input_sf with {expected} elements for M={num_tokens}, "
-                    f"H={hidden_size}; got {got}."
-                )
-            return
-        if self._x_dtype is torch.float8_e4m3fn:
-            scale = act.hidden_states_scale
-            if scale is None or scale.dim() != 0 or scale.dtype is not torch.float32:
-                raise ValueError(
-                    f"{type(self).__name__} requires a 0-dim float32 "
-                    "hidden_states_scale dequant factor."
+                    f"{type(self).__name__} with swizzled_scale_factors=True "
+                    f"requires a contiguous 1-D uint8 swizzled input_sf with "
+                    f"{expected} elements for M={num_tokens}, H={hidden_size}; "
+                    f"got {got}."
                 )
             return
         if act.hidden_states_scale is not None:
@@ -1868,10 +2143,10 @@ class _CutlassRunnerBase(MoERunner):
     def _pack_activation_scale_inputs(
         self, act: MoEActivationPack
     ) -> List[torch.Tensor]:
-        if self._use_mxfp8_act_scaling or self._x_dtype is torch.float8_e4m3fn:
+        if self._act_sf_vec_size is not None:
             assert act.hidden_states_scale is not None
             scale = act.hidden_states_scale
-            if self._use_mxfp8_act_scaling:
+            if self._swizzled_act_sf:
                 scale = scale.reshape(-1)
             return [scale]
         return []
@@ -1885,7 +2160,7 @@ class _CutlassRunnerBase(MoERunner):
         return []
 
     def _input_sf(self, inputs: List[torch.Tensor]) -> torch.Tensor | None:
-        if self._use_mxfp8_act_scaling:
+        if self._act_sf_vec_size is not None:
             return inputs[-1]
         return None
 
@@ -1944,11 +2219,11 @@ class _CutlassRunnerBase(MoERunner):
 
         # Select the deterministic geometric-capacity workspace for this
         # launch; older cached buffers remain alive for captured graphs.
-        num_tokens, hidden_size = inputs[1].shape
+        num_tokens = inputs[1].shape[0]
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens
         )
-        self._ensure_workspace(bucket, hidden_size)
+        self._ensure_workspace(bucket, self._hidden_size_of(inputs[1]))
 
         from .core import cutlass_fused_moe
 
@@ -1971,7 +2246,7 @@ class _CutlassRunnerBase(MoERunner):
             use_packed_weights=self._use_packed_weights,
             use_wfp4afp8_humming=self._use_wfp4afp8_humming,
             use_fused_finalize=self._use_fused_finalize,
-            swizzled_input_sf=True,
+            swizzled_input_sf=self._swizzled_act_sf,
             profile_ids=profile_ids,
             workspace_buffer=self._workspace,
             **self._activation_params,
@@ -2085,15 +2360,24 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
 
     Weights stay packed uint8 in the ``MoEWeightPack`` view. At launch they are
     viewed as ``int64``, matching the flat ``cutlass_fused_moe`` NVFP4 ABI; the
-    inner ``MoERunner`` selects the NVFP4 kernel from that dtype. Activations
-    remain BF16 and are quantized inside the kernel with unit global scale.
+    inner ``MoERunner`` selects the NVFP4 kernel from that dtype.
+
+    Activations use the TRTLLM canonical NVFP4 pack so one
+    ``MoEActivationPack`` serves every NVFP4 backend: ``hidden_states_q`` is
+    packed E2M1 ``uint8 [M, H // 2]`` and ``hidden_states_scale`` is the linear
+    (row-major, unswizzled) E4M3 block scale ``[M, H // 16]`` produced with a
+    unit global scale. The weight view fixes ``fc1_act_global_scale`` and the
+    dequant epilogue scalars at one to match that global scale.
     """
 
     backend_key = "cutlass_nvfp4"
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_NVFP4_ARCHS
+    _x_dtype = torch.uint8
     _weight_dtype = torch.int64
+    _act_sf_vec_size = 16
+    _act_elems_per_column = 2
     _use_w4_group_scaling = False
     _required_weight_keys = (
         "fc1_expert_weights",
@@ -2105,7 +2389,7 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
         "fc2_weight_block_scale",
         "fc2_dequant_scale",
     )
-    _expected_num_inputs = 12
+    _expected_num_inputs = 13
 
     def _pack_weight_inputs(
         self, view: dict[str, torch.Tensor], hidden_size: int
@@ -2122,10 +2406,14 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
         ) = (view[key] for key in self._required_weight_keys)
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
+        # Same alignment prepare_cutlass_nvfp4_weights enforces at load time
+        # (see _CUTLASS_NVFP4_HIDDEN_ALIGNMENT there); re-checked because the
+        # view may not have come from that helper.
+        if hidden_size % 64 != 0 or intermediate_size % 16 != 0:
             raise ValueError(
-                "Cutlass NVFP4 requires hidden_size and intermediate_size "
-                f"divisible by 16, got H={hidden_size}, I={intermediate_size}."
+                "Cutlass NVFP4 requires hidden_size divisible by 64 and "
+                f"intermediate_size divisible by 16, got H={hidden_size}, "
+                f"I={intermediate_size}."
             )
         gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
         expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
@@ -2200,7 +2488,16 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
 
 
 class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
-    """Unified adapter for CUTLASS per-tensor FP8 fused MoE."""
+    """Unified adapter for CUTLASS per-tensor FP8 fused MoE.
+
+    Activations use the TRTLLM canonical per-tensor FP8 pack: E4M3
+    ``[M, H]`` quantized with the static calibration multiplier
+    ``hidden_states_scale_global`` and no ``hidden_states_scale``. The view
+    carries the flat CUTLASS ``quant_scales`` already folded by
+    ``prepare_cutlass_fp8_per_tensor_weights`` (``[fc1_dequant_scale,
+    fc2_act_quant_scale, fc2_dequant_scale, fc1_act_dequant_scale]``); the
+    runner validates and passes them through.
+    """
 
     backend_key = "cutlass_fp8_per_tensor"
     supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
@@ -2211,15 +2508,17 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
     _required_weight_keys = (
         "fc1_expert_weights",
         "fc2_expert_weights",
-        "fc1_dequant",
-        "fc2_dequant",
+        "fc1_dequant_scale",
+        "fc2_act_quant_scale",
+        "fc2_dequant_scale",
+        "fc1_act_dequant_scale",
     )
-    _expected_num_inputs = 9
+    _expected_num_inputs = 10
 
     def _pack_weight_inputs(
         self, view: dict[str, torch.Tensor], hidden_size: int
     ) -> List[torch.Tensor]:
-        w1, w2, w1_dequant, w2_dequant = (
+        w1, w2, fc1_dequant, fc2_act_quant, fc2_dequant, fc1_act_dequant = (
             view[key] for key in self._required_weight_keys
         )
         num_experts = self.config.routing.num_experts
@@ -2234,33 +2533,20 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
                 f"Cutlass FP8 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
                 f"!= expected {expected_w1}/{expected_w2}."
             )
-        if (
-            w1_dequant.dtype is not torch.float32
-            or w2_dequant.dtype is not torch.float32
+        for name, scale, shape in (
+            ("fc1_dequant_scale", fc1_dequant, (num_experts,)),
+            ("fc2_act_quant_scale", fc2_act_quant, ()),
+            ("fc2_dequant_scale", fc2_dequant, (num_experts,)),
+            ("fc1_act_dequant_scale", fc1_act_dequant, ()),
         ):
-            raise TypeError("Cutlass FP8 dequant scales must be float32.")
-        expected_scale = (num_experts,)
-        if (
-            tuple(w1_dequant.shape) != expected_scale
-            or tuple(w2_dequant.shape) != expected_scale
-        ):
-            raise ValueError(
-                "Cutlass FP8 dequant scale shapes "
-                f"{tuple(w1_dequant.shape)}/{tuple(w2_dequant.shape)} != "
-                f"expected {expected_scale}."
-            )
-        self._validate_weight_storage((w1, w2, w1_dequant, w2_dequant))
-        return [w1, w2, w1_dequant, w2_dequant]
+            _require_cutlass_tensor(scale, name=name, dtype=torch.float32, shape=shape)
+        self._validate_weight_storage(
+            (w1, w2, fc1_dequant, fc2_act_quant, fc2_dequant, fc1_act_dequant)
+        )
+        return [w1, w2, fc1_dequant, fc2_act_quant, fc2_dequant, fc1_act_dequant]
 
     def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        act_scale = inputs[8]
-        gemm2_act_quant = torch.ones((), device=act_scale.device, dtype=torch.float32)
-        return [
-            (inputs[6] * act_scale).float(),
-            gemm2_act_quant,
-            inputs[7].float(),
-            act_scale,
-        ]
+        return list(inputs[6:10])
 
 
 class CutlassFp8BlockRunner(_CutlassRunnerBase):
@@ -2324,7 +2610,14 @@ class CutlassFp8BlockRunner(_CutlassRunnerBase):
 
 
 class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
-    """Unified adapter for CUTLASS MXFP8 x MXFP4 fused MoE."""
+    """Unified adapter for CUTLASS MXFP8 x MXFP4 fused MoE.
+
+    Activations use the TRTLLM canonical MXFP8 pack: E4M3 ``[M, H]`` plus a
+    linear E8M0 block scale ``[M, H // 32]`` (uint8 or E4M3-typed storage),
+    the same pack ``TrtllmFp4Config`` / ``CuteDslConfig`` consume for
+    MXFP4×MXFP8. ``QuantConfig(swizzled_scale_factors=True)`` instead selects
+    the flat CUTLASS 128x4-swizzled 1-D ``input_sf``.
+    """
 
     backend_key = "cutlass_mxfp8_mxfp4"
     supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP8),)
@@ -2333,6 +2626,7 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
     _x_dtype = torch.float8_e4m3fn
     _weight_dtype = torch.int64
     _use_mxfp8_act_scaling = True
+    _act_sf_vec_size = 32
     _required_weight_keys = (
         "fc1_expert_weights",
         "fc2_expert_weights",
@@ -2413,7 +2707,14 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
 
 
 class CutlassMxfp8Runner(_CutlassRunnerBase):
-    """Unified adapter for CUTLASS MXFP8 x MXFP8 fused MoE."""
+    """Unified adapter for CUTLASS MXFP8 x MXFP8 fused MoE.
+
+    Activations use the TRTLLM canonical MXFP8 pack: E4M3 ``[M, H]`` plus a
+    linear E8M0 block scale ``[M, H // 32]`` (uint8 or E4M3-typed storage),
+    the same pack ``TrtllmFp8BlockConfig`` consumes for MXFP8×MXFP8.
+    ``QuantConfig(swizzled_scale_factors=True)`` instead selects the flat
+    CUTLASS 128x4-swizzled 1-D ``input_sf``.
+    """
 
     backend_key = "cutlass_mxfp8"
     supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
@@ -2422,6 +2723,7 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
     _x_dtype = torch.float8_e4m3fn
     _weight_dtype = torch.float8_e4m3fn
     _use_mxfp8_act_scaling = True
+    _act_sf_vec_size = 32
     _required_weight_keys = (
         "fc1_expert_weights",
         "fc2_expert_weights",
@@ -2681,6 +2983,12 @@ _CUTILE_BF16_DEFAULT_GEMM_CONFIGS = {
     120: (128, 32, 4),
     121: (128, 32, 4),
 }
+# The sorted GEMM2 input only pays off when GEMM2's K (the intermediate size) is
+# long enough for TMA tiles to beat the per-row gather and the routing batch is
+# large enough for the tuner to land on narrow-K tiles: on SM120 it won 19% at
+# K=1856 with 49k assignments, was neutral at 25k, and lost 6% at K=512.
+_CUTILE_BF16_SORTED_IO_MIN_ASSIGNMENTS = 32768
+_CUTILE_BF16_SORTED_IO_MIN_INTERMEDIATE = 1024
 _CUTILE_BF16_GEMM_CONFIGS = (
     (128, 32, 4),
     (128, 64, 1),
@@ -2913,6 +3221,12 @@ class CuTileBf16Runner(MoERunner):
         self._workspace: Any = None
         self.tuning_config = TuningConfig()
 
+    def _is_current_stream_capturing(self) -> bool:
+        if self.device.type != "cuda":
+            return False
+        with torch.cuda.device(self.device):
+            return torch.cuda.is_current_stream_capturing()
+
     def _check_support(self) -> None:
         super()._check_support()
         if not self.config.finalize.do_finalize:
@@ -2957,6 +3271,53 @@ class CuTileBf16Runner(MoERunner):
         inputs[3].fill_(1.0 / top_k)
         return inputs
 
+    def _compilation_block_size(self, tactic: Any) -> int:
+        if not isinstance(tactic, (tuple, list)) or not tactic:
+            raise ValueError(f"invalid cuTile tactic: {tactic!r}.")
+        return int(tactic[0])
+
+    def _precompile_bucket_variants(
+        self, inputs: List[torch.Tensor], tactic: Any
+    ) -> None:
+        """Compile the finite request-shape variants of one autotune bucket."""
+        # An untuned fallback is intentionally shape-dependent and may choose
+        # different blocks inside one bucket. Preserve its lightweight lazy
+        # behavior; serving preparation applies to selected or persisted
+        # autotuned tactics, which are stable for the whole bucket.
+        if tactic == -1:
+            return
+        num_tokens, hidden_size = inputs[1].shape
+        ceiling = self.config.execution.tune_max_num_tokens
+        bucket = map_to_hybrid_bucket(num_tokens, ceiling)
+        counts = _cutile_bucket_compile_token_counts(
+            bucket,
+            tune_max_num_tokens=ceiling,
+            num_experts=self.config.routing.num_experts,
+            top_k=self.config.routing.top_k,
+            hidden_size=hidden_size,
+            intermediate_size=self.config.experts.intermediate_size,
+            block_size=self._compilation_block_size(tactic),
+        )
+
+        # Every cuTile MoE pack keeps output, activation, routing IDs, and
+        # routing weights in the first four positions. Build one capacity pack
+        # and take leading views so representatives do not retain allocations.
+        # The capacity is capped by the user-provided tune_max_num_tokens; an
+        # allocation failure propagates before capture so callers can lower it.
+        compile_inputs = list(inputs)
+        compile_inputs[0] = inputs[0].new_empty((bucket, *inputs[0].shape[1:]))
+        compile_inputs[1] = inputs[1].new_zeros((bucket, *inputs[1].shape[1:]))
+        compile_inputs[2] = inputs[2].new_empty((bucket, *inputs[2].shape[1:]))
+        compile_inputs[3] = inputs[3].new_empty((bucket, *inputs[3].shape[1:]))
+        self._prepare_tuning_inputs(compile_inputs)
+
+        for count in counts:
+            representative = list(compile_inputs)
+            for index in range(4):
+                representative[index] = compile_inputs[index][:count]
+            self.forward(representative, tactic=tactic)
+        torch.cuda.current_stream(self.device).synchronize()
+
     def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
         self._require_built()
         ceiling = self.config.execution.tune_max_num_tokens
@@ -2968,6 +3329,12 @@ class CuTileBf16Runner(MoERunner):
         key = (capacity, hidden_size)
         workspace = self._workspace_cache.get(key)
         if workspace is None:
+            if self._is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{type(self).__name__} workspace for token bucket "
+                    f"{capacity} must be allocated before CUDA Graph capture; "
+                    "warm this bucket first."
+                )
             workspace = self._kernel_module.allocate_workspace(
                 num_tokens=capacity,
                 hidden_size=hidden_size,
@@ -2977,9 +3344,20 @@ class CuTileBf16Runner(MoERunner):
                 is_gated=self.config.activation.is_gated,
                 block_sizes=self._block_sizes,
                 device=self.device,
+                **self._workspace_kwargs(capacity * self.config.routing.top_k),
             )
             self._workspace_cache[key] = workspace
         self._workspace = workspace
+
+    def _use_sorted_io(self, num_assignments: int) -> bool:
+        return (
+            num_assignments >= _CUTILE_BF16_SORTED_IO_MIN_ASSIGNMENTS
+            and self.config.experts.intermediate_size
+            >= _CUTILE_BF16_SORTED_IO_MIN_INTERMEDIATE
+        )
+
+    def _workspace_kwargs(self, max_num_assignments: int) -> dict[str, Any]:
+        return {"sorted_io": self._use_sorted_io(max_num_assignments)}
 
     def _validate_inputs(self, act: MoEActivationPack) -> tuple[torch.Tensor, int, int]:
         self._require_built()
@@ -3254,6 +3632,7 @@ class CuTileBf16Runner(MoERunner):
             block_size=block_size,
             gemm1_config=gemm1_config,
             gemm2_config=gemm2_config,
+            sorted_io=self._use_sorted_io(inputs[2].numel()),
         )
 
     def _cache_key_extras(self) -> tuple:
@@ -3265,12 +3644,12 @@ class CuTileBf16Runner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
-# cuTile NVFP4 runners
+# cuTile FP4-weight runners
 # ---------------------------------------------------------------------------
 
 
-_CUTILE_W4A4_GATED_FUSION_MIN_ASSIGNMENTS = 64
-_CUTILE_W4A4_GEMM_CONFIGS = (
+_CUTILE_FP4_GATED_FUSION_MIN_ASSIGNMENTS = 64
+_CUTILE_FP4_GEMM_CONFIGS = (
     (128, 128, 2),
     (256, 64, 2),
     (256, 128, 1),
@@ -3281,16 +3660,41 @@ _CUTILE_W4A4_GEMM_CONFIGS = (
     (256, 128, 2),
     (256, 256, 1),
 )
+_CUTILE_NVFP4_W4A16_SM12X_EXTRA_GEMM_CONFIGS = (
+    (128, 128, 1),
+    (128, 256, 1),
+)
 
 
-def _cutile_w4a4_config_rejection_reason(
+def _cutile_fp8_gemm_candidates(
+    problem: _CuTileGemmProblem,
+) -> tuple[tuple[int, int, int], ...]:
+    """Return the compact FP8 stage-tuning set for a GEMM problem."""
+    common = (
+        (64, 128, 2),
+        (128, 128, 2),
+        (64, 128, 4),
+        (128, 128, 1),
+        (128, 256, 2),
+        (256, 128, 2),
+    )
+    if problem.stage == 2:
+        return (*common, (128, 64, 4))
+    # Full-model SM89/SM90/SM120 sweeps found 256x128x1 useful only in GEMM1.
+    # The wider-K variant replaces a never-selected sparse tile for Hopper's
+    # 64-row GEMM1 schedule. Persisted tactics outside this shortlist remain
+    # valid; this only limits configurations compiled during fresh tuning.
+    if problem.arch == 90 and problem.block_size == 64:
+        return (*common[1:], (256, 128, 1), (256, 256, 1))
+    return (*common, (256, 128, 1))
+
+
+def _cutile_fp4_config_rejection_reason(
     problem: _CuTileGemmProblem, config: tuple[int, int, int]
 ) -> str | None:
-    if config not in _CUTILE_W4A4_GEMM_CONFIGS:
-        return f"config={config} is outside the supported cuTile W4A4 tile set"
     tile_n, tile_k, _ = config
-    if tile_n % 128 != 0 or tile_k % 64 != 0:
-        return "W4A4 requires tile_n divisible by 128 and tile_k by 64"
+    if tile_n % 128 != 0:
+        return "FP4 grouped GEMM requires tile_n divisible by 128"
     effective_tile_n = (
         tile_n // 2
         if problem.stage == 1 and problem.fused_epilogue and problem.is_gated
@@ -3316,31 +3720,598 @@ def _cutile_w4a4_config_rejection_reason(
     return None
 
 
-def _cutile_w4a4_gemm_configs(
-    problem: _CuTileGemmProblem,
-) -> list[tuple[int, int, int]]:
-    return _valid_cutile_gemm_configs(
-        problem,
-        _CUTILE_W4A4_GEMM_CONFIGS,
-        _cutile_w4a4_config_rejection_reason,
-        "CuTileNvfp4Runner",
-    )
+class _CuTileFp8StageRunner(TunableRunner):
+    def __init__(
+        self,
+        parent: Any,
+        stage: int,
+        fallback: tuple[int, ...],
+    ):
+        self.parent = parent
+        self.stage = stage
+        self.fallback = fallback
+
+    def get_valid_tactics(self, inputs: list[torch.Tensor], _profile: Any) -> list[Any]:
+        return self.parent._stage_tactics(
+            inputs, stage=self.stage, block_size=self.fallback[1]
+        )
+
+    def forward(
+        self,
+        inputs: list[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        stage_slice = slice(2, 5) if self.stage == 1 else slice(5, 8)
+        values = self.fallback[stage_slice] if tactic == -1 else tuple(map(int, tactic))
+        if len(values) != 3:
+            raise ValueError(
+                f"{self.parent.backend_key} sorted GEMM{self.stage} tactics "
+                "must contain three integers."
+            )
+        compound = list(self.fallback)
+        compound[stage_slice] = values
+        return self.parent.forward(
+            inputs,
+            tactic=tuple(compound),
+            do_preparation=do_preparation,
+            **kwargs,
+        )
+
+    def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
+        return (
+            "cutile_fp8_sorted_stage_v1",
+            self.fallback[0],
+            *self.parent._stage_cache_key(
+                inputs,
+                stage=self.stage,
+                block_size=self.fallback[1],
+            ),
+        )
 
 
-class CuTileNvfp4Runner(CuTileBf16Runner):
-    """cuTile NVFP4 weights and inputs for both grouped GEMMs."""
+class _CuTileFp8Runner(CuTileBf16Runner):
+    """Shared FP8/MXFP8 adapter; routing and staged tuning follow BF16."""
 
-    backend_key = "cutile_nvfp4"
+    _block_sizes: ClassVar[tuple[int, ...]] = (16, 32, 64, 128)
+    _activation_fp8: ClassVar[bool] = True
+    _block_scaled: ClassVar[bool] = False
+    _weight_fp4: ClassVar[bool] = False
+    _supported_archs: ClassVar[tuple[int, ...]] = _CUTILE_FP8_ARCHS
+    _precision_name = "FP8"
+
+    @staticmethod
+    def _fp8_mode(*, fused: bool, persistent: bool) -> int:
+        return 1 + int(fused) + 2 * int(persistent)
+
+    def _compilation_block_size(self, tactic: Any) -> int:
+        """Return the block size after the sorted-execution mode field."""
+        if not isinstance(tactic, (tuple, list)) or len(tactic) not in (7, 8):
+            raise ValueError(f"invalid cuTile FP8 tactic: {tactic!r}.")
+        return int(tactic[1] if len(tactic) == 8 else tactic[0])
+
+    def _fp8_sorted_modes(self, inputs: List[torch.Tensor]) -> tuple[int, ...]:
+        num_assignments = inputs[2].numel()
+        fused = (
+            (True,)
+            if self._activation_fp8
+            and self.config.activation.is_gated
+            and inputs[1].shape[0] <= 2
+            else (
+                (False, True)
+                if self._activation_fp8
+                and self.config.activation.is_gated
+                and inputs[1].shape[0] <= 4
+                else (False,)
+            )
+        )
+        rows_per_expert = (
+            num_assignments + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        persistent = (
+            (False, True)
+            if self._device_arch in (90, 120, 121)
+            and rows_per_expert >= 64
+            and not (self._activation_fp8 and self._block_scaled)
+            else (False,)
+        )
+        modes = tuple(
+            self._fp8_mode(fused=fuse, persistent=keep_resident)
+            for keep_resident in persistent
+            for fuse in fused
+        )
+        return modes
+
+    def _fused_gemm1_quant_rejection_reason(
+        self, gemm1_config: tuple[int, int, int]
+    ) -> str | None:
+        if not (self._activation_fp8 and self._block_scaled):
+            return "fused GEMM1 quantization requires MXFP8 activations"
+        if self.config.activation.is_gated != self._weight_fp4:
+            return (
+                "fused GEMM1 quantization supports gated MXFP4 weights or "
+                "ungated FP8/MXFP8 weights"
+            )
+        tile_n = gemm1_config[0]
+        intermediate_size = self.config.experts.intermediate_size
+        if self.config.activation.is_gated and intermediate_size % tile_n:
+            return (
+                f"gated fused GEMM1 quantization requires intermediate_size="
+                f"{intermediate_size} to be divisible by tile_n={tile_n}"
+            )
+        return None
+
+    def _persistent_factors(self) -> tuple[int, int]:
+        # Cold-L2 model-shape sweeps favor different resident grids by MMA path.
+        if self._device_arch == 90:
+            return (2, 2) if self._activation_fp8 else (1, 2)
+        if not self._activation_fp8:
+            return (2, 2) if self._block_scaled else (4, 4)
+        return (2, 1) if self.config.activation.is_gated else (1, 2)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError("cuTile FP8 does not support per-token scales.")
+
+    def _build(self) -> None:
+        from .cutile import fp8
+
+        self._kernel_module = fp8
+
+    def _workspace_kwargs(self, max_num_assignments: int) -> dict[str, Any]:
+        del max_num_assignments
+        return dict(
+            activation_fp8=self._activation_fp8, block_scaled=self._block_scaled
+        )
+
+    def _factorized_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
+        rows_per_expert = (
+            num_assignments + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        # A 16-row block avoids severe expert padding at sparse H100 loads and
+        # on the SM12x mixed FP4/FP8 path. Smaller blocks are legal but slow.
+        if rows_per_expert <= 16 and (
+            self._device_arch == 90
+            or (self._device_arch in (120, 121) and self._weight_fp4)
+        ):
+            return (16,)
+        if not self.config.activation.is_gated:
+            return super()._factorized_block_sizes(num_assignments)
+        # Balance expert padding against weight reuse for each MMA path.
+        if self._device_arch == 90 and not self._activation_fp8:
+            if rows_per_expert < 64:
+                return (32,)
+            use_wide_block = rows_per_expert >= 128 or (
+                rows_per_expert >= 64 and self.config.experts.intermediate_size > 1024
+            )
+            return (128 if use_wide_block else 64,)
+        if self._device_arch in (120, 121):
+            if not self._activation_fp8:
+                use_wide_block = (
+                    self._block_scaled
+                    and rows_per_expert >= 256
+                    and self.config.experts.intermediate_size <= 512
+                )
+                return (64 if use_wide_block else 32,)
+            if self._block_scaled and not self._weight_fp4:
+                use_wide_block = (
+                    rows_per_expert >= 192
+                    and self.config.experts.intermediate_size > 512
+                )
+                return (64 if use_wide_block else 32,)
+            return (64 if rows_per_expert >= 192 else 32,)
+        return super()._factorized_block_sizes(num_assignments)
+
+    def _stage_tactics(
+        self, inputs: List[torch.Tensor], *, stage: int, block_size: int
+    ) -> List[Any]:
+        problem = self._gemm_problem(inputs, stage=stage, block_size=block_size)
+        # Keep K tiles aligned to four scale groups; the MXFP4 scale loader
+        # additionally needs 128-wide N tiles. Tails are masked in the kernels.
+        candidates = _cutile_fp8_gemm_candidates(problem)
+        if stage == 1 and not self._activation_fp8 and inputs[1].shape[0] <= 2:
+            # Cold-L2 sweeps consistently favor occupancy 2 for sparse A16;
+            # occupancy 4 first becomes useful from four tokens onward.
+            candidates = tuple(
+                config for config in candidates if config != (64, 128, 4)
+            )
+        return _valid_cutile_gemm_configs(
+            problem, candidates, self._fp8_rejection_reason, type(self).__name__
+        )
+
+    def _fp8_rejection_reason(
+        self, problem: _CuTileGemmProblem, config: tuple[int, int, int]
+    ) -> str | None:
+        n, k, _ = config
+        if config not in _CUTILE_FP4_GEMM_CONFIGS + (
+            (64, 128, 2),
+            (64, 128, 4),
+            (128, 128, 1),
+        ):
+            return "unknown FP8 GEMM config"
+        allow_k64 = (
+            self._device_arch == 90
+            and problem.stage == 2
+            and problem.block_size == 16
+            and not self._weight_fp4
+            and config == (128, 64, 4)
+        ) or (
+            self._device_arch in (120, 121)
+            and problem.stage == 2
+            and not self._weight_fp4
+            and not self._activation_fp8
+            and self._block_scaled
+            and problem.k % 128 != 0
+        )
+        tile_k_alignment = 64 if allow_k64 else 128
+        if allow_k64 and k == 64 and n != 128:
+            return "64-wide K tiles are supported only with tile_n=128"
+        if k % tile_k_alignment or (self._weight_fp4 and n % 128):
+            return (
+                f"FP8 requires tile_k divisible by {tile_k_alignment}; "
+                "MXFP4 requires tile_n divisible by 128"
+            )
+        # Retain at least the smallest legal padded tile for tiny dimensions.
+        if n > max(128 if self._weight_fp4 else 64, 2 * problem.n) or k > max(
+            128, 2 * problem.k
+        ):
+            return f"tile {config} is oversized for N={problem.n}, K={problem.k}"
+        return None
+
+    def _stage_cache_key(
+        self, inputs: List[torch.Tensor], *, stage: int, block_size: int
+    ) -> tuple[Any, ...]:
+        return (self.backend_key, self.config.quant.pair) + super()._stage_cache_key(
+            inputs, stage=stage, block_size=block_size
+        )
+
+    def _fallback_tactic(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[int, int, int, int, int, int, int]:
+        block = self._factorized_block_sizes(inputs[2].numel())[0]
+        return (
+            block,
+            *self._stage_tactics(inputs, stage=1, block_size=block)[0],
+            *self._stage_tactics(inputs, stage=2, block_size=block)[0],
+        )
+
+    def _factorized_sorted_tactics(
+        self, inputs: List[torch.Tensor], mode: int
+    ) -> list[tuple[int, ...]]:
+        gather_fallback = self._fallback_tactic(inputs)
+        block_size = gather_fallback[0]
+        fallback = (mode, *gather_fallback)
+        gemm1_runner = _CuTileFp8StageRunner(self, 1, fallback)
+        gemm2_runner = _CuTileFp8StageRunner(self, 2, fallback)
+        tuner = AutoTuner.get()
+        tuning_config = TuningConfig(
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+        prefix = (
+            f"moe_{self.backend_key}_sorted_v1_sm{self._device_arch}_"
+            f"b{block_size}_m{mode}"
+        )
+        top_k = self._num_top_tactics_per_stage
+        gemm1 = _resolve_cutile_stage_tactics(
+            tuner.rank_tactics(
+                f"{prefix}_gemm1",
+                [gemm1_runner],
+                tuning_config,
+                inputs,
+                k=top_k,
+            ),
+            gather_fallback[1:4],
+            arity=3,
+            name=f"{self.backend_key} sorted GEMM1",
+        )
+        if gather_fallback[1:4] not in gemm1:
+            gemm1[-1] = gather_fallback[1:4]
+        gemm2_runner.fallback = (
+            mode,
+            block_size,
+            *gemm1[0],
+            *gather_fallback[4:7],
+        )
+        gemm2 = _resolve_cutile_stage_tactics(
+            tuner.rank_tactics(
+                f"{prefix}_gemm2",
+                [gemm2_runner],
+                tuning_config,
+                inputs,
+                k=top_k,
+            ),
+            gather_fallback[4:7],
+            arity=3,
+            name=f"{self.backend_key} sorted GEMM2",
+        )
+        if gather_fallback[4:7] not in gemm2:
+            gemm2[-1] = gather_fallback[4:7]
+        return [
+            (mode, block_size, *gemm1_config, *gemm2_config)
+            for gemm1_config in gemm1
+            for gemm2_config in gemm2
+        ]
+
+    def _include_gather_tactics(self, num_assignments: int) -> bool:
+        # Full-model cold-L2 sweeps found sorted input universally faster on
+        # SM89/SM90, and on SM12x for MXFP8xBF16 and MXFP4xMXFP8. Avoid tuning
+        # the two gather GEMMs where that path never wins.
+        if (
+            self._device_arch not in (120, 121)
+            or self._weight_fp4
+            or (self._block_scaled and not self._activation_fp8)
+        ):
+            return False
+        num_tokens = num_assignments // self.config.routing.top_k
+        gather_min_tokens = 16 if self._activation_fp8 else 32
+        rows_per_expert = (
+            num_assignments + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        # SM12x sweeps found no gather winner once each expert averages at
+        # least one 64-row block.
+        return num_tokens >= gather_min_tokens and rows_per_expert < 64
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        self._require_built()
+        gather = (
+            [(0, *tactic) for tactic in self._factorized_tactics(inputs)]
+            if self._include_gather_tactics(inputs[2].numel())
+            else []
+        )
+        modes = self._fp8_sorted_modes(inputs)
+        # GEMM rankings are independent of the exact quantization fusion mode.
+        # Rank one sorted schedule, then let the end-to-end tuner compare the
+        # small set of applicable fusion/persistence variants.
+        ranked = self._factorized_sorted_tactics(inputs, modes[0])
+        sorted_tactics = [(mode, *tactic[1:]) for mode in modes for tactic in ranked]
+        rows_per_expert = (
+            inputs[2].numel() + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        if self._activation_fp8 and self._block_scaled and rows_per_expert >= 64:
+            # Gated fusion uses the measured register-safe GEMM1 tile; ungated
+            # fusion reuses the independently ranked GEMM1 winner. Pair either
+            # with two ranked GEMM2 winners for the end-to-end decision.
+            fused_gemm1: tuple[int, int, int] = (
+                (128, 128, 2)
+                if self.config.activation.is_gated
+                else (ranked[0][2], ranked[0][3], ranked[0][4])
+            )
+            if self._fused_gemm1_quant_rejection_reason(fused_gemm1) is None:
+                gemm2 = list(dict.fromkeys(tactic[5:8] for tactic in ranked))[:2]
+                sorted_tactics.extend(
+                    (5, ranked[0][1], *fused_gemm1, *gemm2_config)
+                    for gemm2_config in gemm2
+                )
+        return list(dict.fromkeys((*gather, *sorted_tactics)))
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        hidden_states, tokens, hidden = self._validate_inputs(act)
+        inter = self.config.experts.intermediate_size
+        if min(hidden, inter) <= 0 or hidden % 32 or inter % 32:
+            raise ValueError(
+                "cuTile FP8 requires positive hidden/intermediate sizes divisible by 32."
+            )
+        view = weights.get_view(self.backend_key)
+        tensors = [view[key] for key in ("w1", "w1_scale", "w2", "w2_scale")]
+        experts = self.config.routing.num_experts
+        n1 = inter * (2 if self.config.activation.is_gated else 1)
+        for name, w, s, n, k in (
+            ("w1", *tensors[:2], n1, hidden),
+            ("w2", *tensors[2:], hidden, inter),
+        ):
+            shape = (experts, n, k // 2 if self._weight_fp4 else k)
+            if tuple(w.shape) != shape:
+                raise ValueError(f"{name} must have shape {shape}.")
+            dtype = torch.uint8 if self._weight_fp4 else torch.float8_e4m3fn
+            if w.dtype != dtype:
+                raise TypeError(f"{name} must use {dtype}.")
+            scale_shape: tuple[int, ...]
+            if self._weight_fp4:
+                scale_shape = (experts, (n + 127) // 128, (k // 32 + 3) // 4, 32, 16)
+            else:
+                scale_shape = (
+                    (experts, n, k // 32) if self._block_scaled else (experts,)
+                )
+            if tuple(s.shape) != scale_shape:
+                raise ValueError(f"{name}_scale must have shape {scale_shape}.")
+            scale_dtype = torch.float8_e8m0fnu if self._block_scaled else torch.float32
+            if s.dtype != scale_dtype:
+                raise TypeError(f"{name}_scale must use {scale_dtype}.")
+        if any(t.device != self.device or not t.is_contiguous() for t in tensors):
+            raise ValueError(
+                "cuTile FP8 prepared weights/scales must be contiguous on the runner device."
+            )
+        capacity = map_to_hybrid_bucket(
+            tokens, self.config.execution.tune_max_num_tokens
+        )
+        assignments = capacity * self.config.routing.top_k
+        _validate_cutile_int32_routing(
+            type(self).__name__,
+            assignments,
+            assignments + experts * (max(self._block_sizes) - 1),
+        )
+        self._configure_tuning(tokens, hidden)
+        return [
+            hidden_states.new_empty((tokens, hidden)),
+            hidden_states,
+            act.topk_ids,
+            act.topk_weights,
+            *tensors,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if len(inputs) != 8:
+            raise ValueError(f"{type(self).__name__} expects 8 inputs.")
+        if tactic == -1:
+            tactic = self._fallback_tactic(inputs)
+        if not isinstance(tactic, (tuple, list)) or len(tactic) not in (7, 8):
+            raise ValueError(
+                "cuTile FP8 tactic must be -1, a legacy seven-integer tuple, "
+                "or (mode, block, GEMM1 config, GEMM2 config)."
+            )
+        if len(tactic) == 7:
+            mode = 0
+            values = tuple(map(int, tactic))
+        else:
+            mode, *rest = map(int, tactic)
+            values = tuple(rest)
+        if mode not in range(6):
+            raise ValueError(f"unsupported cuTile FP8 execution mode {mode}.")
+        block, g1_n, g1_k, g1_occ, g2_n, g2_k, g2_occ = values
+        configs = ((g1_n, g1_k, g1_occ), (g2_n, g2_k, g2_occ))
+        if mode == 5:
+            reason = self._fused_gemm1_quant_rejection_reason(configs[0])
+            if reason is not None:
+                raise ValueError(f"cuTile {reason}.")
+        if block not in self._block_sizes:
+            raise ValueError(f"unsupported cuTile FP8 block size {block}.")
+        for stage, tile in enumerate(configs, start=1):
+            problem = self._gemm_problem(inputs, stage=stage, block_size=block)
+            reason = self._fp8_rejection_reason(problem, tile)
+            if reason is not None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} GEMM{stage}: {reason}."
+                )
+        self._ensure_workspace(*inputs[1].shape)
+        return self._kernel_module.run_moe(
+            *inputs[1:4],
+            *inputs[4:],
+            inputs[0],
+            self._workspace,
+            activation=self.config.activation,
+            activation_fp8=self._activation_fp8,
+            block_scaled=self._block_scaled,
+            weight_fp4=self._weight_fp4,
+            block_size=block,
+            gemm1_config=self._kernel_module.GemmConfig(*configs[0]),
+            gemm2_config=self._kernel_module.GemmConfig(*configs[1]),
+            sorted_input=mode != 0,
+            fuse_quantization=mode in (2, 4),
+            num_sms=self._num_sms,
+            persistent_factors=(
+                self._persistent_factors()
+                if mode in (3, 4)
+                else ((0, self._persistent_factors()[1]) if mode == 5 else (0, 0))
+            ),
+            fuse_gemm1_quant=mode == 5,
+        )
+
+
+class CuTileFp8PerTensorRunner(_CuTileFp8Runner):
+    backend_key = "cutile_fp8_per_tensor"
+    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+
+
+class CuTileFp8PerTensorBf16Runner(CuTileFp8PerTensorRunner):
+    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.BF16),)
+    _activation_fp8 = False
+    _supported_archs = _CUTILE_BF16_ARCHS
+
+
+class CuTileMxfp8Runner(_CuTileFp8Runner):
+    backend_key = "cutile_mxfp8"
+    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
+    _block_scaled = True
+    _supported_archs: ClassVar[tuple[int, ...]] = _CUTILE_MXFP8_ARCHS
+    _precision_name = "MXFP8"
+
+
+class CuTileMxfp8Bf16Runner(CuTileMxfp8Runner):
+    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.BF16),)
+    _activation_fp8 = False
+    _supported_archs = _CUTILE_BF16_ARCHS
+
+
+class CuTileMxfp4Mxfp8Runner(CuTileMxfp8Runner):
+    backend_key = "cutile_mxfp4"
+    supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP8),)
+    _weight_fp4 = True
+    _precision_name = "MXFP4 x MXFP8"
+
+
+class _CuTileFp4Runner(CuTileBf16Runner):
+    """Shared adapter for cuTile FP4-weight MoE pipelines."""
+
+    _activation_fp4: ClassVar[bool]
+    _scale_block_size: ClassVar[int]
+    _scale_dtype: ClassVar[torch.dtype]
+
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
     _block_sizes = (16, 32, 64, 128)
-    _supported_archs = _CUTILE_NVFP4_ARCHS
-    _precision_name = "NVFP4"
 
     def _build(self) -> None:
         from .cutile import fp4
 
         self._kernel_module = fp4
+
+    def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
+        self._require_built()
+        ceiling = self.config.execution.tune_max_num_tokens
+        if num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}."
+            )
+        capacity = map_to_hybrid_bucket(num_tokens, ceiling)
+        key = (capacity, hidden_size)
+        workspace = self._workspace_cache.get(key)
+        if workspace is None:
+            workspace = self._kernel_module.allocate_workspace(
+                num_tokens=capacity,
+                hidden_size=hidden_size,
+                intermediate_size=self.config.experts.intermediate_size,
+                num_experts=self.config.routing.num_experts,
+                top_k=self.config.routing.top_k,
+                is_gated=self.config.activation.is_gated,
+                block_sizes=self._block_sizes,
+                activation_fp4=self._activation_fp4,
+                scale_block_size=self._scale_block_size,
+                scale_dtype=self._scale_dtype,
+                device=self.device,
+            )
+            self._workspace_cache[key] = workspace
+        self._workspace = workspace
+
+    def _fp4_config_rejection_reason(
+        self, problem: _CuTileGemmProblem, config: tuple[int, int, int]
+    ) -> str | None:
+        if config not in self._fp4_gemm_candidates():
+            return f"config={config} is outside the supported cuTile FP4 tile set"
+        reason = _cutile_fp4_config_rejection_reason(problem, config)
+        if reason is not None:
+            return reason
+        tile_k = config[1]
+        alignment = 4 * self._scale_block_size
+        if tile_k % alignment != 0:
+            return (
+                f"{self._precision_name} requires tile_k divisible by {alignment}, "
+                f"got {tile_k}"
+            )
+        return None
+
+    def _fp4_gemm_candidates(self) -> tuple[tuple[int, int, int], ...]:
+        return _CUTILE_FP4_GEMM_CONFIGS
+
+    def _fp4_gemm_configs(
+        self, problem: _CuTileGemmProblem
+    ) -> list[tuple[int, int, int]]:
+        return _valid_cutile_gemm_configs(
+            problem,
+            self._fp4_gemm_candidates(),
+            self._fp4_config_rejection_reason,
+            type(self).__name__,
+        )
 
     def _candidate_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
         num_experts = self.config.routing.num_experts
@@ -3354,7 +4325,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             return (32, 64)
         return (32, 64, 128)
 
-    def _w4a4_gemm_problem(
+    def _fp4_gemm_problem(
         self,
         inputs: List[torch.Tensor],
         *,
@@ -3379,7 +4350,9 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
         num_assignments = inputs[2].numel()
         from .cutile.fp4 import _use_row_major_scale_layout
 
-        input_sorted = _use_row_major_scale_layout(num_assignments, intermediate_size)
+        input_sorted = self._activation_fp4 and _use_row_major_scale_layout(
+            num_assignments, intermediate_size
+        )
         return _CuTileGemmProblem(
             stage=stage,
             arch=self._device_arch,
@@ -3391,26 +4364,28 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             input_sorted=input_sorted,
         )
 
-    def _w4a4_fused_gemm1_supported(
+    def _fp4_fused_gemm1_supported(
         self, inputs: List[torch.Tensor], block_size: int
     ) -> bool:
-        problem = self._w4a4_gemm_problem(
+        problem = self._fp4_gemm_problem(
             inputs, stage=1, block_size=block_size, fuse_gemm1=True
         )
         return any(
-            _cutile_w4a4_config_rejection_reason(problem, config) is None
-            for config in _CUTILE_W4A4_GEMM_CONFIGS
+            self._fp4_config_rejection_reason(problem, config) is None
+            for config in self._fp4_gemm_candidates()
         )
 
-    def _w4a4_fusion_modes(
+    def _fp4_fusion_modes(
         self, inputs: List[torch.Tensor], block_size: int
     ) -> tuple[bool, ...]:
         if not self.config.activation.is_gated:
             return (True,)
-        fallback = self._w4a4_fallback_fuse_gemm1(inputs, block_size)
+        if not self._activation_fp4:
+            return (False,)
+        fallback = self._fp4_fallback_fuse_gemm1(inputs, block_size)
         if (
-            inputs[2].numel() < _CUTILE_W4A4_GATED_FUSION_MIN_ASSIGNMENTS
-            or not self._w4a4_fused_gemm1_supported(inputs, block_size)
+            inputs[2].numel() < _CUTILE_FP4_GATED_FUSION_MIN_ASSIGNMENTS
+            or not self._fp4_fused_gemm1_supported(inputs, block_size)
         ):
             return (False,)
         return (fallback, not fallback)
@@ -3423,15 +4398,15 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
         block_size: int,
     ) -> List[Any]:
         if stage == 2:
-            return _cutile_w4a4_gemm_configs(
-                self._w4a4_gemm_problem(inputs, stage=2, block_size=block_size)
+            return self._fp4_gemm_configs(
+                self._fp4_gemm_problem(inputs, stage=2, block_size=block_size)
             )
         return list(
             dict.fromkeys(
                 (int(fuse_gemm1), *config)
-                for fuse_gemm1 in self._w4a4_fusion_modes(inputs, block_size)
-                for config in _cutile_w4a4_gemm_configs(
-                    self._w4a4_gemm_problem(
+                for fuse_gemm1 in self._fp4_fusion_modes(inputs, block_size)
+                for config in self._fp4_gemm_configs(
+                    self._fp4_gemm_problem(
                         inputs,
                         stage=1,
                         block_size=block_size,
@@ -3451,19 +4426,29 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
         stage: int,
         block_size: int,
     ) -> tuple[Any, ...]:
-        problem = self._w4a4_gemm_problem(
+        problem = self._fp4_gemm_problem(
             inputs,
             stage=stage,
             block_size=block_size,
             fuse_gemm1=False,
         )
+        # Preserve existing NVFP4 W4A4 stage-cache entries.
+        precision_key = (
+            ("cutile_w4a4_stage",)
+            if self._precision_name == "NVFP4" and self._activation_fp4
+            else (
+                "cutile_fp4_stage",
+                self._precision_name,
+                "a4" if self._activation_fp4 else "a16",
+            )
+        )
         return (
-            "cutile_w4a4_stage",
+            *precision_key,
             self._device_arch,
             self._num_sms,
             stage,
             block_size,
-            self._w4a4_fusion_modes(inputs, block_size) if stage == 1 else (False,),
+            self._fp4_fusion_modes(inputs, block_size) if stage == 1 else (False,),
             problem.input_sorted,
             int(self.config.activation.type),
             repr(self.config.activation),
@@ -3472,23 +4457,25 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             self.config.experts.intermediate_size,
         )
 
-    def _w4a4_fallback_fuse_gemm1(
+    def _fp4_fallback_fuse_gemm1(
         self, inputs: List[torch.Tensor], block_size: int
     ) -> bool:
         if not self.config.activation.is_gated:
             return True
+        if not self._activation_fp4:
+            return False
         num_assignments = inputs[2].numel()
         rows_per_expert = (
             num_assignments + self.config.routing.num_experts - 1
         ) // self.config.routing.num_experts
         return (
-            num_assignments >= _CUTILE_W4A4_GATED_FUSION_MIN_ASSIGNMENTS
+            num_assignments >= _CUTILE_FP4_GATED_FUSION_MIN_ASSIGNMENTS
             and block_size < 128
             and not (rows_per_expert >= 16 and rows_per_expert < block_size)
-            and self._w4a4_fused_gemm1_supported(inputs, block_size)
+            and self._fp4_fused_gemm1_supported(inputs, block_size)
         )
 
-    def _w4a4_gated_block_size(self, num_assignments: int) -> int:
+    def _fp4_gated_block_size(self, num_assignments: int) -> int:
         rows_per_expert = (
             num_assignments + self.config.routing.num_experts - 1
         ) // self.config.routing.num_experts
@@ -3500,9 +4487,9 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             return 64
         return 128 if rows_per_expert <= 128 else 64
 
-    def _w4a4_block_size(self, num_assignments: int) -> int:
-        if self.config.activation.is_gated:
-            return self._w4a4_gated_block_size(num_assignments)
+    def _fp4_block_size(self, num_assignments: int) -> int:
+        if self.config.activation.is_gated and self._activation_fp4:
+            return self._fp4_gated_block_size(num_assignments)
         candidates = self._candidate_block_sizes(num_assignments)
         rows_per_expert = (
             num_assignments + self.config.routing.num_experts - 1
@@ -3515,12 +4502,12 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             return 32
         return 64 if 64 in candidates else candidates[0]
 
-    def _w4a4_fallback_tactic(
+    def _fp4_fallback_tactic(
         self, inputs: List[torch.Tensor]
     ) -> tuple[int, int, int, int, int, int, int, int]:
         num_assignments = inputs[2].numel()
-        block_size = self._w4a4_block_size(num_assignments)
-        if self.config.activation.is_gated:
+        block_size = self._fp4_block_size(num_assignments)
+        if self.config.activation.is_gated and self._activation_fp4:
             small_defaults = (
                 (8, (0, 128, 256, 2, 256, 128, 2)),
                 (16, (0, 256, 256, 1, 256, 256, 1)),
@@ -3531,49 +4518,53 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
                 if num_assignments > limit:
                     continue
                 fuse_gemm1 = bool(stage_tactics[0])
-                gemm1_problem = self._w4a4_gemm_problem(
+                gemm1_problem = self._fp4_gemm_problem(
                     inputs,
                     stage=1,
                     block_size=block_size,
                     fuse_gemm1=fuse_gemm1,
                 )
-                gemm2_problem = self._w4a4_gemm_problem(
+                gemm2_problem = self._fp4_gemm_problem(
                     inputs, stage=2, block_size=block_size
                 )
                 if (
-                    _cutile_w4a4_config_rejection_reason(
-                        gemm1_problem, stage_tactics[1:4]
-                    )
+                    self._fp4_config_rejection_reason(gemm1_problem, stage_tactics[1:4])
                     is None
-                    and _cutile_w4a4_config_rejection_reason(
+                    and self._fp4_config_rejection_reason(
                         gemm2_problem, stage_tactics[4:7]
                     )
                     is None
                 ):
                     return (block_size, *stage_tactics)
                 break
-        fuse_gemm1 = self._w4a4_fallback_fuse_gemm1(inputs, block_size)
-        gemm1 = _cutile_w4a4_gemm_configs(
-            self._w4a4_gemm_problem(
+        fuse_gemm1 = self._fp4_fallback_fuse_gemm1(inputs, block_size)
+        gemm1 = self._fp4_gemm_configs(
+            self._fp4_gemm_problem(
                 inputs,
                 stage=1,
                 block_size=block_size,
                 fuse_gemm1=fuse_gemm1,
             )
         )[0]
-        gemm2 = _cutile_w4a4_gemm_configs(
-            self._w4a4_gemm_problem(inputs, stage=2, block_size=block_size)
+        gemm2 = self._fp4_gemm_configs(
+            self._fp4_gemm_problem(inputs, stage=2, block_size=block_size)
         )[0]
         return (block_size, int(fuse_gemm1), *gemm1, *gemm2)
 
-    def _factorized_w4a4_tactics(
+    def _factorized_fp4_tactics(
         self, inputs: List[torch.Tensor]
     ) -> list[tuple[int, ...]]:
-        fallback = self._w4a4_fallback_tactic(inputs)
+        fallback = self._fp4_fallback_tactic(inputs)
         block_size = fallback[0]
         gemm1_runner = _CuTileStageRunner(self, 1, block_size, fallback)
         gemm2_runner = _CuTileStageRunner(self, 2, block_size, fallback)
         activation_name = self.config.activation.type.name.lower()
+        name_suffix = f"_{activation_name}"
+        if not (self._precision_name == "NVFP4" and self._activation_fp4):
+            name_suffix = (
+                f"_{self._precision_name.lower()}_"
+                f"{'a4' if self._activation_fp4 else 'a16'}{name_suffix}"
+            )
         return _factorized_cutile_tactics(
             self,
             inputs,
@@ -3582,7 +4573,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             gemm2_runner,
             fallback[1:5],
             fallback[5:8],
-            name_suffix=f"_{activation_name}",
+            name_suffix=name_suffix,
         )
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
@@ -3591,7 +4582,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             raise ValueError(
                 f"{type(self).__name__} expects 10 inputs, got {len(inputs)}."
             )
-        return self._factorized_w4a4_tactics(inputs)
+        return self._factorized_fp4_tactics(inputs)
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -3622,50 +4613,71 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
         expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
         if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
             raise ValueError(
-                f"cuTile NVFP4 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"cuTile {self._precision_name} weight shapes "
+                f"{tuple(w1.shape)}/{tuple(w2.shape)} "
                 f"!= expected {expected_w1}/{expected_w2}."
             )
-        expected_s1: tuple[int, ...] = (
+        w1_scale_groups = hidden_size // self._scale_block_size
+        w2_scale_groups = intermediate_size // self._scale_block_size
+        linear_s1: tuple[int, ...] = (num_experts, w1_rows, w1_scale_groups)
+        linear_s2: tuple[int, ...] = (num_experts, hidden_size, w2_scale_groups)
+        swizzled_s1: tuple[int, ...] = (
             num_experts,
             (w1_rows + 127) // 128,
-            hidden_size // 64,
+            (w1_scale_groups + 3) // 4,
             32,
             16,
         )
-        expected_s2: tuple[int, ...] = (
+        swizzled_s2: tuple[int, ...] = (
             num_experts,
             (hidden_size + 127) // 128,
-            intermediate_size // 64,
+            (w2_scale_groups + 3) // 4,
             32,
             16,
         )
+        if self._device_arch < 100:
+            expected_s1, expected_s2 = linear_s1, linear_s2
+        else:
+            expected_s1, expected_s2 = swizzled_s1, swizzled_s2
         if tuple(w1_scale.shape) != expected_s1 or tuple(w2_scale.shape) != expected_s2:
             raise ValueError(
-                "cuTile NVFP4 block-scale shapes "
+                f"cuTile {self._precision_name} block-scale shapes "
                 f"{tuple(w1_scale.shape)}/{tuple(w2_scale.shape)} != "
-                f"expected {expected_s1}/{expected_s2}."
+                f"expected {expected_s1}/{expected_s2}. "
+                "Prepare weights with device set to the target execution GPU; "
+                "scale layouts differ between SM89/90 and SM12x."
             )
         if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
-            raise TypeError("cuTile NVFP4 prepared weights must use torch.uint8.")
+            raise TypeError(
+                f"cuTile {self._precision_name} prepared weights must use torch.uint8."
+            )
         if (
-            w1_scale.dtype is not torch.float8_e4m3fn
-            or w2_scale.dtype is not torch.float8_e4m3fn
+            w1_scale.dtype is not self._scale_dtype
+            or w2_scale.dtype is not self._scale_dtype
         ):
-            raise TypeError("cuTile NVFP4 block scales must use float8_e4m3fn.")
+            raise TypeError(
+                f"cuTile {self._precision_name} block scales must use "
+                f"{self._scale_dtype}."
+            )
         if w1_global.dtype is not torch.float32 or w2_global.dtype is not torch.float32:
-            raise TypeError("cuTile NVFP4 global scales must use torch.float32.")
+            raise TypeError(
+                f"cuTile {self._precision_name} global scales must use torch.float32."
+            )
         if any(
             t.device != self.device
             for t in (w1, w1_scale, w1_global, w2, w2_scale, w2_global)
         ):
             raise ValueError(
-                "cuTile NVFP4 prepared weights must match the runner device."
+                f"cuTile {self._precision_name} prepared weights must match the "
+                "runner device."
             )
         if any(
             not t.is_contiguous()
             for t in (w1, w1_scale, w1_global, w2, w2_scale, w2_global)
         ):
-            raise ValueError("cuTile NVFP4 prepared weights must be contiguous.")
+            raise ValueError(
+                f"cuTile {self._precision_name} prepared weights must be contiguous."
+            )
 
         capacity = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens
@@ -3704,7 +4716,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
                 f"{type(self).__name__} expects 10 inputs, got {len(inputs)}."
             )
         if tactic == -1:
-            tactic = self._w4a4_fallback_tactic(inputs)
+            tactic = self._fp4_fallback_tactic(inputs)
         if not isinstance(tactic, (tuple, list)) or len(tactic) != 8:
             raise ValueError(
                 f"{type(self).__name__} tactic must be -1 or an eight-integer tuple."
@@ -3720,26 +4732,33 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             g2_occ,
         ) = map(int, tactic)
         if fuse_gemm1 not in (0, 1):
-            raise ValueError("cuTile NVFP4 GEMM1 fusion flag must be 0 or 1.")
+            raise ValueError("cuTile FP4 GEMM1 fusion flag must be 0 or 1.")
+        expected_fuse = not self.config.activation.is_gated
+        if not self._activation_fp4 and bool(fuse_gemm1) != expected_fuse:
+            raise ValueError(
+                f"cuTile A16 requires fuse_gemm1={int(expected_fuse)} for "
+                f"{self.config.activation.type.name}."
+            )
         if block_size not in self._block_sizes:
             raise ValueError(
-                f"cuTile NVFP4 block size must be one of {self._block_sizes}, "
+                f"cuTile FP4 block size must be one of {self._block_sizes}, "
                 f"got {block_size}."
             )
         for stage, config in (
             (1, (g1_n, g1_k, g1_occ)),
             (2, (g2_n, g2_k, g2_occ)),
         ):
-            problem = self._w4a4_gemm_problem(
+            problem = self._fp4_gemm_problem(
                 inputs,
                 stage=stage,
                 block_size=block_size,
                 fuse_gemm1=bool(fuse_gemm1) if stage == 1 else False,
             )
-            reason = _cutile_w4a4_config_rejection_reason(problem, config)
+            reason = self._fp4_config_rejection_reason(problem, config)
             if reason is not None:
                 raise NotImplementedError(
-                    f"CuTileNvfp4Runner GEMM{stage} tactic is unsupported: {reason}."
+                    f"{type(self).__name__} GEMM{stage} tactic is unsupported: "
+                    f"{reason}."
                 )
         hidden_size = inputs[1].shape[1]
         self._ensure_workspace(inputs[1].shape[0], hidden_size)
@@ -3756,12 +4775,68 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             inputs[0],
             self._workspace,
             activation=self.config.activation,
+            activation_fp4=self._activation_fp4,
+            scale_block_size=self._scale_block_size,
             fuse_gemm1=bool(fuse_gemm1),
             num_sms=self._num_sms,
             block_size=block_size,
             gemm1_config=self._kernel_module.GemmConfig(g1_n, g1_k, g1_occ),
             gemm2_config=self._kernel_module.GemmConfig(g2_n, g2_k, g2_occ),
         )
+
+
+class CuTileNvfp4Runner(_CuTileFp4Runner):
+    """cuTile NVFP4 weights and inputs for both grouped GEMMs."""
+
+    backend_key = "cutile_nvfp4"
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    _supported_archs = _CUTILE_NVFP4_ARCHS
+    _precision_name = "NVFP4"
+    _activation_fp4 = True
+    _scale_block_size = 16
+    _scale_dtype = torch.float8_e4m3fn
+
+
+class CuTileNvfp4Bf16Runner(_CuTileFp4Runner):
+    """cuTile NVFP4 weights and BF16 activations for both grouped GEMMs."""
+
+    backend_key = "cutile_nvfp4"
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
+    _supported_archs = _CUTILE_W4A16_ARCHS
+    _precision_name = "NVFP4"
+    _activation_fp4 = False
+    _scale_block_size = 16
+    _scale_dtype = torch.float8_e4m3fn
+
+    def _fp4_gemm_candidates(self) -> tuple[tuple[int, int, int], ...]:
+        candidates = super()._fp4_gemm_candidates()
+        if self._device_arch in (120, 121):
+            return (*candidates, *_CUTILE_NVFP4_W4A16_SM12X_EXTRA_GEMM_CONFIGS)
+        return candidates
+
+
+class CuTileMxfp4Runner(_CuTileFp4Runner):
+    """cuTile MXFP4 weights and activations for both grouped GEMMs."""
+
+    backend_key = "cutile_mxfp4"
+    supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP4),)
+    _supported_archs = _CUTILE_MXFP4_ARCHS
+    _precision_name = "MXFP4"
+    _activation_fp4 = True
+    _scale_block_size = 32
+    _scale_dtype = torch.float8_e8m0fnu
+
+
+class CuTileMxfp4Bf16Runner(_CuTileFp4Runner):
+    """cuTile MXFP4 weights and BF16 activations for both grouped GEMMs."""
+
+    backend_key = "cutile_mxfp4"
+    supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.BF16),)
+    _supported_archs = _CUTILE_W4A16_ARCHS
+    _precision_name = "MXFP4"
+    _activation_fp4 = False
+    _scale_block_size = 32
+    _scale_dtype = torch.float8_e8m0fnu
 
 
 # ---------------------------------------------------------------------------
@@ -3781,9 +4856,19 @@ class CuteDslRunner(MoERunner):
         (QuantFormat.NVFP4, QuantFormat.BF16),
     )
     supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
+    # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
+    # takes the recipe as an argument; _check_support() below narrows this to
+    # the per-token path, the only one that runs that quantizer.
+    supports_nvfp4_4over6 = True
 
     def _check_support(self) -> None:
         super()._check_support()
+        if self.config.quant.swizzled_scale_factors is True:
+            raise NotImplementedError(
+                f"{type(self).__name__} consumes only the linear activation "
+                "block-scale layout; swizzled_scale_factors=True is supported "
+                "by the CUTLASS MXFP8 runners only."
+            )
         if isinstance(self.config.activation, SiTU) and (
             self.config.activation.clamp_limit is not None
         ):
@@ -3795,27 +4880,39 @@ class CuteDslRunner(MoERunner):
                 f"{type(self).__name__} requires do_finalize=True."
             )
         if (
-            self.config.quant.variant is not QuantVariant.NVFP4
+            self.config.quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
             and self.config.quant.per_token_scale
         ):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support per-token "
-                f"{self.config.quant.variant.name} activation scales."
+                f"{self.config.quant.weight.name}×{self.config.quant.activation.name} "
+                "activation scales."
             )
-        if self.config.quant.variant is QuantVariant.MXFP4 and isinstance(
-            self.config.activation, SiTU
-        ):
+        mxfp4_mxfp8 = self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+        if mxfp4_mxfp8 and isinstance(self.config.activation, SiTU):
             raise NotImplementedError("CuTe-DSL W4A8 does not support SiTU.")
-        if (
-            self.config.quant.variant is QuantVariant.MXFP4
-            and not self.config.finalize.use_fused_finalize
-        ):
+        if mxfp4_mxfp8 and not self.config.finalize.use_fused_finalize:
             raise NotImplementedError("CuTe-DSL W4A8 requires fused finalize.")
-        if self.config.quant.variant is QuantVariant.MXFP4 and hasattr(self, "device"):
+        if mxfp4_mxfp8 and hasattr(self, "device"):
             from ..utils import get_compute_capability
 
             if get_compute_capability(self.device) == (10, 7):
                 raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
+        if (
+            isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
+            and not self.config.quant.per_token_scale
+        ):
+            # Without per-token activation scales the GEMM2 input is produced
+            # by GEMM1's NVFP4 epilogue, which has no 4over6 variant. Only a
+            # pinned recipe is rejected: ``None`` (4over6 off) is exactly what
+            # that path already does, since it never reads the environment.
+            raise NotImplementedError(
+                f"{type(self).__name__} honors a pinned QuantConfig.nvfp4_4over6 "
+                "only with per_token_scale=True, the one path where it quantizes "
+                "the GEMM2 input itself (nvfp4_quantize_per_token_cute_dsl). "
+                "Otherwise GEMM1's epilogue emits NVFP4 directly and has no "
+                "4over6 variant."
+            )
         self._assert_rubin_cute_dsl_available()
 
     def _assert_rubin_cute_dsl_available(self) -> None:
@@ -3840,7 +4937,7 @@ class CuteDslRunner(MoERunner):
         # CuteDslRunner. Keep the original blast radius -- only the NVFP4 path
         # reaches the SM107 rubin kernels. MXFP4/W4A8 is already declined on
         # SM107 above, and W4A16 gates itself via require_cute_dsl_arch().
-        if self.config.quant.variant is not QuantVariant.NVFP4:
+        if self.config.quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
             return
 
         # check_support() is also exercised on runners built with __new__ and only
@@ -3882,6 +4979,7 @@ class CuteDslRunner(MoERunner):
         self.config = config
         self.device = torch.device(device)
         self._inner: Any = None
+        self._forward_kwargs: dict[str, Any] = {}
         self.tuning_config = TuningConfig()
 
     def _build(self) -> None:
@@ -3900,7 +4998,10 @@ class CuteDslRunner(MoERunner):
             if self.config.execution.enable_pdl is None
             else self.config.execution.enable_pdl
         )
-        if self.config.quant.variant in (QuantVariant.NVFP4, QuantVariant.MXFP4):
+        if self.config.quant.pair in (
+            (QuantFormat.NVFP4, QuantFormat.NVFP4),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        ):
             self._inner = CuteDslFusedMoERunner(
                 forward_impl=_cute_dsl_fused_moe_impl,
                 num_experts=routing.num_experts,
@@ -3912,12 +5013,12 @@ class CuteDslRunner(MoERunner):
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
                 quant_mode=(
                     "w4a8"
-                    if self.config.quant.variant is QuantVariant.MXFP4
+                    if self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
                     else "w4a4"
                 ),
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
-        elif self.config.quant.variant is QuantVariant.W4A16:
+        elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
             self._inner = CuteDslFusedMoEW4A16Runner(
                 num_experts=routing.num_experts,
                 top_k=routing.top_k,
@@ -3929,8 +5030,16 @@ class CuteDslRunner(MoERunner):
             )
         else:
             raise NotImplementedError(
-                f"CuteDslRunner does not support {self.config.quant.variant}."
+                f"CuteDslRunner does not support {self.config.quant}."
             )
+        # Forwarded only when explicit (like use_fused_finalize), so the
+        # default path stays byte-identical to the env-driven behaviour. It
+        # rides on **kwargs down to _cute_dsl_fused_moe_nvfp4_impl.
+        self._forward_kwargs = (
+            {}
+            if self.config.quant.nvfp4_4over6 is _UNSET
+            else {"nvfp4_4over6": self.config.quant.nvfp4_4over6}
+        )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
         # the instance we just built, not off the class.
@@ -3955,7 +5064,11 @@ class CuteDslRunner(MoERunner):
     ) -> torch.Tensor:
         self._require_built()
         return self._inner.forward(
-            inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
+            inputs,
+            tactic=tactic,
+            do_preparation=do_preparation,
+            **self._forward_kwargs,
+            **kwargs,
         )
 
     def pack_inputs(
@@ -3999,15 +5112,19 @@ class CuteDslRunner(MoERunner):
                 "the same typed activation."
             )
 
-        quant_variant = self.config.quant.variant
+        pair = self.config.quant.pair
         use_per_token_activation = bool(self.config.quant.per_token_scale)
         if (
-            quant_variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
+            pair
+            in (
+                (QuantFormat.NVFP4, QuantFormat.NVFP4),
+                (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            )
             and not use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is None
         ):
-            is_mxfp4 = quant_variant is QuantVariant.MXFP4
+            is_mxfp4 = pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
             hidden_size = act.hidden_states_q.shape[1] * (1 if is_mxfp4 else 2)
             moe_output = act.hidden_states_q.new_empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16
@@ -4031,7 +5148,7 @@ class CuteDslRunner(MoERunner):
                 moe_output,
             ]
         elif (
-            quant_variant is QuantVariant.NVFP4
+            pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
             and use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is not None
@@ -4056,7 +5173,7 @@ class CuteDslRunner(MoERunner):
                 moe_output,
             ]
         elif (
-            quant_variant is QuantVariant.W4A16
+            pair == (QuantFormat.NVFP4, QuantFormat.BF16)
             and act.hidden_states_scale is None
             and act.per_token_scale is None
         ):
@@ -4137,6 +5254,20 @@ class _TrtllmRunnerBase(MoERunner):
 
     _module: Any
     _inner: Any
+    _pair: tuple[QuantFormat, QuantFormat]
+    _num_weight_rows: int
+    _intermediate_size: int
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        if self.config.quant.swizzled_scale_factors is True:
+            # TRT-LLM consumes the canonical linear block scale only; the flat
+            # CUTLASS swizzled input_sf is a CUTLASS MXFP8 opt-in.
+            raise NotImplementedError(
+                f"{type(self).__name__} consumes only the linear activation "
+                "block-scale layout; swizzled_scale_factors=True is supported "
+                "by the CUTLASS MXFP8 runners only."
+            )
 
     def _build(self) -> None:
         from .core import get_trtllm_moe_sm100_module
@@ -4166,193 +5297,6 @@ class _TrtllmRunnerBase(MoERunner):
             return inputs[0]
         return result
 
-
-class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
-    """FP4 adapter over the canonical trtllm-gen ``MoERunner``.
-
-    Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
-    plus the immutable per-call weight/config kwargs that
-    ``core.MoERunner.forward`` consumes, then delegates tactic enumeration,
-    tuning-config construction, and the tactic'd forward to that inner runner.
-    This mirrors
-    ``CuteDslRunner`` (which wraps ``CuteDslFusedMoERunner``) and keeps
-    the fragile raw-op positional launch in exactly one place —
-    ``core.MoERunner.forward``.
-
-    Routing mode is chosen per-call from ``act.routing_input_mode``:
-
-    * **pre-routed** (``RoutingInputMode.PackedPrecomputed``): the pack carries
-      ``topk_ids`` / ``topk_weights`` and the runner packs them into int32 top-k ids
-      ``(GLOBAL expert_id << 16) | bf16(weight)`` (the kernel maps global ids to the
-      local shard via the separately passed ``local_expert_offset``).
-    * **unpacked pre-routed** (``RoutingInputMode.UnpackedPrecomputed``): the
-      pack carries plain int32 ids plus BF16 or FP32 weights, which are
-      forwarded as separate kernel inputs without packed-id construction.
-    * **in-kernel** (``RoutingInputMode.FromLogits``): the pack carries
-      ``routing_logits`` (+ optional ``routing_bias``); the kernel computes the top-k
-      selection per ``RoutingConfig.method`` and writes ``topk_ids`` / ``topk_weights``
-      into the OUTPUT buffers we allocate.
-
-    The inner ``MoERunner`` needs the hidden size for its tactic keys and tuning
-    buckets, so it is built lazily on the first ``pack_inputs`` call.
-    """
-
-    backend_key = "trtllm_fp4_routed"
-    supported_routing_modes = (
-        RoutingInputMode.PackedPrecomputed,
-        RoutingInputMode.UnpackedPrecomputed,
-        RoutingInputMode.FromLogits,
-    )
-    supported_quant_variants = (
-        (QuantFormat.NVFP4, QuantFormat.NVFP4),
-        (QuantFormat.MXFP4, QuantFormat.MXFP8),
-        (QuantFormat.MXFP4, QuantFormat.BF16),
-    )
-    supports_fused_shared_experts = True
-    supported_activation_classes_by_quant: ClassVar[
-        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
-    ] = {
-        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
-        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
-        (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
-    }
-
-    def _check_support(self) -> None:
-        super()._check_support()
-        activation = self.config.activation
-        if isinstance(activation, SiTU) and activation.linear_scale is None:
-            # gemm1_beta is a per-expert float tensor with no encoding for
-            # "unclamped"; only the CuTe-DSL scalar ABI can express it.
-            raise NotImplementedError(
-                f"{type(self).__name__} cannot express SiTU(linear_scale=None); "
-                "the TRT-LLM ABI has no unclamped linear-branch encoding."
-            )
-        variant = self.config.quant.variant
-        if self.config.quant.pair in self.supported_quant_variants:
-            if self.config.quant.per_token_scale and variant is not QuantVariant.NVFP4:
-                raise NotImplementedError(
-                    f"{type(self).__name__} does not support per-token scale for {variant.name}."
-                )
-
-            from ..utils import get_compute_capability
-
-            # Direct-runner guard: #4280 relanded the SM107 cubins removed by
-            # #4171. NVFP4/MXFP4 support SM100/SM103/SM107; W4A16 supports
-            # SM100/SM107 and retains the upstream SM103 xfail in #1754.
-            compute_capability = get_compute_capability(self.device)
-            if compute_capability == (10, 7) and isinstance(activation, SiTU):
-                # The pinned Rubin BMM lacks SiTuGlu; its enum value collides
-                # with None and would silently disable the activation.
-                # TODO: Update TRTLLM_GEN_BMM_RUBIN to an artifact with
-                # SiTuGlu, then remove this guard and add SM107 parity coverage.
-                raise NotImplementedError(
-                    f"{type(self).__name__} does not support SiTU on SM107 with "
-                    "the currently pinned Rubin BMM artifact."
-                )
-            if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4):
-                supported = compute_capability in ((10, 0), (10, 3), (10, 7))
-            else:
-                supported = compute_capability in ((10, 0), (10, 7))
-            if not supported:
-                raise NotImplementedError(
-                    f"TRTLLM {variant.name} is unsupported on "
-                    f"SM{compute_capability[0]}{compute_capability[1]}."
-                )
-
-    def __init__(self, config: MoEConfig, device: torch.device):
-        super().__init__()
-        from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
-        from ..utils import device_support_pdl
-
-        self.config = config
-        self.device = device
-        self._module: Any = None
-
-        routing = config.routing
-        experts = config.experts
-        execution = config.execution
-        self._num_local_experts = experts.local_num_experts or routing.num_experts
-        self._num_fused_shared_experts = experts.num_fused_shared_experts
-        self._num_weight_rows = self._num_local_experts + self._num_fused_shared_experts
-        self._local_expert_offset = experts.local_expert_offset
-        self._intermediate_size = experts.intermediate_size
-        self._activation_type = int(config.activation.type)
-        self._tune_max_num_tokens = execution.tune_max_num_tokens
-
-        variant = config.quant.variant
-        if variant is QuantVariant.MXFP4:
-            dtype_act = DtypeTrtllmGen.MxE4m3
-            dtype_weights = DtypeTrtllmGen.MxE2m1
-        elif variant is QuantVariant.W4A16:
-            dtype_act = DtypeTrtllmGen.Bfloat16
-            dtype_weights = DtypeTrtllmGen.MxE2m1
-        else:
-            # Harmless construction default; check_support rejects unknown variants.
-            dtype_act = DtypeTrtllmGen.E2m1
-            dtype_weights = DtypeTrtllmGen.E2m1
-        self._variant = variant
-        self._dtype_act = dtype_act
-        self._dtype_weights = dtype_weights
-        self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
-        self._per_token = bool(self.config.quant.per_token_scale)
-
-        # enable_pdl=None means "auto" — resolve once here exactly like the
-        # high-level wrapper does before building its MoERunner, because the raw
-        # op (reached via MoERunner.forward) expects a concrete bool.  Resolving
-        # once also keeps the value stable across CUDA-graph capture/replay.
-        enable_pdl = execution.enable_pdl
-        if enable_pdl is None:
-            enable_pdl = device_support_pdl(device)
-        self._enable_pdl = enable_pdl
-
-        # Built lazily on first pack_inputs once hidden_size is known.
-        self._inner: Any = None
-
-    def _ensure_inner(self, hidden_size: int) -> None:
-        self._require_built()
-        if self._inner is not None:
-            return
-        from ..tllm_enums import WeightLayout
-
-        self._inner = self._module.MoERunner(
-            top_k=self.config.routing.top_k,
-            num_local_experts=self._num_local_experts,
-            dtype_act=self._dtype_act,
-            dtype_weights=self._dtype_weights,
-            fp8_quantization_type=self._fp8_quantization_type,
-            hidden_size=hidden_size,
-            intermediate_size=self._intermediate_size,
-            activation_type=self._activation_type,
-            use_shuffled_weight=True,
-            weight_layout=int(WeightLayout.MajorK),
-            use_per_token_scaling=self._per_token,
-            num_experts=self.config.routing.num_experts,
-            num_fused_shared_experts=self._num_fused_shared_experts,
-        )
-
-    def get_valid_tactics(  # type: ignore[override]
-        self, inputs: List[torch.Tensor], profile: Any
-    ) -> List[Any]:
-        self._require_built()
-        # The inner runner reads num_tokens from inputs + its own instance key;
-        # no launch kwargs are needed for tactic enumeration.
-        return self._inner.get_valid_tactics(inputs, profile)
-
-    def forward(
-        self,
-        inputs: List[torch.Tensor],
-        tactic: Any = -1,
-        do_preparation: bool = False,
-        **kwargs: Any,
-    ) -> torch.Tensor | List[torch.Tensor]:
-        self._require_built()
-        # Finalized calls write into inputs[0]; unfinalized calls return the flat
-        # API's three-tensor result. Launch kwargs come from the same packed call
-        # even when another pack_inputs invocation interleaves before forward.
-        return self._forward_inner(
-            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
-        )
-
     def _validate_fp4_tensors(
         self,
         act: MoEActivationPack,
@@ -4360,7 +5304,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         hidden_size: int,
     ) -> torch.Tensor | None:
         num_tokens = act.hidden_states_q.shape[0]
-        if self._variant is QuantVariant.NVFP4:
+        if self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
             if act.hidden_states_q.dtype != torch.uint8:
                 raise TypeError(
                     "NVFP4 hidden_states_q must be packed uint8, got "
@@ -4382,7 +5326,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 scale = scale.view(torch.float8_e4m3fn)
             scale_dtype = torch.float8_e4m3fn
             sf_vec_size = 16
-        elif self._variant is QuantVariant.MXFP4:
+        elif self._pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
             if act.hidden_states_q.dtype != torch.float8_e4m3fn:
                 raise TypeError(
                     "MXFP4×MXFP8 hidden_states_q must be float8_e4m3fn, got "
@@ -4487,6 +5431,201 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 raise ValueError(f"{name} must be contiguous.")
         return scale
 
+
+class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
+    """FP4 adapter over the canonical trtllm-gen ``MoERunner``.
+
+    Translates (MoEActivationPack, MoEWeightPack) into the ``MoeRunnerInputs`` list
+    plus the immutable per-call weight/config kwargs that
+    ``core.MoERunner.forward`` consumes, then delegates tactic enumeration,
+    tuning-config construction, and the tactic'd forward to that inner runner.
+    This mirrors
+    ``CuteDslRunner`` (which wraps ``CuteDslFusedMoERunner``) and keeps
+    the fragile raw-op positional launch in exactly one place —
+    ``core.MoERunner.forward``.
+
+    Routing mode is chosen per-call from ``act.routing_input_mode``:
+
+    * **pre-routed** (``RoutingInputMode.PackedPrecomputed``): the pack carries
+      ``topk_ids`` / ``topk_weights`` and the runner packs them into int32 top-k ids
+      ``(GLOBAL expert_id << 16) | bf16(weight)`` (the kernel maps global ids to the
+      local shard via the separately passed ``local_expert_offset``).
+    * **unpacked pre-routed** (``RoutingInputMode.UnpackedPrecomputed``): the
+      pack carries plain int32 ids plus BF16 or FP32 weights, which are
+      forwarded as separate kernel inputs without packed-id construction.
+    * **in-kernel** (``RoutingInputMode.FromLogits``): the pack carries
+      ``routing_logits`` (+ optional ``routing_bias``); the kernel computes the top-k
+      selection per ``RoutingConfig.method`` and writes ``topk_ids`` / ``topk_weights``
+      into the OUTPUT buffers we allocate.
+
+    The inner ``MoERunner`` needs the hidden size for its tactic keys and tuning
+    buckets, so it is built lazily on the first ``pack_inputs`` call.
+    """
+
+    backend_key = "trtllm_fp4_routed"
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    )
+    supported_quant_variants = (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP4, QuantFormat.BF16),
+    )
+    supports_fused_shared_experts = True
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
+    }
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        activation = self.config.activation
+        if isinstance(activation, SiTU) and activation.linear_scale is None:
+            # gemm1_beta is a per-expert float tensor with no encoding for
+            # "unclamped"; only the CuTe-DSL scalar ABI can express it.
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot express SiTU(linear_scale=None); "
+                "the TRT-LLM ABI has no unclamped linear-branch encoding."
+            )
+        pair = self.config.quant.pair
+        if pair in self.supported_quant_variants:
+            if self.config.quant.per_token_scale and pair != (
+                QuantFormat.NVFP4,
+                QuantFormat.NVFP4,
+            ):
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support per-token scale for "
+                    f"{pair[0].name}×{pair[1].name}."
+                )
+
+            from ..utils import get_compute_capability
+
+            # Direct-runner guard: #4280 relanded the SM107 cubins removed by
+            # #4171. NVFP4/MXFP4 support SM100/SM103/SM107; W4A16 supports
+            # SM100/SM107 and retains the upstream SM103 xfail in #1754.
+            compute_capability = get_compute_capability(self.device)
+            if compute_capability == (10, 7) and isinstance(activation, SiTU):
+                # The pinned Rubin BMM lacks SiTuGlu; its enum value collides
+                # with None and would silently disable the activation.
+                # TODO: Update TRTLLM_GEN_BMM_RUBIN to an artifact with
+                # SiTuGlu, then remove this guard and add SM107 parity coverage.
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support SiTU on SM107 with "
+                    "the currently pinned Rubin BMM artifact."
+                )
+            if pair in (
+                (QuantFormat.NVFP4, QuantFormat.NVFP4),
+                (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            ):
+                supported = compute_capability in ((10, 0), (10, 3), (10, 7))
+            else:
+                supported = compute_capability in ((10, 0), (10, 7))
+            if not supported:
+                raise NotImplementedError(
+                    f"TRTLLM {pair[0].name}×{pair[1].name} is unsupported on "
+                    f"SM{compute_capability[0]}{compute_capability[1]}."
+                )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
+        from ..utils import device_support_pdl
+
+        self.config = config
+        self.device = device
+        self._module: Any = None
+
+        routing = config.routing
+        experts = config.experts
+        execution = config.execution
+        self._num_local_experts = experts.local_num_experts or routing.num_experts
+        self._num_fused_shared_experts = experts.num_fused_shared_experts
+        self._num_weight_rows = self._num_local_experts + self._num_fused_shared_experts
+        self._local_expert_offset = experts.local_expert_offset
+        self._intermediate_size = experts.intermediate_size
+        self._activation_type = int(config.activation.type)
+        self._tune_max_num_tokens = execution.tune_max_num_tokens
+
+        pair = config.quant.pair
+        if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+            dtype_act = DtypeTrtllmGen.MxE4m3
+            dtype_weights = DtypeTrtllmGen.MxE2m1
+        elif pair == (QuantFormat.MXFP4, QuantFormat.BF16):
+            dtype_act = DtypeTrtllmGen.Bfloat16
+            dtype_weights = DtypeTrtllmGen.MxE2m1
+        else:
+            # Harmless construction default; check_support rejects unknown pairs.
+            dtype_act = DtypeTrtllmGen.E2m1
+            dtype_weights = DtypeTrtllmGen.E2m1
+        self._pair = pair
+        self._dtype_act = dtype_act
+        self._dtype_weights = dtype_weights
+        self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
+        self._per_token = bool(self.config.quant.per_token_scale)
+
+        # enable_pdl=None means "auto" — resolve once here exactly like the
+        # high-level wrapper does before building its MoERunner, because the raw
+        # op (reached via MoERunner.forward) expects a concrete bool.  Resolving
+        # once also keeps the value stable across CUDA-graph capture/replay.
+        enable_pdl = execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(device)
+        self._enable_pdl = enable_pdl
+
+        # Built lazily on first pack_inputs once hidden_size is known.
+        self._inner: Any = None
+
+    def _ensure_inner(self, hidden_size: int) -> None:
+        self._require_built()
+        if self._inner is not None:
+            return
+        from ..tllm_enums import WeightLayout
+
+        self._inner = self._module.MoERunner(
+            self._module.moe_op,
+            top_k=self.config.routing.top_k,
+            num_local_experts=self._num_local_experts,
+            dtype_act=self._dtype_act,
+            dtype_weights=self._dtype_weights,
+            fp8_quantization_type=self._fp8_quantization_type,
+            hidden_size=hidden_size,
+            intermediate_size=self._intermediate_size,
+            activation_type=self._activation_type,
+            use_shuffled_weight=True,
+            weight_layout=int(WeightLayout.MajorK),
+            use_per_token_scaling=self._per_token,
+            num_experts=self.config.routing.num_experts,
+            num_fused_shared_experts=self._num_fused_shared_experts,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self, inputs: List[torch.Tensor], profile: Any
+    ) -> List[Any]:
+        self._require_built()
+        # The inner runner reads num_tokens from inputs + its own instance key;
+        # no launch kwargs are needed for tactic enumeration.
+        return self._inner.get_valid_tactics(inputs, profile)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        self._require_built()
+        # Finalized calls write into inputs[0]; unfinalized calls return the flat
+        # API's three-tensor result. Launch kwargs come from the same packed call
+        # even when another pack_inputs invocation interleaves before forward.
+        return self._forward_inner(
+            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
+        )
+
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
@@ -4509,6 +5648,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         ``[offset, offset + local_num_experts)``.
         """
         self._require_built()
+        from ..tllm_enums import SfLayout
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
@@ -4520,7 +5660,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         num_tokens = act.hidden_states_q.shape[0]
         hidden_size = (
             act.hidden_states_q.shape[1] * 2
-            if self._variant is QuantVariant.NVFP4
+            if self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
             else act.hidden_states_q.shape[1]
         )
         hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
@@ -4560,12 +5700,16 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             )
             routing_logits = act.routing_logits
             if (
-                self._variant in (QuantVariant.MXFP4, QuantVariant.W4A16)
+                self._pair
+                in (
+                    (QuantFormat.MXFP4, QuantFormat.MXFP8),
+                    (QuantFormat.MXFP4, QuantFormat.BF16),
+                )
                 and routing_logits.dtype != torch.bfloat16
             ):
                 raise TypeError(
-                    f"{self._variant.name} FromLogits requires bfloat16 "
-                    f"routing_logits, got {routing_logits.dtype}."
+                    f"{self._pair[0].name}×{self._pair[1].name} FromLogits requires "
+                    f"bfloat16 routing_logits, got {routing_logits.dtype}."
                 )
             routing_bias = act.routing_bias
             topk_ids = act.hidden_states_q.new_empty(
@@ -4677,6 +5821,13 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             moe_inputs,
             tune_max_num_tokens=self._tune_max_num_tokens,
             routing_input_mode=routing_input_mode,
+            # Declare the activation scale-factor layout instead of letting the
+            # runner infer it (deprecated). The unified path's own activation
+            # preparation quantizes linear for trtllm-gen — see
+            # prepare_trtllm_fp4_activations in prepare.py, which passes
+            # is_sf_swizzled_layout=False for both the MXFP4 and NVFP4 variants
+            # — which is also the only layout the routed GEMM can consume.
+            hidden_states_scale_layout=SfLayout.layout_linear,
             # Match the canonical trtllm-gen wrappers' profiling regime so
             # choose_one() tunes under the same conditions as deployment
             # (otherwise it can cache a tactic picked under a different regime).
@@ -4739,9 +5890,9 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         super().__init__()
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
         from ..utils import device_support_pdl
-        from .api import QuantVariant
+        from .api import QuantFormat
 
-        if config.quant.variant is QuantVariant.MxFp8:
+        if config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
             dtype = DtypeTrtllmGen.MxE4m3
             fp8_type = Fp8QuantizationType.MxFp8
         else:
@@ -4753,11 +5904,11 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         self.config = config
         self.device = device
         self._module: Any = None
-        self._variant = config.quant.variant
+        self._pair = config.quant.pair
         self._dtype_act = dtype
         self._dtype_weights = dtype
         self._fp8_quantization_type = fp8_type
-        self._use_shuffled_weight = config.quant.variant is QuantVariant.MxFp8
+        self._use_shuffled_weight = self._pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
 
         routing = config.routing
         experts = config.experts
@@ -4785,6 +5936,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -4824,7 +5976,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         view: dict,
         hidden_size: int,
     ) -> torch.Tensor:
-        from .api import QuantVariant
+        from .api import QuantFormat
 
         if act.hidden_states_q.dtype != torch.float8_e4m3fn:
             raise TypeError(
@@ -4835,7 +5987,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         if scale is None:
             raise ValueError("TrtllmFp8BlockRunner requires hidden_states_scale.")
         num_tokens = act.hidden_states_q.shape[0]
-        if self._variant is QuantVariant.DeepSeekFp8:
+        if self._pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
             expected_scale = (hidden_size // 128, num_tokens)
             if scale.dtype != torch.float32 or tuple(scale.shape) != expected_scale:
                 raise ValueError(
@@ -5140,6 +6292,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         from ..tllm_enums import RoutingMethodType, WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -5419,6 +6572,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -5584,6 +6738,383 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
 
 
 # ---------------------------------------------------------------------------
+# Prims-TS runner — TRT-LLM routing/finalize + Prims-TS GEMM
+# ---------------------------------------------------------------------------
+
+
+class PrimsTsRunner(_TrtllmRunnerBase):
+    """Unified adapter over the inner ``PrimsTs*MoERunner`` classes.
+
+    Routing and finalize stay on the TRT-LLM Gen module loaded by
+    ``_TrtllmRunnerBase._build``. The middle GEMM is the Prims-TS CuTe-DSL
+    batched path. Weight/activation layouts match the corresponding TRT-LLM
+    prepare helpers so one ``MoEWeightPack`` view can be registered under both
+    ``"prims_ts"`` and ``"trtllm_fp4_routed"`` / ``"trtllm_bf16_routed"``.
+    """
+
+    backend_key = "prims_ts"
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+        RoutingInputMode.FromLogits,
+    )
+    supported_quant_variants = (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.BF16, QuantFormat.BF16),
+    )
+    supports_fused_shared_experts = False
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2),
+    }
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from flashinfer.prims_ts.utils import is_prims_ts_available
+        from flashinfer.tllm_enums import RoutingMethodType
+        from flashinfer.utils import get_compute_capability
+
+        if not is_prims_ts_available():
+            raise RuntimeError(
+                "PrimsTsRunner requires nvidia-cutlass-dsl with "
+                "cutlass.experimental.primitives and task_scheduling."
+            )
+        compute_capability = get_compute_capability(self.device)
+        arch = compute_capability[0] * 10 + compute_capability[1]
+        if arch not in _PRIMS_TS_ARCHS:
+            raise NotImplementedError(
+                f"{type(self).__name__} is enabled only on SM100/SM103, "
+                f"got SM{compute_capability[0]}{compute_capability[1]}."
+            )
+        if self.config.experts.intermediate_size % 128 != 0:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires intermediate_size % 128 == 0, "
+                f"got {self.config.experts.intermediate_size}."
+            )
+        activation = self.config.activation
+        if isinstance(activation, SiTU) and activation.linear_scale is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot express SiTU(linear_scale=None); "
+                "the TRT-LLM ABI has no unclamped linear-branch encoding."
+            )
+        pair = self.config.quant.pair
+        if self.config.quant.per_token_scale and pair != (
+            QuantFormat.NVFP4,
+            QuantFormat.NVFP4,
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support per-token scale for "
+                f"{pair[0].name}×{pair[1].name}."
+            )
+        if pair == (QuantFormat.BF16, QuantFormat.BF16) and (
+            self.config.routing.method
+            in (RoutingMethodType.Sigmoid, RoutingMethodType.DeepSeekV3)
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support "
+                f"{self.config.routing.method.name} routing for BF16×BF16."
+            )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        from flashinfer.utils import device_support_pdl
+
+        self.config = config
+        self.device = device
+        self._module: Any = None
+
+        routing = config.routing
+        experts = config.experts
+        execution = config.execution
+        self._pair = config.quant.pair
+        self._num_local_experts = experts.local_num_experts or routing.num_experts
+        self._num_weight_rows = self._num_local_experts
+        self._local_expert_offset = experts.local_expert_offset
+        self._intermediate_size = experts.intermediate_size
+        self._activation_type = int(config.activation.type)
+        self._tune_max_num_tokens = execution.tune_max_num_tokens
+        self._per_token = bool(config.quant.per_token_scale)
+
+        enable_pdl = execution.enable_pdl
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(device)
+        self._enable_pdl = enable_pdl
+        self._inner: Any = None
+
+    def _weight_layout(self) -> int:
+        from flashinfer.tllm_enums import WeightLayout
+
+        if self._pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return int(WeightLayout.BlockMajorK)
+        return int(WeightLayout.MajorK)
+
+    def _ensure_inner(self, hidden_size: int) -> None:
+        self._require_built()
+        if self._inner is not None:
+            return
+        # Inner runners live under flashinfer.prims_ts; import only after
+        # check_support confirmed the DSL, so ``import flashinfer`` stays lazy.
+        from flashinfer.prims_ts.moe.runner import (
+            PrimsTsBf16MoERunner,
+            PrimsTsNvfp4MoERunner,
+        )
+
+        moe_op = self._module.moe_op
+        common = dict(
+            moe_op=moe_op,
+            top_k=self.config.routing.top_k,
+            num_local_experts=self._num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=self._intermediate_size,
+            activation_type=self._activation_type,
+            use_shuffled_weight=True,
+            weight_layout=self._weight_layout(),
+            num_experts=self.config.routing.num_experts,
+        )
+        if self._pair == (QuantFormat.BF16, QuantFormat.BF16):
+            self._inner = PrimsTsBf16MoERunner(**common)
+            return
+        self._inner = PrimsTsNvfp4MoERunner(
+            **common,
+            use_per_token_scaling=self._per_token,
+        )
+
+    def get_valid_tactics(  # type: ignore[override]
+        self, inputs: List[torch.Tensor], profile: Any
+    ) -> List[Any]:
+        self._require_built()
+        # Under autotune the pack's ``inputs_pre_hook`` has already synced the
+        # inner extras; a direct call with the packed list syncs here.
+        self._sync_inner_static_extras(getattr(inputs, "launch_state", None))
+        return self._inner.get_valid_tactics(inputs, profile)
+
+    def _sync_inner_static_extras(self, launch_state: Any) -> None:
+        # The inner enumerates tactics from view-derived flags (bias / OA
+        # presence) it keeps as static extras, so they must be set from the
+        # launch state of the call being tuned or launched, never from a
+        # previous pack.
+        if isinstance(launch_state, _TrtllmLaunchState) and self._inner is not None:
+            self._inner.set_cache_key_static_extras(**launch_state.static_kwargs)
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        self._require_built()
+        launch_state = kwargs.pop("launch_state", None)
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        self._sync_inner_static_extras(launch_state)
+        return self._forward_inner(inputs, tactic, do_preparation, launch_state)
+
+    def _gemm1_oa_launch_kwargs(self, view: dict) -> dict[str, Any]:
+        # Prims-TS OA (alpha/beta/clamp) is SwiGLU/SiTU only. TRT-LLM FP4
+        # prepare inserts gemm1_alpha=ones for every gated activation,
+        # including GeGLU; forwarding that placeholder fails support.
+        if isinstance(self.config.activation, (SwiGLU, SiTU)):
+            return {
+                "gemm1_alpha": view.get("gemm1_alpha"),
+                "gemm1_beta": view.get("gemm1_beta"),
+                "gemm1_clamp_limit": view.get("gemm1_clamp_limit"),
+            }
+        return {
+            "gemm1_alpha": None,
+            "gemm1_beta": None,
+            "gemm1_clamp_limit": None,
+        }
+
+    def _pack_routing(
+        self, act: MoEActivationPack
+    ) -> tuple[Any, Any, torch.Tensor, torch.Tensor]:
+        """Allocate the same 2-D routing buffers as ``TrtllmBf16RoutedRunner``.
+
+        Inner ``_staged_routing_io`` rewrites Packed/FromLogits placeholders
+        to the 1-D empties the staged C++ launcher infers mode from.
+        """
+        from .core import RoutingInputMode
+
+        routing = self.config.routing
+        num_tokens = act.hidden_states_q.shape[0]
+        hidden = act.hidden_states_q
+        mode = act.routing_input_mode
+        if mode == RoutingInputMode.FromLogits:
+            _validate_logits_inputs(
+                act, num_tokens, routing.num_experts, type(self).__name__
+            )
+            topk_ids = hidden.new_empty((num_tokens, routing.top_k), dtype=torch.int32)
+            expert_weights = hidden.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+            return act.routing_logits, act.routing_bias, topk_ids, expert_weights
+        if mode == RoutingInputMode.PackedPrecomputed:
+            _validate_prerouted_inputs(
+                act, num_tokens, routing.top_k, type(self).__name__
+            )
+            topk_ids = _pack_prerouted_topk_ids(act)
+            expert_weights = act.topk_weights.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+            return None, None, topk_ids, expert_weights
+        if mode == RoutingInputMode.UnpackedPrecomputed:
+            _validate_prerouted_inputs(
+                act,
+                num_tokens,
+                routing.top_k,
+                type(self).__name__,
+                allowed_weights_dtypes=(torch.bfloat16, torch.float32),
+                require_contiguous=True,
+            )
+            return None, None, act.topk_ids, act.topk_weights
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support "
+            f"routing_input_mode={mode!r} "
+            "(only FromLogits, PackedPrecomputed, and "
+            "UnpackedPrecomputed are wired)."
+        )
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        from flashinfer.prims_ts.moe.support import (
+            is_prims_ts_bf16_supported,
+            is_prims_ts_nvfp4_supported,
+        )
+        from .core import MoeRunnerInputs
+
+        v = weights.get_view(self.backend_key)
+        _validate_prepared_activation_params(
+            v, self.config.activation, type(self).__name__
+        )
+        routing = self.config.routing
+        num_tokens = act.hidden_states_q.shape[0]
+        is_nvfp4 = self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
+        hidden_size = (
+            act.hidden_states_q.shape[1] * 2
+            if is_nvfp4
+            else act.hidden_states_q.shape[1]
+        )
+
+        if is_nvfp4:
+            hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
+            if self._per_token and act.per_token_scale is None:
+                raise RuntimeError(
+                    "Per-token NVFP4 scale is configured but no activation scale is given."
+                )
+            per_token_scale = act.per_token_scale
+        else:
+            _validate_optional_gemm1_activation_params(
+                v,
+                self._num_local_experts,
+                act.hidden_states_q.device,
+                type(self).__name__,
+            )
+            if act.hidden_states_q.dtype != torch.bfloat16:
+                raise TypeError(
+                    "Prims-TS BF16 hidden_states_q must be bfloat16, got "
+                    f"{act.hidden_states_q.dtype}."
+                )
+            hidden_states_scale = None
+            per_token_scale = None
+
+        routing_logits, routing_bias, topk_ids, expert_weights = self._pack_routing(act)
+
+        output = act.hidden_states_q.new_empty(
+            (
+                num_tokens,
+                hidden_size if self.config.finalize.do_finalize else 0,
+            ),
+            dtype=torch.bfloat16,
+        )
+        moe_inputs = MoeRunnerInputs(
+            output=output,
+            routing_logits=routing_logits,
+            topk_ids=topk_ids,
+            expert_weights=expert_weights,
+            hidden_states=act.hidden_states_q,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_lora_delta=None,
+            per_token_scale=per_token_scale,
+        )
+
+        static_kwargs = dict(
+            routing_input_mode=act.routing_input_mode,
+            routing_bias=routing_bias,
+            gemm1_weights=v["gemm1_weights"],
+            gemm2_weights=v["gemm2_weights"],
+            gemm1_bias=v.get("gemm1_bias"),
+            gemm2_bias=v.get("gemm2_bias"),
+            **self._gemm1_oa_launch_kwargs(v),
+            num_experts=routing.num_experts,
+            num_fused_shared_experts=0,
+            n_group=routing.n_group,
+            topk_group=routing.topk_group,
+            local_expert_offset=self._local_expert_offset,
+            local_num_experts=self._num_local_experts,
+            routed_scaling_factor=routing.routed_scaling_factor,
+            routing_method_type=int(routing.method),
+            use_shuffled_weight=True,
+            weight_layout=self._weight_layout(),
+            do_finalize=self.config.finalize.do_finalize,
+            enable_pdl=self._enable_pdl,
+            activation_type=self._activation_type,
+            norm_topk_prob=True,
+            routing_replay_out=None,
+        )
+        if is_nvfp4:
+            static_kwargs.update(
+                gemm1_weights_scale=v.get("gemm1_weights_scale"),
+                gemm2_weights_scale=v.get("gemm2_weights_scale"),
+                output1_scale_scalar=v.get("output1_scale_scalar"),
+                output1_scale_gate_scalar=v.get("output1_scale_gate_scalar"),
+                output2_scale_scalar=v.get("output2_scale_scalar"),
+            )
+
+        self._ensure_inner(hidden_size)
+        support_fn = (
+            is_prims_ts_nvfp4_supported if is_nvfp4 else is_prims_ts_bf16_supported
+        )
+        ok, reason = support_fn(self._inner, moe_inputs, [-1, -1], **static_kwargs)
+        if not ok:
+            raise RuntimeError(f"Config not supported by Prims-TS kernel ({reason})")
+
+        tuning_kwargs: dict[str, Any] = dict(
+            tune_max_num_tokens=self._tune_max_num_tokens,
+            routing_input_mode=act.routing_input_mode,
+            use_cuda_graph=True,
+            use_cold_l2_cache=True,
+        )
+        if is_nvfp4:
+            from ..tllm_enums import SfLayout
+
+            tuning_kwargs["act_sf_layout"] = SfLayout.layout_linear
+        tuning_config = self._inner._make_tuning_config(moe_inputs, **tuning_kwargs)
+        launch_state = _TrtllmLaunchState(static_kwargs)
+        # The autotuner calls get_valid_tactics(tensors, profile) with no
+        # launch kwargs, but runs inputs_pre_hook first; bind this pack's
+        # static extras there so tuning never reads another pack's state.
+        inner, inner_hook = self._inner, tuning_config.inputs_pre_hook
+
+        def _bind_static_extras(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
+            inner.set_cache_key_static_extras(**launch_state.static_kwargs)
+            return inner_hook(tensors) if inner_hook is not None else tensors
+
+        tuning_config = dataclasses.replace(
+            tuning_config, inputs_pre_hook=_bind_static_extras
+        )
+        return _TrtllmPackedInputs(
+            moe_inputs.to_list(),
+            tuning_config=tuning_config,
+            launch_state=launch_state,
+        )
+
+
+# ---------------------------------------------------------------------------
 # TRTLLM MxInt4 runner — BF16 activations, packed INT4 BlockMajorK weights
 # ---------------------------------------------------------------------------
 
@@ -5648,6 +7179,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -5852,7 +7384,717 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
 
 
 # ---------------------------------------------------------------------------
-# SM12x b12x runners — fixed tactic, existing wrapper delegation
+# SM12x FP8 runner - fixed tactic, internal op composition
+# ---------------------------------------------------------------------------
+
+
+def _sm12x_fp8_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
+    if isinstance(activation, SwiGLU):
+        default = SwiGLU()
+        if activation.alpha != default.alpha or activation.beta != default.beta:
+            raise NotImplementedError(
+                "SM12x FP8 supports only default SwiGLU alpha and beta."
+            )
+        return {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": None
+            if activation.limit == default.limit
+            else activation.limit,
+        }
+    raise NotImplementedError(
+        f"SM12x FP8 does not support {type(activation).__name__}."
+    )
+
+
+def _validate_sm12x_fp8_weight_view(
+    view: dict[str, torch.Tensor], x: torch.Tensor, config: MoEConfig
+) -> None:
+    experts = config.routing.num_experts
+    hidden = x.shape[1]
+    intermediate = config.experts.intermediate_size
+    expected = {
+        "w1_weight": (experts, 2 * intermediate, hidden),
+        "w1_weight_sf": (experts, hidden // 128, 2 * intermediate // 128),
+        "w2_weight": (experts, hidden, intermediate),
+        "w2_weight_sf": (experts, intermediate // 128, hidden // 128),
+    }
+    for key, shape in expected.items():
+        tensor = view[key]
+        if tensor.device != x.device:
+            raise ValueError(f"{key} must be on {x.device}, got {tensor.device}.")
+        expected_dtype = torch.float32 if key.endswith("_sf") else torch.float8_e4m3fn
+        if tensor.dtype is not expected_dtype:
+            raise TypeError(f"{key} must be {expected_dtype}, got {tensor.dtype}.")
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{key} shape {tuple(tensor.shape)} != expected {shape}.")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{key} must be contiguous.")
+
+
+class SM12xFp8Runner(MoERunner):
+    """Unified adapter for the SM12x DeepSeek FP8 internal op chain."""
+
+    backend_key = "sm12x_fp8"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = ((QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),)
+    supported_activation_classes = (SwiGLU,)
+    supports_expert_parallelism = False
+    required_weight_keys = (
+        "w1_weight",
+        "w1_weight_sf",
+        "w2_weight",
+        "w2_weight_sf",
+    )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.tuning_config = TuningConfig()
+
+    def _check_activation_parameters(self) -> None:
+        _sm12x_fp8_activation_kwargs(self.config.activation)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..cute_dsl import is_cute_dsl_available
+        from ..jit.cpp_ext import get_cuda_version
+        from ..utils import get_compute_capability
+
+        if get_cuda_version().major < 13:
+            raise ValueError("SM12x FP8 requires CUDA 13 or later.")
+        if not is_cute_dsl_available():
+            raise RuntimeError("SM12x FP8 requires the CuTe DSL package.")
+        if get_compute_capability(self.device) not in ((12, 0), (12, 1)):
+            raise RuntimeError("SM12x FP8 requires SM120 or SM121.")
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("SM12x FP8 requires do_finalize=True.")
+        if not self.config.finalize.use_fused_finalize:
+            raise NotImplementedError("SM12x FP8 requires use_fused_finalize=True.")
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                "SM12x FP8 quantizes BF16 activations internally."
+            )
+
+    def _build(self) -> None:
+        from .cute_dsl.blackwell_sm12x.moe_fp8_fc1_act_q1 import (
+            cute_dsl_sm12x_fc1_act_q1_fp8,
+            out_sf_shape,
+        )
+        from .cute_dsl.blackwell_sm12x.moe_fp8_fc2_finalize import (
+            cute_dsl_sm12x_fc2_finalize_fp8,
+        )
+        from .cute_dsl.blackwell_sm12x.moe_fp8_q0_route_triton import (
+            Fp8Q0RouteWorkspace,
+            fp8_q0_route_triton,
+            make_fp8_q0_route_workspace,
+        )
+
+        self._fc1 = cute_dsl_sm12x_fc1_act_q1_fp8
+        self._fc2 = cute_dsl_sm12x_fc2_finalize_fp8
+        self._out_sf_shape = out_sf_shape
+        self._workspace_cls = Fp8Q0RouteWorkspace
+        self._make_workspace = make_fp8_q0_route_workspace
+        self._route = fp8_q0_route_triton
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.hidden_states_q.dtype is not torch.bfloat16:
+            raise TypeError("SM12x FP8 requires BF16 hidden states.")
+        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+            raise ValueError("SM12x FP8 requires activation scales to be None.")
+        _validate_prerouted_inputs(
+            act,
+            act.hidden_states_q.shape[0],
+            self.config.routing.top_k,
+            type(self).__name__,
+        )
+        if act.topk_weights.dtype is not torch.float32:
+            raise TypeError("SM12x FP8 requires FP32 top-k weights.")
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self.required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        _validate_sm12x_fp8_weight_view(view, act.hidden_states_q, self.config)
+        x = act.hidden_states_q
+        num_experts = self.config.routing.num_experts
+        workspace = self._make_workspace(x, act.topk_ids, num_experts)
+        total_pairs = x.shape[0] * act.topk_ids.shape[1]
+        intermediate_size = view["w1_weight"].shape[1] // 2
+        q1 = torch.empty(
+            total_pairs,
+            intermediate_size,
+            dtype=torch.float8_e4m3fn,
+            device=x.device,
+        )
+        sf1 = torch.zeros(
+            self._out_sf_shape(total_pairs, intermediate_size, num_experts),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        output = torch.zeros(
+            x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
+        )
+        return [
+            x,
+            act.topk_ids,
+            act.topk_weights,
+            view["w1_weight"],
+            view["w1_weight_sf"],
+            view["w2_weight"],
+            view["w2_weight_sf"],
+            q1,
+            sf1,
+            output,
+            workspace.counts,
+            workspace.offsets,
+            workspace.expert_cursor,
+            workspace.token_map,
+            workspace.token_weights,
+            workspace.dst_rows,
+            workspace.scale_dst_rows,
+            workspace.q_out,
+            workspace.scale_out,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError("SM12x FP8 supports only tactic -1.")
+        x, ids, topk_weights, w1, w1_sf, w2, w2_sf, q1, sf1, output = inputs[:10]
+        workspace = self._workspace_cls(*inputs[10:])
+        act_kwargs = _sm12x_fp8_activation_kwargs(self.config.activation)
+        enable_pdl = self.config.execution.enable_pdl is not False
+        output.zero_()
+        offsets, token_map, route_weights, a_q, a_scale = self._route(
+            x,
+            ids,
+            topk_weights,
+            self.config.routing.num_experts,
+            workspace=workspace,
+        )
+        self._fc1(
+            a_q,
+            a_scale,
+            w1,
+            w1_sf,
+            offsets,
+            enable_pdl=enable_pdl,
+            out_q=q1,
+            out_sf=sf1,
+            **act_kwargs,
+        )
+        self._fc2(
+            q1,
+            sf1,
+            w2,
+            w2_sf,
+            offsets,
+            token_map,
+            route_weights,
+            x.shape[0],
+            enable_pdl=enable_pdl,
+            out=output,
+        )
+        return output
+
+
+# ---------------------------------------------------------------------------
+# SM12x MXFP8 x MXFP4 runner - fixed tactic, internal op composition
+# ---------------------------------------------------------------------------
+
+
+def _sm12x_mxfp8_mxfp4_activation_kwargs(
+    activation: ActivationConfig,
+) -> dict[str, Any]:
+    if isinstance(activation, SwiGLU):
+        default = SwiGLU()
+        if activation.alpha != default.alpha or activation.beta != default.beta:
+            raise NotImplementedError(
+                "SM12x MXFP8 x MXFP4 supports only default SwiGLU alpha and beta."
+            )
+        return {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": None
+            if activation.limit == default.limit
+            else activation.limit,
+        }
+    if isinstance(activation, SiTU):
+        if activation.linear_scale is None or activation.clamp_limit is not None:
+            raise NotImplementedError(
+                "SM12x MXFP8 x MXFP4 requires a finite SiTU linear scale and no clamp limit."
+            )
+        return {
+            "activation": ActivationType.Situ,
+            "situ_beta": activation.gate_scale,
+            "situ_linear_beta": activation.linear_scale,
+        }
+    raise NotImplementedError(
+        f"SM12x MXFP8 x MXFP4 does not support {type(activation).__name__}."
+    )
+
+
+def _validate_sm12x_mxfp8_mxfp4_weight_view(
+    view: dict[str, torch.Tensor], x: torch.Tensor, config: MoEConfig
+) -> None:
+    experts = config.routing.num_experts
+    hidden = x.shape[1]
+    intermediate = config.experts.intermediate_size
+    expected = {
+        "w1_weight": (experts, 2 * intermediate, hidden // 2),
+        "w1_weight_sf": (experts, hidden // 128, 8 * intermediate),
+        "w2_weight": (experts, hidden, intermediate // 2),
+        "w2_weight_sf": (experts, intermediate // 128, 4 * hidden),
+    }
+    for key, shape in expected.items():
+        tensor = view[key]
+        if tensor.device != x.device:
+            raise ValueError(f"{key} must be on {x.device}, got {tensor.device}.")
+        if tensor.dtype is not torch.uint8:
+            raise TypeError(f"{key} must be uint8, got {tensor.dtype}.")
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{key} shape {tuple(tensor.shape)} != expected {shape}.")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{key} must be contiguous.")
+
+
+class SM12xMxfp8Mxfp4Runner(MoERunner):
+    """Unified adapter for the SM12x MXFP8 x MXFP4 internal op chain."""
+
+    backend_key = "sm12x_mxfp8_mxfp4"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP8),)
+    supported_activation_classes = (SwiGLU, SiTU)
+    supports_expert_parallelism = False
+    required_weight_keys = (
+        "w1_weight",
+        "w1_weight_sf",
+        "w2_weight",
+        "w2_weight_sf",
+    )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.tuning_config = TuningConfig()
+
+    def _check_activation_parameters(self) -> None:
+        _sm12x_mxfp8_mxfp4_activation_kwargs(self.config.activation)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..cute_dsl import is_cute_dsl_available
+        from ..jit.cpp_ext import get_cuda_version
+        from ..utils import get_compute_capability
+
+        if get_cuda_version().major < 13:
+            raise ValueError("SM12x MXFP8 x MXFP4 requires CUDA 13 or later.")
+        if not is_cute_dsl_available():
+            raise RuntimeError("SM12x MXFP8 x MXFP4 requires the CuTe DSL package.")
+        if get_compute_capability(self.device) not in ((12, 0), (12, 1)):
+            raise RuntimeError("SM12x MXFP8 x MXFP4 requires SM120 or SM121.")
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("SM12x MXFP8 x MXFP4 requires do_finalize=True.")
+        if not self.config.finalize.use_fused_finalize:
+            raise NotImplementedError(
+                "SM12x MXFP8 x MXFP4 requires use_fused_finalize=True."
+            )
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                "SM12x MXFP8 x MXFP4 quantizes BF16 activations internally."
+            )
+
+    def _build(self) -> None:
+        from .cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1 import (
+            cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4,
+            out_sf_shape,
+        )
+        from .cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc2_finalize import (
+            cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4,
+        )
+        from .cute_dsl.blackwell_sm12x.moe_mxfp8_q0_route_triton import (
+            Mxfp8Q0RouteWorkspace,
+            make_mxfp8_q0_route_workspace,
+            mxfp8_q0_route_triton,
+        )
+
+        self._fc1 = cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4
+        self._fc2 = cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4
+        self._out_sf_shape = out_sf_shape
+        self._workspace_cls = Mxfp8Q0RouteWorkspace
+        self._make_workspace = make_mxfp8_q0_route_workspace
+        self._route = mxfp8_q0_route_triton
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.hidden_states_q.dtype is not torch.bfloat16:
+            raise TypeError("SM12x MXFP8 x MXFP4 requires BF16 hidden states.")
+        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+            raise ValueError(
+                "SM12x MXFP8 x MXFP4 requires activation scales to be None."
+            )
+        _validate_prerouted_inputs(
+            act,
+            act.hidden_states_q.shape[0],
+            self.config.routing.top_k,
+            type(self).__name__,
+        )
+        if act.topk_weights.dtype is not torch.float32:
+            raise TypeError("SM12x MXFP8 x MXFP4 requires FP32 top-k weights.")
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self.required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        _validate_sm12x_mxfp8_mxfp4_weight_view(view, act.hidden_states_q, self.config)
+        x = act.hidden_states_q
+        num_experts = self.config.routing.num_experts
+        workspace = self._make_workspace(x, act.topk_ids, num_experts)
+        total_pairs = x.shape[0] * act.topk_ids.shape[1]
+        intermediate_size = view["w1_weight"].shape[1] // 2
+        q1 = torch.empty(
+            total_pairs,
+            intermediate_size,
+            dtype=torch.float8_e4m3fn,
+            device=x.device,
+        )
+        sf1 = torch.zeros(
+            self._out_sf_shape(total_pairs, intermediate_size, num_experts),
+            dtype=torch.int32,
+            device=x.device,
+        )
+        output = torch.zeros(
+            x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
+        )
+        return [
+            x,
+            act.topk_ids,
+            act.topk_weights,
+            view["w1_weight"],
+            view["w1_weight_sf"],
+            view["w2_weight"],
+            view["w2_weight_sf"],
+            q1,
+            sf1,
+            output,
+            workspace.counts,
+            workspace.offsets,
+            workspace.expert_cursor,
+            workspace.token_map,
+            workspace.token_weights,
+            workspace.dst_rows,
+            workspace.scale_dst_rows,
+            workspace.q_out,
+            workspace.scale_out,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError("SM12x MXFP8 x MXFP4 supports only tactic -1.")
+        x, ids, topk_weights, w1, w1_sf, w2, w2_sf, q1, sf1, output = inputs[:10]
+        workspace = self._workspace_cls(*inputs[10:])
+        activation = self.config.activation
+        act_kwargs = _sm12x_mxfp8_mxfp4_activation_kwargs(activation)
+        enable_pdl = self.config.execution.enable_pdl is not False
+        output.zero_()
+        offsets, token_map, route_weights, a_q, a_scale = self._route(
+            x,
+            ids,
+            topk_weights,
+            self.config.routing.num_experts,
+            workspace=workspace,
+            enable_pdl=enable_pdl,
+        )
+        self._fc1(
+            a_q,
+            a_scale,
+            w1,
+            w1_sf,
+            offsets,
+            tune=False,
+            enable_pdl=enable_pdl,
+            out_q=q1,
+            out_sf=sf1,
+            **act_kwargs,
+        )
+        self._fc2(
+            q1,
+            sf1,
+            w2,
+            w2_sf,
+            offsets,
+            token_map,
+            route_weights,
+            x.shape[0],
+            tune=False,
+            enable_pdl=enable_pdl,
+            out=output,
+        )
+        return output
+
+
+# ---------------------------------------------------------------------------
+# SM12x NVFP4 x BF16 runner - shared cuTile NVFP4 weight view, fixed tactic
+# ---------------------------------------------------------------------------
+
+
+class _SM12xNvfp4Bf16Inputs(list):
+    """Packed inputs padded to a token bucket; ``num_tokens`` is the real count."""
+
+    num_tokens: int
+
+
+class SM12xNvfp4Bf16Runner(MoERunner):
+    """CuTe-DSL W4A16 over the canonical NVFP4 weights shared with W4A4.
+
+    Kernels are specialized per token count, so calls are padded to the
+    layer's hybrid token bucket: padded rows repeat row 0's experts with zero
+    router weight, which adds no weight traffic and bounds compilation.
+    """
+
+    backend_key = "sm12x_nvfp4_bf16"
+    # A view prepared for the cuTile NVFP4 runners is the same tensors.
+    weight_view_keys = (backend_key, "cutile_nvfp4")
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
+    supported_activation_classes = (SwiGLU, ReLU2)
+    supports_expert_parallelism = False
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.tuning_config = TuningConfig()
+        self._workspaces: dict[int, list[torch.Tensor]] = {}
+
+    def _check_activation_parameters(self) -> None:
+        activation = self.config.activation
+        if isinstance(activation, SwiGLU) and activation != SwiGLU():
+            raise NotImplementedError(
+                "SM12x NVFP4 x BF16 supports only default SwiGLU alpha, beta and limit."
+            )
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..cute_dsl import is_cute_dsl_available
+        from ..jit.cpp_ext import get_cuda_version
+        from ..utils import get_compute_capability
+
+        if get_cuda_version().major < 13:
+            raise ValueError("SM12x NVFP4 x BF16 requires CUDA 13 or later.")
+        if not is_cute_dsl_available():
+            raise RuntimeError("SM12x NVFP4 x BF16 requires the CuTe DSL package.")
+        if get_compute_capability(self.device) not in ((12, 0), (12, 1)):
+            raise RuntimeError("SM12x NVFP4 x BF16 requires SM120 or SM121.")
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("SM12x NVFP4 x BF16 requires do_finalize=True.")
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                "SM12x NVFP4 x BF16 does not take activation scales."
+            )
+
+    def _build(self) -> None:
+        from .cute_dsl.blackwell_sm12x.moe_nvfp4_w4a16 import (
+            allocate_workspace,
+            run_moe_w4a16,
+        )
+
+        self._run = run_moe_w4a16
+        self._allocate_workspace = allocate_workspace
+
+    def _workspace(self, capacity: int, hidden_size: int) -> list[torch.Tensor]:
+        # One per token bucket and runner: layers never share scratch, and the
+        # persistent kernel's completion counters stay private to this layer.
+        workspace = self._workspaces.get(capacity)
+        if workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{type(self).__name__} workspace for token bucket {capacity} "
+                    "must be allocated before CUDA Graph capture; warm this bucket "
+                    "first."
+                )
+            workspace = self._allocate_workspace(
+                num_tokens=capacity,
+                hidden_size=hidden_size,
+                intermediate_size=self.config.experts.intermediate_size,
+                num_experts=self.config.routing.num_experts,
+                top_k=self.config.routing.top_k,
+                is_gated=self.config.activation.is_gated,
+                device=self.device,
+            )
+            self._workspaces[capacity] = workspace
+        return workspace
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def _weight_view(self, weights: MoEWeightPack) -> dict[str, torch.Tensor]:
+        for key in self.weight_view_keys:
+            if key in weights.native_views:
+                return weights.get_view(key)
+        return weights.get_view(self.backend_key)
+
+    def _canonical_weights(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> tuple[torch.Tensor, ...]:
+        required = (
+            "w1",
+            "w1_scale",
+            "w1_global_scale",
+            "w2",
+            "w2_scale",
+            "w2_global_scale",
+        )
+        missing = [key for key in required if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        w1, s1, g1, w2, s2, g2 = (view[key] for key in required)
+        experts = self.config.routing.num_experts
+        inter = self.config.experts.intermediate_size
+        w1_rows = inter * (2 if self.config.activation.is_gated else 1)
+        pad = lambda n, m: (n + m - 1) // m * m  # noqa: E731
+        expected = {
+            "w1": (w1, (experts, w1_rows, hidden_size // 2), torch.uint8),
+            "w2": (w2, (experts, hidden_size, inter // 2), torch.uint8),
+            "w1_global_scale": (g1, (experts,), torch.float32),
+            "w2_global_scale": (g2, (experts,), torch.float32),
+        }
+        for key, (tensor, shape, dtype) in expected.items():
+            if tuple(tensor.shape) != shape or tensor.dtype is not dtype:
+                raise ValueError(
+                    f"{self.backend_key}: {key} must be {dtype} {shape}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                )
+        # The cuTile view stores 128x4-swizzled scales as [E, rows/128, K/64, 32, 16];
+        # the kernel reads the same bytes as [E, pad128(rows), pad4(K/16)].
+        scales = []
+        for key, tensor, rows, k in (
+            ("w1_scale", s1, w1_rows, hidden_size),
+            ("w2_scale", s2, hidden_size, inter),
+        ):
+            shape = (experts, pad(rows, 128), pad(k // 16, 4))
+            if tensor.dtype is not torch.float8_e4m3fn or tensor.numel() != (
+                shape[0] * shape[1] * shape[2]
+            ):
+                raise ValueError(
+                    f"{self.backend_key}: {key} must hold 128x4-swizzled E4M3 "
+                    f"scales for {shape}, got {tensor.dtype} {tuple(tensor.shape)}."
+                )
+            scales.append(tensor.view(shape))
+        for tensor in (w1, w2, g1, g2, *scales):
+            if tensor.device != self.device or not tensor.is_contiguous():
+                raise ValueError(
+                    f"{self.backend_key} weights must be contiguous on {self.device}."
+                )
+        return w1, scales[0], g1, w2, scales[1], g2
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only PackedPrecomputed routing."
+            )
+        x = act.hidden_states_q
+        if x.ndim != 2 or x.dtype is not torch.bfloat16 or not x.is_contiguous():
+            raise TypeError(
+                f"{type(self).__name__} requires contiguous 2D BF16 hidden states."
+            )
+        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+            raise ValueError(f"{type(self).__name__} requires activation scales None.")
+        num_tokens, hidden_size = x.shape
+        if num_tokens == 0:
+            raise NotImplementedError(
+                f"{type(self).__name__} needs at least one token."
+            )
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32,),
+            require_contiguous=True,
+        )
+        ceiling = self.config.execution.tune_max_num_tokens
+        if num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}."
+            )
+        w1, s1, g1, w2, s2, g2 = self._canonical_weights(
+            self._weight_view(weights), hidden_size
+        )
+        ids, topk_weights = act.topk_ids, act.topk_weights
+        capacity = map_to_hybrid_bucket(num_tokens, ceiling)
+        if capacity != num_tokens:
+            pad_rows = capacity - num_tokens
+            x = torch.cat((x, x[:1].expand(pad_rows, -1)))
+            ids = torch.cat((ids, ids[:1].expand(pad_rows, -1)))
+            topk_weights = torch.cat(
+                (topk_weights, topk_weights.new_zeros(pad_rows, topk_weights.shape[1]))
+            )
+        packed = _SM12xNvfp4Bf16Inputs(
+            [x.new_empty(x.shape), x, ids, topk_weights, w1, s1, g1, w2, s2, g2]
+        )
+        packed.num_tokens = num_tokens
+        return packed
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError(f"{type(self).__name__} supports only tactic -1.")
+        out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2 = inputs
+        workspace = self._workspace(x.shape[0], x.shape[1])
+        self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, out, workspace)
+        return out[: getattr(inputs, "num_tokens", out.shape[0])]
+
+
+# ---------------------------------------------------------------------------
+# SM12x b12x runners - fixed tactic, existing wrapper delegation
 # ---------------------------------------------------------------------------
 
 
@@ -5894,6 +8136,28 @@ class _B12xRunner(MoERunner):
                 f"b12x unified MoE requires SM120 or SM121, got SM{major}{minor}."
             )
 
+        experts = self.config.experts
+        num_experts = self.config.routing.num_experts
+        local_num_experts = (
+            experts.local_num_experts
+            if experts.local_num_experts is not None
+            else num_experts
+        )
+        if experts.local_expert_offset != 0 or local_num_experts != num_experts:
+            if not 0 < local_num_experts <= num_experts:
+                raise ValueError(
+                    f"local_num_experts={local_num_experts} must be in "
+                    f"[1, num_experts={num_experts}]."
+                )
+            if (
+                experts.local_expert_offset < 0
+                or experts.local_expert_offset + local_num_experts > num_experts
+            ):
+                raise ValueError(
+                    f"local expert block [{experts.local_expert_offset}, "
+                    f"{experts.local_expert_offset + local_num_experts}) exceeds "
+                    f"num_experts={num_experts}."
+                )
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
 
@@ -5915,6 +8179,12 @@ class _B12xRunner(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.activation = None
         self.tuning_config = TuningConfig()
+        self._local_num_experts = (
+            config.experts.local_num_experts
+            if config.experts.local_num_experts is not None
+            else config.routing.num_experts
+        )
+        self._local_expert_offset = config.experts.local_expert_offset
         self._prepared_weights: dict[str, torch.Tensor] | None = None
         self._inner: Any = None
         self._wrapper_cls: Any = None
@@ -5965,13 +8235,29 @@ class _B12xRunner(MoERunner):
             and num_tokens <= self._inner.max_num_tokens
         ):
             return
+        num_experts = self.config.routing.num_experts
+        expert_map = None
+        if self._local_num_experts != num_experts or self._local_expert_offset != 0:
+            # ExpertConfig describes a contiguous shard, so expand it into
+            # the wrapper's global-to-local map.
+            expert_map = torch.full(
+                (num_experts,), -1, dtype=torch.int32, device=self.device
+            )
+            expert_map[
+                self._local_expert_offset : self._local_expert_offset
+                + self._local_num_experts
+            ] = torch.arange(
+                self._local_num_experts, dtype=torch.int32, device=self.device
+            )
         self._inner = self._wrapper_cls(
-            num_experts=self.config.routing.num_experts,
+            num_experts=num_experts,
             top_k=self.config.routing.top_k,
             hidden_size=hidden_size,
             intermediate_size=self.config.experts.intermediate_size,
             use_cuda_graph=True,
             max_num_tokens=max(1, num_tokens),
+            num_local_experts=self._local_num_experts,
+            expert_map=expert_map,
             device=self.device,
             activation=self.activation,
             quant_mode=self._get_quant_mode_name(),
@@ -5984,12 +8270,14 @@ class _B12xRunner(MoERunner):
         self._require_built()
         v = weights.get_view(self.backend_key)
         self._validate_prepared_weights(v)
-        first_weight = v[self.required_weight_keys[0]]
-        if first_weight.shape[0] != self.config.routing.num_experts:
-            raise ValueError(
-                f"{self.backend_key} prepared {first_weight.shape[0]} "
-                f"experts, expected {self.config.routing.num_experts}."
-            )
+        # Only the packed weights are expert-major; SFs are swizzled, alphas may broadcast.
+        for key in ("w1_weight", "w2_weight"):
+            prepared_experts = v[key].shape[0]
+            if prepared_experts != self._local_num_experts:
+                raise ValueError(
+                    f"{self.backend_key} {key} prepared {prepared_experts} "
+                    f"experts, expected {self._local_num_experts} rank-local ones."
+                )
 
         hidden_states = act.hidden_states_q
         if hidden_states.dtype != torch.bfloat16:
@@ -6087,12 +8375,18 @@ class B12xNvfp4Runner(_B12xRunner):
 
 
 class B12xW4A16Runner(_B12xRunner):
-    """Unified SM120/SM121 adapter for b12x W4A16 MoE."""
+    """Unified SM120/SM121 adapter for b12x W4A16 MoE.
+
+    Supports expert parallelism over a contiguous expert shard
+    (``ExpertConfig.local_expert_offset`` / ``local_num_experts``): each rank
+    computes a zero-filled partial that the caller sums across the EP group.
+    """
 
     backend_key = "b12x_w4a16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
     supported_activation_classes = (SwiGLU, ReLU2)
+    supports_expert_parallelism = True
     required_weight_keys = (
         "w1_weight",
         "w1_weight_sf",

@@ -29,6 +29,7 @@
 # This file is ported from CUTLASS's Rubin dense_blockscaled_gemm_persistent.py
 # with modifications for FlashInfer integration (alpha scaling, tensor-based API, wrapper method).
 
+import logging
 import os
 import sys
 from typing import Literal, NamedTuple, Optional, Tuple, Type, Union
@@ -50,20 +51,17 @@ from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+logger = logging.getLogger(__name__)
+
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, ".."))
 
-# Import from the nvidia-cutlass-dsl wheel's Blackwell kernel (not TRT-LLM's modified version)
-# The wheel's Blackwell kernel is the correct parent for Rubin
-from nvidia_cutlass_dsl.examples.CuTeDSL.cute.blackwell.kernel.blockscaled_gemm import (
-    dense_blockscaled_gemm_persistent as _sm100_blockscaled_gemm,
-)
-
-Sm100BlockScaledPersistentDenseGemmKernel = (
-    _sm100_blockscaled_gemm.Sm100BlockScaledPersistentDenseGemmKernel
-)
-scaled_mm = _sm100_blockscaled_gemm.scaled_mm
+# Use FlashInfer's own Blackwell parent. flashinfer/data is a build-time
+# artifact and its CUTLASS package-data ships only include/** and
+# tools/util/include/**, so importing the examples tree resolves in an
+# editable checkout but not in a released wheel.
+from .dense_blockscaled_gemm_sm100 import Sm100BlockScaledPersistentDenseGemmKernel
 
 
 """
@@ -224,6 +222,37 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
         # Prefetch configuration: None=auto (num_ab_stage), 0=disable, >0=explicit distance
         self.prefetch_dist_param = prefetch_dist
+
+    @staticmethod
+    def _compute_grid(
+        c: cute.Tensor,
+        cta_tile_shape_mnk: Tuple[int, int, int],
+        cluster_shape_mn: Tuple[int, int],
+        max_active_clusters: cutlass.Constexpr,
+        swizzle_size: int = 1,
+        raster_order: Literal["m", "n"] = "m",
+    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+        """Adapt the bundled Blackwell parent to the CuTe DSL 4.8 scheduler ABI.
+
+        The SM107 kernel passes the swizzle and raster-order controls introduced
+        by the newer CUTLASS example.  FlashInfer's pinned Blackwell parent has
+        the older helper signature, although its scheduler implementation
+        already supports both fields.
+        """
+        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
+        gc = cute.zipped_divide(c, tiler=c_shape)
+        num_ctas_mnl = gc[(0, (None, None, None))].shape
+        cluster_shape_mnl = (*cluster_shape_mn, 1)
+        tile_sched_params = utils.PersistentTileSchedulerParams(
+            num_ctas_mnl,
+            cluster_shape_mnl,
+            swizzle_size,
+            raster_order == "m",
+        )
+        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+            tile_sched_params, max_active_clusters
+        )
+        return tile_sched_params, grid
 
     # ------------------------------------------------------------------
     # flashinfer compatibility shims (not in TRT-LLM): the mm_fp4 cute-dsl
@@ -2290,7 +2319,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 m, n, k, l, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
             )
         except testing.CantImplementError as e:
-            print(f"[DSL ERROR] CantImplementError: {e}")
+            # Unsupported autotuning candidates are expected, not kernel failures.
+            logger.debug("Skipping unsupported GEMM candidate: %s", e)
             return False
         return True
 

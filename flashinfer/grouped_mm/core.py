@@ -33,7 +33,7 @@ from .cudnn import (
 # =========================================================================
 
 
-@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_bf16(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -88,7 +88,7 @@ def grouped_mm_bf16(
     backend: str = "cudnn",
     tactic: int = -1,
 ) -> torch.Tensor:
-    r"""Grouped matrix multiplication with BF16/FP16 data types (cuDNN MOE backend).
+    r"""Grouped matrix multiplication with BF16/FP16 data types (cuDNN MOE backend, or the experimental Cake backend).
 
     Performs a grouped GEMM across experts, as used in Mixture-of-Experts layers.
     Mirrors :func:`flashinfer.mm_bf16` but for expert-partitioned inputs.
@@ -113,10 +113,16 @@ def grouped_mm_bf16(
     out_dtype : torch.dtype
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
-        Backend selector.  Currently only ``"cudnn"`` is supported.
+        Backend selector.  ``"cudnn"`` (default), or the experimental
+        ``"cake"`` backend (:mod:`flashinfer.experimental.cake_moe_grouped_gemm`,
+        SM100 / SM103 / SM107): generated ragged BF16 programs that read
+        ``m_indptr`` on the device, need no padding, produce bfloat16 outputs
+        only and require ``n % 256 == 0`` and ``k % 64 == 0``.  Naming it is the
+        opt-in and emits an ``ExperimentalWarning`` once.
     tactic : int
         cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
-        plan; non-negative values select a specific plan.
+        plan; non-negative values select a specific plan.  The Cake backend has
+        a single program per architecture and accepts only ``-1``.
 
     Returns
     -------
@@ -131,7 +137,16 @@ def grouped_mm_bf16(
     >>> b = torch.randn(E, n, k, dtype=torch.bfloat16, device="cuda")
     >>> m_indptr = (torch.arange(E + 1, device="cuda") * tpe).to(torch.int32)
     >>> out = flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr)
+    >>> out_cake = flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr, backend="cake")
     """
+    if backend == "cake":
+        from ..experimental.cake_moe_grouped_gemm.cake_backend import (
+            grouped_mm_bf16_cake,
+        )
+
+        return grouped_mm_bf16_cake(
+            a, b, m_indptr, out=out, out_dtype=out_dtype, tactic=tactic
+        )
 
     if out is not None:
         out_dtype = out.dtype

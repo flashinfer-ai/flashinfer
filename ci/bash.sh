@@ -83,7 +83,11 @@ fi
 
 # Use nvidia-docker if the container is GPU.
 if [[ ${USE_GPU} == "true" ]]; then
-    DOCKER_ENV="${DOCKER_ENV} -e CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    # An unset host mask should leave the container's GPUs visible. Preserve
+    # explicitly configured masks, including an intentionally empty one.
+    if [[ -v CUDA_VISIBLE_DEVICES ]]; then
+        DOCKER_ENV="${DOCKER_ENV} -e CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    fi
     if type nvidia-docker 1> /dev/null 2> /dev/null; then
         DOCKER_BINARY=nvidia-docker
     else

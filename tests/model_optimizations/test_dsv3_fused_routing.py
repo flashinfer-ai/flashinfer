@@ -516,6 +516,67 @@ def test_dsv3_fused_routing_backend_correctness(
     )
 
 
+@pytest.mark.parametrize("backend", ["default", "cake"])
+@pytest.mark.parametrize(
+    "strided", ["scores", "bias", "topk_values", "topk_indices", "routing_replay_out"]
+)
+def test_dsv3_fused_routing_rejects_strided_views(backend, strided):
+    """Every tensor argument must be contiguous; a strided view is rejected, not misread."""
+
+    if backend == "cake" and torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Cake fused routing requires SM100 or SM103")
+
+    num_tokens, num_experts, topk = 4, 256, 8
+
+    def dense_or_strided(name, *shape, dtype):
+        if name != strided:
+            return torch.zeros(*shape, device="cuda", dtype=dtype)
+        wide = torch.zeros(*shape[:-1], 2 * shape[-1], device="cuda", dtype=dtype)
+        return wide[..., ::2]
+
+    scores = dense_or_strided("scores", num_tokens, num_experts, dtype=torch.bfloat16)
+    bias = dense_or_strided("bias", num_experts, dtype=torch.bfloat16)
+    topk_values = dense_or_strided(
+        "topk_values", num_tokens, topk, dtype=torch.bfloat16
+    )
+    topk_indices = dense_or_strided("topk_indices", num_tokens, topk, dtype=torch.int32)
+    routing_replay_out = dense_or_strided(
+        "routing_replay_out", num_tokens, topk, dtype=torch.int16
+    )
+
+    with pytest.raises(ValueError, match="contiguous"):
+        fused_topk_deepseek(
+            scores,
+            bias,
+            8,
+            4,
+            topk,
+            1.0,
+            topk_values,
+            topk_indices,
+            routing_replay_out=routing_replay_out,
+            backend=backend,
+        )
+    # The binding enforces the same contract when the Python checks are skipped.
+    with pytest.raises(Exception, match="contiguous"):
+        fused_topk_deepseek(
+            scores,
+            bias,
+            8,
+            4,
+            topk,
+            1.0,
+            topk_values,
+            topk_indices,
+            routing_replay_out=routing_replay_out,
+            backend=backend,
+            skip_check=True,
+        )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 16, 64])
 @pytest.mark.parametrize("num_experts", [256, 384])
 @pytest.mark.parametrize("topk", [1, 2, 4, 8])

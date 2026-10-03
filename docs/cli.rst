@@ -108,6 +108,11 @@ environment:
 
 This command installs from the flat FlashInfer wheel index.
 
+Wheel installs prefer ``uv pip`` when ``pyvenv.cfg`` identifies a uv-created
+environment, or when pip is unavailable, provided uv is on ``PATH``. Otherwise,
+they use ``python -m pip``. Both target the interpreter running FlashInfer;
+uv receives an explicit ``--python`` argument.
+
 Install JIT Cache Wheel
 -----------------------
 
