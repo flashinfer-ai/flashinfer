@@ -173,7 +173,10 @@ enum class ActivationType : int64_t {
   GegluTanh = 8,
   Identity = 9,
   Situ = 10,
-  InvalidType = 11,  // Must be last
+  InvalidType = 11,  // Must be last among the normally-sequential members
+  // CUTLASS-backend only. Keep this after InvalidType so the existing values
+  // consumed by the TRT-LLM backend remain stable.
+  ClampedRelu2 = 12,
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -200,6 +203,8 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "GegluTanh";
     case ActivationType::Situ:
       return "Situ";
+    case ActivationType::ClampedRelu2:
+      return "ClampedRelu2";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
