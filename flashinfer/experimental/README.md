@@ -82,6 +82,10 @@ support trace, and a trace-apply solution is the deployer's explicit choice.
 Importing `flashinfer.experimental` is always allowed so that tooling, docs,
 and introspection work; nothing is enforced at import time.
 
+The optional [cuDNN variable-length Top-K backend](cudnn_topk_varlen/README.md)
+uses this gate behind the stable `top_k_varlen` API. Its automatic eligibility
+is a narrow shape allowlist; `backend="cudnn"` is the explicit opt-in.
+
 ### Gating primitives
 
 Defined in `flashinfer/api_logging.py` (`experimental_backend` lives in
