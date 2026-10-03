@@ -46,35 +46,19 @@ PRIMARY_K = (0, 1, 4, 8)
 POLICY_ROWS = [
     ("sm_100a", 1, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 1),
     ("sm_100a", 16, 0, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 16),
-    ("sm_100a", 32, 0, False, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 32),
+    ("sm_100a", 32, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 32),
     ("sm_100a", 8, 1, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 8),
     ("sm_100a", 16, 4, True, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 32),
-    (
-        "sm_100a",
-        256,
-        0,
-        True,
-        "k0_tma",
-        "k0_tma_persistent_ws288_vec128_fp32x2",
-        2 * SM_COUNT,
-    ),
+    ("sm_100a", 256, 0, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 256),
     ("sm_100a", 2048, 0, True, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 148),
     ("sm_100a", 256, 8, False, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
     ("sm_100a", 1, 5, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
-    ("sm_100a", 64, 4, True, "native", "native_m128_nc3_d2_ws288_grid148", NATIVE_GRID),
+    ("sm_100a", 64, 4, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 64),
     ("sm_100a", 1, 7, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
     ("sm_100a", 1, 7, True, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
     ("sm_100a", 16, 8, True, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 64),
     ("sm_100a", 16, 8, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 64),
-    (
-        "sm_100a",
-        512,
-        1,
-        False,
-        "persistent",
-        "trtllm_persistent_ws288_nc2_d2_vec128_fp32x2_early_consume",
-        128,
-    ),
+    ("sm_100a", 512, 1, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 512),
     (
         "sm_100a",
         1024,
@@ -112,7 +96,7 @@ POLICY_ROWS = [
         NATIVE_GRID,
     ),
     ("sm_103a", 4, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 4),
-    ("sm_103a", 32, 0, False, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 32),
+    ("sm_103a", 32, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 32),
     ("sm_103a", 1, 3, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 1),
     ("sm_103a", 16, 4, False, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 32),
     (
@@ -155,15 +139,9 @@ POLICY_ROWS = [
         "trtllm_persistent_ws288_nc4_d3_vec128_fp32x2_early_consume_relaxed_producer_wait",
         148,
     ),
-    (
-        "sm_103a",
-        256,
-        1,
-        False,
-        "persistent",
-        "trtllm_persistent_ws288_nc2_d2_vec128_fp32x2",
-        128,
-    ),
+    ("sm_103a", 256, 1, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 256),
+    ("sm_103a", 512, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 512),
+    ("sm_103a", 512, 1, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 512),
     (
         "sm_103a",
         512,
@@ -238,17 +216,26 @@ def test_small_m_table_boundary():
             bands = cb._SMALL_M_CLUSTER[arch].get(K, ())
             assert list(bands) == sorted(bands)
             assert all(cs in (2, 4) and 1 <= mm <= max_m for mm, cs in bands)
+            chunk_bands = cb._SMALL_M_CHUNK_BANDS[arch].get(K, ())
+            assert list(chunk_bands) == sorted(chunk_bands)
+            assert all(1 <= nc <= 8 and 1 <= mm <= max_m for mm, nc in chunk_bands)
             edges = {mm for mm, _cs in bands} | {
                 mm + 1 for mm, _cs in bands if mm < max_m
+            }
+            edges |= {mm for mm, _nc in chunk_bands} | {
+                mm + 1 for mm, _nc in chunk_bands if mm < max_m
             }
             for m in sorted({1, max_m} | edges):
                 at = plan_route(arch, SM_COUNT, m, K, False)
                 cluster = cb._small_m_cluster(arch, m, K)
+                nc = cb._small_m_sources_per_chunk(arch, m, K)
+                suffix = "" if nc is None else f"_nc{nc}"
                 key = (
-                    f"small_m_direct:k{K}"
+                    f"small_m_direct:k{K}{suffix}"
                     if cluster == 1
-                    else f"small_m_cluster{cluster}:k{K}"
+                    else f"small_m_cluster{cluster}:k{K}{suffix}"
                 )
+                assert at.schedule_id.endswith(suffix)
                 assert (at.kind, at.kernel_key, at.grid_x, at.threads) == (
                     "small_m",
                     key,
@@ -262,8 +249,9 @@ def test_small_m_table_boundary():
 
 
 def test_persistent_key_is_the_complete_flag_tuple():
-    a = plan_route("sm_103a", SM_COUNT, 32, 1, True)
-    b = plan_route("sm_103a", SM_COUNT, 32, 1, False)
+    # M 1024 is the first K1 token count above the small-M table on both architectures
+    a = plan_route("sm_103a", SM_COUNT, 1024, 1, True)
+    b = plan_route("sm_103a", SM_COUNT, 1024, 1, False)
     for plan in (a, b):
         assert plan.kind == "persistent"
         assert re.fullmatch(r"persistent:k1_nc\d_d\d_f[01]{15}", plan.kernel_key)

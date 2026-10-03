@@ -165,8 +165,8 @@ _NATIVE_K8_SM100_PDL_ONLY_M = frozenset({16})
 # Small-M direct kernel: one token per 256-thread CTA, every source register-resident,
 # selected ahead of every other dense program for M <= max_m (per architecture and K).
 _SMALL_M_DIRECT_MAX_M = {
-    "sm_100a": {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16},
-    "sm_103a": {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16},
+    "sm_100a": {0: 256, 1: 512, 2: 256, 3: 256, 4: 128, 5: 128, 6: 128, 7: 128, 8: 64},
+    "sm_103a": {0: 512, 1: 512, 2: 256, 3: 256, 4: 128, 5: 128, 6: 128, 7: 128, 8: 64},
 }
 # Cluster split of the small-M kernel: K -> ((max_m, cluster), ...) bands in ascending max_m; the
 # first band with max_m >= M gives the CTAs per token (2 or 4). K absent or M above the last band
@@ -175,16 +175,16 @@ _SMALL_M_CLUSTER: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
     "sm_100a": {
         4: ((4, 4), (16, 2)),
         5: ((4, 4), (16, 2)),
-        6: ((4, 4), (16, 2)),
-        7: ((4, 4), (16, 2)),
-        8: ((16, 4),),
+        6: ((4, 4), (32, 2)),
+        7: ((4, 4), (64, 2)),
+        8: ((16, 4), (64, 2)),
     },
     "sm_103a": {
         4: ((16, 2),),
-        5: ((16, 2),),
-        6: ((16, 2),),
-        7: ((16, 2),),
-        8: ((16, 2),),
+        5: ((32, 2),),
+        6: ((32, 2),),
+        7: ((32, 2),),
+        8: ((64, 2),),
     },
 }
 
@@ -194,6 +194,24 @@ def _small_m_cluster(arch: str, M: int, K: int) -> int:
         if max_m >= M:
             return int(cluster)
     return 1
+
+
+# Online-softmax chunk size of the small-M programs: K -> ((max_m, sources_per_chunk), ...) bands in
+# ascending max_m; the first band with max_m >= M applies, K absent or M above the last band -> the
+# program default (nc4 for K <= 3, nc3 for K >= 4). The mid-M cells mirror the chunking of the
+# persistent program they replace (nc4), so their results are bit-identical to it.
+_SMALL_M_CHUNK_BANDS: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
+    "sm_100a": {5: ((16, 3), (128, 4)), 6: ((16, 3), (128, 4)), 7: ((16, 3), (128, 4))},
+    "sm_103a": {5: ((16, 3), (128, 4)), 6: ((16, 3), (128, 4)), 7: ((16, 3), (128, 4))},
+}
+
+
+def _small_m_sources_per_chunk(arch: str, M: int, K: int) -> int | None:
+    default = 4 if K <= 3 else 3
+    for max_m, sources_per_chunk in _SMALL_M_CHUNK_BANDS[arch].get(K, ()):
+        if max_m >= M:
+            return None if int(sources_per_chunk) == default else int(sources_per_chunk)
+    return None
 
 
 class RoutePlan(NamedTuple):
@@ -349,14 +367,18 @@ def plan_route(
     if max_m is not None and max_m >= M:
         cluster = _small_m_cluster(arch, M, K)
         threads = DIRECT_THREADS // cluster
+        sources_per_chunk = _small_m_sources_per_chunk(arch, M, K)
+        nc_suffix = "" if sources_per_chunk is None else f"_nc{sources_per_chunk}"
         if cluster == 1:
-            schedule_id = "small_m_direct_cta256_regres_fp32x2"
+            schedule_id = f"small_m_direct_cta256_regres_fp32x2{nc_suffix}"
             grid_policy = "one_token_per_cta"
-            kernel_key = f"small_m_direct:k{K}"
+            kernel_key = f"small_m_direct:k{K}{nc_suffix}"
         else:
-            schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2"
+            schedule_id = (
+                f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2{nc_suffix}"
+            )
             grid_policy = f"one_token_per_cluster{cluster}"
-            kernel_key = f"small_m_cluster{cluster}:k{K}"
+            kernel_key = f"small_m_cluster{cluster}:k{K}{nc_suffix}"
         route_id = (
             f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write0.norm1."
             f"pdl{int(use_pdl)}.{grid_policy}"
