@@ -53,7 +53,7 @@ from ..trace.templates.moe import (
 from ..utils import get_compute_capability, round_up
 
 if TYPE_CHECKING:
-    from .api import QuantConfig
+    from .api import ActivationConfig, QuantConfig
 
 # Module-level permute-index caches. Permute indices depend on weight geometry
 # and layout parameters, so matching keys are safe to reuse across calls.
@@ -1686,6 +1686,52 @@ def prepare_cutile_mxfp4_weights(
             num_local_experts, dtype=torch.float32, device=device
         ),
     }
+
+
+def prepare_cutile_deepseek_fp8_weights(
+    w1_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation: ActivationConfig,
+    device: Optional[torch.device] = None,
+    cache_bf16_weights: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Preserve checkpoint E4M3 data and FP32 block scales in gate/up order."""
+    if hidden_size % 128 or intermediate_size % 128:
+        raise ValueError(
+            "DeepSeek FP8 hidden/intermediate sizes must be multiples of 128."
+        )
+    device = w1_fp8.device if device is None else device
+    result = {}
+    rows = intermediate_size * (2 if activation.is_gated else 1)
+    for name, weight, scale, n, k in (
+        ("w1", w1_fp8, w1_scale, rows, hidden_size),
+        ("w2", w2_fp8, w2_scale, hidden_size, intermediate_size),
+    ):
+        if weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float32:
+            raise TypeError("DeepSeek weights require E4M3 data and FP32 scales.")
+        if weight.shape != (num_local_experts, n, k) or scale.shape != (
+            num_local_experts,
+            n // 128,
+            k // 128,
+        ):
+            raise ValueError("DeepSeek weight and 128x128 scale shapes do not match.")
+        weight, scale = weight.to(device), scale.to(device)
+        if name == "w1" and activation.is_gated:
+            up, gate = weight.view(torch.uint8).chunk(2, dim=1)
+            weight = torch.cat((gate, up), dim=1).view(torch.float8_e4m3fn)
+            up, gate = scale.chunk(2, dim=1)
+            scale = torch.cat((gate, up), dim=1)
+        result[name] = weight.contiguous()
+        result[f"{name}_scale"] = scale.contiguous()
+        if cache_bf16_weights:
+            result[f"{name}_bf16"] = result[name].to(torch.bfloat16)
+    return result
 
 
 def prepare_cutile_fp8_weights(

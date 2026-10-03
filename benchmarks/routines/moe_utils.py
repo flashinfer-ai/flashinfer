@@ -560,6 +560,8 @@ def calculate_moe_kernel_bandwidth(
             granularity = 128 * 128 if is_weight else 128
             # 1 e4m3 + 1 float32 scale factor per block
             return 1.0 + (4 / granularity)
+        elif fmt == "bf16_block_scale":
+            return 2.0 + 4 / (128 * 128)
         return dtype.itemsize
 
     input_bytes_per_element = get_effective_bytes(input_dtype, input_format)

@@ -113,7 +113,8 @@ A test case is generally invoked as `python3 flashinfer_benchmark.py --routine <
 The unified MoE comparison runs the selected backends from the same routing, activation,
 and weight inputs. Supported cuTile quantization modes are `bf16`, `nvfp4`,
 `nvfp4_w4a16`, `mxfp4`, `mxfp4_w4a16`, `fp8`, `fp8_w8a16`, `mxfp8`,
-`mxfp8_w8a16`, and `mxfp4_w4a8`. `fp8` uses per-tensor E4M3 scaling;
+`mxfp8_w8a16`, `mxfp4_w4a8`, `deepseek_fp8`, and `deepseek_fp8_w8a16`.
+`fp8` uses per-tensor E4M3 scaling;
 `mxfp8` uses E8M0 block scales. The W8A16 modes retain BF16 activations;
 `mxfp4_w4a8` uses MXFP4 weights with MXFP8 activations. A8 modes include
 BF16-to-FP8 quantization before both GEMMs in the timed region. This example uses the
