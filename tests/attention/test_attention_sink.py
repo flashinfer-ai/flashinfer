@@ -19,6 +19,7 @@ import math
 import pytest
 import torch
 from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
@@ -1123,6 +1124,149 @@ def test_attention_sink_varlen(
         f"kv_lens={[kv_indptr[i + 1] - kv_indptr[i] for i in range(batch_size)]}, "
         f"causal={causal}"
     )
+
+
+_NVFP4_KV_DTYPES = [torch.uint8] + (
+    [torch.float4_e2m1fn_x2] if hasattr(torch, "float4_e2m1fn_x2") else []
+)
+
+
+@pytest.mark.parametrize(
+    ("kv_data_type", "expected_backend"),
+    [(torch.bfloat16, "fa3")] + [(dtype, "fa2") for dtype in _NVFP4_KV_DTYPES],
+)
+def test_attention_sink_auto_selects_backend(
+    monkeypatch, kv_data_type, expected_backend
+):
+    from flashinfer.attention import _core
+
+    monkeypatch.setattr(
+        _core, "determine_attention_backend", lambda *args, **kwargs: "fa3"
+    )
+
+    def init_wrapper(self, **kwargs):
+        self._backend = kwargs["backend"]
+
+    monkeypatch.setattr(
+        _core.BatchPrefillWithPagedKVCacheWrapper, "__init__", init_wrapper
+    )
+    wrapper = flashinfer.BatchAttentionWithAttentionSinkWrapper(
+        torch.empty(8 * 1024 * 1024, dtype=torch.uint8),
+        kv_layout="HND",
+        backend="auto",
+        kv_data_type=kv_data_type,
+    )
+    assert wrapper._backend == expected_backend
+
+
+@pytest.mark.parametrize("kv_data_type", _NVFP4_KV_DTYPES)
+@pytest.mark.parametrize("window_left", [-1, 128])
+def test_attention_sink_nvfp4_paged_kv(window_left, kv_data_type):
+    """BatchAttentionWithAttentionSinkWrapper accepts a packed NVFP4 KV cache.
+
+    Regression test for https://github.com/flashinfer-ai/flashinfer/issues/5966:
+    the sink wrapper must declare the fp4 block scale-factor tensors next to the
+    sink tensor when the KV dtype is fp4x2_e2m1 (uint8), otherwise module
+    generation rejects the JIT spec. The fp4 result is checked against the same
+    wrapper running the dequantized KV as bf16.
+    """
+    device = torch.device("cuda:0")
+    torch.manual_seed(42)
+
+    head_dim, page_size = 128, 16
+    num_qo_heads, num_kv_heads = 16, 8
+    qo_len, kv_len = 200, 513
+    dtype = torch.bfloat16
+
+    num_pages = (kv_len + page_size - 1) // page_size
+    k_packed, k_sf, k_gs = create_nvfp4_kv(
+        (num_pages, num_kv_heads, page_size, head_dim // 2), device
+    )
+    v_packed, v_sf, v_gs = create_nvfp4_kv(
+        (num_pages, num_kv_heads, page_size, head_dim // 2), device
+    )
+    k_dq = nvfp4_to_float(k_packed, k_sf, k_gs).to(dtype)
+    v_dq = nvfp4_to_float(v_packed, v_sf, v_gs).to(dtype)
+    if kv_data_type != torch.uint8:
+        k_packed = k_packed.view(kv_data_type)
+        v_packed = v_packed.view(kv_data_type)
+
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=dtype, device=device)
+    sink = torch.rand(num_qo_heads, device=device, dtype=torch.float32) * 5
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
+    qo_indptr_host = torch.tensor([0, qo_len], dtype=torch.int32)
+    kv_indptr_host = torch.tensor([0, num_pages], dtype=torch.int32)
+    kv_indices_host = torch.arange(num_pages, dtype=torch.int32)
+    kv_last_page_len_host = torch.tensor(
+        [(kv_len - 1) % page_size + 1], dtype=torch.int32
+    )
+    plan_args = (
+        qo_indptr_host,
+        kv_indptr_host,
+        kv_indices_host,
+        kv_last_page_len_host,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+    )
+
+    def make_wrapper(kv_data_type):
+        return flashinfer.BatchAttentionWithAttentionSinkWrapper(
+            torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device),
+            kv_layout="HND",
+            backend="fa2",
+            q_data_type=dtype,
+            kv_data_type=kv_data_type,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            window_left=window_left,
+        )
+
+    wrapper_fp4 = make_wrapper(kv_data_type)
+    wrapper_fp4.plan(
+        *plan_args,
+        causal=True,
+        window_left=window_left,
+        q_data_type=dtype,
+        kv_data_type=kv_data_type,
+        non_blocking=True,
+    )
+    o_fp4 = wrapper_fp4.run(
+        q,
+        (k_packed, v_packed),
+        sink,
+        sm_scale,
+        k_scale=k_gs.item(),
+        v_scale=v_gs.item(),
+        kv_cache_sf=(k_sf, v_sf),
+    )
+
+    wrapper_ref = make_wrapper(dtype)
+    wrapper_ref.plan(
+        *plan_args,
+        causal=True,
+        window_left=window_left,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        non_blocking=True,
+    )
+    o_ref = wrapper_ref.run(q, (k_dq, v_dq), sink, sm_scale)
+
+    torch.testing.assert_close(o_fp4.float(), o_ref.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("kv_data_type", _NVFP4_KV_DTYPES)
+def test_attention_sink_nvfp4_fa3_rejected(kv_data_type):
+    """FA3 has no packed-FP4 KV path; the sink wrapper must fail early."""
+    with pytest.raises(NotImplementedError, match="only supported by the fa2"):
+        flashinfer.BatchAttentionWithAttentionSinkWrapper(
+            torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+            kv_layout="HND",
+            backend="fa3",
+            kv_data_type=kv_data_type,
+        )
 
 
 if __name__ == "__main__":
