@@ -1,42 +1,27 @@
-// Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
-// DeepGEMM portions are licensed under MIT; see ../DEEPGEMM_NOTICE.txt.
+/*
+ * Copyright (c) 2026 by FlashInfer team.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek, licensed under
+ * the MIT License; see DEEPGEMM_NOTICE.txt in this directory.
+ */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Deepgemm requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(128) DeepgemmTensorMap { uint64_t opaque[16]; };
-struct __align__(64) DeepgemmTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(DeepgemmTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(DeepgemmTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_deepgemm_fp4_gemm_device_common.cuh"
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(DeepgemmTensorMap) >= alignof(CUtensorMap), "DeepgemmTensorMap alignment must cover the CUtensorMap CUDA ABI");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define DEEPGEMM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_TMEM_ACC_OFFSET 0
 #define TMEM_TMEM_SFA_OFFSET 488
@@ -61,413 +46,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TOTAL 232448
 #define THREADS 256
 
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
-}
-
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count) : "memory");
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE;\n\t"
-        "bra.uni LAB_WAIT;\n\t"
-        "DONE:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-
-__device__ __forceinline__ void tcgen05_mma_mxf4_bs_cta2(
-    int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
-    int sfa_taddr, int sfb_taddr, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %6, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::mxf4.block_scale"
-        " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr),
-           "r"(enable_input_d));
-}
-
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
-
-
-union MmaSmemDesc {
-    uint64_t u64;
-    uint32_t u32[2];
-};
-
-__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
-}
-
-
-__device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "@leader tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], %1;\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "h"(cta_mask) : "memory");
-}
-
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-__device__ __forceinline__ uint32_t smem_addr(const void* ptr) {
-    uint32_t addr;
-    asm("{\n\t"
-        ".reg .u64 u64addr;\n\t"
-        "cvta.to.shared.u64 u64addr, %1;\n\t"
-        "cvt.u32.u64 %0, u64addr;\n\t"
-        "}\n" : "=r"(addr) : "l"(ptr));
-    return addr;
-}
-
-
-__device__ __forceinline__ uint32_t mapa_to_rank(uint32_t local_addr, uint32_t rank) {
-    uint32_t remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
-        : "=r"(remote) : "r"(local_addr), "r"(rank));
-    return remote;
-}
-
-
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-
-__device__ __forceinline__ uint64_t make_sf_cp_desc_sbo128(int addr) {
-    const int SBO = 128;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL);
-}
-
-
-__device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo128(int lo) {
-    const int SBO = 128;
-    return (uint64_t)(uint32_t)lo
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL);
-}
-
-
-__device__ __forceinline__ void tcgen05_cp_32x128b_warpx4_cta2(
-    int taddr, uint64_t s_desc) {
-    asm volatile(
-        "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-        :: "r"(taddr), "l"(s_desc));
-}
-
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
-
-
-__device__ __forceinline__ void tma_3d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tma_3d_gmem2smem_cta2(
-    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cluster.global"
-        ".mbarrier::complete_tx::bytes.cta_group::2"
-        " [%0], [%1, {%2, %3, %4}], [%5];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tma_store_2d(
-    const void *tmap, int x, int y, unsigned smem_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
-        " [%0, {%1, %2}], [%3];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
-    asm volatile(
-        "{\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "mov.b32 {lo, hi}, %1;\n\t"
-        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], lo;\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"((uint32_t)cta_mask) : "memory");
-}
-
-
-__device__ __forceinline__ void tmem_ld_x8(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x8.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-        : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]),
-          "=f"(dst[4]), "=f"(dst[5]), "=f"(dst[6]), "=f"(dst[7])
-        : "r"(tmem_addr));
-}
-
-
-__device__ __forceinline__ void tmem_ld_x8_wait(float* dst, int addr) {
-    tmem_ld_x8(dst, addr);
-    asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
-
 extern "C" {
 
 __global__ __launch_bounds__(256) __cluster_dims__(2,1,1) void
-kernel_deepgemm_native_fp4_gemm_sm100a_0163c0e520cab070b48a(const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, int M, int N, int K, int grid_m, int grid_n, int K_tiles, float alpha)
+kernel_cake_deepgemm_fp4_gemm_40f53c88e86797021dc8(const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, int M, int N, int K, int grid_m, int grid_n, int K_tiles, float alpha)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -475,8 +57,12 @@ kernel_deepgemm_native_fp4_gemm_sm100a_0163c0e520cab070b48a(const __grid_constan
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -578,13 +164,13 @@ kernel_deepgemm_native_fp4_gemm_sm100a_0163c0e520cab070b48a(const __grid_constan
     if (warp == 0) {
         { // load_main
             unsigned int load_stage = 0;
-            int num_tiles = grid_m * 18;
+            int num_tiles = grid_m * grid_n;
             unsigned int _phase_mma_done = 1;
             #pragma unroll 1
             for (unsigned int this_bid = bid; this_bid < num_tiles; this_bid += num_bids) {
-                int swizzle_group = this_bid / 144;
+                int swizzle_group = this_bid / (unsigned int)(grid_n * 8);
                 int first_m = swizzle_group * 8;
-                int in_group = this_bid % 144;
+                int in_group = this_bid % (unsigned int)(grid_n * 8);
                 int _min_0 = ((8) < (grid_m - first_m) ? (8) : (grid_m - first_m));
                 int m_blocks = _min_0;
                 int bid_m = first_m + in_group % m_blocks;
@@ -592,7 +178,7 @@ kernel_deepgemm_native_fp4_gemm_sm100a_0163c0e520cab070b48a(const __grid_constan
                 int off_m = bid_m * 128;
                 int off_n = bid_n * 256;
                 #pragma unroll 1
-                for (int iter_k = 0; iter_k < 20; iter_k++) {
+                for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
                     mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
                     if (elect_sync()) {
                         {
@@ -620,7 +206,7 @@ kernel_deepgemm_native_fp4_gemm_sm100a_0163c0e520cab070b48a(const __grid_constan
             unsigned int mma_tma_stage = 0;
             unsigned int mma_epi_stage = 0;
             unsigned int mma_iteration = 0;
-            int num_tiles_1 = grid_m * 18;
+            int num_tiles_1 = grid_m * grid_n;
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_sf_ready = 0;
             if (cta_rank == 0) {
@@ -629,7 +215,7 @@ kernel_deepgemm_native_fp4_gemm_sm100a_0163c0e520cab070b48a(const __grid_constan
                     mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     #pragma unroll 1
-                    for (int iter_k_1 = 0; iter_k_1 < 20; iter_k_1++) {
+                    for (int iter_k_1 = 0; iter_k_1 < K_tiles; iter_k_1++) {
                         mbarrier_wait(sf_ready_addr + (mma_tma_stage) * 8, _phase_sf_ready);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init_flag = ((iter_k_1 == 0) ? 1 : 0);
@@ -695,12 +281,12 @@ kernel_deepgemm_native_fp4_gemm_sm100a_0163c0e520cab070b48a(const __grid_constan
         { // transpose_main
             int sf_subblock = warp - 2;
             unsigned int transpose_stage = 0;
-            int num_tiles_2 = grid_m * 18;
+            int num_tiles_2 = grid_m * grid_n;
             unsigned int _phase_tma_full = 0;
             #pragma unroll 1
             for (unsigned int this_bid_2 = bid; this_bid_2 < num_tiles_2; this_bid_2 += num_bids) {
                 #pragma unroll 1
-                for (int iter_k_2 = 0; iter_k_2 < 20; iter_k_2++) {
+                for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
                     mbarrier_wait(tma_full_addr + (transpose_stage) * 8, _phase_tma_full);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     int sfa_smem = smem_sfa_addr + transpose_stage * 35840 + (unsigned int)(sf_subblock * 512);
@@ -745,14 +331,14 @@ kernel_deepgemm_native_fp4_gemm_sm100a_0163c0e520cab070b48a(const __grid_constan
         { // epilogue_main
             unsigned int epi_stage = 0;
             const int epi_warp = warp % 4;
-            int num_tiles_3 = grid_m * 18;
+            int num_tiles_3 = grid_m * grid_n;
             unsigned int store_stage = 0;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (unsigned int this_bid_3 = bid; this_bid_3 < num_tiles_3; this_bid_3 += num_bids) {
-                int swizzle_group_1 = this_bid_3 / 144;
+                int swizzle_group_1 = this_bid_3 / (unsigned int)(grid_n * 8);
                 int first_m_1 = swizzle_group_1 * 8;
-                int in_group_1 = this_bid_3 % 144;
+                int in_group_1 = this_bid_3 % (unsigned int)(grid_n * 8);
                 int _min_1 = ((8) < (grid_m - first_m_1) ? (8) : (grid_m - first_m_1));
                 int m_blocks_1 = _min_1;
                 int bid_m_1 = first_m_1 + in_group_1 % m_blocks_1;
