@@ -43,6 +43,22 @@ pytestmark = pytest.mark.filterwarnings(
 )
 
 _D = 128
+
+
+@pytest.fixture(autouse=True)
+def _fresh_frozen_decode_selection_cache():
+    """Every test starts from empty frozen-decode selection and module caches.
+
+    The cache is keyed by tensor address/shape/stride/dtype, so a test that
+    monkeypatches the selector or emulates another architecture must not see a
+    schedule memoized by an earlier test on recycled allocator addresses.
+    """
+
+    recurrent_module._reset_frozen_decode_caches()
+    yield
+    recurrent_module._reset_frozen_decode_caches()
+
+
 _T = 5
 _VARIANT_PREFIX = "d128_t5_precomputed_gram_split"
 _T3 = 3
@@ -2377,9 +2393,11 @@ def test_t1_unbounded_softplus_auto_falls_back_to_cute_with_explicit_cu_seqlens(
 ):
     """Explicit T=1 ``cu_seqlens`` decode routes to CuTe without probing Cake.
 
-    ``backend="cake"`` refuses this contract outright, so ``"auto"`` must not
-    quietly serve it either: the candidate drops it before the selector is ever
-    consulted. Parametrised over the one-warp threshold at 32 heads and over
+    ``backend="cake"`` serves this contract on the frozen route (see
+    ``test_cake_backend_serves_explicit_t1_cu_seqlens_like_dense_decode``), but
+    ``"auto"`` keeps CuTe for it: in the launch-bound regime CuTe's host path is
+    the cheaper one, and the candidate drops the form before the selector is
+    ever consulted. Parametrised over the one-warp threshold at 32 heads and over
     both ways the probe used to resolve -- with a per-sequence
     ``num_accepted_tokens`` the selector accepted at every ``num_sequences``,
     and without one it accepted only at ``num_sequences=1``, where the single
@@ -2489,6 +2507,83 @@ def test_t1_unbounded_softplus_auto_falls_back_to_cute_with_explicit_cu_seqlens(
     torch.testing.assert_close(
         actual_pool[untouched], before[untouched], atol=0, rtol=0
     )
+
+
+def test_frozen_decode_selection_is_memoized_per_contract(
+    flash_kda_device, monkeypatch
+):
+    """Repeated decode steps on the same buffers consult the selector once.
+
+    The memo key covers every tensor's address, shape, strides and dtype plus
+    the scalar flags, so a changed pitch (a different view of the same
+    storage) or a different head count re-runs the predicate chain.
+    """
+
+    num_sequences = 4
+    num_heads = 16
+    generator = torch.Generator(device=flash_kda_device).manual_seed(4941)
+
+    def dense(*shape):
+        return torch.randn(
+            shape, dtype=torch.bfloat16, device=flash_kda_device, generator=generator
+        )
+
+    call = dict(
+        q=dense(num_sequences, 1, num_heads, _D),
+        k=dense(num_sequences, 1, num_heads, _D),
+        v=dense(num_sequences, 1, num_heads, _D),
+        g=dense(num_sequences, 1, num_heads, _D),
+        beta=dense(num_sequences, 1, num_heads),
+        A_log=torch.rand(
+            num_heads, dtype=torch.float32, device=flash_kda_device, generator=generator
+        )
+        - 1.5,
+        dt_bias=torch.randn(
+            num_heads * _D,
+            dtype=torch.float32,
+            device=flash_kda_device,
+            generator=generator,
+        ),
+        use_gate_in_kernel=True,
+        beta_is_logit=True,
+        lower_bound=None,
+        use_qk_l2norm_in_kernel=True,
+        ssm_state_indices=torch.arange(
+            num_sequences, dtype=torch.int32, device=flash_kda_device
+        ),
+        output_final_state=True,
+    )
+    pool = dense(num_sequences, num_heads, _D, _D)
+    output = torch.empty_like(call["q"])
+
+    select_calls = 0
+    select_variant = recurrent_module._select_flash_kda_decode_variant
+
+    def track_select_call(**kwargs):
+        nonlocal select_calls
+        select_calls += 1
+        return select_variant(**kwargs)
+
+    monkeypatch.setattr(
+        recurrent_module, "_select_flash_kda_decode_variant", track_select_call
+    )
+
+    for _ in range(3):
+        recurrent_kda(**call, initial_state=pool, output=output, backend="cake")
+    assert select_calls == 1
+
+    # A wider token pitch on the same storage is a different contract.
+    wide = dense(num_sequences, 1, num_heads + 8, _D)
+    strided = dict(call, q=wide[:, :, :num_heads, :])
+    recurrent_kda(**strided, initial_state=pool, output=output, backend="cake")
+    assert select_calls == 2
+    recurrent_kda(**strided, initial_state=pool, output=output, backend="cake")
+    assert select_calls == 2
+
+    # Fresh buffers of the same shape at new addresses are validated again.
+    other = dict(call, q=dense(num_sequences, 1, num_heads, _D))
+    recurrent_kda(**other, initial_state=pool, output=output, backend="cake")
+    assert select_calls == 3
 
 
 @pytest.mark.parametrize("emulated_capability", [(9, 0), (12, 0)])
@@ -2647,10 +2742,20 @@ def test_cake_backend_rejects_unexported_precomputed_t3_without_entering_cute_ds
         recurrent_kda(**_call_kwargs(case), backend="cake")
 
 
-def test_cake_backend_rejects_explicit_t1_cu_seqlens_without_launching(
-    flash_kda_device, monkeypatch
+@pytest.mark.parametrize("explicit_num_accepted_tokens", [False, True])
+@pytest.mark.parametrize("num_sequences", [1, 2, 8])
+def test_cake_backend_serves_explicit_t1_cu_seqlens_like_dense_decode(
+    flash_kda_device, monkeypatch, num_sequences, explicit_num_accepted_tokens
 ):
-    num_sequences = 2
+    """``backend="cake"`` launches explicit T=1 ``cu_seqlens`` decode in place.
+
+    The frozen family's ABI is one packed token axis plus ``cu_seqlens`` and a
+    per-sequence accepted-token count; the dense ``[B, 1, ...]`` entry point
+    synthesizes exactly that. Handing the metadata in explicitly (the precomputed
+    H=16 / HV=32 route here) must pick the same schedule, write the same bits
+    and leave every other state slot untouched.
+    """
+
     case = _make_case(
         flash_kda_device,
         num_sequences=num_sequences,
@@ -2659,39 +2764,50 @@ def test_cake_backend_rejects_explicit_t1_cu_seqlens_without_launching(
         num_tokens=1,
         seed=2270,
     )
+    frozen_calls = []
+    run_frozen = recurrent_module._run_flash_kda_decode
+
+    def track_frozen_call(variant, **kwargs):
+        frozen_calls.append(variant)
+        return run_frozen(variant, **kwargs)
+
+    monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
+
+    dense_state = case["initial_state"].clone()
+    dense_output, _ = recurrent_kda(
+        **_call_kwargs(
+            case, state=dense_state, output=torch.empty_like(case["output"])
+        ),
+        backend="cake",
+    )
+    assert len(frozen_calls) == 1
+
+    explicit = dict(case)
     for name in ("q", "k", "v", "g", "beta", "output"):
         tensor = case[name]
-        case[name] = tensor.reshape(1, num_sequences, *tensor.shape[2:])
-    case["cu_seqlens"] = torch.arange(
+        explicit[name] = tensor.reshape(1, num_sequences, *tensor.shape[2:])
+    explicit["cu_seqlens"] = torch.arange(
         num_sequences + 1, dtype=torch.int32, device=flash_kda_device
     )
-    case["ssm_state_indices"] = torch.arange(
+    explicit["ssm_state_indices"] = torch.arange(
         num_sequences, dtype=torch.int32, device=flash_kda_device
     )
-
-    def unexpected_launch(*args, **kwargs):
-        pytest.fail(f"unexpected kernel launch: args={args}, kwargs={kwargs}")
-
-    monkeypatch.setattr(
-        recurrent_module,
-        "_run_flash_kda_decode",
-        unexpected_launch,
+    if explicit_num_accepted_tokens:
+        explicit["num_accepted_tokens"] = torch.ones(
+            num_sequences, dtype=torch.int32, device=flash_kda_device
+        )
+    explicit_state = case["initial_state"].clone()
+    explicit_output, _ = recurrent_kda(
+        **_call_kwargs(
+            explicit, state=explicit_state, output=torch.empty_like(explicit["output"])
+        ),
+        backend="cake",
     )
-    monkeypatch.setattr(
-        recurrent_module,
-        "_get_grouped_compiled",
-        unexpected_launch,
+    assert frozen_calls == [frozen_calls[0]] * 2
+    torch.testing.assert_close(
+        explicit_output.reshape(dense_output.shape), dense_output, atol=0, rtol=0
     )
-    monkeypatch.setattr(
-        recurrent_module,
-        "_get_compiled_kernel",
-        unexpected_launch,
-    )
-    with pytest.raises(
-        ValueError,
-        match="does not support explicit T=1 cu_seqlens",
-    ):
-        recurrent_kda(**_call_kwargs(case), backend="cake")
+    torch.testing.assert_close(explicit_state, dense_state, atol=0, rtol=0)
 
 
 def test_internal_direct_t1_nonidentity_metadata_is_memory_safe(flash_kda_device):
