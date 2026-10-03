@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -12,30 +17,35 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #include <cuda_bf16.h>
 
 #define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
+#define TMEM_NCOLS 512
 #define TMEM_SCORES0_OFFSET 0
 #define TMEM_OUTPUT0_OFFSET 128
-#define NUM_KV_PIPE_STAGES 6
+#define TMEM_SCORES1_OFFSET 256
+#define TMEM_OUTPUT1_OFFSET 384
+#define NUM_KV_PIPE_STAGES 3
 #define SMEM_Q0_SMEM_OFF 1024
-#define SMEM_Q0_SMEM_STAGE_BYTES 8192
-#define SMEM_Q0_SMEM_STRIDE 8192
-#define SMEM_KV_SMEM_OFF 9216
-#define SMEM_KV_SMEM_STAGE_BYTES 16384
-#define SMEM_KV_SMEM_STRIDE 16384
-#define SMEM_V_SMEM_OFF 9216
-#define SMEM_V_SMEM_STAGE_BYTES 16384
-#define SMEM_V_SMEM_STRIDE 16384
-#define SMEM_SCALE_SMEM_OFF 107520
+#define SMEM_Q0_SMEM_STAGE_BYTES 16384
+#define SMEM_Q0_SMEM_STRIDE 16384
+#define SMEM_Q1_SMEM_OFF 17408
+#define SMEM_Q1_SMEM_STAGE_BYTES 16384
+#define SMEM_Q1_SMEM_STRIDE 16384
+#define SMEM_KV_SMEM_OFF 33792
+#define SMEM_KV_SMEM_STAGE_BYTES 32768
+#define SMEM_KV_SMEM_STRIDE 32768
+#define SMEM_V_SMEM_OFF 33792
+#define SMEM_V_SMEM_STAGE_BYTES 32768
+#define SMEM_V_SMEM_STRIDE 32768
+#define SMEM_SCALE_SMEM_OFF 132096
 #define SMEM_SCALE_SMEM_STAGE_BYTES 1024
 #define SMEM_SCALE_SMEM_STRIDE 1024
-#define SMEM_UNION_COUNT_SMEM_OFF 108544
-#define SMEM_UNION_COUNT_SMEM_STAGE_BYTES 4
-#define SMEM_UNION_COUNT_SMEM_STRIDE 4
-#define SMEM_UNION_BLOCKS_OFF 108548
-#define SMEM_UNION_BLOCKS_STAGE_BYTES 256
-#define SMEM_UNION_BLOCKS_STRIDE 256
-#define SMEM_TOTAL 108928
-#define THREADS 384
+#define SMEM_UNION_COUNT_SMEM_OFF 134144
+#define SMEM_UNION_COUNT_SMEM_STAGE_BYTES 8
+#define SMEM_UNION_COUNT_SMEM_STRIDE 8
+#define SMEM_UNION_BLOCKS_OFF 134152
+#define SMEM_UNION_BLOCKS_STAGE_BYTES 512
+#define SMEM_UNION_BLOCKS_STRIDE 512
+#define SMEM_TOTAL 134784
+#define THREADS 512
 
 #include <math_constants.h>
 
@@ -479,8 +489,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) void
-kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, uint8_t* __restrict__ block_mask, int mb, int nb, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
+__global__ __launch_bounds__(512, 1) void
+kernel_flashinfer_blackwell_vsa_blk128_seed_sm100(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, uint8_t* __restrict__ block_mask, int mb, int nb, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -496,19 +506,21 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
     // Kernel setup ops
     __nv_bfloat16* q0_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q0_smem_addr = smem + 1024;
-    __nv_bfloat16* kv_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 9216);
-    const int kv_smem_addr = smem + 9216;
-    __nv_bfloat16* v_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 9216);
-    const int v_smem_addr = smem + 9216;
-    float* scale_smem = reinterpret_cast<float*>(smem_raw + 107520);
-    const int scale_smem_addr = smem + 107520;
-    int* union_count_smem = reinterpret_cast<int*>(smem_raw + 108544);
-    const int union_count_smem_addr = smem + 108544;
-    int* union_blocks = reinterpret_cast<int*>(smem_raw + 108548);
-    const int union_blocks_addr = smem + 108548;
+    __nv_bfloat16* q1_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+    const int q1_smem_addr = smem + 17408;
+    __nv_bfloat16* kv_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+    const int kv_smem_addr = smem + 33792;
+    __nv_bfloat16* v_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+    const int v_smem_addr = smem + 33792;
+    float* scale_smem = reinterpret_cast<float*>(smem_raw + 132096);
+    const int scale_smem_addr = smem + 132096;
+    int* union_count_smem = reinterpret_cast<int*>(smem_raw + 134144);
+    const int union_count_smem_addr = smem + 134144;
+    int* union_blocks = reinterpret_cast<int*>(smem_raw + 134152);
+    const int union_blocks_addr = smem + 134152;
 
-    // Mbarrier init (10 groups, 20 barriers)
-    // Mbarriers at smem_raw[0..160)
+    // Mbarrier init (10 groups, 19 barriers)
+    // Mbarriers at smem_raw[0..152)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -517,44 +529,43 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
             mbarrier_init(smem + 0, 1);
             // union_ready: 1 barriers, init_count=32
             mbarrier_init(smem + 8, 32);
-            // kv_full: 6 barriers, init_count=1
+            // kv_full: 3 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
             mbarrier_init(smem + 24, 1);
             mbarrier_init(smem + 32, 1);
+            // --- pipeline 'kv_pipe' ---
+            // kv_empty: 3 barriers, init_count=1
             mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
-            // --- pipeline 'kv_pipe' ---
-            // kv_empty: 6 barriers, init_count=1
+            // s_full: 2 barriers, init_count=1
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
-            mbarrier_init(smem + 80, 1);
-            mbarrier_init(smem + 88, 1);
-            mbarrier_init(smem + 96, 1);
-            mbarrier_init(smem + 104, 1);
-            // s_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 112, 1);
-            // p_full: 1 barriers, init_count=256
-            mbarrier_init(smem + 120, 256);
-            // corr_sig: 1 barriers, init_count=128
-            mbarrier_init(smem + 128, 128);
-            // corr_done: 1 barriers, init_count=128
-            mbarrier_init(smem + 136, 128);
-            // o_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 144, 1);
+            // p_full: 2 barriers, init_count=256
+            mbarrier_init(smem + 80, 256);
+            mbarrier_init(smem + 88, 256);
+            // corr_sig: 2 barriers, init_count=128
+            mbarrier_init(smem + 96, 128);
+            mbarrier_init(smem + 104, 128);
+            // corr_done: 2 barriers, init_count=128
+            mbarrier_init(smem + 112, 128);
+            mbarrier_init(smem + 120, 128);
+            // o_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 128, 1);
+            mbarrier_init(smem + 136, 1);
             // tmem_dealloc: 1 barriers, init_count=128
-            mbarrier_init(smem + 152, 128);
+            mbarrier_init(smem + 144, 128);
             asm volatile("fence.mbarrier_init.release.cluster;");
         }
     }
 
     __syncwarp();
 
-    // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 160);
+    // TMEM alloc (512 columns, 512 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 152);
     if (warp == 0) {
-        int _tmem_hold = smem + 160;
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
+        int _tmem_hold = smem + 152;
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
@@ -565,36 +576,37 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
     #define q_full_addr (mbar_base + 0)
     #define union_ready_addr (mbar_base + 8)
     #define kv_full_addr (mbar_base + 16)
-    #define kv_empty_addr (mbar_base + 64)
-    #define s_full_addr (mbar_base + 112)
-    #define p_full_addr (mbar_base + 120)
-    #define corr_sig_addr (mbar_base + 128)
-    #define corr_done_addr (mbar_base + 136)
-    #define o_full_addr (mbar_base + 144)
-    #define tmem_dealloc_addr (mbar_base + 152)
+    #define kv_empty_addr (mbar_base + 40)
+    #define s_full_addr (mbar_base + 64)
+    #define p_full_addr (mbar_base + 80)
+    #define corr_sig_addr (mbar_base + 96)
+    #define corr_done_addr (mbar_base + 112)
+    #define o_full_addr (mbar_base + 128)
+    #define tmem_dealloc_addr (mbar_base + 144)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
     const int tmem_scores0 = taddr;
     const int tmem_output0 = taddr + 128;
+    const int tmem_scores1 = taddr + 256;
+    const int tmem_output1 = taddr + 384;
 
     // ---- Register redistribution for WGs split across roles ----
     // Dec phase frees registers before any WG attempts inc.
-    if (warp >= 8 && warp <= 11) {
+    if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
 
     // ---- Role: softmax ----
-    if (warp <= 3) {
+    if (warp <= 7) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 192;");
         { // softmax_main
             int batch = 0;
-            int q_tile = blockIdx.x / 2;
-            int q_half = blockIdx.x % 2;
+            int q_tile = blockIdx.x;
             int q_head = blockIdx.y;
             int kv_head = q_head;
-            int q_local_base = q_tile * 128 + q_half * 64;
-            int q_valid = 64;
+            int q_local_base = q_tile * 128;
+            int q_valid = 128;
             if (q_tile >= mb) {
                 q_valid = 0;
             }
@@ -606,7 +618,7 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
             unsigned int _phase_union_ready_0 = 0;
             mbarrier_wait(union_ready_addr, _phase_union_ready_0);
             _phase_union_ready_0 ^= 1;
-            const int instance = 0;
+            int instance = make_warp_uniform(warp / 4);
             int instance_row_offset = make_warp_uniform(instance * 64);
             int instance_token_offset = make_warp_uniform(instance * 64);
             int instance_tmem_offset = make_warp_uniform(instance * 256);
@@ -630,12 +642,19 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
             float row_sum = 0.0f;
             float temperature_sum = 0.0f;
             unsigned int _phase_s_full_0 = 0;
+            unsigned int _phase_s_full_1 = 0;
             unsigned int _phase_corr_done_0 = 0;
+            unsigned int _phase_corr_done_1 = 0;
             #pragma unroll 1
             for (int union_index = 0; union_index < union_count; union_index++) {
                 int n_block = union_blocks[instance * 64 + union_index];
-                mbarrier_wait(s_full_addr, _phase_s_full_0);
-                _phase_s_full_0 ^= 1;
+                if (instance == 0) {
+                    mbarrier_wait(s_full_addr, _phase_s_full_0);
+                    _phase_s_full_0 ^= 1;
+                } else {
+                    mbarrier_wait(s_full_addr + 8, _phase_s_full_1);
+                    _phase_s_full_1 ^= 1;
+                }
                 int selected = row_valid;
                 int valid_cols = 0;
                 if (selected != 0) {
@@ -740,7 +759,11 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
                     scale_smem[instance_row_offset + my_row] = acc_scale;
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                mbarrier_arrive(corr_sig_addr);
+                if (instance == 0) {
+                    mbarrier_arrive(corr_sig_addr);
+                } else {
+                    mbarrier_arrive(corr_sig_addr + 8);
+                }
                 float score_bias = ((valid_cols > 0) ? -new_max_scaled : -CAKE_INF);
                 float block_temperature_sum = 0.0f;
                 float block_sum = 0.0f;
@@ -872,34 +895,43 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
                         :: "r"(p_addr + 16), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[0])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[1])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[2])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[3])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[4])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[5])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[6])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[7])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[8])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[9])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[10])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[11])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[12])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[13])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[14])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[15])));
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-                mbarrier_arrive(p_full_addr);
-                mbarrier_wait(corr_done_addr, _phase_corr_done_0);
-                _phase_corr_done_0 ^= 1;
+                if (instance == 0) {
+                    mbarrier_arrive(p_full_addr);
+                    mbarrier_wait(corr_done_addr, _phase_corr_done_0);
+                    _phase_corr_done_0 ^= 1;
+                } else {
+                    mbarrier_arrive(p_full_addr + 8);
+                    mbarrier_wait(corr_done_addr + 8, _phase_corr_done_1);
+                    _phase_corr_done_1 ^= 1;
+                }
                 row_sum = row_sum * acc_scale + block_sum;
                 if (return_temperature_lse != 0) {
                     temperature_sum = temperature_sum * temperature_acc_scale + block_temperature_sum;
                 }
             }
             if (col_half == 0) {
-                scale_smem[64 + instance_row_offset + my_row] = row_sum;
-                scale_smem[128 + instance_row_offset + my_row] = row_max;
-                scale_smem[192 + instance_row_offset + my_row] = temperature_sum;
+                scale_smem[128 + instance_row_offset + my_row] = row_sum;
+                scale_smem[256 + instance_row_offset + my_row] = row_max;
+                scale_smem[384 + instance_row_offset + my_row] = temperature_sum;
             }
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            mbarrier_arrive(corr_sig_addr);
+            if (instance == 0) {
+                mbarrier_arrive(corr_sig_addr);
+            } else {
+                mbarrier_arrive(corr_sig_addr + 8);
+            }
         }
     }
     // ---- Role: correction ----
-    if (warp >= 4 && warp <= 7) {
+    if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
         { // correction_main
             int batch_1 = 0;
-            int q_tile_1 = blockIdx.x / 2;
-            int q_half_1 = blockIdx.x % 2;
+            int q_tile_1 = blockIdx.x;
             int q_head_1 = blockIdx.y;
             int kv_head_1 = q_head_1;
-            int q_local_base_1 = q_tile_1 * 128 + q_half_1 * 64;
-            int q_valid_1 = 64;
+            int q_local_base_1 = q_tile_1 * 128;
+            int q_valid_1 = 128;
             if (q_tile_1 >= mb) {
                 q_valid_1 = 0;
             }
@@ -912,17 +944,26 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
             mbarrier_wait(union_ready_addr, _phase_union_ready_0_1);
             _phase_union_ready_0_1 ^= 1;
             int max_union_count = union_count_smem[0];
-            const int warp_in_role = warp - 4;
+            int union_count1 = union_count_smem[1];
+            if (max_union_count < union_count1) {
+                max_union_count = union_count1;
+            }
+            const int warp_in_role = warp - 8;
             const int tmem_row_origin_1 = warp_in_role * 32;
             const int logical_row_origin_1 = warp_in_role * 16;
             int my_row_1 = logical_row_origin_1 + lane % 16;
             int col_half_1 = lane / 16;
             int row_addr = tmem_row_origin_1 << 16;
             mbarrier_arrive(p_full_addr);
+            mbarrier_arrive(p_full_addr + 8);
             unsigned int _phase_corr_sig_0 = 0;
             mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
             _phase_corr_sig_0 ^= 1;
             mbarrier_arrive(corr_done_addr);
+            unsigned int _phase_corr_sig_1 = 0;
+            mbarrier_wait(corr_sig_addr + 8, _phase_corr_sig_1);
+            _phase_corr_sig_1 ^= 1;
+            mbarrier_arrive(corr_done_addr + 8);
             #pragma unroll 1
             for (int union_index_1 = 1; union_index_1 < max_union_count; union_index_1++) {
                 int union_count0 = union_count_smem[0];
@@ -956,21 +997,57 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
                     mbarrier_arrive(p_full_addr);
                     mbarrier_arrive(corr_done_addr);
                 }
+                int union_count1_0 = union_count_smem[1];
+                if (union_count1_0 > union_index_1) {
+                    mbarrier_wait(corr_sig_addr + 8, _phase_corr_sig_1);
+                    _phase_corr_sig_1 ^= 1;
+                    float acc_scale1 = scale_smem[64 + my_row_1];
+                    int _vote_2 = __any_sync(0xFFFFFFFF, acc_scale1 < 1.0f);
+                    if (_vote_2 != 0) {
+                        float _tmem_load_3[64];
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[31]))
+                            : "r"(taddr + 256 + 128 + (unsigned int)row_addr));
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[32])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[33])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[34])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[35])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[36])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[37])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[38])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[39])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[40])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[41])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[42])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[43])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[44])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[45])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[46])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[47])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[48])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[49])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[50])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[51])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[52])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[53])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[54])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[55])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[56])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[57])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[58])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[59])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[60])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[61])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[62])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[63]))
+                            : "r"(taddr + 256 + 128 + (unsigned int)row_addr + 32));
+                        const float2 _scale2_1 = {acc_scale1, acc_scale1};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_1);
+                        asm volatile(
+                            "tcgen05.st.sync.aligned.16x32bx2.x64.b32"
+                            " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63, %64};"
+                            :: "r"(taddr + 256 + 128 + (unsigned int)row_addr), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[15])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[16])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[17])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[18])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[19])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[20])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[21])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[22])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[23])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[24])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[25])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[26])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[27])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[28])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[29])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[30])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[31])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[32])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[33])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[34])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[35])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[36])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[37])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[38])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[39])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[40])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[41])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[42])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[43])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[44])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[45])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[46])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[47])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[48])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[49])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[50])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[51])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[52])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[53])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[54])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[55])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[56])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[57])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[58])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[59])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[60])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[61])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[62])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3[63])));
+                        asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                    }
+                    mbarrier_arrive(p_full_addr + 8);
+                    mbarrier_arrive(corr_done_addr + 8);
+                }
             }
             unsigned int _phase_o_full_0 = 0;
             mbarrier_wait(o_full_addr, _phase_o_full_0);
             _phase_o_full_0 ^= 1;
+            unsigned int _phase_o_full_1 = 0;
+            mbarrier_wait(o_full_addr + 8, _phase_o_full_1);
+            _phase_o_full_1 ^= 1;
             mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
             _phase_corr_sig_0 ^= 1;
+            mbarrier_wait(corr_sig_addr + 8, _phase_corr_sig_1);
+            _phase_corr_sig_1 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
             #pragma unroll
-            for (int instance_1 = 0; instance_1 < 1; instance_1++) {
+            for (int instance_1 = 0; instance_1 < 2; instance_1++) {
                 int instance_row_offset_1 = instance_1 * 64;
                 int instance_token_offset_1 = instance_1 * 64;
                 int output_tmem_offset = instance_1 * 256 + 128;
-                float final_sum = scale_smem[64 + instance_row_offset_1 + my_row_1];
-                float final_max = scale_smem[128 + instance_row_offset_1 + my_row_1];
-                float final_temperature_sum = scale_smem[192 + instance_row_offset_1 + my_row_1];
+                float final_sum = scale_smem[128 + instance_row_offset_1 + my_row_1];
+                float final_max = scale_smem[256 + instance_row_offset_1 + my_row_1];
+                float final_temperature_sum = scale_smem[384 + instance_row_offset_1 + my_row_1];
                 float _rcp_0 = approx_rcp(final_sum);
                 float inv_sum = ((final_sum > 0.0f && final_sum == final_sum) ? _rcp_0 : 0.0f);
                 int query_in_instance_1 = my_row_1;
@@ -984,51 +1061,53 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
                 }
                 int output_head = q_head_1;
                 int query = query_base_1 + query_in_tile_1;
-                int output_row = (query * num_q_heads + output_head) * 64;
-                float _tmem_load_3[64];
+                int output_row = (query * num_q_heads + output_head) * 128;
+                float _tmem_load_4[64];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[31]))
+                    : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[31]))
                     : "r"(taddr + (unsigned int)output_tmem_offset + (unsigned int)row_addr));
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[32])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[33])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[34])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[35])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[36])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[37])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[38])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[39])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[40])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[41])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[42])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[43])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[44])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[45])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[46])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[47])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[48])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[49])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[50])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[51])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[52])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[53])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[54])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[55])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[56])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[57])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[58])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[59])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[60])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[61])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[62])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_3[63]))
+                    : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[32])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[33])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[34])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[35])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[36])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[37])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[38])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[39])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[40])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[41])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[42])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[43])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[44])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[45])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[46])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[47])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[48])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[49])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[50])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[51])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[52])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[53])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[54])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[55])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[56])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[57])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[58])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[59])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[60])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[61])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[62])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[63]))
                     : "r"(taddr + (unsigned int)output_tmem_offset + (unsigned int)row_addr + 32));
                 int col_base = col_half_1 * 64;
-                if (query_in_instance_1 < instance_valid_1 && col_half_1 == 0) {
+                if (query_in_instance_1 < instance_valid_1) {
                     #pragma unroll
                     for (int offset = 0; offset < 64; offset += 8) {
                         {
-                            const float2 _prescale2_1 = {inv_sum, inv_sum};
+                            const float2 _prescale2_2 = {inv_sum, inv_sum};
                             #if __CUDA_ARCH__ >= 1000
                             #pragma unroll
                             for (int _ps = 0; _ps < 4; _ps++)
-                                mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_3[offset])[_ps], _prescale2_1);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_4[offset])[_ps], _prescale2_2);
                             #else
                             #pragma unroll
                             for (int _ps = 0; _ps < 8; _ps++)
-                                _tmem_load_3[offset + _ps] *= inv_sum;
+                                _tmem_load_4[offset + _ps] *= inv_sum;
                             #endif
                             __nv_bfloat162 _pk[4];
-                            _pk[0] = __floats2bfloat162_rn(_tmem_load_3[offset + 0], _tmem_load_3[offset + 1]);
-                            _pk[1] = __floats2bfloat162_rn(_tmem_load_3[offset + 2], _tmem_load_3[offset + 3]);
-                            _pk[2] = __floats2bfloat162_rn(_tmem_load_3[offset + 4], _tmem_load_3[offset + 5]);
-                            _pk[3] = __floats2bfloat162_rn(_tmem_load_3[offset + 6], _tmem_load_3[offset + 7]);
+                            _pk[0] = __floats2bfloat162_rn(_tmem_load_4[offset + 0], _tmem_load_4[offset + 1]);
+                            _pk[1] = __floats2bfloat162_rn(_tmem_load_4[offset + 2], _tmem_load_4[offset + 3]);
+                            _pk[2] = __floats2bfloat162_rn(_tmem_load_4[offset + 4], _tmem_load_4[offset + 5]);
+                            _pk[3] = __floats2bfloat162_rn(_tmem_load_4[offset + 6], _tmem_load_4[offset + 7]);
                             *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (output_row + col_base + offset)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                         }
                     }
-                    int stat_idx = query * num_q_heads + output_head;
-                    if (return_softmax_lse != 0) {
-                        float _log2_0;
-                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(final_sum));
-                        lse[stat_idx] = ((final_sum > 0.0f) ? final_max * softmax_scale_log2 * 0.6931471805599453f + _log2_0 * 0.6931471805599453f : -CAKE_INF);
-                    }
-                    if (return_temperature_lse != 0) {
-                        float _log2_1;
-                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(final_temperature_sum));
-                        temperature_lse[stat_idx] = ((final_temperature_sum > 0.0f) ? final_max * softmax_scale_log2 * 0.6931471805599453f * lse_temperature_scale + _log2_1 * 0.6931471805599453f : -CAKE_INF);
+                    if (col_half_1 == 0) {
+                        int stat_idx = query * num_q_heads + output_head;
+                        if (return_softmax_lse != 0) {
+                            float _log2_0;
+                            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(final_sum));
+                            lse[stat_idx] = ((final_sum > 0.0f) ? final_max * softmax_scale_log2 * 0.6931471805599453f + _log2_0 * 0.6931471805599453f : -CAKE_INF);
+                        }
+                        if (return_temperature_lse != 0) {
+                            float _log2_1;
+                            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(final_temperature_sum));
+                            temperature_lse[stat_idx] = ((final_temperature_sum > 0.0f) ? final_max * softmax_scale_log2 * 0.6931471805599453f * lse_temperature_scale + _log2_1 * 0.6931471805599453f : -CAKE_INF);
+                        }
                     }
                 }
             }
@@ -1038,29 +1117,37 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
         }
     }
     // ---- Role: mma_warp ----
-    if (warp == 8) {
+    if (warp == 12) {
         { // mma_warp_main
             unsigned int _phase_union_ready_0_2 = 0;
             mbarrier_wait(union_ready_addr, _phase_union_ready_0_2);
             _phase_union_ready_0_2 ^= 1;
             int max_union_count_1 = union_count_smem[0];
+            int union_count1_1 = union_count_smem[1];
+            if (max_union_count_1 < union_count1_1) {
+                max_union_count_1 = union_count1_1;
+            }
             unsigned int kv_stage = 0;
             unsigned int kv_phase = 0;
             unsigned int _phase_q_full_0 = 0;
             mbarrier_wait(q_full_addr, _phase_q_full_0);
             _phase_q_full_0 ^= 1;
             int first_pv0 = 1;
+            int first_pv1 = 1;
             unsigned int _phase_p_full_0 = 0;
+            unsigned int _phase_p_full_1 = 0;
             #pragma unroll 1
             for (int union_index_2 = 0; union_index_2 < max_union_count_1; union_index_2++) {
-                unsigned int k_stage = kv_stage;
-                unsigned int k_phase = kv_phase;
-                kv_stage += 1;
-                if (kv_stage == 6) { kv_stage = 0; kv_phase ^= 1; }
-                mbarrier_wait(kv_full_addr + (k_stage) * 8, k_phase);
-                int _mma_a_lo_0 = make_warp_uniform(((q0_smem_addr) >> 4) & 0x3FFF);
-                int _mma_b_lo_0 = make_warp_uniform((((kv_smem_addr) >> 4) & 0x3FFF) + (k_stage) * 1024);
-                asm volatile(
+                int union_count0_1 = union_count_smem[0];
+                if (union_count0_1 > union_index_2) {
+                    unsigned int k_stage0 = kv_stage;
+                    unsigned int k_phase0 = kv_phase;
+                    kv_stage += 1;
+                    if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
+                    mbarrier_wait(kv_full_addr + (k_stage0) * 8, k_phase0);
+                    int _mma_a_lo_0 = make_warp_uniform(((q0_smem_addr) >> 4) & 0x3FFF);
+                    int _mma_b_lo_0 = make_warp_uniform((((kv_smem_addr) >> 4) & 0x3FFF) + (k_stage0) * 2048);
+                    asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
@@ -1092,19 +1179,107 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 506;\n\t"
+                    "add.u32 blo, blo, 1018;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_scores0), "r"(0));
-                elect_commit(s_full_addr);
-                elect_commit(kv_empty_addr + (k_stage) * 8);
-                unsigned int v_stage = kv_stage;
-                unsigned int v_phase = kv_phase;
-                kv_stage += 1;
-                if (kv_stage == 6) { kv_stage = 0; kv_phase ^= 1; }
-                mbarrier_wait(kv_full_addr + (v_stage) * 8, v_phase);
-                mbarrier_wait(p_full_addr, _phase_p_full_0);
-                _phase_p_full_0 ^= 1;
-                int _mma_b_lo_1 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage) * 1024);
-                asm volatile(
+                    elect_commit(s_full_addr);
+                    elect_commit(kv_empty_addr + (k_stage0) * 8);
+                }
+                int union_count1_0_1 = union_count_smem[1];
+                if (union_count1_0_1 > union_index_2) {
+                    unsigned int k_stage1 = kv_stage;
+                    unsigned int k_phase1 = kv_phase;
+                    kv_stage += 1;
+                    if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
+                    mbarrier_wait(kv_full_addr + (k_stage1) * 8, k_phase1);
+                    int _mma_a_lo_1 = make_warp_uniform(((q1_smem_addr) >> 4) & 0x3FFF);
+                    int _mma_b_lo_1 = make_warp_uniform((((kv_smem_addr) >> 4) & 0x3FFF) + (k_stage1) * 2048);
+                    asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    ""
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 69207184;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 506;\n\t"
+                    "add.u32 blo, blo, 1018;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "}\n"
+                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"(tmem_scores1), "r"(0));
+                    elect_commit(s_full_addr + 8);
+                    elect_commit(kv_empty_addr + (k_stage1) * 8);
+                }
+                if (union_count0_1 > union_index_2) {
+                    unsigned int v_stage0 = kv_stage;
+                    unsigned int v_phase0 = kv_phase;
+                    kv_stage += 1;
+                    if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
+                    mbarrier_wait(kv_full_addr + (v_stage0) * 8, v_phase0);
+                    mbarrier_wait(p_full_addr, _phase_p_full_0);
+                    _phase_p_full_0 ^= 1;
+                    int _mma_b_lo_2 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage0) * 2048);
+                    asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 dhi, blo, ta, id;\n\t"
@@ -1114,7 +1289,7 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 68224144;\n\t"
+                    "mov.b32 id, 69272720;\n\t"
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1148,34 +1323,94 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output0), "r"(_mma_b_lo_1), "r"(tmem_scores0 + 64), "r"(((first_pv0) ? 0 : 1)));
-                first_pv0 = 0;
-                if (union_index_2 + 1 == max_union_count_1) {
-                    elect_commit(o_full_addr);
+                    :: "r"(tmem_output0), "r"(_mma_b_lo_2), "r"(tmem_scores0 + 64), "r"(((first_pv0) ? 0 : 1)));
+                    first_pv0 = 0;
+                    if (union_index_2 + 1 == union_count0_1) {
+                        elect_commit(o_full_addr);
+                    }
+                    elect_commit(kv_empty_addr + (v_stage0) * 8);
                 }
-                elect_commit(kv_empty_addr + (v_stage) * 8);
+                if (union_count1_0_1 > union_index_2) {
+                    unsigned int v_stage1 = kv_stage;
+                    unsigned int v_phase1 = kv_phase;
+                    kv_stage += 1;
+                    if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
+                    mbarrier_wait(kv_full_addr + (v_stage1) * 8, v_phase1);
+                    mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
+                    _phase_p_full_1 ^= 1;
+                    int _mma_b_lo_3 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage1) * 2048);
+                    asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
+                    ".reg .b64 db;\n\t"
+                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    ""
+                    "mov.b32 dhi, 0x40004040;\n\t"
+                    "mov.b32 id, 69272720;\n\t"
+                    "mov.b32 ta, %2;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "}\n"
+                    :: "r"(tmem_output1), "r"(_mma_b_lo_3), "r"(tmem_scores1 + 64), "r"(((first_pv1) ? 0 : 1)));
+                    first_pv1 = 0;
+                    if (union_index_2 + 1 == union_count1_0_1) {
+                        elect_commit(o_full_addr + 8);
+                    }
+                    elect_commit(kv_empty_addr + (v_stage1) * 8);
+                }
             }
             unsigned int _phase_tmem_dealloc_0 = 0;
             mbarrier_wait(tmem_dealloc_addr, _phase_tmem_dealloc_0);
             _phase_tmem_dealloc_0 ^= 1;
             int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(256));
+            asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(512));
         }
     }
     // ---- Role: empty ----
-    if (warp >= 9 && warp <= 10) {
+    if (warp >= 13 && warp <= 14) {
         // idle — no tasks assigned
     }
     // ---- Role: load_warp ----
-    if (warp == 11) {
+    if (warp == 15) {
         { // load_warp_main
             int batch_2 = 0;
-            int q_tile_2 = blockIdx.x / 2;
-            int q_half_2 = blockIdx.x % 2;
+            int q_tile_2 = blockIdx.x;
             int q_head_2 = blockIdx.y;
             int kv_head_2 = q_head_2;
-            int q_local_base_2 = q_tile_2 * 128 + q_half_2 * 64;
-            int q_valid_2 = 64;
+            int q_local_base_2 = q_tile_2 * 128;
+            int q_valid_2 = 128;
             if (q_tile_2 >= mb) {
                 q_valid_2 = 0;
             }
@@ -1185,8 +1420,9 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
             int query_offset_2 = 0;
             int num_n_blocks_2 = nb;
             if (elect_sync()) {
-                mbarrier_arrive_expect_tx(q_full_addr, 8192);
+                mbarrier_arrive_expect_tx(q_full_addr, 32768);
                 tma_4d_gmem2smem(q0_smem_addr, (&q), 0, query_base_2, q_head_2, 0, q_full_addr);
+                tma_4d_gmem2smem(q1_smem_addr, (&q), 0, query_base_2 + 64, q_head_2, 0, q_full_addr);
             }
             int q_block = query_base_2 / 128;
             int mask_base = (q_head_2 * mb + q_block) * nb;
@@ -1207,16 +1443,18 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
                 int selected_slot = selected_count + _popc_1;
                 if (selected_1 != 0) {
                     union_blocks[selected_slot] = n_block_1;
+                    union_blocks[64 + selected_slot] = n_block_1;
                 }
                 selected_count += ballot_count;
             }
             if (selected_count == 0) {
                 if (lane == 0) {
                     union_blocks[0] = 0;
+                    union_blocks[64] = 0;
                 }
                 selected_count = 1;
             }
-            if (lane < 1) {
+            if (lane < 2) {
                 union_count_smem[lane] = selected_count;
             }
             asm volatile("barrier.sync 8, 32;" ::: "memory");
@@ -1224,31 +1462,53 @@ kernel_flashinfer_blackwell_vsa_head64_native_sm100(const __grid_constant__ CUte
             mbarrier_arrive(union_ready_addr);
             unsigned int load_stage = 0;
             int max_union_count_2 = union_count_smem[0];
+            int union_count1_2 = union_count_smem[1];
+            if (max_union_count_2 < union_count1_2) {
+                max_union_count_2 = union_count1_2;
+            }
             unsigned int _phase_kv_empty = 1;
             #pragma unroll 1
             for (int union_index_3 = 0; union_index_3 < max_union_count_2; union_index_3++) {
-                int n_block_2 = union_blocks[union_index_3];
-                int token_base = k_start_2 + n_block_2 * 128;
-                mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
-                if (elect_sync()) {
-                    mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 16384);
-                    int token0 = token_base;
-                    int token1 = token_base + 64;
-                    tma_4d_gmem2smem(kv_smem_addr + load_stage * 16384, (&k), 0, token0, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
-                    tma_4d_gmem2smem(kv_smem_addr + load_stage * 16384 + 8192, (&k), 0, token1, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                #pragma unroll
+                for (int instance_2 = 0; instance_2 < 2; instance_2++) {
+                    int instance_union_count = union_count_smem[instance_2];
+                    if (instance_union_count > union_index_3) {
+                        int n_block_2 = union_blocks[instance_2 * 64 + union_index_3];
+                        int token_base = k_start_2 + n_block_2 * 128;
+                        mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
+                        if (elect_sync()) {
+                            mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 32768);
+                            int token0 = token_base;
+                            int token1 = token_base + 64;
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768, (&k), 0, token0, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 8192, (&k), 0, token1, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 16384, (&k), 0, token0, 1, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 24576, (&k), 0, token1, 1, kv_head_2, kv_full_addr + (load_stage) * 8);
+                        }
+                        load_stage += 1;
+                        if (load_stage == 3) { load_stage = 0; _phase_kv_empty ^= 1; }
+                    }
                 }
-                load_stage += 1;
-                if (load_stage == 6) { load_stage = 0; _phase_kv_empty ^= 1; }
-                mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
-                if (elect_sync()) {
-                    mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 16384);
-                    int token0_1 = token_base;
-                    int token1_1 = token_base + 64;
-                    tma_4d_gmem2smem(v_smem_addr + load_stage * 16384, (&v), 0, token0_1, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
-                    tma_4d_gmem2smem(v_smem_addr + load_stage * 16384 + 8192, (&v), 0, token1_1, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                #pragma unroll
+                for (int instance_3 = 0; instance_3 < 2; instance_3++) {
+                    int instance_union_count_1 = union_count_smem[instance_3];
+                    if (instance_union_count_1 > union_index_3) {
+                        int n_block_3 = union_blocks[instance_3 * 64 + union_index_3];
+                        int token_base_1 = k_start_2 + n_block_3 * 128;
+                        mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
+                        if (elect_sync()) {
+                            mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 32768);
+                            int token0_1 = token_base_1;
+                            int token1_1 = token_base_1 + 64;
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768, (&v), 0, token0_1, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 8192, (&v), 0, token1_1, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 16384, (&v), 0, token0_1, 1, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 24576, (&v), 0, token1_1, 1, kv_head_2, kv_full_addr + (load_stage) * 8);
+                        }
+                        load_stage += 1;
+                        if (load_stage == 3) { load_stage = 0; _phase_kv_empty ^= 1; }
+                    }
                 }
-                load_stage += 1;
-                if (load_stage == 6) { load_stage = 0; _phase_kv_empty ^= 1; }
             }
         }
     }

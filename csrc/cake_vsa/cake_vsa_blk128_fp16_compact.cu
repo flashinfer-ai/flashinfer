@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -485,7 +490,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, uint8_t* __restrict__ block_mask, int mb, int nb, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
+kernel_flashinfer_blackwell_vsa_blk128_fp16_compact_sm100(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, __half* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, uint8_t* __restrict__ block_mask, int mb, int nb, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -499,13 +504,13 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
     const int num_bids = gridDim.x;
 
     // Kernel setup ops
-    __nv_bfloat16* q0_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    __half* q0_smem = reinterpret_cast<__half*>(smem_raw + 1024);
     const int q0_smem_addr = smem + 1024;
-    __nv_bfloat16* q1_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+    __half* q1_smem = reinterpret_cast<__half*>(smem_raw + 17408);
     const int q1_smem_addr = smem + 17408;
-    __nv_bfloat16* kv_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+    __half* kv_smem = reinterpret_cast<__half*>(smem_raw + 33792);
     const int kv_smem_addr = smem + 33792;
-    __nv_bfloat16* v_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+    __half* v_smem = reinterpret_cast<__half*>(smem_raw + 33792);
     const int v_smem_addr = smem + 33792;
     float* scale_smem = reinterpret_cast<float*>(smem_raw + 132096);
     const int scale_smem_addr = smem + 132096;
@@ -520,8 +525,8 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
-            // q_full: 1 barriers, init_count=448
-            mbarrier_init(smem + 0, 448);
+            // q_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 0, 1);
             // union_ready: 1 barriers, init_count=32
             mbarrier_init(smem + 8, 32);
             // kv_full: 3 barriers, init_count=1
@@ -598,18 +603,11 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
         { // softmax_main
             int batch = 0;
             int q_tile = blockIdx.x;
-            int kv_head = blockIdx.y;
-            int group_size = num_q_heads / num_kv_heads;
-            int tokens_per_instance = 64 / group_size;
-            int tokens_per_tile = 2 * tokens_per_instance;
-            int q_head = kv_head * group_size;
-            int q_len = mb * 128;
-            int q_local_base = q_tile * tokens_per_tile;
-            int q_valid = q_len - q_local_base;
-            if (q_valid > tokens_per_tile) {
-                q_valid = tokens_per_tile;
-            }
-            if (q_valid < 0) {
+            int q_head = blockIdx.y;
+            int kv_head = q_head;
+            int q_local_base = q_tile * 128;
+            int q_valid = 128;
+            if (q_tile >= mb) {
                 q_valid = 0;
             }
             int query_base = q_local_base;
@@ -617,88 +615,29 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
             int kv_len = nb * 128;
             int query_offset = 0;
             int num_n_blocks = nb;
-            int group_size_0 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_1 = 64 / group_size_0;
-            int q_len_2 = mb * 128;
-            #pragma unroll
-            for (int instance = 0; instance < 2; instance++) {
-                #pragma unroll
-                for (int k_half = 0; k_half < 2; k_half++) {
-                    #pragma unroll
-                    for (int iteration = 0; iteration < 2; iteration++) {
-                        int packed_vector = tid + iteration * 448;
-                        if (packed_vector < 512) {
-                            int packed_row = packed_vector / 8;
-                            int d_vector = packed_vector % 8;
-                            int query_in_instance = packed_row / group_size_0;
-                            int head_in_group = packed_row % group_size_0;
-                            int query = query_base + instance * tokens_per_instance_1 + query_in_instance;
-                            int q_offset = (query * num_q_heads + q_head + head_in_group) * 128 + k_half * 64 + d_vector * 8;
-                            if (instance == 0) {
-                                int q0_dst = (q0_smem_addr + (unsigned int)((packed_row + k_half * 64) * 128 + d_vector * 8 * 2 ^ ((packed_row + k_half * 64) * 128 + d_vector * 8 * 2 >> 7 & 7) << 4));
-                                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
-                                    :: "r"(q0_dst), "l"(q + q_offset), "r"((query < q_len_2) ? 16 : 0));
-                            } else {
-                                int q1_dst = (q1_smem_addr + (unsigned int)((packed_row + k_half * 64) * 128 + d_vector * 8 * 2 ^ ((packed_row + k_half * 64) * 128 + d_vector * 8 * 2 >> 7 & 7) << 4));
-                                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
-                                    :: "r"(q1_dst), "l"(q + q_offset), "r"((query < q_len_2) ? 16 : 0));
-                            }
-                        }
-                    }
-                }
-            }
-            asm volatile(
-                "{\n\t"
-                "cp.async.mbarrier.arrive.shared::cta.b64 [%0];\n\t"
-                "}"
-                :: "r"(q_full_addr) : "memory");
-            mbarrier_arrive(q_full_addr);
-            int batch_3 = 0;
-            int q_tile_4 = blockIdx.x;
-            int kv_head_5 = blockIdx.y;
-            int group_size_6 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_7 = 64 / group_size_6;
-            int tokens_per_tile_8 = 2 * tokens_per_instance_7;
-            int q_head_9 = kv_head_5 * group_size_6;
-            int q_len_10 = mb * 128;
-            int q_local_base_11 = q_tile_4 * tokens_per_tile_8;
-            int q_valid_12 = q_len_10 - q_local_base_11;
-            if (q_valid_12 > tokens_per_tile_8) {
-                q_valid_12 = tokens_per_tile_8;
-            }
-            if (q_valid_12 < 0) {
-                q_valid_12 = 0;
-            }
-            int query_base_13 = q_local_base_11;
-            int k_start_14 = 0;
-            int kv_len_15 = nb * 128;
-            int query_offset_16 = 0;
-            int num_n_blocks_17 = nb;
             unsigned int _phase_union_ready_0 = 0;
             mbarrier_wait(union_ready_addr, _phase_union_ready_0);
             _phase_union_ready_0 ^= 1;
-            int instance_1 = make_warp_uniform(warp / 4);
-            int instance_row_offset = make_warp_uniform(instance_1 * 64);
-            int instance_tmem_offset = make_warp_uniform(instance_1 * 256);
-            int union_count = union_count_smem[instance_1];
+            int instance = make_warp_uniform(warp / 4);
+            int instance_row_offset = make_warp_uniform(instance * 64);
+            int instance_token_offset = make_warp_uniform(instance * 64);
+            int instance_tmem_offset = make_warp_uniform(instance * 256);
+            int union_count = union_count_smem[instance];
             const int warp_in_instance = warp % 4;
             const int tmem_row_origin = warp_in_instance * 32;
             const int logical_row_origin = warp_in_instance * 16;
             int my_row = logical_row_origin + lane % 16;
             int col_half = lane / 16;
-            int group_size_18 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_19 = 64 / group_size_18;
-            int instance_token_offset = instance_1 * tokens_per_instance_19;
-            int query_in_instance_1 = my_row / group_size_18;
-            int query_in_tile = instance_token_offset + query_in_instance_1;
-            int instance_valid = q_valid_12 - instance_token_offset;
-            if (instance_valid > tokens_per_instance_19) {
-                instance_valid = tokens_per_instance_19;
+            int query_in_instance = my_row;
+            int query_in_tile = instance_token_offset + query_in_instance;
+            int instance_valid = q_valid - instance_token_offset;
+            if (instance_valid > 64) {
+                instance_valid = 64;
             }
             if (instance_valid < 0) {
                 instance_valid = 0;
             }
-            int row_valid = ((query_in_instance_1 < instance_valid) ? 1 : 0);
+            int row_valid = ((query_in_instance < instance_valid) ? 1 : 0);
             float row_max = -CAKE_INF;
             float row_sum = 0.0f;
             float temperature_sum = 0.0f;
@@ -708,8 +647,8 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
             unsigned int _phase_corr_done_1 = 0;
             #pragma unroll 1
             for (int union_index = 0; union_index < union_count; union_index++) {
-                int n_block = union_blocks[instance_1 * 64 + union_index];
-                if (instance_1 == 0) {
+                int n_block = union_blocks[instance * 64 + union_index];
+                if (instance == 0) {
                     mbarrier_wait(s_full_addr, _phase_s_full_0);
                     _phase_s_full_0 ^= 1;
                 } else {
@@ -719,7 +658,7 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                 int selected = row_valid;
                 int valid_cols = 0;
                 if (selected != 0) {
-                    valid_cols = kv_len_15 - n_block * 128;
+                    valid_cols = kv_len - n_block * 128;
                     if (valid_cols > 128) {
                         valid_cols = 128;
                     }
@@ -820,7 +759,7 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                     scale_smem[instance_row_offset + my_row] = acc_scale;
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                if (instance_1 == 0) {
+                if (instance == 0) {
                     mbarrier_arrive(corr_sig_addr);
                 } else {
                     mbarrier_arrive(corr_sig_addr + 8);
@@ -912,8 +851,8 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                     unsigned int packed_p[32];
                     #pragma unroll
                     for (int _lp = 0; _lp < 32; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
-                        packed_p[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
+                        packed_p[_lp] = *(uint32_t*)&_h2;
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
@@ -943,8 +882,8 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                     unsigned int packed_p_1[32];
                     #pragma unroll
                     for (int _lp = 0; _lp < 32; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
-                        packed_p_1[_lp] = *(uint32_t*)&_bf2;
+                        __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
+                        packed_p_1[_lp] = *(uint32_t*)&_h2;
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
@@ -956,7 +895,7 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                         :: "r"(p_addr + 16), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[0])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[1])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[2])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[3])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[4])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[5])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[6])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[7])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[8])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[9])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[10])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[11])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[12])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[13])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[14])), "r"(*reinterpret_cast<const uint32_t*>(&(packed_p_1 + 16)[15])));
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-                if (instance_1 == 0) {
+                if (instance == 0) {
                     mbarrier_arrive(p_full_addr);
                     mbarrier_wait(corr_done_addr, _phase_corr_done_0);
                     _phase_corr_done_0 ^= 1;
@@ -976,7 +915,7 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                 scale_smem[384 + instance_row_offset + my_row] = temperature_sum;
             }
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            if (instance_1 == 0) {
+            if (instance == 0) {
                 mbarrier_arrive(corr_sig_addr);
             } else {
                 mbarrier_arrive(corr_sig_addr + 8);
@@ -989,18 +928,11 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
         { // correction_main
             int batch_1 = 0;
             int q_tile_1 = blockIdx.x;
-            int kv_head_1 = blockIdx.y;
-            int group_size_1 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_2 = 64 / group_size_1;
-            int tokens_per_tile_1 = 2 * tokens_per_instance_2;
-            int q_head_1 = kv_head_1 * group_size_1;
-            int q_len_1 = mb * 128;
-            int q_local_base_1 = q_tile_1 * tokens_per_tile_1;
-            int q_valid_1 = q_len_1 - q_local_base_1;
-            if (q_valid_1 > tokens_per_tile_1) {
-                q_valid_1 = tokens_per_tile_1;
-            }
-            if (q_valid_1 < 0) {
+            int q_head_1 = blockIdx.y;
+            int kv_head_1 = q_head_1;
+            int q_local_base_1 = q_tile_1 * 128;
+            int q_valid_1 = 128;
+            if (q_tile_1 >= mb) {
                 q_valid_1 = 0;
             }
             int query_base_1 = q_local_base_1;
@@ -1008,63 +940,6 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
             int kv_len_1 = nb * 128;
             int query_offset_1 = 0;
             int num_n_blocks_1 = nb;
-            int group_size_0_1 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_1_1 = 64 / group_size_0_1;
-            int q_len_2_1 = mb * 128;
-            #pragma unroll
-            for (int instance_2 = 0; instance_2 < 2; instance_2++) {
-                #pragma unroll
-                for (int k_half_1 = 0; k_half_1 < 2; k_half_1++) {
-                    #pragma unroll
-                    for (int iteration_1 = 0; iteration_1 < 2; iteration_1++) {
-                        int packed_vector_1 = tid + iteration_1 * 448;
-                        if (packed_vector_1 < 512) {
-                            int packed_row_1 = packed_vector_1 / 8;
-                            int d_vector_1 = packed_vector_1 % 8;
-                            int query_in_instance_2 = packed_row_1 / group_size_0_1;
-                            int head_in_group_1 = packed_row_1 % group_size_0_1;
-                            int query_1 = query_base_1 + instance_2 * tokens_per_instance_1_1 + query_in_instance_2;
-                            int q_offset_1 = (query_1 * num_q_heads + q_head_1 + head_in_group_1) * 128 + k_half_1 * 64 + d_vector_1 * 8;
-                            if (instance_2 == 0) {
-                                int q0_dst_1 = (q0_smem_addr + (unsigned int)((packed_row_1 + k_half_1 * 64) * 128 + d_vector_1 * 8 * 2 ^ ((packed_row_1 + k_half_1 * 64) * 128 + d_vector_1 * 8 * 2 >> 7 & 7) << 4));
-                                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
-                                    :: "r"(q0_dst_1), "l"(q + q_offset_1), "r"((query_1 < q_len_2_1) ? 16 : 0));
-                            } else {
-                                int q1_dst_1 = (q1_smem_addr + (unsigned int)((packed_row_1 + k_half_1 * 64) * 128 + d_vector_1 * 8 * 2 ^ ((packed_row_1 + k_half_1 * 64) * 128 + d_vector_1 * 8 * 2 >> 7 & 7) << 4));
-                                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
-                                    :: "r"(q1_dst_1), "l"(q + q_offset_1), "r"((query_1 < q_len_2_1) ? 16 : 0));
-                            }
-                        }
-                    }
-                }
-            }
-            asm volatile(
-                "{\n\t"
-                "cp.async.mbarrier.arrive.shared::cta.b64 [%0];\n\t"
-                "}"
-                :: "r"(q_full_addr) : "memory");
-            mbarrier_arrive(q_full_addr);
-            int batch_3_1 = 0;
-            int q_tile_4_1 = blockIdx.x;
-            int kv_head_5_1 = blockIdx.y;
-            int group_size_6_1 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_7_1 = 64 / group_size_6_1;
-            int tokens_per_tile_8_1 = 2 * tokens_per_instance_7_1;
-            int q_head_9_1 = kv_head_5_1 * group_size_6_1;
-            int q_len_10_1 = mb * 128;
-            int q_local_base_11_1 = q_tile_4_1 * tokens_per_tile_8_1;
-            int q_valid_12_1 = q_len_10_1 - q_local_base_11_1;
-            if (q_valid_12_1 > tokens_per_tile_8_1) {
-                q_valid_12_1 = tokens_per_tile_8_1;
-            }
-            if (q_valid_12_1 < 0) {
-                q_valid_12_1 = 0;
-            }
-            int query_base_13_1 = q_local_base_11_1;
-            int k_start_14_1 = 0;
-            int kv_len_15_1 = nb * 128;
-            int query_offset_16_1 = 0;
-            int num_n_blocks_17_1 = nb;
             unsigned int _phase_union_ready_0_1 = 0;
             mbarrier_wait(union_ready_addr, _phase_union_ready_0_1);
             _phase_union_ready_0_1 ^= 1;
@@ -1165,30 +1040,28 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
             mbarrier_wait(corr_sig_addr + 8, _phase_corr_sig_1);
             _phase_corr_sig_1 ^= 1;
             asm volatile("tcgen05.fence::after_thread_sync;");
-            int group_size_18_1 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_19_1 = 64 / group_size_18_1;
             #pragma unroll
-            for (int instance_3 = 0; instance_3 < 2; instance_3++) {
-                int instance_row_offset_1 = instance_3 * 64;
-                int instance_token_offset_1 = instance_3 * tokens_per_instance_19_1;
-                int output_tmem_offset = instance_3 * 256 + 128;
+            for (int instance_1 = 0; instance_1 < 2; instance_1++) {
+                int instance_row_offset_1 = instance_1 * 64;
+                int instance_token_offset_1 = instance_1 * 64;
+                int output_tmem_offset = instance_1 * 256 + 128;
                 float final_sum = scale_smem[128 + instance_row_offset_1 + my_row_1];
                 float final_max = scale_smem[256 + instance_row_offset_1 + my_row_1];
                 float final_temperature_sum = scale_smem[384 + instance_row_offset_1 + my_row_1];
                 float _rcp_0 = approx_rcp(final_sum);
                 float inv_sum = ((final_sum > 0.0f && final_sum == final_sum) ? _rcp_0 : 0.0f);
-                int query_in_instance_3 = my_row_1 / group_size_18_1;
-                int query_in_tile_1 = instance_token_offset_1 + query_in_instance_3;
-                int instance_valid_1 = q_valid_12_1 - instance_token_offset_1;
-                if (instance_valid_1 > tokens_per_instance_19_1) {
-                    instance_valid_1 = tokens_per_instance_19_1;
+                int query_in_instance_1 = my_row_1;
+                int query_in_tile_1 = instance_token_offset_1 + query_in_instance_1;
+                int instance_valid_1 = q_valid_1 - instance_token_offset_1;
+                if (instance_valid_1 > 64) {
+                    instance_valid_1 = 64;
                 }
                 if (instance_valid_1 < 0) {
                     instance_valid_1 = 0;
                 }
-                int output_head = q_head_9_1 + my_row_1 % group_size_18_1;
-                int query_2 = query_base_13_1 + query_in_tile_1;
-                int output_row = (query_2 * num_q_heads + output_head) * 128;
+                int output_head = q_head_1;
+                int query = query_base_1 + query_in_tile_1;
+                int output_row = (query * num_q_heads + output_head) * 128;
                 float _tmem_load_4[64];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
@@ -1201,7 +1074,7 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[32])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[33])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[34])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[35])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[36])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[37])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[38])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[39])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[40])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[41])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[42])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[43])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[44])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[45])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[46])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[47])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[48])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[49])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[50])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[51])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[52])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[53])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[54])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[55])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[56])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[57])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[58])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[59])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[60])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[61])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[62])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[63]))
                     : "r"(taddr + (unsigned int)output_tmem_offset + (unsigned int)row_addr + 32));
                 int col_base = col_half_1 * 64;
-                if (query_in_instance_3 < instance_valid_1) {
+                if (query_in_instance_1 < instance_valid_1) {
                     #pragma unroll
                     for (int offset = 0; offset < 64; offset += 8) {
                         {
@@ -1215,16 +1088,16 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                             for (int _ps = 0; _ps < 8; _ps++)
                                 _tmem_load_4[offset + _ps] *= inv_sum;
                             #endif
-                            __nv_bfloat162 _pk[4];
-                            _pk[0] = __floats2bfloat162_rn(_tmem_load_4[offset + 0], _tmem_load_4[offset + 1]);
-                            _pk[1] = __floats2bfloat162_rn(_tmem_load_4[offset + 2], _tmem_load_4[offset + 3]);
-                            _pk[2] = __floats2bfloat162_rn(_tmem_load_4[offset + 4], _tmem_load_4[offset + 5]);
-                            _pk[3] = __floats2bfloat162_rn(_tmem_load_4[offset + 6], _tmem_load_4[offset + 7]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (output_row + col_base + offset)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            __half2 _pk[4];
+                            _pk[0] = __floats2half2_rn(_tmem_load_4[offset + 0], _tmem_load_4[offset + 1]);
+                            _pk[1] = __floats2half2_rn(_tmem_load_4[offset + 2], _tmem_load_4[offset + 3]);
+                            _pk[2] = __floats2half2_rn(_tmem_load_4[offset + 4], _tmem_load_4[offset + 5]);
+                            _pk[3] = __floats2half2_rn(_tmem_load_4[offset + 6], _tmem_load_4[offset + 7]);
+                            *reinterpret_cast<uint4*>(&((__half*)(out + (output_row + col_base + offset)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                         }
                     }
                     if (col_half_1 == 0) {
-                        int stat_idx = query_2 * num_q_heads + output_head;
+                        int stat_idx = query * num_q_heads + output_head;
                         if (return_softmax_lse != 0) {
                             float _log2_0;
                             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(final_sum));
@@ -1285,7 +1158,7 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 69207184;\n\t"
+                    "mov.b32 id, 69206032;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -1351,7 +1224,7 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 69207184;\n\t"
+                    "mov.b32 id, 69206032;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -1416,7 +1289,7 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 69272720;\n\t"
+                    "mov.b32 id, 69271568;\n\t"
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1476,7 +1349,7 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 69272720;\n\t"
+                    "mov.b32 id, 69271568;\n\t"
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1525,24 +1398,20 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
             asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(512));
         }
     }
-    // ---- Role: q_load ----
+    // ---- Role: empty ----
     if (warp >= 13 && warp <= 14) {
-        { // q_load_main
-            int q_loader_tid = 384 + (warp - 13) * 32 + lane;
+        // idle — no tasks assigned
+    }
+    // ---- Role: load_warp ----
+    if (warp == 15) {
+        { // load_warp_main
             int batch_2 = 0;
             int q_tile_2 = blockIdx.x;
-            int kv_head_2 = blockIdx.y;
-            int group_size_2 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_3 = 64 / group_size_2;
-            int tokens_per_tile_2 = 2 * tokens_per_instance_3;
-            int q_head_2 = kv_head_2 * group_size_2;
-            int q_len_3 = mb * 128;
-            int q_local_base_2 = q_tile_2 * tokens_per_tile_2;
-            int q_valid_2 = q_len_3 - q_local_base_2;
-            if (q_valid_2 > tokens_per_tile_2) {
-                q_valid_2 = tokens_per_tile_2;
-            }
-            if (q_valid_2 < 0) {
+            int q_head_2 = blockIdx.y;
+            int kv_head_2 = q_head_2;
+            int q_local_base_2 = q_tile_2 * 128;
+            int q_valid_2 = 128;
+            if (q_tile_2 >= mb) {
                 q_valid_2 = 0;
             }
             int query_base_2 = q_local_base_2;
@@ -1550,76 +1419,19 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
             int kv_len_2 = nb * 128;
             int query_offset_2 = 0;
             int num_n_blocks_2 = nb;
-            int group_size_0_2 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_1_2 = 64 / group_size_0_2;
-            int q_len_2_2 = mb * 128;
-            #pragma unroll
-            for (int instance_4 = 0; instance_4 < 2; instance_4++) {
-                #pragma unroll
-                for (int k_half_2 = 0; k_half_2 < 2; k_half_2++) {
-                    #pragma unroll
-                    for (int iteration_2 = 0; iteration_2 < 2; iteration_2++) {
-                        int packed_vector_2 = q_loader_tid + iteration_2 * 448;
-                        if (packed_vector_2 < 512) {
-                            int packed_row_2 = packed_vector_2 / 8;
-                            int d_vector_2 = packed_vector_2 % 8;
-                            int query_in_instance_4 = packed_row_2 / group_size_0_2;
-                            int head_in_group_2 = packed_row_2 % group_size_0_2;
-                            int query_3 = query_base_2 + instance_4 * tokens_per_instance_1_2 + query_in_instance_4;
-                            int q_offset_2 = (query_3 * num_q_heads + q_head_2 + head_in_group_2) * 128 + k_half_2 * 64 + d_vector_2 * 8;
-                            if (instance_4 == 0) {
-                                int q0_dst_2 = (q0_smem_addr + (unsigned int)((packed_row_2 + k_half_2 * 64) * 128 + d_vector_2 * 8 * 2 ^ ((packed_row_2 + k_half_2 * 64) * 128 + d_vector_2 * 8 * 2 >> 7 & 7) << 4));
-                                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
-                                    :: "r"(q0_dst_2), "l"(q + q_offset_2), "r"((query_3 < q_len_2_2) ? 16 : 0));
-                            } else {
-                                int q1_dst_2 = (q1_smem_addr + (unsigned int)((packed_row_2 + k_half_2 * 64) * 128 + d_vector_2 * 8 * 2 ^ ((packed_row_2 + k_half_2 * 64) * 128 + d_vector_2 * 8 * 2 >> 7 & 7) << 4));
-                                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
-                                    :: "r"(q1_dst_2), "l"(q + q_offset_2), "r"((query_3 < q_len_2_2) ? 16 : 0));
-                            }
-                        }
-                    }
-                }
+            if (elect_sync()) {
+                mbarrier_arrive_expect_tx(q_full_addr, 32768);
+                tma_4d_gmem2smem(q0_smem_addr, (&q), 0, query_base_2, q_head_2, 0, q_full_addr);
+                tma_4d_gmem2smem(q1_smem_addr, (&q), 0, query_base_2 + 64, q_head_2, 0, q_full_addr);
             }
-            asm volatile(
-                "{\n\t"
-                "cp.async.mbarrier.arrive.shared::cta.b64 [%0];\n\t"
-                "}"
-                :: "r"(q_full_addr) : "memory");
-            mbarrier_arrive(q_full_addr);
-        }
-    }
-    // ---- Role: load_warp ----
-    if (warp == 15) {
-        { // load_warp_main
-            int batch_4 = 0;
-            int q_tile_3 = blockIdx.x;
-            int kv_head_3 = blockIdx.y;
-            int group_size_3 = num_q_heads / num_kv_heads;
-            int tokens_per_instance_4 = 64 / group_size_3;
-            int tokens_per_tile_3 = 2 * tokens_per_instance_4;
-            int q_head_3 = kv_head_3 * group_size_3;
-            int q_len_4 = mb * 128;
-            int q_local_base_3 = q_tile_3 * tokens_per_tile_3;
-            int q_valid_3 = q_len_4 - q_local_base_3;
-            if (q_valid_3 > tokens_per_tile_3) {
-                q_valid_3 = tokens_per_tile_3;
-            }
-            if (q_valid_3 < 0) {
-                q_valid_3 = 0;
-            }
-            int query_base_3 = q_local_base_3;
-            int k_start_3 = 0;
-            int kv_len_3 = nb * 128;
-            int query_offset_3 = 0;
-            int num_n_blocks_3 = nb;
-            int q_block = query_base_3 / 128;
-            int mask_base = (q_head_3 * mb + q_block) * nb;
+            int q_block = query_base_2 / 128;
+            int mask_base = (q_head_2 * mb + q_block) * nb;
             int selected_count = 0;
             #pragma unroll 1
-            for (int block_base = 0; block_base < num_n_blocks_3; block_base += 32) {
+            for (int block_base = 0; block_base < num_n_blocks_2; block_base += 32) {
                 int n_block_1 = block_base + lane;
                 int selected_1 = 0;
-                if (n_block_1 < num_n_blocks_3) {
+                if (n_block_1 < num_n_blocks_2) {
                     selected_1 = (int)((int)block_mask[mask_base + n_block_1] != 0);
                 }
                 unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, selected_1 != 0);
@@ -1658,40 +1470,40 @@ kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100(__nv_bfloat16* __restrict__ 
             #pragma unroll 1
             for (int union_index_3 = 0; union_index_3 < max_union_count_2; union_index_3++) {
                 #pragma unroll
-                for (int instance_5 = 0; instance_5 < 2; instance_5++) {
-                    int instance_union_count = union_count_smem[instance_5];
+                for (int instance_2 = 0; instance_2 < 2; instance_2++) {
+                    int instance_union_count = union_count_smem[instance_2];
                     if (instance_union_count > union_index_3) {
-                        int n_block_2 = union_blocks[instance_5 * 64 + union_index_3];
-                        int token_base = k_start_3 + n_block_2 * 128;
+                        int n_block_2 = union_blocks[instance_2 * 64 + union_index_3];
+                        int token_base = k_start_2 + n_block_2 * 128;
                         mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
                         if (elect_sync()) {
                             mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 32768);
                             int token0 = token_base;
                             int token1 = token_base + 64;
-                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768, (&k), 0, token0, 0, kv_head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 8192, (&k), 0, token1, 0, kv_head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 16384, (&k), 0, token0, 1, kv_head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 24576, (&k), 0, token1, 1, kv_head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768, (&k), 0, token0, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 8192, (&k), 0, token1, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 16384, (&k), 0, token0, 1, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 24576, (&k), 0, token1, 1, kv_head_2, kv_full_addr + (load_stage) * 8);
                         }
                         load_stage += 1;
                         if (load_stage == 3) { load_stage = 0; _phase_kv_empty ^= 1; }
                     }
                 }
                 #pragma unroll
-                for (int instance_6 = 0; instance_6 < 2; instance_6++) {
-                    int instance_union_count_1 = union_count_smem[instance_6];
+                for (int instance_3 = 0; instance_3 < 2; instance_3++) {
+                    int instance_union_count_1 = union_count_smem[instance_3];
                     if (instance_union_count_1 > union_index_3) {
-                        int n_block_3 = union_blocks[instance_6 * 64 + union_index_3];
-                        int token_base_1 = k_start_3 + n_block_3 * 128;
+                        int n_block_3 = union_blocks[instance_3 * 64 + union_index_3];
+                        int token_base_1 = k_start_2 + n_block_3 * 128;
                         mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
                         if (elect_sync()) {
                             mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 32768);
                             int token0_1 = token_base_1;
                             int token1_1 = token_base_1 + 64;
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768, (&v), 0, token0_1, 0, kv_head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 8192, (&v), 0, token1_1, 0, kv_head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 16384, (&v), 0, token0_1, 1, kv_head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 24576, (&v), 0, token1_1, 1, kv_head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768, (&v), 0, token0_1, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 8192, (&v), 0, token1_1, 0, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 16384, (&v), 0, token0_1, 1, kv_head_2, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 24576, (&v), 0, token1_1, 1, kv_head_2, kv_full_addr + (load_stage) * 8);
                         }
                         load_stage += 1;
                         if (load_stage == 3) { load_stage = 0; _phase_kv_empty ^= 1; }
