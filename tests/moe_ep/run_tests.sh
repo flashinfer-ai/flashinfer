@@ -133,6 +133,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_sm90_pull_mega_cuda_graph.py \
     --ignore=tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm107_kernel_boundaries.py \
     --ignore=tests/moe_ep/test_sm90_pull_fp8_tuner.py \
@@ -281,7 +282,9 @@ run_oracle() {
 }
 
 # Single-GPU Hopper torch-oracle correctness: sm90_fp8_fp8_bf16_pull_cutedsl mega kernel vs the
-# kernel drop's own pure-torch reference (compute_megamoe_reference_fp8).
+# kernel drop's own pure-torch reference (compute_megamoe_reference_fp8),
+# including MXFP8 checkpoint weights and masked/short/hot/empty routing rounds,
+# plus layer-level CUDA graph capture/replay.
 # Runs in its OWN pytest process: the SM90 and SM100 kernel trees share
 # top-level module names and are mutually exclusive per process, so this file
 # is excluded from run_unit and must not share an invocation with
@@ -290,7 +293,8 @@ run_oracle() {
 run_oracle_sm90() {
   MEGA_NO_DIST=1 "${PY}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py -v \
+    tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
+    tests/moe_ep/test_sm90_pull_mega_cuda_graph.py -v \
     -m arch_hopper
 }
 

@@ -25,6 +25,17 @@ syncing future drops.
 Local extensions pending upstream (re-apply when syncing a drop that has
 not picked them up):
 
+- Masked-route reduce (2026-10-01): the separate-reduce `TopkReduce` summed
+  every top-k slot, but a `-1` route is never dispatched, so its
+  `(token, topk)` combine row kept a PREVIOUS launch's term (wrong output on
+  any reused workspace; a fresh zeroed one hid it).
+  `moe_nvfp4_swapab/topk_reduce.py` gains `slot_topk_idx` (bf16 reduce
+  only): the per-token live-slot mask is derived from the local routing
+  (`topk_idx >= 0`) and reuses the `slot_mask` skip path;
+  `moe_hopper_fp8/megamoe_kernel_fp8.py` passes `slot_topk_idx=topk_idx` on
+  the non-grouped call.  Grouped token-back and in-kernel FC2 reduce were
+  already correct.  Covered by `test_sm90_fp8_kernel_routing_rounds_on_one_buffer`.
+
 - `moe_hopper_fp8/heuristic_config.py` carries a `token_back_mode` field
   per bucket (2026-08-23 FI-layer epi-vs-reuse sweep winners).
 - Wire-level top-k dedup (`dedup_dispatch`, 2026-08-24, design in

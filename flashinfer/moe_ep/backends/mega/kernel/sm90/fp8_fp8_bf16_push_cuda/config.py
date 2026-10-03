@@ -8,7 +8,12 @@ from typing import Literal
 
 @dataclass
 class Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig:
-    """Static dimensions and protocol choices for the Hopper FP8 backend."""
+    """Static dimensions and protocol choices for the Hopper FP8 backend.
+
+    Weights: canonical bf16 ``MoEWeightPack`` or an MXFP8 checkpoint (E4M3 +
+    E8M0 per-32 scales); both are quantized/converted once at preprocess to
+    128x128 FP8 block scales (MXFP8 exactly, except for E4M3 underflow).
+    """
 
     intermediate_size: int
     top_k: int

@@ -23,6 +23,7 @@ import torch
 
 __all__ = [
     "Sm90PushWeights",
+    "interleave_sm90_push_gate_up",
     "make_sm90_push_weights",
     "transform_weights_for_sm90_push",
 ]
@@ -83,20 +84,36 @@ def transform_weights_for_sm90_push(
         w2_fp8[e].copy_(q)
         w2_sf[e].copy_(s)
     if interleave_gate_up:
-        nb = I // 128
-        w13_fp8 = (
-            w13_fp8.reshape(E, 2, nb, 128, H)
-            .transpose(1, 2)
-            .reshape(E, two_i, H)
-            .contiguous()
-        )
-        w13_sf = (
-            w13_sf.reshape(E, 2, nb, H // 128)
-            .transpose(1, 2)
-            .reshape(E, two_i // 128, H // 128)
-            .contiguous()
-        )
+        w13_fp8, w13_sf = interleave_sm90_push_gate_up(w13_fp8, w13_sf)
     return w13_fp8, w13_sf, w2_fp8, w2_sf
+
+
+def interleave_sm90_push_gate_up(
+    w13_fp8: torch.Tensor, w13_sf: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gate/up 128-row block interleave of quantized FC1 weights (fused FC1 layout).
+
+    ``w13_fp8`` ``(E, 2I, H)`` and its ``(E, 2I/128, H/128)`` block scales,
+    gate rows first, become ``[gate block 0, up block 0, gate block 1, ...]``.
+    Each 128-row block keeps its own scale row, so this is lossless.
+    """
+    E, two_i, H = w13_fp8.shape
+    if two_i % 256 != 0:
+        raise ValueError(f"interleave_gate_up needs I % 128 == 0, got 2I={two_i}")
+    nb = two_i // 256
+    w13_fp8 = (
+        w13_fp8.reshape(E, 2, nb, 128, H)
+        .transpose(1, 2)
+        .reshape(E, two_i, H)
+        .contiguous()
+    )
+    w13_sf = (
+        w13_sf.reshape(E, 2, nb, H // 128)
+        .transpose(1, 2)
+        .reshape(E, two_i // 128, H // 128)
+        .contiguous()
+    )
+    return w13_fp8, w13_sf
 
 
 @dataclass(frozen=True)
