@@ -2833,6 +2833,7 @@ def test_bf16_swiglu_step_clamps_after_silu_and_graph_replay(limit, from_logits)
     )
     act = MoEActivationPack(
         hidden_states_q=x,
+        hidden_states_scale=None,
         topk_ids=None if from_logits else ids,
         topk_weights=None if from_logits else torch.ones(tokens, 1, device=device),
         routing_logits=logits if from_logits else None,
