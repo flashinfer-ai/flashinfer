@@ -4303,6 +4303,260 @@ def test_attention_ts_decode_rejects_mismatched_o_stages_and_kv_insts():
         )
 
 
+def _nvfp4_storage_views(k, v, scales, layout):
+    """Populate cache views once, preserving the existing K/V scale ordering."""
+    if layout == "compact":
+        return (k, v), scales
+    pages, heads, tokens, packed_dim = k.shape
+    sf_dim = scales[0].shape[-1]
+    if layout == "packed":
+        data_bytes = heads * tokens * packed_dim
+        scale_bytes = heads * tokens * sf_dim
+        page_bytes = 2 * (data_bytes + scale_bytes)
+        # FP4 unpacking TMA needs 32-byte data-pointer alignment. Keep a
+        # nonzero offset to exercise retention of sliced storage as well.
+        backing = torch.zeros(
+            32 + pages * page_bytes, dtype=torch.uint8, device=k.device
+        )
+        views = []
+        offset = 32
+        for source in (k, scales[0], v, scales[1]):
+            width = source.shape[-1]
+            view = backing.view(source.dtype).as_strided(
+                source.shape,
+                (page_bytes, tokens * width, width, 1),
+                offset,
+            )
+            view.copy_(source)
+            views.append(view)
+            offset += heads * tokens * width
+        return (views[0], views[2]), (views[1], views[3])
+    assert layout == "padded"
+    padded = []
+    for index, source in enumerate(scales):
+        head_stride = tokens * sf_dim + 16 * (index + 1)
+        page_stride = heads * head_stride + 32 * (index + 1)
+        backing = torch.zeros(
+            16 + pages * page_stride, dtype=source.dtype, device=k.device
+        )
+        view = backing.as_strided(
+            source.shape, (page_stride, head_stride, sf_dim, 1), 16
+        )
+        view.copy_(source)
+        padded.append(view)
+    return (k, v), tuple(padded)
+
+
+@pytest.mark.parametrize("layout", ("compact", "packed", "padded"))
+def test_attention_ts_nvfp4_scale_views_contract(layout):
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    k = torch.zeros((3, 4, 32, 64), dtype=torch.uint8)
+    scales = tuple(torch.zeros((3, 4, 32, 8), dtype=_FP8) for _ in range(2))
+    (k, v), scales = _nvfp4_storage_views(k, k, scales, layout)
+    normalized = decode_module._normalize_paged_kv_scale_factors(
+        scales, k_cache=k, logical_head_dim=128
+    )
+    for actual, original in zip(normalized, scales, strict=True):
+        assert actual is original
+        assert actual.data_ptr() == original.data_ptr()
+        assert actual.storage_offset() == original.storage_offset()
+    if layout == "packed":
+        assert k.untyped_storage().data_ptr() == v.untyped_storage().data_ptr()
+        assert all(
+            sf.untyped_storage().data_ptr() == k.untyped_storage().data_ptr()
+            for sf in scales
+        )
+
+
+@pytest.mark.parametrize("which_scale", (0, 1), ids=("k", "v"))
+@pytest.mark.parametrize(
+    ("strides", "offset", "error"),
+    (
+        ((1024, 128, 8, 1), 0, "overlaps"),
+        ((512, 256, 8, 1), 0, "overlaps"),
+        ((1024, 0, 8, 1), 0, "positive"),
+        ((0, 256, 8, 1), 0, "positive"),
+        ((1040, 257, 8, 1), 0, "head stride must be 16-byte aligned"),
+        ((1025, 256, 8, 1), 0, "page stride must be 16-byte aligned"),
+        ((2048, 512, 16, 1), 0, "contiguous token/scale"),
+        ((2048, 512, 16, 2), 0, "contiguous token/scale"),
+        ((1024, 256, 8, 1), 1, "16-byte aligned"),
+    ),
+)
+def test_attention_ts_nvfp4_rejects_invalid_scale_views(
+    which_scale, strides, offset, error
+):
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    k = torch.empty((3, 4, 32, 64), dtype=torch.uint8)
+    scales = [torch.empty((3, 4, 32, 8), dtype=_FP8) for _ in range(2)]
+    scales[which_scale] = torch.empty(8192, dtype=_FP8).as_strided(
+        scales[0].shape, strides, offset
+    )
+    with pytest.raises(ValueError, match=error):
+        decode_module._normalize_paged_kv_scale_factors(
+            tuple(scales), k_cache=k, logical_head_dim=128
+        )
+
+
+@pytest.mark.parametrize(
+    ("strides", "error"),
+    (
+        ((2**63, 256, 8, 1), "stride exceeds signed int64"),
+        ((2**62, 256, 8, 1), "address span exceeds signed int64"),
+    ),
+)
+def test_attention_ts_nvfp4_scale_address_bounds(monkeypatch, strides, error):
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    k = torch.empty((3, 4, 32, 64), dtype=torch.uint8)
+    scales = torch.empty((3, 4, 32, 8), dtype=_FP8)
+    # Synthetic metadata exercises overflow without allocating exabytes.
+    monkeypatch.setattr(
+        scales, "stride", lambda dim=None: strides if dim is None else strides[dim]
+    )
+    with pytest.raises(ValueError, match=error):
+        decode_module._normalize_paged_kv_scale_factors(
+            (scales, scales), k_cache=k, logical_head_dim=128
+        )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("transformed_tmem", (False, True), ids=("smem", "tmem"))
+@pytest.mark.parametrize(
+    ("head_dim", "page_size", "seq_len_q"), ((128, 64, 1), (256, 32, 4))
+)
+def test_attention_ts_decode_nvfp4_strided_scales(
+    monkeypatch, transformed_tmem, head_dim, page_size, seq_len_q
+):
+    """All entrypoints consume original strided views with either transform."""
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    original_make_config = fmha_decode_config.make_decode_config
+
+    def make_config(*args, **kwargs):
+        kwargs["args"] = {
+            **(kwargs.get("args") or {}),
+            "store_transformed_kv_in_tmem": transformed_tmem,
+        }
+        cfg = original_make_config(*args, **kwargs)
+        assert cfg.store_transformed_kv_in_tmem is transformed_tmem
+        if head_dim == 256:
+            assert cfg.head_dim_kv_stage == 128
+        return cfg
+
+    monkeypatch.setattr(fmha_decode_config, "make_decode_config", make_config)
+    monkeypatch.setattr(
+        decode_module,
+        "_resolve_decode_launch_spec",
+        decode_module._resolve_decode_launch_spec.__wrapped__,
+    )
+    seq_len_kv = 205
+    case, compact_scales = _make_mixed_precision_decode_case(
+        batch_size=2,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=32,
+        num_kv_heads=4,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        q_dtype=_FP8,
+        kv_dtype=torch.uint8,
+        output_dtype=_FP8,
+        device="cuda",
+        seed=20260930,
+    )
+    wrapper = _plan_case(case, max_kv_len=seq_len_kv)
+    seq_lens = _seq_lens_from_csr(
+        case.paged_kv_indptr, case.paged_kv_last_page_len, page_size
+    )
+    workspace_bytes = get_prims_ts_batch_decode_workspace_size(
+        2,
+        32,
+        4,
+        head_dim,
+        page_size,
+        seq_len_kv,
+        seq_len_q=seq_len_q,
+        q_dtype=_FP8,
+        k_dtype=torch.uint8,
+        v_dtype=torch.uint8,
+        out_dtype=_FP8,
+        device=case.q.device,
+    )
+    workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device="cuda")
+    out = torch.empty_like(case.q)
+    misses_after_compact = None
+    for layout in ("compact", "packed", "padded"):
+        cache, scales = _nvfp4_storage_views(
+            case.k_cache, case.v_cache, compact_scales, layout
+        )
+        for validate in (True, False):
+            output = wrapper.run(
+                case.q,
+                cache,
+                None,
+                case.block_tables,
+                kv_scale_factors=scales,
+                bmm1_scale=case.bmm1_scale,
+                bmm2_scale=case.bmm2_scale,
+                validate=validate,
+            )
+            _assert_case_correct(output, case)
+        output = batch_decode_with_paged_kv_cache(
+            case.q,
+            cache,
+            case.block_tables,
+            seq_lens,
+            kv_scale_factors=scales,
+            seq_len_q=seq_len_q,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
+            out_dtype=case.output_dtype,
+        )
+        _assert_case_correct(output, case)
+        plan = prepare_prims_ts_batch_decode_with_kv_cache(
+            case.q,
+            cache,
+            workspace,
+            case.block_tables,
+            seq_lens,
+            seq_len_kv,
+            out=out,
+            seq_len_q=seq_len_q,
+            kv_scale_factors=scales,
+        )
+        assert plan._k_sf_cache is scales[0]
+        assert plan._v_sf_cache is scales[1]
+
+        def run_plan():
+            return plan.run(
+                case.q, out=out, bmm1_scale=case.bmm1_scale, bmm2_scale=case.bmm2_scale
+            )
+
+        assert run_plan() is out
+        _assert_case_correct(out, case)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_plan()
+        # Change live scale values after capture to prove replay reads the views.
+        saved_k = scales[0].clone()
+        scales[0].zero_()
+        graph.replay()
+        zero_scale_out = out.clone()
+        scales[0].copy_(saved_k)
+        graph.replay()
+        _assert_case_correct(out, case)
+        assert not torch.equal(zero_scale_out.float(), out.float())
+        misses = _get_compiled_decode.cache_info().misses
+        if layout == "compact":
+            misses_after_compact = misses
+        else:
+            assert misses == misses_after_compact
+
+
 def test_attention_ts_nvfp4_cache_contract():
     from flashinfer.attention.prims_ts import decode as decode_module
 
