@@ -12,8 +12,20 @@ not edit them by hand.
 from __future__ import annotations
 
 import functools
+from typing import TypedDict
 
-PROGRAMS = {
+
+class _Program(TypedDict):
+    """One generated program record: sources and flags relative to ``csrc``."""
+
+    sources: list[str]
+    compile_flags: list[str]
+    ffi_entry: str
+    arg_plan: list[list[str]]
+    arches: list[str]
+
+
+PROGRAMS: dict[str, _Program] = {
     "cake_deepgemm_mixed_gemm_20bec5dc16309a77b8c4": {
         "sources": [
             "experimental/deepgemm_mixed_gemm/cake_deepgemm_mixed_gemm_20bec5dc16309a77b8c4_kernel.cu",
