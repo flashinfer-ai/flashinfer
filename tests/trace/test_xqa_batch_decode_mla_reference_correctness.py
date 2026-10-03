@@ -24,12 +24,12 @@ from tests.trace.reference_utils import (
     ],
 )
 def test_xqa_batch_decode_mla_reference_correctness(shape_kwargs):
-    """flashinfer.mla.xqa_batch_decode_with_kv_cache_mla kernel vs reference (SM120/121)."""
+    """flashinfer.mla.xqa_batch_decode_with_kv_cache_mla kernel vs reference (SM120/SM121)."""
     from flashinfer.mla import xqa_batch_decode_with_kv_cache_mla
     from flashinfer.trace.templates.attention import xqa_batch_decode_mla_trace
 
     if _cc()[0] != 12:
-        pytest.skip("XQA MLA kernel only supports SM120/121")
+        pytest.skip("XQA MLA kernel only supports SM120/SM121")
     torch.manual_seed(0)
     B = shape_kwargs["batch_size"]
     num_heads = shape_kwargs["num_heads"]
