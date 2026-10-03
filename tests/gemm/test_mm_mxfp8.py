@@ -78,8 +78,8 @@ def _run_mm_mxfp8(
             pytest.skip("trtllm does not support non-multiple of 256")
         if out_dtype != torch.bfloat16:
             pytest.skip("trtllm does not support non-bfloat16 output")
-    if backend == "b12x" and k % 128 != 0:
-        pytest.skip("b12x requires K % 128 == 0")
+    if backend == "b12x" and k % 32 != 0:
+        pytest.skip("b12x requires K % 32 == 0")
     if backend == "cutlass" and use_8x4_sf_layout_for_a:
         pytest.skip("cutlass doesn't support 8x4 swizzle layout")
 

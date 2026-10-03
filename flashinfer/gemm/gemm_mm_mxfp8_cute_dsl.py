@@ -71,12 +71,12 @@ def _b12x_gemm_mxfp8_requirement(
             "b12x mm_mxfp8 requires 1D 128x4-swizzled block scales. "
             "Use mxfp8_quantize(..., is_sf_swizzled_layout=True)."
         )
-    if a.shape[1] % 128 != 0:
+    if a.shape[1] % 32 != 0:
         if backend != "b12x":
             return False
         raise ValueError(
             "b12x mm_mxfp8 requires the contraction dim K to be a multiple of "
-            f"128 (one full BK128 tile). Got K={a.shape[1]}."
+            f"32 (one MXFP8 scale/MMA group). Got K={a.shape[1]}."
         )
     if not _b12x_mxfp8_dsl_supported():
         if backend != "b12x":
@@ -231,6 +231,7 @@ def _b12x_gemm_mxfp8_runner(
             sf_m = (m + 127) // 128
             sf_n = (n + 127) // 128
             sf_k = (real_k // sf_vec_size + 3) // 4
+            k_tail = real_k % 128
 
             cache_key = (
                 sf_vec_size,
@@ -242,6 +243,7 @@ def _b12x_gemm_mxfp8_runner(
                 use_tma_store,
                 enable_pdl,
                 out_dtype,
+                k_tail,
             )
 
             make_kernel = lambda: Sm120B12xBlockScaledDenseGemmKernel(
@@ -253,6 +255,7 @@ def _b12x_gemm_mxfp8_runner(
                 use_prefetch=use_prefetch,
                 enable_pdl=enable_pdl,
                 swap_ab=swap_ab,
+                mxfp8_k_tail=k_tail,
             )
 
             # swap_ab is applied inside the kernel, so the public C tensor
