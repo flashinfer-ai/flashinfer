@@ -1,8 +1,9 @@
 """Offline tuning for CuTe DSL MegaMoE backends.
 
-``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The
-``sm90_fp8_*`` dtypes select the Hopper tuner. BF16 and mixed BF16/MXFP8
-are supported by the SM100 tuner only. MXFP4/MXFP8 is wired for SM107.
+``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The ``sm90_*``
+dtypes (``sm90_fp8_e4m3`` / ``sm90_fp8_e5m2`` / ``sm90_bf16``) select the
+Hopper tuner. ``bf16`` and mixed BF16/MXFP8 are SM100 tuner dtypes.
+MXFP4/MXFP8 is wired for SM107.
 
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
@@ -37,6 +38,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "mxfp4_mxfp8",
             "sm90_fp8_e4m3",
             "sm90_fp8_e5m2",
+            "sm90_bf16",
             "bf16",
             "bf16_mxfp8_e4m3",
             "bf16_mxfp8_e5m2",
@@ -54,7 +56,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=("auto", "sm90", "sm100", "sm107"),
         default="auto",
         help="backend family; auto selects sm107 on Rubin, sm100 otherwise; "
-        "sm90_fp8_* dtypes select sm90",
+        "sm90_* dtypes select sm90",
     )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
@@ -181,12 +183,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("--combine-dtype is only wired for --dtype nvfp4", file=sys.stderr)
         return 2
 
-    if args.dtype.startswith("sm90_fp8"):
+    if args.dtype.startswith("sm90_"):
         if args.arch not in ("auto", "sm90"):
-            print("sm90_fp8_* dtypes require --arch auto or sm90", file=sys.stderr)
+            print("sm90_* dtypes require --arch auto or sm90", file=sys.stderr)
             return 2
         family = "sm90"
-        backend = "fp8_fp8_bf16_pull_cutedsl"
+        if args.dtype == "sm90_bf16":
+            if args.fp8_scale_mode != "per_tensor":
+                print("sm90_bf16 has no FP8 scale mode", file=sys.stderr)
+                return 2
+            backend = "bf16_bf16_bf16_pull_cutedsl"
+        else:
+            backend = "fp8_fp8_bf16_pull_cutedsl"
     else:
         family = _resolve_arch(args.arch)
         if family == "sm90" or (family == "sm107" and args.dtype.startswith("bf16")):

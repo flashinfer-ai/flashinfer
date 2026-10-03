@@ -237,10 +237,13 @@ device-side aborts):
 
 ### SM90 mega token sweep
 
-Hopper-only (`sm90_fp8_fp8_bf16_pull_cutedsl`) correctness targets run in their own pytest
-process (the SM90/SM100 kernel trees are mutually exclusive per process):
-`bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
-`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
+Hopper-only pull-style (`sm90_fp8_fp8_bf16_pull_cutedsl`,
+`sm90_bf16_bf16_bf16_pull_cutedsl`) correctness targets run in their own
+pytest process (the SM90/SM100 kernel trees are mutually exclusive per
+process): `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
+`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs). Offline tuning:
+`python -m flashinfer.moe_ep.tune --arch sm90 --dtype sm90_fp8_e4m3` (FP8)
+or `--dtype sm90_bf16` (BF16).
 
 The native BF16 Hopper backend (`sm90_bf16_bf16_bf16_push_cake`: bf16 dispatch
 payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine
@@ -300,7 +303,9 @@ each row names the matching drop reference CSV
 (`moe_hopper_fp8/benchmark_data/20260720/...`) so comparison is one grep
 away. The `compute_*_us` columns map to the drop's per-rank
 `mega_us + topk_us`; `e2e_*_us` adds FI staging/validation/output-copy.
-Axes: `--scale-mode {per_tensor,blockwise,both}`, `--swap-ab`/`--no-swap-ab`
+Axes: `--scale-mode {per_tensor,blockwise,both,bf16,all}` (`bf16` = the
+native BF16 backend, `all` = FP8 per-tensor + blockwise + BF16 on the same
+node), `--swap-ab`/`--no-swap-ab`
 (default both layouts at the shim default tiles: non-swap M64 N128, swap-AB
 M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
 for the full timing/mapping notes. Measured results, comparison caveats,
