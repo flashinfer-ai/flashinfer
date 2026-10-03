@@ -1096,6 +1096,11 @@ def plan_dense_projection_gemm(
         pf = rule.get("pf", default_pf(M, N, K))
     if promo is None:
         promo = rule.get("promo", default_promo(m_tiles, n_tiles))
+    promo = str(promo)
+    if promo not in L2_PROMOS:
+        raise ValueError(
+            f"dense_projection_gemm: promo must be one of {L2_PROMOS}, got {promo!r}"
+        )
     if group_m is None:
         group_m = rule.get(
             "group_m", default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)
@@ -1125,7 +1130,6 @@ def plan_dense_projection_gemm(
         box_rows=None,
         cta_rows=cta_rows,
         pf=pf,
-        promo=promo,
         hints=hints,
         f32_v8=f32_v8,
         quad_store=quad_store,
@@ -1215,26 +1219,14 @@ def plan_dense_projection_gemm(
     return plan, a_desc, b_desc, O3
 
 
-# Knob variants the registry fallback tries, nearest first (see ``plan_dense_projection_gemm``): the 256 B L2
-# promotion (same tile walk and store path; round 8 retired the un-promoted sm_107a ``kk_n128`` program when the
-# indexer_hw forward rows took the promotion, so a tail-T ``indexer_k fwd`` instance lands here), the tall tile and
-# the raster groups the measured rules use, the register epilogue (the canonical-T templates), then BLOCK_N = 128.
+# Knob variants the registry fallback tries, nearest first (see ``plan_dense_projection_gemm``): the tall tile,
+# the register epilogue (the canonical-T templates), then BLOCK_N = 128.  The TMA L2 promotion and the raster group
+# width are launch parameters since round 11: they select no program and are not variants.
 _FALLBACK_KNOB_VARIANTS = (
-    dict(promo="l2_256b"),
-    dict(promo="l2_256b", group_m=8),
     dict(cta_rows=256),
-    dict(group_m=8),
-    dict(cta_rows=256, group_m=8),
-    dict(group_m=4),
-    dict(group_m=32),
     dict(epi="reg"),
     dict(epi="reg", f32_v8=True),
     dict(epi="reg", cta_rows=256),
-    dict(epi="reg", group_m=8),
-    dict(epi="reg", group_m=8, f32_v8=True),
-    dict(epi="reg", group_m=32, f32_v8=True),
-    dict(epi="reg", cta_rows=256, group_m=8),
-    dict(epi="reg", group_m=4),
     dict(block_n=128),
     dict(block_n=128, epi="reg"),
 )

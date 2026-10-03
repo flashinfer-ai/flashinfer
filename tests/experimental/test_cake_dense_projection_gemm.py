@@ -765,10 +765,7 @@ def test_epilogue_rules():
             dict(a_mn=False, b_mn=False, hints=("none", "evict_normal")),
             "dense_proj_gemm_kk_n256_hne",
         ),
-        (
-            dict(a_mn=False, b_mn=False, promo="l2_128b"),
-            "dense_proj_gemm_kk_n256_l2_128b",
-        ),
+        # the TMA L2 promotion is a launch parameter since round 11: no symbol suffix, not a key field
         (dict(a_mn=False, b_mn=False, pf=4), "dense_proj_gemm_kk_n256_pf4"),
         # the raster group width is a launch parameter since round 11: no symbol suffix, not a key field
         (
@@ -786,12 +783,11 @@ def test_epilogue_rules():
                 a_mn=False,
                 b_mn=False,
                 pf=2,
-                promo="l2_256b",
                 hints=("evict_first", "none"),
                 epi="tma",
                 slots=1,
             ),
-            "dense_proj_gemm_kk_n256_pf2_l2_256b_hen_tma1",
+            "dense_proj_gemm_kk_n256_pf2_hen_tma1",
         ),
         (
             dict(
@@ -832,10 +828,6 @@ def test_epilogue_rules():
         (
             dict(a_mn=False, b_mn=True, stages=6, epi="reg", quad_store=True),
             "dense_proj_gemm_kn_n256_q_s6",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, promo="l2_256b", epi="reg", quad_store=True),
-            "dense_proj_gemm_kk_n256_l2_256b_q",
         ),
         # round 9: the 64-row Layout-B family (``_m64``); its default is the deepest pipeline that fits
         # (9 at BLOCK_N = 256): 9 carries no suffix, 6 does
@@ -1065,22 +1057,32 @@ def test_instance_key_rejects_bad_configurations():
         instance_key(a_mn=False, b_mn=False, cta_rows=64, stages=14)
     with pytest.raises(ValueError, match="diagnostic"):
         instance_key(a_mn=False, b_mn=False, diag=("no_mma",))
-    with pytest.raises(ValueError, match="promo"):
-        instance_key(a_mn=False, b_mn=False, promo="l2_512b")
     with pytest.raises(ValueError, match="hints"):
         instance_key(a_mn=False, b_mn=False, hints=("evict_first", "keep"))
     with pytest.raises(ValueError, match="prefetch"):
         instance_key(a_mn=False, b_mn=False, pf=17)
     key = instance_key(a_mn=False, b_mn=False)
-    # 16 fields since round 11 (the raster group width left the key for the launch arguments):
-    # pf, promo, hints, f32_v8, quad_store
-    assert len(key) == 16 and key[11:] == (
+    # 15 fields since round 11 (the raster group width and the TMA L2 promotion left the key for the launch
+    # arguments): pf, hints, f32_v8, quad_store
+    assert len(key) == 15 and key[11:] == (
         0,
-        "none",
         ("none", "none"),
         False,
         False,
     )
+    # the promotion is validated where it is resolved, by the planner
+    v = _views("proj", "o_proj", "fwd", "bf16", 257)
+    with pytest.raises(ValueError, match="promo"):
+        plan_dense_projection_gemm(
+            v["A"],
+            v["B"],
+            v["out"],
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+            _fallback=False,
+            transposed_out=v["transposed"],
+            promo="l2_512b",
+        )
 
 
 @pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
