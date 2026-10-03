@@ -7,10 +7,13 @@ command on the baseline and candidate checkouts in separate processes:
 
     python benchmarks/bench_cudnn_wrapper_host.py --kind decode --batch 64 --kv 1024 --output decode.json
     python benchmarks/bench_cudnn_wrapper_host.py --kind ragged --batch 16 --q 512 --kv 512 --output ragged.json
+    python benchmarks/bench_cudnn_wrapper_host.py --kind paged --batch 1 --q 513 --kv 16384 --lengths-device cuda --replan --output paged.json
 
 Each result includes sampled independent math checks and one-ULP CUDA
 graph replay after poisoning the output. Host enqueue excludes synchronization,
 first-call compilation and output allocation; these are component measurements.
+Paged plan+replay also reports host waiting on any plan-internal synchronization
+behind a 20-run graph, with synchronization outside each four-step timed burst.
 """
 
 import argparse
@@ -53,13 +56,14 @@ def _source_revision():
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--kind", choices=["decode", "ragged"], required=True)
+    p.add_argument("--kind", choices=["decode", "ragged", "paged"], required=True)
     p.add_argument("--batch", type=int, required=True)
     p.add_argument("--q", type=int, default=1)
     p.add_argument("--kv", type=int, required=True)
     p.add_argument("--layout", choices=["HND", "NHD"], default="NHD")
     p.add_argument("--backends", nargs="+", default=["cudnn"])
     p.add_argument("--output", required=True)
+    p.add_argument("--lengths-device", choices=["cpu", "cuda"], default="cpu")
     p.add_argument(
         "--replan",
         action="store_true",
@@ -84,6 +88,8 @@ def main():
     indices = tables.flatten()
     last = torch.full((b,), sk - (pages - 1) * page, dtype=torch.int32)
     qo = torch.arange(b + 1, dtype=torch.int32) * sq
+    q_lengths = torch.full((b,), sq, dtype=torch.int32, device=a.lengths_device)
+    kv_lengths = torch.full((b,), sk, dtype=torch.int32, device=a.lengths_device)
     if a.kind == "ragged":
         k_ragged = (
             cache_nhd[tables.long(), 0]
@@ -150,6 +156,42 @@ def main():
                 if sq > 1:
                     kw["q_len_per_req"] = sq
                 plan = lambda: w.plan(indptr, indices, last, h, hk, d, page, **kw)
+            elif a.kind == "paged":
+                w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                    ws,
+                    a.layout,
+                    backend=backend,
+                    use_cuda_graph=True,
+                    qo_indptr_buf=qo.to(q.device),
+                    paged_kv_indptr_buf=indptr.to(q.device),
+                    paged_kv_indices_buf=indices.clone(),
+                    paged_kv_last_page_len_buf=last.to(q.device),
+                )
+                metadata = (
+                    dict(
+                        seq_lens=kv_lengths,
+                        seq_lens_q=q_lengths,
+                        block_tables=tables,
+                        max_token_per_sequence=sq,
+                        max_sequence_kv=sk,
+                    )
+                    if backend == "cudnn"
+                    else {}
+                )
+                plan = lambda: w.plan(
+                    qo,
+                    indptr,
+                    indices,
+                    last,
+                    h,
+                    hk,
+                    d,
+                    page,
+                    causal=True,
+                    q_data_type=q.dtype,
+                    kv_data_type=q.dtype,
+                    **metadata,
+                )
             else:
                 w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
                     ws, "NHD", backend=backend
@@ -276,10 +318,26 @@ def main():
                 timed_replay="within_one_ulp",
                 math_reference_rows=len(samples),
             )
+            if a.replan and a.kind == "paged":
+                plan_replay = []
+                for _ in range(100):
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter_ns()
+                    for _ in range(4):
+                        plan()
+                        g.replay()
+                    plan_replay.append((time.perf_counter_ns() - t0) / 4e3)
+                torch.cuda.synchronize()
+                row["plan_replay_host_us"] = statistics.median(plan_replay)
+                row["plan_replay_host_samples_us"] = plan_replay
+                row["runs_per_replay"] = 20
+                assert torch.isfinite(out).all()
+                assert ((out.float() - expected.float()).abs() <= ulp).all()
         except Exception as exc:
             import traceback
 
             traceback.print_exc()
+            row["status"] = "fail"
             row["error"] = repr(exc)
         record["results"].append(row)
         print(json.dumps(row), flush=True)
