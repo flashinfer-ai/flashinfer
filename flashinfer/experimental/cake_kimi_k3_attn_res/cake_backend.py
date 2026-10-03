@@ -112,7 +112,7 @@ _NC3_D3_CELLS = {
 _SM100_HELD_CONSUMED_RELEASE_CELLS = frozenset({(4096, 5)})
 # K = 0 TMA route: grid multiple of the SM count on the promoted mid-M cells.
 _K0_TMA_GRID_MULTIPLIER_M = {
-    "sm_100a": {256: 2, 512: 2, 1024: 2},
+    "sm_100a": {256: 2, 512: 2, 1024: 3},
     "sm_103a": {256: 2, 512: 3, 1024: 3},
 }
 _SM100_RELAXED_PRODUCER_WAIT_CELLS: frozenset[tuple[int, int]] = frozenset()
