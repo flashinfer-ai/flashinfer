@@ -25,6 +25,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer.fused_moe as fused_moe
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.utils import (
     get_compute_capability,
@@ -1364,7 +1365,7 @@ def dequantize_block(
         batch_size, hidden_size = x_quant.shape
         num_blocks = (hidden_size + 127) // 128
         scales = scales.view(batch_size, num_blocks, 1).expand(-1, -1, 128)
-        scales = scales[:, :, : hidden_size % 128] if hidden_size % 128 != 0 else scales
+        scales = scales.reshape(batch_size, -1)[:, :hidden_size]
     else:  # For weight tensors [..., in_dim, out_dim]
         *_dims, in_dim, out_dim = x_quant.shape
 
@@ -1389,7 +1390,7 @@ def dequantize_block(
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8_block_scaling(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size
+    batch_size, hidden_size, num_experts, top_k, intermediate_size, ep_size=1
 ):
     """
     Test MoE with FP8 block scaling (Deepseek style):
@@ -1403,7 +1404,12 @@ def test_moe_fp8_block_scaling(
         num_experts: Number of experts
         top_k: Number of experts to route to per token
         intermediate_size: Intermediate dimension size
+        ep_size: Number of expert shards, evaluated sequentially on one GPU.
     """
+    if not is_cuda_version_at_least("12.8"):
+        pytest.skip("FP8 block-scale MoE requires CUDA 12.8 or newer")
+    if num_experts % ep_size:
+        pytest.skip("Experts must divide evenly across EP ranks")
     torch.manual_seed(42)
     otype = torch.bfloat16
 
@@ -1479,19 +1485,38 @@ def test_moe_fp8_block_scaling(
     )
 
     with execption_context:
-        _ = fused_moe.cutlass_fused_moe(
-            x.contiguous(),
-            selected_experts.to(torch.int),
-            routing_weights,
-            w31_quant.contiguous(),
-            w2_quant.contiguous(),
-            otype,
-            use_deepseek_fp8_block_scale=True,
-            quant_scales=[w31_scales.contiguous(), w2_scales.contiguous()],
-            output=flash_output,
-        )
+        local_experts = num_experts // ep_size
+        for ep_rank in range(ep_size):
+            shard = slice(ep_rank * local_experts, (ep_rank + 1) * local_experts)
+            local_output = torch.empty_like(x)
+            fused_moe.cutlass_fused_moe(
+                x.contiguous(),
+                selected_experts.to(torch.int),
+                routing_weights,
+                w31_quant[shard].contiguous(),
+                w2_quant[shard].contiguous(),
+                otype,
+                use_deepseek_fp8_block_scale=True,
+                quant_scales=[
+                    w31_scales[shard].contiguous(),
+                    w2_scales[shard].contiguous(),
+                ],
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                output=local_output,
+            )
+            assert torch.isfinite(local_output).all()
+            flash_output += local_output
 
         torch.testing.assert_close(flash_output, ref_output, rtol=1e-1, atol=1e-1)
+
+
+def test_moe_fp8_block_scaling_ep8_batch_transition():
+    """Keep sparse EP outputs correct after a dense call grows runner workspace."""
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 block-scale MoE requires SM90a")
+    for batch_size in (512, 192, 1, 288):
+        test_moe_fp8_block_scaling(batch_size, 128, 32, 4, 128, ep_size=8)
 
 
 def quant_mxfp4_batches(a, num_experts):

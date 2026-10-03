@@ -565,7 +565,8 @@ template <typename T,                         /* The type used for activations *
           typename Enable = void>
 class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   using DeepSeekBlockScaleGemmRunner =
-      tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface;
+      tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunner<
+          __nv_bfloat16, __nv_fp8_e4m3, __nv_bfloat16>;
   using ScaleBiasType = BackBoneType;
   using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
                                   Sm90Wfp4Afp8Mode>;
