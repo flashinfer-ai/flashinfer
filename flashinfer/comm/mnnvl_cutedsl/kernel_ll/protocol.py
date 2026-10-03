@@ -114,6 +114,27 @@ LL_FINALIZE_GB300_TP8_H5120_K3 = LLFinalizeTuning(
 LL_ALL_REDUCE_GB300_TP4_H5120 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H5120)
 LL_ALL_REDUCE_GB300_TP8_H5120 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H5120)
 
+# hidden_size=6144, bf16, top_k 8. A 6144-wide token is 768 bf16x8 vectors;
+# cluster_size 6 makes fragment_stride (cluster_size * threads / rank_lanes)
+# exactly 768, so the Lamport RMSNorm covers a token in one fully utilised
+# trip. On B300 it measured fastest or tied at tp=4 and tp=8 with the norm on;
+# 8 (the H8192 value, leaving 25% of the lanes idle) was ~1-2% slower, and
+# 3/4 up to 30% slower. With the norm compiled out 8 is ~2% faster, but the
+# presets are shared with the norm-free profiles, as at hidden 5120.
+# prefetch_group tracks top_k, as at hidden 5120.
+_LL_COLLECTIVE_H6144 = LLCollectiveTuning(cluster_size=6)
+
+LL_FINALIZE_B300_TP4_H6144_K8 = LLFinalizeTuning(
+    prefetch_group=8, collective=_LL_COLLECTIVE_H6144
+)
+
+LL_FINALIZE_B300_TP8_H6144_K8 = LLFinalizeTuning(
+    prefetch_group=8, collective=_LL_COLLECTIVE_H6144
+)
+
+LL_ALL_REDUCE_B300_TP4_H6144 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H6144)
+LL_ALL_REDUCE_B300_TP8_H6144 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H6144)
+
 
 @dataclass(slots=True)
 class LLProtocolState:

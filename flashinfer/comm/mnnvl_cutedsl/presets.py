@@ -46,6 +46,14 @@ from .kernel_bt import (
     BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_1,
     BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0,
     BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_1,
+    BT_ALL_REDUCE_B300_TP4_H6144_PRESET_0,
+    BT_ALL_REDUCE_B300_TP4_H6144_PRESET_1,
+    BT_ALL_REDUCE_B300_TP8_H6144_PRESET_0,
+    BT_ALL_REDUCE_B300_TP8_H6144_PRESET_1,
+    BT_FINALIZE_B300_TP4_H6144_K8_PRESET_0,
+    BT_FINALIZE_B300_TP4_H6144_K8_PRESET_1,
+    BT_FINALIZE_B300_TP8_H6144_K8_PRESET_0,
+    BT_FINALIZE_B300_TP8_H6144_K8_PRESET_1,
 )
 from .kernel_ll import (
     LL_ALL_REDUCE_GB300_TP4_H5120,
@@ -58,6 +66,10 @@ from .kernel_ll import (
     LL_ALL_REDUCE_GB300_TP8_H8192,
     LL_FINALIZE_GB300_TP16_H8192_K10,
     LL_FINALIZE_GB300_TP8_H8192_K10,
+    LL_FINALIZE_B300_TP4_H6144_K8,
+    LL_FINALIZE_B300_TP8_H6144_K8,
+    LL_ALL_REDUCE_B300_TP4_H6144,
+    LL_ALL_REDUCE_B300_TP8_H6144,
 )
 from .kernel_ht import (
     HT_ALL_REDUCE_GB300_H3584,
@@ -69,6 +81,10 @@ from .kernel_ht import (
     HT_ALL_REDUCE_GB300_TP8_H8192,
     HT_FINALIZE_GB300_TP16_H8192_K10,
     HT_FINALIZE_GB300_TP8_H8192_K10,
+    HT_ALL_REDUCE_B300_TP4_H6144,
+    HT_ALL_REDUCE_B300_TP8_H6144,
+    HT_FINALIZE_B300_TP4_H6144_K8,
+    HT_FINALIZE_B300_TP8_H6144_K8,
 )
 
 __all__ = [
@@ -93,6 +109,7 @@ _H5120_TOP_K = (6, 3)
 # hidden=5120 for tp>=8 (see the note in kernel_ht/protocol.py), so the tp=8
 # routes below hand their large-M ranges to BT instead of HT.
 _H5120_TP_SIZES = (4, 8)
+
 
 _LL_H5120_FINALIZE = {
     (4, 6): LL_FINALIZE_GB300_TP4_H5120_K6,
@@ -338,6 +355,210 @@ def _h5120_profiles(
     )
 
 
+# hidden_size 6144, bf16, at top_k 8 (GLM-5.2: one MoE stage, so one top_k).
+# Unlike H5120, HT is reachable at tp=8 here -- 6144 has no factor of 5 to
+# strand the HT shard -- so both tp sizes carry HT presets.
+_H6144_HIDDEN = 6144
+_H6144_TOP_K = (8,)
+_H6144_TP_SIZES = (4, 8)
+
+_LL_H6144_FINALIZE = {
+    (4, 8): LL_FINALIZE_B300_TP4_H6144_K8,
+    (8, 8): LL_FINALIZE_B300_TP8_H6144_K8,
+}
+_LL_H6144_ALL_REDUCE = {
+    4: LL_ALL_REDUCE_B300_TP4_H6144,
+    8: LL_ALL_REDUCE_B300_TP8_H6144,
+}
+_BT_H6144_FINALIZE = {
+    (4, 8): (
+        BT_FINALIZE_B300_TP4_H6144_K8_PRESET_0,
+        BT_FINALIZE_B300_TP4_H6144_K8_PRESET_1,
+    ),
+    (8, 8): (
+        BT_FINALIZE_B300_TP8_H6144_K8_PRESET_0,
+        BT_FINALIZE_B300_TP8_H6144_K8_PRESET_1,
+    ),
+}
+_BT_H6144_ALL_REDUCE = {
+    4: (BT_ALL_REDUCE_B300_TP4_H6144_PRESET_0, BT_ALL_REDUCE_B300_TP4_H6144_PRESET_1),
+    8: (BT_ALL_REDUCE_B300_TP8_H6144_PRESET_0, BT_ALL_REDUCE_B300_TP8_H6144_PRESET_1),
+}
+_HT_H6144_FINALIZE = {
+    (4, 8): HT_FINALIZE_B300_TP4_H6144_K8,
+    (8, 8): HT_FINALIZE_B300_TP8_H6144_K8,
+}
+_HT_H6144_ALL_REDUCE = {
+    4: HT_ALL_REDUCE_B300_TP4_H6144,
+    8: HT_ALL_REDUCE_B300_TP8_H6144,
+}
+
+# M-range boundaries for the H6144 routes.
+#
+# Measured on 8x NVIDIA B300 SXM6 (single node, NVSwitch, no multi-node
+# NVLink) with `benchmarks/comm/bench_mnnvl_cutedsl_h6144.py`, two runs each;
+# 8x B200 was swept as a cross-check. Each bound is the largest swept M at
+# which the lower-M protocol was still ahead. LL -> BT sat at the same ladder
+# step on both GPUs; the finalize BT -> HT edge is the one that moved, arriving
+# a step later on B200 (1536 vs 1024).
+_H6144_FINALIZE_LL_MAX = {(4, 8): 28, (8, 8): 12}
+_H6144_ALL_REDUCE_LL_MAX = {4: 28, 8: 12}
+# BT PRESET_0 -> PRESET_1, measured between the two BT presets alone so the
+# same split serves BT_ONLY_CONFIG. At top_k=8 the finalize gather outgrows the
+# narrow 2-element tiling almost at once; at tp=4 that happens inside LL's
+# range, so the default route has no PRESET_0 band there. For the all-reduce
+# the presets stay within ~4% of each other past M=256 and trade places
+# run to run, so the split sits where PRESET_0 stops winning clearly.
+_H6144_FINALIZE_BT_SPLIT = {(4, 8): 20, (8, 8): 20}
+_H6144_ALL_REDUCE_BT_SPLIT = {4: 256, 8: 256}
+# BT -> HT. Reachable at both tp sizes here, unlike hidden 5120; HT's edge at
+# M=4096, tp=8 is ~26% on the finalize pattern and ~24% on the all-reduce.
+_H6144_FINALIZE_BT_MAX = {(4, 8): 768, (8, 8): 768}
+_H6144_ALL_REDUCE_BT_MAX = {4: 1536, 8: 1024}
+
+# Norm-free boundaries (`apply_rms_norm=False`, `add_residual=True`). LL stays
+# ahead further, as at hidden 5120. HT has no norm-free kernel, so these routes
+# end on BT even where the norm-on route reaches HT. PRESET_0 never wins the
+# norm-free finalize past LL at either tp size (a tie at tp=8, M=20), so those
+# splits sit at the LL bound and the route skips it.
+_H6144_NO_NORM_FINALIZE_LL_MAX = {(4, 8): 40, (8, 8): 16}
+_H6144_NO_NORM_ALL_REDUCE_LL_MAX = {4: 32, 8: 16}
+_H6144_NO_NORM_FINALIZE_BT_SPLIT = {(4, 8): 16, (8, 8): 16}
+_H6144_NO_NORM_ALL_REDUCE_BT_SPLIT = {4: 256, 8: 256}
+
+
+def _h6144_ll_only_finalize(tp: int, k: int) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.LL, _LL_H6144_FINALIZE[(tp, k)]),),
+    )
+
+
+def _h6144_ll_only_all_reduce(tp: int) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.LL, _LL_H6144_ALL_REDUCE[tp]),),
+    )
+
+
+def _h6144_bt_only_finalize(tp: int, k: int) -> MRangeDispatch:
+    preset_0, preset_1 = _BT_H6144_FINALIZE[(tp, k)]
+    return MRangeDispatch(
+        upper_bounds=(_H6144_FINALIZE_BT_SPLIT[(tp, k)], None),
+        targets=(
+            _target(ProtocolKind.BT, preset_0),
+            _target(ProtocolKind.BT, preset_1),
+        ),
+    )
+
+
+def _h6144_bt_only_all_reduce(tp: int) -> MRangeDispatch:
+    preset_0, preset_1 = _BT_H6144_ALL_REDUCE[tp]
+    return MRangeDispatch(
+        upper_bounds=(_H6144_ALL_REDUCE_BT_SPLIT[tp], None),
+        targets=(
+            _target(ProtocolKind.BT, preset_0),
+            _target(ProtocolKind.BT, preset_1),
+        ),
+    )
+
+
+def _h6144_ht_only_finalize(tp: int, k: int) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.HT, _HT_H6144_FINALIZE[(tp, k)]),),
+    )
+
+
+def _h6144_ht_only_all_reduce(tp: int) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.HT, _HT_H6144_ALL_REDUCE[tp]),),
+    )
+
+
+def _h6144_default_routes(
+    ll_preset, bt_presets, ht_preset, ll_max: int, bt_split: int, bt_max: int
+) -> MRangeDispatch:
+    """LL, then BT (split at `bt_split`), then HT above `bt_max`.
+
+    As in `_no_norm_routes`, a split at or below the LL bound means LL already
+    covers everything PRESET_0 would win, so BT starts on PRESET_1.
+    """
+    preset_0, preset_1 = bt_presets
+    bounds: tuple[int | None, ...] = (ll_max,)
+    targets: tuple[KernelTarget[object], ...] = (_target(ProtocolKind.LL, ll_preset),)
+    if bt_split > ll_max:
+        bounds += (bt_split,)
+        targets += (_target(ProtocolKind.BT, preset_0),)
+    bounds += (bt_max, None)
+    targets += (
+        _target(ProtocolKind.BT, preset_1),
+        _target(ProtocolKind.HT, ht_preset),
+    )
+    return MRangeDispatch(upper_bounds=bounds, targets=targets)
+
+
+def _h6144_default_finalize(tp: int, k: int) -> MRangeDispatch:
+    return _h6144_default_routes(
+        _LL_H6144_FINALIZE[(tp, k)],
+        _BT_H6144_FINALIZE[(tp, k)],
+        _HT_H6144_FINALIZE[(tp, k)],
+        _H6144_FINALIZE_LL_MAX[(tp, k)],
+        _H6144_FINALIZE_BT_SPLIT[(tp, k)],
+        _H6144_FINALIZE_BT_MAX[(tp, k)],
+    )
+
+
+def _h6144_default_all_reduce(tp: int) -> MRangeDispatch:
+    return _h6144_default_routes(
+        _LL_H6144_ALL_REDUCE[tp],
+        _BT_H6144_ALL_REDUCE[tp],
+        _HT_H6144_ALL_REDUCE[tp],
+        _H6144_ALL_REDUCE_LL_MAX[tp],
+        _H6144_ALL_REDUCE_BT_SPLIT[tp],
+        _H6144_ALL_REDUCE_BT_MAX[tp],
+    )
+
+
+def _h6144_no_norm_finalize(tp: int, k: int) -> MRangeDispatch:
+    return _no_norm_routes(
+        _LL_H6144_FINALIZE[(tp, k)],
+        _BT_H6144_FINALIZE[(tp, k)],
+        _H6144_NO_NORM_FINALIZE_LL_MAX[(tp, k)],
+        _H6144_NO_NORM_FINALIZE_BT_SPLIT[(tp, k)],
+    )
+
+
+def _h6144_no_norm_all_reduce(tp: int) -> MRangeDispatch:
+    return _no_norm_routes(
+        _LL_H6144_ALL_REDUCE[tp],
+        _BT_H6144_ALL_REDUCE[tp],
+        _H6144_NO_NORM_ALL_REDUCE_LL_MAX[tp],
+        _H6144_NO_NORM_ALL_REDUCE_BT_SPLIT[tp],
+    )
+
+
+def _h6144_profiles(
+    finalize_routes: Callable[[int, int], MRangeDispatch],
+    all_reduce_routes: Callable[[int], MRangeDispatch],
+    tp_sizes: tuple[int, ...] = _H6144_TP_SIZES,
+) -> tuple[StaticProfile, ...]:
+    """Build one H6144 profile per (tp_size, top_k) pair; see _h5120_profiles."""
+    return tuple(
+        StaticProfile(
+            tp_size=tp,
+            hidden_size=_H6144_HIDDEN,
+            top_k=k,
+            dtype=torch.bfloat16,
+            finalize_routes=finalize_routes(tp, k),
+            all_reduce_routes=all_reduce_routes(tp),
+        )
+        for tp in tp_sizes
+        for k in _H6144_TOP_K
+    )
+
+
 LL_ONLY_CONFIG = MNNVLCuteDSLConfig(
     profiles=(
         StaticProfile(
@@ -389,6 +610,7 @@ LL_ONLY_CONFIG = MNNVLCuteDSLConfig(
             ),
         ),
         *_h5120_profiles(_h5120_ll_only_finalize, _h5120_ll_only_all_reduce),
+        *_h6144_profiles(_h6144_ll_only_finalize, _h6144_ll_only_all_reduce),
     ),
     # Protocol-pinned: these ranges force one protocol rather than describe a
     # crossover, so the config suits either apply_rms_norm setting.
@@ -463,6 +685,7 @@ BT_ONLY_CONFIG = MNNVLCuteDSLConfig(
             ),
         ),
         *_h5120_profiles(_h5120_bt_only_finalize, _h5120_bt_only_all_reduce),
+        *_h6144_profiles(_h6144_bt_only_finalize, _h6144_bt_only_all_reduce),
     ),
     # Protocol-pinned: these ranges force one protocol rather than describe a
     # crossover, so the config suits either apply_rms_norm setting.
@@ -565,6 +788,7 @@ HT_ONLY_CONFIG = MNNVLCuteDSLConfig(
         *_h5120_profiles(
             _h5120_ht_only_finalize, _h5120_ht_only_all_reduce, tp_sizes=(4,)
         ),
+        *_h6144_profiles(_h6144_ht_only_finalize, _h6144_ht_only_all_reduce),
     ),
     # Protocol-pinned: these ranges force one protocol rather than describe a
     # crossover, so the config suits either apply_rms_norm setting.
@@ -671,11 +895,15 @@ DEFAULT_CONFIG = MNNVLCuteDSLConfig(
             ),
         ),
         *_h5120_profiles(_h5120_default_finalize, _h5120_default_all_reduce),
+        *_h6144_profiles(_h6144_default_finalize, _h6144_default_all_reduce),
     )
 )
 
 
 NO_NORM_CONFIG = MNNVLCuteDSLConfig(
-    profiles=_h5120_profiles(_h5120_no_norm_finalize, _h5120_no_norm_all_reduce),
+    profiles=(
+        *_h5120_profiles(_h5120_no_norm_finalize, _h5120_no_norm_all_reduce),
+        *_h6144_profiles(_h6144_no_norm_finalize, _h6144_no_norm_all_reduce),
+    ),
     applies_rms_norm=False,
 )
