@@ -156,17 +156,12 @@ SM_COUNTS = (148, 212)
 # --- BEGIN GENERATED TABLES ---
 L2_BYTES = 132120576
 EXPECTED_TEMPLATES = {
-    ('o_proj', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_m256_g8',
-        (1001, 212): 'dense_proj_gemm_kk_n256_m256',
-        (2049, 148): 'dense_proj_gemm_kk_n256_m256_g8',
-        (2049, 212): 'dense_proj_gemm_kk_n256_m256',
-    },
+    ('o_proj', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256_m256',
     ('o_proj', 'dgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_kn_n256',
-        (1001, 212): 'dense_proj_gemm_kn_n256_m256_g8',
+        (1001, 212): 'dense_proj_gemm_kn_n256_m256',
         (2049, 148): 'dense_proj_gemm_kn_n256',
-        (2049, 212): 'dense_proj_gemm_kn_n256_m256_g8',
+        (2049, 212): 'dense_proj_gemm_kn_n256_m256',
     },
     ('o_proj', 'dgrad', 'f32'): {
         (1001, 148): 'dense_proj_gemm_kn_n256_f32_v8',
@@ -175,25 +170,15 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_kn_n256_m256_f32_tma1',
     },
     ('o_proj', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_g8_tma1',
+        (1001, 148): 'dense_proj_gemm_nn_n256_m256_tma1',
         (1001, 212): 'dense_proj_gemm_nn_n256_m256_tma1',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_g8',
+        (2049, 148): 'dense_proj_gemm_nn_n256_m256',
         (2049, 212): 'dense_proj_gemm_nn_n256_m256',
     },
     ('o_proj', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
-    ('q_a', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_g8',
-        (1001, 212): 'dense_proj_gemm_kk_n256',
-        (2049, 148): 'dense_proj_gemm_kk_n256_g8',
-        (2049, 212): 'dense_proj_gemm_kk_n256',
-    },
-    ('q_a', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_g8',
-        (1001, 212): 'dense_proj_gemm_kn_n256',
-        (2049, 148): 'dense_proj_gemm_kn_n256_g8',
-        (2049, 212): 'dense_proj_gemm_kn_n256',
-    },
-    ('q_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_g8_f32_v8',
+    ('q_a', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
+    ('q_a', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
+    ('q_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_v8',
     ('q_a', 'wgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_nn_n256_tma1',
         (1001, 212): 'dense_proj_gemm_nn_n256_tma1',
@@ -201,26 +186,26 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_nn_n256',
     },
     ('q_a', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_g32_f32_v8',
+        (1001, 148): 'dense_proj_gemm_nn_n256_f32_v8',
         (1001, 212): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
-        (2049, 148): 'dense_proj_gemm_nn_n256_g32_f32_v8',
+        (2049, 148): 'dense_proj_gemm_nn_n256_f32_v8',
         (2049, 212): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
     },
-    ('q_b', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256_g32',
+    ('q_b', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
     ('q_b', 'dgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_kn_n256_m256',
         (1001, 212): 'dense_proj_gemm_kn_n256',
         (2049, 148): 'dense_proj_gemm_kn_n256_m256',
         (2049, 212): 'dense_proj_gemm_kn_n256',
     },
-    ('q_b', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_g8_f32_v8',
+    ('q_b', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_v8',
     ('q_b', 'wgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_nn_n256_tma1',
         (1001, 212): 'dense_proj_gemm_nn_n256_tma1',
         (2049, 148): 'dense_proj_gemm_nn_n256',
         (2049, 212): 'dense_proj_gemm_nn_n256',
     },
-    ('q_b', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_g8_f32_v8',
+    ('q_b', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_v8',
     ('kv_a', 'fwd', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_kk_n192_hee_s8',
         (1001, 212): 'dense_proj_gemm_kk_n192_m256_hen_s5',
@@ -228,37 +213,17 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_kk_n192_m256_hen_s5',
     },
     ('kv_a', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_g8_q_s6',
-        (1001, 212): 'dense_proj_gemm_kn_n256_g8_q',
-        (2049, 148): 'dense_proj_gemm_kn_n256_g8_q_s6',
-        (2049, 212): 'dense_proj_gemm_kn_n256_g8_q',
+        (1001, 148): 'dense_proj_gemm_kn_n256_q_s6',
+        (1001, 212): 'dense_proj_gemm_kn_n256_q',
+        (2049, 148): 'dense_proj_gemm_kn_n256_q_s6',
+        (2049, 212): 'dense_proj_gemm_kn_n256_q',
     },
-    ('kv_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_l2_256b_g8_f32_tma1',
-    ('kv_a', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n192_hee_t',
-        (1001, 212): 'dense_proj_gemm_nn_n192_hee_g8_t',
-        (2049, 148): 'dense_proj_gemm_nn_n192_hee_t',
-        (2049, 212): 'dense_proj_gemm_nn_n192_hee_g8_t',
-    },
-    ('kv_a', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n192_hee_f32_t',
-        (1001, 212): 'dense_proj_gemm_nn_n192_hee_g8_f32_t',
-        (2049, 148): 'dense_proj_gemm_nn_n192_hee_f32_t',
-        (2049, 212): 'dense_proj_gemm_nn_n192_hee_g8_f32_t',
-    },
-    ('shared_gate_up', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_g8',
-        (1001, 212): 'dense_proj_gemm_kk_n256',
-        (2049, 148): 'dense_proj_gemm_kk_n256_g8',
-        (2049, 212): 'dense_proj_gemm_kk_n256',
-    },
-    ('shared_gate_up', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_g8',
-        (1001, 212): 'dense_proj_gemm_kn_n256',
-        (2049, 148): 'dense_proj_gemm_kn_n256_g8',
-        (2049, 212): 'dense_proj_gemm_kn_n256',
-    },
-    ('shared_gate_up', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_g8_f32_v8',
+    ('kv_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
+    ('kv_a', 'wgrad', 'bf16'): 'dense_proj_gemm_nn_n192_hee_t',
+    ('kv_a', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n192_hee_f32_t',
+    ('shared_gate_up', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
+    ('shared_gate_up', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
+    ('shared_gate_up', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_v8',
     ('shared_gate_up', 'wgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_nn_n256_tma1',
         (1001, 212): 'dense_proj_gemm_nn_n256_tma1',
@@ -266,31 +231,31 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_nn_n256',
     },
     ('shared_gate_up', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_g32_f32_v8',
+        (1001, 148): 'dense_proj_gemm_nn_n256_f32_v8',
         (1001, 212): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
-        (2049, 148): 'dense_proj_gemm_nn_n256_g32_f32_v8',
+        (2049, 148): 'dense_proj_gemm_nn_n256_f32_v8',
         (2049, 212): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
     },
     ('shared_down', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
     ('shared_down', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('shared_down', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_g8_f32_v8',
+    ('shared_down', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_v8',
     ('shared_down', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_g4_tma1',
+        (1001, 148): 'dense_proj_gemm_nn_n256_tma1',
         (1001, 212): 'dense_proj_gemm_nn_n256_tma1',
-        (2049, 148): 'dense_proj_gemm_nn_n256_g4',
+        (2049, 148): 'dense_proj_gemm_nn_n256',
         (2049, 212): 'dense_proj_gemm_nn_n256',
     },
     ('shared_down', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_g8_f32_v8',
+        (1001, 148): 'dense_proj_gemm_nn_n256_f32_v8',
         (1001, 212): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
-        (2049, 148): 'dense_proj_gemm_nn_n256_g8_f32_v8',
+        (2049, 148): 'dense_proj_gemm_nn_n256_f32_v8',
         (2049, 212): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
     },
     ('dense_gate_up', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
     ('dense_gate_up', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_m256_g8',
+        (1001, 148): 'dense_proj_gemm_kn_n256_m256',
         (1001, 212): 'dense_proj_gemm_kn_n256',
-        (2049, 148): 'dense_proj_gemm_kn_n256_m256_g8',
+        (2049, 148): 'dense_proj_gemm_kn_n256_m256',
         (2049, 212): 'dense_proj_gemm_kn_n256',
     },
     ('dense_gate_up', 'dgrad', 'f32'): {
@@ -300,9 +265,9 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_kn_n256_m256_f32_tma1',
     },
     ('dense_gate_up', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_g8_tma1',
+        (1001, 148): 'dense_proj_gemm_nn_n256_m256_tma1',
         (1001, 212): 'dense_proj_gemm_nn_n256_m256_tma1',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_g8',
+        (2049, 148): 'dense_proj_gemm_nn_n256_m256',
         (2049, 212): 'dense_proj_gemm_nn_n256_m256',
     },
     ('dense_gate_up', 'wgrad', 'f32'): {
@@ -325,9 +290,9 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_kn_n256_m256_f32_tma1',
     },
     ('dense_down', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_g8_tma1',
+        (1001, 148): 'dense_proj_gemm_nn_n256_m256_tma1',
         (1001, 212): 'dense_proj_gemm_nn_n256_m256_tma1',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_g8',
+        (2049, 148): 'dense_proj_gemm_nn_n256_m256',
         (2049, 212): 'dense_proj_gemm_nn_n256_m256',
     },
     ('dense_down', 'wgrad', 'f32'): {
@@ -338,17 +303,12 @@ EXPECTED_TEMPLATES = {
     },
     ('indexer_q', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
     ('indexer_q', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('indexer_q', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_g8_f32_v8',
-        (1001, 212): 'dense_proj_gemm_kn_n256_f32_v8',
-        (2049, 148): 'dense_proj_gemm_kn_n256_g8_f32_v8',
-        (2049, 212): 'dense_proj_gemm_kn_n256_f32_v8',
-    },
+    ('indexer_q', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_v8',
     ('indexer_q', 'wgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_nn_n256_m256_tma1',
-        (1001, 212): 'dense_proj_gemm_nn_n160_m256_g4',
+        (1001, 212): 'dense_proj_gemm_nn_n160_m256',
         (2049, 148): 'dense_proj_gemm_nn_n256_m256',
-        (2049, 212): 'dense_proj_gemm_nn_n160_m256_g4',
+        (2049, 212): 'dense_proj_gemm_nn_n160_m256',
     },
     ('indexer_q', 'wgrad', 'f32'): {
         (1001, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
@@ -361,12 +321,7 @@ EXPECTED_TEMPLATES = {
     ('indexer_k', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n128_f32_tma1',
     ('indexer_k', 'wgrad', 'bf16'): 'dense_proj_gemm_nn_n128_m64_t',
     ('indexer_k', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n128_m64_f32_t',
-    ('indexer_hw', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n128',
-        (1001, 212): 'dense_proj_gemm_kk_n128_l2_256b',
-        (2049, 148): 'dense_proj_gemm_kk_n128',
-        (2049, 212): 'dense_proj_gemm_kk_n128_l2_256b',
-    },
+    ('indexer_hw', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n128',
     ('indexer_hw', 'dgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_kn_n256_m256_tma2',
         (1001, 212): 'dense_proj_gemm_kn_n256_tma2',
@@ -399,10 +354,10 @@ MLA_TEMPLATES = {
     ('qabs', 'dgrad'): {
         (33, 148): 'dense_proj_gemm_kk_n128_t',
         (33, 212): 'dense_proj_gemm_kk_n128_t',
-        (1001, 148): 'dense_proj_gemm_kk_n192_l2_256b',
-        (1001, 212): 'dense_proj_gemm_kk_n192_l2_256b',
-        (2049, 148): 'dense_proj_gemm_kk_n192_l2_256b',
-        (2049, 212): 'dense_proj_gemm_kk_n192_l2_256b',
+        (1001, 148): 'dense_proj_gemm_kk_n192',
+        (1001, 212): 'dense_proj_gemm_kk_n192',
+        (2049, 148): 'dense_proj_gemm_kk_n192',
+        (2049, 212): 'dense_proj_gemm_kk_n192',
     },
     ('qabs', 'wgrad'): {
         (33, 148): 'dense_proj_gemm_nn_n192_m256_t',
@@ -415,18 +370,18 @@ MLA_TEMPLATES = {
     ('vproj', 'fwd'): {
         (33, 148): 'dense_proj_gemm_kk_n128_t',
         (33, 212): 'dense_proj_gemm_kk_n128_t',
-        (1001, 148): 'dense_proj_gemm_kk_n256_l2_256b_q',
-        (1001, 212): 'dense_proj_gemm_kk_n256_l2_256b_q',
-        (2049, 148): 'dense_proj_gemm_kk_n256_l2_256b_q',
-        (2049, 212): 'dense_proj_gemm_kk_n256_l2_256b_q',
+        (1001, 148): 'dense_proj_gemm_kk_n256_q',
+        (1001, 212): 'dense_proj_gemm_kk_n256_q',
+        (2049, 148): 'dense_proj_gemm_kk_n256_q',
+        (2049, 212): 'dense_proj_gemm_kk_n256_q',
     },
     ('vproj', 'dgrad'): {
         (33, 148): 'dense_proj_gemm_nk_n128_t',
         (33, 212): 'dense_proj_gemm_nk_n128_t',
         (1001, 148): 'dense_proj_gemm_kn_n256_m256_tma1',
-        (1001, 212): 'dense_proj_gemm_kn_n256_l2_256b_tma1',
+        (1001, 212): 'dense_proj_gemm_kn_n256_tma1',
         (2049, 148): 'dense_proj_gemm_kn_n256_m256_tma1',
-        (2049, 212): 'dense_proj_gemm_kn_n256_l2_256b_tma1',
+        (2049, 212): 'dense_proj_gemm_kn_n256_tma1',
     },
     ('vproj', 'wgrad'): {
         (33, 148): 'dense_proj_gemm_nn_n256_m256_t',
@@ -441,34 +396,24 @@ EXPORTED_TEMPLATES = frozenset(
     {
         'dense_proj_gemm_kk_n128',
         'dense_proj_gemm_kk_n128_hen',
-        'dense_proj_gemm_kk_n128_l2_256b',
-        'dense_proj_gemm_kk_n128_l2_256b_hen',
+        'dense_proj_gemm_kk_n192',
         'dense_proj_gemm_kk_n192_hee_s8',
-        'dense_proj_gemm_kk_n192_l2_256b',
         'dense_proj_gemm_kk_n192_m256_hen_s5',
         'dense_proj_gemm_kk_n256',
-        'dense_proj_gemm_kk_n256_g32',
-        'dense_proj_gemm_kk_n256_g8',
-        'dense_proj_gemm_kk_n256_l2_256b_q',
         'dense_proj_gemm_kk_n256_m256',
-        'dense_proj_gemm_kk_n256_m256_g8',
+        'dense_proj_gemm_kk_n256_q',
         'dense_proj_gemm_kn_n128_f32_tma1',
         'dense_proj_gemm_kn_n128_m256_tma1',
         'dense_proj_gemm_kn_n256',
         'dense_proj_gemm_kn_n256_f32_tma1',
         'dense_proj_gemm_kn_n256_f32_v8',
-        'dense_proj_gemm_kn_n256_g8',
-        'dense_proj_gemm_kn_n256_g8_f32_v8',
-        'dense_proj_gemm_kn_n256_g8_q',
-        'dense_proj_gemm_kn_n256_g8_q_s6',
         'dense_proj_gemm_kn_n256_hne',
-        'dense_proj_gemm_kn_n256_l2_256b_g8_f32_tma1',
-        'dense_proj_gemm_kn_n256_l2_256b_tma1',
         'dense_proj_gemm_kn_n256_m256',
         'dense_proj_gemm_kn_n256_m256_f32_tma1',
-        'dense_proj_gemm_kn_n256_m256_g8',
         'dense_proj_gemm_kn_n256_m256_tma1',
         'dense_proj_gemm_kn_n256_m256_tma2',
+        'dense_proj_gemm_kn_n256_q',
+        'dense_proj_gemm_kn_n256_q_s6',
         'dense_proj_gemm_kn_n256_tma1',
         'dense_proj_gemm_kn_n256_tma2',
         'dense_proj_gemm_nk_n256_t',
@@ -480,24 +425,17 @@ EXPORTED_TEMPLATES = frozenset(
         'dense_proj_gemm_nn_n128_m64_hen_t',
         'dense_proj_gemm_nn_n128_m64_t',
         'dense_proj_gemm_nn_n128_t',
+        'dense_proj_gemm_nn_n160_m256',
         'dense_proj_gemm_nn_n160_m256_f32',
-        'dense_proj_gemm_nn_n160_m256_g4',
         'dense_proj_gemm_nn_n192_hee_f32_t',
-        'dense_proj_gemm_nn_n192_hee_g8_f32_t',
-        'dense_proj_gemm_nn_n192_hee_g8_t',
         'dense_proj_gemm_nn_n192_hee_t',
         'dense_proj_gemm_nn_n192_m256_hee_t',
         'dense_proj_gemm_nn_n192_m256_t',
         'dense_proj_gemm_nn_n256',
         'dense_proj_gemm_nn_n256_f32_tma1',
         'dense_proj_gemm_nn_n256_f32_v8',
-        'dense_proj_gemm_nn_n256_g32_f32_v8',
-        'dense_proj_gemm_nn_n256_g4',
-        'dense_proj_gemm_nn_n256_g8_f32_v8',
         'dense_proj_gemm_nn_n256_m256',
         'dense_proj_gemm_nn_n256_m256_f32_tma1',
-        'dense_proj_gemm_nn_n256_m256_g8',
-        'dense_proj_gemm_nn_n256_m256_g8_tma1',
         'dense_proj_gemm_nn_n256_m256_hee_t',
         'dense_proj_gemm_nn_n256_m256_t',
         'dense_proj_gemm_nn_n256_m256_tma1',
@@ -867,24 +805,24 @@ def test_instance_symbols(kwargs, symbol):
 
 def test_quad_store_knob_normalisation():
     # only the row-major bf16 register epilogue carries the quad-store knob: fp32 output, the TMA-store
-    # epilogue and the transposed store drop it from the key (and the symbol)
-    assert instance_key(a_mn=False, b_mn=True, epi="reg", quad_store=True)[16] is True
+    # epilogue and the transposed store drop it from the key (and the symbol); field 14 of the 15-field key
+    assert instance_key(a_mn=False, b_mn=True, epi="reg", quad_store=True)[14] is True
     assert (
         instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", quad_store=True)[
-            16
+            14
         ]
         is False
     )
     assert (
-        instance_key(a_mn=False, b_mn=True, epi="tma", slots=1, quad_store=True)[16]
+        instance_key(a_mn=False, b_mn=True, epi="tma", slots=1, quad_store=True)[14]
         is False
     )
     assert (
-        instance_key(a_mn=True, b_mn=True, out_t=True, epi="reg", quad_store=True)[16]
+        instance_key(a_mn=True, b_mn=True, out_t=True, epi="reg", quad_store=True)[14]
         is False
     )
     assert (
-        instance_key(a_mn=False, b_mn=True, block_n=128, epi="reg", quad_store=True)[16]
+        instance_key(a_mn=False, b_mn=True, block_n=128, epi="reg", quad_store=True)[14]
         is True
     )
     # whole 64-column groups per warp slice: not at BLOCK_N = 160 / 192 / 224 (80 / 96 / 112 columns) nor on
@@ -893,17 +831,17 @@ def test_quad_store_knob_normalisation():
         assert (
             instance_key(
                 a_mn=False, b_mn=True, block_n=block_n, epi="reg", quad_store=True
-            )[16]
+            )[14]
             is False
         )
     assert (
-        instance_key(a_mn=False, b_mn=True, cta_rows=64, epi="reg", quad_store=True)[16]
+        instance_key(a_mn=False, b_mn=True, cta_rows=64, epi="reg", quad_store=True)[14]
         is True
     )
     assert (
         instance_key(
             a_mn=False, b_mn=True, block_n=128, cta_rows=64, epi="reg", quad_store=True
-        )[16]
+        )[14]
         is False
     )
     assert (
@@ -1080,7 +1018,6 @@ def test_instance_key_rejects_bad_configurations():
             sm_count=148,
             l2_bytes=L2_BYTES,
             _fallback=False,
-            transposed_out=v["transposed"],
             promo="l2_512b",
         )
 
@@ -1362,9 +1299,9 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         plan.sm_pairs,
                     ),
                 )
-                assert (re.search(r"_g\d+", plan.template) is None) == (
-                    plan.group_m == 16
-                )  # raster-group suffix only away from the default ("_gemm" is not one)
+                # the raster group width is a launch parameter since round 11: never a template suffix
+                # ("_gemm" is not one)
+                assert re.search(r"_g\d+", plan.template) is None
                 assert plan.stages == rule.get(
                     "stages",
                     default_stages(plan.slots, plan.cta_rows, plan.block_n, plan.b_mn),
@@ -1733,11 +1670,12 @@ def test_batched_small_m_swap_and_row_rules():
             _fallback=False,
             arch="sm_100a",
         )
+        # group_m is a launch parameter (round 11): it is planned from the rule but is not a template axis
         assert (
             ruled.cta_rows == 256
             and ruled.group_m == 8
             and "_m256" in ruled.template
-            and "_g8" in ruled.template
+            and re.search(r"_g\d+", ruled.template) is None
         )
         pinned, *_ = plan_dense_projection_gemm(
             Q.permute(1, 2, 0),
@@ -1769,10 +1707,10 @@ def test_batched_small_m_swap_and_row_rules():
             arch="sm_100a",
         )
         assert (ruled.cta_rows, ruled.stages, ruled.group_m) == (256, 3, 8)
-        assert ruled.template == "dense_proj_gemm_nn_n192_m256_g8_t_s3"
+        assert ruled.template == "dense_proj_gemm_nn_n192_m256_t_s3"
         for rows, template in (
-            (128, "dense_proj_gemm_nn_n192_g8_t"),
-            (64, "dense_proj_gemm_nn_n192_m64_g8_t"),
+            (128, "dense_proj_gemm_nn_n192_t"),
+            (64, "dense_proj_gemm_nn_n192_m64_t"),
         ):
             forced, *_ = plan_dense_projection_gemm(
                 Q.permute(1, 2, 0),
