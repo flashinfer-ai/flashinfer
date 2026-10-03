@@ -14,6 +14,8 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.typing import Float32
+from cutlass.cutlass_dsl import Int32, T
+from cutlass._mlir.dialects import llvm
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -47,6 +49,135 @@ from common.megamoe_constants import (
 )
 from moe_nvfp4_swapab.moe_utils import spin_wait
 
+# FI local extension -- W4A16 augmented weight tile.  Packed NVFP4 weights
+# reach the kernel as one byte tensor per expert holding, per row PAIR and
+# 128-K tile, [row 2p payload | row 2p+1 payload | row 2p scales | row 2p+1
+# scales] = 64 + 64 + 8 + 8 = 144 B: a legal TMA box (inner extent a multiple
+# of 16 B), so one A load per stage carries payload and scales.  Payload bytes
+# are E2M1 pairs (low nibble = even k), lane-permuted on the host
+# (flashinfer/moe_ep/backends/mega/kernel/sm90/common/nvfp4.py augment_w4a16)
+# so the 16 bytes one RS fragment lane decodes per tile are contiguous and
+# 16-byte aligned: byte ``kb*8 + h*4 + l`` -> ``l*16 + kb*2 + h`` (k16 block
+# kb, k half h, lane l).  Within each 32-bit word, output pair j = (kb%2)*2+h
+# keeps its even-k code in nibble j and its odd-k code in nibble j+4 (see
+# _w4a16_decode_pair).  Scale byte kb covers k16 block kb.  The host also
+# canonicalizes blocks (zero scale -> zero codes, sign folded into the codes),
+# so the kernel can treat every block scale as a non-negative finite E4M3.
+W4A16TileK = 128
+W4A16PayloadBytes = 64
+W4A16ScaleBytes = 8
+W4A16PairTileBytes = 2 * (W4A16PayloadBytes + W4A16ScaleBytes)
+# Bit-placed E2M1 is the true value * 2^-126 and the converted block scale is
+# the true scale * 2^119 (the largest power of two that keeps 448 * 2^k finite
+# in BF16), so each decoded weight carries 2^-7; the epilogue multiplies the
+# per-expert weight dequant scale by this to undo it (exact: a power of two).
+W4A16AccumScale = 2.0**7
+
+
+@cute.jit
+def _w4a16_scale_pair(code: cutlass.Uint32) -> cutlass.Uint32:
+    """Two E4M3 block scales (low 16 bits) -> BF16x2 of ``scale * 2^119`` (exact).
+
+    ``cvt.rn.f16x2.e4m3x2`` makes both scales normal FP16 (E4M3's smallest
+    subnormal, 2^-9, is above FP16's normal range floor); dropping the three
+    low mantissa bits (always zero) turns each half into BF16 bits of
+    ``scale * 2^-112``, and adding 231 to the exponent field gives
+    ``scale * 2^119`` (field <= 254 for scale <= 448).  A zero scale becomes
+    2^104 rather than 0, which is harmless because the host zeroes the codes
+    of zero-scale blocks.
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Uint32(code).ir_value()],
+            "{\n"
+            "  .reg .b16 lo, hi;\n"
+            "  .reg .b32 h;\n"
+            "  mov.b32 {lo, hi}, $1;\n"
+            "  cvt.rn.f16x2.e4m3x2 h, lo;\n"
+            "  shr.b32 h, h, 3;\n"
+            "  and.b32 h, h, 0x0FFF0FFF;\n"
+            "  add.u32 $0, h, 0x73807380;\n"
+            "}",
+            "=r,r",
+            has_side_effects=False,
+        )
+    )
+
+
+@cute.jit
+def _w4a16_decode_pair(q: cutlass.Uint32, j: cutlass.Constexpr) -> cutlass.Uint32:
+    """Output pair ``j`` of a payload word as BF16x2 bits of ``value * 2^-126``.
+
+    Pair j's codes sit in nibbles j (even k, low half) and j+4 (odd k, high
+    half).  Placing a code's sign at bit 15 and its three magnitude bits
+    (exponent:mantissa) at bits 8..6 of a BF16 yields exactly the E2M1 value
+    times 2^-126 (code 1, 0.5, lands on the BF16 subnormal 2^-127); one
+    shift + mask per field covers both halves.
+    """
+    if cutlass.const_expr(j < 3):
+        sign = q << cutlass.Uint32(12 - 4 * j)
+    else:
+        sign = q
+    if cutlass.const_expr(6 - 4 * j >= 0):
+        mag = q << cutlass.Uint32(6 - 4 * j)
+    else:
+        mag = q >> cutlass.Uint32(4 * j - 6)
+    return (sign & cutlass.Uint32(0x80008000)) | (mag & cutlass.Uint32(0x01C001C0))
+
+
+@cute.jit
+def _w4a16_scale_mul(
+    lo_pair: cutlass.Uint32,
+    hi_pair: cutlass.Uint32,
+    scale2: cutlass.Uint32,
+    half: cutlass.Constexpr,
+):
+    """Multiply two decoded BF16x2 by half ``half`` of ``scale2`` (mul.rn.bf16x2).
+
+    BF16 arithmetic keeps subnormals, and the products (<= 6 significant
+    bits, magnitudes in [2^-17, 21]) are exact normal BF16.
+    """
+    pick = "{s0, s0}" if half == 0 else "{s1, s1}"
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            cutlass.Uint32(lo_pair).ir_value(),
+            cutlass.Uint32(hi_pair).ir_value(),
+            cutlass.Uint32(scale2).ir_value(),
+        ],
+        "{\n"
+        "  .reg .b16 s0, s1;\n"
+        "  .reg .b32 b;\n"
+        "  mov.b32 {s0, s1}, $4;\n"
+        f"  mov.b32 b, {pick};\n"
+        "  mul.rn.bf16x2 $0, $2, b;\n"
+        "  mul.rn.bf16x2 $1, $3, b;\n"
+        "}",
+        "=r,=r,r,r,r",
+        has_side_effects=False,
+    )
+    return (
+        cutlass.Uint32(llvm.extractvalue(T.i32(), res, [0])),
+        cutlass.Uint32(llvm.extractvalue(T.i32(), res, [1])),
+    )
+
+
+@cute.jit
+def _w4a16_fence_operand(frag: cute.Tensor) -> None:
+    """Pin decoded A registers ahead of the dependent RS WGMMA (compiler fence)."""
+    regs = cute.recast_tensor(frag, cutlass.Uint32)
+    for i in cutlass.range_constexpr(cute.size(regs)):
+        regs[i] = cutlass.Uint32(
+            llvm.inline_asm(
+                T.i32(),
+                [cutlass.Uint32(regs[i]).ir_value()],
+                "",
+                "=r,0",
+                has_side_effects=True,
+            )
+        )
+
 
 # =============================================================================
 # Sm90SwapABSwigluFp8Fc12Kernel
@@ -69,8 +200,13 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
     # FP8 elements, and four such bytes are carried as one 128-element dispatch
     # scale atom. Gate/up interleave is tracked separately by
     # Fp8GateUpInterleave.
+    # FI local extension: BFloat16 runs the per-tensor path with unit
+    # dequant scales (BF16 WGMMA, BF16 FC1 output; the E8M0 wire rides along
+    # unused).
     VALID_AB_DTYPE_SF_SIZE: dict = {
-        Fp8E8M0SfVecSize: (cutlass.Float8E4M3FN, cutlass.Float8E5M2,),
+        Fp8E8M0SfVecSize: (
+            cutlass.Float8E4M3FN, cutlass.Float8E5M2, cutlass.BFloat16,
+        ),
     }
 
     # Interleave granularity for gate and up in SwiGLU / GeGlu
@@ -193,6 +329,16 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             self.fp8_output_rcp_limit = Fp8E4M3RcpLimit
         elif ab_dtype == cutlass.Float8E5M2:
             self.fp8_output_rcp_limit = Fp8E5M2RcpLimit
+        elif ab_dtype == cutlass.BFloat16:
+            # No FC1-output quantization: the per-tensor epilogue only
+            # multiplies by the (unit) static scales and converts to BF16.
+            if fp8_scale_mode != "per_tensor" or fp8_accum_mode != "1xacc":
+                raise ValueError(
+                    "BFloat16 ab_dtype runs the per_tensor/1xacc path with "
+                    f"unit scales; got fp8_scale_mode={fp8_scale_mode!r}, "
+                    f"fp8_accum_mode={fp8_accum_mode!r}."
+                )
+            self.fp8_output_rcp_limit = 1.0
         else:
             raise ValueError(
                 f"Unsupported Hopper FP8 ab_dtype for output quant: {ab_dtype}."
@@ -359,11 +505,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 f"got ({m}, {n})."
             )
 
-        dispatch_scale_atom_k = Fp8DispatchScaleAtomK
-        if k % dispatch_scale_atom_k != 0:
+        k_atom = self._mma_tile_k_atom()
+        if k % k_atom != 0:
             raise ValueError(
-                f"mma_tiler K ({k}) must be a multiple of "
-                f"FP8 dispatch scale atom K = {dispatch_scale_atom_k}"
+                f"mma_tiler K ({k}) must be a multiple of {k_atom} "
+                "(FP8: the dispatch scale atom; BF16: one 128-B swizzle atom)"
             )
 
         supported_cluster_shapes = ((1, 1), (2, 1), (1, 2), (2, 2))
@@ -453,6 +599,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             pingpong=self.pingpong,
             generate_c=self.generate_c,
             c_dtype=self.c_dtype,
+            weight_dequant_multiplier=W4A16AccumScale if self.w4a16 else 1.0,
         )
         self.epilogue = SwapABFp8GluEpilogue(**_epi_common)
 
@@ -483,9 +630,23 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             self.num_sched_stages,
         )
 
-        self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
-            self.a_layout, self.mma_tiler, self.a_dtype, self.num_ab_stage,
-        )
+        if self.w4a16:
+            # Packed row-pair tiles, read by the consumer threads (LDS), not
+            # by WGMMA descriptors: plain layout behind an identity swizzle so
+            # the composed-layout plumbing (.inner / .outer) is unchanged.
+            pairs = self.mma_tiler[0] // 2
+            self.a_smem_layout_staged = cute.make_composed_layout(
+                cute.make_swizzle(0, 4, 3),
+                0,
+                cute.make_layout(
+                    (pairs, W4A16PairTileBytes, self.num_ab_stage),
+                    stride=(W4A16PairTileBytes, 1, pairs * W4A16PairTileBytes),
+                ),
+            )
+        else:
+            self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
+                self.a_layout, self.mma_tiler, self.a_dtype, self.num_ab_stage,
+            )
         self.b_smem_layout_staged = sm90_utils.make_smem_layout_b(
             self.b_layout,
             self.mma_tiler,
@@ -509,13 +670,45 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.atom_thr_size = atom_thr_size  # store as Python int for use in @cute.kernel
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
-        a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
+        a_copy_size = cute.size_in_bytes(self.a_smem_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (
             a_copy_size
             + b_copy_size
             + self._activation_sf_bytes_per_stage()
         ) * atom_thr_size
+
+    @property
+    def a_smem_dtype(self):
+        """Element type of the A SMEM stage (packed bytes under W4A16)."""
+        return cutlass.Uint8 if self.w4a16 else self.a_dtype
+
+    def _a_bytes_per_stage(self, mma_tiler_mnk, a_dtype) -> int:
+        if self.w4a16:
+            return (mma_tiler_mnk[0] // 2) * W4A16PairTileBytes
+        return super()._a_bytes_per_stage(mma_tiler_mnk, a_dtype)
+
+    def _a_logical_extents(self, fc1_weight_gemm, fc2_weight_gemm):
+        """(fc1 M, fc1 K, fc2 K) of the A operands in elements.
+
+        Under W4A16 the A GEMM tensors hold augmented row-pair bytes, so the
+        k-tile counts and FC2 spin thresholds come from the expert shape.
+        """
+        if self.w4a16:
+            _, gateup, hidden = self.static_expert_shape
+            return gateup, hidden, gateup // 2
+        return (
+            fc1_weight_gemm.shape[0],
+            fc1_weight_gemm.shape[1],
+            fc2_weight_gemm.shape[1],
+        )
+
+    def _a_gmem_tiler(self):
+        if self.w4a16:
+            # Row pairs x one 128-K tile of the augmented byte tensor; same
+            # tile counts as the logical (M, 128) BF16 tiling.
+            return (self.mma_tiler[0] // 2, W4A16PairTileBytes)
+        return super()._a_gmem_tiler()
 
     def wgmma_warpgroup_init(
         self,
@@ -530,15 +723,28 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             stride=32 * self.epilogue_warps_per_warpgroup,
         )
         thr_mma = tiled_mma.get_slice(warpgroup_thread_layout(wg_idx))
-        sA_wg = cute.local_tile(
-            sA,
-            cute.slice_(self.wgmma_tiler, (None, 0, None)),
-            (wg_idx, 0, None),
-        )
-        tCsA = thr_mma.partition_A(sA_wg)
         tCsB = thr_mma.partition_B(sB)
-        tCrA = tiled_mma.make_fragment_A(tCsA)
         tCrB = tiled_mma.make_fragment_B(tCsB)
+        if cutlass.const_expr(self.w4a16):
+            # RS A: each thread decodes the (m, k) elements of its own
+            # fragment, so slice per thread (not per warpgroup) and keep the
+            # coordinates instead of SMEM descriptors.
+            tidx_in_wg = cute.arch.thread_idx()[0] % Int32(
+                32 * self.epilogue_warps_per_warpgroup
+            )
+            tCcA = tiled_mma.get_slice(tidx_in_wg).partition_A(
+                cute.make_identity_tensor(
+                    (self.wgmma_tiler[0], self.wgmma_tiler[2])
+                )
+            )
+            tCrA = (sA, tCcA, wg_idx * (self.wgmma_tiler[0] // 2))
+        else:
+            sA_wg = cute.local_tile(
+                sA,
+                cute.slice_(self.wgmma_tiler, (None, 0, None)),
+                (wg_idx, 0, None),
+            )
+            tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA_wg))
         cC = cute.make_identity_tensor((self.wgmma_tiler[0], self.wgmma_tiler[1]))
         tCgC = thr_mma.partition_C(cC)
 
@@ -552,6 +758,166 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             tCgC.shape[:3],
             ab_consumer_state,
         )
+
+    @cute.jit
+    def _w4a16_load_ktile(
+        self,
+        sA_stage: cute.Tensor,
+        tCcA: cute.Tensor,
+        pair_base,
+        words: cute.Tensor,
+    ) -> None:
+        """Load this thread's packed words for one K tile into ``words[j, mi, rh]``.
+
+        Rows come from the fragment coordinates: value 0 (row r) and value 2
+        (row r+8) of each M64 atom ``mi``.  j = 0..3: the lane's 16 payload
+        bytes (k16 blocks 2j, 2j+1); j = 4, 5: the row's 8 block scales.
+        """
+        words_u32 = cute.recast_tensor(sA_stage, cutlass.Uint32)
+        lane = tCcA[0, 0, 0][1] // Int32(2)
+        for mi in cutlass.range_constexpr(cute.size(tCcA, mode=[1])):
+            for rh in cutlass.range_constexpr(2):
+                m = tCcA[2 * rh, mi, 0][0]
+                pair = pair_base + m // Int32(2)
+                q = m % Int32(2)
+                payload = q * Int32(W4A16PayloadBytes // 4) + lane * Int32(4)
+                scales = Int32(2 * W4A16PayloadBytes // 4) + q * Int32(
+                    W4A16ScaleBytes // 4
+                )
+                for j in cutlass.range_constexpr(4):
+                    words[j, mi, rh] = words_u32[pair, payload + Int32(j)]
+                for j in cutlass.range_constexpr(2):
+                    words[4 + j, mi, rh] = words_u32[pair, scales + Int32(j)]
+
+    @cute.jit
+    def _w4a16_issue_kblock(
+        self,
+        tiled_mma,
+        accumulators: cute.Tensor,
+        abuf: cute.Tensor,
+        words: cute.Tensor,
+        scales: cute.Tensor,
+        tCrB_stage: cute.Tensor,
+        k_block: cutlass.Constexpr,
+        first_tile: cutlass.Constexpr,
+    ) -> None:
+        """Retire the WGMMA that last read this slot, decode, issue, commit.
+
+        Per M64 atom and row half, output pairs (k, k+1) and (k+8, k+9) of
+        this k16 block go to fragment pairs p = rh and p = rh + 2 (the RS A
+        operand's (2,2,2) value mode: k pair, row +8, k +8).  Even blocks
+        convert the scales of blocks (kb, kb+1) into ``scales``.
+        ``first_tile``: the accumulate flag is flipped only while tracing the
+        peeled first tile (an attribute rebind inside the dynamic k-tile loop
+        would not dominate its later uses).
+        """
+        slot = k_block % 2
+        cute.nvgpu.warpgroup.wait_group(1)
+        abuf_u32 = cute.recast_tensor(abuf, cutlass.Uint32)
+        num_m = cute.size(abuf, mode=[1])
+        for mi in cutlass.range_constexpr(num_m):
+            for rh in cutlass.range_constexpr(2):
+                if cutlass.const_expr(k_block % 2 == 0):
+                    scale_word = cutlass.Uint32(words[4 + k_block // 4, mi, rh])
+                    scales[mi, rh] = _w4a16_scale_pair(
+                        scale_word >> cutlass.Uint32(8 * (k_block % 4))
+                    )
+                q = cutlass.Uint32(words[k_block // 2, mi, rh])
+                lo_pair, hi_pair = _w4a16_scale_mul(
+                    _w4a16_decode_pair(q, 2 * (k_block % 2)),
+                    _w4a16_decode_pair(q, 2 * (k_block % 2) + 1),
+                    cutlass.Uint32(scales[mi, rh]),
+                    k_block % 2,
+                )
+                abuf_u32[rh + 4 * mi + 4 * num_m * slot] = lo_pair
+                abuf_u32[rh + 2 + 4 * mi + 4 * num_m * slot] = hi_pair
+        _w4a16_fence_operand(abuf[None, None, slot])
+        cute.nvgpu.warpgroup.fence()
+        cute.gemm(
+            tiled_mma,
+            accumulators,
+            abuf[None, None, slot],
+            tCrB_stage[None, None, k_block],
+            accumulators,
+        )
+        if cutlass.const_expr(first_tile):
+            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+        cute.nvgpu.warpgroup.commit_group()
+
+    @cute.jit
+    def _mma_w4a16_rs(
+        self,
+        local_warp_idx: int,
+        tiled_mma,
+        a_views,
+        tCrB: cute.Tensor,
+        accumulators: cute.Tensor,
+        ab_pipeline,
+        ab_consumer_state,
+        k_tile_cnt,
+    ):
+        """W4A16 mainloop: packed NVFP4 A decoded into register-sourced WGMMA.
+
+        One WGMMA group per k16 block on a two-slot register fragment, so the
+        decode of block b+1 overlaps the WGMMA of block b; ``wait_group(1)``
+        before each decode retires the WGMMA that last read the slot.  A
+        stage is released once its last block's group retired (after the next
+        tile's second wait).  The first tile is peeled so only its first WGMMA
+        overwrites the accumulator.
+        """
+        if local_warp_idx < self.epilogue_warps_per_warpgroup:
+            sA, tCcA, pair_base = a_views
+            num_k_blocks = cute.size(tCcA, mode=[2])
+            abuf = cute.make_rmem_tensor(
+                (tCcA.shape[0], tCcA.shape[1], 2), cutlass.BFloat16
+            )
+            words = cute.make_rmem_tensor((6, tCcA.shape[1], 2), cutlass.Uint32)
+            scales = cute.make_rmem_tensor((tCcA.shape[1], 2), cutlass.Uint32)
+            release_state = ab_consumer_state.clone()
+            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
+
+            ab_pipeline.consumer_wait(ab_consumer_state)
+            stage = ab_consumer_state.index
+            self._w4a16_load_ktile(sA[None, None, stage], tCcA, pair_base, words)
+            for k_block in cutlass.range_constexpr(num_k_blocks):
+                self._w4a16_issue_kblock(
+                    tiled_mma,
+                    accumulators,
+                    abuf,
+                    words,
+                    scales,
+                    tCrB[None, None, None, stage],
+                    k_block,
+                    True,
+                )
+            ab_consumer_state.advance()
+
+            for k_tile in cutlass.range(1, k_tile_cnt, 1, unroll=1):
+                ab_pipeline.consumer_wait(ab_consumer_state)
+                stage = ab_consumer_state.index
+                self._w4a16_load_ktile(sA[None, None, stage], tCcA, pair_base, words)
+                for k_block in cutlass.range_constexpr(num_k_blocks):
+                    self._w4a16_issue_kblock(
+                        tiled_mma,
+                        accumulators,
+                        abuf,
+                        words,
+                        scales,
+                        tCrB[None, None, None, stage],
+                        k_block,
+                        False,
+                    )
+                    if cutlass.const_expr(k_block == 1):
+                        # wait_group(1) inside block 1 retired the previous
+                        # tile's last group: its stage is free.
+                        ab_pipeline.consumer_release(release_state)
+                        release_state.advance()
+                ab_consumer_state.advance()
+
+            cute.nvgpu.warpgroup.wait_group(0)
+            ab_pipeline.consumer_release(release_state)
+            release_state.advance()
+        return ab_consumer_state
 
     def _activation_scale_rmem_layout(self) -> cute.Layout:
         return cute.make_layout(2 * (self.wgmma_tile_n // 8))
@@ -695,20 +1061,21 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             ) = self.static_expert_shape
             intermediate_downproj_static = intermediate_gateup_static // 2
 
-            fc1_weight = cute.make_tensor(
-                fc1_weight.iterator,
-                cute.make_layout(
-                    (experts_static, hidden_static, intermediate_gateup_static),
-                    stride=fc1_weight.stride,
-                ),
-            )
-            fc2_weight = cute.make_tensor(
-                fc2_weight.iterator,
-                cute.make_layout(
-                    (experts_static, intermediate_downproj_static, hidden_static),
-                    stride=fc2_weight.stride,
-                ),
-            )
+            if cutlass.const_expr(not self.w4a16):
+                fc1_weight = cute.make_tensor(
+                    fc1_weight.iterator,
+                    cute.make_layout(
+                        (experts_static, hidden_static, intermediate_gateup_static),
+                        stride=fc1_weight.stride,
+                    ),
+                )
+                fc2_weight = cute.make_tensor(
+                    fc2_weight.iterator,
+                    cute.make_layout(
+                        (experts_static, intermediate_downproj_static, hidden_static),
+                        stride=fc2_weight.stride,
+                    ),
+                )
             activation = cute.make_tensor(
                 activation.iterator,
                 cute.make_layout(
@@ -759,14 +1126,39 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # A_gemm (fc1 weights): (experts, hidden, intermediate_gateup)
         # -> (M=intermediate_gateup, K=hidden, L=experts).
-        experts, hidden_b, intermediate_gateup = fc1_weight.shape
-        fc1_weight_gemm = cute.make_tensor(
-            fc1_weight.iterator,
-            cute.make_layout(
-                (intermediate_gateup, hidden_b, experts),
-                stride=(fc1_weight.stride[2], fc1_weight.stride[1], fc1_weight.stride[0]),
-            ),
-        )
+        if cutlass.const_expr(self.w4a16):
+            # Augmented bytes (experts, gateup/2 row pairs, hidden/128 * 144)
+            # -> (M'=pairs, K'=tile bytes, L=experts); logical dims are the
+            # codegen-time expert shape (W4A16 requires static_expert_shape).
+            experts, intermediate_gateup, hidden_b = self.static_expert_shape
+            fc1_weight_gemm = cute.make_tensor(
+                fc1_weight.iterator,
+                cute.make_layout(
+                    (
+                        intermediate_gateup // 2,
+                        hidden_b // W4A16TileK * W4A16PairTileBytes,
+                        experts,
+                    ),
+                    stride=(
+                        fc1_weight.stride[1],
+                        fc1_weight.stride[2],
+                        fc1_weight.stride[0],
+                    ),
+                ),
+            )
+        else:
+            experts, hidden_b, intermediate_gateup = fc1_weight.shape
+            fc1_weight_gemm = cute.make_tensor(
+                fc1_weight.iterator,
+                cute.make_layout(
+                    (intermediate_gateup, hidden_b, experts),
+                    stride=(
+                        fc1_weight.stride[2],
+                        fc1_weight.stride[1],
+                        fc1_weight.stride[0],
+                    ),
+                ),
+            )
 
         # C_gemm is a user-view output tensor; epilogue owns its store path.
         intermediate_downproj = fc1_output.shape[1]
@@ -797,14 +1189,37 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # A_gemm (fc2 weights): (experts, intermediate_downproj, hidden)
         # -> (M=hidden, K=intermediate_downproj, L=experts).
-        experts2, intermediate_downproj_b2, hidden_b2 = fc2_weight.shape
-        fc2_weight_gemm = cute.make_tensor(
-            fc2_weight.iterator,
-            cute.make_layout(
-                (hidden_b2, intermediate_downproj_b2, experts2),
-                stride=(fc2_weight.stride[2], fc2_weight.stride[1], fc2_weight.stride[0]),
-            ),
-        )
+        if cutlass.const_expr(self.w4a16):
+            experts2, hidden_b2 = experts, hidden_b
+            intermediate_downproj_b2 = intermediate_gateup // 2
+            fc2_weight_gemm = cute.make_tensor(
+                fc2_weight.iterator,
+                cute.make_layout(
+                    (
+                        hidden_b2 // 2,
+                        intermediate_downproj_b2 // W4A16TileK * W4A16PairTileBytes,
+                        experts2,
+                    ),
+                    stride=(
+                        fc2_weight.stride[1],
+                        fc2_weight.stride[2],
+                        fc2_weight.stride[0],
+                    ),
+                ),
+            )
+        else:
+            experts2, intermediate_downproj_b2, hidden_b2 = fc2_weight.shape
+            fc2_weight_gemm = cute.make_tensor(
+                fc2_weight.iterator,
+                cute.make_layout(
+                    (hidden_b2, intermediate_downproj_b2, experts2),
+                    stride=(
+                        fc2_weight.stride[2],
+                        fc2_weight.stride[1],
+                        fc2_weight.stride[0],
+                    ),
+                ),
+            )
 
         # fc2 phase B operand = fc1 output reused (no new view needed:
         # ``fc1_output_gemm`` was built from ``fc1_output.iterator`` with the same
@@ -851,7 +1266,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # raw WGMMA and are interpreted by the selected scale-mode path.
         # ``self.fc1_output_dtype`` drives the sC SMEM element type and flows
         # into the epilogue ctor as ``fc1_output_dtype``.
-        self.a_dtype: Type[cutlass.Numeric] = fc1_weight_gemm.element_type
+        self.a_dtype: Type[cutlass.Numeric] = (
+            cutlass.BFloat16 if self.w4a16 else fc1_weight_gemm.element_type
+        )
         self.b_dtype: Type[cutlass.Numeric] = activation_gemm.element_type
         self.fc1_output_dtype: Type[cutlass.Numeric] = fc1_output_gemm.element_type
         self.sf_dtype: Type[cutlass.Numeric] = activation_sf.element_type
@@ -877,7 +1294,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             a_op,
             fc1_weight_gemm,
             a_smem_layout,
-            cute.slice_(self.mma_tiler, (None, 0, None)),
+            self._a_gmem_tiler(),
             num_multicast=self.num_mcast_ctas_a,
         )
 
@@ -1026,7 +1443,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 a_op,
                 fc2_weight_gemm,
                 a_smem_layout,
-                cute.slice_(self.mma_tiler, (None, 0, None)),
+                self._a_gmem_tiler(),
                 num_multicast=self.num_mcast_ctas_a,
             )
         )
@@ -1052,7 +1469,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     a_single_op,
                     fc1_weight_gemm,
                     a_smem_layout,
-                    cute.slice_(self.mma_tiler, (None, 0, None)),
+                    self._a_gmem_tiler(),
                     num_multicast=1,
                 )
             )
@@ -1061,7 +1478,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     a_single_op,
                     fc2_weight_gemm,
                     a_smem_layout,
-                    cute.slice_(self.mma_tiler, (None, 0, None)),
+                    self._a_gmem_tiler(),
                     num_multicast=1,
                 )
             )
@@ -1261,9 +1678,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # Round the FC1 channel count to whole cluster-M groups because each CTA
         # publishes one completion for its independent token-N tile.
+        fc1_rows, fc1_k, fc2_k = self._a_logical_extents(
+            fc1_weight_gemm, fc2_weight_gemm
+        )
         ext_fc2_spin_threshold = (
             (
-                fc1_weight_gemm.shape[0]
+                fc1_rows
                 + self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
                 - 1
             )
@@ -1510,7 +1930,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # ── SMEM tensors A / B (shared by fc1 / fc2) ──
         sA = smem.allocate_tensor(
-            element_type=self.a_dtype,
+            element_type=self.a_smem_dtype,
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
@@ -1578,13 +1998,13 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # (rewritten on ``fc1_weight`` / ``fc2_weight`` at ``__call__``
         # entry); otherwise they are runtime Int32 from tensor metadata.
         # The arithmetic below folds to an immediate in the static path.
-        k_tile_cnt_fc1 = (fc1_weight_gemm.shape[1] + mma_tiler_k - 1) // mma_tiler_k
-        k_tile_cnt_fc2 = (fc2_weight_gemm.shape[1] + mma_tiler_k - 1) // mma_tiler_k
+        k_tile_cnt_fc1 = (fc1_k + mma_tiler_k - 1) // mma_tiler_k
+        k_tile_cnt_fc2 = (fc2_k + mma_tiler_k - 1) // mma_tiler_k
         # Each raw gate/up CTA-M tile publishes one completion for the same
         # compile-time token-N block.
         fc2_spin_threshold = (
             (
-                fc1_weight_gemm.shape[0]
+                fc1_rows
                 + self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
                 - 1
             )

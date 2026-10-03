@@ -44,6 +44,11 @@ class MoEWeightPack:
       with E4M3 or E5M2 data; SM107 MXFP4/MXFP8 uses the same scale format
       with packed E2M1 weights. These are canonical, unswizzled scale planes;
       backend preprocessing handles the physical layout.
+      The SM90 FP8 mega backends accept MXFP8:
+      ``float8_e4m3fn`` data with E8M0 (``float8_e8m0fnu`` or ``uint8``)
+      per-32 scales, converted once to their 128x128 block scales.  The SM90
+      W4A16 mega backend keeps NVFP4 packed (``uint8`` / ``float4_e2m1fn_x2``
+      data, E4M3 per-16 scales; per-expert global scales via ``fc*_alpha``).
 
     Supplying exactly one scale raises: that state used to silently select
     the re-quantize-from-bf16 path in every backend, ignoring the provided
