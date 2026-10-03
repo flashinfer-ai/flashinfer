@@ -34,7 +34,9 @@ from .fused_add_rmsnorm import (
 )
 from .layernorm import (
     LayerNormKernel,
+    LayerNormQuantKernel,
     layernorm_cute,
+    layernorm_quant_cute,
 )
 
 __all__ = [
@@ -52,5 +54,7 @@ __all__ = [
     "fused_add_rmsnorm_quant_cute",
     # LayerNorm
     "LayerNormKernel",
+    "LayerNormQuantKernel",
     "layernorm_cute",
+    "layernorm_quant_cute",
 ]
