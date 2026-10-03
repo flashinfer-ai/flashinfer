@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, current_compilation_context
+from .core import JitSpec, current_compilation_context, gen_jit_spec
 
 
 def gen_mla_module() -> JitSpec:
@@ -60,6 +60,8 @@ def gen_sparse_mla_sm120_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/decode_dispatch.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_dispatch.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv41_fp4_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "sparse_mla_sm120/cake_dsv41_fp8_cache_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/nvfp4_mma_layout_probe.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_cache_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR
