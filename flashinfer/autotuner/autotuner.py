@@ -816,11 +816,11 @@ class TunableRunner(ABC):
 
     def __hash__(self) -> int:
         # Subclasses may carry unhashable instance attributes (e.g. _algo_cache
-        # dicts added by GEMM runners). Skip *_cache fields entirely and fall
-        # back to id() for any remaining unhashable values.
+        # dicts added by GEMM runners). Skip *_cache / *_caches fields entirely
+        # and fall back to id() for any remaining unhashable values.
         hashable_vals: list[Any] = []
         for k, v in self.__dict__.items():
-            if k.endswith("_cache"):
+            if k.endswith(("_cache", "_caches")):
                 continue
             try:
                 hash(v)

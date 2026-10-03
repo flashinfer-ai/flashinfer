@@ -69,7 +69,6 @@ from .batched_gemm_quant import (
     build_sf_buffer as _build_sf_buffer,
     is_e2m1_kind as _is_e2m1_kind,
 )
-
 import cutlass.torch as _cutlass_torch
 
 
@@ -86,6 +85,71 @@ DTYPE_NAME_TO_VALUE = {
     "mxe4m3": DType.MXE4M3,
     "e4m3": DType.E4M3,
 }
+
+_DSFP8_K_BLOCK = 128
+
+
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _nearest_ue8m0_bytes(scales: torch.Tensor) -> torch.Tensor:
+    """Encode positive FP32 scales as nearest-power-of-two UE8M0 bytes."""
+    lower_exponent = torch.floor(torch.log2(scales))
+    lower = torch.pow(2.0, lower_exponent)
+    exponent = lower_exponent + (scales >= 1.5 * lower)
+    return (exponent + 127).clamp_(0, 254).to(torch.uint8)
+
+
+def _materialize_dsfp8_weight_scales(compact_scales: torch.Tensor) -> torch.Tensor:
+    """Build R128c4 UE8M0 scales for this file's numerical reference."""
+    if compact_scales.ndim != 3:
+        raise ValueError("compact weight scales must have shape [E, N128, K128]")
+    encoded = _nearest_ue8m0_bytes(compact_scales)
+    physical = torch.empty(
+        (*encoded.shape, 128, 4), dtype=torch.uint8, device=encoded.device
+    )
+    rows = torch.arange(128, device=encoded.device)
+    sf_rows = (rows % 32) * 4 + rows // 32
+    physical[..., sf_rows, :] = encoded[..., None, None]
+    return physical.flatten().view(torch.float8_e8m0fnu)
+
+
+def _materialize_dsfp8_activation_scales(
+    compact_scales: torch.Tensor, *, layout: int
+) -> torch.Tensor:
+    """Build native UE8M0 scales for this file's standalone launch inputs."""
+    if compact_scales.ndim != 2:
+        raise ValueError("compact activation scales must have shape [K128, rows]")
+    k128_blocks, rows = compact_scales.shape
+    encoded = _nearest_ue8m0_bytes(compact_scales).transpose(0, 1)
+    if layout == int(SfLayout.LINEAR):
+        padded_k32 = _ceil_div(k128_blocks * 4, 16) * 16
+        physical = torch.full(
+            (rows, padded_k32), 0x7F, dtype=torch.uint8, device=encoded.device
+        )
+        physical[:, : k128_blocks * 4] = encoded.repeat_interleave(4, dim=1)
+        return physical.flatten().view(torch.float8_e8m0fnu)
+
+    rows_per_block = 8 if layout == int(SfLayout.R8c4) else 128
+    if layout not in (int(SfLayout.R8c4), int(SfLayout.R128c4)):
+        raise ValueError(f"unsupported native-MX scale layout: {layout}")
+    padded_rows = _ceil_div(rows, rows_per_block) * rows_per_block
+    padded = torch.full(
+        (padded_rows, k128_blocks),
+        0x7F,
+        dtype=torch.uint8,
+        device=encoded.device,
+    )
+    padded[:rows] = encoded
+    tiled = padded.view(-1, rows_per_block, k128_blocks).permute(0, 2, 1)
+    if rows_per_block == 128:
+        row = torch.arange(128, device=encoded.device)
+        sf_row = (row % 32) * 4 + row // 32
+        swizzled = torch.empty_like(tiled)
+        swizzled[..., sf_row] = tiled
+        tiled = swizzled
+    return tiled[..., None].expand(*tiled.shape, 4).flatten().view(torch.float8_e8m0fnu)
 
 
 def _per_token_torch_dtype(cfg):
@@ -284,11 +348,16 @@ def _runtime_config(cfg, in_hidden: int):
                 "use_deepseek_fp8=1 requires tile_k=128 to match the "
                 f"128-K DeepSeek scale-factor blocks, got {cfg.tile_k}"
             )
-        if in_hidden % cfg.tile_k != 0:
-            raise ValueError(
-                "use_deepseek_fp8=1 requires problem_k to be a multiple of "
-                f"tile_k={cfg.tile_k}, got problem_k={in_hidden}"
-            )
+    if (cfg.has_deepseek_fp8 or cfg.has_mxfp8_backed_dsfp8) and (
+        in_hidden % _DSFP8_K_BLOCK != 0
+    ):
+        scale_path = (
+            "use_deepseek_fp8" if cfg.has_deepseek_fp8 else "use_mxfp8_deepseek_fp8"
+        )
+        raise ValueError(
+            f"{scale_path}=1 requires problem_k to be a multiple of "
+            f"the K128 scale block, got problem_k={in_hidden}"
+        )
     num_k_tiles = (in_hidden + cfg.tile_k - 1) // cfg.tile_k
     use_unroll_loop_2x_for_mma = cfg.use_unroll_loop_2x_for_mma
     if use_unroll_loop_2x_for_mma and (num_k_tiles < 2 or num_k_tiles % 2 != 0):
@@ -303,36 +372,60 @@ def _runtime_config(cfg, in_hidden: int):
     return runtime_cfg
 
 
-def _expand_bf16_activations(
+def _expand_activations(
     compact_activations: torch.Tensor,
     token_layout: TokenLayout,
 ) -> torch.Tensor:
+    """Expand routed activation rows with one device-side indexed copy."""
     expanded = torch.zeros(
         (token_layout.total_padded_tokens, compact_activations.shape[1]),
         dtype=compact_activations.dtype,
         device=compact_activations.device,
     )
-    for expanded_idx, expert_idx in enumerate(token_layout.expanded_to_expert):
-        if expert_idx >= 0:
-            token_idx = token_layout.expanded_to_token[expanded_idx]
-            expanded[expanded_idx, :] = compact_activations[token_idx, :]
+    valid_expanded_rows = [
+        expanded_idx
+        for expanded_idx, expert_idx in enumerate(token_layout.expanded_to_expert)
+        if expert_idx >= 0
+    ]
+    if valid_expanded_rows:
+        expanded_rows = torch.tensor(
+            valid_expanded_rows,
+            dtype=torch.long,
+            device=compact_activations.device,
+        )
+        compact_rows = torch.tensor(
+            [token_layout.expanded_to_token[row] for row in valid_expanded_rows],
+            dtype=torch.long,
+            device=compact_activations.device,
+        )
+        expanded_bytes = expanded.view(torch.uint8).reshape(
+            token_layout.total_padded_tokens, -1
+        )
+        compact_bytes = (
+            compact_activations.contiguous()
+            .view(torch.uint8)
+            .reshape(compact_activations.shape[0], -1)
+        )
+        expanded_bytes.index_copy_(
+            0,
+            expanded_rows,
+            compact_bytes.index_select(0, compact_rows),
+        )
     return expanded
+
+
+def _expand_bf16_activations(
+    compact_activations: torch.Tensor,
+    token_layout: TokenLayout,
+) -> torch.Tensor:
+    return _expand_activations(compact_activations, token_layout)
 
 
 def _expand_fp4_activations(
     compact_activations: torch.Tensor,
     token_layout: TokenLayout,
 ) -> torch.Tensor:
-    expanded = torch.zeros(
-        (token_layout.total_padded_tokens, compact_activations.shape[1]),
-        dtype=compact_activations.dtype,
-        device=compact_activations.device,
-    )
-    for expanded_idx, expert_idx in enumerate(token_layout.expanded_to_expert):
-        if expert_idx >= 0:
-            token_idx = token_layout.expanded_to_token[expanded_idx]
-            expanded[expanded_idx, :] = compact_activations[token_idx, :]
-    return expanded
+    return _expand_activations(compact_activations, token_layout)
 
 
 def _random_uint8(
@@ -402,6 +495,8 @@ def _cutlass_data_dtype(dtype_kind: int):
 def _sf_ab_cutlass_dtype(cfg):
     if cfg.has_deepseek_fp8:
         return cutlass.Float32
+    if cfg.has_mxfp8_backed_dsfp8:
+        return cutlass.Float32
     return cutlass.Float8E8M0FNU if cfg.uses_mx_scale_factors else cutlass.Float8E4M3FN
 
 
@@ -455,6 +550,33 @@ def _create_deepseek_fp8_sf_tensors(
         device=device,
     ).uniform_(0.75, 1.25)
     return sf_weights, sf_activations
+
+
+def _create_mxfp8_deepseek_compact_sf_tensors(
+    cfg,
+    *,
+    num_experts: int,
+    out_hidden: int,
+    in_hidden: int,
+    total_padded_tokens: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create compact K128 FP32 scales that require UE8M0 rounding."""
+    if not cfg.has_mxfp8_backed_dsfp8:
+        raise ValueError("native MXFP8 compact scales require use_mxfp8_deepseek_fp8=1")
+    k128_blocks = in_hidden // 128
+    n128_blocks = _round_up(out_hidden, 128) // 128
+    weight_scales = torch.empty(
+        (num_experts, n128_blocks, k128_blocks),
+        dtype=torch.float32,
+        device=device,
+    ).uniform_(0.25, 2.0)
+    activation_scales = torch.empty(
+        (k128_blocks, total_padded_tokens),
+        dtype=torch.float32,
+        device=device,
+    ).uniform_(0.25, 2.0)
+    return weight_scales, activation_scales
 
 
 def _randomize_sf_layout(layout_kind: str) -> bool:
@@ -1518,6 +1640,7 @@ def _parse_overrides(args):
         "use_per_token_sf_b": args.use_per_token_sf_b,
         "per_token_sf_dtype": int(DTYPE_NAME_TO_VALUE[args.per_token_sf_dtype]),
         "use_deepseek_fp8": args.use_deepseek_fp8,
+        "use_mxfp8_deepseek_fp8": args.use_mxfp8_deepseek_fp8,
         # DeepSeek FP8 will use a single LoadSfAb warp.
         "num_load_sfab_warps": int(args.use_deepseek_fp8 != 0),
         "load_sfab_regs": args.load_sfab_regs,
@@ -1637,6 +1760,11 @@ def reference_check(
         launch_early_exit_max_token_ctas,
     )
     total_padded_tokens = token_layout.total_padded_tokens
+    compact_mxfp8_weight_scales = None
+    compact_mxfp8_activation_scales = None
+    reference_mxfp8_weight_scales = None
+    reference_mxfp8_activation_scales = None
+    reference_activation_sf_layout = None
 
     print(
         f"Reference check: tokens={total_tokens}, padded_tokens={total_padded_tokens}, "
@@ -1829,9 +1957,10 @@ def reference_check(
         # LDGSTS. The loader converts it to the R128c4 SMEM layout consumed by
         # tcgen05_cp.
         activation_sf_layout = cfg.sf_layout_b if cfg.is_swap_ab else cfg.sf_layout_a
+        reference_activation_sf_layout = activation_sf_layout
         weight_sf_layout = cfg.sf_layout_a if cfg.is_swap_ab else cfg.sf_layout_b
 
-        if cfg.act_kind != int(ActKind.NONE):
+        if cfg.act_kind != int(ActKind.NONE) and not cfg.has_mxfp8_backed_dsfp8:
             # Fused-activation runs: Kaiming-init the data in fp32 and then
             # quantize. This keeps GEMM outputs O(1) instead of summing large
             # random products that catastrophically cancel to tiny values
@@ -1877,7 +2006,38 @@ def reference_check(
                 fan_in=in_hidden,
                 device=device,
             )
-            if cfg.has_routed_sfs:
+            if cfg.has_mxfp8_backed_dsfp8:
+                native_activation_rows = (
+                    total_tokens if cfg.has_routed_sfs else total_padded_tokens
+                )
+                native_activation_layout = (
+                    int(SfLayout.LINEAR) if cfg.has_routed_sfs else activation_sf_layout
+                )
+                if cfg.dsfp8_mxfp8_sfb_is_mxfp8:
+                    reference_activation_sf_layout = native_activation_layout
+                (
+                    compact_mxfp8_weight_scales,
+                    compact_mxfp8_activation_scales,
+                ) = _create_mxfp8_deepseek_compact_sf_tensors(
+                    cfg,
+                    num_experts=num_experts,
+                    out_hidden=out_hidden,
+                    in_hidden=in_hidden,
+                    total_padded_tokens=native_activation_rows,
+                    device=device,
+                )
+                reference_mxfp8_weight_scales = _materialize_dsfp8_weight_scales(
+                    compact_mxfp8_weight_scales
+                )
+                reference_mxfp8_activation_scales = (
+                    _materialize_dsfp8_activation_scales(
+                        compact_mxfp8_activation_scales,
+                        layout=native_activation_layout,
+                    )
+                )
+                sf_weights = compact_mxfp8_weight_scales
+                sf_activations = reference_mxfp8_activation_scales
+            elif cfg.has_routed_sfs:
                 # Activation SF = linear, weight SF = R128c4
                 sf_activations = _create_sf_linear(
                     num_tokens=total_tokens,
@@ -1937,16 +2097,19 @@ def reference_check(
         shuffled_weights = shuffle_matrix(preprocessed_weights, cfg.tile_m)
         kernel_a = _block_major_k_weight_tensor(shuffled_weights, cfg)
         kernel_b = activations_torch
-        sf_a = _kernel_weight_sf(
-            sf_weights,
-            cfg=cfg,
-            out_hidden=out_hidden,
-            in_hidden=in_hidden,
-            num_experts=num_experts,
-            is_gated=is_gated,
-            weight_sf_layout=weight_sf_layout,
-            shuffle_for_swap_ab=(not cfg.has_deepseek_fp8),
-        )
+        if cfg.has_mxfp8_backed_dsfp8:
+            sf_a = sf_weights
+        else:
+            sf_a = _kernel_weight_sf(
+                sf_weights,
+                cfg=cfg,
+                out_hidden=out_hidden,
+                in_hidden=in_hidden,
+                num_experts=num_experts,
+                is_gated=is_gated,
+                weight_sf_layout=weight_sf_layout,
+                shuffle_for_swap_ab=(not cfg.has_deepseek_fp8),
+            )
         sf_b = sf_activations
     else:
         M, N, K, L = total_padded_tokens, out_hidden, in_hidden, num_experts
@@ -2111,6 +2274,7 @@ def reference_check(
     )
 
     sf_ab_dtype = _sf_ab_cutlass_dtype(cfg)
+    sfb_dtype = cutlass.Float8E8M0FNU if cfg.dsfp8_mxfp8_sfb_is_mxfp8 else sf_ab_dtype
     sf_c_dtype = _sf_c_cutlass_dtype(cfg)
     if sf_a is not None:
         sfa_dp = make_ptr(
@@ -2120,7 +2284,7 @@ def reference_check(
         sfa_dp = a_dp  # unused
     if sf_b is not None:
         sfb_dp = make_ptr(
-            sf_ab_dtype, sf_b.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
+            sfb_dtype, sf_b.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
         )
     else:
         sfb_dp = b_dp  # unused
@@ -2519,9 +2683,19 @@ def reference_check(
     else:
         weight_dtype_kind = cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind
         activation_dtype_kind = cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind
+        reference_sf_weights = (
+            reference_mxfp8_weight_scales
+            if reference_mxfp8_weight_scales is not None
+            else sf_weights
+        )
+        reference_sf_activations = (
+            reference_mxfp8_activation_scales
+            if reference_mxfp8_activation_scales is not None
+            else sf_activations
+        )
         weights_ref = _dequantize_block_scaled_tensor(
             weights_torch,
-            sf_weights,
+            reference_sf_weights,
             dtype_kind=weight_dtype_kind,
             logical_cols=in_hidden,
             layout=weight_sf_layout,
@@ -2535,14 +2709,18 @@ def reference_check(
             token_idx = token_layout.expanded_to_token[expanded_idx]
             act_row = _dequantize_block_scaled_activation_row(
                 activation_compact_torch,
-                sf_activations,
+                reference_sf_activations,
                 dtype_kind=activation_dtype_kind,
                 logical_cols=in_hidden,
                 token_idx=token_idx,
                 expanded_idx=expanded_idx,
                 expert_idx=expert_idx,
                 cfg=cfg,
-                activation_sf_layout=activation_sf_layout,
+                activation_sf_layout=(
+                    reference_activation_sf_layout
+                    if reference_activation_sf_layout is not None
+                    else activation_sf_layout
+                ),
                 num_experts=num_experts,
                 sf_k=sf_k,
             )
@@ -2808,6 +2986,7 @@ def _build_launch_io(
     gemm1_beta_value=None,
     gemm1_clamp_limit_value=2.0,
     early_exit_max_token_ctas=0,
+    domain_tensor_cache=None,
     **cfg_overrides,
 ):
     """Build all device tensors + pointers for a single kernel launch.
@@ -2830,6 +3009,9 @@ def _build_launch_io(
     torch.manual_seed(seed)
     device = "cuda"
     from cutlass.cute.runtime import make_ptr
+
+    def cached_domain_tensor(key: tuple, factory):
+        return _get_cached_domain_tensor(domain_tensor_cache, seed, key, factory)
 
     # Keep shape semantics aligned with reference_check and generated batch-N
     # kernels: problem_n names the output hidden dimension for both swapAB and
@@ -2859,21 +3041,29 @@ def _build_launch_io(
         launch_early_exit_max_token_ctas,
     )
     total_padded_tokens = token_layout.total_padded_tokens
+    compact_mxfp8_weight_scales = None
+    compact_mxfp8_activation_scales = None
 
     # Create domain tensors. Routed kernels consume compact activation rows;
     # non-routed kernels consume the expanded/padded expert-token layout.
     if cfg.is_bf16_mma:
-        weights_torch = _kaiming_uniform_tensor(
-            (num_experts, out_hidden, in_hidden),
-            fan_in=in_hidden,
-            dtype=torch.bfloat16,
-            device=device,
+        weights_torch = cached_domain_tensor(
+            ("weights", "bf16", num_experts, out_hidden, in_hidden),
+            lambda: _kaiming_uniform_tensor(
+                (num_experts, out_hidden, in_hidden),
+                fan_in=in_hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
         )
-        activation_compact_torch = _kaiming_uniform_tensor(
-            (num_tokens, in_hidden),
-            fan_in=in_hidden,
-            dtype=torch.bfloat16,
-            device=device,
+        activation_compact_torch = cached_domain_tensor(
+            ("activations", "bf16", num_tokens, in_hidden),
+            lambda: _kaiming_uniform_tensor(
+                (num_tokens, in_hidden),
+                fan_in=in_hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
         )
         activations_torch = (
             activation_compact_torch
@@ -2885,17 +3075,29 @@ def _build_launch_io(
         activation_sf_layout = None
         sf_weights = sf_activations = None
     elif cfg.has_cast_a:
-        weights_torch = _random_quantized_tensor(
-            (num_experts, out_hidden, in_hidden),
-            dtype_kind=cfg.dtype_a_kind,
-            fan_in=in_hidden,
-            device=device,
+        weights_torch = cached_domain_tensor(
+            (
+                "weights",
+                int(cfg.dtype_a_kind),
+                num_experts,
+                out_hidden,
+                in_hidden,
+            ),
+            lambda: _random_quantized_tensor(
+                (num_experts, out_hidden, in_hidden),
+                dtype_kind=cfg.dtype_a_kind,
+                fan_in=in_hidden,
+                device=device,
+            ),
         )
-        activation_compact_torch = _kaiming_uniform_tensor(
-            (num_tokens, in_hidden),
-            fan_in=in_hidden,
-            dtype=torch.bfloat16,
-            device=device,
+        activation_compact_torch = cached_domain_tensor(
+            ("activations", "bf16", num_tokens, in_hidden),
+            lambda: _kaiming_uniform_tensor(
+                (num_tokens, in_hidden),
+                fan_in=in_hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
         )
         activations_torch = (
             activation_compact_torch
@@ -2916,17 +3118,31 @@ def _build_launch_io(
         )
         sf_activations = None
     elif cfg.is_fp8_mma:
-        weights_torch = _random_quantized_tensor(
-            (num_experts, out_hidden, in_hidden),
-            dtype_kind=cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind,
-            fan_in=in_hidden,
-            device=device,
+        weight_dtype_kind = cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind
+        activation_dtype_kind = cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind
+        weights_torch = cached_domain_tensor(
+            (
+                "weights",
+                int(weight_dtype_kind),
+                num_experts,
+                out_hidden,
+                in_hidden,
+            ),
+            lambda: _random_quantized_tensor(
+                (num_experts, out_hidden, in_hidden),
+                dtype_kind=weight_dtype_kind,
+                fan_in=in_hidden,
+                device=device,
+            ),
         )
-        activation_compact_torch = _random_quantized_tensor(
-            (num_tokens, in_hidden),
-            dtype_kind=cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind,
-            fan_in=in_hidden,
-            device=device,
+        activation_compact_torch = cached_domain_tensor(
+            ("activations", int(activation_dtype_kind), num_tokens, in_hidden),
+            lambda: _random_quantized_tensor(
+                (num_tokens, in_hidden),
+                dtype_kind=activation_dtype_kind,
+                fan_in=in_hidden,
+                device=device,
+            ),
         )
         activations_torch = (
             activation_compact_torch
@@ -2949,17 +3165,31 @@ def _build_launch_io(
                 device=device,
             )
     else:
-        weights_torch = _random_quantized_tensor(
-            (num_experts, out_hidden, in_hidden),
-            dtype_kind=cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind,
-            fan_in=in_hidden,
-            device=device,
+        weight_dtype_kind = cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind
+        activation_dtype_kind = cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind
+        weights_torch = cached_domain_tensor(
+            (
+                "weights",
+                int(weight_dtype_kind),
+                num_experts,
+                out_hidden,
+                in_hidden,
+            ),
+            lambda: _random_quantized_tensor(
+                (num_experts, out_hidden, in_hidden),
+                dtype_kind=weight_dtype_kind,
+                fan_in=in_hidden,
+                device=device,
+            ),
         )
-        activation_compact_torch = _random_quantized_tensor(
-            (num_tokens, in_hidden),
-            dtype_kind=cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind,
-            fan_in=in_hidden,
-            device=device,
+        activation_compact_torch = cached_domain_tensor(
+            ("activations", int(activation_dtype_kind), num_tokens, in_hidden),
+            lambda: _random_quantized_tensor(
+                (num_tokens, in_hidden),
+                dtype_kind=activation_dtype_kind,
+                fan_in=in_hidden,
+                device=device,
+            ),
         )
         activations_torch = (
             activation_compact_torch
@@ -2970,8 +3200,37 @@ def _build_launch_io(
         b_dtype = _cutlass_data_dtype(cfg.dtype_b_kind)
         sf_k = in_hidden // cfg.sf_vec_size
         activation_sf_layout = cfg.sf_layout_b if cfg.is_swap_ab else cfg.sf_layout_a
+        native_activation_layout = (
+            cfg.dsfp8_mxfp8_native_sfb_layout
+            if cfg.dsfp8_mxfp8_sfb_is_mxfp8
+            else activation_sf_layout
+        )
         weight_sf_layout = cfg.sf_layout_a if cfg.is_swap_ab else cfg.sf_layout_b
-        if cfg.has_routed_sfs:
+        if cfg.has_mxfp8_backed_dsfp8:
+            native_activation_rows = (
+                num_tokens if cfg.has_routed_sfs else total_padded_tokens
+            )
+            (
+                compact_mxfp8_weight_scales,
+                compact_mxfp8_activation_scales,
+            ) = _create_mxfp8_deepseek_compact_sf_tensors(
+                cfg,
+                num_experts=num_experts,
+                out_hidden=out_hidden,
+                in_hidden=in_hidden,
+                total_padded_tokens=native_activation_rows,
+                device=device,
+            )
+            if cfg.dsfp8_mxfp8_sfb_is_mxfp8:
+                sf_activations = _materialize_dsfp8_activation_scales(
+                    compact_mxfp8_activation_scales,
+                    layout=native_activation_layout,
+                )
+                sf_weights = compact_mxfp8_weight_scales
+            else:
+                sf_weights = compact_mxfp8_weight_scales
+                sf_activations = compact_mxfp8_activation_scales
+        elif cfg.has_routed_sfs:
             sf_activations = _create_sf_linear(
                 num_tokens=num_tokens,
                 sf_k_dim=sf_k,
@@ -3016,16 +3275,19 @@ def _build_launch_io(
             cfg,
         )
         kernel_b = activations_torch
-        sf_a = _kernel_weight_sf(
-            sf_weights,
-            cfg=cfg,
-            out_hidden=out_hidden,
-            in_hidden=in_hidden,
-            num_experts=num_experts,
-            is_gated=is_gated,
-            weight_sf_layout=weight_sf_layout,
-            shuffle_for_swap_ab=(not cfg.has_deepseek_fp8),
-        )
+        if cfg.has_mxfp8_backed_dsfp8:
+            sf_a = sf_weights
+        else:
+            sf_a = _kernel_weight_sf(
+                sf_weights,
+                cfg=cfg,
+                out_hidden=out_hidden,
+                in_hidden=in_hidden,
+                num_experts=num_experts,
+                is_gated=is_gated,
+                weight_sf_layout=weight_sf_layout,
+                shuffle_for_swap_ab=(not cfg.has_deepseek_fp8),
+            )
         sf_b = sf_activations
     else:
         M, N, K, L = total_padded_tokens, out_hidden, in_hidden, num_experts
@@ -3128,6 +3390,7 @@ def _build_launch_io(
         b_dtype, kernel_b.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
     )
     sf_ab_dtype = _sf_ab_cutlass_dtype(cfg)
+    sfb_dtype = cutlass.Float8E8M0FNU if cfg.dsfp8_mxfp8_sfb_is_mxfp8 else sf_ab_dtype
     if sf_a is not None:
         sfa_dp = make_ptr(
             sf_ab_dtype, sf_a.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
@@ -3136,7 +3399,7 @@ def _build_launch_io(
         sfa_dp = a_dp
     if sf_b is not None:
         sfb_dp = make_ptr(
-            sf_ab_dtype, sf_b.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
+            sfb_dtype, sf_b.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
         )
     else:
         sfb_dp = b_dp
@@ -3313,6 +3576,8 @@ def _build_launch_io(
             per_token_sf_b_torch,
             num_non_exiting_ctas,
             total_num_padded_tokens_torch,
+            compact_mxfp8_weight_scales,
+            compact_mxfp8_activation_scales,
         )
         if tensor is not None
     ]
@@ -3352,6 +3617,8 @@ def _build_launch_io(
         "gemm1_beta_dp": gemm1_beta_dp,
         "gemm1_clamp_limit_dp": gemm1_clamp_limit_dp,
         "sf_c_torch": sf_c_torch,
+        "compact_mxfp8_weight_scales": compact_mxfp8_weight_scales,
+        "compact_mxfp8_activation_scales": compact_mxfp8_activation_scales,
         "_keepalive": _keepalive,
     }
 
@@ -3533,6 +3800,125 @@ def FLOPS_FORMULA(
     return 2.0 * num_tokens * top_k * n * k
 
 
+def _rotated_workspace_nbytes(
+    cfg,
+    logical_output_m: int,
+    logical_output_n: int,
+    sf_c_numel: int,
+    expanded_activation_scale_numel: int,
+) -> int:
+    """Return bytes allocated anew by one benchmark workspace.
+
+    Inputs and weights are shared by every invocation of ``generate_tensors``.
+    Including those fixed allocations here can collapse cold-L2 rotation to a
+    single workspace for large MoE weights, even though each workspace actually
+    owns only its output and optional activation-scale expansion buffer.
+    """
+    output_numel = (
+        _quantized_c_numel(cfg, logical_output_m, logical_output_n)
+        if cfg.has_epilogue_quant
+        else logical_output_m * logical_output_n
+    )
+    output_elem_bytes = 1 if (cfg.has_epilogue_quant or cfg.uses_fp8_output) else 2
+    return (
+        output_numel * output_elem_bytes
+        + (sf_c_numel if cfg.has_epilogue_quant else 0)
+        + expanded_activation_scale_numel
+    )
+
+
+def _benchmark_cache_key(
+    *,
+    num_experts: int,
+    num_tokens: int,
+    top_k: int,
+    problem_n: int | None,
+    problem_k: int | None,
+    seed: int,
+    scale_c_value: float,
+    scale_gate_value: float,
+    gemm1_alpha_value: float | None,
+    gemm1_beta_value: float | None,
+    gemm1_clamp_limit_value: float,
+    early_exit_max_token_ctas: int,
+    cfg_overrides: dict,
+) -> tuple:
+    """Build the stable key for opt-in benchmark preparation reuse."""
+    return (
+        num_experts,
+        num_tokens,
+        top_k,
+        problem_n,
+        problem_k,
+        seed,
+        scale_c_value,
+        scale_gate_value,
+        gemm1_alpha_value,
+        gemm1_beta_value,
+        gemm1_clamp_limit_value,
+        early_exit_max_token_ctas,
+        tuple(sorted(cfg_overrides.items())),
+    )
+
+
+def _get_cached_domain_tensor(cache, seed: int, key: tuple, factory):
+    """Return a cached deterministic input tensor, or construct it once."""
+    if cache is None:
+        return factory()
+    cache_key = (seed, *key)
+    if cache_key not in cache:
+        cache[cache_key] = factory()
+    return cache[cache_key]
+
+
+def _kernel_weight_cache_key(
+    *,
+    dtype_kind,
+    num_experts: int,
+    out_hidden: int,
+    in_hidden: int,
+    tile_m: int,
+    is_gated: bool,
+) -> tuple:
+    """Key a derived swap-AB weight tensor after row preprocessing/shuffle."""
+    return (
+        "kernel_weights",
+        dtype_kind,
+        num_experts,
+        out_hidden,
+        in_hidden,
+        tile_m,
+        is_gated,
+    )
+
+
+def _kernel_weight_sf_cache_key(
+    *,
+    dtype_kind,
+    num_experts: int,
+    out_hidden: int,
+    in_hidden: int,
+    tile_m: int,
+    is_gated: bool,
+    weight_sf_layout: int,
+    sf_vec_size: int,
+    scale_source: str,
+) -> tuple:
+    """Key a derived swap-AB weight-scale tensor after row permutation."""
+    return (
+        "kernel_weight_scales",
+        dtype_kind,
+        num_experts,
+        out_hidden,
+        in_hidden,
+        tile_m,
+        is_gated,
+        weight_sf_layout,
+        sf_vec_size,
+        scale_source,
+    )
+
+
 def benchmark(
     *,
     num_experts,
@@ -3550,12 +3936,23 @@ def benchmark(
     bench_iters=50,
     num_rotated_buffers=None,
     cuda_profiler_range=False,
+    benchmark_cache=None,
+    domain_tensor_cache=None,
     early_exit_max_token_ctas=0,
     use_cuda_graphs=True,
     **cfg_overrides,
 ):
-    """Benchmark the kernel using CUDA graph capture + replay."""
-    io = _build_launch_io(
+    """Benchmark the kernel using CUDA graph capture + replay.
+
+    ``benchmark_cache`` is an optional caller-owned dictionary that reuses
+    prepared inputs and compiled functions across repeated measurements of the
+    same shape and configuration. It is intended for alternating finalist
+    rounds; the default preserves one-shot benchmark lifetime behavior.
+    ``domain_tensor_cache`` separately reuses large deterministic input tensors
+    across different schedule configurations without retaining their compiled
+    functions or output workspaces.
+    """
+    cache_key = _benchmark_cache_key(
         num_experts=num_experts,
         num_tokens=num_tokens,
         top_k=top_k,
@@ -3568,37 +3965,41 @@ def benchmark(
         gemm1_beta_value=gemm1_beta_value,
         gemm1_clamp_limit_value=gemm1_clamp_limit_value,
         early_exit_max_token_ctas=early_exit_max_token_ctas,
-        **cfg_overrides,
+        cfg_overrides=cfg_overrides,
     )
+    session = benchmark_cache.get(cache_key) if benchmark_cache is not None else None
+    if session is None:
+        io = _build_launch_io(
+            num_experts=num_experts,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            problem_n=problem_n,
+            problem_k=problem_k,
+            seed=seed,
+            scale_c_value=scale_c_value,
+            scale_gate_value=scale_gate_value,
+            gemm1_alpha_value=gemm1_alpha_value,
+            gemm1_beta_value=gemm1_beta_value,
+            gemm1_clamp_limit_value=gemm1_clamp_limit_value,
+            early_exit_max_token_ctas=early_exit_max_token_ctas,
+            domain_tensor_cache=domain_tensor_cache,
+            **cfg_overrides,
+        )
+        if benchmark_cache is not None:
+            session = {"io": io}
+            benchmark_cache[cache_key] = session
+    else:
+        io = session["io"]
     cfg = io["cfg"]
     M, N, K, L = io["M"], io["N"], io["K"], io["L"]
     num_tokens = io["num_tokens"]
     total_padded_tokens = io["total_padded_tokens"]
-    out_hidden, in_hidden = io["out_hidden"], io["in_hidden"]
     logical_output_m = io["logical_output_m"]
     logical_output_n = io["logical_output_n"]
     plain_output_dtype = io["plain_output_dtype"]
-    a_dp = io["a_dp"]
-    b_dp = io["b_dp"]
     sfa_dp = io["sfa_dp"]
     sfb_dp = io["sfb_dp"]
     sf_c_dp = io["sf_c_dp"]
-    tile_idx_dp = io["tile_idx_dp"]
-    route_map_dp = io["route_map_dp"]
-    mn_limit_dp = io["mn_limit_dp"]
-    num_non_exiting_ctas_dp = io["num_non_exiting_ctas_dp"]
-    total_num_padded_tokens_dp = io.get(
-        "total_num_padded_tokens_dp", num_non_exiting_ctas_dp
-    )
-    act_dp = io["act_dp"]
-    per_token_sf_a_dp = io["per_token_sf_a_dp"]
-    per_token_sf_b_dp = io["per_token_sf_b_dp"]
-    bias_dp = io["bias_dp"]
-    scale_c_dp = io["scale_c_dp"]
-    scale_gate_dp = io["scale_gate_dp"]
-    gemm1_alpha_dp = io["gemm1_alpha_dp"]
-    gemm1_beta_dp = io["gemm1_beta_dp"]
-    gemm1_clamp_limit_dp = io["gemm1_clamp_limit_dp"]
     sf_c_torch = io["sf_c_torch"]
     # Pin the domain tensors alive for the whole benchmark (pointers alias them).
     _io_keepalive = io["_keepalive"]
@@ -3620,10 +4021,20 @@ def benchmark(
         f"scheduler={'persistent' if cfg.is_persistent else 'static'}, "
         f"swap_ab={cfg.is_swap_ab}"
     )
-    compiled_fn = _compile_for_launch(io, stream)
+    if session is not None and "compiled_fn" in session:
+        compiled_fn = session["compiled_fn"]
+    else:
+        compiled_fn = _compile_for_launch(io, stream)
+        if session is not None:
+            session["compiled_fn"] = compiled_fn
+
+    def timed_callable(*args):
+        compiled_fn(*args)
 
     # Build workspace generator for cold-L2 / rotated buffers
     def generate_tensors():
+        rotated_sfa_dp = sfa_dp
+        rotated_sfb_dp = sfb_dp
         if cfg.has_epilogue_quant or cfg.uses_fp8_output:
             c_buf = torch.zeros(
                 (
@@ -3667,59 +4078,26 @@ def benchmark(
             )
             sf_c_buf = sf_c_torch
             sf_c_ptr = sf_c_dp
-        args = testing.JitArguments(
-            a_dp,
-            b_dp,
-            sfa_dp,
-            sfb_dp,
-            c_ptr,
-            sf_c_ptr,
-            tile_idx_dp,
-            route_map_dp,
-            mn_limit_dp,
-            num_non_exiting_ctas_dp,
-            total_num_padded_tokens_dp,
-            act_dp,
-            per_token_sf_a_dp,
-            per_token_sf_b_dp,
-            bias_dp,
-            scale_c_dp,
-            scale_gate_dp,
-            gemm1_alpha_dp,
-            gemm1_beta_dp,
-            gemm1_clamp_limit_dp,
-            (M, N, K, L, num_tokens),
-            io["launch_early_exit_max_token_ctas"],
-            stream,
-        )
+        rotated_io = {
+            **io,
+            "sfa_dp": rotated_sfa_dp,
+            "sfb_dp": rotated_sfb_dp,
+            "c0_dp": c_ptr,
+            "sf_c_dp": sf_c_ptr,
+        }
+        args = testing.JitArguments(*_launch_arg_tuple(rotated_io, stream))
         args.add_to_scope([c_buf, sf_c_buf])
         return args
 
-    # Compute workspace count for cold L2
-    if cfg.is_bf16_mma or cfg.has_cast_a:
-        ab_elem_bytes = 2
-    elif cfg.is_fp8_mma:
-        ab_elem_bytes = 1
-    else:
-        ab_elem_bytes = 0.5
-    one_workspace_bytes = (
-        int(num_experts * out_hidden * in_hidden * ab_elem_bytes)
-        + int(num_tokens * in_hidden * ab_elem_bytes)
-        + (
-            logical_output_m * logical_output_n
-            if (cfg.has_epilogue_quant or cfg.uses_fp8_output)
-            else logical_output_m * logical_output_n * 2
-        )
-        + (
-            _sf_c_numel(
-                logical_output_m,
-                logical_output_n,
-                cfg.sf_layout_c,
-                cfg.output_sf_block_size_c,
-            )
-            if cfg.has_epilogue_quant
-            else 0
-        )
+    # Compute workspace count from allocations that generate_tensors() actually
+    # rotates. Inputs and expert weights are fixed and must not suppress output
+    # rotation merely because they are large.
+    one_workspace_bytes = _rotated_workspace_nbytes(
+        cfg,
+        logical_output_m,
+        logical_output_n,
+        sf_c_torch.numel(),
+        0,
     )
     workspace_count = testing.get_workspace_count(
         one_workspace_bytes,
@@ -3733,13 +4111,16 @@ def benchmark(
         workspace_count = (
             1 if num_rotated_buffers <= 0 else min(workspace_count, num_rotated_buffers)
         )
+    print(
+        f"  Rotated workspace: {one_workspace_bytes} bytes x {workspace_count} buffers"
+    )
 
     if cuda_profiler_range:
         torch.cuda.synchronize()
         torch.cuda.cudart().cudaProfilerStart()
     try:
         exec_time = testing.benchmark(
-            compiled_fn,
+            timed_callable,
             workspace_generator=generate_tensors,
             workspace_count=workspace_count,
             stream=stream,
@@ -3754,10 +4135,11 @@ def benchmark(
     # Match the reference-check path: clustered persistent kernels are sensitive
     # to compiled CUDA library lifetime if unload overlaps the next compile or
     # launch in the same process.
-    del compiled_fn
-    gc.collect()
+    if session is None:
+        del compiled_fn
+        gc.collect()
 
-    print(f"  Average kernel time: {exec_time:.1f} µs ({exec_time / 1000:.4f} ms)")
+    print(f"  Average kernel time: {exec_time:.1f} us ({exec_time / 1000:.4f} ms)")
     return exec_time
 
 
@@ -3916,6 +4298,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
     )
     parser.add_argument("--use-deepseek-fp8", type=int, default=0)
+    parser.add_argument("--use-mxfp8-deepseek-fp8", type=int, default=0)
     parser.add_argument("--load-sfab-regs", type=int, default=48)
     parser.add_argument("--bias-type", type=int, default=0)
     parser.add_argument("--has-gemm1-alpha", type=int, choices=[0, 1], default=0)

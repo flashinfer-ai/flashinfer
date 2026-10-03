@@ -214,8 +214,21 @@ consumer task, shown as *— (terminal)*.
 | `WorkThrottleBarrierResource` | load tasks | load tasks | per-work-tile load throttle for clustered persistent kernels. |
 | `ProxyClusterBarrierResource` | cluster | cluster | cross-CTA readiness signaling for `cluster_m == 2`. |
 | `TmemCResource` | `MmaTask0` | `EpilogueTask0` | FP32 C accumulator, produced by the tensor cores and consumed by LDTM loading from TMEM to registers (`num_stages_tmem_acc` stages). |
-| `TmemSfAResource` / `TmemSfBResource` / `TmemSfABResource` | `CopySf*Task` | `MmaTask0` | Per-operand / merged block scale factors in TMEM, copied to TMEM using STTM or UTCCP in the producer work. |
-| `TmemSfRouteAResource` / `TmemSfRouteBResource` | `CopySfAbTask` | `MmaTask0` | Routed (low-N) scale factors in TMEM, copied to TMEM using STTM in the producer work. |
+| `TmemSfAResource` / `TmemSfBResource` / `TmemSfABResource` | `CopySf*Task` | `MmaTask0` | Per-operand / merged block scale factors in TMEM, copied using STTM or UTCCP. |
+| `TmemSfRouteAResource` / `TmemSfRouteBResource` | `CopySfA/BTask` | `MmaTask0` | Routed or staged scale factors in TMEM, copied with four-warp STTM producer work. |
+| `SmemDsFp8MxFp8SfAResource` / `SmemDsFp8MxFp8SfBResource` | `LoadSfA/BTask` | `CopySfA/BTask` | One warp per operand stages generated-layout scales: checkpoint-weight SFA converts compact FP32 K128x128 to four UE8M0 K32 slots, while activation SFB loads four native UE8M0 K32 bytes. FC1 reads token-major LINEAR input; the staged output is R8c4 or R128c4 according to tile N. |
+
+### MXFP8-backed DeepSeek FP8 contract
+
+The explicit `use_mxfp8_backed_dsfp8` MoE recipe uses DeepSeek checkpoint
+weights but native MXFP8 activation operands for both GEMMs. Runtime activation
+quantization produces E4M3 data and UE8M0 K32 scales before FC1; fused SwiGLU
+does the same for the FC1 output consumed by FC2. Checkpoint weight scales stay
+FP32 K128x128 and are converted while loading into SMEM, then copied to TMEM.
+Thus each GEMM
+loads FP32 weight SFA and native-UE8M0 activation SFB; true DSFP8 remains
+unchanged. FC1 and FC2 are selected as one same-tile-N tactic because their
+routing metadata is shared.
 | `TmemCastAResource` | `CastATask` | `MmaTask0` | Producer work casts MXFP4 to BF16 and copies it to TMEM. |
 
 Tasks (see `batched_gemm_tasks.py`). The warp counts, warp indices, and register

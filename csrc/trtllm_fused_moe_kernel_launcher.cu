@@ -2466,13 +2466,14 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
       TensorView const& hidden_states, TensorView const& hidden_states_scale,
       TensorView const& gemm1_weights, TensorView const& gemm1_weights_scale,
       TensorView const& gemm2_weights, TensorView const& gemm2_weights_scale,
-      Fp8QuantizationType quantization_type)
+      Fp8QuantizationType quantization_type, bool deepseek_activation_output_mxfp8)
       : StagedMoeLauncher(routing_logits, routing_bias, expert_indices, expert_weights,
                           hidden_states, gemm1_weights, gemm2_weights),
         hidden_states_scale(hidden_states_scale),
         gemm1_weights_scale(gemm1_weights_scale),
         gemm2_weights_scale(gemm2_weights_scale),
-        quantization_type(quantization_type) {}
+        quantization_type(quantization_type),
+        deepseek_activation_output_mxfp8(deepseek_activation_output_mxfp8) {}
 
   DLDataType gemm_buffer_dtype() const override { return dl_uint8; }
 
@@ -2560,14 +2561,23 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
 
     int64_t const totalLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
-      TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_float32)
-          << "Staged DeepSeek FP8 MoE: hidden_states_scale must be float32.";
       TVM_FFI_ICHECK_EQ(hidden_states_scale.ndim(), 2)
           << "Staged DeepSeek FP8 MoE: hidden_states_scale must be 2D.";
-      TVM_FFI_ICHECK_EQ(hidden_states_scale.size(0), args->hidden_size / 128)
-          << "Staged DeepSeek FP8 MoE: hidden_states_scale dim0 must be hidden_size / 128.";
-      TVM_FFI_ICHECK_EQ(hidden_states_scale.size(1), args->num_tokens)
-          << "Staged DeepSeek FP8 MoE: hidden_states_scale dim1 must be num_tokens.";
+      if (deepseek_activation_output_mxfp8) {
+        TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_uint8)
+            << "Staged MXFP8-backed DeepSeek MoE: hidden_states_scale must be uint8.";
+        TVM_FFI_ICHECK_EQ(hidden_states_scale.size(0), args->num_tokens)
+            << "Staged MXFP8-backed DeepSeek MoE: hidden_states_scale dim0 must be num_tokens.";
+        TVM_FFI_ICHECK_GE(hidden_states_scale.size(1), args->hidden_size / 32)
+            << "Staged MXFP8-backed DeepSeek MoE: hidden_states_scale dim1 is too small.";
+      } else {
+        TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_float32)
+            << "Staged DeepSeek FP8 MoE: hidden_states_scale must be float32.";
+        TVM_FFI_ICHECK_EQ(hidden_states_scale.size(0), args->hidden_size / 128)
+            << "Staged DeepSeek FP8 MoE: hidden_states_scale dim0 must be hidden_size / 128.";
+        TVM_FFI_ICHECK_EQ(hidden_states_scale.size(1), args->num_tokens)
+            << "Staged DeepSeek FP8 MoE: hidden_states_scale dim1 must be num_tokens.";
+      }
       TVM_FFI_ICHECK_EQ(gemm1_weights_scale.dtype(), dl_float32)
           << "Staged DeepSeek FP8 MoE: gemm1_weights_scale must be float32.";
       TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_float32)
@@ -2612,12 +2622,15 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
             workspace.total_max_padded_tokens, args->hidden_size,
             btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
 
-    auto const gemm1_output_hidden = quantization_type == Fp8QuantizationType::DeepSeekFp8
-                                         ? intermediate_size_factor * args->intermediate_size
-                                         : args->intermediate_size;
+    bool const fused_native_fc1 =
+        quantization_type == Fp8QuantizationType::DeepSeekFp8 && deepseek_activation_output_mxfp8;
+    auto const gemm1_output_hidden =
+        quantization_type == Fp8QuantizationType::DeepSeekFp8 && !fused_native_fc1
+            ? intermediate_size_factor * args->intermediate_size
+            : args->intermediate_size;
     gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
                                 hidden_states.device());
-    if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
+    if (quantization_type == Fp8QuantizationType::DeepSeekFp8 && !fused_native_fc1) {
       gemm1_output_scale =
           alloc_tensor({gemm1_output_hidden / 128, workspace.total_max_padded_tokens}, dl_float32,
                        hidden_states.device());
@@ -2636,12 +2649,14 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
-    workspace.gemm1_output_scale = quantization_type == Fp8QuantizationType::DeepSeekFp8
-                                       ? static_cast<float*>(gemm1_output_scale.data_ptr())
-                                       : reinterpret_cast<float*>(gemm1_output_scale.data_ptr());
-    if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
+    workspace.gemm1_output_scale =
+        quantization_type == Fp8QuantizationType::DeepSeekFp8 && !fused_native_fc1
+            ? static_cast<float*>(gemm1_output_scale.data_ptr())
+            : reinterpret_cast<float*>(gemm1_output_scale.data_ptr());
+    if (quantization_type == Fp8QuantizationType::DeepSeekFp8 && !fused_native_fc1) {
       workspace.activation_output = activation_output.data_ptr();
-      workspace.activation_output_scale = static_cast<float*>(activation_output_scale.data_ptr());
+      workspace.activation_output_scale =
+          reinterpret_cast<float*>(activation_output_scale.data_ptr());
     } else {
       workspace.activation_output = gemm1_output.data_ptr();
       workspace.activation_output_scale = reinterpret_cast<float*>(gemm1_output_scale.data_ptr());
@@ -2661,10 +2676,14 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
     result.push_back(total_num_padded_tokens);
     result.push_back(gemm1_output);
     result.push_back(gemm1_output_scale);
-    result.push_back(quantization_type == Fp8QuantizationType::DeepSeekFp8 ? activation_output
-                                                                           : gemm1_output);
-    result.push_back(quantization_type == Fp8QuantizationType::DeepSeekFp8 ? activation_output_scale
-                                                                           : gemm1_output_scale);
+    bool const fused_native_fc1 =
+        quantization_type == Fp8QuantizationType::DeepSeekFp8 && deepseek_activation_output_mxfp8;
+    result.push_back(quantization_type == Fp8QuantizationType::DeepSeekFp8 && !fused_native_fc1
+                         ? activation_output
+                         : gemm1_output);
+    result.push_back(quantization_type == Fp8QuantizationType::DeepSeekFp8 && !fused_native_fc1
+                         ? activation_output_scale
+                         : gemm1_output_scale);
     result.push_back(gemm2_output);
     return result;
   }
@@ -2676,6 +2695,7 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
   Tensor gemm1_output_scale;
   Tensor activation_output_scale;
   Fp8QuantizationType quantization_type;
+  bool deepseek_activation_output_mxfp8;
 
  protected:
   DLDataType expert_weight_storage_dtype() const override { return dl_bfloat16; }
@@ -2957,7 +2977,8 @@ std::unique_ptr<Fp8BlockScaleStagedMoeLauncher> make_fp8_block_scale_staged_laun
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     Optional<double> routed_scaling_factor, int64_t routing_method_type, int64_t tile_tokens_dim,
     int64_t weight_layout, int64_t activation_type, Fp8QuantizationType quantization_type,
-    bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    bool deepseek_activation_output_mxfp8) {
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
   auto const activation = validateAndCastActivationType(activation_type);
@@ -2983,7 +3004,7 @@ std::unique_ptr<Fp8BlockScaleStagedMoeLauncher> make_fp8_block_scale_staged_laun
   auto launcher = std::make_unique<Fp8BlockScaleStagedMoeLauncher>(
       routing_logits, routing_bias, expert_indices, expert_weights, hidden_states,
       hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
-      quantization_type);
+      quantization_type, deepseek_activation_output_mxfp8);
   launcher->init(std::move(args), tile_tokens_dim, routing_method_type,
                  /*use_shuffled_weight=*/true, weight_layout, activation,
                  static_cast<int64_t>(batchedGemm::gemm::BiasType::None), norm_topk_prob);
@@ -3299,7 +3320,8 @@ Array<Tensor> trtllm_moe_run_routing_fp8_block_scale(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool enable_pdl,
     Array<int64_t> moe_tactic, int64_t weight_layout, int64_t activation_type,
-    int64_t fp8_quantization_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    int64_t fp8_quantization_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    bool deepseek_activation_output_mxfp8) {
   auto const quantization_type = static_cast<Fp8QuantizationType>(fp8_quantization_type);
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn)
       << "Staged FP8 block-scale MoE routing: hidden_states must be float8_e4m3fn.";
@@ -3314,7 +3336,7 @@ Array<Tensor> trtllm_moe_run_routing_fp8_block_scale(
 
   auto const num_tokens = hidden_states.size(0);
   std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128};
-  if (quantization_type == Fp8QuantizationType::MxFp8) {
+  if (quantization_type == Fp8QuantizationType::MxFp8 || deepseek_activation_output_mxfp8) {
     supported_tile_nums.push_back(256);
   }
   auto const [tile_N, config] = resolveMoeTileAndConfig(moe_tactic, supported_tile_nums, num_tokens,
@@ -3326,7 +3348,8 @@ Array<Tensor> trtllm_moe_run_routing_fp8_block_scale(
       hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
       num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset,
       local_num_experts, routed_scaling_factor, routing_method_type, tile_N, weight_layout,
-      activation_type, quantization_type, norm_topk_prob, routing_replay_out);
+      activation_type, quantization_type, norm_topk_prob, routing_replay_out,
+      deepseek_activation_output_mxfp8);
 
   launcher->check_routing();
   launcher->prepare_routing();
