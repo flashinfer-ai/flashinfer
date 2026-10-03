@@ -83,8 +83,12 @@ def gen_moe_utils_module() -> JitSpec:
     # SM90 is included for the Hopper CuTe-DSL MoE path: every kernel in this
     # module only requires __CUDA_ARCH__ >= 900 (PDL guards), and moe_sort's
     # routing kernels are documented as SM90+ (grid-sync).
+    # SM121 (DGX Spark GB10, compute_121a) is a major-12 device: the [9, 10]
+    # filter emptied its arch list and aborted JIT builds with "No supported
+    # CUDA architectures found for major versions [9, 10]". Same SM90+
+    # requirement, so major 12 is safe here.
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10], map_sm107_to_100f=True
+        supported_major_versions=[9, 10, 12], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(
