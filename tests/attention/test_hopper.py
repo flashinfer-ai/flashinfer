@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import pytest
 import torch
 from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
@@ -548,6 +550,196 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
 
     torch.testing.assert_close(lse_fa2, lse_fa3, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page_size", [None, 1, 16])
+@pytest.mark.parametrize(
+    "qo_lens,kv_lens,num_qo_heads,num_kv_heads,dtype,always_split",
+    [
+        # Short query chunk against a long prefix with few heads (tensor parallel).
+        ([512], [16384], 8, 1, torch.half, True),
+        # Mixed batch: short requests next to a long one, including single-token rows.
+        ([1, 37, 300, 129], [4000, 777, 9000, 129], 8, 2, torch.half, True),
+        # Enough heads that the merge cannot put all heads of a row in one block.
+        ([256], [16384], 96, 8, torch.bfloat16, True),
+        # Several works per CTA, with empty causal chunks next to full ones.
+        ([9999], [9999], 4, 4, torch.half, False),
+    ],
+)
+def test_batch_prefill_split_kv(
+    head_dim,
+    causal,
+    page_size,
+    qo_lens,
+    kv_lens,
+    num_qo_heads,
+    num_kv_heads,
+    dtype,
+    always_split,
+):
+    """FA3 splits the KV range when the unsplit plan leaves SMs idle."""
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+    torch.random.manual_seed(42)
+    qo_indptr = torch.tensor([0] + qo_lens, dtype=torch.int32).cumsum(0).int()
+    q = torch.randn(qo_indptr[-1].item(), num_qo_heads, head_dim, dtype=dtype).cuda()
+    if page_size is None:
+        kv_indptr = torch.tensor([0] + kv_lens, dtype=torch.int32).cumsum(0).int()
+        k = torch.randn(kv_indptr[-1].item(), num_kv_heads, head_dim, dtype=dtype)
+        v = torch.randn(kv_indptr[-1].item(), num_kv_heads, head_dim, dtype=dtype)
+        kv_args = (k.cuda(), v.cuda())
+    else:
+        num_pages = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+        kv_indptr = torch.tensor([0] + num_pages, dtype=torch.int32).cumsum(0).int()
+        kv_indices = torch.randperm(kv_indptr[-1].item()).int()
+        last_page_len = torch.tensor(
+            [
+                kv_len - (n - 1) * page_size
+                for kv_len, n in zip(kv_lens, num_pages, strict=True)
+            ],
+            dtype=torch.int32,
+        )
+        shape = (kv_indptr[-1].item(), page_size, num_kv_heads, head_dim)
+        kv_args = (
+            (
+                torch.randn(shape, dtype=dtype).cuda(),
+                torch.randn(shape, dtype=dtype).cuda(),
+            ),
+        )
+
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    outputs = {}
+    for backend, disable_split_kv in [("fa2", False), ("fa3", True), ("fa3", False)]:
+        if page_size is None:
+            wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                workspace_buffer, backend=backend
+            )
+            wrapper.plan(
+                qo_indptr,
+                kv_indptr,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                causal=causal,
+                q_data_type=dtype,
+                disable_split_kv=disable_split_kv,
+            )
+        else:
+            wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer, backend=backend
+            )
+            wrapper.plan(
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                causal=causal,
+                q_data_type=dtype,
+                disable_split_kv=disable_split_kv,
+            )
+        if backend == "fa3":
+            # Entry 9 of the SM90 plan info is the number of KV chunks.
+            num_kv_chunks = wrapper._plan_info[9]
+            if disable_split_kv:
+                assert num_kv_chunks == 1
+            elif always_split:
+                assert num_kv_chunks > 1
+        outputs[(backend, disable_split_kv)] = wrapper.run(q, *kv_args, return_lse=True)
+
+    o_fa2, lse_fa2 = outputs[("fa2", False)]
+    o_unsplit, lse_unsplit = outputs[("fa3", True)]
+    o_split, lse_split = outputs[("fa3", False)]
+    # The partial outputs are rounded to the output dtype before the merge.
+    tol = 2e-3 if dtype == torch.half else 1e-2
+    torch.testing.assert_close(lse_split, lse_unsplit, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o_split, o_unsplit, rtol=tol, atol=tol)
+    torch.testing.assert_close(lse_split, lse_fa2, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o_split, o_fa2, rtol=tol, atol=tol)
+
+
+def test_batch_ragged_prefill_causal_kv_shorter_than_qo():
+    """Query tiles with no visible keys must not overwrite the LSE of the next tile."""
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+    torch.random.manual_seed(42)
+    qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim = 3000, 1000, 32, 8, 128
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        backend="fa3",
+    )
+    wrapper.plan(
+        torch.tensor([0, qo_len], dtype=torch.int32),
+        torch.tensor([0, kv_len], dtype=torch.int32),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=True,
+        q_data_type=torch.bfloat16,
+    )
+    lse = wrapper.run(q, k, v, return_lse=True)[1]
+    # Rows before qo_len - kv_len see no keys; compare the rows that do (base-2 LSE).
+    first_row = qo_len - kv_len
+    k_rep = k.float().repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q[first_row:].float(), k_rep) / head_dim**0.5
+    rows = torch.arange(kv_len, device="cuda")
+    scores.masked_fill_(rows[None, None, :] > rows[None, :, None], float("-inf"))
+    lse_ref = (torch.logsumexp(scores, dim=-1) / math.log(2)).transpose(0, 1)
+    assert torch.isneginf(lse[:first_row]).all()
+    torch.testing.assert_close(lse[first_row:], lse_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_batch_prefill_split_kv_strided_out():
+    """A split-KV FA3 run writes a strided `out` through a contiguous staging buffer."""
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+    torch.random.manual_seed(42)
+    qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, page_size = (
+        512,
+        16384,
+        8,
+        1,
+        128,
+        16,
+    )
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda")
+    num_pages = kv_len // page_size
+    shape = (num_pages, page_size, num_kv_heads, head_dim)
+    kv = (
+        torch.randn(shape, dtype=torch.half, device="cuda"),
+        torch.randn(shape, dtype=torch.half, device="cuda"),
+    )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        backend="fa3",
+    )
+    wrapper.plan(
+        torch.tensor([0, qo_len], dtype=torch.int32),
+        torch.tensor([0, num_pages], dtype=torch.int32),
+        torch.arange(num_pages, dtype=torch.int32),
+        torch.tensor([page_size], dtype=torch.int32),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+    )
+    assert wrapper._plan_info[9] > 1
+    out_buffer = torch.zeros(
+        qo_len, num_qo_heads, 2 * head_dim, dtype=torch.half, device="cuda"
+    )
+    out = out_buffer[..., :head_dim]
+    wrapper.run(q, kv, out=out)
+    torch.testing.assert_close(out, wrapper.run(q, kv), rtol=0, atol=0)
+    assert out_buffer[..., head_dim:].count_nonzero() == 0
 
 
 if __name__ == "__main__":

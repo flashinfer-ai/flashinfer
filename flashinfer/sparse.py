@@ -1310,6 +1310,9 @@ class BlockSparseAttentionWrapper:
                 args.append(False)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
+            else:
+                # FA3 split-KV is not wired into the block-sparse wrappers.
+                args.append(True)  # disable_split_kv
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -2043,6 +2046,9 @@ class VariableBlockSparseAttentionWrapper:
             args.append(False)  # disable_split_kv
             args.append(0)  # num_colocated_ctas
             args.append(0)  # uniform_q_len
+        else:
+            # FA3 split-KV is not wired into the block-sparse wrappers.
+            args.append(True)  # disable_split_kv
         self._plan_info = self._cached_module.plan(
             *args,
         )

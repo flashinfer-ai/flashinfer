@@ -151,14 +151,15 @@ struct CollectiveMainloop {
     return num_kv_tiles;
   }
 
-  template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
-            typename SharedStorage>
+  template <bool LEFT_SLIDING_WINDOW, bool SPLIT_KV = false, typename BlockCoord,
+            typename Scheduler, typename SharedStorage>
   CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
                            MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_k,
                            PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
                            Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
                            typename Scheduler::WorkTileInfo& work_tile_info,
-                           BlockCoord const& block_coord, int work_idx) {
+                           BlockCoord const& block_coord, int work_idx, int kv_tile_begin = 0,
+                           int kv_tile_end = -1) {
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
@@ -191,12 +192,17 @@ struct CollectiveMainloop {
                       group_modes<0, 2>(gV));  // (TMA, k), (TMA, PIPE)
 
     int num_kv_tiles = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
-    int kv_tile_idx = num_kv_tiles - 1;
     int swa_begin_kv_tile_idx = 0;
     if constexpr (LEFT_SLIDING_WINDOW) {
       swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
                                                                        q_tile_idx, qo_len, kv_len);
     }
+    if constexpr (SPLIT_KV) {
+      // Split-KV restricts the loads to the KV tiles in [kv_tile_begin, kv_tile_end).
+      num_kv_tiles = kv_tile_end;
+      swa_begin_kv_tile_idx = std::max(swa_begin_kv_tile_idx, kv_tile_begin);
+    }
+    int kv_tile_idx = num_kv_tiles - 1;
 
     int lane_predicate = cute::elect_one_sync();
     if (lane_predicate) {

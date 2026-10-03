@@ -129,6 +129,9 @@ struct CollectiveEpilogue {
     LayoutT const layout_O;
     float* lse_ptr;
     LayoutLseT const layout_LSE;
+    // Split-KV: element offsets between the partial outputs of consecutive KV chunks.
+    int64_t o_chunk_stride = 0;
+    int64_t lse_chunk_stride = 0;
   };
 
   // Device side kernel params
@@ -137,11 +140,14 @@ struct CollectiveEpilogue {
     LayoutT const layout_O;
     float* lse_ptr;
     LayoutLseT const layout_LSE;
+    int64_t o_chunk_stride;
+    int64_t lse_chunk_stride;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
     Tensor mO = make_tensor(make_gmem_ptr(args.O_ptr), args.layout_O);
-    return {args.O_ptr, args.layout_O, args.lse_ptr, args.layout_LSE};
+    return {args.O_ptr,      args.layout_O,       args.lse_ptr,
+            args.layout_LSE, args.o_chunk_stride, args.lse_chunk_stride};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -152,7 +158,8 @@ struct CollectiveEpilogue {
             typename TiledMma>
   CUTLASS_DEVICE void store(Params const& epilogue_params, FrgTensorO const& tOrO,
                             FrgTensorLSE const& lse, SharedStorage& shared_storage,
-                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord) {
+                            TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord,
+                            int kv_chunk_idx = 0) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
@@ -171,7 +178,9 @@ struct CollectiveEpilogue {
     cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
-    Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
+    Tensor mLSE = make_tensor(
+        make_gmem_ptr(epilogue_params.lse_ptr + kv_chunk_idx * epilogue_params.lse_chunk_stride),
+        epilogue_params.layout_LSE);
     Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
                                             qo_len)(_, qo_tile_idx);
     Tensor cO = cute::make_identity_tensor(select<0, 1>(TileShape_PDV{}));
@@ -199,7 +208,8 @@ struct CollectiveEpilogue {
     cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
                                       cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     TiledCopyO gmem_tiled_copy_O;
-    write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
+    write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr + kv_chunk_idx * epilogue_params.o_chunk_stride,
+                              gmem_tiled_copy_O, epilogue_params.layout_O,
                               select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
                               qo_head_idx, qo_indptr, qo_len, write_warp_idx);
   }
@@ -211,14 +221,19 @@ struct CollectiveEpilogue {
   // Write 0 to output and -inf to LSE
   template <typename BlockCoord, typename SharedStorage>
   CUTLASS_DEVICE void store_zero(Params const& epilogue_params, SharedStorage& shared_storage,
-                                 int thread_idx, BlockCoord const& block_coord) {
+                                 int thread_idx, BlockCoord const& block_coord,
+                                 int kv_chunk_idx = 0) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
         block_coord;
-    Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.O_ptr), epilogue_params.layout_O);
+    Tensor mO = make_tensor(
+        make_gmem_ptr(epilogue_params.O_ptr + kv_chunk_idx * epilogue_params.o_chunk_stride),
+        epilogue_params.layout_O);
     Tensor gO = get_local_tile_tensor(mO, select<0, 1>(TileShape_PDV{}), qo_head_idx, qo_indptr,
                                       qo_len)(_, _, qo_tile_idx);  // (O, D)
     Tensor cO = cute::make_identity_tensor(gO.shape());            // (O, D) -> (o_idx, d_idx)
-    Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
+    Tensor mLSE = make_tensor(
+        make_gmem_ptr(epilogue_params.lse_ptr + kv_chunk_idx * epilogue_params.lse_chunk_stride),
+        epilogue_params.layout_LSE);
     Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
                                             qo_len)(_, qo_tile_idx);
 
@@ -246,7 +261,8 @@ struct CollectiveEpilogue {
 
     static_assert(CTA_Q <= NUM_MMA_THREADS);
     if (epilogue_params.lse_ptr) {  // don't write to LSE if it's nullptr
-      if (thread_idx < qo_len - qo_tile_idx * CTA_Q) {
+      // Only the first CTA_Q threads own rows of this tile; the others would write the next tile.
+      if (thread_idx < CTA_Q && thread_idx < qo_len - qo_tile_idx * CTA_Q) {
         gLSE(thread_idx) = -math::inf;
       }
     }

@@ -27,7 +27,7 @@ Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
     ffi::TensorView kv_indptr, ffi::TensorView kv_len_arr, int64_t total_num_rows,
     int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
     bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo, bool causal,
-    int64_t window_left);
+    int64_t window_left, bool disable_split_kv);
 
 void BatchPrefillWithRaggedKVCacheSM90Run(
     ffi::TensorView float_workspace_buffer, ffi::TensorView int_workspace_buffer,

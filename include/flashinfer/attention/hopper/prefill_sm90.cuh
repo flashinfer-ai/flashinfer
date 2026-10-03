@@ -173,7 +173,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         }
         int num_kv_tiles =
             collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
-        if (num_kv_tiles <= 0) {
+        // With split-KV this work covers the KV tiles [kv_tile_begin, num_kv_tiles).
+        int kv_tile_begin = 0;
+        auto [kv_chunk_idx, num_kv_chunks] = work_tile_info.get_kv_chunk(scheduler_params);
+        if (num_kv_chunks > 1) {
+          kv_tile_begin = num_kv_tiles * kv_chunk_idx / num_kv_chunks;
+          num_kv_tiles = num_kv_tiles * (kv_chunk_idx + 1) / num_kv_chunks;
+        }
+        if (num_kv_tiles <= kv_tile_begin) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           scheduler.broadcast_next_work(work_tile_info);
           continue;
@@ -193,10 +200,21 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
               num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
-        } else {
+        } else if constexpr (!TileScheduler::kSplitKV) {
           collective_mainloop.template load<LEFT_SLIDING_WINDOW>(
               mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
               shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx);
+        } else if constexpr (use_tma_load_kv) {
+          collective_mainloop.template load<LEFT_SLIDING_WINDOW, /*SPLIT_KV=*/true>(
+              mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
+              shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
+              kv_tile_begin, num_kv_tiles);
+        } else {
+          collective_mainloop.template load<LEFT_SLIDING_WINDOW, /*SPLIT_KV=*/true>(
+              mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
+              shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx,
+              /*num_kv_tiles_outside_items_window=*/0, /*num_kv_tiles_prefix=*/0, kv_tile_begin,
+              num_kv_tiles);
         }
         ++work_idx;
       }
@@ -242,9 +260,15 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       }
       int num_kv_tiles =
           collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
-      if (num_kv_tiles <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
+      int kv_tile_begin = 0;
+      auto [kv_chunk_idx, num_kv_chunks] = work_tile_info.get_kv_chunk(scheduler_params);
+      if (num_kv_chunks > 1) {
+        kv_tile_begin = num_kv_tiles * kv_chunk_idx / num_kv_chunks;
+        num_kv_tiles = num_kv_tiles * (kv_chunk_idx + 1) / num_kv_chunks;
+      }
+      if (num_kv_tiles <= kv_tile_begin) {  // We exit early and write 0 to gO and -inf to gLSE.
         collective_epilogue.store_zero(epilogue_params, shared_storage,
-                                       threadIdx.x - NUM_COPY_THREADS, block_coord);
+                                       threadIdx.x - NUM_COPY_THREADS, block_coord, kv_chunk_idx);
         continue;
       }
 
@@ -256,6 +280,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
         swa_end_kv_tile_idx = get_swa_end_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
                                                                      q_tile_idx, qo_len, kv_len);
       }
+      swa_begin_kv_tile_idx = std::max(swa_begin_kv_tile_idx, kv_tile_begin);
+      swa_end_kv_tile_idx = std::max(swa_end_kv_tile_idx, kv_tile_begin - 1);
 
       uint32_t prefix_len = 0;
       uint16_t* token_pos_in_items = nullptr;
@@ -281,7 +307,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
           num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
       collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
-                                tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
+                                tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord,
+                                kv_chunk_idx);
 
       ++work_idx;
     }
@@ -351,8 +378,35 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
   return cudaSuccess;
 }
 
+// With split-KV the kernel writes per-chunk partial outputs to [nnz_qo, num_kv_chunks, H, D] and
+// partial LSEs to [nnz_qo, num_kv_chunks, H], which are merged after the kernel.
+template <typename CollectiveEpilogue, int HEAD_DIM_VO, typename Params>
+typename CollectiveEpilogue::Params make_batch_epilogue_params(Params& params) {
+  if (params.num_kv_chunks > 1) {
+    const int64_t num_chunks = params.num_kv_chunks;
+    const int64_t row_stride = num_chunks * params.num_qo_heads * HEAD_DIM_VO;
+    return CollectiveEpilogue::to_underlying_arguments({
+        params.tmp_o,
+        get_gmem_layout(params.nnz_qo, params.num_qo_heads, HEAD_DIM_VO, row_stride, HEAD_DIM_VO),
+        params.tmp_lse,
+        // The LSE tile helper takes the row stride from the head extent, so fold the chunks into
+        // it.
+        get_lse_gmem_layout(params.nnz_qo, num_chunks * params.num_qo_heads),
+        /*o_chunk_stride=*/static_cast<int64_t>(params.num_qo_heads) * HEAD_DIM_VO,
+        /*lse_chunk_stride=*/static_cast<int64_t>(params.num_qo_heads),
+    });
+  }
+  return CollectiveEpilogue::to_underlying_arguments({
+      params.o_ptr,
+      get_gmem_layout(params.nnz_qo, params.num_qo_heads, HEAD_DIM_VO, params.o_stride_n,
+                      params.o_stride_h),                                       // layout_O
+      params.lse_ptr, get_lse_gmem_layout(params.nnz_qo, params.num_qo_heads),  // layout_LSE
+  });
+}
+
 template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
-          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool MULTIITEMSCORING = false>
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool MULTIITEMSCORING = false,
+          bool SPLIT_KV = false>
 cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
                                                                cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
@@ -365,7 +419,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
-                         BatchPrefillPersistentTileScheduler<IdType>>;
+                         BatchPrefillPersistentTileScheduler<IdType, SPLIT_KV>>;
 
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {params.q_ptr,
@@ -385,13 +439,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
        static_cast<uint32_t>(params.page_size),  // Page size
        params.additional_params});
   typename CollectiveEpilogue::Params epilogue_params =
-      CollectiveEpilogue::to_underlying_arguments({
-          params.o_ptr,
-          get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_VO,
-                          params.o_stride_n,
-                          params.o_stride_h),                                       // layout_O
-          params.lse_ptr, get_lse_gmem_layout(params.nnz_qo, params.num_qo_heads),  // layout_LSE
-      });
+      make_batch_epilogue_params<CollectiveEpilogue, KernelTraits::HEAD_DIM_VO>(params);
 
   typename Scheduler::Arguments scheduler_args = {
       params.work_indptr,
@@ -403,7 +451,9 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
       params.kv_lens,
       params.batch_indices,
       cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
-      params.num_qo_heads};
+      params.num_qo_heads,
+      params.kv_chunk_indices,
+      static_cast<int>(params.num_kv_chunks)};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.
@@ -429,7 +479,7 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
 }
 
 template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
-          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params>
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params, bool SPLIT_KV = false>
 cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
                                                                 cudaStream_t stream) {
   using DTypeQ = typename KernelTraits::DTypeQ;
@@ -442,7 +492,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler =
       std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
-                         BatchPrefillPersistentTileScheduler<IdType>>;
+                         BatchPrefillPersistentTileScheduler<IdType, SPLIT_KV>>;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {params.q_ptr,
        get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_QK,
@@ -459,13 +509,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
                        params.v_stride_h),  // layout_V
        params.window_left, params.additional_params});
   typename CollectiveEpilogue::Params epilogue_params =
-      CollectiveEpilogue::to_underlying_arguments({
-          params.o_ptr,
-          get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_VO,
-                          params.o_stride_n,
-                          params.o_stride_h),                                       // layout_O
-          params.lse_ptr, get_lse_gmem_layout(params.nnz_qo, params.num_qo_heads),  // layout_LSE
-      });
+      make_batch_epilogue_params<CollectiveEpilogue, KernelTraits::HEAD_DIM_VO>(params);
 
   // NOTE(Zihao): add support for kv head-major later
   typename Scheduler::Arguments scheduler_args = {
@@ -478,7 +522,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
       params.kv_lens,
       params.batch_indices,
       cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
-      params.num_qo_heads};
+      params.num_qo_heads,
+      params.kv_chunk_indices,
+      static_cast<int>(params.num_kv_chunks)};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.
@@ -501,6 +547,39 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
 
   return cudaSuccess;
+}
+
+// Split-KV kernels are only built for the persistent scheduler, without sliding window or
+// multi-item scoring, and only launched when the plan split the KV range.
+template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, bool MULTIITEMSCORING, typename Params>
+cudaError_t BatchPrefillWithPagedKVCacheSplitKVDispatched(Params& params, cudaStream_t stream) {
+  if constexpr (!SAME_SCHEDULE_FOR_ALL_HEADS && !LEFT_SLIDING_WINDOW && !MULTIITEMSCORING) {
+    if (params.num_kv_chunks > 1) {
+      return BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+          KernelTraits, LEFT_SLIDING_WINDOW, CAUSAL, /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false, Params,
+          /*MULTIITEMSCORING=*/false, /*SPLIT_KV=*/true>(params, stream);
+    }
+  }
+  return BatchPrefillWithPagedKVCacheKernelTraitsDispatched<KernelTraits, LEFT_SLIDING_WINDOW,
+                                                            CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS,
+                                                            Params, MULTIITEMSCORING>(params,
+                                                                                      stream);
+}
+
+template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename Params>
+cudaError_t BatchPrefillWithRaggedKVCacheSplitKVDispatched(Params& params, cudaStream_t stream) {
+  if constexpr (!SAME_SCHEDULE_FOR_ALL_HEADS && !LEFT_SLIDING_WINDOW) {
+    if (params.num_kv_chunks > 1) {
+      return BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
+          KernelTraits, LEFT_SLIDING_WINDOW, CAUSAL, /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false, Params,
+          /*SPLIT_KV=*/true>(params, stream);
+    }
+  }
+  return BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<KernelTraits, LEFT_SLIDING_WINDOW,
+                                                             CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(
+      params, stream);
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, bool CAUSAL>
@@ -554,7 +633,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
   constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
-  BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
+  BatchPrefillWithRaggedKVCacheSplitKVDispatched<
       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
                             /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
@@ -578,37 +657,37 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
   if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
     if constexpr (HEAD_DIM_VO == 64) {
       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 64, need to optimize later
-      BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+      BatchPrefillWithPagedKVCacheSplitKVDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
                                 /*CTA_Q_=*/192,
                                 /*CTA_KV_=*/96,
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, MULTIITEMSCORING>(params,
+                                                                                      stream);
     } else if constexpr (HEAD_DIM_VO == 128) {
-      BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+      BatchPrefillWithPagedKVCacheSplitKVDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
                                 /*CTA_Q_=*/128,
                                 /*CTA_KV_=*/96,
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, MULTIITEMSCORING>(params,
+                                                                                      stream);
     } else {
       // HEAD_DIM == 256;
       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 256, need to optimize later
-      BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+      BatchPrefillWithPagedKVCacheSplitKVDispatched<
           AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
                                 /*CTA_Q_=*/128,
                                 /*CTA_KV_=*/32,
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
                                 typename Params::IdType, AttentionVariant>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, MULTIITEMSCORING>(params,
+                                                                                      stream);
     }
   } else {
     return cudaErrorNotSupported;
