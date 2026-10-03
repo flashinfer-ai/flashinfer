@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -36,6 +38,7 @@ from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from flashinfer.utils import (
     get_compute_capability,
     has_flashinfer_jit_cache,
+    is_sm90a_supported,
     is_sm100a_supported,
 )
 
@@ -407,6 +410,40 @@ def test_variable_block_sparse_attention_wrapper(
         block_row_sz,
         block_col_sz,
     )
+
+
+def _fp8_fa3(M):
+    """FP8 Q/K/V over a diagonal BSR layout with C=1, below the KV-head count."""
+    w = flashinfer.BlockSparseAttentionWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device="cuda:0"), backend="fa3"
+    )
+    rows = torch.arange(M + 1, dtype=torch.int32, device="cuda:0")
+    fp8 = torch.float8_e4m3fn
+    w.plan(rows, rows[:-1], M, M, 1, 1, 8, 4, 128, q_data_type=fp8, kv_data_type=fp8)
+    q, k, v = (torch.randn(M, h, 128, device="cuda:0").to(fp8) for h in (8, 4, 4))
+    return w, q, k, v
+
+
+def test_fp8_default_scales_are_sized_by_the_kv_head_count(monkeypatch):
+    seen = []  # paged_run's scale_k and scale_v
+    rec = SimpleNamespace(
+        plan=lambda *a: [], paged_run=lambda *a, **k: seen.extend(a[25:27])
+    )
+    monkeypatch.setattr(
+        flashinfer.sparse, "get_batch_prefill_module", lambda *a, **k: rec
+    )
+    w, q, k, v = _fp8_fa3(16)
+    w.run(q, k, v)
+    assert [s.numel() for s in seen] == [4, 4]
+
+
+def test_fp8_default_scales_match_explicit_unit_scales():
+    if not is_sm90a_supported(torch.device("cuda:0")):
+        pytest.skip("FP8 block-sparse runs on FA3")
+    w, q, k, v = _fp8_fa3(64)
+    q_s, k_s, v_s = (torch.ones(h, device="cuda:0") for h in (8, 4, 4))
+    explicit = w.run(q, k, v, scale_q=q_s, scale_k=k_s, scale_v=v_s)
+    torch.testing.assert_close(w.run(q, k, v), explicit, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

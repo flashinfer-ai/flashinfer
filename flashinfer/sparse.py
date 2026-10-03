@@ -1203,6 +1203,7 @@ class BlockSparseAttentionWrapper:
         self.N = N
         self.R = R
         self.C = C
+        self._num_kv_heads = num_kv_heads
 
         kv_indptr_host = indptr.to("cpu")
 
@@ -1578,10 +1579,17 @@ class BlockSparseAttentionWrapper:
 
             if scale_q is None:
                 scale_q = torch.ones(q.shape[1], dtype=torch.float32, device=q.device)
+            # One scale per KV head, which is what the kernel indexes them by.
+            # k and v are (num_blocks, C, num_kv_heads, head_dim) by now, so
+            # their second axis is the block width, not the head count.
             if scale_k is None:
-                scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
+                scale_k = torch.ones(
+                    self._num_kv_heads, dtype=torch.float32, device=q.device
+                )
             if scale_v is None:
-                scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+                scale_v = torch.ones(
+                    self._num_kv_heads, dtype=torch.float32, device=q.device
+                )
 
         if self._use_tensor_cores:
             self._cached_module.paged_run(
