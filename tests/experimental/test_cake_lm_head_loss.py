@@ -1996,11 +1996,11 @@ def test_gemm_tuning_default_env(monkeypatch):
 
 
 def test_toolchain_workaround_flags(monkeypatch):
-    """The CUDA 13.0 ptxas workaround (``-Xptxas -O1``) applies to the sm_103a programs on nvcc 13.0.x only."""
+    """The CUDA 13.0 ptxas workaround (``-Xptxas -O0``) applies to the sm_103a programs on nvcc 13.0.x only."""
     from packaging.version import Version
 
     for version, expected in (
-        ("13.0", ["-Xptxas", "-O1"]),
+        ("13.0", ["-Xptxas", "-O0"]),
         ("12.9", []),
         ("13.1", []),
         ("13.4", []),

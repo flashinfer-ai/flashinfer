@@ -369,12 +369,15 @@ registered program or a compute capability 10.0 / 10.3 device).  Benchmark:
 `benchmarks/bench_cake_lm_head_loss.py`.
 
 Toolchain note: on CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built
-with `-Xptxas -O1` (`cake_jit.toolchain_workaround_flags`).  That toolchain's
-ptxas mis-schedules their 2-CTA TMA producer loops at -O3 (and -O2, which
-emits the same code): with a short K loop (`chunk_size <= 1024`) the dW
+with `-Xptxas -O0` (`cake_jit.toolchain_workaround_flags`).  That toolchain's
+ptxas mis-schedules their 2-CTA TMA producer loops: at -O3 (and -O2, which
+emits the same code), with a short K loop (`chunk_size <= 1024`) the dW
 accumulate GEMM's second B-operand TMA load is rejected by the TMA unit with
-`cudaErrorIllegalInstruction` although every operand is legal; the -O1 code and
-the code of CUDA 12.9, 13.3 and 13.4 are correct.  With the -O1 code the hidden
+`cudaErrorIllegalInstruction` although every operand is legal; at -O1 the
+structural-form programs' dW cast GEMM (the last chunk's `dz_c^T @ X_c`) faults
+the same way on every call whose last chunk is partial (`T % chunk_size != 0`).
+The -O0 code and the code of CUDA 12.9, 13.3 and 13.4 are correct.  With the
+earlier -O1 code the hidden
 valid-row count's schedule (the compaction index, chunk 0's row gather and
 device-count logits GEMM queued before the count is read back) still reaches a
 `cudaErrorIllegalInstruction` from the dW accumulate GEMM at its shortest K
