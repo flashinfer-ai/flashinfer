@@ -109,12 +109,30 @@ def test_fp4_swiglu_and_packed_output_contract():
     assert prepared_global_scale.shape == (1,)
     torch.testing.assert_close(prepared_payload, payload)
     torch.testing.assert_close(prepared_scales, scales)
-    dequantized = dequantize_nvfp4_128x4(payload, scales, global_scale)
+    # The default encode scale of 1 caps |output| at 448 * 6 = 2688, and this
+    # problem reaches about 4e3 (the exact max depends on the device's RNG
+    # stream), so measure accuracy the way a caller would: map the global
+    # absmax onto the E4M3 x E2M1 range.
+    encode_scale = (448.0 * 6.0 / expected.abs().amax()).reshape(1)
+    payload, scales = fp4_linear_swiglu(
+        a,
+        a_sf,
+        1.0,
+        w,
+        w_sf,
+        1.0,
+        out_dtype=torch.uint8,
+        output_quant_scale=encode_scale,
+    )
+    dequantized = dequantize_nvfp4_128x4(payload, scales, encode_scale)
     block_error = (
         (dequantized - expected).reshape(a.shape[0], -1, 16).abs()
         / expected.reshape(a.shape[0], -1, 16).abs().amax(-1, keepdim=True).clamp(min=1)
     ).amax()
-    assert block_error < 0.35
+    # E2M1 rounds to within half a step, at most 1/6 of the block absmax,
+    # widened by up to 1/16 for E4M3 rounding of the block scale (~0.177).
+    # Encoding against the unrounded FP32 scale instead measures about 0.225.
+    assert block_error < 0.2
     with pytest.raises(ValueError, match="fp4_linear_swiglu"):
         fp4_linear(a, a_sf, 1.0, w, w_sf, 1.0, out_dtype=torch.uint8)
 

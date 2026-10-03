@@ -2119,7 +2119,15 @@ class GmemDResource(MemoryResource):
             block_absmax = cute.math.max(block_absmax, cute.math.abs(values[i]))
 
         sf = block_absmax * scale_c * cutlass.Float32(1.0 / _FP4_E2M1_MAX)
-        sf_for_rcp = cute.math.max(sf, cutlass.Float32(1.0e-12))
+        # Encode with the stored E4M3 scale, not the FP32 one, so the payload
+        # decodes against the scale a reader sees (as in TensorRT-LLM's
+        # cvt_warp_fp16_to_fp4). E4M3 rounding moves the scale up to 6.25%,
+        # and a block whose scale saturates at 448 would otherwise decode
+        # every non-max element at 448 / sf of its value.
+        sf_e4m3 = sf.to(cutlass.Float8E4M3FN)
+        sf_for_rcp = cute.math.max(
+            sf_e4m3.to(cutlass.Float32), cutlass.Float32(1.0e-12)
+        )
         output_scale = scale_c * cute.math.rcp(sf_for_rcp, approx=True, ftz=True)
 
         packed = []
@@ -2144,7 +2152,7 @@ class GmemDResource(MemoryResource):
             ) * cutlass.Int32(4)
             sf_col = output_col // cutlass.Int32(_SF_VEC_SIZE)
             sf_idx = self._sf_c_index_128x4(row, sf_col, padded_sf_cols)
-            sf_packed = sf.to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
+            sf_packed = sf_e4m3.bitcast(cutlass.Int8)
             self.gSfC_bytes.subview(sf_idx).store(sf_packed)
 
     @producer_work
