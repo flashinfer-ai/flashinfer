@@ -1,6 +1,7 @@
 """Trace tests for TRT-LLM BF16 MoE."""
 
 import torch
+import pytest
 
 
 def _bf16_trace_kwargs():
@@ -148,3 +149,49 @@ def test_bf16_moe_trace_reference_applies_swiglu_oa_params():
     torch.testing.assert_close(routed_oa_out, oa_out)
     assert not torch.allclose(default_out, clamp_only_out, atol=1e-2, rtol=1e-2)
     assert not torch.allclose(default_out, oa_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("limit", [0.25, 7.0, 16.0])
+def test_bf16_step_trace_serialized_reference(limit):
+    from flashinfer import ActivationType
+    from flashinfer.fused_moe import trtllm_bf16_moe, trtllm_bf16_routed_moe
+
+    up = torch.tensor([-32.0, -8.0, 8.0, 32.0])
+    gate = torch.tensor([32.0, 7.0, 1.0, -1.0])
+    x = torch.stack((up, gate), dim=1).to(torch.bfloat16)
+    w1 = torch.eye(2, dtype=torch.bfloat16).unsqueeze(0)
+    w2 = torch.tensor([[[1.0], [0.0]]], dtype=torch.bfloat16)
+    expected = torch.zeros_like(x)
+    expected[:, 0] = (
+        torch.nn.functional.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+    ).to(x.dtype)
+    for api, kwargs, name in (
+        (trtllm_bf16_moe, _bf16_trace_kwargs(), "_trtllm_bf16_moe_reference"),
+        (
+            trtllm_bf16_routed_moe,
+            _bf16_routed_trace_kwargs(),
+            "_trtllm_bf16_routed_moe_reference",
+        ),
+    ):
+        kwargs.update(
+            hidden_states=x,
+            gemm1_weights=w1,
+            gemm2_weights=w2,
+            num_experts=1,
+            local_num_experts=1,
+            intermediate_size=1,
+            activation_type=ActivationType.SwigluStep.value,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=torch.tensor([limit]),
+        )
+        if "routing_logits" in kwargs:
+            kwargs["routing_logits"] = torch.zeros(4, 1)
+        else:
+            # Native routed IDs pack the BF16 routing weight in the low bits.
+            kwargs["topk_ids"] = torch.full((4, 1), 0x3F80, dtype=torch.int32)
+        definition = api.fi_trace(**kwargs)
+        namespace = {}
+        exec(definition["reference"], namespace)  # noqa: S102
+        actual = namespace[name](**kwargs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

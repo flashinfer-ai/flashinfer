@@ -8,6 +8,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+import benchmarks.bench_trtllm_moe_da as da_benchmark
 from benchmarks.bench_trtllm_moe_da import (
     _canonical_inputs,
     _capture,
@@ -33,7 +34,7 @@ from flashinfer.fused_moe import (
     trtllm_moe_release_da_resources,
 )
 from flashinfer.fused_moe.da_tuner import DADistribution, RoutingRealizationFactory
-from flashinfer.tllm_enums import RoutingInputMode, RoutingMethodType
+from flashinfer.tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
 from tests.moe.da_acceptance_utils import (
     PRODUCTION_PRECISIONS,
@@ -509,6 +510,45 @@ def test_public_routed_precision_matches_ordinary_graph(precision: str) -> None:
     require_sm100()
     rows = run_matched_public_graphs(precision)
     assert {str(row["distribution"]) for row in rows} == {"uniform", "ddist:4"}
+
+
+def test_bf16_swiglu_step_limits_reach_da_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Captured DA and ordinary BF16 bodies must read the same per-expert caps."""
+    require_sm100()
+    shape = compact_shape(num_tokens=16)
+    limits = torch.tensor(
+        [7.0 if expert % 2 == 0 else 16.0 for expert in range(shape.local_num_experts)],
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    original_inputs = da_benchmark._canonical_inputs
+
+    def capped_inputs(problem):
+        hidden, w1, w2, ids, weights = original_inputs(problem)
+        # Make both caps active; the benchmark's default 0.02-scale inputs do not reach 7.
+        return hidden * 100, w1 * 100, w2, ids, weights
+
+    original_run = da_benchmark.trtllm_bf16_routed_moe
+
+    def run_step(**kwargs):
+        return original_run(
+            **kwargs,
+            activation_type=ActivationType.SwigluStep.value,
+            gemm1_clamp_limit=limits,
+        )
+
+    monkeypatch.setattr(da_benchmark, "_canonical_inputs", capped_inputs)
+    monkeypatch.setattr(da_benchmark, "trtllm_bf16_routed_moe", run_step)
+    with _temporary_environment(FLASHINFER_DA_BASELINE_GUARD="0"):
+        rows = run_matched_public_graphs(
+            "bf16",
+            shape=shape,
+            distributions=("uniform", "ddist:4"),
+        )
+    if {row["policy"] for row in rows} == {"da_fallback"}:
+        pytest.skip("natural autotuning did not select a DA body")
+    assert {row["policy"] for row in rows} <= {"da_single_body", "da_switch"}
 
 
 def test_live_distribution_selects_distinct_reachable_bodies() -> None:
