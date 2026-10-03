@@ -364,6 +364,16 @@ def _batch_prefill_specs(items):
         for hd_qk, hd_vo in ((512, 256), (256, 128)):
             bp("fa2", B, U8, B, I, hd_qk, hd_vo, 0, False, False, False)
 
+    if "test_nvfp4_paged_split_kv_matches_gated_result" in fns:
+        # NVFP4 split-KV gate test: bf16 q/o, uint8 (fp4x2_e2m1) kv, fa2, on
+        # the arches where the gate force-disables split-KV. Symmetric
+        # 128/128 and asymmetric 512/256 head dims (mirrors the test guards).
+        from flashinfer.prefill import _NVFP4_SPLIT_KV_BROKEN_ARCHS
+
+        if get_compute_capability(device) in _NVFP4_SPLIT_KV_BROKEN_ARCHS:
+            bp("fa2", B, U8, B, I, 128, 128, 0, False, False, False)
+            bp("fa2", B, U8, B, I, 512, 256, 0, False, False, False)
+
     if "test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256" in fns and hd512_ok:
         bp("fa2", H, H, H, I, 448, 256, 0, False, False, False)
         if cc_major >= 10:
