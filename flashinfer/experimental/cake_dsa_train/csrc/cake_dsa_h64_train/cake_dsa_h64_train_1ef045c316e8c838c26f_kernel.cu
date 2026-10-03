@@ -26,12 +26,9 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -40,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -133,52 +129,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count) : "memory");
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
@@ -198,155 +148,7 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
 
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-
-__device__ __forceinline__ void tcgen05_mma_f16(
-    int taddr, uint64_t a_desc, uint64_t b_desc,
-    uint32_t i_desc, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(enable_input_d)
-         : "memory");
-}
-
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
 
 
 union MmaSmemDesc {
@@ -354,24 +156,6 @@ union MmaSmemDesc {
     uint32_t u32[2];
 };
 
-__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
-}
-
-
-__device__ __forceinline__ void elect_commit(int mbar_addr) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];\n\t"
-        "}\n"
-        :: "r"(mbar_addr));
-}
 
 
 __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
@@ -388,36 +172,6 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
-__device__ __forceinline__ void tmem_ld_x32(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7,"
-        "  %8, %9, %10, %11, %12, %13, %14, %15,"
-        "  %16, %17, %18, %19, %20, %21, %22, %23,"
-        "  %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
-          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
-          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15]),
-          "=f"(dst[16]), "=f"(dst[17]), "=f"(dst[18]), "=f"(dst[19]),
-          "=f"(dst[20]), "=f"(dst[21]), "=f"(dst[22]), "=f"(dst[23]),
-          "=f"(dst[24]), "=f"(dst[25]), "=f"(dst[26]), "=f"(dst[27]),
-          "=f"(dst[28]), "=f"(dst[29]), "=f"(dst[30]), "=f"(dst[31])
-        : "r"(tmem_addr));
-}
-
-
-__device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x16.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7,"
-        "  %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
-        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
-          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
-          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
-        : "r"(tmem_addr));
-}
 
 
 __device__ __forceinline__ float approx_exp2(float x) {
@@ -427,36 +181,7 @@ __device__ __forceinline__ float approx_exp2(float x) {
 }
 
 
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
 
-
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
-
-
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
 
 
 __device__ __forceinline__ void tma_4d_gmem2smem(
@@ -469,23 +194,6 @@ __device__ __forceinline__ void tma_4d_gmem2smem(
            "r"(mbar_addr) : "memory");
 }
 
-
-__device__ __forceinline__ void tma_gather4_gmem2smem(
-    int dst, const void *tmap_ptr,
-    int col_idx, int row0, int row1, int row2, int row3,
-    int mbar_addr) {
-    // Canonical .shared::cta form for non-multicast gather4, matching
-    // trtllm-gen / cuda_ptx and the PTX ISA qualifier order
-    // (dim.dst.src.load_mode.completion_mechanism). Per the PTX grammar,
-    // .shared::cluster is reserved for the multicast variant (ctaMask).
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(col_idx),
-           "r"(row0), "r"(row1), "r"(row2), "r"(row3),
-           "r"(mbar_addr) : "memory");
-}
 
 
 __device__ __forceinline__ void tma_store_4d(
@@ -507,7 +215,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(640, 1) void
-kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, CakeTensorMap const* q_rope, CakeTensorMap const* dout, CakeTensorMap const* dq_latent, CakeTensorMap const* dq_rope, CakeTensorMap const* kv_latent, CakeTensorMap const* k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts)
+kernel_cake_dsa_h64_train_1ef045c316e8c838c26f(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -515,7 +223,12 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define qdo_full_addr (mbar_base + 0)
@@ -545,17 +258,6 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
     const int num_bids = gridDim.x;
 
     const int cta_rank = 0;
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(q_latent)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(q_rope)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(dout)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(dq_latent)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(dq_rope)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(kv_latent)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(k_rope)) : "memory");
-    }
-    __syncthreads();
-
 
     // Kernel setup ops
     __nv_bfloat16* q_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -594,13 +296,13 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
     const int validity32_addr = smem + 230912;
     int* blocks_word = reinterpret_cast<int*>(smem_raw + 231552);
     const int blocks_word_addr = smem + 231552;
-    if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(q_latent)) : "memory"); }
-    if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(q_rope)) : "memory"); }
-    if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(dout)) : "memory"); }
-    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(kv_latent)) : "memory"); }
-    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(k_rope)) : "memory"); }
-    if (warp == 4 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(dq_latent)) : "memory"); }
-    if (warp == 4 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(dq_rope)) : "memory"); }
+    if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&q_latent))) : "memory"); }
+    if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&q_rope))) : "memory"); }
+    if (warp == 17 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dout))) : "memory"); }
+    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&kv_latent))) : "memory"); }
+    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&k_rope))) : "memory"); }
+    if (warp == 4 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dq_latent))) : "memory"); }
+    if (warp == 4 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dq_rope))) : "memory"); }
 
     // Mbarrier init (22 pipeline groups, 0 ordered-sequence groups, 24 barriers)
     // Mbarriers at smem_raw[0..192)
@@ -712,147 +414,147 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 0 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 0 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 0 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 0 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 0 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 0 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 0 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 0 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 8192 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 64 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 8192 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 64 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 8192 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 64 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 8192 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 64 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 8192 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 64 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 8192 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 64 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 8192 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 64 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 8192 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 64 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 16384 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 128 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 16384 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 128 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 16384 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 128 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 16384 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 128 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 16384 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 128 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 16384 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 128 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 16384 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 128 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 16384 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 128 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 24576 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 192 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 24576 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 192 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 24576 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 192 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 24576 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 192 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 24576 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 192 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 24576 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 192 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 24576 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 192 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 24576 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 192 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 32768 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 256 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 32768 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 256 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 32768 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 256 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 32768 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 256 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 32768 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 256 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 32768 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 256 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 32768 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 256 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 32768 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 256 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 40960 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 320 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 40960 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 320 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 40960 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 320 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 40960 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 320 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 40960 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 320 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 40960 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 320 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 40960 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 320 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 40960 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 320 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 49152 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 384 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 49152 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 384 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 49152 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 384 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 49152 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 384 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 49152 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 384 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 49152 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 384 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 49152 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 384 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 49152 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 384 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 57344 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 448 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 57344 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 448 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 57344 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 448 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 57344 + 2048 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 448 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 57344 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 448 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 57344 + 4096 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 448 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 57344 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? (kv_latent) : (k_rope))), "r"(((1) ? 448 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 57344 + 6144 + (unsigned int)(pw * 512)), "l"(((1) ? ((&kv_latent)) : ((&k_rope)))), "r"(((1) ? 448 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 65536 + (unsigned int)(pw * 512)), "l"(((0) ? (kv_latent) : (k_rope))), "r"(((0) ? 512 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 65536 + (unsigned int)(pw * 512)), "l"(((0) ? ((&kv_latent)) : ((&k_rope)))), "r"(((0) ? 512 : 0)), "r"(rows[0]), "r"(rows[1]), "r"(rows[2]), "r"(rows[3]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 65536 + 2048 + (unsigned int)(pw * 512)), "l"(((0) ? (kv_latent) : (k_rope))), "r"(((0) ? 512 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 65536 + 2048 + (unsigned int)(pw * 512)), "l"(((0) ? ((&kv_latent)) : ((&k_rope)))), "r"(((0) ? 512 : 0)), "r"(rows[4]), "r"(rows[5]), "r"(rows[6]), "r"(rows[7]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 65536 + 4096 + (unsigned int)(pw * 512)), "l"(((0) ? (kv_latent) : (k_rope))), "r"(((0) ? 512 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 65536 + 4096 + (unsigned int)(pw * 512)), "l"(((0) ? ((&kv_latent)) : ((&k_rope)))), "r"(((0) ? 512 : 0)), "r"(rows[8]), "r"(rows[9]), "r"(rows[10]), "r"(rows[11]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                         ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                        :: "r"(k_blk_addr + 65536 + 6144 + (unsigned int)(pw * 512)), "l"(((0) ? (kv_latent) : (k_rope))), "r"(((0) ? 512 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
+                        :: "r"(k_blk_addr + 65536 + 6144 + (unsigned int)(pw * 512)), "l"(((0) ? ((&kv_latent)) : ((&k_rope)))), "r"(((0) ? 512 : 0)), "r"(rows[12]), "r"(rows[13]), "r"(rows[14]), "r"(rows[15]), "r"(k_full_addr), "l"(0x14F0000000000000ULL) : "memory");
                 }
             }
         }
@@ -3059,15 +2761,15 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
             if (w == 0) {
                 if (dq_mode == 0 || dq_mode == 3) {
                     if (elect_sync()) {
-                        tma_store_4d(dq_latent, 0, 0, 0, token, k_blk_addr);
-                        tma_store_4d(dq_latent, 0, 0, 1, token, k_blk_addr + 8192);
-                        tma_store_4d(dq_latent, 0, 0, 2, token, k_blk_addr + 16384);
-                        tma_store_4d(dq_latent, 0, 0, 3, token, k_blk_addr + 24576);
-                        tma_store_4d(dq_latent, 0, 0, 4, token, k_blk_addr + 32768);
-                        tma_store_4d(dq_latent, 0, 0, 5, token, k_blk_addr + 40960);
-                        tma_store_4d(dq_latent, 0, 0, 6, token, k_blk_addr + 49152);
-                        tma_store_4d(dq_latent, 0, 0, 7, token, k_blk_addr + 57344);
-                        tma_store_4d(dq_rope, 0, 0, 0, token, k_blk_addr + 65536);
+                        tma_store_4d((&dq_latent), 0, 0, 0, token, k_blk_addr);
+                        tma_store_4d((&dq_latent), 0, 0, 1, token, k_blk_addr + 8192);
+                        tma_store_4d((&dq_latent), 0, 0, 2, token, k_blk_addr + 16384);
+                        tma_store_4d((&dq_latent), 0, 0, 3, token, k_blk_addr + 24576);
+                        tma_store_4d((&dq_latent), 0, 0, 4, token, k_blk_addr + 32768);
+                        tma_store_4d((&dq_latent), 0, 0, 5, token, k_blk_addr + 40960);
+                        tma_store_4d((&dq_latent), 0, 0, 6, token, k_blk_addr + 49152);
+                        tma_store_4d((&dq_latent), 0, 0, 7, token, k_blk_addr + 57344);
+                        tma_store_4d((&dq_rope), 0, 0, 0, token, k_blk_addr + 65536);
                         asm volatile("cp.async.bulk.commit_group;");
                         asm volatile("cp.async.bulk.wait_group 0;");
                     }
@@ -3077,7 +2779,11 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
     }
     // ---- Role: reduce ----
     if (warp >= 8 && warp <= 15) {
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 104;");
+#else
         asm volatile("setmaxnreg.inc.sync.aligned.u32 112;");
+#endif
         { // reduce_main
             int lane_0_1 = lane;
             int w2 = (warp - 8) % 4;
@@ -3290,7 +2996,11 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
     }
     // ---- Role: mma ----
     if (warp == 16) {
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
+#else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
+#endif
         { // mma_main
             mbarrier_wait(blocks_ready_addr, 0);
             int blocks_3 = blocks_word[0];
@@ -4394,28 +4104,32 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
     }
     // ---- Role: load ----
     if (warp == 17) {
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
+#else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
+#endif
         { // load_main
             int token_1 = token_base + token_step * blockIdx.x;
             int lane_0_2 = lane;
             if (elect_sync()) {
-                tma_4d_gmem2smem(q_k_addr, q_latent, 0, 0, 0, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(do_k_addr, dout, 0, 0, 0, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(q_k_addr + 8192, q_latent, 0, 0, 1, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(do_k_addr + 8192, dout, 0, 0, 1, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(q_k_addr + 16384, q_latent, 0, 0, 2, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(do_k_addr + 16384, dout, 0, 0, 2, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(q_k_addr + 24576, q_latent, 0, 0, 3, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(do_k_addr + 24576, dout, 0, 0, 3, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(q_k_addr + 32768, q_latent, 0, 0, 4, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(do_k_addr + 32768, dout, 0, 0, 4, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(q_k_addr + 40960, q_latent, 0, 0, 5, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(do_k_addr + 40960, dout, 0, 0, 5, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(q_k_addr + 49152, q_latent, 0, 0, 6, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(do_k_addr + 49152, dout, 0, 0, 6, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(q_k_addr + 57344, q_latent, 0, 0, 7, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(do_k_addr + 57344, dout, 0, 0, 7, token_1, qdo_full_addr);
-                tma_4d_gmem2smem(q_k_addr + 65536, q_rope, 0, 0, 0, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(q_k_addr, (&q_latent), 0, 0, 0, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(do_k_addr, (&dout), 0, 0, 0, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(q_k_addr + 8192, (&q_latent), 0, 0, 1, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(do_k_addr + 8192, (&dout), 0, 0, 1, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(q_k_addr + 16384, (&q_latent), 0, 0, 2, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(do_k_addr + 16384, (&dout), 0, 0, 2, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(q_k_addr + 24576, (&q_latent), 0, 0, 3, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(do_k_addr + 24576, (&dout), 0, 0, 3, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(q_k_addr + 32768, (&q_latent), 0, 0, 4, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(do_k_addr + 32768, (&dout), 0, 0, 4, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(q_k_addr + 40960, (&q_latent), 0, 0, 5, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(do_k_addr + 40960, (&dout), 0, 0, 5, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(q_k_addr + 49152, (&q_latent), 0, 0, 6, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(do_k_addr + 49152, (&dout), 0, 0, 6, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(q_k_addr + 57344, (&q_latent), 0, 0, 7, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(do_k_addr + 57344, (&dout), 0, 0, 7, token_1, qdo_full_addr);
+                tma_4d_gmem2smem(q_k_addr + 65536, (&q_rope), 0, 0, 0, token_1, qdo_full_addr);
                 mbarrier_arrive_expect_tx(qdo_full_addr, 139264);
             }
             stats[lane_0_2] = lse[token_1 * 64 + lane_0_2] * 1.4426950408889634f;
@@ -4428,7 +4142,11 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
     }
     // ---- Role: metadata ----
     if (warp == 18) {
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
+#else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
+#endif
         { // metadata_main
             int token_2 = token_base + token_step * blockIdx.x;
             int lane_0_3 = lane;
@@ -4594,7 +4312,11 @@ kernel_cake_dsa_h64_train_5b1accdf3cbb4915bed7(CakeTensorMap const* q_latent, Ca
     }
     // ---- Role: spare ----
     if (warp == 19) {
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
+#else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 80;");
+#endif
         { // spare_main
             if (dq_mode >= 2) {
                 int sbid = blockIdx.x;

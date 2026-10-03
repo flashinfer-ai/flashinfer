@@ -26,12 +26,9 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -40,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -109,52 +105,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count) : "memory");
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
@@ -174,155 +124,7 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
 
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-
-__device__ __forceinline__ void tcgen05_mma_f16(
-    int taddr, uint64_t a_desc, uint64_t b_desc,
-    uint32_t i_desc, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(enable_input_d)
-         : "memory");
-}
-
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
 
 
 union MmaSmemDesc {
@@ -330,24 +132,6 @@ union MmaSmemDesc {
     uint32_t u32[2];
 };
 
-__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
-}
-
-
-__device__ __forceinline__ void elect_commit(int mbar_addr) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];\n\t"
-        "}\n"
-        :: "r"(mbar_addr));
-}
 
 
 __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
@@ -363,24 +147,6 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
         :: "r"(mbar_addr), "r"(bytes) : "memory");
 }
 
-
-__device__ __forceinline__ void tmem_ld_x32(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7,"
-        "  %8, %9, %10, %11, %12, %13, %14, %15,"
-        "  %16, %17, %18, %19, %20, %21, %22, %23,"
-        "  %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
-          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
-          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15]),
-          "=f"(dst[16]), "=f"(dst[17]), "=f"(dst[18]), "=f"(dst[19]),
-          "=f"(dst[20]), "=f"(dst[21]), "=f"(dst[22]), "=f"(dst[23]),
-          "=f"(dst[24]), "=f"(dst[25]), "=f"(dst[26]), "=f"(dst[27]),
-          "=f"(dst[28]), "=f"(dst[29]), "=f"(dst[30]), "=f"(dst[31])
-        : "r"(tmem_addr));
-}
 
 
 __device__ __forceinline__ void tmem_st_x32_f32(int tmem_addr, const float* src) {
@@ -416,109 +182,10 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 }
 
 
-__device__ __forceinline__ float2 ex2_emulation_f32x2_value(float2 value) {
-    const float c0 = 1.0f, c1 = 0.695146143436431884765625f;
-    const float c2 = 0.227564394474029541015625f, c3 = 0.077119089663028717041015625f;
-    const float magic = 12582912.0f;
-    float x0 = max_noftz(value.x, -127.0f), x1 = max_noftz(value.y, -127.0f);
-    float2 xc2 = make_float2(x0, x1), magic2 = make_float2(magic, magic);
-    float2 xr2;
-    asm("add.rm.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&xr2)
-        : "l"(*(unsigned long long*)&xc2), "l"(*(unsigned long long*)&magic2));
-    float2 c3_2 = make_float2(c3, c3), c2_2 = make_float2(c2, c2);
-    float2 c1_2 = make_float2(c1, c1), c0_2 = make_float2(c0, c0);
-    float2 xrb2, xfrac2;
-    asm("sub.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&xrb2)
-        : "l"(*(unsigned long long*)&xr2), "l"(*(unsigned long long*)&magic2));
-    asm("sub.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&xfrac2)
-        : "l"(*(unsigned long long*)&xc2), "l"(*(unsigned long long*)&xrb2));
-    float2 poly2;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(*(unsigned long long*)&poly2)
-        : "l"(*(unsigned long long*)&c3_2), "l"(*(unsigned long long*)&xfrac2), "l"(*(unsigned long long*)&c2_2));
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(*(unsigned long long*)&poly2)
-        : "l"(*(unsigned long long*)&poly2), "l"(*(unsigned long long*)&xfrac2), "l"(*(unsigned long long*)&c1_2));
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(*(unsigned long long*)&poly2)
-        : "l"(*(unsigned long long*)&poly2), "l"(*(unsigned long long*)&xfrac2), "l"(*(unsigned long long*)&c0_2));
-    int x0r_i, x1r_i, p0_i, p1_i;
-    asm("mov.b64 {%0, %1}, %2;" : "=r"(x0r_i), "=r"(x1r_i) : "l"(*(unsigned long long*)&xr2));
-    asm("mov.b64 {%0, %1}, %2;" : "=r"(p0_i), "=r"(p1_i) : "l"(*(unsigned long long*)&poly2));
-    float r0, r1;
-    asm("mov.b32 %0, %1;" : "=f"(r0) : "r"((x0r_i << 23) + p0_i));
-    asm("mov.b32 %0, %1;" : "=f"(r1) : "r"((x1r_i << 23) + p1_i));
-    return make_float2(r0, r1);
-}
 
-__device__ __forceinline__ void ex2_emulation_f32x2(float* x0_ptr, float* x1_ptr) {
-    float2 result = ex2_emulation_f32x2_value(make_float2(*x0_ptr, *x1_ptr));
-    *x0_ptr = result.x; *x1_ptr = result.y;
-}
-
-__device__ __forceinline__ void softmax_frag_exp2_cast(
-    float* sv, uint32_t* pv, int use_emu)
-{
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        if (use_emu && j >= 12)
-            ex2_emulation_f32x2(&sv[j*2], &sv[j*2+1]);
-        else {
-            sv[j*2]   = approx_exp2(sv[j*2]);
-            sv[j*2+1] = approx_exp2(sv[j*2+1]);
-        }
-    }
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        __nv_bfloat162 bf = __float22bfloat162_rn({sv[j*2], sv[j*2+1]});
-        pv[j] = reinterpret_cast<uint32_t&>(bf);
-    }
-}
-
-
-
-__device__ __forceinline__ void fma_f32x2_inplace(float2* a, float2 b, float2 c) {
-    unsigned long long r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(r)
-        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    *(unsigned long long*)a = r;
-}
-
-__device__ __forceinline__ void fma_f32x2_noftz_inplace(float2* a, float2 b, float2 c) {
-    unsigned long long r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(r)
-        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    *(unsigned long long*)a = r;
-}
 
 __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
     asm("mul.rn.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("mul.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void add_f32x2_inplace(float2* a, float2 b) {
-    asm("add.rn.ftz.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void add_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("add.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void sub_f32x2_inplace(float2* a, float2 b) {
-    asm("sub.rn.ftz.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void sub_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("sub.f32x2 %0, %0, %1;"
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
 
@@ -530,39 +197,6 @@ __device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
     return r;
 }
 
-__device__ __forceinline__ float2 add_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 sub_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("sub.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 sub_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("sub.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ void fma_scale_x32(
-    float* sv, const float2* scale2, const float2* neg_max2)
-{
-    float2* sv_2 = reinterpret_cast<float2*>(sv);
-    #pragma unroll
-    for (int j = 0; j < 16; j++)
-        fma_f32x2_inplace(&sv_2[j], *scale2, *neg_max2);
-}
-
 __device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
     float2 r;
     asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
@@ -572,472 +206,13 @@ __device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
     return r;
 }
 
-__device__ __forceinline__ float2 fma_f32x2_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
 
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
 
-__device__ __forceinline__ float2 add_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rz_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rz_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rz_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rz.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rz_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rz.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rm_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rm.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rm_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rm.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rm_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rm.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rm_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rm.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rp_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rp.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rp_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rp.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rp_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rp.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rp.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
 
 
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
 
 
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
-
-
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tma_4d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.4d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4, %5}], [%6];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tma_gather4_gmem2smem(
-    int dst, const void *tmap_ptr,
-    int col_idx, int row0, int row1, int row2, int row3,
-    int mbar_addr) {
-    // Canonical .shared::cta form for non-multicast gather4, matching
-    // trtllm-gen / cuda_ptx and the PTX ISA qualifier order
-    // (dim.dst.src.load_mode.completion_mechanism). Per the PTX grammar,
-    // .shared::cluster is reserved for the multicast variant (ctaMask).
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(col_idx),
-           "r"(row0), "r"(row1), "r"(row2), "r"(row3),
-           "r"(mbar_addr) : "memory");
-}
 
 
 __device__ __forceinline__ void tma_store_4d(
@@ -1057,28 +232,11 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 }
 
 
-__device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x16.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7,"
-        "  %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
-        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
-          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
-          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
-        : "r"(tmem_addr));
-}
-
-
-__device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
-    tmem_ld_x16(dst, addr);
-    asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
 
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, CakeTensorMap const* q_rope, CakeTensorMap const* kv_latent, __nv_bfloat16* __restrict__ k_rope, CakeTensorMap const* out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int k_rope_stride, int k_rope_offset, int has_topk_length, float scale_log2)
+kernel_cake_dsa_h64_train_877b7797bb6b1bd6a37e(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap kv_latent, __nv_bfloat16* __restrict__ k_rope, const __grid_constant__ CUtensorMap out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int k_rope_stride, int k_rope_offset, int has_topk_length, float scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1086,7 +244,12 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define q_full_addr (mbar_base + 0)
@@ -1111,14 +274,6 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
     const int num_bids = gridDim.x;
 
     const int cta_rank = 0;
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(q_latent)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(q_rope)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(kv_latent)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(out)) : "memory");
-    }
-    __syncthreads();
-
 
     // Kernel setup ops
     __nv_bfloat16* qko = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -1141,10 +296,10 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
     const int stats_addr = smem + 230528;
     unsigned int* clc_payload = reinterpret_cast<unsigned int*>(smem_raw + 231552);
     const int clc_payload_addr = smem + 231552;
-    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(q_latent)) : "memory"); }
-    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(kv_latent)) : "memory"); }
-    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(out)) : "memory"); }
-    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(q_rope)) : "memory"); }
+    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&q_latent))) : "memory"); }
+    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&kv_latent))) : "memory"); }
+    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&out))) : "memory"); }
+    if (warp == 0 && lane == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&q_rope))) : "memory"); }
 
     // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 30 barriers)
     // Mbarriers at smem_raw[0..240)
@@ -1748,10 +903,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                             : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31])
                             : "r"(tmrow));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        #if __CUDA_ARCH__ >= 1000
                         const float2 _scale2_18 = {factor, factor};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_ls], _scale2_18);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            _tmem_load_0[_ls] = _tmem_load_0[_ls] * factor;
+                        }
+                        #endif
                         tmem_st_x32_f32(tmrow, _tmem_load_0);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         float _tmem_load_1[32];
@@ -1761,10 +923,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                             : "=f"(_tmem_load_1[0]), "=f"(_tmem_load_1[1]), "=f"(_tmem_load_1[2]), "=f"(_tmem_load_1[3]), "=f"(_tmem_load_1[4]), "=f"(_tmem_load_1[5]), "=f"(_tmem_load_1[6]), "=f"(_tmem_load_1[7]), "=f"(_tmem_load_1[8]), "=f"(_tmem_load_1[9]), "=f"(_tmem_load_1[10]), "=f"(_tmem_load_1[11]), "=f"(_tmem_load_1[12]), "=f"(_tmem_load_1[13]), "=f"(_tmem_load_1[14]), "=f"(_tmem_load_1[15]), "=f"(_tmem_load_1[16]), "=f"(_tmem_load_1[17]), "=f"(_tmem_load_1[18]), "=f"(_tmem_load_1[19]), "=f"(_tmem_load_1[20]), "=f"(_tmem_load_1[21]), "=f"(_tmem_load_1[22]), "=f"(_tmem_load_1[23]), "=f"(_tmem_load_1[24]), "=f"(_tmem_load_1[25]), "=f"(_tmem_load_1[26]), "=f"(_tmem_load_1[27]), "=f"(_tmem_load_1[28]), "=f"(_tmem_load_1[29]), "=f"(_tmem_load_1[30]), "=f"(_tmem_load_1[31])
                             : "r"(tmrow + 32));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        #if __CUDA_ARCH__ >= 1000
                         const float2 _scale2_19 = {factor, factor};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_19);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            _tmem_load_1[_ls] = _tmem_load_1[_ls] * factor;
+                        }
+                        #endif
                         tmem_st_x32_f32(tmrow + 32, _tmem_load_1);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         float _tmem_load_2[32];
@@ -1774,10 +943,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                             : "=f"(_tmem_load_2[0]), "=f"(_tmem_load_2[1]), "=f"(_tmem_load_2[2]), "=f"(_tmem_load_2[3]), "=f"(_tmem_load_2[4]), "=f"(_tmem_load_2[5]), "=f"(_tmem_load_2[6]), "=f"(_tmem_load_2[7]), "=f"(_tmem_load_2[8]), "=f"(_tmem_load_2[9]), "=f"(_tmem_load_2[10]), "=f"(_tmem_load_2[11]), "=f"(_tmem_load_2[12]), "=f"(_tmem_load_2[13]), "=f"(_tmem_load_2[14]), "=f"(_tmem_load_2[15]), "=f"(_tmem_load_2[16]), "=f"(_tmem_load_2[17]), "=f"(_tmem_load_2[18]), "=f"(_tmem_load_2[19]), "=f"(_tmem_load_2[20]), "=f"(_tmem_load_2[21]), "=f"(_tmem_load_2[22]), "=f"(_tmem_load_2[23]), "=f"(_tmem_load_2[24]), "=f"(_tmem_load_2[25]), "=f"(_tmem_load_2[26]), "=f"(_tmem_load_2[27]), "=f"(_tmem_load_2[28]), "=f"(_tmem_load_2[29]), "=f"(_tmem_load_2[30]), "=f"(_tmem_load_2[31])
                             : "r"(tmrow + 64));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        #if __CUDA_ARCH__ >= 1000
                         const float2 _scale2_20 = {factor, factor};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_20);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            _tmem_load_2[_ls] = _tmem_load_2[_ls] * factor;
+                        }
+                        #endif
                         tmem_st_x32_f32(tmrow + 64, _tmem_load_2);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         float _tmem_load_3[32];
@@ -1787,10 +963,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                             : "=f"(_tmem_load_3[0]), "=f"(_tmem_load_3[1]), "=f"(_tmem_load_3[2]), "=f"(_tmem_load_3[3]), "=f"(_tmem_load_3[4]), "=f"(_tmem_load_3[5]), "=f"(_tmem_load_3[6]), "=f"(_tmem_load_3[7]), "=f"(_tmem_load_3[8]), "=f"(_tmem_load_3[9]), "=f"(_tmem_load_3[10]), "=f"(_tmem_load_3[11]), "=f"(_tmem_load_3[12]), "=f"(_tmem_load_3[13]), "=f"(_tmem_load_3[14]), "=f"(_tmem_load_3[15]), "=f"(_tmem_load_3[16]), "=f"(_tmem_load_3[17]), "=f"(_tmem_load_3[18]), "=f"(_tmem_load_3[19]), "=f"(_tmem_load_3[20]), "=f"(_tmem_load_3[21]), "=f"(_tmem_load_3[22]), "=f"(_tmem_load_3[23]), "=f"(_tmem_load_3[24]), "=f"(_tmem_load_3[25]), "=f"(_tmem_load_3[26]), "=f"(_tmem_load_3[27]), "=f"(_tmem_load_3[28]), "=f"(_tmem_load_3[29]), "=f"(_tmem_load_3[30]), "=f"(_tmem_load_3[31])
                             : "r"(tmrow + 96));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        #if __CUDA_ARCH__ >= 1000
                         const float2 _scale2_21 = {factor, factor};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_21);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            _tmem_load_3[_ls] = _tmem_load_3[_ls] * factor;
+                        }
+                        #endif
                         tmem_st_x32_f32(tmrow + 96, _tmem_load_3);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         float _tmem_load_4[32];
@@ -1800,10 +983,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                             : "=f"(_tmem_load_4[0]), "=f"(_tmem_load_4[1]), "=f"(_tmem_load_4[2]), "=f"(_tmem_load_4[3]), "=f"(_tmem_load_4[4]), "=f"(_tmem_load_4[5]), "=f"(_tmem_load_4[6]), "=f"(_tmem_load_4[7]), "=f"(_tmem_load_4[8]), "=f"(_tmem_load_4[9]), "=f"(_tmem_load_4[10]), "=f"(_tmem_load_4[11]), "=f"(_tmem_load_4[12]), "=f"(_tmem_load_4[13]), "=f"(_tmem_load_4[14]), "=f"(_tmem_load_4[15]), "=f"(_tmem_load_4[16]), "=f"(_tmem_load_4[17]), "=f"(_tmem_load_4[18]), "=f"(_tmem_load_4[19]), "=f"(_tmem_load_4[20]), "=f"(_tmem_load_4[21]), "=f"(_tmem_load_4[22]), "=f"(_tmem_load_4[23]), "=f"(_tmem_load_4[24]), "=f"(_tmem_load_4[25]), "=f"(_tmem_load_4[26]), "=f"(_tmem_load_4[27]), "=f"(_tmem_load_4[28]), "=f"(_tmem_load_4[29]), "=f"(_tmem_load_4[30]), "=f"(_tmem_load_4[31])
                             : "r"(tmrow + 128));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        #if __CUDA_ARCH__ >= 1000
                         const float2 _scale2_22 = {factor, factor};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_4)[_ls], _scale2_22);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            _tmem_load_4[_ls] = _tmem_load_4[_ls] * factor;
+                        }
+                        #endif
                         tmem_st_x32_f32(tmrow + 128, _tmem_load_4);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         float _tmem_load_5[32];
@@ -1813,10 +1003,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                             : "=f"(_tmem_load_5[0]), "=f"(_tmem_load_5[1]), "=f"(_tmem_load_5[2]), "=f"(_tmem_load_5[3]), "=f"(_tmem_load_5[4]), "=f"(_tmem_load_5[5]), "=f"(_tmem_load_5[6]), "=f"(_tmem_load_5[7]), "=f"(_tmem_load_5[8]), "=f"(_tmem_load_5[9]), "=f"(_tmem_load_5[10]), "=f"(_tmem_load_5[11]), "=f"(_tmem_load_5[12]), "=f"(_tmem_load_5[13]), "=f"(_tmem_load_5[14]), "=f"(_tmem_load_5[15]), "=f"(_tmem_load_5[16]), "=f"(_tmem_load_5[17]), "=f"(_tmem_load_5[18]), "=f"(_tmem_load_5[19]), "=f"(_tmem_load_5[20]), "=f"(_tmem_load_5[21]), "=f"(_tmem_load_5[22]), "=f"(_tmem_load_5[23]), "=f"(_tmem_load_5[24]), "=f"(_tmem_load_5[25]), "=f"(_tmem_load_5[26]), "=f"(_tmem_load_5[27]), "=f"(_tmem_load_5[28]), "=f"(_tmem_load_5[29]), "=f"(_tmem_load_5[30]), "=f"(_tmem_load_5[31])
                             : "r"(tmrow + 160));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        #if __CUDA_ARCH__ >= 1000
                         const float2 _scale2_23 = {factor, factor};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_5)[_ls], _scale2_23);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            _tmem_load_5[_ls] = _tmem_load_5[_ls] * factor;
+                        }
+                        #endif
                         tmem_st_x32_f32(tmrow + 160, _tmem_load_5);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         float _tmem_load_6[32];
@@ -1826,10 +1023,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                             : "=f"(_tmem_load_6[0]), "=f"(_tmem_load_6[1]), "=f"(_tmem_load_6[2]), "=f"(_tmem_load_6[3]), "=f"(_tmem_load_6[4]), "=f"(_tmem_load_6[5]), "=f"(_tmem_load_6[6]), "=f"(_tmem_load_6[7]), "=f"(_tmem_load_6[8]), "=f"(_tmem_load_6[9]), "=f"(_tmem_load_6[10]), "=f"(_tmem_load_6[11]), "=f"(_tmem_load_6[12]), "=f"(_tmem_load_6[13]), "=f"(_tmem_load_6[14]), "=f"(_tmem_load_6[15]), "=f"(_tmem_load_6[16]), "=f"(_tmem_load_6[17]), "=f"(_tmem_load_6[18]), "=f"(_tmem_load_6[19]), "=f"(_tmem_load_6[20]), "=f"(_tmem_load_6[21]), "=f"(_tmem_load_6[22]), "=f"(_tmem_load_6[23]), "=f"(_tmem_load_6[24]), "=f"(_tmem_load_6[25]), "=f"(_tmem_load_6[26]), "=f"(_tmem_load_6[27]), "=f"(_tmem_load_6[28]), "=f"(_tmem_load_6[29]), "=f"(_tmem_load_6[30]), "=f"(_tmem_load_6[31])
                             : "r"(tmrow + 192));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        #if __CUDA_ARCH__ >= 1000
                         const float2 _scale2_24 = {factor, factor};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_6)[_ls], _scale2_24);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            _tmem_load_6[_ls] = _tmem_load_6[_ls] * factor;
+                        }
+                        #endif
                         tmem_st_x32_f32(tmrow + 192, _tmem_load_6);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         float _tmem_load_7[32];
@@ -1839,10 +1043,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                             : "=f"(_tmem_load_7[0]), "=f"(_tmem_load_7[1]), "=f"(_tmem_load_7[2]), "=f"(_tmem_load_7[3]), "=f"(_tmem_load_7[4]), "=f"(_tmem_load_7[5]), "=f"(_tmem_load_7[6]), "=f"(_tmem_load_7[7]), "=f"(_tmem_load_7[8]), "=f"(_tmem_load_7[9]), "=f"(_tmem_load_7[10]), "=f"(_tmem_load_7[11]), "=f"(_tmem_load_7[12]), "=f"(_tmem_load_7[13]), "=f"(_tmem_load_7[14]), "=f"(_tmem_load_7[15]), "=f"(_tmem_load_7[16]), "=f"(_tmem_load_7[17]), "=f"(_tmem_load_7[18]), "=f"(_tmem_load_7[19]), "=f"(_tmem_load_7[20]), "=f"(_tmem_load_7[21]), "=f"(_tmem_load_7[22]), "=f"(_tmem_load_7[23]), "=f"(_tmem_load_7[24]), "=f"(_tmem_load_7[25]), "=f"(_tmem_load_7[26]), "=f"(_tmem_load_7[27]), "=f"(_tmem_load_7[28]), "=f"(_tmem_load_7[29]), "=f"(_tmem_load_7[30]), "=f"(_tmem_load_7[31])
                             : "r"(tmrow + 224));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        #if __CUDA_ARCH__ >= 1000
                         const float2 _scale2_25 = {factor, factor};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_7)[_ls], _scale2_25);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            _tmem_load_7[_ls] = _tmem_load_7[_ls] * factor;
+                        }
+                        #endif
                         tmem_st_x32_f32(tmrow + 224, _tmem_load_7);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1954,10 +1165,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     ov[62] = 0.0f;
                     ov[63] = 0.0f;
                 }
+                #if __CUDA_ARCH__ >= 1000
                 const float2 _scale2_26 = {output_scale, output_scale};
                 #pragma unroll
                 for (int _ls = 0; _ls < 32; _ls++)
                     mul_f32x2_inplace(&reinterpret_cast<float2*>(ov)[_ls], _scale2_26);
+                #else
+                #pragma unroll
+                for (int _ls = 0; _ls < 64; _ls++) {
+                    ov[_ls] = ov[_ls] * output_scale;
+                }
+                #endif
                 int out_col = row / 64 * 128;
                 float residual[16];
                 uint32_t ov_bf16[4];
@@ -2284,7 +1502,7 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                 if (warp < 2) {
                     if (elect_sync()) {
                         int output_chunk = warp * 2;
-                        tma_store_4d(out, 0, 0, output_chunk, query, qko_addr + (unsigned int)(o_slot * 65536) + (unsigned int)(output_chunk * 8192));
+                        tma_store_4d((&out), 0, 0, output_chunk, query, qko_addr + (unsigned int)(o_slot * 65536) + (unsigned int)(output_chunk * 8192));
                     }
                 }
                 float ov_24[64];
@@ -2361,10 +1579,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     ov_24[62] = 0.0f;
                     ov_24[63] = 0.0f;
                 }
+                #if __CUDA_ARCH__ >= 1000
                 const float2 _scale2_27 = {output_scale, output_scale};
                 #pragma unroll
                 for (int _ls = 0; _ls < 32; _ls++)
                     mul_f32x2_inplace(&reinterpret_cast<float2*>(ov_24)[_ls], _scale2_27);
+                #else
+                #pragma unroll
+                for (int _ls = 0; _ls < 64; _ls++) {
+                    ov_24[_ls] = ov_24[_ls] * output_scale;
+                }
+                #endif
                 int out_col_25 = row / 64 * 128 + 64;
                 float residual_26[16];
                 uint32_t ov_24_bf16[4];
@@ -2691,7 +1916,7 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                 if (warp < 2) {
                     if (elect_sync()) {
                         int output_chunk_1 = warp * 2 + 1;
-                        tma_store_4d(out, 0, 0, output_chunk_1, query, qko_addr + (unsigned int)(o_slot * 65536) + (unsigned int)(output_chunk_1 * 8192));
+                        tma_store_4d((&out), 0, 0, output_chunk_1, query, qko_addr + (unsigned int)(o_slot * 65536) + (unsigned int)(output_chunk_1 * 8192));
                     }
                 }
                 float ov_53[64];
@@ -2768,10 +1993,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     ov_53[62] = 0.0f;
                     ov_53[63] = 0.0f;
                 }
+                #if __CUDA_ARCH__ >= 1000
                 const float2 _scale2_28 = {output_scale, output_scale};
                 #pragma unroll
                 for (int _ls = 0; _ls < 32; _ls++)
                     mul_f32x2_inplace(&reinterpret_cast<float2*>(ov_53)[_ls], _scale2_28);
+                #else
+                #pragma unroll
+                for (int _ls = 0; _ls < 64; _ls++) {
+                    ov_53[_ls] = ov_53[_ls] * output_scale;
+                }
+                #endif
                 int out_col_54 = 256 + row / 64 * 128;
                 float residual_55[16];
                 uint32_t ov_53_bf16[4];
@@ -3098,7 +2330,7 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                 if (warp < 2) {
                     if (elect_sync()) {
                         int output_chunk_2 = 4 + warp * 2;
-                        tma_store_4d(out, 0, 0, output_chunk_2, query, qko_addr + (unsigned int)(o_slot * 65536) + (unsigned int)(output_chunk_2 * 8192));
+                        tma_store_4d((&out), 0, 0, output_chunk_2, query, qko_addr + (unsigned int)(o_slot * 65536) + (unsigned int)(output_chunk_2 * 8192));
                     }
                 }
                 float ov_82[64];
@@ -3175,10 +2407,17 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     ov_82[62] = 0.0f;
                     ov_82[63] = 0.0f;
                 }
+                #if __CUDA_ARCH__ >= 1000
                 const float2 _scale2_29 = {output_scale, output_scale};
                 #pragma unroll
                 for (int _ls = 0; _ls < 32; _ls++)
                     mul_f32x2_inplace(&reinterpret_cast<float2*>(ov_82)[_ls], _scale2_29);
+                #else
+                #pragma unroll
+                for (int _ls = 0; _ls < 64; _ls++) {
+                    ov_82[_ls] = ov_82[_ls] * output_scale;
+                }
+                #endif
                 int out_col_83 = 256 + row / 64 * 128 + 64;
                 float residual_84[16];
                 uint32_t ov_82_bf16[4];
@@ -3505,7 +2744,7 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                 if (warp < 2) {
                     if (elect_sync()) {
                         int output_chunk_3 = 4 + warp * 2 + 1;
-                        tma_store_4d(out, 0, 0, output_chunk_3, query, qko_addr + (unsigned int)(o_slot * 65536) + (unsigned int)(output_chunk_3 * 8192));
+                        tma_store_4d((&out), 0, 0, output_chunk_3, query, qko_addr + (unsigned int)(o_slot * 65536) + (unsigned int)(output_chunk_3 * 8192));
                     }
                 }
                 asm volatile("cp.async.bulk.commit_group;");
@@ -3870,131 +3109,131 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512)), "l"(kv_latent), "r"(0), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512)), "l"((&kv_latent)), "r"(0), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 8192), "l"(kv_latent), "r"(64), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 8192), "l"((&kv_latent)), "r"(64), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 16384), "l"(kv_latent), "r"(128), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 16384), "l"((&kv_latent)), "r"(128), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 24576), "l"(kv_latent), "r"(192), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 24576), "l"((&kv_latent)), "r"(192), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048), "l"(kv_latent), "r"(0), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048), "l"((&kv_latent)), "r"(0), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 8192), "l"(kv_latent), "r"(64), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 8192), "l"((&kv_latent)), "r"(64), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 16384), "l"(kv_latent), "r"(128), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 16384), "l"((&kv_latent)), "r"(128), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 24576), "l"(kv_latent), "r"(192), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 24576), "l"((&kv_latent)), "r"(192), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096), "l"(kv_latent), "r"(0), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096), "l"((&kv_latent)), "r"(0), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 8192), "l"(kv_latent), "r"(64), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 8192), "l"((&kv_latent)), "r"(64), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 16384), "l"(kv_latent), "r"(128), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 16384), "l"((&kv_latent)), "r"(128), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 24576), "l"(kv_latent), "r"(192), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 24576), "l"((&kv_latent)), "r"(192), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144), "l"(kv_latent), "r"(0), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144), "l"((&kv_latent)), "r"(0), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 8192), "l"(kv_latent), "r"(64), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 8192), "l"((&kv_latent)), "r"(64), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 16384), "l"(kv_latent), "r"(128), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 16384), "l"((&kv_latent)), "r"(128), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 24576), "l"(kv_latent), "r"(192), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 24576), "l"((&kv_latent)), "r"(192), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 32768), "l"(kv_latent), "r"(256), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 32768), "l"((&kv_latent)), "r"(256), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 40960), "l"(kv_latent), "r"(320), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 40960), "l"((&kv_latent)), "r"(320), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 49152), "l"(kv_latent), "r"(384), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 49152), "l"((&kv_latent)), "r"(384), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 57344), "l"(kv_latent), "r"(448), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 57344), "l"((&kv_latent)), "r"(448), "r"(idx[0]), "r"(idx[1]), "r"(idx[2]), "r"(idx[3]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 32768), "l"(kv_latent), "r"(256), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 32768), "l"((&kv_latent)), "r"(256), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 40960), "l"(kv_latent), "r"(320), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 40960), "l"((&kv_latent)), "r"(320), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 49152), "l"(kv_latent), "r"(384), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 49152), "l"((&kv_latent)), "r"(384), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 57344), "l"(kv_latent), "r"(448), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 2048 + 57344), "l"((&kv_latent)), "r"(448), "r"(idx[4]), "r"(idx[5]), "r"(idx[6]), "r"(idx[7]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 32768), "l"(kv_latent), "r"(256), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 32768), "l"((&kv_latent)), "r"(256), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 40960), "l"(kv_latent), "r"(320), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 40960), "l"((&kv_latent)), "r"(320), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 49152), "l"(kv_latent), "r"(384), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 49152), "l"((&kv_latent)), "r"(384), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 57344), "l"(kv_latent), "r"(448), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 4096 + 57344), "l"((&kv_latent)), "r"(448), "r"(idx[8]), "r"(idx[9]), "r"(idx[10]), "r"(idx[11]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 32768), "l"(kv_latent), "r"(256), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 32768), "l"((&kv_latent)), "r"(256), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 40960), "l"(kv_latent), "r"(320), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 40960), "l"((&kv_latent)), "r"(320), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 49152), "l"(kv_latent), "r"(384), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 49152), "l"((&kv_latent)), "r"(384), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
                                 ".mbarrier::complete_tx::bytes.L2::cache_hint ""[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 57344), "l"(kv_latent), "r"(448), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                :: "r"(qko_addr + (unsigned int)(slot_1 * 65536) + (unsigned int)(producer_warp * 512) + 6144 + 57344), "l"((&kv_latent)), "r"(448), "r"(idx[12]), "r"(idx[13]), "r"(idx[14]), "r"(idx[15]), "r"(kv_ready_addr + (slot_1 * 2 + 1) * 8), "l"(0x14F0000000000000ULL) : "memory");
                         } else {
                             asm volatile("mbarrier.complete_tx.relaxed.cta.shared::cta.b64 [%0], %1;"
                                 :: "r"(kv_ready_addr + (slot_1 * 2) * 8), "r"((uint32_t)(8192)) : "memory");
@@ -4060,12 +3299,12 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     asm volatile(
                         "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                         " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                        :: "r"(rope_addr), "l"(q_rope), "r"(0), "r"(0), "r"(0), "r"(query_2),
+                        :: "r"(rope_addr), "l"((&q_rope)), "r"(0), "r"(0), "r"(0), "r"(query_2),
                            "r"(qr_full_addr), "l"(0x12F0000000000000ULL) : "memory");
                     asm volatile(
                         "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                         " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                        :: "r"(qko_addr + (unsigned int)(q_slot * 65536)), "l"(q_latent), "r"(0), "r"(0), "r"(0), "r"(query_2),
+                        :: "r"(qko_addr + (unsigned int)(q_slot * 65536)), "l"((&q_latent)), "r"(0), "r"(0), "r"(0), "r"(query_2),
                            "r"(q_full_addr), "l"(0x12F0000000000000ULL) : "memory");
                     mbarrier_arrive_expect_tx(qr_full_addr, 8192);
                     mbarrier_wait(qr_full_addr, outer_phase_2);
@@ -4074,7 +3313,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_0 = ((((uint64_t)(rope_addr)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(512)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (4ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_0 = ((((uint64_t)(rope_addr)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(512)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (4ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 384)), "l"(_tcgen05_cp_desc_0)
@@ -4084,7 +3327,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(rope_addr + 32)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(512)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (4ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(rope_addr + 32)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(512)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (4ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 384 + 8)), "l"(_tcgen05_cp_desc_1)
@@ -4098,7 +3345,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536))) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536))) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256)), "l"(_tcgen05_cp_desc_2)
@@ -4108,7 +3359,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 8)), "l"(_tcgen05_cp_desc_3)
@@ -4118,7 +3373,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 64)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 64)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 16)), "l"(_tcgen05_cp_desc_4)
@@ -4128,7 +3387,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 96)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 96)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 24)), "l"(_tcgen05_cp_desc_5)
@@ -4138,7 +3401,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 16384)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 16384)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 32)), "l"(_tcgen05_cp_desc_6)
@@ -4148,7 +3415,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 16384 + 32)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 16384 + 32)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 32 + 8)), "l"(_tcgen05_cp_desc_7)
@@ -4158,7 +3429,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 16384 + 64)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 16384 + 64)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 32 + 16)), "l"(_tcgen05_cp_desc_8)
@@ -4168,7 +3443,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_9 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 16384 + 96)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_9 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 16384 + 96)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 32 + 24)), "l"(_tcgen05_cp_desc_9)
@@ -4178,7 +3457,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_10 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32768)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_10 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32768)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 64)), "l"(_tcgen05_cp_desc_10)
@@ -4188,7 +3471,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_11 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32768 + 32)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_11 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32768 + 32)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 64 + 8)), "l"(_tcgen05_cp_desc_11)
@@ -4198,7 +3485,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_12 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32768 + 64)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_12 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32768 + 64)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 64 + 16)), "l"(_tcgen05_cp_desc_12)
@@ -4208,7 +3499,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_13 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32768 + 96)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_13 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 32768 + 96)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 64 + 24)), "l"(_tcgen05_cp_desc_13)
@@ -4218,7 +3513,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_14 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 49152)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_14 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 49152)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 96)), "l"(_tcgen05_cp_desc_14)
@@ -4228,7 +3527,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_15 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 49152 + 32)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_15 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 49152 + 32)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 96 + 8)), "l"(_tcgen05_cp_desc_15)
@@ -4238,7 +3541,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_16 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 49152 + 64)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_16 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 49152 + 64)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 96 + 16)), "l"(_tcgen05_cp_desc_16)
@@ -4248,7 +3555,11 @@ kernel_cake_dsa_h64_train_0b6054bf52663f80236b(CakeTensorMap const* q_latent, Ca
                     #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                     #endif
                     {
+#if __CUDA_ARCH__ == 1070
+                        uint64_t _tcgen05_cp_desc_17 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 49152 + 96)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#else
                         uint64_t _tcgen05_cp_desc_17 = ((((uint64_t)(qko_addr + (unsigned int)(q_slot * 65536) + 49152 + 96)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+#endif
                         asm volatile(
                             "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
                             :: "r"((uint32_t)(tmem_tmem + 256 + 96 + 24)), "l"(_tcgen05_cp_desc_17)
