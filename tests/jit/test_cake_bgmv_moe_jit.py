@@ -153,7 +153,7 @@ def test_binding_preserves_graph_and_tensor_contracts():
     assert "cudaMemsetAsync" not in binding
     assert "EXPAND_PAIR" not in binding
     assert "CAKE_BGMV_MOE_SHRINK_DECODE<<<" in binding
-    assert "CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL<<<" in binding
+    assert "cudaLaunchKernelEx(&config, CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL," in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
 
@@ -198,35 +198,59 @@ def test_variant_routing(hidden_size, rank, expected):
 @pytest.mark.parametrize(
     ("hidden_size", "num_tokens", "expected"),
     [
-        (3072, 1, "specialized"),
-        (3072, 2048, "specialized"),
-        (2688, 2049, "generic"),
+        (3072, 1, "generic"),
+        (3072, 16, "generic"),
+        (3072, 31, "generic"),
+        (3072, 32, "specialized"),
+        (3072, 64, "specialized"),
+        (3072, 128, "specialized"),
+        (2688, 512, "specialized"),
+        (3072, 1024, "specialized"),
+        (2688, 1025, "generic"),
+        (3072, 2048, "generic"),
         (3072, 4096, "generic"),
         (2048, 4096, "generic"),
     ],
 )
 def test_variant_routing_by_token_count(hidden_size, num_tokens, expected):
-    assert cake_bgmv_moe.CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS == 2048
-    assert cake_bgmv_moe.cake_bgmv_moe_variant(hidden_size, 32, num_tokens) == expected
-
-
-@pytest.mark.parametrize("arch", cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES)
-@pytest.mark.parametrize(
-    ("hidden_size", "num_tokens", "expected"),
-    [
-        (2048, 1, "token_owned_t64"),
-        (2048, 8, "token_owned_t64"),
-        (2048, 9, "token_owned_t128"),
-        (736, 512, "token_owned_t128"),
-    ],
-)
-def test_generic_selector(arch, hidden_size, num_tokens, expected):
-    assert (
-        cake_bgmv_moe.select_cake_bgmv_moe_generic_schedule(
-            hidden_size, num_tokens, arch
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW == {
+        "sm90a": None,
+        "sm100a": (32, 1024),
+        "sm103a": (32, 1024),
+    }
+    for arch in ("sm100a", "sm103a"):
+        assert (
+            cake_bgmv_moe.cake_bgmv_moe_variant(hidden_size, 32, num_tokens, arch)
+            == expected
         )
-        == expected
+    # Hopper: the generic bundle wins or ties at every token count.
+    assert (
+        cake_bgmv_moe.cake_bgmv_moe_variant(hidden_size, 32, num_tokens, "sm90a")
+        == "generic"
     )
+    # Support queries (no token count) keep the specialized answer.
+    assert cake_bgmv_moe.cake_bgmv_moe_variant(3072, 32) == "specialized"
+
+
+def test_pdl_mode_policy():
+    pdl = cake_bgmv_moe.cake_bgmv_moe_pdl_mode
+    # 16 tokens x 23 column CTAs = 368 CTAs: small on every part.
+    assert pdl("sm90a", 16, 2944, 132) == 1
+    assert pdl("sm100a", 16, 2944, 148) == 1
+    assert pdl("sm103a", 16, 2944, 148) == 1
+    # 128 tokens x 12 column CTAs = 1536 CTAs: still small on Hopper (12/SM),
+    # large on Blackwell (8/SM).
+    assert pdl("sm90a", 128, 1472, 132) == 1
+    assert pdl("sm100a", 128, 1472, 148) == 2
+    # 512 tokens x 6 column CTAs = 3072 CTAs: large.
+    assert pdl("sm90a", 512, 736, 132) == 0
+    assert pdl("sm100a", 512, 736, 148) == 2
+    assert pdl("sm103a", 512, 736, 148) == 2
+    # The specialized bodies take plain launches at every grid size.
+    assert pdl("sm100a", 512, 3072, 148, "specialized") == 0
+    assert pdl("sm103a", 1024, 2688, 148, "specialized") == 0
+    assert pdl("sm100a", 32, 3072, 148, "specialized") == 0
+    assert pdl("sm90a", 32, 3072, 132, "specialized") == 0
 
 
 def test_generic_selector_rejects_unsupported_inputs():
@@ -278,13 +302,25 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     for macro in (
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE 221824",
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL 37120",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE_PDL 221824",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_PDL 37120",
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64 ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128 ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64_PF ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128_PF ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_HIST ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED ",
     ):
         assert macro in body
-    # Route-index publication in both shrink kernels; the expand keeps one
-    # owner per output (no output atomics).
-    assert body.count("atomicAdd(") == 2
+    # Route-index publication in the four shrink kernels plus the three grouping
+    # counters (shared-memory histogram and fill counters, per-token route
+    # counters) in group_hist / group_scatter; the expands keep one owner per
+    # output (no output atomics).
+    assert body.count("atomicAdd(") == 7
     assert "atomicAdd(&reinterpret_cast<float" not in body
     binding = spec.sources[0].read_text()
     assert f'#define CAKE_BGMV_MOE_BODY_FILE "{metadata.body}"' in binding
@@ -333,8 +369,28 @@ def test_generic_binding_preserves_graph_and_tensor_contracts():
     assert "x.size(1) % kVec == 0" in binding
     assert "CAKE_BGMV_MOE_SHRINK_DECODE<<<" in binding
     assert "CAKE_BGMV_MOE_SHRINK_PREFILL<<<" in binding
-    assert "CAKE_BGMV_MOE_EXPAND_T64<<<" in binding
-    assert "CAKE_BGMV_MOE_EXPAND_T128<<<" in binding
+    assert "CAKE_BGMV_MOE_SHRINK_DECODE_PDL<<<" in binding
+    assert "CAKE_BGMV_MOE_SHRINK_PREFILL_PDL<<<" in binding
+    # The expand is a programmatic dependent launch of the shrink (PDL): the
+    # expand grid may start while the shrink drains and waits in-kernel.
+    assert "cudaLaunchKernelEx(&config, expand_kernel_t64," in binding
+    assert "cudaLaunchKernelEx(&config, expand_kernel_t128," in binding
+    # PDL launches select the register-prefetch expand forms; plain launches the
+    # lower-register interleaved forms (both are rendered into every bundle).
+    assert "const bool prefetch_form = pdl_mode != 0;" in binding
+    assert (
+        "prefetch_form ? CAKE_BGMV_MOE_EXPAND_T64_PF : CAKE_BGMV_MOE_EXPAND_T64"
+        in binding
+    )
+    assert (
+        "prefetch_form ? CAKE_BGMV_MOE_EXPAND_T128_PF : CAKE_BGMV_MOE_EXPAND_T128"
+        in binding
+    )
+    assert "cudaLaunchAttributeProgrammaticStreamSerialization" in binding
+    assert "programmaticStreamSerializationAllowed = pdl_mode != 0 ? 1 : 0" in binding
+    # clang-format may wrap the signature; match across whitespace.
+    assert re.search(r"int64_t pdl_mode,\s*int64_t cuda_stream\)", binding)
+    assert re.search(r"kRouteAdvance,\s*hidden\)", binding)
     assert "TensorView route_index" in binding
     assert "CHECK_INPUT_TYPE(route_index, dl_int32)" in binding
     assert "kRouteIndexWordsPerToken = 3 + kRouteIndexMaxRoutes" in binding
@@ -392,3 +448,60 @@ def test_generic_shrink_launch_selection_rejects_bad_inputs():
         cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(0, 32, 3072)
     with pytest.raises(ValueError):
         cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(8, 24, 3072)
+
+
+def test_grouped_workspace_sizing_and_selector():
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_GROUP_TILE_TOKENS == 16
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_GROUP_BINS_MAX == 4096
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_GROUP_HEADER_WORDS == 4
+    # 8192 routes over 1024 bins: 1024 + 1024 tiles at most
+    assert cake_bgmv_moe.cake_bgmv_moe_group_max_tiles(8192, 1024) == 1536
+    words = cake_bgmv_moe.cake_bgmv_moe_grouped_workspace_words(8192, 4096, 1024)
+    assert cake_bgmv_moe.cake_bgmv_moe_group_hist_ctas(8192) == 8
+    assert cake_bgmv_moe.cake_bgmv_moe_group_hist_ctas(1) == 1
+    assert cake_bgmv_moe.cake_bgmv_moe_group_hist_ctas(1 << 20) == 64
+    assert words == 4 + 1025 + 1536 + 8192 + 4096 + 4096 * 16 + 2 * 8 * 1024
+    # weight reuse only pays off once routes clearly outnumber the bins
+    select = cake_bgmv_moe.select_cake_bgmv_moe_generic_grouped
+    assert select(8192, 4096, 8, 128, 4096, 32)
+    assert select(4096, 2048, 8, 128, 3072, 32)  # 4 routes per bin
+    assert not select(2048, 1024, 8, 128, 3072, 32)  # 2 routes per bin
+    assert not select(1024, 512, 8, 128, 4096, 32)
+    assert not select(8192, 4096, 64, 128, 4096, 32)  # too many bins
+    assert not select(8192, 4096, 0, 128, 4096, 32)
+    # small per-pair weights: the fixed grouping cost exceeds the reuse win
+    assert not select(8192, 4096, 8, 128, 768, 8)
+    assert select(
+        8192, 4096, 8, 128, 2048, 8
+    )  # 16384 weight elems: wins 5-13 % with the multi-CTA prologue
+    assert select(8192, 4096, 8, 128, 4096, 8)
+    assert select(8192, 4096, 8, 128, 5888, 8)
+    assert select(
+        8192, 4096, 8, 128, 768, 16
+    )  # 12288 weight elems: wins 13-16 % with the multi-CTA prologue
+    assert not select(8192, 4096, 8, 128, 512, 16)  # 8192 weight elems: below the floor
+    assert select(8192, 4096, 8, 128, 1024, 16)
+    assert select(8192, 4096, 8, 128, 2048, 16)
+    assert select(8192, 4096, 8, 128, 768, 32)
+    for rank in cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS:
+        metadata = cake_bgmv_moe._generic_metadata(rank, "bfloat16")
+        body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
+        for symbol in (
+            metadata.group_hist_symbol,
+            metadata.group_scan_symbol,
+            metadata.group_scatter_symbol,
+            metadata.shrink_grouped_symbol,
+            metadata.shrink_grouped_single_symbol,
+            metadata.expand_grouped_symbol,
+            metadata.combine_grouped_symbol,
+        ):
+            assert body.count(f"{symbol}(") == 1, symbol
+        for macro in (
+            "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_HIST",
+            "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN",
+            "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER",
+            "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED",
+            "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED",
+            "CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED",
+        ):
+            assert f"#define {macro} " in body, macro

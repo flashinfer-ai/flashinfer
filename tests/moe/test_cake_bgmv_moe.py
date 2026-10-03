@@ -54,6 +54,19 @@ def _require_cuda():
         pytest.skip("CUDA is unavailable")
 
 
+def _device_arch():
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm{major}{minor}a"
+
+
+def _expected_variant(hidden_size, num_tokens, rank=32):
+    """The bundle the selector picks for this device (per-arch token window)."""
+
+    from flashinfer.jit.cake_bgmv_moe import cake_bgmv_moe_variant
+
+    return cake_bgmv_moe_variant(hidden_size, rank, num_tokens, _device_arch())
+
+
 def _make_inputs(
     hidden_size,
     num_tokens,
@@ -339,15 +352,15 @@ def test_plan_alias_kept_and_blackwell_backend_rejected():
         )
 
 
-@pytest.mark.parametrize(
-    ("hidden_size", "rank", "variant"),
-    [(2688, 32, "specialized"), (1024, 16, "generic")],
-)
-def test_y_accum_may_be_a_column_slice_of_a_wider_buffer(hidden_size, rank, variant):
+@pytest.mark.parametrize(("hidden_size", "rank"), [(2688, 32), (1024, 16)])
+def test_y_accum_may_be_a_column_slice_of_a_wider_buffer(hidden_size, rank):
     _require_cake_arch()
     inputs = _make_inputs(hidden_size, 32, torch.bfloat16, rank=rank)
     expected = _reference(inputs)
     num_tokens = int(inputs[0].shape[0])
+    # The bundle follows the per-arch selector (specialized 2688/3072 x 32 only
+    # inside the Blackwell token window; generic everywhere else).
+    variant = _expected_variant(hidden_size, num_tokens, rank)
     wide = torch.full(
         (num_tokens, hidden_size + 64), float("nan"), dtype=torch.float32, device="cuda"
     )
@@ -463,11 +476,7 @@ def test_expert_sorted_routes_match_reference_and_replay_bitwise(
     expected = _reference(inputs)
     plan = prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
     assert isinstance(plan, BGMVMoECakePlan)
-    assert plan.variant == (
-        "specialized"
-        if hidden_size in (2688, 3072) and num_tokens <= 2048
-        else "generic"
-    )
+    assert plan.variant == _expected_variant(hidden_size, num_tokens)
     first = plan.run().clone()
     torch.cuda.synchronize()
     torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
@@ -475,10 +484,13 @@ def test_expert_sorted_routes_match_reference_and_replay_bitwise(
         replay = plan.run().clone()
         torch.cuda.synchronize()
         assert torch.equal(replay, first)
-    # Launch counter advanced once per run (first run + 3 replays); the
-    # parity recorded for the last shrink is (launches - 1) & 1.
-    assert int(plan.route_index[0]) == 4
-    assert int(plan.route_index[1]) == 1
+    if not plan.grouped:
+        # Launch counter advanced once per run (first run + 3 replays); the
+        # parity recorded for the last shrink is (launches - 1) & 1.  The
+        # pair-grouped pipeline builds its own grouping each launch and does
+        # not publish the per-route index.
+        assert int(plan.route_index[0]) == 4
+        assert int(plan.route_index[1]) == 1
     plan.close()
 
 
@@ -522,13 +534,157 @@ def test_generic_variant_matches_reference_and_replays_bitwise(
     plan.close()
 
 
-@pytest.mark.parametrize("hidden_size", [2688, 3072])
-def test_specialized_variant_is_preferred_at_rank_32(hidden_size):
+_GROUPED_CASES = [
+    # (hidden, rank, tokens, dtype, arbitrary_routes, expert_sorted, top_k)
+    (
+        768,
+        8,
+        256,
+        torch.bfloat16,
+        False,
+        False,
+        2,
+    ),  # dense bins (2 LoRAs x 128 experts)
+    (2048, 64, 192, torch.bfloat16, False, False, 2),
+    (
+        1344,
+        16,
+        160,
+        torch.float16,
+        True,
+        False,
+        2,
+    ),  # interleaved pair order, masked tail
+    (
+        4096,
+        32,
+        300,
+        torch.bfloat16,
+        False,
+        True,
+        2,
+    ),  # expert-sorted dispatch order (generic hidden)
+    (
+        736,
+        32,
+        40,
+        torch.float16,
+        True,
+        False,
+        20,
+    ),  # > 16 routes per token: scan combine
+    (2112, 64, 64, torch.float16, False, True, 4),
+]
+
+
+@pytest.mark.parametrize(
+    (
+        "hidden_size",
+        "rank",
+        "num_tokens",
+        "dtype",
+        "arbitrary_routes",
+        "expert_sorted",
+        "top_k",
+    ),
+    _GROUPED_CASES,
+    ids=[
+        f"h{h}_r{r}_t{t}_{str(d).split('.')[-1]}{'_arb' if a else ''}{'_es' if e else ''}_k{k}"
+        for h, r, t, d, a, e, k in _GROUPED_CASES
+    ],
+)
+def test_grouped_pipeline_matches_reference_and_replays_bitwise(
+    hidden_size, rank, num_tokens, dtype, arbitrary_routes, expert_sorted, top_k
+):
+    """Pair-grouped generic pipeline (forced): correct, bitwise-stable, shrink equal to per-route."""
+
     _require_cake_arch()
+    inputs = _make_inputs(
+        hidden_size,
+        num_tokens,
+        dtype,
+        rank=rank,
+        arbitrary_routes=arbitrary_routes,
+        expert_sorted=expert_sorted,
+        top_k=top_k,
+    )
+    expected = _reference(inputs)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        plan = prepare_bgmv_moe(*inputs, backend="cake", fallback=False, grouped=True)
+        baseline = prepare_bgmv_moe(
+            *inputs, backend="cake", fallback=False, grouped=False
+        )
+    assert isinstance(plan, BGMVMoECakePlan)
+    assert plan.variant == "generic" and plan.grouped
+    assert baseline.variant == "generic" and not baseline.grouped
+    first = plan.run().clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
+    reference_run = baseline.run().clone()
+    torch.cuda.synchronize()
+    # The grouped shrink runs the per-route kernel's exact FP32 FMA chain and
+    # reduction per lane, so every route's shrink row is bitwise identical to
+    # the ungrouped kernel's; only the expand's FP32 summation order differs.
+    assert torch.equal(plan.shrink_out, baseline.shrink_out)
+    torch.testing.assert_close(first, reference_run, atol=1e-5, rtol=1e-5)
+    for _ in range(3):
+        replay = plan.run().clone()
+        torch.cuda.synchronize()
+        assert torch.equal(replay, first)
+    # Replays consume current tensor contents through the same pointers (the
+    # grouping is rebuilt every launch).
+    inputs[0].mul_(0.5)
+    torch.testing.assert_close(plan.run(), _reference(inputs), atol=1e-2, rtol=1e-2)
+    plan.close()
+    baseline.close()
+
+
+def test_grouped_pipeline_is_selected_for_wide_generic_prefill():
+    _require_cake_arch()
+    wide = _make_inputs(2048, 1024, torch.bfloat16, rank=16)
+    plan = prepare_bgmv_moe(*wide, backend="cake", fallback=False)
+    assert plan.variant == "generic"
+    assert plan.grouped, "2048 routes over 256 (lora, expert) bins should group"
+    assert plan.group_partials.numel() == 2048 * 2048
+    # Same numerics as the per-route pipeline (bitwise shrink, FP32-reordered
+    # expand). The FP64 reference is covered by the forced-grouped test; at this
+    # 2M-element shape the bf16 shrink intermediate shared by both pipelines can
+    # leave a cancelling two-route element ~1e-2 off with |ref| ~3e-3, which the
+    # 1e-2 tolerance cannot absorb (seen on GB300, whose torch.randn stream
+    # differs from H100/B200 for the same seed).
+    ungrouped = prepare_bgmv_moe(*wide, backend="cake", fallback=False, grouped=False)
+    assert not ungrouped.grouped
+    torch.testing.assert_close(plan.run(), ungrouped.run(), atol=1e-5, rtol=1e-5)
+    assert torch.equal(plan.shrink_out, ungrouped.shrink_out)
+    ungrouped.close()
+    plan.close()
+    narrow = _make_inputs(2048, 64, torch.bfloat16, rank=16)
+    plan = prepare_bgmv_moe(*narrow, backend="cake", fallback=False)
+    assert plan.variant == "generic" and not plan.grouped
+    assert plan.group_partials.numel() == 1
+    plan.close()
+    forced_off = prepare_bgmv_moe(*wide, backend="cake", fallback=False, grouped=False)
+    assert not forced_off.grouped
+    forced_off.close()
+
+
+@pytest.mark.parametrize("hidden_size", [2688, 3072])
+def test_specialized_variant_window_at_rank_32(hidden_size):
+    _require_cake_arch()
+    # Decode-sized launches take the generic bundle on every architecture
+    # (hidden-split shrink + programmatic dependent launch); the specialized
+    # bodies are used only inside the per-arch token window (Blackwell 128..512).
     plan = prepare_bgmv_moe(
         *_make_inputs(hidden_size, 4, torch.bfloat16), backend="cake"
     )
-    assert plan.variant == "specialized"
+    assert plan.variant == "generic"
+    plan.close()
+    plan = prepare_bgmv_moe(
+        *_make_inputs(hidden_size, 256, torch.bfloat16), backend="cake"
+    )
+    assert plan.variant == _expected_variant(hidden_size, 256)
+    assert plan.variant == ("generic" if _device_arch() == "sm90a" else "specialized")
     plan.close()
     plan = prepare_bgmv_moe(
         *_make_inputs(hidden_size, 4, torch.bfloat16, rank=16), backend="cake"
