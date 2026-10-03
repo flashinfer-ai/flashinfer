@@ -1,8 +1,8 @@
 {
   "files": {
-    "csrc/fused_moe/warp_decode/cake_warp_decode_binding.cu": "cdec1e8e125013f0d8f389e15af51c99170b3af65b0d38b106d6f07b3c076745",
-    "csrc/fused_moe/warp_decode/cake_warp_decode_contract.cuh": "5e87f3c0a1199d9a231be0e743d9972a69e622fcfdc7fe5899c6da92602e90ef",
-    "csrc/fused_moe/warp_decode/generated/cake_warp_decode_generated_manifest.cuh": "15b50b86964dd9d99e4c9b0d4eb427acd9fb5c97b136e52b8ba05edc65b19de7",
+    "csrc/fused_moe/warp_decode/cake_warp_decode_binding.cu": "22c9b99ac4d41050f8b95d35ac6345977bea854cb39168a661c040b7d2b15da0",
+    "csrc/fused_moe/warp_decode/cake_warp_decode_contract.cuh": "0932d60df94ec88dbfd93b19d891d32f88548a3f79323f1304dbc0a183fff363",
+    "csrc/fused_moe/warp_decode/generated/cake_warp_decode_generated_manifest.cuh": "1e88e68fee3da0267bb5cac572be5d51dbfbbc0461850bbf72a525c2cd06e778",
     "csrc/fused_moe/warp_decode/generated/sm_100a/cake_warp_decode_024bed5eb8061821a022_binding.cu": "3bc08da482f9c8c4c796f10593ae0088ad0e4322c65d4dbadda0ddcffc24b6ad",
     "csrc/fused_moe/warp_decode/generated/sm_100a/cake_warp_decode_024bed5eb8061821a022_kernel.cu": "32f7090e1f1741dd3aad6e10c162d030f069231694e9270bf3e43ef8ba739919",
     "csrc/fused_moe/warp_decode/generated/sm_100a/cake_warp_decode_1919fdc835c6d5747044_binding.cu": "76e14c910fe7d8556642b62ad9adb6e2058a089d3dca368bedbb574998af1629",
@@ -981,7 +981,7 @@
       "role": "kernel"
     }
   ],
-  "program_hash": "39f3d098d179bbc1b9e897db4050489d91a769aca1171e53f3fa1c60c07aeed4",
+  "program_hash": "9ec67885c070f79fd32f91ac43c76df7f6ae5f9f9dec848719bb0d212e091d47",
   "routes": [
     {
       "arch": "sm_100a",

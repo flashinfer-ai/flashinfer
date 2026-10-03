@@ -817,6 +817,10 @@ class CakeWarpDecodeRunner(MoERunner):
     ``alpha=1`` and ``beta=0``. Parameterized SwiGLU and SiTU use an extended
     launch entry point that consumes the prepared per-expert activation tensors.
     Activation is identified by the exact geometry.
+    The SM100 H4096/I2048/E256/top-k6 route keeps its dedicated clamped
+    entry and raw-accumulator parameter units. Its weights require matched
+    NVFP4 shuffled MajorK data and R128c4 E4M3 block scales, not merely an
+    FP4 dtype label; checkpoint conversion precedes weight-pack preparation.
     """
 
     backend_key = "cake"
@@ -833,6 +837,7 @@ class CakeWarpDecodeRunner(MoERunner):
         (SwiGLU(), 2048, 1536, 60, 4),
         (SwiGLU(), 2560, 768, 384, 4),
         (SiLU(), 6144, 1536, 192, 4),
+        (SwiGLU(limit=10.0), 4096, 2048, 256, 6),
         (SwiGLU(), 2048, 768, 128, 8),
         (SwiGLU(), 4096, 1536, 128, 8),
         (SwiGLU(), 2048, 512, 256, 8),
@@ -852,6 +857,7 @@ class CakeWarpDecodeRunner(MoERunner):
     )
     _GATED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = ("gemm1_alpha",)
     _ACTIVATION_PARAMETER_KEYS: ClassVar[dict[ActivationConfig, tuple[str, ...]]] = {
+        SwiGLU(limit=10.0): ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
         SwiGLU(alpha=1.702, beta=1.0, limit=7.0): (
             "gemm1_alpha",
             "gemm1_beta",
@@ -897,6 +903,9 @@ class CakeWarpDecodeRunner(MoERunner):
         # profiled as-is, so the autotuner never synthesizes invalid expert ids.
         self.tuning_config = TuningConfig(use_cuda_graph=True)
 
+    def _uses_clamped_swiglu(self) -> bool:
+        return self.config.activation == SwiGLU(limit=10.0)
+
     def _check_support(self) -> None:
         super()._check_support()
         if self._device_arch not in (100, 103):
@@ -904,6 +913,8 @@ class CakeWarpDecodeRunner(MoERunner):
                 "CakeWarpDecodeRunner requires exact SM100 or SM103, "
                 f"got SM{self._device_arch}."
             )
+        if self._uses_clamped_swiglu() and self._device_arch != 100:
+            raise NotImplementedError("Clamped E256 warp decode requires exact SM100.")
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("CakeWarpDecodeRunner requires do_finalize=True.")
         if self.config.execution.enable_pdl is not True:
@@ -952,7 +963,8 @@ class CakeWarpDecodeRunner(MoERunner):
                 "(1536, 256, 8), and SiLU() with "
                 "(1536, 192, 4), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
                 "with (3072, 128, 4), or SiTU(gate_scale=4.0, linear_scale=25.0) "
-                "with (3072, 896, 16); got "
+                "with (3072, 896, 16), or SwiGLU(limit=10.0) with "
+                "(2048, 256, 6) on SM100; got "
                 f"{configuration_without_hidden}."
             )
 
@@ -1181,8 +1193,8 @@ class CakeWarpDecodeRunner(MoERunner):
         # pack_inputs runs before forward on every MoELayer call. During graph
         # capture it cannot allocate, so transfer the most recently used,
         # already-prepared workspace for this exact geometry to the capture
-        # stream. forward records the stream claim and C++ inserts the external
-        # completion-event dependency on any prior warmup submission.
+        # stream. forward records the stream claim. The caller must order uses
+        # of shared scratch: captured calls do not wait on a prior submission.
         for cached_key, (_, workspace) in reversed(self._workspace_cache.items()):
             if cached_key[1] != geometry:
                 continue
@@ -1226,10 +1238,10 @@ class CakeWarpDecodeRunner(MoERunner):
             )
         ):
             # A framework may pack on its caller stream and perform the first
-            # real launch on an internal side stream. During capture, the C++
-            # completion event records the dependency on any prior warmup
-            # submission, so the prepared packed workspace can transfer without
-            # allocation. Eager cross-stream calls still allocate independently.
+            # real launch on an internal side stream. Capture can transfer the
+            # prepared workspace without allocation; the caller must order any
+            # graph replay or eager call sharing it. Captured launches do not
+            # insert a wait. Eager cross-stream calls allocate independently.
             self._cache_workspace_for_stream(stream, geometry, packed_workspace)
             return packed_workspace
 
@@ -1337,7 +1349,8 @@ class CakeWarpDecodeRunner(MoERunner):
                 "with (6144, 1536, 192, 4), "
                 "SwiGLU(alpha=1.702, beta=1.0, limit=7.0) with (6144, 3072, 128, 4), "
                 "or SiTU(gate_scale=4.0, linear_scale=25.0) "
-                "with (3584, 3072, 896, 16); got "
+                "with (3584, 3072, 896, 16), or SwiGLU(limit=10.0) with "
+                "(4096, 2048, 256, 6) on SM100; got "
                 f"{configuration}."
             )
 
@@ -1375,6 +1388,8 @@ class CakeWarpDecodeRunner(MoERunner):
 
         view = weights.get_view(self.backend_key)
         activation = self.config.activation
+        if self._uses_clamped_swiglu() and self._device_arch != 100:
+            raise NotImplementedError("Clamped E256 warp decode requires exact SM100.")
         activation_parameter_keys = self._ACTIVATION_PARAMETER_KEYS.get(activation, ())
         gated_weight_keys = (
             activation_parameter_keys or self._GATED_WEIGHT_KEYS
@@ -1542,7 +1557,11 @@ class CakeWarpDecodeRunner(MoERunner):
             self._stream_token(stream),
         )
         try:
-            if parameterized:
+            if self._uses_clamped_swiglu():
+                self._module.cake_fused_moe_warp_decode_clamped_swiglu(
+                    *launch_inputs, prepared[1], True
+                )
+            elif parameterized:
                 self._module.cake_fused_moe_warp_decode_with_activation_params(
                     *launch_inputs, prepared[1], True
                 )

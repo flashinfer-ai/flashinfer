@@ -134,6 +134,15 @@ GEOMETRIES = (
     Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
     Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
     Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
+    Geometry(
+        "e256_i2048_k6_clamp10",
+        4096,
+        2048,
+        256,
+        6,
+        (1, 6, 7, 8, 9, 10, 11, 12, 22, 23, 24, 32),
+        SwiGLU(limit=10.0),
+    ),
     Geometry("e384_i768_k4", 2560, 768, 384, 4, (1, 2, 32)),
     Geometry("e128_i768_k8", 2048, 768, 128, 8, (1, 2, 32)),
     Geometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 2, 32)),
@@ -175,6 +184,18 @@ def _uses_activation_params(geometry: Geometry) -> bool:
 
 def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
     """Name the fixed schedule/route-packer bucket exercised by a row."""
+    if geometry.activation == SwiGLU(limit=10.0):
+        # Names describe the semantic selection; generated inventory supplies
+        # exact kernel identities, not a second heuristic selector.
+        if num_tokens <= 6:
+            return "direct"
+        if num_tokens in (7, 8):
+            return "direct_expert_order"
+        if num_tokens in (9, 10):
+            return "packed_sorted_short"
+        if num_tokens in (11, 23):
+            return "packed_count_rank"
+        return "packed_general"
     key = (
         geometry.hidden_size,
         geometry.intermediate_size,
@@ -346,6 +367,8 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
         )
         * 0.02
     ).to(torch.bfloat16)
+    if geometry.activation == SwiGLU(limit=10.0):
+        hidden.mul_(16.0)  # Exercise both upper-gate and symmetric-linear clamp.
     hidden_q, hidden_scale = TrtllmFp4Config.prepare_activations(
         hidden,
         quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
@@ -360,6 +383,16 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
         activation=geometry.activation,
         device=device,
     )
+    if geometry.activation == SwiGLU(limit=10.0):
+        # Both arms consume these same physical tensors. Non-unit gate scales
+        # exercise the raw-accumulator clamp conversion used by calibrated views.
+        gate_scale = torch.linspace(
+            0.5, 1.5, geometry.num_experts, dtype=torch.float32, device=device
+        )
+        weight_view["output1_scale_gate_scalar"] = gate_scale
+        weight_view["gemm1_clamp_limit"] = (
+            torch.full_like(gate_scale, 10.0) / gate_scale
+        )
     initial_ids, initial_weights = _make_routing(geometry, mutated=False)
     mutated_ids, mutated_weights = _make_routing(geometry, mutated=True)
     return PhysicalFixture(
@@ -530,7 +563,16 @@ def _invoke_cake(
         view["output1_scale_gate_scalar"],
         view["output2_scale_scalar"],
     )
-    if _uses_activation_params(case.geometry):
+    if case.geometry.activation == SwiGLU(limit=10.0):
+        module.cake_fused_moe_warp_decode_clamped_swiglu(
+            *inputs,
+            view["gemm1_alpha"],
+            view["gemm1_beta"],
+            view["gemm1_clamp_limit"],
+            workspace_receipt,
+            True,
+        )
+    elif _uses_activation_params(case.geometry):
         module.cake_fused_moe_warp_decode_with_activation_params(
             *inputs,
             view.get("gemm1_alpha"),
@@ -938,9 +980,12 @@ def _workspace_retirement_case(
             _release_workspace_receipt_fail_closed(module, workspace, retiring_receipt)
 
 
-def _layer_graph_case(fixture: PhysicalFixture) -> dict[str, Any]:
+def _layer_graph_case(
+    fixture: PhysicalFixture, num_tokens: int | None = None
+) -> dict[str, Any]:
     """Exercise the public MoELayer winner path and graph capture end to end."""
-    num_tokens = fixture.geometry.selector_boundaries[1]
+    if num_tokens is None:
+        num_tokens = fixture.geometry.selector_boundaries[1]
     case = fixture.stage_routes(num_tokens, mutated=False)
     geometry = fixture.geometry
     activations = MoEActivationPack(
@@ -1480,6 +1525,8 @@ def run_benchmark(
         tokens = (
             tuple(benchmark_tokens)
             if benchmark_tokens is not None
+            else tuple(range(1, MAX_TOKENS + 1))
+            if geometry.activation == SwiGLU(limit=10.0)
             else geometry.selector_boundaries
         )
         for num_tokens in tokens:
@@ -1597,10 +1644,18 @@ def run_benchmark(
 
 def _selected_geometries(name: str) -> tuple[Geometry, ...]:
     if name == "all":
-        return GEOMETRIES
+        return tuple(
+            geometry
+            for geometry in GEOMETRIES
+            if geometry.activation != SwiGLU(limit=10.0)
+            or torch.cuda.get_device_capability() == (10, 0)
+        )
     selected = tuple(geometry for geometry in GEOMETRIES if geometry.name == name)
     if not selected:
         raise ValueError(f"unknown geometry {name!r}")
+    if any(g.activation == SwiGLU(limit=10.0) for g in selected):
+        if torch.cuda.get_device_capability() != (10, 0):
+            raise ValueError("Clamped E256 warp decode requires exact SM100.")
     return selected
 
 
