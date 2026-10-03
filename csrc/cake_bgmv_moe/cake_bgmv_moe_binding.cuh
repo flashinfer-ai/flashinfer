@@ -152,8 +152,14 @@ inline int32_t OutputRowStride(const TensorView& y_accum, int64_t num_tokens, in
 void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lora_a,
          TensorView lora_b, TensorView sorted_token_ids, TensorView expert_ids,
          TensorView lora_indices, TensorView topk_weights, TensorView route_index,
-         int64_t schedule_value, int64_t cuda_stream) {
+         int64_t schedule_value, int64_t pdl_mode, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
+  // The specialized bodies take plain launches: measured as programmatic
+  // dependents they lose 2-16 % (round 5), so these kernels carry no
+  // griddepcontrol instruction and the host policy always passes 0.
+  TVM_FFI_ICHECK(pdl_mode == 0) << "the specialized Cake BGMV MoE kernels take plain launches "
+                                   "(pdl_mode must be 0), got "
+                                << pdl_mode;
   CHECK_CUDA(x);
   // The device/module match is checked once in Configure (module load); the
   // Python side already routes each device to the module compiled for it.
@@ -266,26 +272,42 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
 
   const int32_t output_stride = OutputRowStride(y_accum, num_tokens, kHidden);
   const int32_t output_offset = 0;
+  // Plain stream launch (no programmatic dependency): the specialized kernels
+  // carry no griddepcontrol instruction.
+  cudaLaunchConfig_t config = {};
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 0;
+  config.attrs = attrs;
+  config.numAttrs = 1;
+  cudaError_t expand_status;
   if (schedule == Schedule::kTokenOwnedT64) {
-    const dim3 grid(num_tokens, (kHidden + 63) / 64, 1);
-    CAKE_BGMV_MOE_EXPAND_TOKEN_T64<<<grid, 64, kExpandT64SmemBytes, stream>>>(
-        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup,
-        kRouteAdvance);
+    config.gridDim = dim3(num_tokens, (kHidden + 63) / 64, 1);
+    config.blockDim = dim3(64, 1, 1);
+    config.dynamicSmemBytes = kExpandT64SmemBytes;
+    expand_status = cudaLaunchKernelEx(&config, CAKE_BGMV_MOE_EXPAND_TOKEN_T64, y_ptr, shrink_ptr,
+                                       b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr,
+                                       num_pairs, num_experts, num_tokens, output_stride,
+                                       output_offset, route_ptr, kRouteLookup, kRouteAdvance);
   } else if (schedule == Schedule::kTokenOwned) {
-    const dim3 grid(num_tokens, (kHidden + 127) / 128, 1);
-    CAKE_BGMV_MOE_EXPAND_TOKEN<<<grid, 128, kExpandTokenSmemBytes, stream>>>(
-        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup,
-        kRouteAdvance);
+    config.gridDim = dim3(num_tokens, (kHidden + 127) / 128, 1);
+    config.blockDim = dim3(128, 1, 1);
+    config.dynamicSmemBytes = kExpandTokenSmemBytes;
+    expand_status =
+        cudaLaunchKernelEx(&config, CAKE_BGMV_MOE_EXPAND_TOKEN, y_ptr, shrink_ptr, b_ptr, token_ptr,
+                           expert_ptr, lora_ptr, weight_ptr, num_pairs, num_experts, num_tokens,
+                           output_stride, output_offset, route_ptr, kRouteLookup, kRouteAdvance);
   } else {
-    const dim3 grid(num_tokens, (kHidden + 255) / 256, 1);
-    CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL<<<grid, 128, kExpandDualSmemBytes, stream>>>(
-        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup,
-        kRouteAdvance);
+    config.gridDim = dim3(num_tokens, (kHidden + 255) / 256, 1);
+    config.blockDim = dim3(128, 1, 1);
+    config.dynamicSmemBytes = kExpandDualSmemBytes;
+    expand_status = cudaLaunchKernelEx(&config, CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL, y_ptr, shrink_ptr,
+                                       b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr,
+                                       num_pairs, num_experts, num_tokens, output_stride,
+                                       output_offset, route_ptr, kRouteLookup, kRouteAdvance);
   }
-  CheckCuda(cudaGetLastError(), "Cake BGMV MoE expand launch");
+  CheckCuda(expand_status, "Cake BGMV MoE expand launch");
 }
 
 }  // namespace cake_bgmv_moe

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import functools
 from pathlib import Path
-from typing import Literal, NamedTuple, Optional, Sequence, Tuple
+from typing import Literal, NamedTuple, Optional, Sequence, Tuple, Dict
 
 from . import env as jit_env
 from .core import (
@@ -86,6 +86,106 @@ CAKE_BGMV_MOE_SHRINK_SPLIT_PARTIAL_WORDS = (
 CAKE_BGMV_MOE_SHRINK_SPLIT_COUNTER_WORDS = CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS * (
     64 // CAKE_BGMV_MOE_SHRINK_RANK_TILE
 )
+
+
+# Pair-grouped pipeline (generic bundles, round 5): routes are grouped by their
+# unique (LoRA, expert) pair so each pair's A/B weights are streamed once per tile
+# of ``CAKE_BGMV_MOE_GROUP_TILE_TOKENS`` routes instead of once per route. The
+# plan owns an int32 grouping workspace (header, bin counts/offsets/fill, tile
+# table, grouped route ids, per-token route lists, per-CTA histogram rows) rebuilt by the grouping kernels
+# on every launch, and FP32 per-route expand partials ``[num_pairs, hidden]``
+# that the deterministic per-token combine sums in ascending pair order.
+CAKE_BGMV_MOE_GROUP_TILE_TOKENS = 16
+CAKE_BGMV_MOE_GROUP_BINS_MAX = 4096
+CAKE_BGMV_MOE_GROUP_HEADER_WORDS = 4
+CAKE_BGMV_MOE_GROUP_HIST_THREADS = 256
+CAKE_BGMV_MOE_GROUP_HIST_PAIRS_PER_LANE = 4
+CAKE_BGMV_MOE_GROUP_HIST_CTAS_MAX = 64
+CAKE_BGMV_MOE_GROUPED_MIN_PAIRS = 2048
+CAKE_BGMV_MOE_GROUPED_MIN_ROUTES_PER_BIN = 4
+CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS = 12288
+CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS_R8 = 16384
+
+
+def cake_bgmv_moe_group_max_tiles(num_pairs: int, bins: int) -> int:
+    """Upper bound on the (group, token chunk) tiles of the grouped kernels."""
+
+    return (
+        int(num_pairs) + CAKE_BGMV_MOE_GROUP_TILE_TOKENS - 1
+    ) // CAKE_BGMV_MOE_GROUP_TILE_TOKENS + int(bins)
+
+
+def cake_bgmv_moe_group_hist_ctas(num_pairs: int) -> int:
+    """CTAs of the grouping histogram / scatter kernels (mirrors the binding's GroupHistCtas)."""
+
+    per_cta = CAKE_BGMV_MOE_GROUP_HIST_THREADS * CAKE_BGMV_MOE_GROUP_HIST_PAIRS_PER_LANE
+    return max(
+        1,
+        min(
+            CAKE_BGMV_MOE_GROUP_HIST_CTAS_MAX, (int(num_pairs) + per_cta - 1) // per_cta
+        ),
+    )
+
+
+def cake_bgmv_moe_grouped_workspace_words(
+    num_pairs: int, num_tokens: int, bins: int
+) -> int:
+    """int32 words of the grouping workspace (mirrors the binding's ComputeGroupedOffsets)."""
+
+    num_pairs, num_tokens, bins = int(num_pairs), int(num_tokens), int(bins)
+    return (
+        CAKE_BGMV_MOE_GROUP_HEADER_WORDS
+        + bins
+        + 1  # bin offsets
+        + cake_bgmv_moe_group_max_tiles(num_pairs, bins)
+        + num_pairs  # grouped route ids
+        + num_tokens  # per-token route counts
+        + num_tokens * CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES
+        + 2
+        * cake_bgmv_moe_group_hist_ctas(num_pairs)
+        * bins  # per-CTA histogram + base rows
+    )
+
+
+def select_cake_bgmv_moe_generic_grouped(
+    num_pairs: int,
+    num_tokens: int,
+    num_loras: int,
+    num_experts: int,
+    hidden_size: int,
+    rank: int,
+) -> bool:
+    """True when the generic plan should run the pair-grouped pipeline.
+
+    Mirrors the Cake generator's ``select_generic_grouped``: weight reuse pays
+    off once the routes clearly outnumber the ``num_loras * num_experts`` bins
+    (``CAKE_BGMV_MOE_GROUPED_MIN_PAIRS`` routes and
+    ``CAKE_BGMV_MOE_GROUPED_MIN_ROUTES_PER_BIN`` routes per bin) and the
+    per-pair weights (``hidden_size * rank``) are large enough for the saved
+    traffic to exceed the fixed grouping prologue and the FP32 partials round
+    trip; the grouping prologue bounds the bin count by
+    ``CAKE_BGMV_MOE_GROUP_BINS_MAX``.
+    """
+
+    bins = int(num_loras) * int(num_experts)
+    if bins <= 0 or bins > CAKE_BGMV_MOE_GROUP_BINS_MAX:
+        return False
+    if int(num_pairs) < CAKE_BGMV_MOE_GROUPED_MIN_PAIRS:
+        return False
+    if int(num_pairs) < CAKE_BGMV_MOE_GROUPED_MIN_ROUTES_PER_BIN * bins:
+        return False
+    min_elems = (
+        CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS
+        if int(rank) >= 16
+        else CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS_R8
+    )
+    if int(hidden_size) * int(rank) < min_elems:
+        return False
+    if (
+        int(num_pairs) + CAKE_BGMV_MOE_GROUP_TILE_TOKENS - 1
+    ) // CAKE_BGMV_MOE_GROUP_TILE_TOKENS >= 65536:
+        return False
+    return cake_bgmv_moe_group_max_tiles(num_pairs, bins) < 2**31
 
 
 def cake_bgmv_moe_route_index_words(num_tokens: int) -> int:
@@ -174,8 +274,19 @@ class CakeBGMVMoEGenericMetadata(NamedTuple):
     body: str
     shrink_decode_symbol: str
     shrink_prefill_symbol: str
+    shrink_decode_pdl_symbol: str
+    shrink_prefill_pdl_symbol: str
     expand_t64_symbol: str
     expand_t128_symbol: str
+    expand_t64_pf_symbol: str
+    expand_t128_pf_symbol: str
+    group_hist_symbol: str
+    group_scan_symbol: str
+    group_scatter_symbol: str
+    shrink_grouped_symbol: str
+    shrink_grouped_single_symbol: str
+    expand_grouped_symbol: str
+    combine_grouped_symbol: str
 
 
 def cake_bgmv_moe_arch_for_capability(
@@ -245,33 +356,92 @@ def _check_generic_rank(rank: int) -> None:
         )
 
 
-# Above this many tokens the generic rank-32 bundle (rank-split expand,
-# register-accumulated shrink) beats the specialized hidden 2688/3072 bodies
-# (GB300 shrink+expand, contiguous: 220 vs 227 us at 2048 tokens, 388 vs 449
-# us at 4096; expert-sorted 437 vs 495 us at 4096; the specialized bodies
-# lead by ~13% at 1024 tokens).
-CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS = 2048
+# Token-count window (inclusive) in which the specialized hidden 2688/3072 x
+# rank-32 bodies serve, per architecture.  The window is independent of the
+# route layout the host cannot see: below it the generic bundle's hidden-split
+# shrink and programmatic dependent launch win by 1.5-2.6x at 1-16 tokens on
+# both layouts; inside it the specialized bodies win on expert-sorted routes
+# (generic 1.08-1.10x slower at 32 tokens, 1.2-1.3x at 64-256, 1.3-1.5x at
+# 512-1024 on B200/GB300) while losing 7-21 % on contiguous top-k=2 routes;
+# above it the generic pair-grouped pipeline wins (~0.65 at 2048 tokens).  On
+# Hopper the generic bundle wins or ties at every token count.  Measured in
+# round 5 (lever 8, fair screens with PDL on both arms, 3 interleaved reps).
+CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW: Dict[
+    CakeBGMVMoEArch, Optional[Tuple[int, int]]
+] = {
+    "sm90a": None,
+    "sm100a": (32, 1024),
+    "sm103a": (32, 1024),
+}
+
+# Programmatic dependent launch (PDL) of the per-route expand behind the shrink.
+# Mode 0 = plain stream launch, 1 = shrink triggers its dependents at CTA entry,
+# 2 = shrink triggers after its tile loop.  Blackwell wins with PDL on every
+# decode row (early best for small expand grids, late best for large grids);
+# Hopper wins only on small expand grids and loses 1-5 % at 512 tokens with
+# either trigger.  "Small" = at most this many expand CTAs per SM, counted at
+# 128 output columns per CTA: crossover sweeps (736/1472/2944 x 32 x 32..256
+# tokens) put the Blackwell early/late crossover between 768 and 1472 CTAs
+# (8/SM) and the Hopper early/off crossover between 1536 and 2944 CTAs (12/SM).
+CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM: Dict[CakeBGMVMoEArch, int] = {
+    "sm90a": 12,
+    "sm100a": 8,
+    "sm103a": 8,
+}
+CAKE_BGMV_MOE_PDL_EXPAND_COLS_NOMINAL = 128
+
+
+def cake_bgmv_moe_pdl_mode(
+    arch: CakeBGMVMoEArch,
+    num_tokens: int,
+    hidden_size: int,
+    sm_count: int,
+    variant: CakeBGMVMoEVariant = "generic",
+) -> int:
+    """PDL launch mode for the per-route shrink -> expand pair (0 off, 1 early, 2 late).
+
+    The specialized 2688/3072 bodies take plain launches on every architecture:
+    round-5 A/B vs the plain launch measured the late trigger 1.02-1.04 at
+    256-512 tokens and the early trigger 1.09-1.11 at 1024 expert-sorted
+    tokens (the earlier "specialized PDL ~1.00" screens ran stale bundles
+    without griddepcontrol)."""
+
+    if variant == "specialized":
+        return 0
+    cols = CAKE_BGMV_MOE_PDL_EXPAND_COLS_NOMINAL
+    expand_ctas = int(num_tokens) * ((int(hidden_size) + cols - 1) // cols)
+    per_sm = CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM.get(arch, 0)
+    small = expand_ctas <= per_sm * int(sm_count)
+    if arch in ("sm100a", "sm103a"):
+        return 1 if small else 2
+    if arch == "sm90a":
+        return 1 if small else 0
+    return 0
 
 
 def cake_bgmv_moe_variant(
-    hidden_size: int, rank: int, num_tokens: Optional[int] = None
+    hidden_size: int,
+    rank: int,
+    num_tokens: Optional[int] = None,
+    arch: Optional[CakeBGMVMoEArch] = None,
 ) -> Optional[CakeBGMVMoEVariant]:
     """Return which generated Cake bundle serves ``(hidden_size, rank)``.
 
-    ``"specialized"`` for the measured hidden 2688/3072 x rank 32 bodies at up
-    to ``CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS`` tokens (``num_tokens=None``
-    means "any token count"), ``"generic"`` for any other hidden size that is
-    a positive multiple of 8 at rank 8, 16, 32 or 64, and ``None`` when no
+    ``"specialized"`` for the measured hidden 2688/3072 x rank 32 bodies when
+    ``num_tokens`` lies in ``CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW[arch]``
+    (``num_tokens=None`` means "any token count" and keeps the specialized
+    answer for support queries), ``"generic"`` for any other hidden size that
+    is a positive multiple of 8 at rank 8, 16, 32 or 64, and ``None`` when no
     generated program applies.
     """
 
     hidden_size = int(hidden_size)
     rank = int(rank)
     if hidden_size in CAKE_BGMV_MOE_HIDDEN_SIZES and rank == 32:
-        if (
-            num_tokens is None
-            or int(num_tokens) <= CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS
-        ):
+        if num_tokens is None:
+            return "specialized"
+        window = CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW.get(arch or "sm100a")
+        if window is not None and window[0] <= int(num_tokens) <= window[1]:
             return "specialized"
         return "generic"
     if (
@@ -294,12 +464,41 @@ def _generic_metadata(rank: int, dtype: CakeBGMVMoEDType) -> CakeBGMVMoEGenericM
         shrink_prefill_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p1_s2"
         ),
+        # PDL forms: griddepcontrol.launch_dependents (early/late by pdl_early);
+        # selected by the binding together with the prefetch expand forms.
+        shrink_decode_pdl_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p4_s3_pdl"
+        ),
+        shrink_prefill_pdl_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p1_s2_pdl"
+        ),
         expand_t64_symbol=(
             f"kernel_flashinfer_bgmv_moe_expand_generic_token_t64_{tag}_r{rank}"
         ),
         expand_t128_symbol=(
             f"kernel_flashinfer_bgmv_moe_expand_generic_token_t128_{tag}_r{rank}"
         ),
+        # Register-prefetch forms: both routes' B rows are loaded into registers
+        # before griddepcontrol.wait. Selected by the binding for PDL launches
+        # (pdl_mode != 0); plain launches take the lower-register forms above.
+        expand_t64_pf_symbol=(
+            f"kernel_flashinfer_bgmv_moe_expand_generic_token_t64_pf_{tag}_r{rank}"
+        ),
+        expand_t128_pf_symbol=(
+            f"kernel_flashinfer_bgmv_moe_expand_generic_token_t128_pf_{tag}_r{rank}"
+        ),
+        group_hist_symbol=f"kernel_flashinfer_bgmv_moe_group_hist_{tag}_r{rank}",
+        group_scan_symbol=f"kernel_flashinfer_bgmv_moe_group_scan_{tag}_r{rank}",
+        group_scatter_symbol=f"kernel_flashinfer_bgmv_moe_group_scatter_{tag}_r{rank}",
+        shrink_grouped_symbol=f"kernel_flashinfer_bgmv_moe_shrink_grouped_{tag}_r{rank}",
+        # Lever 20k: one-rank-tile-per-CTA form (rank 8 has one rank tile: same kernel).
+        shrink_grouped_single_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_grouped_single_{tag}_r{rank}"
+            if rank > 8
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_{tag}_r{rank}"
+        ),
+        expand_grouped_symbol=f"kernel_flashinfer_bgmv_moe_expand_grouped_{tag}_r{rank}",
+        combine_grouped_symbol=f"kernel_flashinfer_bgmv_moe_combine_grouped_{tag}_r{rank}",
     )
 
 
@@ -453,8 +652,19 @@ def _generic_binding_source(
 #define CAKE_BGMV_MOE_CC_MINOR {minor}
 #define CAKE_BGMV_MOE_SHRINK_DECODE {metadata.shrink_decode_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL {metadata.shrink_prefill_symbol}
+#define CAKE_BGMV_MOE_SHRINK_DECODE_PDL {metadata.shrink_decode_pdl_symbol}
+#define CAKE_BGMV_MOE_SHRINK_PREFILL_PDL {metadata.shrink_prefill_pdl_symbol}
 #define CAKE_BGMV_MOE_EXPAND_T64 {metadata.expand_t64_symbol}
 #define CAKE_BGMV_MOE_EXPAND_T128 {metadata.expand_t128_symbol}
+#define CAKE_BGMV_MOE_EXPAND_T64_PF {metadata.expand_t64_pf_symbol}
+#define CAKE_BGMV_MOE_EXPAND_T128_PF {metadata.expand_t128_pf_symbol}
+#define CAKE_BGMV_MOE_GROUP_HIST {metadata.group_hist_symbol}
+#define CAKE_BGMV_MOE_GROUP_SCAN {metadata.group_scan_symbol}
+#define CAKE_BGMV_MOE_GROUP_SCATTER {metadata.group_scatter_symbol}
+#define CAKE_BGMV_MOE_SHRINK_GROUPED {metadata.shrink_grouped_symbol}
+#define CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE {metadata.shrink_grouped_single_symbol}
+#define CAKE_BGMV_MOE_EXPAND_GROUPED {metadata.expand_grouped_symbol}
+#define CAKE_BGMV_MOE_COMBINE_GROUPED {metadata.combine_grouped_symbol}
 
 #include \"cake_bgmv_moe_generic_binding.cuh\"
 """
@@ -589,7 +799,10 @@ __all__ = [
     "CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN",
     "CAKE_BGMV_MOE_SCHEDULE_IDS",
     "CAKE_BGMV_MOE_SHRINK_SPLIT_MAX",
-    "CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS",
+    "CAKE_BGMV_MOE_PDL_EXPAND_COLS_NOMINAL",
+    "CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM",
+    "CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW",
+    "cake_bgmv_moe_pdl_mode",
     "CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS",
     "CakeBGMVMoEArch",
     "CakeBGMVMoEArchTarget",
@@ -610,6 +823,10 @@ __all__ = [
     "get_cake_bgmv_moe_module",
     "get_cake_bgmv_moe_uri",
     "select_cake_bgmv_moe_generic_shrink",
+    "select_cake_bgmv_moe_generic_grouped",
+    "cake_bgmv_moe_grouped_workspace_words",
+    "cake_bgmv_moe_group_max_tiles",
+    "cake_bgmv_moe_group_hist_ctas",
     "load_cake_bgmv_moe_generic_module",
     "load_cake_bgmv_moe_module",
     "select_cake_bgmv_moe_generic_schedule",
