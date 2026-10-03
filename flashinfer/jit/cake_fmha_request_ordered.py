@@ -345,7 +345,8 @@ def _compile_cubin(spec: CakeFmhaRequestOrderedModuleSpec) -> bytes:
 
     source = spec.device_path.read_bytes()
     options = _nvrtc_options(spec)
-    if any("o1" in option.lower() for option in options):
+    # Match the flag itself, not an "o1" substring in a CUDA include path.
+    if any(option.lower() == "-o1" for option in options):
         raise RuntimeError(f"forbidden O1 option in Cake FMHA NVRTC flags: {options}")
     result, program = nvrtc.nvrtcCreateProgram(source, b"kernel.cu", 0, [], [])
     if not _result_ok(result):
