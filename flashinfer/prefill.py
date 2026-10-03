@@ -53,6 +53,7 @@ from .jit.attention.modules import (
     _gen_batch_prefill_primary_module,
 )
 from .jit.attention.utils import _is_nvfp4_kv_dtype
+from .jit.core import logger
 from .mla import (
     trtllm_prefill_with_kv_cache_mla as trtllm_prefill_with_kv_cache_mla,
 )
@@ -1654,6 +1655,53 @@ def _nvfp4_kv_requires_disabled_split_kv(
     return get_compute_capability(device) in _NVFP4_SPLIT_KV_BROKEN_ARCHS
 
 
+def _resolve_uniform_q_len(
+    uniform_q_len: Optional[int],
+    qo_indptr_host: torch.Tensor,
+    is_cuda_graph_enabled: bool,
+    backend: str,
+    caller: str,
+) -> int:
+    """Return the ``uniform_q_len`` value handed to the FA2 planner.
+
+    ``0`` means "no promise": a CUDA-graph plan then sizes its query tile for
+    the ragged worst case ``total_num_rows - batch_size + 1`` rows
+    (``PrefillSplitQOKVIndptr`` in include/flashinfer/attention/scheduler.cuh).
+    A positive value is forwarded only when the backend is ``fa2``, the wrapper
+    plans for CUDA-graph replay (the only case in which the scheduler reads the
+    hint) and every request in ``qo_indptr_host`` has exactly ``uniform_q_len``
+    rows -- the per-request check the scheduler performs itself (with the GQA
+    factor cancelled), evaluated here on the host copy ``plan()`` already makes
+    so that the C++ error path is never reached: a hint that does not describe
+    the batch is dropped with one warning and the plan proceeds as if it had
+    not been given.
+    """
+    if uniform_q_len is None:
+        return 0
+    uniform_q_len = int(uniform_q_len)
+    if uniform_q_len <= 0:
+        return 0
+    if backend != "fa2" or not is_cuda_graph_enabled:
+        # Only the FA2 CUDA-graph planner reads the hint; the eager planner
+        # already sizes the tile from the batch's actual query lengths.
+        return 0
+    q_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
+    if q_lens.numel() == 0 or not bool((q_lens == uniform_q_len).all()):
+        lo = int(q_lens.min()) if q_lens.numel() else 0
+        hi = int(q_lens.max()) if q_lens.numel() else 0
+        logger.warning_once(
+            "%s: uniform_q_len=%d does not describe this batch (batch_size=%d, "
+            "query lengths %d..%d); planning without the hint",
+            caller,
+            uniform_q_len,
+            int(q_lens.numel()),
+            lo,
+            hi,
+        )
+        return 0
+    return uniform_q_len
+
+
 def _build_block_tables_from_paged_kv_indices(
     paged_kv_indptr_host: torch.Tensor,
     paged_kv_indices: torch.Tensor,
@@ -2286,6 +2334,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        uniform_q_len: Optional[int] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -2517,7 +2566,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             args.append(fixed_split_size)
             args.append(disable_split_kv)
             args.append(0)  # num_colocated_ctas
-            args.append(0)  # uniform_q_len
+            args.append(
+                _resolve_uniform_q_len(
+                    uniform_q_len,
+                    qo_indptr_host,
+                    self.is_cuda_graph_enabled,
+                    backend,
+                    "BatchPrefillWithPagedKVCacheWrapper.workspace_size",
+                )
+            )
         float_workspace_size, int_workspace_size = module.workspace_size(*args)
         return int(float_workspace_size), int(int_workspace_size)
 
@@ -2558,6 +2615,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        uniform_q_len: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -2670,6 +2728,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        uniform_q_len : Optional[int]
+            Number of query rows of every request in the batch, when the caller can
+            guarantee it for every plan replayed through this wrapper (speculative-decoding
+            target verify: each request carries exactly ``draft_token_num`` query rows).
+            Only the ``fa2`` backend in CUDA-graph mode uses it: the scheduler then sizes
+            the query tile for ``uniform_q_len * gqa_group_size`` packed rows instead of
+            the ragged worst case ``total_num_rows - batch_size + 1``. The hint is checked
+            against ``qo_indptr`` on the host and dropped, with one warning, when the batch
+            is not uniform. Defaults to ``None`` (no hint).
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3049,7 +3116,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
-                args.append(0)  # uniform_q_len
+                args.append(
+                    _resolve_uniform_q_len(
+                        uniform_q_len,
+                        qo_indptr_host,
+                        self.is_cuda_graph_enabled,
+                        self._backend,
+                        "BatchPrefillWithPagedKVCacheWrapper.plan",
+                    )
+                )
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -4284,6 +4359,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        uniform_q_len: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -4399,6 +4475,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         o_indptr: Optional[torch.Tensor]
             Only used by the cudnn backend. Token-unit indptr of the output tensor;
             defaults to ``qo_indptr``.
+        uniform_q_len : Optional[int]
+            Number of query rows of every request in the batch, when the caller can
+            guarantee it for every plan replayed through this wrapper. Only the ``fa2``
+            backend in CUDA-graph mode uses it (query tile sized for
+            ``uniform_q_len * gqa_group_size`` packed rows instead of the ragged worst
+            case); see :meth:`BatchPrefillWithPagedKVCacheWrapper.plan`. Checked against
+            ``qo_indptr`` on the host and dropped when the batch is not uniform.
+            Defaults to ``None``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -5004,7 +5088,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
-                args.append(0)  # uniform_q_len
+                args.append(
+                    _resolve_uniform_q_len(
+                        uniform_q_len,
+                        qo_indptr_host,
+                        self.is_cuda_graph_enabled,
+                        self._backend,
+                        "BatchPrefillWithRaggedKVCacheWrapper.plan",
+                    )
+                )
             self._plan_info = self._cached_module.plan(
                 *args,
             )
