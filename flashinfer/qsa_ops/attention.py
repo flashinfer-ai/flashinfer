@@ -654,8 +654,6 @@ class QSAAttention:
                 "the cache holds whole pages, so num_slots has to be a "
                 f"multiple of page_size, got {num_slots} and {page_size}"
             )
-        self.page_size = page_size
-
         ranges = []
         offset = 0
         for rows, size in zip(self.row_buckets, self._plan_bytes, strict=True):
@@ -725,6 +723,7 @@ class QSAAttention:
             wrappers[rows] = wrapper
 
         self.num_slots = num_slots
+        self.page_size = page_size
         self.pages = num_slots // page_size
         self._slices = ranges
         # The previous set, if there was one, is dropped here: its plans lived

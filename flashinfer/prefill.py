@@ -3795,6 +3795,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "scale_k_scalar": scale_k_scalar,
                         "scale_v_scalar": scale_v_scalar,
                         "token_pos_in_items_len": self._token_pos_in_items_len,
+                        "kv_logical_block_size": 0,
                     }
                     # prepare_jit_additional_args returns one entry per declared
                     # tensor name plus any scalars the caller passed

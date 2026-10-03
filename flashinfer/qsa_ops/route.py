@@ -278,6 +278,8 @@ def qsa_route_from_blocks(
         )
     if compress_ratio < 1:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
+    if page_size < 1:
+        raise ValueError(f"page_size must be positive, got {page_size}")
     if indexer_block_ids.shape[0] == 0:
         return
     _qsa_route_from_blocks(

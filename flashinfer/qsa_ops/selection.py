@@ -268,6 +268,10 @@ class QSASelection:
         token_topk: int,
         num_heads: int,
         head_dim: int,
+        score_budget_bytes: int = 256 * 1024 * 1024,
+        deterministic: bool = True,
+        tie_break: int = TopKTieBreak.SMALL,
+        dsa_graph_safe: bool = True,
     ) -> int:
         """Bytes :meth:`run` will need, without allocating any of them.
 
@@ -282,6 +286,9 @@ class QSASelection:
             The device the workspace will be on.
         max_rows, max_columns, compress_ratio, token_topk, num_heads, head_dim : int
             As for :class:`QSASelection`.
+        score_budget_bytes, deterministic, tie_break, dsa_graph_safe
+            As for :class:`QSASelection`. These change the size, so a caller
+            that passes them to the constructor has to pass them here too.
         """
         return QSASelection(
             max_rows=max_rows,
@@ -291,6 +298,10 @@ class QSASelection:
             num_heads=num_heads,
             head_dim=head_dim,
             device=device,
+            score_budget_bytes=score_budget_bytes,
+            deterministic=deterministic,
+            tie_break=tie_break,
+            dsa_graph_safe=dsa_graph_safe,
         ).workspace_size()
 
     @flashinfer_api

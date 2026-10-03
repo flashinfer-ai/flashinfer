@@ -746,8 +746,10 @@ int64_t cub_topk_ragged_transform_workspace_size_for(int64_t num_rows, int64_t m
                                                      int64_t top_k, int64_t tie_break,
                                                      bool with_row_starts) {
   TVM_FFI_ICHECK_GE(num_rows, 0) << "num_rows must not be negative";
-  TVM_FFI_ICHECK_GT(max_len, 0) << "max_len must be positive";
+  TVM_FFI_ICHECK(max_len > 0 && max_len <= CUB_TOPK_MAX_LEN)
+      << "cub_topk supports 0 < d <= " << CUB_TOPK_MAX_LEN << ", got d=" << max_len;
   TVM_FFI_ICHECK_GT(top_k, 0) << "top_k must be positive";
+  TVM_FFI_ICHECK(tie_break >= 0 && tie_break <= 2) << "Invalid tie_break mode " << tie_break;
   if (num_rows == 0) {
     return 0;
   }
