@@ -315,10 +315,12 @@ def test_blackwell_bf16_fp4_many_distinct_activations(blackwell_device, backend)
     ]
     outputs = [mm_bf16_fp4(a, *prepared, backend=backend) for a in activations]
     torch.cuda.synchronize()
-    for a, actual in zip(activations[::700], outputs[::700], strict=True):
+    # Every 700th call, plus the two calls on either side of the 4096-call mark
+    # where the previous binding's fixed-size descriptor cache ran out.
+    for index in (*range(0, 4200, 700), 4096, 4199):
         torch.testing.assert_close(
-            actual,
-            _reference(a, reference_weights, None, torch.bfloat16),
+            outputs[index],
+            _reference(activations[index], reference_weights, None, torch.bfloat16),
             atol=1e-2,
             rtol=1e-2,
         )
