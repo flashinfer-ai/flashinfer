@@ -1402,8 +1402,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
             fc1_weight_block.size(0) == num_experts_on_rank &&
             fc1_weight_block.size(1) ==
                 TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                    inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4) *
-                    2 &&
+                    inter_size * 2, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4) &&
             fc1_weight_block.size(2) * FP8_PER_INT32 *
                     TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize ==
                 TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
@@ -1416,7 +1415,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
             fc1_weight_block.size(0) == num_experts_on_rank &&
             fc1_weight_block.size(1) ==
                 TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                    inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4) &&
+                    inter_size, TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4) &&
             fc1_weight_block.size(2) * FP8_PER_INT32 *
                     TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize ==
                 TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
