@@ -3821,8 +3821,9 @@ class TestTrtllmFp4UnpackedContract:
         )
         if isinstance(activation, SwiGLUStep):
             # Cover physical limits with both global and per-token dequantization.
-            prepared_weights["output1_scale_scalar"].fill_(2.0)
-            prepared_weights["output1_scale_gate_scalar"].fill_(2.0)
+            # Preparation can share the default scale tensor with FC2.
+            for key in ("output1_scale_scalar", "output1_scale_gate_scalar"):
+                prepared_weights[key] = torch.full_like(prepared_weights[key], 2.0)
             if "gemm1_clamp_limit" in prepared_weights:
                 prepared_weights["gemm1_clamp_limit"] /= 2.0
         fc1_size = intermediate_size * (2 if activation.is_gated else 1)
