@@ -26,7 +26,6 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
@@ -38,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -66,7 +64,11 @@ static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap ali
 #define SMEM_SMEM_V_STAGE_BYTES 16384
 #define SMEM_SMEM_V_STRIDE 16384
 #define SMEM_TOTAL 150528
+#if __CUDA_ARCH__ == 1000
+#define USE_TMEM_LD_RED 0
+#else
 #define USE_TMEM_LD_RED 1
+#endif
 #define BLOCK_M 128
 #define BLOCK_N 128
 #define HEAD_DIM 128
@@ -92,52 +94,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
@@ -157,88 +113,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
 __device__ __forceinline__ void mbarrier_wait_cluster_hint(
         int mbar_addr, int phase, uint32_t suspend_time_hint) {
     asm volatile(
@@ -254,74 +128,13 @@ __device__ __forceinline__ void mbarrier_wait_cluster_hint(
         :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
 
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-
-__device__ __forceinline__ void tcgen05_mma_f16_cta2(
-    int taddr, uint64_t a_desc, uint64_t b_desc,
-    uint32_t i_desc, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        ".reg .b32 m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\t"
-        "mov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, {m0, m1, m2, m3, m4, m5, m6, m7}, p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(enable_input_d)
-         : "memory");
-}
-
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
 
 
 union MmaSmemDesc {
     uint64_t u64;
     uint32_t u32[2];
 };
-
-__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
-}
 
 
 __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
@@ -343,30 +156,6 @@ __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
 }
 
 
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-__device__ __forceinline__ void tmem_ld_x32(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7,"
-        "  %8, %9, %10, %11, %12, %13, %14, %15,"
-        "  %16, %17, %18, %19, %20, %21, %22, %23,"
-        "  %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
-          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
-          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15]),
-          "=f"(dst[16]), "=f"(dst[17]), "=f"(dst[18]), "=f"(dst[19]),
-          "=f"(dst[20]), "=f"(dst[21]), "=f"(dst[22]), "=f"(dst[23]),
-          "=f"(dst[24]), "=f"(dst[25]), "=f"(dst[26]), "=f"(dst[27]),
-          "=f"(dst[28]), "=f"(dst[29]), "=f"(dst[30]), "=f"(dst[31])
-        : "r"(tmem_addr));
-}
 
 
 __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
@@ -382,18 +171,6 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 }
 
 
-__device__ __forceinline__ void tmem_st_x16(int tmem_addr, uint32_t* src) {
-    asm volatile(
-        "tcgen05.st.sync.aligned.32x32b.x16.b32"
-        " [%0], {%1, %2, %3, %4, %5, %6, %7, %8,"
-        "  %9, %10, %11, %12, %13, %14, %15, %16};"
-        :: "r"(tmem_addr),
-           "r"(src[0]),  "r"(src[1]),  "r"(src[2]),  "r"(src[3]),
-           "r"(src[4]),  "r"(src[5]),  "r"(src[6]),  "r"(src[7]),
-           "r"(src[8]),  "r"(src[9]),  "r"(src[10]), "r"(src[11]),
-           "r"(src[12]), "r"(src[13]), "r"(src[14]), "r"(src[15]));
-}
-
 
 __device__ __forceinline__ void tmem_st_x16_f32(int tmem_addr, const float* src) {
     asm volatile(
@@ -405,25 +182,6 @@ __device__ __forceinline__ void tmem_st_x16_f32(int tmem_addr, const float* src)
            "f"(src[4]),  "f"(src[5]),  "f"(src[6]),  "f"(src[7]),
            "f"(src[8]),  "f"(src[9]),  "f"(src[10]), "f"(src[11]),
            "f"(src[12]), "f"(src[13]), "f"(src[14]), "f"(src[15]));
-}
-
-
-__device__ __forceinline__ uint32_t smem_addr(const void* ptr) {
-    uint32_t addr;
-    asm("{\n\t"
-        ".reg .u64 u64addr;\n\t"
-        "cvta.to.shared.u64 u64addr, %1;\n\t"
-        "cvt.u32.u64 %0, u64addr;\n\t"
-        "}\n" : "=r"(addr) : "l"(ptr));
-    return addr;
-}
-
-
-__device__ __forceinline__ uint32_t mapa_to_rank(uint32_t local_addr, uint32_t rank) {
-    uint32_t remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
-        : "=r"(remote) : "r"(local_addr), "r"(rank));
-    return remote;
 }
 
 
@@ -448,20 +206,6 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 }
 
 
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = max_noftz(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    return val;
-}
-
-
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
 
 
 __device__ __forceinline__ float row_max_reduce(float2 acc) {
@@ -512,30 +256,6 @@ __device__ __forceinline__ float2 ex2_emulation_f32x2_value(float2 value) {
     return make_float2(r0, r1);
 }
 
-__device__ __forceinline__ void ex2_emulation_f32x2(float* x0_ptr, float* x1_ptr) {
-    float2 result = ex2_emulation_f32x2_value(make_float2(*x0_ptr, *x1_ptr));
-    *x0_ptr = result.x; *x1_ptr = result.y;
-}
-
-__device__ __forceinline__ void softmax_frag_exp2_cast(
-    float* sv, uint32_t* pv, int use_emu)
-{
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        if (use_emu && j >= 12)
-            ex2_emulation_f32x2(&sv[j*2], &sv[j*2+1]);
-        else {
-            sv[j*2]   = approx_exp2(sv[j*2]);
-            sv[j*2+1] = approx_exp2(sv[j*2+1]);
-        }
-    }
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        __nv_bfloat162 bf = __float22bfloat162_rn({sv[j*2], sv[j*2+1]});
-        pv[j] = reinterpret_cast<uint32_t&>(bf);
-    }
-}
-
 
 
 __device__ __forceinline__ void fma_f32x2_inplace(float2* a, float2 b, float2 c) {
@@ -547,42 +267,8 @@ __device__ __forceinline__ void fma_f32x2_inplace(float2* a, float2 b, float2 c)
     *(unsigned long long*)a = r;
 }
 
-__device__ __forceinline__ void fma_f32x2_noftz_inplace(float2* a, float2 b, float2 c) {
-    unsigned long long r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(r)
-        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    *(unsigned long long*)a = r;
-}
-
 __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
     asm("mul.rn.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("mul.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void add_f32x2_inplace(float2* a, float2 b) {
-    asm("add.rn.ftz.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void add_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("add.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void sub_f32x2_inplace(float2* a, float2 b) {
-    asm("sub.rn.ftz.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-__device__ __forceinline__ void sub_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("sub.f32x2 %0, %0, %1;"
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
 
@@ -594,474 +280,10 @@ __device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
     return r;
 }
 
-__device__ __forceinline__ float2 add_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 sub_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("sub.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 sub_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("sub.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ void fma_scale_x32(
-    float* sv, const float2* scale2, const float2* neg_max2)
-{
-    float2* sv_2 = reinterpret_cast<float2*>(sv);
-    #pragma unroll
-    for (int j = 0; j < 16; j++)
-        fma_f32x2_inplace(&sv_2[j], *scale2, *neg_max2);
-}
-
-__device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
-    return r;
-}
-
 
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
 
-__device__ __forceinline__ float2 add_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
 
-__device__ __forceinline__ float2 add_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 add_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("add.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rn_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rz_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rz.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rm_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rm.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_noftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 mul_f32x2_rp_ftz(float2 a, float2 b) {
-    float2 r;
-    asm("mul.rp.ftz.f32x2 %0, %1, %2;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rn.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rz_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rz_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rz_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rz.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rz_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rz.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rm_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rm.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rm_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rm.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rm_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rm.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rm_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rm.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rp_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rp.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rp_noftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rp.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_f32x2_rp_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm("fma.rp.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-__device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float2 c) {
-    float2 r;
-    asm volatile("{\n\t"
-        ".reg .f32 _c0, _c1;\n\t"
-        ".reg .b64 _neg_c;\n\t"
-        "mov.b64 {_c0, _c1}, %3;\n\t"
-        "neg.f32 _c0, _c0;\n\t"
-        "neg.f32 _c1, _c1;\n\t"
-        "mov.b64 _neg_c, {_c0, _c1};\n\t"
-        "fma.rp.ftz.f32x2 %0, %1, %2, _neg_c;\n\t"
-        "}\n"
-        : "=l"(*(unsigned long long*)&r)
-        : "l"(*(const unsigned long long*)&a),
-          "l"(*(const unsigned long long*)&b),
-          "l"(*(const unsigned long long*)&c));
-    return r;
-}
-
-
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
 
 
 __device__ __forceinline__ void tma_4d_gmem2smem_cta2(
@@ -1075,17 +297,6 @@ __device__ __forceinline__ void tma_4d_gmem2smem_cta2(
 }
 
 
-__device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
-    asm volatile(
-        "{\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "mov.b32 {lo, hi}, %1;\n\t"
-        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], lo;\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"((uint32_t)cta_mask) : "memory");
-}
-
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
@@ -1097,7 +308,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_constant__ CUtensorMap Q, __nv_bfloat16* __restrict__ Q_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, __half* __restrict__ partial_O, float* __restrict__ partial_ML, unsigned int total_tiles, int num_heads, float softmax_scale_log2)
+kernel_cake_minimax_h3_varlen_attention_4e6602e44a81b36f88ed(const __grid_constant__ CUtensorMap Q, __nv_bfloat16* __restrict__ Q_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, __half* __restrict__ partial_O, float* __restrict__ partial_ML, unsigned int total_tiles, int num_heads, float softmax_scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1105,7 +316,12 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define q_full_addr (mbar_base + 0)
@@ -1257,12 +473,20 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                     float sv[128];
                     float tile_max = -CAKE_INF;
                     {
+#if !(__CUDA_ARCH__ == 1000)
                         float tile_max_lo = -CAKE_INF;
                         float tile_max_hi = -CAKE_INF;
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                         #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
                         #endif
+#endif
                         asm volatile(
+#if __CUDA_ARCH__ == 1000
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31])
+                            : "r"(s_addr));
+#else
                             "tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, [%65];"
                             : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31]), "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63]), "=f"(tile_max_lo)
@@ -1270,7 +494,31 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                         #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
                         #endif
+#endif
                         asm volatile(
+#if __CUDA_ARCH__ == 1000
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63])
+                            : "r"(s_addr + 32));
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(sv[64]), "=f"(sv[65]), "=f"(sv[66]), "=f"(sv[67]), "=f"(sv[68]), "=f"(sv[69]), "=f"(sv[70]), "=f"(sv[71]), "=f"(sv[72]), "=f"(sv[73]), "=f"(sv[74]), "=f"(sv[75]), "=f"(sv[76]), "=f"(sv[77]), "=f"(sv[78]), "=f"(sv[79]), "=f"(sv[80]), "=f"(sv[81]), "=f"(sv[82]), "=f"(sv[83]), "=f"(sv[84]), "=f"(sv[85]), "=f"(sv[86]), "=f"(sv[87]), "=f"(sv[88]), "=f"(sv[89]), "=f"(sv[90]), "=f"(sv[91]), "=f"(sv[92]), "=f"(sv[93]), "=f"(sv[94]), "=f"(sv[95])
+                            : "r"(s_addr + 64));
+                        asm volatile(
+                            "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                            : "=f"(sv[96]), "=f"(sv[97]), "=f"(sv[98]), "=f"(sv[99]), "=f"(sv[100]), "=f"(sv[101]), "=f"(sv[102]), "=f"(sv[103]), "=f"(sv[104]), "=f"(sv[105]), "=f"(sv[106]), "=f"(sv[107]), "=f"(sv[108]), "=f"(sv[109]), "=f"(sv[110]), "=f"(sv[111]), "=f"(sv[112]), "=f"(sv[113]), "=f"(sv[114]), "=f"(sv[115]), "=f"(sv[116]), "=f"(sv[117]), "=f"(sv[118]), "=f"(sv[119]), "=f"(sv[120]), "=f"(sv[121]), "=f"(sv[122]), "=f"(sv[123]), "=f"(sv[124]), "=f"(sv[125]), "=f"(sv[126]), "=f"(sv[127])
+                            : "r"(s_addr + 96));
+                        float2 _reg_reduce_max2_0 = {-CAKE_INF, -CAKE_INF};
+                        row_max_x32_accum(&sv[0], _reg_reduce_max2_0);
+                        row_max_x32_accum(&sv[32], _reg_reduce_max2_0);
+                        row_max_x32_accum(&sv[64], _reg_reduce_max2_0);
+                        row_max_x32_accum(&sv[96], _reg_reduce_max2_0);
+                        float sv_max = row_max_reduce(_reg_reduce_max2_0);
+                        tile_max = sv_max;
+#else
                             "tcgen05.ld.red.sync.aligned.32x32b.x64.max.f32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, [%65];"
                             : "=f"(sv[64]), "=f"(sv[65]), "=f"(sv[66]), "=f"(sv[67]), "=f"(sv[68]), "=f"(sv[69]), "=f"(sv[70]), "=f"(sv[71]), "=f"(sv[72]), "=f"(sv[73]), "=f"(sv[74]), "=f"(sv[75]), "=f"(sv[76]), "=f"(sv[77]), "=f"(sv[78]), "=f"(sv[79]), "=f"(sv[80]), "=f"(sv[81]), "=f"(sv[82]), "=f"(sv[83]), "=f"(sv[84]), "=f"(sv[85]), "=f"(sv[86]), "=f"(sv[87]), "=f"(sv[88]), "=f"(sv[89]), "=f"(sv[90]), "=f"(sv[91]), "=f"(sv[92]), "=f"(sv[93]), "=f"(sv[94]), "=f"(sv[95]), "=f"(sv[96]), "=f"(sv[97]), "=f"(sv[98]), "=f"(sv[99]), "=f"(sv[100]), "=f"(sv[101]), "=f"(sv[102]), "=f"(sv[103]), "=f"(sv[104]), "=f"(sv[105]), "=f"(sv[106]), "=f"(sv[107]), "=f"(sv[108]), "=f"(sv[109]), "=f"(sv[110]), "=f"(sv[111]), "=f"(sv[112]), "=f"(sv[113]), "=f"(sv[114]), "=f"(sv[115]), "=f"(sv[116]), "=f"(sv[117]), "=f"(sv[118]), "=f"(sv[119]), "=f"(sv[120]), "=f"(sv[121]), "=f"(sv[122]), "=f"(sv[123]), "=f"(sv[124]), "=f"(sv[125]), "=f"(sv[126]), "=f"(sv[127]), "=f"(tile_max_hi)
@@ -1278,20 +526,31 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         float _max_0 = max_noftz(tile_max_lo, tile_max_hi);
                         tile_max = _max_0;
+#endif
                     }
                     int tail_valid = tail_base - n_block * BLOCK_N;
                     if (tail_valid < BLOCK_N) {
                         uint32_t _slice_lo_mask_0;
                         {
+#if __CUDA_ARCH__ == 1000
+                            int _lim_1 = tail_valid;
+                            if (_lim_1 <= 0) { _slice_lo_mask_0 = 0u; }
+                            else if (_lim_1 >= 32) { _slice_lo_mask_0 = 0xFFFFFFFFu; }
+#else
                             int _lim_0 = tail_valid;
                             if (_lim_0 <= 0) { _slice_lo_mask_0 = 0u; }
                             else if (_lim_0 >= 32) { _slice_lo_mask_0 = 0xFFFFFFFFu; }
+#endif
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
+#if __CUDA_ARCH__ == 1000
+                                    "}" : "=r"(_slice_lo_mask_0) : "r"(_lim_1));
+#else
                                     "}" : "=r"(_slice_lo_mask_0) : "r"(_lim_0));
+#endif
                             }
                         }
                         if (!(_slice_lo_mask_0 & (1u << 0))) sv[0] = -CAKE_INF;
@@ -1328,15 +587,25 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                         if (!(_slice_lo_mask_0 & (1u << 31))) sv[31] = -CAKE_INF;
                         uint32_t _slice_lo_mask_1;
                         {
+#if __CUDA_ARCH__ == 1000
+                            int _lim_2 = tail_valid - 32;
+                            if (_lim_2 <= 0) { _slice_lo_mask_1 = 0u; }
+                            else if (_lim_2 >= 32) { _slice_lo_mask_1 = 0xFFFFFFFFu; }
+#else
                             int _lim_1 = tail_valid - 32;
                             if (_lim_1 <= 0) { _slice_lo_mask_1 = 0u; }
                             else if (_lim_1 >= 32) { _slice_lo_mask_1 = 0xFFFFFFFFu; }
+#endif
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
+#if __CUDA_ARCH__ == 1000
+                                    "}" : "=r"(_slice_lo_mask_1) : "r"(_lim_2));
+#else
                                     "}" : "=r"(_slice_lo_mask_1) : "r"(_lim_1));
+#endif
                             }
                         }
                         if (!(_slice_lo_mask_1 & (1u << 0))) sv[32] = -CAKE_INF;
@@ -1373,15 +642,25 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                         if (!(_slice_lo_mask_1 & (1u << 31))) sv[63] = -CAKE_INF;
                         uint32_t _slice_lo_mask_2;
                         {
+#if __CUDA_ARCH__ == 1000
+                            int _lim_3 = tail_valid - 64;
+                            if (_lim_3 <= 0) { _slice_lo_mask_2 = 0u; }
+                            else if (_lim_3 >= 32) { _slice_lo_mask_2 = 0xFFFFFFFFu; }
+#else
                             int _lim_2 = tail_valid - 64;
                             if (_lim_2 <= 0) { _slice_lo_mask_2 = 0u; }
                             else if (_lim_2 >= 32) { _slice_lo_mask_2 = 0xFFFFFFFFu; }
+#endif
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
+#if __CUDA_ARCH__ == 1000
+                                    "}" : "=r"(_slice_lo_mask_2) : "r"(_lim_3));
+#else
                                     "}" : "=r"(_slice_lo_mask_2) : "r"(_lim_2));
+#endif
                             }
                         }
                         if (!(_slice_lo_mask_2 & (1u << 0))) sv[64] = -CAKE_INF;
@@ -1418,15 +697,25 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                         if (!(_slice_lo_mask_2 & (1u << 31))) sv[95] = -CAKE_INF;
                         uint32_t _slice_lo_mask_3;
                         {
+#if __CUDA_ARCH__ == 1000
+                            int _lim_4 = tail_valid - 96;
+                            if (_lim_4 <= 0) { _slice_lo_mask_3 = 0u; }
+                            else if (_lim_4 >= 32) { _slice_lo_mask_3 = 0xFFFFFFFFu; }
+#else
                             int _lim_3 = tail_valid - 96;
                             if (_lim_3 <= 0) { _slice_lo_mask_3 = 0u; }
                             else if (_lim_3 >= 32) { _slice_lo_mask_3 = 0xFFFFFFFFu; }
+#endif
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
+#if __CUDA_ARCH__ == 1000
+                                    "}" : "=r"(_slice_lo_mask_3) : "r"(_lim_4));
+#else
                                     "}" : "=r"(_slice_lo_mask_3) : "r"(_lim_3));
+#endif
                             }
                         }
                         if (!(_slice_lo_mask_3 & (1u << 0))) sv[96] = -CAKE_INF;
@@ -1461,6 +750,15 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                         if (!(_slice_lo_mask_3 & (1u << 29))) sv[125] = -CAKE_INF;
                         if (!(_slice_lo_mask_3 & (1u << 30))) sv[126] = -CAKE_INF;
                         if (!(_slice_lo_mask_3 & (1u << 31))) sv[127] = -CAKE_INF;
+#if __CUDA_ARCH__ == 1000
+                        float2 _reg_reduce_max2_5 = {-CAKE_INF, -CAKE_INF};
+                        row_max_x32_accum(&sv[0], _reg_reduce_max2_5);
+                        row_max_x32_accum(&sv[32], _reg_reduce_max2_5);
+                        row_max_x32_accum(&sv[64], _reg_reduce_max2_5);
+                        row_max_x32_accum(&sv[96], _reg_reduce_max2_5);
+                        float sv_max_1 = row_max_reduce(_reg_reduce_max2_5);
+                        tile_max = sv_max_1;
+#else
                         float2 _reg_reduce_max2_4 = {-CAKE_INF, -CAKE_INF};
                         row_max_x32_accum(&sv[0], _reg_reduce_max2_4);
                         row_max_x32_accum(&sv[32], _reg_reduce_max2_4);
@@ -1468,6 +766,7 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                         row_max_x32_accum(&sv[96], _reg_reduce_max2_4);
                         float sv_max = row_max_reduce(_reg_reduce_max2_4);
                         tile_max = sv_max;
+#endif
                     }
                     float _max_1 = max_noftz(tile_max, row_max);
                     float new_max = _max_1;
@@ -1476,7 +775,11 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                     float _fma_0 = __fmaf_rn(row_max, softmax_scale_log2, -new_max_scaled);
                     float acc_scale_log2 = _fma_0;
                     float acc_scale;
+#if __CUDA_ARCH__ == 1000
+                    if (acc_scale_log2 >= -4.0f) {
+#else
                     if (acc_scale_log2 >= -8.0f) {
+#endif
                         safe_max = ((row_max == -CAKE_INF) ? 0.0f : row_max);
                         acc_scale = 1.0f;
                         new_max_scaled = safe_max * softmax_scale_log2;
@@ -1485,17 +788,32 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                         acc_scale = ((row_max > -CAKE_INF) ? _exp2_0 : 1.0f);
                         row_max = new_max;
                     }
+#if __CUDA_ARCH__ == 1000
+                    const float2 _fma_b2_6 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_7 = {-new_max_scaled, -new_max_scaled};
+#else
                     const float2 _fma_b2_5 = {softmax_scale_log2, softmax_scale_log2};
                     const float2 _fma_c2_6 = {-new_max_scaled, -new_max_scaled};
+#endif
                     #pragma unroll
                     for (int _lf = 0; _lf < 8; _lf++)
+#if __CUDA_ARCH__ == 1000
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 0))[_lf], _fma_b2_6, _fma_c2_7);
+#else
                         fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 0))[_lf], _fma_b2_5, _fma_c2_6);
+#endif
                     #pragma unroll
                     for (int _le = 0; _le < 1; _le++) {
                         if (1 && _le >= 0) {
+#if __CUDA_ARCH__ == 1000
+                            float2 _exp2_pair_8 = ex2_emulation_f32x2_value(make_float2(sv[_le*2], sv[_le*2 + 1]));
+                            sv[_le*2] = _exp2_pair_8.x;
+                            sv[_le*2 + 1] = _exp2_pair_8.y;
+#else
                             float2 _exp2_pair_7 = ex2_emulation_f32x2_value(make_float2(sv[_le*2], sv[_le*2 + 1]));
                             sv[_le*2] = _exp2_pair_7.x;
                             sv[_le*2 + 1] = _exp2_pair_7.y;
+#endif
                         } else {
                             sv[_le*2] = approx_exp2(sv[_le*2]);
                             sv[_le*2 + 1] = approx_exp2(sv[_le*2 + 1]);
@@ -1513,17 +831,51 @@ kernel_cake_minimax_h3_varlen_attention_6ac01dbc67b31d533887(const __grid_consta
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(scale_full_addr + (stage) * 8);
                     #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                    for (int _le = 0; _le < 6; _le++) {
+                        if (1 && _le >= 4) {
+                            float2 _exp2_pair_9 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 3], sv[_le*2 + 1 + 3]));
+                            sv[_le*2 + 3] = _exp2_pair_9.x;
+                            sv[_le*2 + 1 + 3] = _exp2_pair_9.y;
+                        } else {
+                            sv[_le*2 + 3] = approx_exp2(sv[_le*2 + 3]);
+                            sv[_le*2 + 1 + 3] = approx_exp2(sv[_le*2 + 1 + 3]);
+                        }
+#else
                     for (int _le = 0; _le < 13; _le++) {
                         sv[_le + 3] = approx_exp2(sv[_le + 3]);
+#endif
                     }
+#if __CUDA_ARCH__ == 1000
+                    sv[15] = approx_exp2(sv[15]);
+                    const float2 _fma_b2_10 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_11 = {-new_max_scaled, -new_max_scaled};
+#else
                     const float2 _fma_b2_8 = {softmax_scale_log2, softmax_scale_log2};
                     const float2 _fma_c2_9 = {-new_max_scaled, -new_max_scaled};
+#endif
                     #pragma unroll
                     for (int _lf = 0; _lf < 56; _lf++)
+#if __CUDA_ARCH__ == 1000
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 16))[_lf], _fma_b2_10, _fma_c2_11);
+#else
                         fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 16))[_lf], _fma_b2_8, _fma_c2_9);
+#endif
                     #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                    for (int _le = 0; _le < 56; _le++) {
+                        if (1 && _le >= 42) {
+                            float2 _exp2_pair_12 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 16], sv[_le*2 + 1 + 16]));
+                            sv[_le*2 + 16] = _exp2_pair_12.x;
+                            sv[_le*2 + 1 + 16] = _exp2_pair_12.y;
+                        } else {
+                            sv[_le*2 + 16] = approx_exp2(sv[_le*2 + 16]);
+                            sv[_le*2 + 1 + 16] = approx_exp2(sv[_le*2 + 1 + 16]);
+                        }
+#else
                     for (int _le = 0; _le < 112; _le++) {
                         sv[_le + 16] = approx_exp2(sv[_le + 16]);
+#endif
                     }
                     int p_addr = taddr + (unsigned int)tmem_p_off + (unsigned int)(warp % 4 * 32 << 16);
                     float2 _f2_0 = make_float2(sv[0], sv[1]);

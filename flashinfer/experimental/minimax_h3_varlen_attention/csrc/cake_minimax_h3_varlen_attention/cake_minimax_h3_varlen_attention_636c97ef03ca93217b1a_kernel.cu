@@ -26,7 +26,6 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
@@ -38,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -73,41 +71,13 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 }
 
 
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = max_noftz(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    return val;
-}
 
 
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
-
-
-__device__ __forceinline__ float row_max_reduce(float2 acc) {
-    return max_noftz(acc.x, acc.y);
-}
-
-
-__device__ __forceinline__ void row_max_x32_accum(const float* sv, float2& acc) {
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        if (j % 2 == 0)
-            acc.x = max_noftz(acc.x, max_noftz(sv[j*2], sv[j*2+1]));
-        else
-            acc.y = max_noftz(acc.y, max_noftz(sv[j*2], sv[j*2+1]));
-    }
-}
 
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_minimax_h3_varlen_attention_e70c217406e9eafae840(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp4_t, uint8_t* __restrict__ v_scale_lo, uint8_t* __restrict__ v_scale_hi, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
+kernel_cake_minimax_h3_varlen_attention_636c97ef03ca93217b1a(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp4_t, uint8_t* __restrict__ v_scale_lo, uint8_t* __restrict__ v_scale_hi, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -115,11 +85,17 @@ kernel_cake_minimax_h3_varlen_attention_e70c217406e9eafae840(__nv_bfloat16* __re
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     __nv_bfloat16* v_smem_bf16 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);

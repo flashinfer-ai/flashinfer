@@ -26,7 +26,6 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
@@ -38,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -68,7 +66,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_minimax_h3_varlen_attention_530411d4fd6f12553109(__nv_bfloat16* __restrict__ v, float* __restrict__ v_amax_partial, int num_vectors, int num_chunks)
+kernel_cake_minimax_h3_varlen_attention_fbf0a620ff74617e2a6a(__nv_bfloat16* __restrict__ v, float* __restrict__ v_amax_partial, int num_vectors, int num_chunks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -76,11 +74,17 @@ kernel_cake_minimax_h3_varlen_attention_530411d4fd6f12553109(__nv_bfloat16* __re
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);

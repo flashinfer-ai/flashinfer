@@ -26,7 +26,6 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
@@ -38,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -51,10 +49,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define SMEM_V_SMEM_BF16_OFF 0
-#define SMEM_V_SMEM_BF16_STAGE_BYTES 8704
-#define SMEM_V_SMEM_BF16_STRIDE 8704
-#define SMEM_TOTAL 8704
+#define SMEM_AMAX_SMEM_OFF 0
+#define SMEM_AMAX_SMEM_STAGE_BYTES 32
+#define SMEM_AMAX_SMEM_STRIDE 32
+#define SMEM_TOTAL 128
 #define THREADS 256
 
 #include <math_constants.h>
@@ -73,41 +71,22 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 }
 
 
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = max_noftz(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    return val;
+
+
+
+
+__device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
+    asm("mul.rn.f32x2 %0, %0, %1;"
+        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
 
 
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
-
-
-__device__ __forceinline__ float row_max_reduce(float2 acc) {
-    return max_noftz(acc.x, acc.y);
-}
-
-
-__device__ __forceinline__ void row_max_x32_accum(const float* sv, float2& acc) {
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        if (j % 2 == 0)
-            acc.x = max_noftz(acc.x, max_noftz(sv[j*2], sv[j*2+1]));
-        else
-            acc.y = max_noftz(acc.y, max_noftz(sv[j*2], sv[j*2+1]));
-    }
-}
+// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
 
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp4_t, uint8_t* __restrict__ v_scale_lo, uint8_t* __restrict__ v_scale_hi, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
+kernel_cake_minimax_h3_varlen_attention_f3e0c2ed3c60f798ede5(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp8, float* __restrict__ v_amax, float* __restrict__ v_amax_partial, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -115,14 +94,21 @@ kernel_cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179(__nv_bfloat16* __re
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
+    const int cta_rank = 0;
+
     // Kernel setup ops
-    __nv_bfloat16* v_smem_bf16 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
-    const int v_smem_bf16_addr = smem + 0;
+    float* amax_smem = reinterpret_cast<float*>(smem_raw + 0);
+    const int amax_smem_addr = smem + 0;
 
     // === Task calls (dependency order) ===
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -342,6 +328,37 @@ kernel_cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179(__nv_bfloat16* __re
             }
         }
     }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    float amax_lo = v_amax_partial[tid];
+    float amax_hi = v_amax_partial[tid + 256];
+    float _max_0 = max_noftz(amax_lo, amax_hi);
+    float amax_local = _max_0;
+    float _warp_reduce_0 = amax_local;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+    amax_local = _warp_reduce_0;
+    float _cross_warp_reduce_0;
+    if (lane == 0) { amax_smem[warp] = amax_local; }
+    __syncthreads();
+    if (warp == 0) {
+        float _br = (lane < 8) ? amax_smem[lane] : -CUDART_INF_F;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _br = fmaxf(_br, __shfl_xor_sync(0xFFFFFFFF, _br, offset));
+        if (lane == 0) { amax_smem[0] = _br; }
+    }
+    __syncthreads();
+    _cross_warp_reduce_0 = amax_smem[0];
+    float amax = _cross_warp_reduce_0;
+    float _max_1 = max_noftz(amax, 1e-12f);
+    float _rcp_0 = approx_rcp(_max_1);
+    float v_inverse_scale = _rcp_0 * 448.0f;
+    if (bid_0 == 0) {
+        if (tid == 0) {
+            *(reinterpret_cast<float*>(v_amax) + (0)) = amax;
+        }
+    }
     #pragma unroll
     for (int iteration_1 = 0; iteration_1 < 1; iteration_1++) {
         int vector_1 = tid + iteration_1 * 256;
@@ -360,10 +377,10 @@ kernel_cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179(__nv_bfloat16* __re
             q_values_min = fminf(q_values_min, (q_values + iteration_1 * 16)[_lr]);
         }
         float value_min = q_values_min;
-        float _max_0 = max_noftz(value_max, -value_min);
-        float amax = _max_0;
-        float _max_1 = max_noftz(amax * 0.16666666666666666f, 0.001953125f);
-        float raw_scale = _max_1;
+        float _max_2 = max_noftz(value_max, -value_min);
+        float amax_0 = _max_2;
+        float _max_3 = max_noftz(amax_0 * 0.16666666666666666f, 0.001953125f);
+        float raw_scale = _max_3;
         float _fp8_rt_0;
         uint16_t _e4m3x2_3;
         uint32_t _f16x2_3;
@@ -372,8 +389,8 @@ kernel_cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179(__nv_bfloat16* __re
         uint16_t _fp8_h0_3 = (uint16_t)(_f16x2_3 & 0xFFFFu);
         asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_3));
         float rounded_scale = _fp8_rt_0;
-        float _rcp_0 = approx_rcp(rounded_scale);
-        float inverse_scale = _rcp_0;
+        float _rcp_1 = approx_rcp(rounded_scale);
+        float inverse_scale = _rcp_1;
         float normalized[16];
         #pragma unroll
         for (int element_1 = 0; element_1 < 16; element_1++) {
@@ -387,42 +404,42 @@ kernel_cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179(__nv_bfloat16* __re
         for (int _lr = 1; _lr < 16; _lr++) {
             k_values_max = max_noftz(k_values_max, (k_values + iteration_1 * 16)[_lr]);
         }
-        float value_max_0 = k_values_max;
+        float value_max_1 = k_values_max;
         float k_values_min = (k_values + iteration_1 * 16)[0];
         #pragma unroll
         for (int _lr = 1; _lr < 16; _lr++) {
             k_values_min = fminf(k_values_min, (k_values + iteration_1 * 16)[_lr]);
         }
-        float value_min_1 = k_values_min;
-        float _max_2 = max_noftz(value_max_0, -value_min_1);
-        float amax_2 = _max_2;
-        float _max_3 = max_noftz(amax_2 * 0.16666666666666666f, 0.001953125f);
-        float raw_scale_3 = _max_3;
+        float value_min_2 = k_values_min;
+        float _max_4 = max_noftz(value_max_1, -value_min_2);
+        float amax_3 = _max_4;
+        float _max_5 = max_noftz(amax_3 * 0.16666666666666666f, 0.001953125f);
+        float raw_scale_4 = _max_5;
         float _fp8_rt_1;
         uint16_t _e4m3x2_4;
         uint32_t _f16x2_4;
-        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_4) : "f"(0.0f), "f"(raw_scale_3));
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_4) : "f"(0.0f), "f"(raw_scale_4));
         asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_4) : "h"(_e4m3x2_4));
         uint16_t _fp8_h0_4 = (uint16_t)(_f16x2_4 & 0xFFFFu);
         asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_1) : "h"(_fp8_h0_4));
-        float rounded_scale_4 = _fp8_rt_1;
-        float _rcp_1 = approx_rcp(rounded_scale_4);
-        float inverse_scale_5 = _rcp_1;
-        float normalized_6[16];
+        float rounded_scale_5 = _fp8_rt_1;
+        float _rcp_2 = approx_rcp(rounded_scale_5);
+        float inverse_scale_6 = _rcp_2;
+        float normalized_7[16];
         #pragma unroll
         for (int element_2 = 0; element_2 < 16; element_2++) {
-            normalized_6[element_2] = (k_values + iteration_1 * 16)[element_2] * inverse_scale_5;
+            normalized_7[element_2] = (k_values + iteration_1 * 16)[element_2] * inverse_scale_6;
         }
-        unsigned int packed_7[2];
-        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_7[0]) : "f"(normalized_6[0]), "f"(normalized_6[1]), "f"(normalized_6[2]), "f"(normalized_6[3]), "f"(normalized_6[4]), "f"(normalized_6[5]), "f"(normalized_6[6]), "f"(normalized_6[7]));
-        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_7[1]) : "f"(normalized_6[8]), "f"(normalized_6[9]), "f"(normalized_6[10]), "f"(normalized_6[11]), "f"(normalized_6[12]), "f"(normalized_6[13]), "f"(normalized_6[14]), "f"(normalized_6[15]));
+        unsigned int packed_8[2];
+        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_8[0]) : "f"(normalized_7[0]), "f"(normalized_7[1]), "f"(normalized_7[2]), "f"(normalized_7[3]), "f"(normalized_7[4]), "f"(normalized_7[5]), "f"(normalized_7[6]), "f"(normalized_7[7]));
+        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_8[1]) : "f"(normalized_7[8]), "f"(normalized_7[9]), "f"(normalized_7[10]), "f"(normalized_7[11]), "f"(normalized_7[12]), "f"(normalized_7[13]), "f"(normalized_7[14]), "f"(normalized_7[15]));
         long long output_offset = ((long long)tile * 128 + (long long)row128) * 64 + (long long)(group_1 * 8);
         {
             int2 _iv2 = make_int2(packed[0 + 0], packed[0 + 1]);
             *reinterpret_cast<int2*>(q_fp4 + output_offset + 0) = _iv2;
         }
         {
-            int2 _iv2 = make_int2(packed_7[0 + 0], packed_7[0 + 1]);
+            int2 _iv2 = make_int2(packed_8[0 + 0], packed_8[0 + 1]);
             *reinterpret_cast<int2*>(k_fp4 + output_offset + 0) = _iv2;
         }
         int row_outer = row128 / 32;
@@ -439,7 +456,7 @@ kernel_cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179(__nv_bfloat16* __re
         for (int j = 0; j < 4; j++) {
             float _shfl_0 = __shfl_sync(4294967295, raw_scale, j, 4);
             q_sf4[j] = _shfl_0;
-            float _shfl_1 = __shfl_sync(4294967295, raw_scale_3, j, 4);
+            float _shfl_1 = __shfl_sync(4294967295, raw_scale_4, j, 4);
             k_sf4[j] = _shfl_1;
         }
         unsigned int q_sf_word[1];
@@ -474,89 +491,48 @@ kernel_cake_minimax_h3_varlen_attention_c91aa0cff6efdec01179(__nv_bfloat16* __re
             *(reinterpret_cast<unsigned int*>(q_scale + (scale_tile_offset + (long long)scale_offset)) + (0)) = q_sf_word[0];
             *(reinterpret_cast<unsigned int*>(k_scale + (scale_tile_offset + (long long)scale_offset)) + (0)) = k_sf_word[0];
         }
-        unsigned int packed_v_bf16[8];
-        #pragma unroll
-        for (int _lp = 0; _lp < 8; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((v_values + iteration_1 * 16)[_lp*2 + 0], (v_values + iteration_1 * 16)[_lp*2+1 + 0]));
-            packed_v_bf16[_lp] = *(uint32_t*)&_bf2;
-        }
-        int smem_byte = (row_1 * 136 + group_1 * 16) * 2;
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
-            "r"(v_smem_bf16_addr + (unsigned int)smem_byte), "r"(*reinterpret_cast<uint32_t*>(&packed_v_bf16[0])), "r"(*reinterpret_cast<uint32_t*>(&packed_v_bf16[(0) + 1])), "r"(*reinterpret_cast<uint32_t*>(&packed_v_bf16[(0) + 2])), "r"(*reinterpret_cast<uint32_t*>(&packed_v_bf16[(0) + 3])));
-        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::
-            "r"(v_smem_bf16_addr + (unsigned int)smem_byte + 16), "r"(*reinterpret_cast<uint32_t*>(&packed_v_bf16[4])), "r"(*reinterpret_cast<uint32_t*>(&packed_v_bf16[(4) + 1])), "r"(*reinterpret_cast<uint32_t*>(&packed_v_bf16[(4) + 2])), "r"(*reinterpret_cast<uint32_t*>(&packed_v_bf16[(4) + 3])));
-    }
-    __syncthreads();
-    #pragma unroll
-    for (int iteration_2 = 0; iteration_2 < 1; iteration_2++) {
-        int vector_2 = tid + iteration_2 * 256;
-        int v_group = vector_2 / 128;
-        int dim = vector_2 - v_group * 128;
-        float values[16];
-        #pragma unroll
-        for (int element_3 = 0; element_3 < 16; element_3++) {
-            int smem_index = (v_group * 16 + element_3) * 136 + dim;
-            values[element_3] = v_smem_bf16[smem_index];
-        }
-        float values_max = values[0];
-        #pragma unroll
-        for (int _lr = 1; _lr < 16; _lr++) {
-            values_max = max_noftz(values_max, values[_lr]);
-        }
-        float value_max_1 = values_max;
-        float values_min = values[0];
-        #pragma unroll
-        for (int _lr = 1; _lr < 16; _lr++) {
-            values_min = fminf(values_min, values[_lr]);
-        }
-        float value_min_2 = values_min;
-        float _max_4 = max_noftz(value_max_1, -value_min_2);
-        float amax_1 = _max_4;
-        float _max_5 = max_noftz(amax_1 * 0.16666666666666666f, 0.001953125f);
-        float raw_scale_1 = _max_5;
-        float _fp8_rt_2;
-        uint16_t _e4m3x2_5;
-        uint32_t _f16x2_5;
-        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_5) : "f"(0.0f), "f"(raw_scale_1));
-        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_5) : "h"(_e4m3x2_5));
-        uint16_t _fp8_h0_5 = (uint16_t)(_f16x2_5 & 0xFFFFu);
-        asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_2) : "h"(_fp8_h0_5));
-        float rounded_scale_1 = _fp8_rt_2;
-        float _rcp_2 = approx_rcp(rounded_scale_1);
-        float inverse_scale_1 = _rcp_2;
-        float normalized_1[16];
-        #pragma unroll
-        for (int element_4 = 0; element_4 < 16; element_4++) {
-            normalized_1[element_4] = values[element_4] * inverse_scale_1;
-        }
-        unsigned int packed_1[2];
-        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_1[0]) : "f"(normalized_1[0]), "f"(normalized_1[1]), "f"(normalized_1[2]), "f"(normalized_1[3]), "f"(normalized_1[4]), "f"(normalized_1[5]), "f"(normalized_1[6]), "f"(normalized_1[7]));
-        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_1[1]) : "f"(normalized_1[8]), "f"(normalized_1[9]), "f"(normalized_1[10]), "f"(normalized_1[11]), "f"(normalized_1[12]), "f"(normalized_1[13]), "f"(normalized_1[14]), "f"(normalized_1[15]));
-        int group_2 = sub * 2 + v_group;
-        long long output_offset_1 = ((long long)head * 128 + (long long)dim) * ((long long)PB * 64) + (long long)(pblock * 64) + (long long)(group_2 * 8);
+        long long v_output_offset = ((long long)tile * 128 + (long long)row128) * 128 + (long long)(group_1 * 16);
         {
-            int2 _iv2 = make_int2(packed_1[0 + 0], packed_1[0 + 1]);
-            *reinterpret_cast<int2*>(v_fp4_t + output_offset_1 + 0) = _iv2;
-        }
-        int row_outer_1 = dim / 32;
-        int row_inner_1 = dim - row_outer_1 * 32;
-        int row_quad_1 = row_inner_1 / 8;
-        int row_lane_1 = row_inner_1 - row_quad_1 * 8;
-        int group_in_half = group_2 - group_2 / 4 * 4;
-        int scale_offset_1 = ((row_quad_1 * 8 + row_lane_1) * 4 + row_outer_1) * 4 + group_in_half;
-        long long scale_tile_offset_1 = (long long)tile * 512;
-        if (group_2 < 4) {
-            {
-                unsigned short _sf_pair;
-                asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(raw_scale_1));
-                *(reinterpret_cast<unsigned char*>(v_scale_lo + (scale_tile_offset_1 + (long long)scale_offset_1)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
-            }
-        } else {
-            {
-                unsigned short _sf_pair;
-                asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(raw_scale_1));
-                *(reinterpret_cast<unsigned char*>(v_scale_hi + (scale_tile_offset_1 + (long long)scale_offset_1)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
-            }
+            const float2 _prescale2_5 = {v_inverse_scale, v_inverse_scale};
+            #if __CUDA_ARCH__ >= 1000
+            #pragma unroll
+            for (int _ps = 0; _ps < 8; _ps++)
+                mul_f32x2_inplace(&reinterpret_cast<float2*>(&(v_values + iteration_1 * 16)[0])[_ps], _prescale2_5);
+            #else
+            #pragma unroll
+            for (int _ps = 0; _ps < 16; _ps++)
+                (v_values + iteration_1 * 16)[0 + _ps] *= v_inverse_scale;
+            #endif
+            unsigned int _fp8_pk[4];
+            asm("{\n\t"
+                ".reg .b16 _lo, _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}\n"
+                : "=r"(_fp8_pk[0]) : "f"((v_values + iteration_1 * 16)[0 + 0]), "f"((v_values + iteration_1 * 16)[0 + 1]), "f"((v_values + iteration_1 * 16)[0 + 2]), "f"((v_values + iteration_1 * 16)[0 + 3]));
+            asm("{\n\t"
+                ".reg .b16 _lo, _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}\n"
+                : "=r"(_fp8_pk[1]) : "f"((v_values + iteration_1 * 16)[0 + 4]), "f"((v_values + iteration_1 * 16)[0 + 5]), "f"((v_values + iteration_1 * 16)[0 + 6]), "f"((v_values + iteration_1 * 16)[0 + 7]));
+            asm("{\n\t"
+                ".reg .b16 _lo, _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}\n"
+                : "=r"(_fp8_pk[2]) : "f"((v_values + iteration_1 * 16)[0 + 8]), "f"((v_values + iteration_1 * 16)[0 + 9]), "f"((v_values + iteration_1 * 16)[0 + 10]), "f"((v_values + iteration_1 * 16)[0 + 11]));
+            asm("{\n\t"
+                ".reg .b16 _lo, _hi;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                "mov.b32 %0, {_lo, _hi};\n\t"
+                "}\n"
+                : "=r"(_fp8_pk[3]) : "f"((v_values + iteration_1 * 16)[0 + 12]), "f"((v_values + iteration_1 * 16)[0 + 13]), "f"((v_values + iteration_1 * 16)[0 + 14]), "f"((v_values + iteration_1 * 16)[0 + 15]));
+            *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(v_fp8 + v_output_offset) + (0)) = *reinterpret_cast<uint4*>(_fp8_pk);
         }
     }
 }
