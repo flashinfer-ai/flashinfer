@@ -113,6 +113,13 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_format_info() -> dict:
         "prefill_max_chunks": int(
             manifest.get("prefill_max_chunks", manifest["max_chunks_per_block"])
         ),
+        # cp.async ring depths with an exported instance per head-tile count (older manifests: two stages only).
+        "prefill_ring_stages": {
+            int(ht): tuple(int(st) for st in stages)
+            for ht, stages in manifest.get(
+                "prefill_ring_stages", {"1": (2,), "2": (2,), "4": (2,)}
+            ).items()
+        },
         "prefill_kernel_commit": manifest.get("prefill_kernel_commit"),
     }
 
@@ -444,7 +451,78 @@ _PREFILL_POLICY: Dict[str, int] = {
     "two_tile_h128_heads": 128,
     "two_tile_k512_band_lo": 512,
     "two_tile_k512_band_hi": 640,
+    # One-tile prefill ring depth: a third cp.async stage from this many 64-candidate chunks per token (+1-2 % on the
+    # K512 rows of both SKUs); dual-cache lists below ``ring_three_stages_dual_min_chunks`` chunks and below
+    # ``ring_three_stages_dual_min_tokens`` tokens keep two stages (the third stage costs 1.2 % there).
+    "ring_three_stages_min_chunks": 8,
+    "ring_three_stages_dual_min_chunks": 16,
+    "ring_three_stages_dual_min_tokens": 512,
+    # L2 evict-first on the BF16 query loads from this many tokens (+5-9 % on long prefills; single-wave
+    # T=128 rows lose 2-3 % with it).
+    "q_evict_first_min_tokens": 512,
+    # Grid order: head-blocks-first (the head blocks of one token are adjacent CTAs and re-use the gathered rows in
+    # L2) for launches with at most this many 64-candidate chunks per block (+3-12 % on the K128 / K256 rows of the
+    # RTX 5090); longer lists keep the token-major grid (short DRAM-latency-bound rows lose with fewer distinct rows
+    # in flight).
+    "grid_head_blocks_first_max_chunks": 4,
+    # Head-blocks-first puts the token count in grid.y, which CUDA caps at 65535; longer prefills keep the token-major
+    # grid (the binding applies the same cap before it builds the launch grid).
+    "grid_head_blocks_first_max_tokens": 65535,
 }
+
+
+def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages(
+    *,
+    head_tiles: int,
+    topk: int,
+    extra_topk: int = 0,
+    dual: bool = False,
+    num_tokens: int,
+) -> int:
+    """cp.async ring depth (2 or 3) of one prefill launch (mirrors the kernel module's ``plan_num_stages``).
+
+    Three stages only for the one-tile instance with at least ``ring_three_stages_min_chunks`` chunks per
+    token; dual-cache lists with fewer than ``ring_three_stages_dual_min_chunks`` chunks and fewer than
+    ``ring_three_stages_dual_min_tokens`` tokens keep two.  Never asks for an instance the export lacks.
+    """
+
+    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+    policy = _PREFILL_POLICY
+    ht = int(head_tiles)
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    if ht != 1 or chunks < policy["ring_three_stages_min_chunks"]:
+        return 2
+    if (
+        dual
+        and chunks < policy["ring_three_stages_dual_min_chunks"]
+        and int(num_tokens) < policy["ring_three_stages_dual_min_tokens"]
+    ):
+        return 2
+    return 3 if 3 in info["prefill_ring_stages"].get(ht, (2,)) else 2
+
+
+def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first(
+    *, head_tiles: int, topk: int, extra_topk: int = 0, num_tokens: int
+) -> bool:
+    """Grid order of one prefill launch (mirrors the kernel module's ``plan_grid_head_blocks_first``): head blocks
+    first for candidate lists of at most ``grid_head_blocks_first_max_chunks`` chunks and at most
+    ``grid_head_blocks_first_max_tokens`` tokens (the CUDA grid.y limit), tokens first otherwise."""
+
+    del head_tiles  # the rule is keyed on the chunk and token counts (kept in the signature for the planner mirror)
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    policy = _PREFILL_POLICY
+    return (
+        chunks <= policy["grid_head_blocks_first_max_chunks"]
+        and int(num_tokens) <= policy["grid_head_blocks_first_max_tokens"]
+    )
+
+
+def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first(
+    *, num_tokens: int
+) -> bool:
+    """L2 evict-first on the query loads from ``q_evict_first_min_tokens`` tokens (mirrors ``plan_q_evict_first``)."""
+
+    return int(num_tokens) >= _PREFILL_POLICY["q_evict_first_min_tokens"]
 
 
 def cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(
@@ -770,6 +848,9 @@ def get_cake_sparse_mla_sm120_dsv4_nvfp4_module():
         head_tiles: int,
         sm_scale: float,
         lse_scale: float,
+        num_stages: int,
+        q_evict_first: int,
+        grid_head_blocks_first: int,
     ) -> None:
         prefill_entry(
             q,
@@ -789,6 +870,9 @@ def get_cake_sparse_mla_sm120_dsv4_nvfp4_module():
             head_tiles,
             sm_scale,
             lse_scale,
+            num_stages,
+            q_evict_first,
+            grid_head_blocks_first,
         )
 
     @register_fake_op("flashinfer::cake_sparse_mla_sm120_dsv4_nvfp4_prefill")
@@ -1161,6 +1245,24 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
             f"head_tiles={ht} is not valid for the {p.num_heads}-head prefill (choices {tiles})"
         )
     items = p.num_tokens * (p.num_heads // (info["heads_per_block"] * ht))
+    num_stages = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages(
+        head_tiles=ht,
+        topk=p.topk,
+        extra_topk=p.extra_topk,
+        dual=p.extra_flat is not None,
+        num_tokens=p.num_tokens,
+    )
+    q_evict_first = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first(
+        num_tokens=p.num_tokens
+    )
+    grid_head_blocks_first = (
+        cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first(
+            head_tiles=ht,
+            topk=p.topk,
+            extra_topk=p.extra_topk,
+            num_tokens=p.num_tokens,
+        )
+    )
     get_cake_sparse_mla_sm120_dsv4_nvfp4_module().prefill(
         q,
         p.kv_flat,
@@ -1179,8 +1281,17 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
         ht,
         float(sm_scale),
         float(lse_scale),
+        num_stages,
+        1 if q_evict_first else 0,
+        1 if grid_head_blocks_first else 0,
     )
-    return {"head_tiles": ht, "num_ctas": items}
+    return {
+        "head_tiles": ht,
+        "num_ctas": items,
+        "num_stages": num_stages,
+        "q_evict_first": bool(q_evict_first),
+        "grid_head_blocks_first": bool(grid_head_blocks_first),
+    }
 
 
 @supported_compute_capability([120, 121])
