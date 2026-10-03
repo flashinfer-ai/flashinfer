@@ -59,7 +59,7 @@
   "extra_data_bytes": 256,
   "extra_scale_bytes": 32,
   "family": "cake_sparse_mla_sm120_dsv41_mixed",
-  "generated_at": "2026-10-02T23:17:32Z",
+  "generated_at": "2026-10-03T00:41:54Z",
   "generator": "sm120-dsv41-mixed-sparse-mla-flashinfer-export",
   "grid_order": "hb_major on CC 12.1 (GB10), token-major on CC 12.0 (decided in the binding)",
   "head_counts": [
@@ -87,9 +87,9 @@
     "80": 32,
     "96": 32
   },
-  "identity": "ec4aa07e75bfcaea7985dc3754c7c580828ec1c531be6267ea884a1fedbc7f1f",
+  "identity": "e8d675be4f5bb52b2306ca756cd8228408240b09af7f88d4b8a80bb6f6092e84",
   "identity_scope": "sha256 over sorted (file name, file text without the provenance header)",
-  "kernel_commit": "6591d94eb6855b1338c51f31917200289088773b",
+  "kernel_commit": "092b4b1f5fd8913d7c01390c7ceb6bc7e866d8e2",
   "kernel_tree_modified": false,
   "main_bytes_per_token": 528,
   "main_data_bytes": 512,
@@ -138,7 +138,7 @@
     "cake_sparse_mla_dsv41_mixed_h80.cu",
     "cake_sparse_mla_dsv41_mixed_h96.cu"
   ],
-  "tree_commit": "4430b843d2db67d70ecddfffc47368a17890fdd2",
+  "tree_commit": "4141710c8b09419b322a93c5a0442c8d7d698bf9",
   "two_tile_head_counts": [
     32,
     48,
