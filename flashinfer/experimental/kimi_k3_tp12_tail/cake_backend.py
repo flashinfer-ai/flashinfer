@@ -30,7 +30,7 @@ limitations under the License.
 # * ``K1``  Lamport all-reduce of ``routed_partial`` fused with KimiRMSNorm ->
 #   the normalised latent ``y`` on every rank (one-shot for ``M <= 16``, the
 #   token-sliced two-shot form above).  Below ``K3_PERSIST_MIN_TOKENS`` the
-#   early-shared-scatter (ESS) forms ``k1_oneshot_ess:r<rank>`` and
+#   early-shared-scatter (ESS) forms ``k1_oneshot_ess`` and
 #   ``k1_twoshot_ess:grouped`` also scatter this rank's ``shared_partial``
 #   columns into the K3 workspace slots of their owner ranks, so the tail
 #   kernel of that range has no scatter stage of its own;
@@ -40,10 +40,11 @@ limitations under the License.
 #   (``torch.mm``, BF16 slice) above;
 # * the tail  owner reduce of the scattered ``shared_partial`` columns, add of
 #   the up-projection slice, one BF16 rounding, multicast all-gather into the
-#   caller-owned ``out``: ``k23:n<cols>:c<capacity>`` (the fp32 slice GEMM in
+#   caller-owned ``out``: ``k23:c<capacity>`` (the fp32 slice GEMM in
 #   the K2-stream summation order fused with the K3-ESS reduce / add /
-#   all-gather, one CTA per ``K23_ROWS`` output columns; the four-token module
-#   for ``M <= 4``, the eight-token module for ``5 <= M <= 8``) for ``M <= 8``;
+#   all-gather, one CTA per ``K23_ROWS`` output columns; the four-token program
+#   for ``M <= 4``, the eight-token program for ``5 <= M <= 8``; the rank's
+#   column width only sizes the grid) for ``M <= 8``;
 #   ``k3_ess:grouped`` (one CTA per token and column half) for ``8 < M < 256``; the persistent
 #   token pipeline (``min(M, SM count)`` CTAs per column half, own scatter of
 #   ``shared_partial``) as ``k3_persist:grouped`` at 256 tokens and as
@@ -93,11 +94,11 @@ GROUPED_MAX_TOKENS = 256
 #: One 16-byte packet per thread covers one 3584-wide row (K1) or one 3584-wide half row (K3).
 THREADS = 448
 K3_GRID_Y = 2
-#: The fused K23 tail (``k23:n<cols>:c<capacity>``: this rank's fp32 up-projection slice GEMM in the K2-stream summation
+#: The fused K23 tail (``k23:c<capacity>``: this rank's fp32 up-projection slice GEMM in the K2-stream summation
 #: order fused with the owner reduce, add, BF16 rounding and multicast all-gather; no ``torch.mm``) up to this many
 #: tokens; cuBLAS (``torch.mm`` on the contiguous weight-row slice, BF16) plus a separate tail kernel above.
 K23_MAX_TOKENS = 8
-#: K23 accumulator capacities compiled side by side (round 6, CAKE-740): ``M`` runs on the smallest capacity ``>= M``, so
+#: K23 accumulator capacities compiled side by side (round 6): ``M`` runs on the smallest capacity ``>= M``, so
 #: ``M <= 4`` keeps the round-5 four-token module bit for bit and ``5 <= M <= 8`` takes the eight-token module.  The
 #: eight-token rows round once (fp32 slice + shared sum -> BF16) where the round-5 chain rounded twice (cuBLAS BF16 slice,
 #: then the add): paired against an fp64 reference their mean / max absolute error is 0.78x / 0.64-0.93x of the round-5
@@ -142,7 +143,7 @@ def poll_schedule_for(num_tokens: int) -> str:
 def k1_kernel_key(num_tokens: int, rank: int) -> str:
     """The K1 kernel key: the early-shared-scatter (ESS) forms below ``K3_PERSIST_MIN_TOKENS``, plain two-shot above."""
     if num_tokens <= ONESHOT_MAX_TOKENS:
-        return f"k1_oneshot_ess:r{rank}"
+        return "k1_oneshot_ess"
     if num_tokens < K3_PERSIST_MIN_TOKENS:
         return f"k1_twoshot_ess:{poll_schedule_for(num_tokens)}"
     return f"k1_twoshot:{poll_schedule_for(num_tokens)}"
@@ -176,10 +177,11 @@ def k3_form_for(num_tokens: int) -> str:
 
 
 def k3_kernel_key(num_tokens: int, rank: int) -> str:
-    """The tail kernel key of ``rank`` (its column width selects the K23 module)."""
+    """The tail kernel key for ``num_tokens`` (the K23 program is selected by its accumulator capacity; the rank's
+    column width only sizes its grid)."""
     form = k3_form_for(num_tokens)
     if form == "k23":
-        return f"k23:n{PARTITION[rank]}:c{k23_capacity_for(num_tokens)}"
+        return f"k23:c{k23_capacity_for(num_tokens)}"
     return f"k3_{form}:{poll_schedule_for(num_tokens)}"
 
 
@@ -531,6 +533,7 @@ def prepare_kimi_k3_tp12_tail(
             k3_mcast_ptr=workspace.multicast_ptr("k3"),
             k3_flags=workspace.flags("k3"),
             num_tokens=M,
+            rank=rank,
             epsilon=float(RMS_EPS),
             grid=(M, 1, 1),
         )
