@@ -15,7 +15,7 @@
  */
 
 #include <cstdint>
-#include "cake_bf16_bmm_declarations_sm100a.cuh"
+#include "cake_bf16_bmm_declarations.cuh"
 #include <limits>
 
 #include "tvm_ffi_utils.h"
@@ -25,40 +25,15 @@ namespace blackwell_bf16_bmm {
 
 namespace {
 
-#ifndef FLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR
-#error "FLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR must be defined by the JIT/AOT spec"
-#endif
-
-constexpr int kTargetMinor = FLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR;
-static_assert(kTargetMinor == 0 || kTargetMinor == 3,
-              "CAKE BF16 BMM target must be exact SM100a or SM103a");
-
 constexpr int kOutBf16 = 0;
 constexpr int kOutF16 = 1;
 constexpr int kOutF32 = 2;
-
-enum class Route : int {
-  kGenericK64 = 0,
-  kGenericK256 = 1,
-  kGenericK1024 = 2,
-  kK256M32N40Bf16 = 3,
-  kK256M32N40F16 = 4,
-  kK256M32N40F32 = 5,
-  kK256M128N64Bf16 = 6,
-  kK256M128N64F16 = 7,
-  kK256M128N64F32 = 8,
-  kK1024M16N1024Bf16 = 9,
-  kK1024M16N1024F16 = 10,
-  kK1024M16N1024F32 = 11,
-  kK1024N16M8Tail = 12,
-};
 
 struct LaunchSpec {
   const void* kernel;
   dim3 grid;
   int threads;
   int dynamic_smem_bytes;
-  Route route;
   bool use_pdl;
 };
 
@@ -78,18 +53,6 @@ struct Problem {
 
 void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK_EQ(status, cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
-}
-
-void CheckTarget(int device_id) {
-  int major = 0;
-  int minor = 0;
-  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
-            "cudaDeviceGetAttribute(major)");
-  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
-            "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK(major == 10 && minor == kTargetMinor)
-      << "this CAKE BF16 BMM module was compiled for exact compute capability 10." << kTargetMinor
-      << ", got " << major << "." << minor;
 }
 
 int CheckedInt(int64_t value, const char* name) {
@@ -133,212 +96,261 @@ int OutputType(const TensorView& out) {
   return -1;
 }
 
-const void* SelectByOutputType(int out_type, const void* bf16_kernel, const void* f16_kernel,
-                               const void* f32_kernel) {
-  if (out_type == kOutBf16) {
-    return bf16_kernel;
+// Opt every generated kernel into its dynamic shared memory once for every
+// device that accepts it. Function-local static initialization of the caller
+// serializes the first call; no lock, per-device cache or per-call attribute
+// query is needed.
+bool SetMaxDynamicSmem(const void* symbol, int smem_bytes) {
+  cudaKernel_t kernel = nullptr;
+  CheckCuda(cudaGetKernel(&kernel, symbol), "cudaGetKernel");
+  int device_count = 0;
+  CheckCuda(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+  int configured = 0;
+  for (int device = 0; device < device_count; ++device) {
+    if (cudaKernelSetAttributeForDevice(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        smem_bytes, device) == cudaSuccess) {
+      ++configured;
+    } else {
+      (void)cudaGetLastError();
+    }
   }
-  if (out_type == kOutF16) {
-    return f16_kernel;
-  }
-  return f32_kernel;
+  TVM_FFI_ICHECK_GT(configured, 0)
+      << "no CUDA device accepts " << smem_bytes << " B of dynamic shared memory";
+  return true;
 }
 
-Route RouteByOutputType(int out_type, Route bf16_route, Route f16_route, Route f32_route) {
-  if (out_type == kOutBf16) {
-    return bf16_route;
+bool ConfigureDynamicSmem() {
+  struct Entry {
+    const void* kernel;
+    int smem_bytes;
+  };
+  const Entry entries[] = {
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_007557bb28b86b0ad447), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_1428cc8db4c88a1a4faf), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_148ff052ab7f16459f74), 98304},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_215b1124d8a15af5cdd3), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_49bbceba1010338dc287), 36864},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_5143d7dde41d5c40f467), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_5ca33069bbbad5c7016d), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_5fb134eefb0c3d4d3572), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_60c16df3a3f9b440c477), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_6bb5fd7ca479b4132d28), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_6d8fa1a07f5f07cab697), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_73c9472b3d1b2ce56afe), 98304},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_74b735e0c2a4a0ab11b5), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_75d6b3b338da1b83fdd2), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_82a7d836ee60f3f8e54d), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_86f88c11bbab28a112a4), 98304},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_8bbbf16d966b721a5216), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_971934c57c7ec8e277e8), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_9fc7d7b7d693e3601c8e), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_a620001ffb4be97be504), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_aae1fbf4100e7044666d), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_b3614c1b24fcc0d9db41), 65536},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_b45cfbc87416c25a8d38), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_bc0d392cafbe0e91f5aa), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_bda02d92fb3e9e813ac2), 36864},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_beecb1dd16619150e5dc), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_cb886960b55646251e65), 36864},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_cc44de244d2ddb40e3e0), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_cd337271d0ea1ad303f9), 98304},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_d1f4a5edaf1b6f5d5e54), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_d53a138927da127b43f3), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_daddfc793176eeaf96ba), 24576},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_dd1aa52c1efb755d163e), 6144},
+      {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_ed865140f48d71197566), 6144},
+  };
+  for (const Entry& entry : entries) {
+    SetMaxDynamicSmem(entry.kernel, entry.smem_bytes);
   }
-  if (out_type == kOutF16) {
-    return f16_route;
-  }
-  return f32_route;
+  return true;
 }
 
 LaunchSpec SelectLaunch(const Problem& problem) {
   if (problem.batch_size == 16 && problem.k == 256 && problem.m == 128 && problem.n == 80 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_cb886960b55646251e65),
       dim3((problem.m + 31) / 32, (problem.n + 39) / 40, problem.batch_size),
-      160, 36864, static_cast<Route>(3), true};
+      160, 36864, true};
   }
   if (problem.batch_size == 16 && problem.k == 256 && problem.m == 128 && problem.n == 80 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_49bbceba1010338dc287),
       dim3((problem.m + 31) / 32, (problem.n + 39) / 40, problem.batch_size),
-      160, 36864, static_cast<Route>(4), true};
+      160, 36864, true};
   }
   if (problem.batch_size == 16 && problem.k == 256 && problem.m == 128 && problem.n == 80 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_bda02d92fb3e9e813ac2),
       dim3((problem.m + 31) / 32, (problem.n + 39) / 40, problem.batch_size),
-      160, 36864, static_cast<Route>(5), true};
+      160, 36864, true};
   }
   if (problem.batch_size == 16 && problem.k == 256 && problem.m == 128 && problem.n == 64 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_74b735e0c2a4a0ab11b5),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(6), true};
+      128, 24576, true};
   }
   if (problem.batch_size == 16 && problem.k == 256 && problem.m == 128 && problem.n == 64 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_cc44de244d2ddb40e3e0),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(7), true};
+      128, 24576, true};
   }
   if (problem.batch_size == 16 && problem.k == 256 && problem.m == 128 && problem.n == 64 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_daddfc793176eeaf96ba),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(8), true};
+      128, 24576, true};
   }
   if (problem.batch_size == 4 && problem.k == 1024 && problem.m == 16 && problem.n == 1024 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_148ff052ab7f16459f74),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 98304, static_cast<Route>(9), true};
+      128, 98304, true};
   }
   if (problem.batch_size == 4 && problem.k == 1024 && problem.m == 16 && problem.n == 1024 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_73c9472b3d1b2ce56afe),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 98304, static_cast<Route>(10), true};
+      128, 98304, true};
   }
   if (problem.batch_size == 4 && problem.k == 1024 && problem.m == 16 && problem.n == 1024 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_86f88c11bbab28a112a4),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 98304, static_cast<Route>(11), true};
+      128, 98304, true};
   }
   if (problem.batch_size == 2 && problem.k == 1024 && problem.m == 8 && problem.n == 1024 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_b3614c1b24fcc0d9db41),
       dim3((problem.m + 15) / 16, (problem.n + 15) / 16, problem.batch_size),
-      64, 65536, static_cast<Route>(12), true};
+      64, 65536, true};
   }
   if (problem.k == 64 && problem.m == 128 && problem.n == 64 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_ed865140f48d71197566),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 128 && problem.n == 64 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_d1f4a5edaf1b6f5d5e54),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 128 && problem.n == 64 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_5143d7dde41d5c40f467),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 48 && problem.n == 64 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_6d8fa1a07f5f07cab697),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 48 && problem.n == 64 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_1428cc8db4c88a1a4faf),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 48 && problem.n == 64 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_82a7d836ee60f3f8e54d),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 128 && problem.n == 80 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_dd1aa52c1efb755d163e),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 128 && problem.n == 80 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_aae1fbf4100e7044666d),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 128 && problem.n == 80 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_bc0d392cafbe0e91f5aa),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 48 && problem.n == 80 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_971934c57c7ec8e277e8),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 48 && problem.n == 80 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_75d6b3b338da1b83fdd2),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 64 && problem.m == 48 && problem.n == 80 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_9fc7d7b7d693e3601c8e),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 256 && problem.m == 128 && problem.n == 64 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_74b735e0c2a4a0ab11b5),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 128 && problem.n == 64 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_cc44de244d2ddb40e3e0),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 128 && problem.n == 64 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_daddfc793176eeaf96ba),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 48 && problem.n == 64 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_b45cfbc87416c25a8d38),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 48 && problem.n == 64 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_5ca33069bbbad5c7016d),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 48 && problem.n == 64 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_5fb134eefb0c3d4d3572),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 128 && problem.n == 80 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_8bbbf16d966b721a5216),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 128 && problem.n == 80 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_beecb1dd16619150e5dc),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 128 && problem.n == 80 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_007557bb28b86b0ad447),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 48 && problem.n == 80 && problem.out_type == 0) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_6bb5fd7ca479b4132d28),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 48 && problem.n == 80 && problem.out_type == 1) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_a620001ffb4be97be504),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 256 && problem.m == 48 && problem.n == 80 && problem.out_type == 2) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_215b1124d8a15af5cdd3),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 64) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_d53a138927da127b43f3),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 6144, static_cast<Route>(0), true};
+      128, 6144, true};
   }
   if (problem.k == 256) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_60c16df3a3f9b440c477),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 24576, static_cast<Route>(1), true};
+      128, 24576, true};
   }
   if (problem.k == 1024) {
     return {reinterpret_cast<const void*>(kernel_cake_bf16_bmm_cd337271d0ea1ad303f9),
       dim3((problem.m + 15) / 16, (problem.n + 31) / 32, problem.batch_size),
-      128, 98304, static_cast<Route>(2), true};
+      128, 98304, true};
   }
   TVM_FFI_THROW(ValueError) << "No generated CAKE BF16 BMM route for this problem";
   return {};
@@ -429,12 +441,10 @@ void Run(TensorView A, TensorView B, TensorView out) {
   Problem problem = ValidateProblem(A, B, out);
   const LaunchSpec launch = SelectLaunch(problem);
 
+  static const bool smem_ready = ConfigureDynamicSmem();
+  (void)smem_ready;
   ffi::CUDADeviceGuard device_guard(A.device().device_id);
-  CheckTarget(A.device().device_id);
-  cudaError_t status = cudaFuncSetAttribute(
-      launch.kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, launch.dynamic_smem_bytes);
-  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "Failed to set CAKE BF16 BMM dynamic shared memory: " << cudaGetErrorString(status);
+  cudaError_t status = cudaSuccess;
 
   auto* a_ptr = static_cast<__nv_bfloat16*>(A.data_ptr());
   auto* b_ptr = static_cast<__nv_bfloat16*>(B.data_ptr());
@@ -473,14 +483,7 @@ void Run(TensorView A, TensorView B, TensorView out) {
       << "Failed to launch CAKE BF16 BMM: " << cudaGetErrorString(status);
 }
 
-int RouteOf(TensorView A, TensorView B, TensorView out) {
-  const Problem problem = ValidateProblem(A, B, out);
-  CheckTarget(A.device().device_id);
-  return static_cast<int>(SelectLaunch(problem).route);
-}
-
 }  // namespace blackwell_bf16_bmm
 }  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::blackwell_bf16_bmm::Run);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(route_of, flashinfer::blackwell_bf16_bmm::RouteOf);
