@@ -2280,6 +2280,51 @@ struct SituAdaptor {
   }
 };
 
+// PowLU-GLU. The gate branch replaces
+// SiLU's linear factor by a self-adapting power, and the negative half is plain SiLU:
+//   PowLU(g) = g > 0 ? g^(m / (sqrt(g) + 1)) * sigmoid(g)
+//                    : g * sigmoid(g)
+//   out      = min(PowLU(gate), limit) * clamp(up, -limit, limit)
+// The two branches agree at g == 0 (both 0) and at g == 1, so PowLU is continuous.
+//
+// `alpha` carries the exponent numerator m. PowLU needs exactly one scalar besides `limit`, so it
+// reuses the generic per-expert swiglu_alpha/swiglu_limit slots instead of widening the
+// ActivationParams ABI -- the same trade SwigluStepAdaptor makes for `limit`. Per-expert
+// `swiglu_limit` covers split limits (routed experts vs. a fused shared expert).
+//
+// PowLU is bounded: for m == 2.5 it peaks at 4.02 (g ~= 12.9) and decays back toward 1 as g grows,
+// so a `limit` above that peak never clips the gate branch and only clamps `up`.
+struct PowLUAdaptor {
+  constexpr static bool IS_GLU = true;
+  float alpha = 2.5f;  // m
+  // Unused by the math; present so the generic setPerExpertActivationParams branch compiles.
+  float beta = 0.0f;
+  float limit = std::numeric_limits<float>::infinity();
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    // Element-wise rather than whole-Array: the gate needs a sign-dependent branch, which the
+    // cutlass::Array functors cannot express. T is always cutlass::Array<float, N> here (both
+    // dispatch sites call the adaptor with ComputeElem).
+    T out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < T::kElements; ++i) {
+      float const g = gate[i];
+      // __expf overflows to +inf for very negative g, giving sigmoid == 0 exactly (not NaN).
+      float const sigmoid = 1.0f / (1.0f + __expf(-g));
+      // __powf(g, e) is exp2f(e * __log2f(g)). The Triton reference computes exp(e * log(g));
+      // the two agree to <= 6e-6 relative, far below bf16 resolution. Shared edge with that
+      // reference: an overflowed gate (g == inf) gives e == 0 and 0 * log(inf) == NaN, which the
+      // non-propagating fminf below turns into `limit` -- torch.pow(inf, 0) == 1 instead.
+      float act = g > 0.0f ? __powf(g, alpha / (sqrtf(g) + 1.0f)) * sigmoid : g * sigmoid;
+      act = fminf(act, limit);
+      float const u = fmaxf(fminf(linear[i], limit), -limit);
+      out[i] = act * u;
+    }
+    return out;
+  }
+};
+
 __device__ inline bool hasPerExpertActivationParams(ActivationParams const& params) {
   return params.swiglu_alpha || params.swiglu_beta || params.swiglu_limit || params.situ_beta ||
          params.situ_linear_beta;
@@ -2371,6 +2416,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluStepAdaptor>
              : activation_type == ActivationType::Situ
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
+             : activation_type == ActivationType::PowLU
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, PowLUAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -2702,9 +2749,18 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
           &doActivationKernel<T, GemmOutputType, ScaleBiasType, SituAdaptor,
                               decltype(block_scaling_type)::value,
                               decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>  // Situ
+                              decltype(nvfp4_4over6_config_tag)>,  // Situ
+          &doActivationKernel<T, GemmOutputType, ScaleBiasType, PowLUAdaptor,
+                              decltype(block_scaling_type)::value,
+                              decltype(disableFP4QuantFastMathTag)::value,
+                              decltype(nvfp4_4over6_config_tag)>  // PowLU
       };
-      return fn_list[static_cast<int>(activation_type.activation_type)];
+      // fn_list is indexed by the enum value, so it must cover every activation up to the
+      // InvalidType sentinel; an out-of-range value would otherwise read past the array.
+      int const act_index = static_cast<int>(activation_type.activation_type);
+      TLLM_CHECK_WITH_INFO(act_index >= 0 && act_index < static_cast<int>(fn_list.size()),
+                           "Invalid activation type %d for the fused activation kernel", act_index);
+      return fn_list[act_index];
     };
 #ifdef ENABLE_FP4
     auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<

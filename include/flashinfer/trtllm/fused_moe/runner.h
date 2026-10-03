@@ -173,7 +173,8 @@ enum class ActivationType : int64_t {
   GegluTanh = 8,
   Identity = 9,
   Situ = 10,
-  InvalidType = 11,  // Must be last
+  PowLU = 11,
+  InvalidType = 12,  // Must be last
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -200,6 +201,8 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "GegluTanh";
     case ActivationType::Situ:
       return "Situ";
+    case ActivationType::PowLU:
+      return "PowLU";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -209,7 +212,8 @@ inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
          activationType == ActivationType::SwigluBias ||
          activationType == ActivationType::SwigluStep ||
-         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ;
+         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ ||
+         activationType == ActivationType::PowLU;
 }
 
 }  // namespace MoE

@@ -553,6 +553,178 @@ def compute_with_experts_gelu_tanh(
     return results.view_as(x)
 
 
+def compute_with_experts_powlu(
+    num_experts,
+    x,
+    w31_weight,
+    w2_weight,
+    selected_experts,
+    routing_weights,
+    m=2.5,
+    limit=None,
+):
+    """Reference for the PowLU-GLU MoE.
+
+    Same shapes and gated weight-split convention as ``compute_with_experts``:
+    ``w31`` splits along dim 0 into ``(w3, w1)`` with ``w3`` the first half
+    (linear/up branch) and ``w1`` the second half (gate branch). The activation
+    is ``min(PowLU(gate), limit) * clamp(linear, -limit, limit)`` -- the clamp
+    runs *after* the nonlinearity, which is SGLang's ``gemm1_clamp_limit``
+    semantics and what ``powlu_and_mul`` computes.
+
+    Returns ``(results, gate_clip_fraction)``; the caller asserts on the second
+    value so a limit that silently fails to reach the kernel cannot pass.
+    """
+    results = torch.zeros_like(x)
+    clipped = 0
+    total = 0
+    for expert_id in range(num_experts):
+        mask = selected_experts == expert_id
+        if not mask.sum():
+            continue
+        batch_idx, nth_expert = torch.where(mask)
+        w31_expert = w31_weight[expert_id]  # [2 * intermediate_size, hidden_size]
+        w2_expert = w2_weight[expert_id]  # [hidden_size, intermediate_size]
+
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+
+        expert_inputs = x[batch_idx]
+        gate = expert_inputs @ w1_expert.t()
+        linear = (expert_inputs @ w3_expert.t()).float()
+        act = moe_utils.powlu_ref(gate, m)
+        if limit is not None:
+            clipped += int((act > limit).sum())
+            total += act.numel()
+            act = act.clamp(max=limit)
+            linear = linear.clamp(min=-limit, max=limit)
+        # The kernel writes the activation output in the GEMM dtype before GEMM2.
+        inter = (act * linear).to(x.dtype)
+        output = inter @ w2_expert.t()
+        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+    return results.view_as(x), (clipped / total if total else 0.0)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_powlu(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+    """Default PowLU (m=2.5, unclamped) on the bf16 CUTLASS MoE path.
+
+    Same shapes and weight-split convention as the SwiGLU ``test_moe``; only the
+    activation differs. With no per-expert tensors the kernel must fall back to
+    PowLUAdaptor's compile-time m and an infinite limit.
+    """
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    x = torch.randn(batch_size, hidden_size, dtype=dtype).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = (
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=dtype).cuda()
+        / 5
+    )
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda() / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output, _ = compute_with_experts_powlu(
+        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+    )
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        flash_output.dtype,
+        output=flash_output,
+        quant_scales=None,
+        activation_type=ActivationType.PowLU,
+    )
+
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("top_k", TOP_K_VALUES)
+@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_powlu_per_expert_m_and_limit(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size
+):
+    """PowLU with per-expert m and clamp.
+
+    ``m`` rides swiglu_alpha and the clamp rides swiglu_limit (PowLUAdaptor
+    reuses those generic slots). ``m=3.5`` exercises a non-default exponent.
+    The limit is deliberately far below PowLU's peak -- 7.02 at m=3.5 --
+    so the clamp demonstrably engages; the assertion on the clip fraction keeps
+    this test from passing if the limit never reaches the kernel.
+    """
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+        )
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    m = 3.5
+    limit = 0.5
+    # Gate-up weights are left unscaled (no /5) so the gate reaches well past
+    # the clamp; the clip-fraction assert below depends on it.
+    x = torch.randn(batch_size, hidden_size, dtype=dtype).cuda() / 5
+    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    w31_weight = torch.randn(
+        num_experts, 2 * intermediate_size, hidden_size, dtype=dtype
+    ).cuda()
+    w2_weight = (
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda() / 5
+    )
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output, clip_fraction = compute_with_experts_powlu(
+        num_experts,
+        x,
+        w31_weight,
+        w2_weight,
+        selected_experts,
+        routing_weights,
+        m=m,
+        limit=limit,
+    )
+    assert clip_fraction > 0.05, (
+        f"the clamp barely engaged ({clip_fraction:.3%} of gate values); this "
+        "configuration would not detect a dropped swiglu_limit"
+    )
+
+    flash_output = torch.empty_like(ref_output)
+    flash_output = fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        flash_output.dtype,
+        output=flash_output,
+        quant_scales=None,
+        activation_type=ActivationType.PowLU,
+        swiglu_alpha=torch.full((num_experts,), m, dtype=torch.float32).cuda(),
+        swiglu_limit=torch.full((num_experts,), limit, dtype=torch.float32).cuda(),
+    )
+
+    torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)

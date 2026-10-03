@@ -50,6 +50,7 @@ from ..quantization.nvfp4_quantization_utils import (
 )
 from ..utils import next_positive_power_of_2, round_up
 from .api import (
+    _CUTILE_SUPPORTED_ACTIVATIONS,
     _CUTLASS_BF16_ARCHS,
     _CUTLASS_FP8_ARCHS,
     _CUTLASS_FP8_BLOCK_ARCHS,
@@ -72,6 +73,7 @@ from .api import (
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -103,10 +105,22 @@ _CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
     GeGLUTanh,
     ReLU2,
     SiTU,
+    PowLU,
     Identity,
     GELU,
     ReLU,
     SiLU,
+)
+
+# The CuTile backends borrowed the CUTLASS list while both supported the same
+# activations; PowLU (CUTLASS-adaptor-only) is where they diverge. Derive the
+# class tuple from the enum allowlist that cutile/activation.py and prepare.py
+# actually enforce, so a future CUTLASS-only activation cannot leak into the
+# CuTile runners' claimed support.
+_CUTILE_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = tuple(
+    activation
+    for activation in _CUTLASS_SEMANTIC_ACTIVATIONS
+    if activation.type in _CUTILE_SUPPORTED_ACTIVATIONS
 )
 
 _CUTILE_INT32_INDEX_LIMIT = 1 << 31
@@ -547,6 +561,19 @@ def _cutlass_activation_params(
         params["swiglu_limit"] = torch.full(
             (num_experts,), activation.limit, dtype=torch.float32, device=device
         )
+    elif isinstance(activation, PowLU):
+        # PowLUAdaptor reads ``m`` from the generic swiglu_alpha slot and the
+        # clamp from swiglu_limit (see cutlass_fused_moe_kernels.cuh). Its
+        # compile-time default matches PowLU()'s, so a default ``m`` needs no
+        # tensor; an absent limit leaves the branches unclamped.
+        if activation.m != PowLU().m:
+            params["swiglu_alpha"] = torch.full(
+                (num_experts,), activation.m, dtype=torch.float32, device=device
+            )
+        if activation.limit is not None:
+            params["swiglu_limit"] = torch.full(
+                (num_experts,), activation.limit, dtype=torch.float32, device=device
+            )
     return params
 
 
@@ -1794,7 +1821,15 @@ class _CutlassRunnerBase(MoERunner):
                     f"{type(self).__name__}: SwiGLUStep does not consume "
                     f"per-expert overrides {ignored}; only gemm1_clamp_limit is valid."
                 )
-        if present and not isinstance(activation, (SwiGLU, SwiGLUStep, SiTU)):
+        # PowLU reads m from gemm1_alpha and its clamp from gemm1_clamp_limit;
+        # gemm1_beta has no PowLU meaning.
+        if isinstance(activation, PowLU) and "gemm1_beta" in view:
+            raise ValueError(
+                f"{type(self).__name__}: PowLU does not consume the per-expert "
+                "override gemm1_beta; only gemm1_alpha (the exponent m) and "
+                "gemm1_clamp_limit are valid."
+            )
+        if present and not isinstance(activation, (SwiGLU, SwiGLUStep, SiTU, PowLU)):
             raise ValueError(
                 f"{type(self).__name__}: per-expert activation overrides {present} "
                 f"are invalid for {type(activation).__name__}."
@@ -3194,7 +3229,7 @@ class CuTileBf16Runner(MoERunner):
     backend_key = "cutile_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
-    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    supported_activation_classes = _CUTILE_SEMANTIC_ACTIVATIONS
     supports_expert_parallelism = False
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
     _num_top_tactics_per_stage: ClassVar[int] = 2

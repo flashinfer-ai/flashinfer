@@ -31,6 +31,7 @@ enum class ActivationType {
   GegluTanh,
   Identity,
   Situ,
+  PowLU,
   InvalidType
 };
 
