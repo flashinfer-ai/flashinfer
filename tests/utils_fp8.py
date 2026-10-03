@@ -108,7 +108,6 @@ def mxfp8_quantize_reference(
         torch.ones_like(block_scale),
         127 - scales.to(torch.int32),
     )
-    inv_scale.masked_fill_(scales == 0, 0)
     quantized = (blocks * inv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
     return quantized.reshape(*a.shape[:-1], padded_k), _swizzle_mxfp8_scales(
         scales,
