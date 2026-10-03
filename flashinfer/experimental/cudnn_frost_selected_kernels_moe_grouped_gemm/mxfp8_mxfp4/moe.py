@@ -29,6 +29,8 @@ from ..cache import (
 )
 from ..capabilities import require_compiler
 from ..shortlist import _read, select
+from ..heuristics import POLICY_VERSION, select_stages
+from ..tuning import prepared_state, ranked_tactics
 from . import runtime, fma
 from .support import is_eligible
 
@@ -100,10 +102,34 @@ def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activ
         activation_name(activation),
     )
     profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
-    # Reuse the common next-measured-token bucket, while refusing the explicit
-    # legacy path that returns an unfiltered pool when no profile table exists.
-    if not profiles or not 0 < tokens <= 12288:
+    if not 0 < tokens <= 1 << 20:
         return (), ()
+    if not profiles or tokens > max(profiles):
+        first, second = _kernels(
+            tokens * topk, hidden, intermediate, experts, device, activation
+        )
+        if not first or not second:
+            return (), ()
+        fused, _ = _kernels(
+            tokens * topk,
+            hidden,
+            intermediate,
+            experts,
+            device,
+            activation,
+            quantized_output=True,
+        )
+        return select_stages(
+            first,
+            second,
+            fused,
+            tokens=tokens,
+            hidden=hidden,
+            intermediate=intermediate,
+            experts=experts,
+            topk=topk,
+            sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
+        )
     bucket = min((n for n in profiles if n >= tokens), default=max(profiles))
     if any(len(ids) != 2 for ids in profiles[bucket]):
         return (), ()
@@ -168,6 +194,7 @@ class _Plans:
         fma_tactic=None,
     ):
         self.plans, self.launches = {}, {}
+        self.first, self.second = first, second
         required = 0
         module = _module(common._arch_for(device))
         for a, b in product(first, second):
@@ -451,7 +478,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         first, second = _selected_kernels(
             t, h, i, e, k, self.device, self.config.activation
         )
-        return 2 <= len(first) <= 6 and len(second) == 2
+        return bool(first and second)
 
     def pack_inputs(self, act, weights):
         self._require_built()
@@ -476,10 +503,8 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         first, second = _selected_kernels(
             t, h, i, e, k, self.device, self.config.activation
         )
-        if not (2 <= len(first) <= 6 and len(second) == 2):
-            raise ValueError(
-                "No measured two-by-two cuDNN Frost MXFP8 × MXFP4 shortlist for this problem"
-            )
+        if not first or not second:
+            raise ValueError("No legal cuDNN Frost stage candidates for this problem")
         fma_tactic = _fma_tactic(t, h, i, e, k, self.config.activation)
         key = (
             t,
@@ -532,9 +557,9 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
-        state = self.launch_state_for(inputs)
+        state = prepared_state(self, inputs)
         if state is not None:
-            return list(state.launches)
+            return ranked_tactics(state, inputs, _TAG)
         tokens, hidden = inputs[1].shape
         first, second = _selected_kernels(
             tokens,
@@ -559,12 +584,21 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         return tactics
 
     def get_cache_key_extras(self, inputs):
+        state = prepared_state(self, inputs)
         return super().get_cache_key_extras(inputs) + (
-            tuple(self.get_valid_tactics(inputs, None)),
+            POLICY_VERSION,
+            tuple(state.launches)
+            if state is not None
+            else tuple(self.get_valid_tactics(inputs, None)),
         )
 
     def validate_tactic(self, inputs, tactic):
-        return tactic == -1 or tactic in self.get_valid_tactics(inputs, None)
+        state = prepared_state(self, inputs)
+        return tactic == -1 or tactic in (
+            state.launches
+            if state is not None
+            else self.get_valid_tactics(inputs, None)
+        )
 
     def forward(
         self,

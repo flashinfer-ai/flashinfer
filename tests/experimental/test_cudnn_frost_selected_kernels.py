@@ -1590,13 +1590,14 @@ def _assert_mxfp8_auto_admission(name, mixed=False):
         experts=ExpertConfig(intermediate_size=3072),
         backend=BackendOptions((backend(),)),
         activation=ACTIVATIONS[name](),
+        execution=ExecutionConfig(tune_max_num_tokens=16384),
     )
     for tokens, expected in (
         (0, False),
         (1, True),
         (17, True),
         (12288, True),
-        (12289, False),
+        (12289, True),
     ):
         act = MoEActivationPack(
             torch.empty(tokens, 7168, dtype=torch.float8_e4m3fn, device="meta"),
@@ -1610,8 +1611,13 @@ def _assert_mxfp8_auto_admission(name, mixed=False):
             config, replace(act, hidden_states_q=act.hidden_states_q.bfloat16()), 107
         )
         assert not support.is_eligible(replace(config, quant=QuantConfig()), act, 107)
-        assert not support.is_eligible(
-            replace(config, routing=RoutingConfig(num_experts=12, top_k=3)), act, 107
+        assert (
+            support.is_eligible(
+                replace(config, routing=RoutingConfig(num_experts=12, top_k=3)),
+                act,
+                107,
+            )
+            == expected
         )
 
 
@@ -2315,19 +2321,28 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
     )
 
     monkeypatch.setattr(shortlist, "_read", lambda roots: table)
+    fallback = ((first[0],), (second[0],))
+    monkeypatch.setattr(moe, "select_stages", lambda *args, **kwargs: fallback)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=128),
+    )
     args = (4096, 14336, 8, 2, "cuda", SwiGLU())
-    for tokens in (1, 17, 127, 128, 129, 12288):
+    for tokens in (1, 17, 127, 128):
         assert moe._selected_kernels(tokens, *args) == (
             (first[2], first[0]),
             (second[1], second[2]),
         )
-    for tokens in (0, 12289):
+    for tokens in (0, (1 << 20) + 1):
         assert moe._selected_kernels(tokens, *args) == ((), ())
-    assert moe._selected_kernels(128, 4096, 14336, 9, 2, "cuda", SwiGLU()) == ((), ())
+    for tokens in (129, 12288, 12289):
+        assert moe._selected_kernels(tokens, *args) == fallback
+    assert moe._selected_kernels(128, 4096, 14336, 9, 2, "cuda", SwiGLU()) == fallback
     table[key][128] = (("first2",), ("second1", "second2"))
     assert moe._selected_kernels(128, *args) == ((), ())
     table.clear()
-    assert moe._selected_kernels(128, *args) == ((), ())
+    assert moe._selected_kernels(128, *args) == fallback
 
 
 def test_mxfp8_plan_workspaces_preserve_prior_allocations(monkeypatch):
@@ -2478,13 +2493,14 @@ def test_nvfp4_auto_admission_uses_logical_hidden_size(name):
         experts=ExpertConfig(intermediate_size=3072),
         backend=BackendOptions((CutlassNvfp4Config(),)),
         activation=ACTIVATIONS[name](),
+        execution=ExecutionConfig(tune_max_num_tokens=16384),
     )
     for tokens, expected in (
         (0, False),
         (1, True),
         (17, True),
         (12288, True),
-        (12289, False),
+        (12289, True),
     ):
         act = MoEActivationPack(
             torch.empty(tokens, 7168 // 2, dtype=torch.uint8, device="meta"),
@@ -2503,7 +2519,7 @@ def test_nvfp4_auto_admission_uses_logical_hidden_size(name):
             replace(
                 act,
                 hidden_states_q=torch.empty(
-                    tokens, 7168, dtype=torch.uint8, device="meta"
+                    tokens, 7169, dtype=torch.uint8, device="meta"
                 ),
             ),
             107,

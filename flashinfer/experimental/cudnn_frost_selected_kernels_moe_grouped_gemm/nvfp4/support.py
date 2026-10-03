@@ -5,7 +5,7 @@ import torch
 
 from ....fused_moe.api import QuantFormat, RoutingInputMode
 from ..activations import activation_name
-from ..support import shortlisted_moe_geometry
+from ..support import quantized_moe_geometry
 
 
 def is_eligible(config, act, arch):
@@ -23,7 +23,7 @@ def is_eligible(config, act, arch):
         activation_name(config.activation)
     except NotImplementedError:
         return False
-    return shortlisted_moe_geometry(config, act, hidden_size=2 * x.shape[1])
+    return quantized_moe_geometry(config, act, hidden_size=2 * x.shape[1])
 
 
 def create_runner(config, device):

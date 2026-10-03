@@ -171,12 +171,35 @@ experts, expert parallelism, non-default activation parameters and logits-based
 routing are unsupported.
 
 Automatic admission requires SM107a, MXFP8 operands, BF16 finalized output,
-precomputed routing and a matching measured shortlist. As for BF16, each
-`(activation,E,H,I,top_k,tokens)` profile supplies two FC1/activation and two
-FC2 configurations, giving four complete plans to autotune against the original
-eligible backends. Intermediate token counts use the next measured profile;
-native plans use the exact input shape. Calls beyond the largest token profile
-or without a matching table entry retain their original candidates.
+precomputed routing and legal artifacts for both stages. The experimental auto
+gate still requires `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`. Existing
+`(activation,E,H,I,top_k,tokens)` measurements retain their two FC1/activation
+and two FC2 configurations and fused variants. Intermediate token counts use
+the next measured profile; native plans use the exact input shape.
+
+MXFP8, NVFP4 and MXFP8 × MXFP4 shapes without a table entry (including token
+counts beyond its largest profile) use a bounded heuristic pool. H/I must be
+positive multiples of 128, at most 2^20; `1 <= top_k <= E <= 1024`;
+`1 <= T <= min(2^20, tune_max_num_tokens)`; expanded rows must satisfy the
+native int32 bound. Each stage must also match its artifact's dimension and
+activation contracts. Missing legal stages exclude Frost from auto selection.
+BF16 retains its existing measured geometry policy until its shape-specific
+artifact contracts are generalized and validated.
+
+The heuristic uses expanded rows `T * top_k`, estimated rows per active expert,
+each stage's N/K, packed weight type, tile orientation, CTA/cluster geometry and
+SM count. It retains up to four unfused artifacts per stage and two fused FC1
+representatives. NVFP4 retains a third fused cluster family when the average
+expanded rows per expert fill a token tile, allowing larger cluster alternatives
+to compete with the smaller clusters. These are analytic estimates, not measured
+performance guarantees. Actual routing stays on the GPU. During autotuning, each
+unfused stage is ranked separately on the prepared routing, keeping two choices.
+FC1 timing includes intermediate requantization. The outer tuner compares at
+most eight complete pipelines, or ten with the third NVFP4 fused candidate.
+Ordinary calls use deterministic candidates or a cached winner without timing
+stages.
+The existing measured FMA scope is unchanged. Candidate identities and the
+heuristic policy version participate in cache keys.
 
 All ten default activations additionally offer an independent small-token FMA
 tactic on SM107a: E64/H2048/I1408/K6 at T=1..4, and E12/H7168/I3072/K2 at T=1.
