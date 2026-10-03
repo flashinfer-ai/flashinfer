@@ -114,6 +114,26 @@ LL_FINALIZE_GB300_TP8_H5120_K3 = LLFinalizeTuning(
 LL_ALL_REDUCE_GB300_TP4_H5120 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H5120)
 LL_ALL_REDUCE_GB300_TP8_H5120 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H5120)
 
+# hidden_size=7168, bf16, top_k=16 (Kimi K3), TP4 and TP8. A token is
+# 896 bf16x8 fragments, so cluster_size=7 with 128 threads gives a fragment
+# stride of exactly 896. The collective therefore covers one token without a
+# partially utilised trip. TP8 finalize uses a separately measured decode
+# preset: two rank lanes and 256 collective threads reduce the inter-node
+# latency, while an 8-route prefetch group keeps its register footprint down.
+_LL_COLLECTIVE_H7168 = LLCollectiveTuning(cluster_size=7)
+
+LL_FINALIZE_GB300_TP4_H7168_K16 = LLFinalizeTuning(
+    prefetch_group=16, collective=_LL_COLLECTIVE_H7168
+)
+LL_FINALIZE_GB300_TP8_H7168_K16 = LLFinalizeTuning(
+    elements_per_thread=1,
+    threads=256,
+    prefetch_group=8,
+    collective=LLCollectiveTuning(cluster_size=8, rank_lanes=2, threads=256),
+)
+LL_ALL_REDUCE_GB300_TP4_H7168 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H7168)
+LL_ALL_REDUCE_GB300_TP8_H7168 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H7168)
+
 
 @dataclass(slots=True)
 class LLProtocolState:
