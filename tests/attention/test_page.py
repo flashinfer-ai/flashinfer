@@ -323,6 +323,24 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     _assert_nvfp4_quantized_close(v_dequant[valid_slots], v_append[:nnz_kv][valid])
 
 
+def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_4over6():
+    _skip_if_fp8_e4m3_scale_unsupported()
+    torch.manual_seed(0)
+    kv = torch.randn(2, 16, 4, 128, device="cuda:0", dtype=torch.bfloat16)
+    slots = torch.arange(16, device="cuda:0")
+    errors = []
+    for recipe in (None, flashinfer.NVFP44Over6Config(err_mode="MSE")):
+        cache = torch.zeros(1, 2, 16, 4, 64, dtype=torch.uint8, device="cuda:0")
+        sf = torch.zeros(1, 2, 16, 4, 8, dtype=torch.float8_e4m3fn, device="cuda:0")
+        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            *kv, slots, cache, sf, 1.0, 1.0, nvfp4_4over6=recipe
+        )
+        diff = _nvfp4_dequant_linear(cache, sf, 1.0)[0] - kv.float()
+        errors.append(diff.unflatten(-1, (-1, 16)).square().sum(-1))
+    assert (errors[1] <= errors[0] * (1 + 1e-5) + 1e-7).all()
+    assert (errors[1] < errors[0] * (1 - 1e-3)).any()
+
+
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_page_size_one(
     kv_layout,
