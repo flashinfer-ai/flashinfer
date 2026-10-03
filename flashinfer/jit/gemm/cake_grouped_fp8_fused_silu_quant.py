@@ -257,7 +257,7 @@ def generated_program_available(device) -> bool:
 
 
 def _route_table(arch: str) -> dict[str, str]:
-    return ROUTES[arch] if arch in ROUTES else ROUTES  # per-arch tables only when they differ
+    return ROUTES.get(arch, ROUTES)  # per-arch tables only when they differ
 
 
 def stage_program(arch: str, route: str, stage: str) -> str:

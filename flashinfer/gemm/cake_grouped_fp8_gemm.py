@@ -179,7 +179,9 @@ def _validate_indices(m_indices: torch.Tensor, groups: int) -> None:
         if indices.numel() > 1
         else torch.zeros((), dtype=torch.int64, device=indices.device)
     )
-    lowest, highest, unsorted = torch.stack((indices.min(), indices.max(), unsorted)).tolist()
+    lowest, highest, unsorted = torch.stack(
+        (indices.min(), indices.max(), unsorted)
+    ).tolist()
     if lowest < 0 or highest >= groups:
         raise ValueError(
             "m_indices must satisfy 0 <= index < num_groups; -1 padding is unsupported"

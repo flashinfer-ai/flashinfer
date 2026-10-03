@@ -176,7 +176,12 @@ def test_random_token_counts_match_reference(seed, total, groups, n, k):
     group_counts = _random_token_counts(rng, total, groups)
     assert sum(group_counts) == total
     a, b, a_scale, b_scale, m_indices = _make_inputs(
-        group_counts, n, k, seed=4740 + seed, device=device, arbitrary_scales=bool(seed % 2)
+        group_counts,
+        n,
+        k,
+        seed=4740 + seed,
+        device=device,
+        arbitrary_scales=bool(seed % 2),
     )
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
         a, b, a_scale, b_scale, m_indices, validate_indices=True

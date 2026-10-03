@@ -559,7 +559,9 @@ def _validate_indices(m_indices: torch.Tensor, groups: int) -> tuple[int, ...]:
     if m > 1:
         step = indices[1:] - indices[:-1]
         unsorted = (step < 0).sum()
-        misaligned = ((step > 0) & (torch.arange(1, m, device=device) % ROW_BLOCK != 0)).sum()
+        misaligned = (
+            (step > 0) & (torch.arange(1, m, device=device) % ROW_BLOCK != 0)
+        ).sum()
     else:
         unsorted = misaligned = zero
     block_experts = indices[::ROW_BLOCK]
@@ -584,17 +586,25 @@ def _validate_indices(m_indices: torch.Tensor, groups: int) -> tuple[int, ...]:
     return tuple(int(v) for v in stats[4:])
 
 
-def _group_blocks_from_counts(group_counts: Sequence[int], m: int, groups: int) -> tuple[int, ...]:
+def _group_blocks_from_counts(
+    group_counts: Sequence[int], m: int, groups: int
+) -> tuple[int, ...]:
     """Block counts from caller-supplied rows per expert (host integers; no device work)."""
     counts = [int(c) for c in group_counts]
     if len(counts) != groups:
-        raise ValueError(f"group_counts must have one entry per expert ({groups}), got {len(counts)}")
+        raise ValueError(
+            f"group_counts must have one entry per expert ({groups}), got {len(counts)}"
+        )
     if any(c < 0 for c in counts) or sum(counts) != m:
-        raise ValueError(f"group_counts must be non-negative and sum to M={m}, got sum {sum(counts)}")
+        raise ValueError(
+            f"group_counts must be non-negative and sum to M={m}, got sum {sum(counts)}"
+        )
     prefix = 0
     for count in counts:
         prefix += count
-        if 0 < prefix < m and prefix % ROW_BLOCK:  # only the final expert may end in a partial block
+        if (
+            0 < prefix < m and prefix % ROW_BLOCK
+        ):  # only the final expert may end in a partial block
             raise ValueError(
                 "group_counts must place every internal expert boundary at a multiple of 128 rows"
             )
@@ -741,7 +751,9 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     if not isinstance(a, torch.Tensor) or a.device.type != "cuda":
         raise ValueError("a must be a CUDA torch.Tensor")
     device = a.device
-    device_index = torch.cuda.current_device() if device.index is None else int(device.index)
+    device_index = (
+        torch.cuda.current_device() if device.index is None else int(device.index)
+    )
     arch = device_arch(device_index)
     if arch is None:
         raise NotImplementedError(

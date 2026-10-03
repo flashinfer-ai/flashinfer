@@ -50,7 +50,9 @@ def _require_generated_program():
         pytest.skip("requires CUDA")
     device = torch.device("cuda")
     if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
-        pytest.skip("generated fused grouped FP8 gate_up programs target SM100a and SM103a")
+        pytest.skip(
+            "generated fused grouped FP8 gate_up programs target SM100a and SM103a"
+        )
     if not is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available(
         device
     ):
@@ -651,12 +653,21 @@ def _random_aligned_counts(rng, groups, max_blocks):
         blocks[rng.randrange(groups)] += 1
     counts = [b * 128 for b in blocks]
     last = max(i for i, c in enumerate(counts) if c)
-    counts[last] -= rng.choice((0, 0, rng.randint(1, 127)))  # partial final block on some rows
+    counts[last] -= rng.choice(
+        (0, 0, rng.randint(1, 127))
+    )  # partial final block on some rows
     return counts
 
 
 RANDOM_TOKEN_CASES = [
-    pytest.param(seed, groups, max_blocks, n2, k, id=f"s{seed}_g{groups}_b{max_blocks}_n{n2}_k{k}")
+    pytest.param(
+        seed,
+        groups,
+        max_blocks,
+        n2,
+        k,
+        id=f"s{seed}_g{groups}_b{max_blocks}_n{n2}_k{k}",
+    )
     for seed, groups, max_blocks, n2, k in (
         (1, 4, 8, 256, 512),
         (2, 8, 16, 512, 1024),
@@ -676,7 +687,12 @@ def test_random_token_counts_match_torch_reference(seed, groups, max_blocks, n2,
     rng = random.Random(seed)
     group_counts = _random_aligned_counts(rng, groups, max_blocks)
     a, b, a_scale, b_scale, m_indices = _make_inputs(
-        group_counts, n2, k, seed=670 + seed, device=device, arbitrary_scales=bool(seed % 2)
+        group_counts,
+        n2,
+        k,
+        seed=670 + seed,
+        device=device,
+        arbitrary_scales=bool(seed % 2),
     )
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices, validate_indices=True
@@ -714,7 +730,13 @@ def test_group_counts_route_without_device_work(group_counts, n2, k):
         validated.stage_grids,
     )
     both = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
-        a, b, a_scale, b_scale, m_indices, group_counts=group_counts, validate_indices=True
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indices,
+        group_counts=group_counts,
+        validate_indices=True,
     )
     assert both.route == validated.route
     out_q, out_s = from_counts.launch()
@@ -743,7 +765,10 @@ def test_caller_owned_outputs_and_workspace():
     g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
     _assert_quantizes_reference(out_q, out_s, g, u)
     torch.testing.assert_close(
-        workspace.float(), _reference_gemm(a, b, a_scale, b_scale, m_indices).float(), atol=3e-2, rtol=3e-2
+        workspace.float(),
+        _reference_gemm(a, b, a_scale, b_scale, m_indices).float(),
+        atol=3e-2,
+        rtol=3e-2,
     )
 
 
@@ -759,7 +784,9 @@ def test_re_preparing_per_step_retains_no_device_memory():
     baseline = torch.cuda.memory_allocated(device)
     for _ in range(12):
         counts = _random_aligned_counts(rng, groups, 32)
-        counts = [c - c % 128 for c in counts]  # fused routes: whole blocks, M >= SMALL_M_MAX
+        counts = [
+            c - c % 128 for c in counts
+        ]  # fused routes: whole blocks, M >= SMALL_M_MAX
         while sum(counts) < SMALL_M_MAX:
             counts[rng.randrange(groups)] += 128
         m = sum(counts)
@@ -820,7 +847,13 @@ def test_rejects_invalid_inputs():
         )
     with pytest.raises(ValueError, match="disagree with m_indices"):
         prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
-            a, b, a_scale, b_scale, m_indices, group_counts=[256, 0], validate_indices=True
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indices,
+            group_counts=[256, 0],
+            validate_indices=True,
         )
     with pytest.raises(ValueError, match="M must be at most 8192"):
         big_a, big_b, big_as, big_bs, big_idx = _make_inputs(

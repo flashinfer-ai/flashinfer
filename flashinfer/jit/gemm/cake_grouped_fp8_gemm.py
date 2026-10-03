@@ -376,7 +376,7 @@ def generated_program_available(device) -> bool:
 
 def route_program(arch: str, route: str) -> str:
     """Return the generated program serving ``route`` on ``arch``."""
-    table = ROUTES[arch] if arch in ROUTES else ROUTES  # per-arch tables only when they differ
+    table = ROUTES.get(arch, ROUTES)  # per-arch tables only when they differ
     program = table.get(route)
     if program is None or arch not in PROGRAMS[program]["arches"]:
         raise NotImplementedError(
