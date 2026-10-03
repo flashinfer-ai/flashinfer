@@ -985,6 +985,21 @@ def _validate_dsv4_sync_checks(device: torch.device) -> bool:
     return True
 
 
+# DSV4 NVFP4 paged-cache row width (``Dsv4Nvfp4Layout::BYTES_PER_TOKEN``):
+# 224 B packed E2M1 + 128 B BF16 rope + 28 B E4M3 scales + 4 B zero padding.
+_DSV4_NVFP4_BYTES_PER_TOKEN = 384
+
+
+def _check_packed_kv_row(
+    kv_cache: torch.Tensor, bytes_per_token: int, name: str
+) -> None:
+    if kv_cache.dtype != torch.uint8 or kv_cache.size(-1) != bytes_per_token:
+        raise ValueError(
+            f"Expected packed uint8 {name} with {bytes_per_token} bytes per token, "
+            f"got {kv_cache.dtype} {tuple(kv_cache.shape)}"
+        )
+
+
 def _check_dsv4_sparse_mla_inputs(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -1000,6 +1015,7 @@ def _check_dsv4_sparse_mla_inputs(
     allow_sm120_packed_kv: bool = False,
     metadata_rows_may_be_fewer: bool = False,
     check_topk_lens_range: bool = True,
+    packed_kv_bytes_per_token: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1016,6 +1032,9 @@ def _check_dsv4_sparse_mla_inputs(
     ``1 <= rows <= sum_q`` and sizes ``sparse_topk_lens`` by those rows;
     ``check_topk_lens_range=False`` skips the TRTLLM-GEN ``[128, capacity]``
     length check for backends that clamp lengths in-kernel.
+    ``packed_kv_bytes_per_token`` replaces the dense ``[..., 512]`` dtype-match
+    check on both KV pools with an opaque ``uint8`` row of that many bytes
+    (CAKE with ``kv_cache_format="nvfp4"``).
     """
     is_varlen_q = cum_seq_lens_q is not None
     out_shape: Tuple[int, ...]
@@ -1137,7 +1156,9 @@ def _check_dsv4_sparse_mla_inputs(
         swa_kv_cache = _normalize_dsv4_sparse_mla_kv_cache(
             swa_kv_cache, kv_layout, "swa_kv_cache"
         )
-    if allow_sm120_packed_kv and swa_kv_cache.dtype == torch.uint8:
+    if packed_kv_bytes_per_token is not None:
+        _check_packed_kv_row(swa_kv_cache, packed_kv_bytes_per_token, "swa_kv_cache")
+    elif allow_sm120_packed_kv and swa_kv_cache.dtype == torch.uint8:
         if swa_kv_cache.size(-1) != 584:
             raise ValueError(
                 "Expected packed SM120 DSV4 swa_kv_cache head dim 584, got "
@@ -1161,7 +1182,11 @@ def _check_dsv4_sparse_mla_inputs(
         compressed_kv_cache = _normalize_dsv4_sparse_mla_kv_cache(
             compressed_kv_cache, kv_layout, "compressed_kv_cache"
         )
-    if allow_sm120_packed_kv and compressed_kv_cache.dtype == torch.uint8:
+    if packed_kv_bytes_per_token is not None:
+        _check_packed_kv_row(
+            compressed_kv_cache, packed_kv_bytes_per_token, "compressed_kv_cache"
+        )
+    elif allow_sm120_packed_kv and compressed_kv_cache.dtype == torch.uint8:
         if compressed_kv_cache.size(-1) != 584:
             raise ValueError(
                 "Expected packed SM120 DSV4 compressed_kv_cache head dim 584, got "
@@ -1946,8 +1971,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         remain arbitrary absolute token rows in this mode.
     compressed_kv_cache : Optional[torch.Tensor]
         Primary/compressed KV cache in the same backend layout as
-        ``swa_kv_cache``. Required by ``trtllm-gen`` and HCA, and by SM120
-        ``sparse`` when ``extra_sparse_indices`` is provided.
+        ``swa_kv_cache``. Required by ``trtllm-gen`` and HCA, by SM120
+        ``sparse`` when ``extra_sparse_indices`` is provided, and by
+        ``backend="cake"`` except for ``kv_cache_format="nvfp4"`` without
+        ``extra_sparse_indices``.
     sparse_topk_lens : Optional[torch.Tensor]
         Flattened total sparse MLA top-k lengths in query-token order, shape
         ``[sum_q]``. Values must already include the fixed 128 SWA entries,
@@ -1992,7 +2019,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     swa_topk_lens : Optional[torch.Tensor]
         Active SWA segment lengths, shape ``[sum_q]`` INT32. On SM120/SM121
         these are sparse-segment lengths. HCA requires them as its per-row
-        visible sliding-window lengths in the range 0 through 128.
+        visible sliding-window lengths in the range 0 through 128. With
+        ``backend="cake"`` and ``kv_cache_format="nvfp4"`` they are the active
+        lengths of the main table ``sparse_indices`` (one entry per metadata
+        row; ``sparse_topk_lens_offset`` is added in-kernel), as on SM120.
     extra_sparse_indices : Optional[torch.Tensor]
         Optional SM120/SM121 compressed segment indices into
         ``compressed_kv_cache``. With ``backend="cake"``, the separate
@@ -2002,7 +2032,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         Active compressed segment lengths for SM120/SM121, shape ``[sum_q]``
         INT32. With ``backend="cake"``, compressed-only lengths ``[T]`` that
         replace ``sparse_topk_lens`` (the host adds the 128 SWA slots through
-        ``sparse_topk_lens_offset``).
+        ``sparse_topk_lens_offset``); with ``kv_cache_format="nvfp4"`` they
+        are independent of ``swa_topk_lens`` and optional (omitted lengths
+        activate every column of ``extra_sparse_indices``).
     backend : {"auto", "trtllm-gen", "cute-dsl", "sparse", "cake"}
         Backend selection. ``"auto"`` preserves the architecture-based default:
         the prebuilt cubins on SM100/SM103/SM107 and sparse on SM120/SM121. HCA is selected
@@ -2115,6 +2147,21 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         runtime page sizes for main and extra caches, including 256/64 and
         61/53 layouts; page strides may include padding.
         FP4 upconversion is lossy relative to direct cache dequantization.
+        With ``backend="cake"`` on SM100/SM103, ``"nvfp4"`` selects the same
+        384-byte DSV4 NVFP4 cache ABI for both pools (written by
+        :func:`nvfp4_quantize_pack_sparse_mla_cache` and
+        :func:`nvfp4_quantize_append_sparse_mla_cache`) and the CAKE NVFP4
+        prefill route: a BF16 query of 1 to 128 heads, ``sparse_indices`` as
+        the main table (128 or more columns) with ``swa_topk_lens`` as its
+        active lengths, an optional ``extra_sparse_indices`` /
+        ``extra_sparse_topk_lens`` compressed segment, page sizes any power of
+        two of at least 2 with a free page pitch, HND or NHD, ragged or dense
+        queries, ``-1`` padding and zero-length rows. ``sparse_topk_lens`` is
+        rejected there (the NVFP4 main table is not a fixed 128-slot window)
+        and ``compressed_kv_cache`` is only needed with
+        ``extra_sparse_indices``. The route also writes a base-2 LSE per
+        (token, head) into the workspace; read it with
+        :func:`flashinfer.mla.cake_dsv4_nvfp4_lse`.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     if kv_cache_format not in ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"):
@@ -2126,12 +2173,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
     if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
         raise ValueError("kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse'")
-    if kv_cache_format == "nvfp4" and backend != "sparse":
-        if backend != "cake" or not _is_sm120_family(query.device):
-            raise ValueError(
-                "kv_cache_format='nvfp4' requires backend='sparse' (or "
-                "backend='cake' on SM120/SM121)"
-            )
+    if kv_cache_format == "nvfp4" and backend not in ("sparse", "cake"):
+        raise ValueError(
+            "kv_cache_format='nvfp4' requires backend='sparse' (SM120/SM121) or "
+            "backend='cake' (SM100/SM103, SM120/SM121)"
+        )
 
     rope_quant = dsv4_inv_rope_cos_sin_cache is not None
     if dsv4_output_scale is not None and not rope_quant:
@@ -2374,6 +2420,33 @@ def trtllm_batch_decode_sparse_mla_dsv4(
                 "sparse_topk_lens, and seq_lens"
             )
         cake_lens = sparse_topk_lens
+    elif kv_cache_format == "nvfp4":
+        # The SM120 NVFP4 form: sparse_indices is the main table, swa_topk_lens
+        # its active lengths; the compressed segment is optional and has its
+        # own independent lengths.
+        if isinstance(sparse_topk_lens_offset, bool) or not isinstance(
+            sparse_topk_lens_offset, int
+        ):
+            raise TypeError("sparse_topk_lens_offset must be an int")
+        if swa_topk_lens is None:
+            raise ValueError(
+                "backend='cake' with kv_cache_format='nvfp4' requires swa_topk_lens "
+                "(active lengths of the main table sparse_indices), as backend='sparse' does"
+            )
+        if sparse_topk_lens is not None:
+            raise ValueError(
+                "backend='cake' with kv_cache_format='nvfp4' takes swa_topk_lens, not "
+                "sparse_topk_lens: the NVFP4 main table is not a fixed 128-slot window"
+            )
+        if extra_sparse_topk_lens is not None and extra_sparse_indices is None:
+            raise ValueError("extra_sparse_topk_lens requires extra_sparse_indices")
+        if extra_sparse_indices is not None and compressed_kv_cache is None:
+            raise ValueError(
+                "compressed_kv_cache is required when extra_sparse_indices is provided"
+            )
+        if seq_lens is None:
+            raise ValueError("backend='cake' requires seq_lens")
+        cake_lens = swa_topk_lens
     else:
         if swa_topk_lens is not None:
             raise ValueError("backend='cake' does not accept swa_topk_lens")
@@ -2408,6 +2481,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     # whether it was the combined table so the cake host receives exactly one
     # of sparse_topk_lens / extra_sparse_topk_lens.
     combined_lens_given = sparse_topk_lens is not None
+    cake_nvfp4 = backend == "cake" and kv_cache_format == "nvfp4"
+    # The NVFP4 route needs no compressed pool without a compressed segment;
+    # the shared checks validate the main pool in its place.
+    cake_nvfp4_single_pool = cake_nvfp4 and compressed_kv_cache is None
     (
         swa_kv_cache,
         compressed_kv_cache,
@@ -2421,7 +2498,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         query,
         swa_kv_cache,
         sparse_indices,
-        compressed_kv_cache,
+        swa_kv_cache if cake_nvfp4_single_pool else compressed_kv_cache,
         cake_lens,
         None if rope_quant else out,
         sinks,
@@ -2431,7 +2508,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         allow_sm120_packed_kv=False,
         metadata_rows_may_be_fewer=backend in ("cake", "trtllm-gen"),
         check_topk_lens_range=backend != "cake",
+        packed_kv_bytes_per_token=(_DSV4_NVFP4_BYTES_PER_TOKEN if cake_nvfp4 else None),
     )
+    if cake_nvfp4_single_pool:
+        compressed_kv_cache = None
 
     if rope_quant:
         num_tokens, num_heads = query_flat.shape[:2]
@@ -2471,6 +2551,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     if backend == "cake":
         from .cake_dsv4 import run_cake_dsv4
 
+        # The DSv4.1 formats were rejected above; only the dense row pools
+        # ("fp8", which also covers BF16 pools) or the NVFP4 cache ABI remain.
+        cake_kv_cache_format: Literal["fp8", "nvfp4"] = (
+            "nvfp4" if kv_cache_format == "nvfp4" else "fp8"
+        )
         if extra_sparse_indices is not None:
             check_shape_dtype_device(
                 extra_sparse_indices,
@@ -2487,8 +2572,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             sparse_indices=sparse_indices,
             # Combined-convention lengths, or None when the compressed-only
             # extra_sparse_topk_lens carries them (the checked tensor above is
-            # the extra table in that case and must not be passed twice).
-            sparse_topk_lens=sparse_topk_lens if combined_lens_given else None,
+            # the extra table in that case and must not be passed twice). The
+            # NVFP4 route takes the normalized main lengths as swa_topk_lens.
+            sparse_topk_lens=(
+                sparse_topk_lens if combined_lens_given and not cake_nvfp4 else None
+            ),
+            swa_topk_lens=sparse_topk_lens if cake_nvfp4 else None,
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_topk_lens,
             sparse_topk_lens_offset=sparse_topk_lens_offset,
@@ -2500,6 +2589,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             cum_seq_lens_q=cum_seq_lens_q,
             seq_lens=seq_lens,
             backend="cake",
+            kv_cache_format=cake_kv_cache_format,
         )
 
     primary_kv_cache = compressed_kv_cache

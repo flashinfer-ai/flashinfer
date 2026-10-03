@@ -42,6 +42,25 @@ def gen_sparse_mla_nvfp4_sm120_tile_module() -> JitSpec:
     return gen_sparse_mla_sm120_module()
 
 
+def gen_dsv4_nvfp4_cache_ops_module() -> JitSpec:
+    """DeepSeek-V4 NVFP4 paged-cache pack/append for SM100/SM103 and SM12x.
+
+    Compiles only the cache writer (``dsv4_nvfp4_cache_ops.cu``), which has no
+    tcgen05/TMEM or SM120-only dependency, so the same source produces
+    byte-identical caches on B200/GB300 and RTX PRO/5090. The SM12x attention
+    kernels keep their copy of these exports inside the unified
+    :func:`gen_sparse_mla_sm120_module`.
+    """
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 12]
+    )
+    return gen_jit_spec(
+        "dsv4_nvfp4_cache_ops",
+        [jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_cache_ops.cu"],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
 def gen_sparse_mla_sm120_module() -> JitSpec:
     """Sparse-MLA paged attention for SM120.
 
