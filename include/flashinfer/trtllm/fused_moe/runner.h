@@ -62,6 +62,10 @@ enum class RoutingMethodType : int64_t {
   TopKSigmoid = 9,
   // Unspecified
   Unspecified = 10,
+  // SqrtSoftplus: sqrt(softplus) + Bias -> TopK -> ScaledSumNormalize of the un-biased scores
+  // (DeepSeek-V4 family, scoring_func="sqrtsoftplus"). Appended after Unspecified so the existing
+  // values stay stable.
+  SqrtSoftplus = 11,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize,
@@ -93,6 +97,8 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
       return "Sigmoid";
     case RoutingMethodType::TopKSigmoid:
       return "TopKSigmoid";
+    case RoutingMethodType::SqrtSoftplus:
+      return "SqrtSoftplus";
     default:
       return "InvalidRountingMethod";  // TODO throw error
   };
