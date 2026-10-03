@@ -36,7 +36,10 @@ from ..._block_sparse.common import (
     _validate_sparse_kv_block_size,
 )
 from ...split_kv_mode_policy import select_split_kv_modes
+from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
+    E4M3_MAX,
+    SOFTMAX_RESCALE_THRESHOLD_LOG2,
     AUTO_LAUNCH_TILE_SIZE_KV,
     BITS_PER_BYTE,
     BYTES_PER_KIB,
@@ -1375,10 +1378,14 @@ class FmhaDecodeConfig:
     # scales and per-channel V scales. ``sage_k_summary_block_size`` is the K
     # block size of proxy summary scales and equals ``sage_k_block_size``
     # without proxy routes. ``sage_v_mean`` adds a per-channel V mean back.
+    # ``sage_p_headroom_log2`` binades of the E4M3 range above the exponent
+    # anchor let profiles that defer anchor updates keep a lagging anchor for
+    # FP8 P; 0 keeps exact anchors and P at the full E4M3 range.
     sage_q_block_size: int = 0
     sage_k_block_size: int = 0
     sage_k_summary_block_size: int = 0
     sage_v_mean: bool = False
+    sage_p_headroom_log2: float = 0.0
     # Nonzero means each K/V stage covers only this many head-dim columns.
     # H256 SwapsMmaAb uses 128-column stages to keep TMA and TMEM layouts valid.
     head_dim_per_stage_kv: int = 0
@@ -1390,6 +1397,13 @@ class FmhaDecodeConfig:
     softmax_order_barrier_id: int = 8
     # Both softmax task groups participate: 8 warps * 32 lanes.
     softmax_order_barrier_threads: int = 256
+    # Score pairs per streamed K32 fragment whose exponentials run as FMA
+    # polynomials instead of MUFU. The best value depends on the GPU's MUFU
+    # rate; ``arch_config_args`` supplies it for the launch device.
+    ex2_emulated_pairs: int = 4
+    # Reduce streamed score-fragment maxima inside the TMEM load
+    # (tcgen05.ld.red); ``arch_config_args`` supplies it.
+    uses_ldtm_stat: bool = False
     use_cluster_smem_reduction: bool = False
     use_separate_reduction_kernel: bool = False
     # Compile-time attention-mask selection. Public APIs normalize the string
@@ -1926,10 +1940,11 @@ class FmhaDecodeConfig:
                 self.sage_q_block_size != 0
                 or self.sage_k_summary_block_size != 0
                 or self.sage_v_mean
+                or self.sage_p_headroom_log2 != 0
             ):
                 raise ValueError(
-                    "sage_q_block_size, sage_k_summary_block_size and sage_v_mean "
-                    "require sage_k_block_size"
+                    "sage_q_block_size, sage_k_summary_block_size, sage_v_mean and "
+                    "sage_p_headroom_log2 require sage_k_block_size"
                 )
             return
         if self.sage_k_block_size not in SAGE_K_BLOCK_SIZES:
@@ -1941,6 +1956,12 @@ class FmhaDecodeConfig:
             raise ValueError(
                 f"sage_k_summary_block_size must be one of {SAGE_K_BLOCK_SIZES}, "
                 f"got {self.sage_k_summary_block_size}"
+            )
+        if not 0.0 <= self.sage_p_headroom_log2 <= SOFTMAX_RESCALE_THRESHOLD_LOG2:
+            raise ValueError(
+                "sage_p_headroom_log2 must lie in "
+                f"[0, {SOFTMAX_RESCALE_THRESHOLD_LOG2:g}], "
+                f"got {self.sage_p_headroom_log2}"
             )
         q_block_size = self.sage_q_block_size
         if not is_power_of_two(q_block_size) or q_block_size > self.tile_size_q:
@@ -2375,12 +2396,12 @@ class FmhaDecodeConfig:
     def streams_tmem_p_fragments(self) -> bool:
         """Whether P is published as independently ready TMEM fragments.
 
-        Streamed profiles produce their K32 fragments from one rolled runtime
-        loop: the max pass writes masked scores back to TMEM, so the P pass
-        reloads each fragment without mask logic and the exponentiation body
-        exists once in the instruction stream. Each published fragment lets
-        the MMA warp start its PV k-slice before the row is complete, at the
-        cost of one barrier round per fragment.
+        Streamed profiles produce their K32 fragments from one runtime loop:
+        the max pass writes masked scores back to TMEM, so the P pass reloads
+        each fragment without mask logic and the exponentiation body exists
+        ``p_fragment_loop_unroll`` times in the instruction stream. Each
+        published fragment lets the MMA warp start its PV k-slice before the
+        row is complete, at the cost of one barrier round per fragment.
 
         A two-instance TMEM-P profile streams for KV256 tiles and block-sparse
         routes, whose loops wait on K/V loads that the earlier PV start hides.
@@ -2405,23 +2426,70 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def p_fragment_loop_unroll(self) -> int:
+        """Copies of the streamed P-fragment body in the instruction stream.
+
+        With one body, ptxas writes a fragment's scaled scores into the
+        registers the next fragment's TMEM load targets, so that load issues
+        only after the fragment's last exponential. Two bodies use disjoint
+        registers: the next load and the previous fragment's handoff overlap
+        the exponentials. The second body is replicated in both softmax
+        instances and pays only while the kernel's hot code leaves
+        instruction-cache headroom. The WS 2x2 datapath already carries K/V
+        issue code for two lane halves, and FMA ex2 emulation enlarges the
+        body, so either keeps one body.
+        """
+        return 1 if self.uses_ws_2x2_datapath or self.ex2_emulated_pairs else 2
+
+    @property
     def defers_softmax_anchor_updates(self) -> bool:
         """Whether small row-max increases keep the previous exponent anchor.
 
         Keeps correction skips the in-place O rescale whenever the anchor is
         unchanged, so keeping the prior anchor within
-        ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` trades a bounded 16-bit P range
-        (2**8) for fewer TMEM rescales. The profiles listed here are the ones
-        where that trade was measured to pay: KV256 tiles and block-sparse
-        routes, whose row maximum moves often but rarely by much. FP8 P uses
-        the static 448 scale, which needs ``p <= 1``, so it always anchors on
-        the exact row maximum.
+        ``softmax_anchor_headroom_log2`` binades trades a bounded P range for
+        fewer TMEM rescales. The profiles listed here are the ones where that
+        trade was measured to pay: KV256 tiles and block-sparse routes, whose
+        row maximum moves often but rarely by much. FP8 P has headroom only
+        when the Sage recipe reserves it, and otherwise anchors on the exact
+        row maximum.
         """
         return (
             self.use_keeps_mma_ab
-            and not self.use_fp8_pv
             and (self.tile_size_kv == 256 or self.use_block_sparse)
+            and self.softmax_anchor_headroom_log2 > 0
         )
+
+    @property
+    def softmax_anchor_headroom_log2(self) -> float:
+        """Binades a deferred exponent anchor may lag the row maximum.
+
+        A probability is ``2**(s - anchor)`` times its scale with ``s - anchor``
+        at most this headroom. 16-bit P allows
+        ``SOFTMAX_RESCALE_THRESHOLD_LOG2``, far inside its range; FP8 P takes
+        ``sage_p_headroom_log2`` and lowers its scale by it to stay within
+        E4M3 (``fp8_p_quant_scale``).
+        """
+        if self.use_fp8_pv:
+            return self.sage_p_headroom_log2
+        return SOFTMAX_RESCALE_THRESHOLD_LOG2
+
+    @property
+    def fp8_p_quant_scale(self) -> float:
+        """Scale ``c`` of FP8 probabilities, which are quantized to E4M3 as ``c * p``.
+
+        A deferred anchor lets ``p`` reach ``2**softmax_anchor_headroom_log2``,
+        so ``c`` is the E4M3 maximum divided by that bound; an exact anchor
+        keeps ``p <= 1`` and uses the whole range.
+        """
+        if self.defers_softmax_anchor_updates:
+            return E4M3_MAX * 2.0**-self.softmax_anchor_headroom_log2
+        return E4M3_MAX
+
+    @property
+    def fp8_p_quant_log2_scale(self) -> float:
+        """``log2(fp8_p_quant_scale)``, the exponent addend of FP8 probabilities."""
+        return math.log2(self.fp8_p_quant_scale)
 
     @property
     def use_sage_attention(self) -> bool:
@@ -5041,6 +5109,25 @@ def validate_storage_page_size(
         raise ValueError(
             "storage_tokens_per_page must be divisible by num_tokens_per_page"
         )
+
+
+def arch_config_args(compute_capability: tuple[int, int]) -> dict[str, object]:
+    """Return the config fields whose value depends on the GPU architecture.
+
+    SM100 runs a quarter of the streamed exponentials as FMA polynomials
+    because the MUFU issue rate bounds its P pass while the FMA pipe is nearly
+    idle; larger shares grow the fragment body until the softmax warps become
+    instruction-fetch bound. SM103 doubles the MUFU ex2 rate (32 results per
+    SM clock), so the polynomials only add instructions there and every
+    exponential stays on MUFU. GPUs whose TMEM loads return score maxima
+    (LDTM.STAT) take them from the load, which replaces the max pass's
+    register reduction; the context kernel shares that gate.
+    """
+    is_sm103 = tuple(compute_capability) == (10, 3)
+    return {
+        "ex2_emulated_pairs": 0 if is_sm103 else 4,
+        "uses_ldtm_stat": ldtm_stat_supported(compute_capability),
+    }
 
 
 def make_decode_config(

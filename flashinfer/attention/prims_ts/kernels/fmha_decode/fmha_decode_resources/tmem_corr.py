@@ -40,7 +40,6 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ...placeholder_helpers import _placeholder_smem_array
 from ..fmha_decode_config import FmhaDecodeConfig
-from ..fmha_decode_constants import FP8_P_QUANT_SCALE
 from .helpers_common import (
     _TASK_CACHE_LANE_IDX,
     _TASK_CACHE_TMEM_BASE_OFFSET,
@@ -596,9 +595,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         """Return the scale applied to a split-KV partial O before it is stored.
 
         The separate reduction kernel receives normalized partials. Fused GMEM
-        and cluster reductions receive unnormalized partials, with the static
-        448 scale of E4M3 P divided out before the narrowing to 16 bits; the
-        reducer restores it. The 448 scale follows ``pv_dtype``, not the
+        and cluster reductions receive unnormalized partials, with the E4M3 P
+        scale (``fp8_p_quant_scale``) divided out before the narrowing to 16
+        bits; the reducer restores it. The scale follows ``pv_dtype``, not the
         Q/K dtype.
         """
         cfg = self.cfg
@@ -606,7 +605,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         if cutlass.const_expr(cfg.use_separate_reduction_kernel):
             partial_scale = self._separate_partial_norm_scale(denominator)
         elif cutlass.const_expr(cfg.use_fp8_pv):
-            partial_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
+            partial_scale = Float32(1.0 / cfg.fp8_p_quant_scale)
         return partial_scale
 
     @cute.jit
@@ -1135,8 +1134,8 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> tuple[Int64, Float32]:
         """Resolve one logical row's output address and normalization once.
 
-        With E4M3 P the O accumulator and the row sum both carry the 448 P
-        scale, which cancels in a direct tail.
+        With E4M3 P the O accumulator and the row sum both carry the P scale
+        (``fp8_p_quant_scale``), which cancels in a direct tail.
         """
         cfg = self.cfg
         attention_sink_h_r = _attention_sink_head_stride(cfg, self.h_r)
@@ -1158,9 +1157,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         # helper only after the cross-CTA reduction has completed.
         norm_scale = self.output_scale * self._safe_norm_rcp(sum_val)
         if cutlass.const_expr(cfg.use_fp8_pv and cfg.use_split_kv):
-            # Fused split partials carry O divided by 448 (see
+            # Fused split partials carry O divided by the FP8 P scale (see
             # ``_split_partial_scale``); restore it after the FP32 reduction.
-            norm_scale *= Float32(FP8_P_QUANT_SCALE)
+            norm_scale *= Float32(cfg.fp8_p_quant_scale)
         physical_dst_row_idx = _q_physical_output_row_from_logical(
             cfg,
             self.h_r,
@@ -2693,8 +2692,12 @@ class TmemCorrResource(DecodeGenResourceBase):
         # stores are legal exactly when the output base pointer is.
         o_is_32b_aligned = (self.o_ptr.toint() & Int64(31)) == Int64(0)
 
-        for fragment in cutlass.range_constexpr(cfg.headdim // 32):
-            fragment_col = fragment * 32
+        # The merge runs once per work item, so one runtime loop over the D32
+        # fragments keeps a single body in the instruction cache that the
+        # per-tile loops need. The 8-bit owned-column merge is rolled the same
+        # way.
+        for fragment in cutlass.range(cfg.headdim // 32, unroll=1):
+            fragment_col = fragment * Int32(32)
             own_vals = self._kv_tile_256_temporal_fragment(
                 base_addr0=base_addr0,
                 base_addr1=base_addr1,
@@ -2702,7 +2705,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 weight00=weight00,
                 weight10=weight10,
             )
-            if cutlass.const_expr(fragment != 0):
+            if fragment != Int32(0):
                 # The single fragment buffer is reused: lower lanes must have
                 # consumed the previous peer fragment before it is overwritten.
                 prims.barrier_cta_sync(
@@ -3836,8 +3839,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             for pair_idx in cutlass.range_constexpr(output_pair_regs):
                 # Separate reduction includes this split's reciprocal sum;
                 # fused reduction delays normalization until the final merge.
-                # FP8-P fused reduction removes the 448x P quantization scale
-                # so the unnormalized numerator fits the 16-bit scratch.
+                # FP8-P fused reduction removes the P quantization scale so
+                # the unnormalized numerator fits the 16-bit scratch.
                 scale_base = ((pair_idx % (2 * q_repeats)) // 2) * 2
                 reg_base = pair_idx * 2
                 partial_scale0 = (
@@ -4338,7 +4341,7 @@ class TmemCorrResource(DecodeGenResourceBase):
 
             # Store normalized 16-bit O for the standalone reducer, or preserve
             # unnormalized 16-bit O for fused GMEM/cluster reduction.
-            # FP8-P fused reduction removes the 448x P quantization scale before
+            # FP8-P fused reduction removes the P quantization scale before
             # storing the unnormalized O numerator in the 16-bit scratch.
             regs_partial_o = cutlass.Array(
                 Int32,

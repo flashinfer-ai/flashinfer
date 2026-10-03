@@ -2946,18 +2946,30 @@ class SmemKvResource(DecodeGenResourceBase):
                     route_tma_desc = (
                         summary_tma_desc if route_is_proxy else sparse_tma_desc
                     )
+            # Keep two retained route origins ahead of the copies. A copy may
+            # write SMEM, so the compiler keeps a later origin load behind it;
+            # loading each origin right before its copies would serialize every
+            # block's copies behind its own SMEM load.
+            route_coord = None
+            next_route_coord = None
+            if cutlass.const_expr(cfg.use_block_sparse):
+                assert sparse_kv_metadata is not None
+                route_coord = sparse_kv_metadata.route_tma_coordinate(
+                    Int32(0), logical_b_idx
+                )
+                next_route_coord = sparse_kv_metadata.route_tma_coordinate(
+                    Int32(1), logical_b_idx
+                )
             for semantic_block in cutlass.range_constexpr(4):
                 token_coord = Int32(0)
                 storage_coord = logical_b_idx
                 if cutlass.const_expr(cfg.use_block_sparse):
-                    assert sparse_kv_metadata is not None
-                    (
-                        token_coord,
-                        storage_coord,
-                    ) = sparse_kv_metadata.route_tma_coordinate(
-                        Int32(semantic_block),
-                        logical_b_idx,
-                    )
+                    token_coord, storage_coord = route_coord
+                    route_coord = next_route_coord
+                    if cutlass.const_expr(semantic_block + 2 < 4):
+                        next_route_coord = sparse_kv_metadata.route_tma_coordinate(
+                            Int32(semantic_block + 2), logical_b_idx
+                        )
                 physical_block = semantic_block
                 if cutlass.const_expr(kv_kind == KV_KIND_K):
                     physical_block = KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM[

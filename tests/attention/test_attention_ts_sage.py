@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 import warnings
 
 import pytest
@@ -38,6 +39,9 @@ from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
 from flashinfer.attention.prims_ts._block_sparse.plan import (
     _INT8_QK_COMPUTE_CAPABILITIES,
 )
+from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
+    E4M3_MAX,
+)
 
 from tests.attention.test_attention_ts_block_sparse import (
     _HEAD_DIM,
@@ -54,8 +58,6 @@ _REQUIRES_INT8_QK_GPU = pytest.mark.skipif(
     or torch.cuda.get_device_capability() not in _INT8_QK_COMPUTE_CAPABILITIES,
     reason="INT8 Q/K Sage attention requires SM100",
 )
-# The kernel scales probabilities to the E4M3 maximum before quantizing them.
-_P_SCALE = 448.0
 # INT8 Q/K are drawn with this standard deviation and their scales divided by
 # it, so dequantized INT8 and E4M3 inputs share one distribution.
 _INT8_STD = 40.0
@@ -161,6 +163,13 @@ _DENSE_CASES = (
         sage=SageAttentionConfig(q_block_size=4, k_block_size=1),
         persistent=True,
     ),
+    # One binade of P headroom defers the KV256 anchors.
+    _SageCase(
+        "kv256_fp8_k16_p_headroom1_persistent",
+        **_KV256,
+        sage=SageAttentionConfig(p_headroom_log2=1.0),
+        persistent=True,
+    ),
 )
 _SPARSE_CASES = (
     _SageCase(
@@ -189,6 +198,19 @@ _SPARSE_CASES = (
         sage=SageAttentionConfig(v_mean=True, k_summary_block_size=1),
         routes="proxy",
         sparse_format="bitmask",
+    ),
+    _SageCase(
+        "kv256_proxy_fp8_k16_p_headroom1",
+        **_KV256,
+        sage=SageAttentionConfig(p_headroom_log2=1.0),
+        routes="proxy",
+    ),
+    # Headroom log2(1.75) quantizes P at the power-of-two scale 256.
+    _SageCase(
+        "q128_exact_fp8_k16_p_scale256",
+        **_Q128,
+        sage=SageAttentionConfig(p_headroom_log2=math.log2(1.75)),
+        routes="exact",
     ),
     # 33 summaries span three 16-summary scale blocks per batch.
     _SageCase(
@@ -468,11 +490,24 @@ def _row_folds(case: _SageCase, exact_blocks):
                 yield stream, source, torch.tensor(indices, device="cuda")
 
 
-def _fold(state, logits: torch.Tensor, values: torch.Tensor):
-    """Fold one set of columns into an online-softmax stream ``(max, sum, acc)``.
+def _anchor_headroom_log2(case: _SageCase) -> float:
+    """Binades the kernel lets a stream's exponent anchor lag its row maximum.
 
-    The row sum takes FP32 probabilities; the PV operand quantizes them to
-    E4M3 at ``448`` times their ratio to the stream's running maximum.
+    KV256 tiles and block-sparse routes defer anchor updates by the recipe's
+    P headroom; other launches anchor on the exact running maximum.
+    """
+    if case.kv_tile == 256 or case.routes != "dense":
+        return case.sage.p_headroom_log2
+    return 0.0
+
+
+def _fold(state, logits: torch.Tensor, values: torch.Tensor, headroom: float):
+    """Fold one set of columns into an online-softmax stream ``(anchor, sum, acc)``.
+
+    The stream keeps its anchor while the columns raise the row maximum by at
+    most ``headroom`` binades, as the kernel does. The row sum takes FP32
+    probabilities; the PV operand quantizes them to E4M3 at
+    ``E4M3_MAX * 2**-headroom`` times their ratio to the anchor.
     """
 
     if state is None:
@@ -481,8 +516,12 @@ def _fold(state, logits: torch.Tensor, values: torch.Tensor):
         state = (total - float("inf"), total, acc)
     running_max, total, acc = state
     new_max = torch.maximum(running_max, logits.amax(dim=-1))
+    lag_log2 = (new_max - running_max) * math.log2(math.e)
+    new_max = torch.where(
+        running_max.isfinite() & (lag_log2 <= headroom), running_max, new_max
+    )
     anchor = torch.where(new_max.isfinite(), new_max, 0.0)
-    probabilities = torch.exp(logits - anchor.unsqueeze(-1)) * _P_SCALE
+    probabilities = torch.exp(logits - anchor.unsqueeze(-1)) * E4M3_MAX * 2.0**-headroom
     correction = torch.exp(running_max - anchor)
     return (
         new_max,
@@ -498,10 +537,11 @@ def _reference(
     """FP32 attention on the dequantized inputs with the kernel's stream model.
 
     Every online-softmax stream quantizes its probabilities against its own
-    running maximum; a proxy summary of ``mass`` tokens weighs its
+    exponent anchor; a proxy summary of ``mass`` tokens weighs its
     probability by that mass. Rows without visible mass stay zero.
     """
 
+    headroom = _anchor_headroom_log2(case)
     q_real = _dequantize(q, params.q_scale, case.sage.q_block_size)
     k_real = _dequantize(k, params.k_scale, case.sage.k_block_size)
     if summaries is not None:
@@ -555,7 +595,9 @@ def _reference(
                     logits = (logits * sm_scale + bias).masked_fill(
                         ~visible.unsqueeze(1), float("-inf")
                     )
-                    streams[stream] = _fold(streams.get(stream), logits, values.float())
+                    streams[stream] = _fold(
+                        streams.get(stream), logits, values.float(), headroom
+                    )
                 if not streams:
                     continue
                 maxima, totals, accs = (
@@ -685,6 +727,12 @@ def test_int8_qk_plans_only_on_sm100(monkeypatch: pytest.MonkeyPatch) -> None:
             ValueError,
             "k_block_size",
             id="k-block-8",
+        ),
+        pytest.param(
+            {"sage_config": SageAttentionConfig(p_headroom_log2=-1.0)},
+            ValueError,
+            "p_headroom_log2",
+            id="negative-p-headroom",
         ),
         pytest.param(
             {"q_block_size": 8, "kv_block_size": 8},
