@@ -19,15 +19,11 @@ from __future__ import annotations
 import functools
 from collections.abc import Mapping
 from pathlib import Path
+import json
 from typing import Any, Literal
 
 from . import env as jit_env
-from .cake_fmha import (
-    CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
-    CAKE_FMHA_MANIFEST_SHA256,
-    get_cake_fmha_csrc_dir,
-    get_cake_fmha_manifest,
-)
+from .cake_fmha import CAKE_FMHA_JIT_TAG, get_cake_fmha_csrc_dir
 from .core import (
     JitSpec,
     gen_jit_spec,
@@ -45,8 +41,8 @@ _DCP_SPEC_NVCC_FLAGS = {
     "sm103a": sm103a_nvcc_flags,
     "sm100f": sm100f_nvcc_flags,
 }
-# The DCP manifest shares source bodies between SM100 and SM103. Compile those
-# authenticated bodies with the family target for SM107.
+# The DCP registry shares source bodies between SM100 and SM103. Compile those
+# bodies with the family target for SM107.
 _TARGET_MANIFEST_ARCH = {
     "sm100a": "sm_100a",
     "sm103a": "sm_103a",
@@ -71,13 +67,20 @@ _FP8_D256_SUPPORTED_SPLITS = (1, 2, 3, 4, 8, 16)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
 
+@functools.cache
+def get_dcp_spec_registry() -> dict[str, Any]:
+    """Load the checked-in DCP speculative-decode registry."""
+
+    registry_path = get_cake_fmha_csrc_dir() / "cuda" / "dcp_spec" / "registry.json"
+    registry = json.loads(registry_path.read_text())
+    if registry.get("name") != "cake_fmha_dcp_spec":
+        raise RuntimeError("Cake FMHA DCP registry has an invalid product identifier")
+    return registry
+
+
 def _get_dcp_family(name: str) -> Mapping[str, Any]:
-    addon = get_cake_fmha_manifest()["add_ons"]["cake_fmha_dcp_spec"]
-    if addon.get("installed") is not True:
-        raise RuntimeError("the authenticated Cake FMHA DCP add-on is not installed")
-    families = addon["manifest"]["families"]
     try:
-        return families[name]
+        return get_dcp_spec_registry()["families"][name]
     except KeyError as exc:
         raise RuntimeError(f"Cake FMHA DCP family is missing: {name}") from exc
 
@@ -175,8 +178,7 @@ def get_dcp_spec_uri(
     return (
         f"cake_fmha_dcp_spec_bf16_{variant}_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
-        f"_cp{cp_world}_{route_name}{route_param}_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_cp{cp_world}_{route_name}{route_param}_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -239,8 +241,7 @@ def get_dcp_spec_fp8_uri(
     return (
         f"cake_fmha_dcp_spec_bf16_fp8_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}_cp{cp_world}"
-        f"_split{num_split}_retain{retain_kv_l2}_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_split{num_split}_retain{retain_kv_l2}_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -575,10 +576,7 @@ def get_dcp_spec_balanced_uri(
     family: DcpBalancedFamily, target: DcpSpecTarget, n_rows: int
 ) -> str:
     _validate_balanced_specialization(family, target, n_rows)
-    return (
-        f"cake_fmha_{family}_n{n_rows}_{target}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
+    return f"cake_fmha_{family}_n{n_rows}_{target}_{CAKE_FMHA_JIT_TAG}"
 
 
 def _get_dcp_balanced_sources(
@@ -647,6 +645,7 @@ def load_dcp_spec_balanced_module(
 
 __all__ = [
     "DCP_BALANCED_FAMILIES",
+    "get_dcp_spec_registry",
     "DCP_BALANCED_N_ROWS",
     "DcpBalancedFamily",
     "gen_dcp_spec_balanced_module",

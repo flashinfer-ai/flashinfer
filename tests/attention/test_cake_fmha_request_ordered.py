@@ -8,6 +8,7 @@ import math
 
 import flashinfer
 import flashinfer.cake_fmha as cake_api
+import flashinfer.cake_fmha_request_ordered as request_ordered_api
 import pytest
 import torch
 
@@ -95,7 +96,9 @@ def _manifest() -> dict:
 
 
 def test_request_order_plan_selects_exact_exported_schedule(monkeypatch) -> None:
-    monkeypatch.setattr(cake_api, "get_cake_fmha_request_ordered_manifest", _manifest)
+    monkeypatch.setattr(
+        request_ordered_api, "get_cake_fmha_request_ordered_manifest", _manifest
+    )
     plan = cake_api.plan_cake_fmha_request_ordered_paged_decode(
         (8193, 57345, 73729, 81921),
         1,
@@ -111,7 +114,9 @@ def test_request_order_plan_selects_exact_exported_schedule(monkeypatch) -> None
 def test_request_order_plan_uses_graph_safe_fallback_for_other_lengths(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(cake_api, "get_cake_fmha_request_ordered_manifest", _manifest)
+    monkeypatch.setattr(
+        request_ordered_api, "get_cake_fmha_request_ordered_manifest", _manifest
+    )
     plan = cake_api.plan_cake_fmha_request_ordered_paged_decode(
         (64, 128, 192),
         1,
