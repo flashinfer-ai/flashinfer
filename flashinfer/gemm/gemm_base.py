@@ -3168,7 +3168,9 @@ def tgv_gemm_sm100(
             bias,
         ]
         runners = [runner]
-        tuning_config = TuningConfig()
+        tuning_config = TuningConfig(
+            use_cold_l2_cache=True, use_cuda_graph=True, profiling_repeat=100
+        )
         dtype_str = f"{a.dtype}_{b.dtype}_{a_descale.dtype}"
     else:
         runners = [
@@ -5881,7 +5883,12 @@ def mm_fp8(
             None,
         ]
         runner, tactic = AutoTuner.get().choose_one(
-            "mm_fp8_cutedsl_low_latency", [runner], TuningConfig(), inputs
+            "mm_fp8_cutedsl_low_latency",
+            [runner],
+            TuningConfig(
+                use_cold_l2_cache=True, use_cuda_graph=True, profiling_repeat=100
+            ),
+            inputs,
         )
         runner(inputs=inputs, tactic=tactic)
     else:
