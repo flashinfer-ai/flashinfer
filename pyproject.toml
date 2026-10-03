@@ -74,6 +74,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.cake_lm_head_loss" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
 "flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
 "flashinfer" = ["_build_meta.py"]
