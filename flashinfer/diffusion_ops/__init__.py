@@ -18,6 +18,7 @@ from .cake_minimax_h3_sm120_quant_varlen_attention import (
 )
 from .cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     minimax_h3_sm120_varlen_attention_nvfp4,
+    minimax_h3_sm120_varlen_attention_nvfp4_nodelta,
 )
 from .minimax_h3_out_proj import (
     minimax_h3_out_proj,
@@ -86,6 +87,7 @@ __all__ = [
     "quantize_minimax_h3_qkv_weight_nvfp4",
     "minimax_h3_sm120_varlen_attention_fp8",
     "minimax_h3_sm120_varlen_attention_nvfp4",
+    "minimax_h3_sm120_varlen_attention_nvfp4_nodelta",
     "PreparedMiniMaxH3QkvQuantizePack",
     "minimax_h3_qkv_quantize_pack",
     "prepare_minimax_h3_qkv_quantize_pack",
