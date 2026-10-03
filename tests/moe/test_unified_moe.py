@@ -3763,6 +3763,7 @@ class TestTrtllmFp4UnpackedContract:
             pytest.param(SwiGLU(), id="swiglu"),
             pytest.param(SwiGLUStep(), id="swiglu-step"),
             pytest.param(SwiGLUStep(limit=16.0), id="swiglu-step-16"),
+            pytest.param(SwiGLUStep(limit=0.25), id="swiglu-step-025"),
             pytest.param(ReLU2(), id="relu2"),
         ],
     )
@@ -3782,6 +3783,10 @@ class TestTrtllmFp4UnpackedContract:
             use_per_token_activation=True,
             use_nontrivial_alphas=False,
         )
+        if isinstance(activation, SwiGLUStep):
+            # Exercise clipping while keeping identical quantized payloads.
+            tensors["x_per_token_scale"] *= 64.0
+            tensors["x_ref"] *= 64.0
         config = MoEConfig(
             routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
             quant=QuantConfig(
@@ -3814,6 +3819,12 @@ class TestTrtllmFp4UnpackedContract:
             activation=activation,
             device=device,
         )
+        if isinstance(activation, SwiGLUStep):
+            # Cover physical limits with both global and per-token dequantization.
+            prepared_weights["output1_scale_scalar"].fill_(2.0)
+            prepared_weights["output1_scale_gate_scalar"].fill_(2.0)
+            if "gemm1_clamp_limit" in prepared_weights:
+                prepared_weights["gemm1_clamp_limit"] /= 2.0
         fc1_size = intermediate_size * (2 if activation.is_gated else 1)
         assert prepared_weights["gemm1_weights"].shape == (
             num_experts,
@@ -3846,7 +3857,7 @@ class TestTrtllmFp4UnpackedContract:
             hidden_states=tensors["x_ref"],
             gemm1_weights=tensors["w1_weight_bf16"],
             gemm2_weights=tensors["w2_weight_bf16"],
-            gemm1_alpha=ones,
+            gemm1_alpha=ones * 2.0 if isinstance(activation, SwiGLUStep) else ones,
             gemm2_alpha=ones,
             token_selected_experts=act_pack.topk_ids,
             token_final_scales=act_pack.topk_weights,

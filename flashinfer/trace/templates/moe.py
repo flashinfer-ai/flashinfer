@@ -1618,10 +1618,10 @@ def _fp4_moe_run_experts(
         else:
             activated = x1 * torch.sigmoid(x1) * x0
         O = activated.matmul(W2[le].t())  # [N, H]
-        if activation_type == step and output2_scale_scalar is not None:
-            O = O * output2_scale_scalar[le]
         if gemm2_bias is not None:
             O = O + gemm2_bias[le].to(torch.float32)
+        if activation_type == step and output2_scale_scalar is not None:
+            O = O * output2_scale_scalar[le]
         # Fold per-token expert weight.
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()

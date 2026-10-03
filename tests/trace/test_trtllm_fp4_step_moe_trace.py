@@ -7,7 +7,8 @@ import torch
 
 @pytest.mark.parametrize("limit", [None, 0.25, 16.0])
 @pytest.mark.parametrize("per_token", [False, True])
-def test_nvfp4_step_serialized_reference(limit, per_token):
+@pytest.mark.parametrize("output_scale", [1.0, 2.0])
+def test_nvfp4_step_serialized_reference(limit, per_token, output_scale):
     from flashinfer import ActivationType
     from flashinfer.fused_moe import (
         trtllm_fp4_block_scale_moe,
@@ -23,6 +24,8 @@ def test_nvfp4_step_serialized_reference(limit, per_token):
     w1[0, intermediate, 0] = 0x20  # FC1 gate selects channel 1.
     w2 = torch.zeros(1, hidden, intermediate // 2, dtype=torch.uint8)
     w2[0, 0, 0] = 0x02
+    bias2 = torch.zeros(1, hidden, dtype=torch.bfloat16)
+    bias2[0, 0] = 2.0
     token_scales = torch.tensor([0.5, 2.0, 1.0, 4.0]) if per_token else None
     physical_limit = 7.0 if limit is None else limit
     kwargs = dict(
@@ -42,10 +45,10 @@ def test_nvfp4_step_serialized_reference(limit, per_token):
         gemm2_weights_scale=torch.ones(
             1, hidden, intermediate // 16, dtype=torch.float8_e4m3fn
         ),
-        gemm2_bias=None,
+        gemm2_bias=bias2,
         output1_scale_scalar=torch.tensor([2.0]),
         output1_scale_gate_scalar=torch.tensor([2.0]),
-        output2_scale_scalar=torch.ones(1),
+        output2_scale_scalar=torch.tensor([output_scale]),
         per_token_scale=token_scales,
         num_experts=1,
         top_k=1,
@@ -65,8 +68,12 @@ def test_nvfp4_step_serialized_reference(limit, per_token):
         gate *= token_scales
     expected = torch.zeros(tokens, hidden, dtype=torch.bfloat16)
     expected[:, 0] = (
-        up.clamp(-physical_limit, physical_limit)
-        * torch.nn.functional.silu(gate).clamp(max=physical_limit)
+        (
+            up.clamp(-physical_limit, physical_limit)
+            * torch.nn.functional.silu(gate).clamp(max=physical_limit)
+            + 2.0
+        )
+        * output_scale
     ).to(expected.dtype)
     for api, name in (
         (
