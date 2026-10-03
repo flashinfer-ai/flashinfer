@@ -1,5 +1,21 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 // Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
-// DeepGEMM portions are licensed under MIT; see ../DEEPGEMM_NOTICE.txt.
+// DeepGEMM portions are licensed under MIT; see DEEPGEMM_NOTICE.txt in this directory.
 
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
@@ -10,13 +26,12 @@ typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
 #endif
-static_assert(sizeof(uint64_t) == 8, "Deepgemm requires an LP64 CUDA host ABI");
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) DeepgemmTensorMap { uint64_t opaque[16]; };
-struct __align__(64) DeepgemmTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(DeepgemmTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(DeepgemmTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -25,11 +40,10 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(DeepgemmTensorMap) >= alignof(CUtensorMap), "DeepgemmTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define DEEPGEMM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 396
 #define TMEM_TMEM_ACC_OFFSET 0
 #define TMEM_TMEM_SF_Q_OFFSET 384
@@ -56,6 +70,9 @@ static_assert(alignof(DeepgemmTensorMap) >= alignof(CUtensorMap), "DeepgemmTenso
 #define SMEM_SMEM_WEIGHTS_STAGE_BYTES 512
 #define SMEM_SMEM_WEIGHTS_STRIDE 512
 #define SMEM_TOTAL 206336
+#ifndef SM_COUNT
+#error "SM_COUNT is a downstream specialization of this program; define it on the compile line"
+#endif
 
 #include <math_constants.h>
 
@@ -78,39 +95,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
@@ -128,136 +112,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "DONE:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
 }
 
 
@@ -280,6 +134,12 @@ __device__ __forceinline__ void tcgen05_mma_mxf4_bs(
 __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
     return (x & 0x3FFFFULL) >> 4ULL;
 }
+
+
+union MmaSmemDesc {
+    uint64_t u64;
+    uint32_t u32[2];
+};
 
 
 __device__ __forceinline__ void elect_commit(int mbar_addr) {
@@ -321,24 +181,6 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 }
 
 
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
-
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-
-__device__ __forceinline__ uint64_t make_sf_cp_desc_sbo128(int addr) {
-    const int SBO = 128;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL);
-}
 
 
 __device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo128(int lo) {
@@ -356,14 +198,6 @@ __device__ __forceinline__ void tcgen05_cp_32x128b_warpx4(
         :: "r"(taddr), "l"(s_desc));
 }
 
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
 
 
 __device__ __forceinline__ void tma_2d_gmem2smem(
@@ -395,16 +229,20 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
+kernel_cake_deepgemm_dense_mqa_16c66ead857c21f63dba(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
 {
     const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    uint32_t lane;
-    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem + 205824;
     #define q_full_addr (mbar_base + 0)
@@ -416,6 +254,8 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     float* neginf_scratch = reinterpret_cast<float*>(smem_raw + 201728);
@@ -528,7 +368,7 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
             unsigned int remaining = 0;
             first_q = ScheduleMeta[bid * 2];
             split_offset = ScheduleMeta[bid * 2 + 1];
-            remaining = ScheduleMeta[2 * num_bids + bid];
+            remaining = ScheduleMeta[2 * SM_COUNT + bid];
             q_step = 1;
             unsigned int first_q_0 = first_q;
             unsigned int q_step_1 = q_step;
@@ -544,7 +384,7 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                 int q_start = q_block_idx * 4;
                 int kv_start = 0;
                 unsigned int num_kv_blocks = 0;
-                unsigned int span_offset = (3 * num_bids + 1) / 2 * 2;
+                unsigned int span_offset = (3 * SM_COUNT + 1) / 2 * 2;
                 kv_start = ScheduleMeta[span_offset + q_block_idx * 2] + split_offset_2 * 256;
                 unsigned int span_splits = ScheduleMeta[span_offset + q_block_idx * 2 + 1];
                 if (split_offset_2 < span_splits) {
@@ -579,20 +419,20 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                     for (unsigned int kv_iter = 0; kv_iter < num_kv_blocks; kv_iter++) {
                         mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int kv_pos = (unsigned int)kv_start + kv_iter * 256 + wg_idx * 128 + (warp % 4 * 32 + lane);
+                        int kv_pos = (unsigned int)kv_start + kv_iter * 256 + wg_idx * 128 + (unsigned int)(warp % 4 * 32 + lane);
                         float _tmem_load_0[32];
-                        tmem_ld_x16(&_tmem_load_0[0], taddr + math_tmem_stage * 128 + (warp % 4 * 32 << 16));
-                        tmem_ld_x16(&_tmem_load_0[16], taddr + math_tmem_stage * 128 + (warp % 4 * 32 << 16) + 16);
+                        tmem_ld_x16(&_tmem_load_0[0], taddr + math_tmem_stage * 128 + (unsigned int)(warp % 4 * 32 << 16));
+                        tmem_ld_x16(&_tmem_load_0[16], taddr + math_tmem_stage * 128 + (unsigned int)(warp % 4 * 32 << 16) + 16);
                         float _tmem_load_1[32];
-                        tmem_ld_x16(&_tmem_load_1[0], taddr + math_tmem_stage * 128 + 32 + (warp % 4 * 32 << 16));
-                        tmem_ld_x16(&_tmem_load_1[16], taddr + math_tmem_stage * 128 + 32 + (warp % 4 * 32 << 16) + 16);
+                        tmem_ld_x16(&_tmem_load_1[0], taddr + math_tmem_stage * 128 + 32 + (unsigned int)(warp % 4 * 32 << 16));
+                        tmem_ld_x16(&_tmem_load_1[16], taddr + math_tmem_stage * 128 + 32 + (unsigned int)(warp % 4 * 32 << 16) + 16);
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         float _tmem_load_2[32];
-                        tmem_ld_x16(&_tmem_load_2[0], taddr + math_tmem_stage * 128 + 64 + (warp % 4 * 32 << 16));
-                        tmem_ld_x16(&_tmem_load_2[16], taddr + math_tmem_stage * 128 + 64 + (warp % 4 * 32 << 16) + 16);
+                        tmem_ld_x16(&_tmem_load_2[0], taddr + math_tmem_stage * 128 + 64 + (unsigned int)(warp % 4 * 32 << 16));
+                        tmem_ld_x16(&_tmem_load_2[16], taddr + math_tmem_stage * 128 + 64 + (unsigned int)(warp % 4 * 32 << 16) + 16);
                         float _tmem_load_3[32];
-                        tmem_ld_x16(&_tmem_load_3[0], taddr + math_tmem_stage * 128 + 96 + (warp % 4 * 32 << 16));
-                        tmem_ld_x16(&_tmem_load_3[16], taddr + math_tmem_stage * 128 + 96 + (warp % 4 * 32 << 16) + 16);
+                        tmem_ld_x16(&_tmem_load_3[0], taddr + math_tmem_stage * 128 + 96 + (unsigned int)(warp % 4 * 32 << 16));
+                        tmem_ld_x16(&_tmem_load_3[16], taddr + math_tmem_stage * 128 + 96 + (unsigned int)(warp % 4 * 32 << 16) + 16);
                         {
                             float _relu_wsum_0;
                             {
@@ -755,7 +595,7 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                 unsigned int remaining_1 = 0;
                 first_q_1 = ScheduleMeta[bid * 2];
                 split_offset_1 = ScheduleMeta[bid * 2 + 1];
-                remaining_1 = ScheduleMeta[2 * num_bids + bid];
+                remaining_1 = ScheduleMeta[2 * SM_COUNT + bid];
                 q_step_2 = 1;
                 unsigned int first_q_0_1 = first_q_1;
                 unsigned int q_step_1_1 = q_step_2;
@@ -769,7 +609,7 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                     int q_start_1 = q_block_idx_1 * 4;
                     int kv_start_1 = 0;
                     unsigned int num_kv_blocks_1 = 0;
-                    unsigned int span_offset_1 = (3 * num_bids + 1) / 2 * 2;
+                    unsigned int span_offset_1 = (3 * SM_COUNT + 1) / 2 * 2;
                     kv_start_1 = ScheduleMeta[span_offset_1 + q_block_idx_1 * 2] + split_offset_2_1 * 256;
                     unsigned int span_splits_1 = ScheduleMeta[span_offset_1 + q_block_idx_1 * 2 + 1];
                     if (split_offset_2_1 < span_splits_1) {
@@ -802,7 +642,7 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
             unsigned int remaining_2 = 0;
             first_q_2 = ScheduleMeta[bid * 2];
             split_offset_3 = ScheduleMeta[bid * 2 + 1];
-            remaining_2 = ScheduleMeta[2 * num_bids + bid];
+            remaining_2 = ScheduleMeta[2 * SM_COUNT + bid];
             q_step_3 = 1;
             unsigned int first_q_0_2 = first_q_2;
             unsigned int q_step_1_2 = q_step_3;
@@ -817,7 +657,7 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                 int q_start_2 = q_block_idx_2 * 4;
                 int kv_start_2 = 0;
                 unsigned int num_kv_blocks_2 = 0;
-                unsigned int span_offset_2 = (3 * num_bids + 1) / 2 * 2;
+                unsigned int span_offset_2 = (3 * SM_COUNT + 1) / 2 * 2;
                 kv_start_2 = ScheduleMeta[span_offset_2 + q_block_idx_2 * 2] + split_offset_2_2 * 256;
                 unsigned int span_splits_2 = ScheduleMeta[span_offset_2 + q_block_idx_2 * 2 + 1];
                 if (split_offset_2_2 < span_splits_2) {
@@ -856,7 +696,7 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
             unsigned int remaining_4 = 0;
             first_q_3 = ScheduleMeta[bid * 2];
             split_offset_4 = ScheduleMeta[bid * 2 + 1];
-            remaining_4 = ScheduleMeta[2 * num_bids + bid];
+            remaining_4 = ScheduleMeta[2 * SM_COUNT + bid];
             q_step_4 = 1;
             unsigned int first_q_0_3 = first_q_3;
             unsigned int q_step_1_3 = q_step_4;
@@ -873,7 +713,7 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                 int q_start_3 = q_block_idx_3 * 4;
                 int kv_start_3 = 0;
                 unsigned int num_kv_blocks_3 = 0;
-                unsigned int span_offset_3 = (3 * num_bids + 1) / 2 * 2;
+                unsigned int span_offset_3 = (3 * SM_COUNT + 1) / 2 * 2;
                 kv_start_3 = ScheduleMeta[span_offset_3 + q_block_idx_3 * 2] + split_offset_2_3 * 256;
                 unsigned int span_splits_3 = ScheduleMeta[span_offset_3 + q_block_idx_3 * 2 + 1];
                 if (split_offset_2_3 < span_splits_3) {
@@ -886,15 +726,15 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                     mbarrier_wait(q_full_addr + (mma_q_stage) * 8, _phase_q_full_1);
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     unsigned int _sf_v[4];
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[0])) : "r"(smem_sf_q_addr + mma_q_stage * 512 + ((lane >> 3 ^ 0) * 32 + lane) * 4));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[1])) : "r"(smem_sf_q_addr + mma_q_stage * 512 + ((lane >> 3 ^ 1) * 32 + lane) * 4));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[2])) : "r"(smem_sf_q_addr + mma_q_stage * 512 + ((lane >> 3 ^ 2) * 32 + lane) * 4));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[3])) : "r"(smem_sf_q_addr + mma_q_stage * 512 + ((lane >> 3 ^ 3) * 32 + lane) * 4));
+                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[0])) : "r"(smem_sf_q_addr + mma_q_stage * 512 + (unsigned int)(((lane >> 3 ^ 0) * 32 + lane) * 4)));
+                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[1])) : "r"(smem_sf_q_addr + mma_q_stage * 512 + (unsigned int)(((lane >> 3 ^ 1) * 32 + lane) * 4)));
+                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[2])) : "r"(smem_sf_q_addr + mma_q_stage * 512 + (unsigned int)(((lane >> 3 ^ 2) * 32 + lane) * 4)));
+                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v[3])) : "r"(smem_sf_q_addr + mma_q_stage * 512 + (unsigned int)(((lane >> 3 ^ 3) * 32 + lane) * 4)));
                     __syncwarp();
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sf_q_addr + mma_q_stage * 512 + (lane * 4 + (lane >> 3 ^ 0)) * 4), "r"((_sf_v[0])));
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sf_q_addr + mma_q_stage * 512 + (lane * 4 + (lane >> 3 ^ 1)) * 4), "r"((_sf_v[1])));
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sf_q_addr + mma_q_stage * 512 + (lane * 4 + (lane >> 3 ^ 2)) * 4), "r"((_sf_v[2])));
-                    asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sf_q_addr + mma_q_stage * 512 + (lane * 4 + (lane >> 3 ^ 3)) * 4), "r"((_sf_v[3])));
+                    asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sf_q_addr + mma_q_stage * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 0)) * 4)), "r"((_sf_v[0])));
+                    asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sf_q_addr + mma_q_stage * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 1)) * 4)), "r"((_sf_v[1])));
+                    asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sf_q_addr + mma_q_stage * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 2)) * 4)), "r"((_sf_v[2])));
+                    asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sf_q_addr + mma_q_stage * 512 + (unsigned int)((lane * 4 + (lane >> 3 ^ 3)) * 4)), "r"((_sf_v[3])));
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (elect_sync()) {
                         tcgen05_cp_32x128b_warpx4(tmem_tmem_sf_q, make_sf_cp_desc_lo_sbo128((((smem_sf_q_addr) >> 4) + (mma_q_stage) * 32)));
@@ -906,25 +746,25 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                         int sfkv_smem = smem_sf_kv_addr + mma_kv_stage * 1024;
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         unsigned int _sf_v_0[4];
-                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[0])) : "r"((unsigned int)sfkv_smem + ((lane >> 3 ^ 0) * 32 + lane) * 4));
-                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[1])) : "r"((unsigned int)sfkv_smem + ((lane >> 3 ^ 1) * 32 + lane) * 4));
-                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[2])) : "r"((unsigned int)sfkv_smem + ((lane >> 3 ^ 2) * 32 + lane) * 4));
-                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[3])) : "r"((unsigned int)sfkv_smem + ((lane >> 3 ^ 3) * 32 + lane) * 4));
+                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[0])) : "r"(sfkv_smem + ((lane >> 3 ^ 0) * 32 + lane) * 4));
+                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[1])) : "r"(sfkv_smem + ((lane >> 3 ^ 1) * 32 + lane) * 4));
+                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[2])) : "r"(sfkv_smem + ((lane >> 3 ^ 2) * 32 + lane) * 4));
+                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_0[3])) : "r"(sfkv_smem + ((lane >> 3 ^ 3) * 32 + lane) * 4));
                         __syncwarp();
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfkv_smem + (lane * 4 + (lane >> 3 ^ 0)) * 4), "r"((_sf_v_0[0])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfkv_smem + (lane * 4 + (lane >> 3 ^ 1)) * 4), "r"((_sf_v_0[1])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfkv_smem + (lane * 4 + (lane >> 3 ^ 2)) * 4), "r"((_sf_v_0[2])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)sfkv_smem + (lane * 4 + (lane >> 3 ^ 3)) * 4), "r"((_sf_v_0[3])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfkv_smem + (lane * 4 + (lane >> 3 ^ 0)) * 4), "r"((_sf_v_0[0])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfkv_smem + (lane * 4 + (lane >> 3 ^ 1)) * 4), "r"((_sf_v_0[1])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfkv_smem + (lane * 4 + (lane >> 3 ^ 2)) * 4), "r"((_sf_v_0[2])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfkv_smem + (lane * 4 + (lane >> 3 ^ 3)) * 4), "r"((_sf_v_0[3])));
                         unsigned int _sf_v_1[4];
-                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[0])) : "r"((unsigned int)(sfkv_smem + 512) + ((lane >> 3 ^ 0) * 32 + lane) * 4));
-                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[1])) : "r"((unsigned int)(sfkv_smem + 512) + ((lane >> 3 ^ 1) * 32 + lane) * 4));
-                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[2])) : "r"((unsigned int)(sfkv_smem + 512) + ((lane >> 3 ^ 2) * 32 + lane) * 4));
-                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[3])) : "r"((unsigned int)(sfkv_smem + 512) + ((lane >> 3 ^ 3) * 32 + lane) * 4));
+                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[0])) : "r"(sfkv_smem + 512 + ((lane >> 3 ^ 0) * 32 + lane) * 4));
+                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[1])) : "r"(sfkv_smem + 512 + ((lane >> 3 ^ 1) * 32 + lane) * 4));
+                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[2])) : "r"(sfkv_smem + 512 + ((lane >> 3 ^ 2) * 32 + lane) * 4));
+                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&_sf_v_1[3])) : "r"(sfkv_smem + 512 + ((lane >> 3 ^ 3) * 32 + lane) * 4));
                         __syncwarp();
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfkv_smem + 512) + (lane * 4 + (lane >> 3 ^ 0)) * 4), "r"((_sf_v_1[0])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfkv_smem + 512) + (lane * 4 + (lane >> 3 ^ 1)) * 4), "r"((_sf_v_1[1])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfkv_smem + 512) + (lane * 4 + (lane >> 3 ^ 2)) * 4), "r"((_sf_v_1[2])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"((unsigned int)(sfkv_smem + 512) + (lane * 4 + (lane >> 3 ^ 3)) * 4), "r"((_sf_v_1[3])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfkv_smem + 512 + (lane * 4 + (lane >> 3 ^ 0)) * 4), "r"((_sf_v_1[0])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfkv_smem + 512 + (lane * 4 + (lane >> 3 ^ 1)) * 4), "r"((_sf_v_1[1])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfkv_smem + 512 + (lane * 4 + (lane >> 3 ^ 2)) * 4), "r"((_sf_v_1[2])));
+                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfkv_smem + 512 + (lane * 4 + (lane >> 3 ^ 3)) * 4), "r"((_sf_v_1[3])));
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         if (elect_sync()) {
                             tcgen05_cp_32x128b_warpx4(tmem_tmem_sf_kv, make_sf_cp_desc_lo_sbo128((((smem_sf_kv_addr) >> 4) + (mma_kv_stage) * 64)));
@@ -991,7 +831,7 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                 unsigned int clean_tiles_per_row = (stride_logits + 4095) / 4096;
                 unsigned int clean_tasks = (unsigned int)num_q_blocks * clean_tiles_per_row;
                 #pragma unroll 1
-                for (unsigned int clean_task = bid; clean_task < clean_tasks; clean_task += num_bids) {
+                for (unsigned int clean_task = bid; clean_task < clean_tasks; clean_task += SM_COUNT) {
                     unsigned int q_block_idx_4 = clean_task / clean_tiles_per_row;
                     int clean_begin = clean_task % clean_tiles_per_row * 4096;
                     int clean_end_raw = clean_begin + 4096;
@@ -1034,15 +874,15 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                         int aligned_start = (clean_begin + 3) / 4 * 4;
                         int aligned_end = _min_1 / 4 * 4;
                         if (aligned_start >= aligned_end) {
-                            for (int j = (unsigned int)clean_begin + lane; j < _min_1; j += 32) {
+                            for (int j = clean_begin + lane; j < _min_1; j += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j)) + (0)) = -CUDART_INF_F;
                             }
                             __syncwarp();
                         } else {
-                            for (int j_1 = (unsigned int)clean_begin + lane; j_1 < aligned_start; j_1 += 32) {
+                            for (int j_1 = clean_begin + lane; j_1 < aligned_start; j_1 += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_1)) + (0)) = -CUDART_INF_F;
                             }
-                            for (int j_2 = (unsigned int)aligned_end + lane; j_2 < _min_1; j_2 += 32) {
+                            for (int j_2 = aligned_end + lane; j_2 < _min_1; j_2 += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_2)) + (0)) = -CUDART_INF_F;
                             }
                             __syncwarp();
@@ -1066,15 +906,15 @@ kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CU
                         int aligned_start_0 = (_max_0 + 3) / 4 * 4;
                         int aligned_end_1 = clean_end / 4 * 4;
                         if (aligned_start_0 >= aligned_end_1) {
-                            for (int j_4 = (unsigned int)_max_0 + lane; j_4 < clean_end; j_4 += 32) {
+                            for (int j_4 = _max_0 + lane; j_4 < clean_end; j_4 += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_4)) + (0)) = -CUDART_INF_F;
                             }
                             __syncwarp();
                         } else {
-                            for (int j_5 = (unsigned int)_max_0 + lane; j_5 < aligned_start_0; j_5 += 32) {
+                            for (int j_5 = _max_0 + lane; j_5 < aligned_start_0; j_5 += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_5)) + (0)) = -CUDART_INF_F;
                             }
-                            for (int j_6 = (unsigned int)aligned_end_1 + lane; j_6 < clean_end; j_6 += 32) {
+                            for (int j_6 = aligned_end_1 + lane; j_6 < clean_end; j_6 += 32) {
                                 *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_6)) + (0)) = -CUDART_INF_F;
                             }
                             __syncwarp();
