@@ -304,6 +304,10 @@ def cake_fused_moe_prepare_workspace(
                 # The 32- to 256-token routes measured best with a six-row
                 # pool: 6 * 28 = 168 FC2 CTAs on the 148-SM B200 and B300.
                 fc2_grid_n = min(max_tiles, 6)
+                if arch == "sm_103a":
+                    fc2_grid_n = min(
+                        max_tiles, 12
+                    )  # inc23 (N16 claim8 FC2 2 CTAs/SM, s2b2 v39 program): 336 FC2 CTAs on the 148-SM B300 for the sm_103a claim8 rows M32/M64/M128/M256; sm_100a keeps pool 6
             if n8_w2a_m16:
                 # Two resident CTAs per SM: the pool has
                 # _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * SM // (_H // 128) rows
