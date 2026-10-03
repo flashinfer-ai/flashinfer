@@ -32,6 +32,7 @@ from .jit.cake_fmha import (
     load_cake_fmha_decode_balanced_fp8_module,
     load_cake_fmha_decode_balanced_hd256_module,
     load_cake_fmha_decode_balanced_hd64_module,
+    cake_fmha_balanced_hd64_max_group,
     load_cake_fmha_decode_native_bf16_module,
     load_cake_fmha_decode_native_fp16_hd512_module,
     load_cake_fmha_decode_native_fp16_nhd_module,
@@ -510,7 +511,10 @@ _PRODUCT_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
     "decode_balanced_fp8_v1": ("decode_balanced_fp8",),
     "decode_balanced_bf16q_v1": ("decode_balanced_bf16q",),
     "decode_balanced_fp16q_v1": ("decode_balanced_fp16q",),
-    "decode_balanced_bf16_hd64_v1": ("decode_balanced_bf16_hd64",),
+    "decode_balanced_bf16_hd64_v1": (
+        "decode_balanced_bf16_hd64",
+        "decode_balanced_bf16_hd64_g16",
+    ),
     "decode_balanced_bf16_hd256_v1": (
         "decode_balanced_bf16_hd256_p16",
         "decode_balanced_bf16_hd256_p32",
@@ -560,6 +564,7 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "decode_balanced_bf16q",
         "decode_balanced_fp16q",
         "decode_balanced_bf16_hd64",
+        "decode_balanced_bf16_hd64_g16",
         "decode_balanced_bf16_hd256_p16",
         "decode_balanced_bf16_hd256_p32",
         "decode_balanced_bf16_hd256_p64",
@@ -1832,7 +1837,12 @@ def _resolve_cake_fmha_decode_module(
             route.target, route.component.removeprefix("decode_balanced_")
         ), True
     if route.component == "decode_balanced_bf16_hd64":
-        return loader(route.target), True
+        # Structural instance by head group: eight softmax columns for 1..8
+        # query heads per KV head (every product row), sixteen for 9..16.
+        return loader(
+            route.target,
+            cake_fmha_balanced_hd64_max_group(route.num_q_heads, route.num_kv_heads),
+        ), True
     if route.component == "decode_balanced_bf16_hd256":
         return loader(route.target, route.page_size), True
     if route.component == "decode_native_bf16_hd256_smallm":

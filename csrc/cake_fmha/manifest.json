@@ -140,8 +140,8 @@
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e",
-                  "sm_103a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e"
+                  "sm_100a": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf",
+                  "sm_103a": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
@@ -156,8 +156,8 @@
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e",
-                  "sm_103a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e"
+                  "sm_100a": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf",
+                  "sm_103a": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
@@ -515,15 +515,16 @@
                   "N_ROWS": 32
                 },
                 "selector": {
+                  "eight_slice_fold": 0,
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283",
-                  "sm_103a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
+                  "sm_100a": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396",
+                  "sm_103a": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu"
                 }
               },
               {
@@ -531,15 +532,50 @@
                   "N_ROWS": 64
                 },
                 "selector": {
+                  "eight_slice_fold": 0,
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283",
-                  "sm_103a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
+                  "sm_100a": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396",
+                  "sm_103a": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu"
+                }
+              },
+              {
+                "defines": {
+                  "N_ROWS": 32
+                },
+                "selector": {
+                  "eight_slice_fold": 1,
+                  "n_rows": 32
+                },
+                "sha256": {
+                  "sm_100a": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e",
+                  "sm_103a": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu"
+                }
+              },
+              {
+                "defines": {
+                  "N_ROWS": 64
+                },
+                "selector": {
+                  "eight_slice_fold": 1,
+                  "n_rows": 64
+                },
+                "sha256": {
+                  "sm_100a": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e",
+                  "sm_103a": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu"
                 }
               }
             ],
@@ -670,8 +706,8 @@
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669",
-                  "sm_103a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669"
+                  "sm_100a": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6",
+                  "sm_103a": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
@@ -686,8 +722,8 @@
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669",
-                  "sm_103a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669"
+                  "sm_100a": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6",
+                  "sm_103a": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
@@ -1214,8 +1250,8 @@
             }
           }
         },
-        "source_package_file_count": 43,
-        "source_package_sha256": "f56e955b148f35811e30f9d04151170f6989dda502882b62726c5975a2fff409",
+        "source_package_file_count": 44,
+        "source_package_sha256": "98698c57ace9e942a4f6caac3368132bc99c44228a8d517484717c010fc37673",
         "balanced_routes": {
           "dcp_spec_bf16_balanced": {
             "arguments": {
@@ -1384,10 +1420,14 @@
             "dispatch_band": {
               "band": {
                 "chunk_tokens": 256,
-                "long_tile_blocks": 24,
+                "long_tile_blocks": 18,
+                "long_tile_blocks_by_arch": {
+                  "sm_100a": 18,
+                  "sm_103a": 17
+                },
                 "min_items": 160,
                 "two_wave_min_items": {
-                  "sm_100a": 384,
+                  "sm_100a": 160,
                   "sm_103a": 160
                 },
                 "two_wave_min_items_default": 160
@@ -1400,7 +1440,7 @@
                 "q_heads_per_kv_head": 8,
                 "q_tiles": 1
               },
-              "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items and (waves >= 3 or items >= two_wave_min_items[arch]))",
+              "decision": "blocks_per_cta >= long_tile_blocks_by_arch.get(arch, long_tile_blocks) or (waves >= 2 and items >= min_items and (waves >= 3 or items >= two_wave_min_items.get(arch, two_wave_min_items_default)))",
               "family": "dcp_spec_bf16_fp8_balanced",
               "incumbent_family": "dcp_spec_bf16_fp8",
               "incumbent_shape": {
@@ -1455,6 +1495,22 @@
                 8
               ],
               "v_scale": "per_tensor_folded_into_output"
+            },
+            "program_variants": {
+              "at_or_above_grid": 0,
+              "below_grid": 1,
+              "bodies": {
+                "0": "cake_fmha_dcp_spec_bf16_fp8_balanced_eight_slice_fold0.cu",
+                "1": "cake_fmha_dcp_spec_bf16_fp8_balanced_eight_slice_fold1.cu"
+              },
+              "default": 1,
+              "items_lower_bound": "batch_size * num_kv_heads",
+              "key": "eight_slice_fold",
+              "rule": "eight_slice_fold = below_grid when batch_size * num_kv_heads < grid (sm_count: one persistent CTA per multiprocessor), else at_or_above_grid: the idle-CTA eight-slice fold needs chunk tickets + 8 reduce tickets per split tile <= grid and every (request, KV head) is at least one chunk ticket; the program without it has the same plan and fold order",
+              "values": [
+                0,
+                1
+              ]
             },
             "public_name": "cake_fmha_dcp_spec_bf16_fp8_balanced",
             "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_balanced",
@@ -1534,7 +1590,13 @@
               "band": {
                 "chunk_tokens": 256,
                 "long_tile_blocks": 96,
-                "min_items": 160
+                "min_items": 160,
+                "one_wave_long_tile_blocks": 22,
+                "one_wave_long_tile_blocks_by_arch": {
+                  "sm_100a": 22,
+                  "sm_103a": 22
+                },
+                "one_wave_min_q_len": 3
               },
               "contract": {
                 "head_dim": 256,
@@ -1545,7 +1607,7 @@
                 "q_heads_per_kv_head": 16,
                 "q_tiles": "ceil(q_len / q_box_rows)"
               },
-              "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items)",
+              "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items) or (waves < 2 and q_len >= one_wave_min_q_len and blocks_per_cta >= one_wave_long_tile_blocks_by_arch.get(arch, one_wave_long_tile_blocks))",
               "family": "dcp_spec_bf16_fp8_d256_balanced",
               "incumbent_family": "cake_fmha_dcp_spec_bf16_fp8_d256 (static split family, carried downstream in csrc/dcp)",
               "incumbent_shape": {
@@ -1657,7 +1719,7 @@
                 "elements": 4,
                 "initial_state": "zero; every launch leaves it zero"
               },
-              "reduce_slices_max": 8,
+              "reduce_slices_max": 16,
               "tile_counters": {
                 "counters_per_tile": 4,
                 "dtype": "uint32",
@@ -1756,7 +1818,11 @@
     },
     "bindings/cake_fmha_decode_balanced_bf16_hd64_binding.cu": {
       "bytes": 3018,
-      "sha256": "d4511221c96f2656994fc1f7479e0955b2b646f5e881a26af1309a9177117935"
+      "sha256": "c82dcc6e15051a312f5b6cf233ecc1699db9138851fd5a1d75f9351c6bb046ab"
+    },
+    "bindings/cake_fmha_decode_balanced_bf16_hd64_g16_binding.cu": {
+      "bytes": 3034,
+      "sha256": "126c00d833b62df084f771d682403465f3ced2a04c73102654a118abd1be2715"
     },
     "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu": {
       "bytes": 2917,
@@ -1975,8 +2041,8 @@
       "sha256": "03cfc35e253a91a9675d2e3da75d60b15be3f04ca97465c9c656183c3a943ba7"
     },
     "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu": {
-      "bytes": 219427,
-      "sha256": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e"
+      "bytes": 235190,
+      "sha256": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l20.cu": {
       "bytes": 116857,
@@ -2010,13 +2076,17 @@
       "bytes": 127094,
       "sha256": "07240d76baaf7adea6ca1929fe354d32a16d9369470c0071ae6d3ad917fafb91"
     },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu": {
-      "bytes": 252856,
-      "sha256": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu": {
+      "bytes": 300955,
+      "sha256": "73f66b6743112e142a9d98570b4c71028a19a72e3c4c0771f6347cb19f15e396"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu": {
+      "bytes": 301740,
+      "sha256": "7891394e3434a8501d522a4637074ef28becb9674128b1f4e6d3c74abd4c713e"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu": {
-      "bytes": 291398,
-      "sha256": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669"
+      "bytes": 365643,
+      "sha256": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6"
     },
     "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l20.cu": {
       "bytes": 95503,
@@ -2095,36 +2165,44 @@
       "sha256": "b14c1bc6dbcea0ab9fab928e30eea6707b3687d4c876e68f77075ead0c646894"
     },
     "cuda/decode_balanced_bf16_hd256_p16/sm_100a/default.cu": {
-      "bytes": 111811,
-      "sha256": "a943ca17d0e191f9dc44d7f1e59d2b8cddaf289aa361ce315a1e8cec7b2d7b6b"
+      "bytes": 115919,
+      "sha256": "ba2d36e51a7ae003e4dbfe63803f99eaddb81a5ca06e64b162b74520f284e2c8"
     },
     "cuda/decode_balanced_bf16_hd256_p16/sm_103a/default.cu": {
-      "bytes": 111714,
-      "sha256": "37c1dbb69251e9433eed138733d7530fa647786f4f64dc252463d6fddc98e48e"
+      "bytes": 115822,
+      "sha256": "a9ef41e7d68d9dfe162737ac4dd198999110a1f1d6543bc394e654fdabd1f6b0"
     },
     "cuda/decode_balanced_bf16_hd256_p32/sm_100a/default.cu": {
-      "bytes": 110169,
-      "sha256": "915574fab2da2c2aa9ea30b244529416b387ea6bbcc10c2efc44d1ae6e5a6cff"
+      "bytes": 114277,
+      "sha256": "6bd1e5948018470c1d5248e8d6b34ba61c2543c8c008908a7ae60c6897ffa061"
     },
     "cuda/decode_balanced_bf16_hd256_p32/sm_103a/default.cu": {
-      "bytes": 110072,
-      "sha256": "f80807ce4cf6a0211e1cf1e0b8933afb6a231b1cb3cd2b6cc55126c068845a63"
+      "bytes": 114180,
+      "sha256": "1e1566b5b0d9c66a7abe3ea7b13ad4cdb7a20461abd141cc5fbf49e362b066ba"
     },
     "cuda/decode_balanced_bf16_hd256_p64/sm_100a/default.cu": {
-      "bytes": 110169,
-      "sha256": "3279615d2c12fce3de394090cc2a03aa4a5b0182da95856d8412c504130c4271"
+      "bytes": 114277,
+      "sha256": "86560a75b42c4d0b4702f1bd779994eca12292aa56a7968a9a43c877827cf626"
     },
     "cuda/decode_balanced_bf16_hd256_p64/sm_103a/default.cu": {
-      "bytes": 110072,
-      "sha256": "5ccb2e682f76d3d7bb9bff62fc4c8972d89a20509c625b0f033e51b0fca42517"
+      "bytes": 114180,
+      "sha256": "0e5951bb89fa8b4990843bef3b181ea06e99875e5e324aa0dc2f79582a73ebab"
     },
     "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu": {
-      "bytes": 138924,
-      "sha256": "19923c9dc9ee002199f8d5639e5fb39203a6e9ad3650159bbf323d538584cecb"
+      "bytes": 149704,
+      "sha256": "25d1b340a8d12fa112cb6a3043616b430e77f08086125df4206a9d25d126e852"
     },
     "cuda/decode_balanced_bf16_hd64/sm_103a/default.cu": {
-      "bytes": 138827,
-      "sha256": "36c8b398e47c98fdc71241f83bb25a16c3abe1756f47dc7507a6ebff4a2f4417"
+      "bytes": 149607,
+      "sha256": "dd0d8a23e07e4d36d9d1c32ce7ca0eb132208590fc5695a956d7f6d20d63479f"
+    },
+    "cuda/decode_balanced_bf16_hd64_g16/sm_100a/default.cu": {
+      "bytes": 151560,
+      "sha256": "c3959dbfc6450a4f05503c28464453082670c1141eac27841f2187b45695ff26"
+    },
+    "cuda/decode_balanced_bf16_hd64_g16/sm_103a/default.cu": {
+      "bytes": 151463,
+      "sha256": "25cb0d20e6c28556a2219862edb9811497ccc8461997683467e0dd75dfe9728f"
     },
     "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu": {
       "bytes": 213603,
@@ -2499,8 +2577,8 @@
       "sha256": "14388bf51cabd8e32ba47fe6f1d767b55f716795a80246fa33e95f1148059f72"
     },
     "include/cake_fmha.h": {
-      "bytes": 23389,
-      "sha256": "43e3a3c82819e21d304f97e57a9dec35c61a2d4bd37798ee42a9e271cd5b99c6"
+      "bytes": 24016,
+      "sha256": "d23ca8569b1471d19719bb79f125e634adb0cc6f2300474d4df43407f6bf3645"
     },
     "include/cake_fmha_hd256_support.h": {
       "bytes": 1964,
@@ -4094,8 +4172,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "a943ca17d0e191f9dc44d7f1e59d2b8cddaf289aa361ce315a1e8cec7b2d7b6b",
-            "sm_103a": "37c1dbb69251e9433eed138733d7530fa647786f4f64dc252463d6fddc98e48e"
+            "sm_100a": "ba2d36e51a7ae003e4dbfe63803f99eaddb81a5ca06e64b162b74520f284e2c8",
+            "sm_103a": "a9ef41e7d68d9dfe162737ac4dd198999110a1f1d6543bc394e654fdabd1f6b0"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd256_p16/sm_100a/default.cu",
@@ -4208,8 +4286,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "915574fab2da2c2aa9ea30b244529416b387ea6bbcc10c2efc44d1ae6e5a6cff",
-            "sm_103a": "f80807ce4cf6a0211e1cf1e0b8933afb6a231b1cb3cd2b6cc55126c068845a63"
+            "sm_100a": "6bd1e5948018470c1d5248e8d6b34ba61c2543c8c008908a7ae60c6897ffa061",
+            "sm_103a": "1e1566b5b0d9c66a7abe3ea7b13ad4cdb7a20461abd141cc5fbf49e362b066ba"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd256_p32/sm_100a/default.cu",
@@ -4322,8 +4400,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "3279615d2c12fce3de394090cc2a03aa4a5b0182da95856d8412c504130c4271",
-            "sm_103a": "5ccb2e682f76d3d7bb9bff62fc4c8972d89a20509c625b0f033e51b0fca42517"
+            "sm_100a": "86560a75b42c4d0b4702f1bd779994eca12292aa56a7968a9a43c877827cf626",
+            "sm_103a": "0e5951bb89fa8b4990843bef3b181ea06e99875e5e324aa0dc2f79582a73ebab"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd256_p64/sm_100a/default.cu",
@@ -4334,9 +4412,9 @@
       "threads": 512
     },
     "decode_balanced_bf16_hd64": {
-      "binding_sha256": "d4511221c96f2656994fc1f7479e0955b2b646f5e881a26af1309a9177117935",
+      "binding_sha256": "c82dcc6e15051a312f5b6cf233ecc1699db9138851fd5a1d75f9351c6bb046ab",
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_binding.cu",
-      "dynamic_shared_memory_bytes": 117760,
+      "dynamic_shared_memory_bytes": 159616,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64",
       "parameters": [
         {
@@ -4436,12 +4514,126 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "19923c9dc9ee002199f8d5639e5fb39203a6e9ad3650159bbf323d538584cecb",
-            "sm_103a": "36c8b398e47c98fdc71241f83bb25a16c3abe1756f47dc7507a6ebff4a2f4417"
+            "sm_100a": "25d1b340a8d12fa112cb6a3043616b430e77f08086125df4206a9d25d126e852",
+            "sm_103a": "dd0d8a23e07e4d36d9d1c32ce7ca0eb132208590fc5695a956d7f6d20d63479f"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu",
             "sm_103a": "cuda/decode_balanced_bf16_hd64/sm_103a/default.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_balanced_bf16_hd64_g16": {
+      "binding_sha256": "126c00d833b62df084f771d682403465f3ced2a04c73102654a118abd1be2715",
+      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_g16_binding.cu",
+      "dynamic_shared_memory_bytes": 159616,
+      "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64_g16",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "group_ratio"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16_hd64_g16",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "c3959dbfc6450a4f05503c28464453082670c1141eac27841f2187b45695ff26",
+            "sm_103a": "25cb0d20e6c28556a2219862edb9811497ccc8461997683467e0dd75dfe9728f"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_bf16_hd64_g16/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_hd64_g16/sm_103a/default.cu"
           }
         }
       ],
@@ -8422,7 +8614,11 @@
       "components": [
         {
           "component": "decode_balanced_bf16_hd64",
-          "condition": "always"
+          "condition": "num_qo_heads // num_kv_heads <= 8"
+        },
+        {
+          "component": "decode_balanced_bf16_hd64_g16",
+          "condition": "9 <= num_qo_heads // num_kv_heads <= 16"
         }
       ],
       "standalone_ready": true,

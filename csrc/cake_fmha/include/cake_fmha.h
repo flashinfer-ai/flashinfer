@@ -590,6 +590,31 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd64(
     cudaStream_t stream
 );
 
+extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd64_g16(
+    CakeFmhaTensorMap const* Qt,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* O_ptr,
+    int* page_table,
+    int* seq_lens_kv,
+    float* partial_o,
+    float* partial_stats,
+    uint32_t* tile_counters,
+    uint32_t* queue_counters,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    int num_q_heads,
+    int num_kv_heads,
+    int group_ratio,
+    int batch_size,
+    int q_len,
+    uint32_t max_items,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p16(
     CakeFmhaTensorMap const* Qt,
     CakeFmhaTensorMap const* K,

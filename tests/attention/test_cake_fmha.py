@@ -92,9 +92,12 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
     # instances (two arch bodies + one launch binding each) and the seven
     # round-2 balanced components (fp8, bf16q, fp16q, bf16 hd64, bf16 hd256
     # p16/p32/p64: two arch programs + one launch binding each), plus the
-    # round-3 balanced DCP speculative-decode families (three launch bindings
-    # and one program each, instantiated by -DN_ROWS for both architectures).
-    assert len(manifest["artifacts"]) == 206
+    # round-3 balanced DCP speculative-decode families (three launch bindings;
+    # one program each, instantiated by -DN_ROWS for both architectures, except
+    # the E4M3 head_dim 128 family, which ships two host-selected programs), plus
+    # the round-5 bf16 hd64 `_g16` structural instance (two arch bodies + one
+    # launch binding) serving head groups 9..16.
+    assert len(manifest["artifacts"]) == 210
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
     assert dcp_addon["installed"] is True
     assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
@@ -3450,7 +3453,12 @@ def test_cake_fmha_balanced_hd64_route_owns_bf16_gqa_decode(monkeypatch) -> None
         page_size=16,
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
-    assert cake_api._route_components(route) == (component,)
+    # Two structural instances of one body: eight softmax columns for head
+    # groups 1..8, sixteen for 9..16 (selected by the host from the group).
+    assert cake_api._route_components(route) == (
+        component,
+        "decode_balanced_bf16_hd64_g16",
+    )
 
     # One to sixteen query heads per KV head, at every KV length and tile count.
     for group, batch_size, seq_lens in (
@@ -3722,13 +3730,20 @@ def test_cake_fmha_decode_balanced_fp8_family_jit_selects_the_q_dtype_component(
             cake_fmha_balanced_fp8_component_name(bad_q_dtype)
 
 
-def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(monkeypatch) -> None:
+@pytest.mark.parametrize("max_group", [8, 16])
+def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(
+    monkeypatch, max_group
+) -> None:
     import flashinfer.jit.core as jit_core
 
     monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
-    component = "decode_balanced_bf16_hd64"
-    spec = gen_cake_fmha_decode_balanced_hd64_module("sm100a")
-    assert spec.name == get_cake_fmha_decode_balanced_hd64_uri("sm100a")
+    component = (
+        "decode_balanced_bf16_hd64"
+        if max_group == 8
+        else "decode_balanced_bf16_hd64_g16"
+    )
+    spec = gen_cake_fmha_decode_balanced_hd64_module("sm100a", max_group)
+    assert spec.name == get_cake_fmha_decode_balanced_hd64_uri("sm100a", max_group)
     assert spec.name.startswith(f"cake_fmha_{component}_sm100a_")
     assert {Path(source).name for source in spec.sources} == {
         "default.cu",
