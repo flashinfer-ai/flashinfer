@@ -319,7 +319,7 @@ The output CSV will contain detailed metrics including:
 | `--use_routing_scales_on_input` | Whether to use routing scales on input (for Llama4 routing)                                         |
 | `--input_dtype`          | Data type of the input hidden states. Default: bfloat16                                                    |
 | `--weight_dtype`         | Data type of the weights (before quantization). Default: bfloat16                                          |
-| `--cutlass_variant`      | CUTLASS MoE variant: `base` (no quant), `fp8` (per-tensor FP8), `nvfp4` (FP4 block-scale)                   |
+| `--cutlass_variant`      | CUTLASS MoE variant: `base` (no quant), `fp8` (per-tensor FP8), `fp8_block` (128x128 block-scale FP8, SM90), `nvfp4` (FP4 block-scale) |
 | `--quantized_input`      | For `nvfp4` only: quantize input activations to FP4                                                         |
 | `--tp_size`              | Tensor-parallel world size                                                                                  |
 | `--tp_rank`              | Tensor-parallel rank                                                                                        |
