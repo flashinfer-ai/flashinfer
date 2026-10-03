@@ -43,7 +43,7 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define TMEM_TMEM_O1_OFFSET 112
 #define NUM_Q_PIPE_STAGES 2
 #define NUM_KV_PIPE_STAGES 8
-#define NUM_PAGE_PIPE_STAGES 6
+#define NUM_PAGE_PIPE_STAGES 12
 #define NUM_WORK_PIPE_STAGES 4
 #define SMEM_SMEM_CORR0_OFF 1024
 #define SMEM_SMEM_CORR0_STAGE_BYTES 64
@@ -72,9 +72,9 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define SMEM_SMEM_P1_OFF 141312
 #define SMEM_SMEM_P1_STAGE_BYTES 4096
 #define SMEM_SMEM_P1_STRIDE 4096
-#define SMEM_SMEM_PAGE_OFFSETS_OFF 153600
-#define SMEM_SMEM_PAGE_OFFSETS_STAGE_BYTES 192
-#define SMEM_SMEM_PAGE_OFFSETS_STRIDE 192
+#define SMEM_SMEM_PAGE_OFFSETS_OFF 159232
+#define SMEM_SMEM_PAGE_OFFSETS_STAGE_BYTES 384
+#define SMEM_SMEM_PAGE_OFFSETS_STRIDE 384
 #define SMEM_SMEM_FINAL_SCALE0_OFF 153792
 #define SMEM_SMEM_FINAL_SCALE0_STAGE_BYTES 64
 #define SMEM_SMEM_FINAL_SCALE0_STRIDE 64
@@ -99,7 +99,7 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define SMEM_SCHED_SEQ_LENS_OFF 154624
 #define SMEM_SCHED_SEQ_LENS_STAGE_BYTES 4096
 #define SMEM_SCHED_SEQ_LENS_STRIDE 4096
-#define SMEM_TOTAL 159232
+#define SMEM_TOTAL 159616
 #define THREADS 512
 #define BLOCK_N 128
 #define HEAD_DIM 64
@@ -545,10 +545,10 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
     #define o_empty_addr (mbar_base + 304)
     #define tmem_dealloc_addr (mbar_base + 312)
     #define page_offsets_full_addr (mbar_base + 320)
-    #define page_offsets_empty_addr (mbar_base + 368)
-    #define work_full_addr (mbar_base + 416)
-    #define work_empty_addr (mbar_base + 448)
-    #define claim_gate_addr (mbar_base + 480)
+    #define page_offsets_empty_addr (mbar_base + 416)
+    #define work_full_addr (mbar_base + 512)
+    #define work_empty_addr (mbar_base + 544)
+    #define claim_gate_addr (mbar_base + 576)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -581,8 +581,8 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
     const int smem_p0_addr = smem + 137216;
     __nv_bfloat16* smem_p1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 141312);
     const int smem_p1_addr = smem + 141312;
-    int* smem_page_offsets = reinterpret_cast<int*>(smem_raw + 153600);
-    const int smem_page_offsets_addr = smem + 153600;
+    int* smem_page_offsets = reinterpret_cast<int*>(smem_raw + 159232);
+    const int smem_page_offsets_addr = smem + 159232;
     float* smem_final_scale0 = reinterpret_cast<float*>(smem_raw + 153792);
     const int smem_final_scale0_addr = smem + 153792;
     float* smem_final_scale1 = reinterpret_cast<float*>(smem_raw + 153856);
@@ -603,8 +603,8 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(K)) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(V)) : "memory");
 
-    // Mbarrier init (29 pipeline groups, 0 ordered-sequence groups, 61 barriers)
-    // Mbarriers at smem_raw[0..488)
+    // Mbarrier init (29 pipeline groups, 0 ordered-sequence groups, 73 barriers)
+    // Mbarriers at smem_raw[0..584)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -675,33 +675,45 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
             // tmem_dealloc: 1 barriers, init_count=128
             mbarrier_init(smem + 312, 128);
             // --- pipeline 'page_pipe' ---
-            // page_offsets_full: 6 barriers, init_count=1
+            // page_offsets_full: 12 barriers, init_count=1
             mbarrier_init(smem + 320, 1);
             mbarrier_init(smem + 328, 1);
             mbarrier_init(smem + 336, 1);
             mbarrier_init(smem + 344, 1);
             mbarrier_init(smem + 352, 1);
             mbarrier_init(smem + 360, 1);
-            // page_offsets_empty: 6 barriers, init_count=1
             mbarrier_init(smem + 368, 1);
             mbarrier_init(smem + 376, 1);
             mbarrier_init(smem + 384, 1);
             mbarrier_init(smem + 392, 1);
             mbarrier_init(smem + 400, 1);
             mbarrier_init(smem + 408, 1);
-            // --- pipeline 'work_pipe' ---
-            // work_full: 4 barriers, init_count=1
+            // page_offsets_empty: 12 barriers, init_count=1
             mbarrier_init(smem + 416, 1);
             mbarrier_init(smem + 424, 1);
             mbarrier_init(smem + 432, 1);
             mbarrier_init(smem + 440, 1);
-            // work_empty: 4 barriers, init_count=480
-            mbarrier_init(smem + 448, 480);
-            mbarrier_init(smem + 456, 480);
-            mbarrier_init(smem + 464, 480);
-            mbarrier_init(smem + 472, 480);
-            // claim_gate: 1 barriers, init_count=1
+            mbarrier_init(smem + 448, 1);
+            mbarrier_init(smem + 456, 1);
+            mbarrier_init(smem + 464, 1);
+            mbarrier_init(smem + 472, 1);
             mbarrier_init(smem + 480, 1);
+            mbarrier_init(smem + 488, 1);
+            mbarrier_init(smem + 496, 1);
+            mbarrier_init(smem + 504, 1);
+            // --- pipeline 'work_pipe' ---
+            // work_full: 4 barriers, init_count=1
+            mbarrier_init(smem + 512, 1);
+            mbarrier_init(smem + 520, 1);
+            mbarrier_init(smem + 528, 1);
+            mbarrier_init(smem + 536, 1);
+            // work_empty: 4 barriers, init_count=480
+            mbarrier_init(smem + 544, 480);
+            mbarrier_init(smem + 552, 480);
+            mbarrier_init(smem + 560, 480);
+            mbarrier_init(smem + 568, 480);
+            // claim_gate: 1 barriers, init_count=1
+            mbarrier_init(smem + 576, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -709,9 +721,9 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
     __syncwarp();
 
     // TMEM alloc (128 columns, 128 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 488);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 584);
     if (warp == 0) {
-        int _tmem_hold = smem + 488;
+        int _tmem_hold = smem + 584;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -1896,7 +1908,7 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                         mbarrier_arrive(page_offsets_full_addr + (page_prod_stage) * 8);
                     }
                     page_prod_stage += 1;
-                    if (page_prod_stage == 6) { page_prod_stage = 0; page_prod_phase ^= 1; }
+                    if (page_prod_stage == 12) { page_prod_stage = 0; page_prod_phase ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_p) * 8, _phase_work_full_3);
                 unsigned int base_0_3 = work_stage_p * 16;
@@ -2617,11 +2629,11 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                     for (int ni = 0; ni < prefill; ni++) {
                         int page_stage_unwrapped = page_cons_stage + (unsigned int)ni;
                         int page_stage = page_stage_unwrapped;
-                        if (page_stage >= 6) {
-                            page_stage = page_stage - 6;
+                        if (page_stage >= 12) {
+                            page_stage = page_stage - 12;
                         }
                         int page_phase = page_cons_phase;
-                        if (page_stage_unwrapped >= 6) {
+                        if (page_stage_unwrapped >= 12) {
                             page_phase = page_phase ^ 1;
                         }
                         int pg_base = page_stage * 8;
@@ -2665,11 +2677,11 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                         if (next_ni < cta_n_blocks_3) {
                             int next_page_stage_unwrapped = page_cons_stage + 4;
                             int next_page_stage = next_page_stage_unwrapped;
-                            if (next_page_stage >= 6) {
-                                next_page_stage = next_page_stage - 6;
+                            if (next_page_stage >= 12) {
+                                next_page_stage = next_page_stage - 12;
                             }
                             int next_page_phase = page_cons_phase;
-                            if (next_page_stage_unwrapped >= 6) {
+                            if (next_page_stage_unwrapped >= 12) {
                                 next_page_phase = next_page_phase ^ 1;
                             }
                             int npg_base = next_page_stage * 8;
@@ -2692,7 +2704,7 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                         }
                         mbarrier_arrive(page_offsets_empty_addr + (page_cons_stage) * 8);
                         page_cons_stage += 1;
-                        if (page_cons_stage == 6) { page_cons_stage = 0; page_cons_phase ^= 1; }
+                        if (page_cons_stage == 12) { page_cons_stage = 0; page_cons_phase ^= 1; }
                         if (ni_1 == gate_block) {
                             mbarrier_arrive(claim_gate_addr);
                         }

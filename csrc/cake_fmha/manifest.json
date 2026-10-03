@@ -1818,11 +1818,11 @@
     },
     "bindings/cake_fmha_decode_balanced_bf16_hd64_binding.cu": {
       "bytes": 3018,
-      "sha256": "0f65e26dc0d9d3279704edcc40be70a5b34a735e724473de9d2c3aec1704566d"
+      "sha256": "c82dcc6e15051a312f5b6cf233ecc1699db9138851fd5a1d75f9351c6bb046ab"
     },
     "bindings/cake_fmha_decode_balanced_bf16_hd64_g16_binding.cu": {
       "bytes": 3034,
-      "sha256": "57296a766027e90d8147d57bd0fd91b4f7f17bfeb83a1957e56f50201df19ff2"
+      "sha256": "126c00d833b62df084f771d682403465f3ced2a04c73102654a118abd1be2715"
     },
     "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu": {
       "bytes": 2917,
@@ -2189,20 +2189,20 @@
       "sha256": "0e5951bb89fa8b4990843bef3b181ea06e99875e5e324aa0dc2f79582a73ebab"
     },
     "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu": {
-      "bytes": 143602,
-      "sha256": "4dda0b11e354f7615f71a0f71a4074f979d1b8e2526c54f55cc9f5142d3f2c34"
+      "bytes": 144117,
+      "sha256": "bc086537a5380526fd0e73e243a12f35d24e124fa668ea5678e283913e8bf5b5"
     },
     "cuda/decode_balanced_bf16_hd64/sm_103a/default.cu": {
-      "bytes": 143505,
-      "sha256": "435316b836cca1966ede949709f1bcc90185b44d70f66e85a4dacd1f44680418"
+      "bytes": 144020,
+      "sha256": "16b164686c4a1ca56289e75664bf6b4817a1406fcfc99ff6892be16dc094c96a"
     },
     "cuda/decode_balanced_bf16_hd64_g16/sm_100a/default.cu": {
-      "bytes": 145458,
-      "sha256": "1d5b308d72ff6d15425d57545c95582ef2925cd154e51e6d8dbe194a785572d7"
+      "bytes": 145973,
+      "sha256": "0aa5af85e4d9ef9c69222b9a4e090f28b5d757a1f6b3487812046339e7c8dccf"
     },
     "cuda/decode_balanced_bf16_hd64_g16/sm_103a/default.cu": {
-      "bytes": 145361,
-      "sha256": "a707497c3da9f27dcfb7f4915c30841cd1a36dec18d3ca98ee99a8f87ccae847"
+      "bytes": 145876,
+      "sha256": "d9328399825e115ff9dfbe541042ac12130da79dfab0fb9aaf38b7add02c6783"
     },
     "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu": {
       "bytes": 213603,
@@ -4412,9 +4412,9 @@
       "threads": 512
     },
     "decode_balanced_bf16_hd64": {
-      "binding_sha256": "0f65e26dc0d9d3279704edcc40be70a5b34a735e724473de9d2c3aec1704566d",
+      "binding_sha256": "c82dcc6e15051a312f5b6cf233ecc1699db9138851fd5a1d75f9351c6bb046ab",
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_binding.cu",
-      "dynamic_shared_memory_bytes": 159232,
+      "dynamic_shared_memory_bytes": 159616,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64",
       "parameters": [
         {
@@ -4514,8 +4514,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "4dda0b11e354f7615f71a0f71a4074f979d1b8e2526c54f55cc9f5142d3f2c34",
-            "sm_103a": "435316b836cca1966ede949709f1bcc90185b44d70f66e85a4dacd1f44680418"
+            "sm_100a": "bc086537a5380526fd0e73e243a12f35d24e124fa668ea5678e283913e8bf5b5",
+            "sm_103a": "16b164686c4a1ca56289e75664bf6b4817a1406fcfc99ff6892be16dc094c96a"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu",
@@ -4526,9 +4526,9 @@
       "threads": 512
     },
     "decode_balanced_bf16_hd64_g16": {
-      "binding_sha256": "57296a766027e90d8147d57bd0fd91b4f7f17bfeb83a1957e56f50201df19ff2",
+      "binding_sha256": "126c00d833b62df084f771d682403465f3ced2a04c73102654a118abd1be2715",
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_g16_binding.cu",
-      "dynamic_shared_memory_bytes": 159232,
+      "dynamic_shared_memory_bytes": 159616,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64_g16",
       "parameters": [
         {
@@ -4628,8 +4628,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "1d5b308d72ff6d15425d57545c95582ef2925cd154e51e6d8dbe194a785572d7",
-            "sm_103a": "a707497c3da9f27dcfb7f4915c30841cd1a36dec18d3ca98ee99a8f87ccae847"
+            "sm_100a": "0aa5af85e4d9ef9c69222b9a4e090f28b5d757a1f6b3487812046339e7c8dccf",
+            "sm_103a": "d9328399825e115ff9dfbe541042ac12130da79dfab0fb9aaf38b7add02c6783"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd64_g16/sm_100a/default.cu",
