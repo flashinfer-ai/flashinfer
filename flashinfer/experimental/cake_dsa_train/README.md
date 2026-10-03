@@ -156,8 +156,9 @@ through the generated positional launchers of `cake_launch.py`.  During
 CUDA-graph capture the eager entry points plan privately and leave the cache
 untouched.  The bindings encode the tensor maps by value, so a step is its
 kernels -- one launch for the forward; three for the single-pass backward
-(`bwd_delta`, `bwd_main`, `bwd_cast`); `2 + 2 x passes` for the key-range-pass
-backward (`bwd_delta`, then `bwd_main_pass` + `bwd_compact` per pass, `bwd_cast`)
+(`bwd_delta`, `bwd_main`, `bwd_cast`); `2 + 2 x chunks x passes` for the
+key-range-pass backward (`bwd_delta`, then `bwd_compact` + `bwd_main_pass` per
+token chunk and pass, `bwd_cast`)
 -- plus the two fills of the FP32 dK/dV accumulators.  A call without query rows
 (`T == 0`) returns empty outputs and zero gradients without launching; `S == 0`
 is rejected.
@@ -210,18 +211,35 @@ disjoint key ranges (`R = ceil(S / P)` keys each), so that the accumulator
 slice one pass touches stays L2-resident: `bwd_delta`, then per pass
 `bwd_compact` + `bwd_main_pass` over the whole row, then `bwd_cast`.  The
 policy the record carries (`key_pass_policy`: L2 budget 100 MiB, 2304 B per
-key, workspace budget 640 MiB, token chunk multiple 128) takes the pass path
-only when `P > 1` and the whole row fits the pass workspace budget
-(`T <= 4224` tokens at top-k 2048; there is no token chunking); otherwise the
-single-pass `bwd_main` runs unchanged.  At top-k 2048 that is `T <= 4224` and
-`S >= 45,512`: two passes at `S = 65,536`, three at `131,072`; 4k x 4k rows
-and 32k-token rows stay single-pass.  The passes split the whole key row
+key, workspace budget 640 MiB, token chunk multiple 128, and one rule per
+architecture under `rules`) takes the pass path only for `P > 1` and under
+the rule of the device's architecture, measured in paired sweeps per target:
+
+| target | tail rows (`2 T <= S`) | passes | floor (one-chunk row / tail row) | tail cap |
+|---|---|---|---|---|
+| `sm_100a` | no | `P` | - / - | - |
+| `sm_103a` | yes | `P` | - / 131,072 keys | 3 |
+| `sm_107a` | yes | 2 | 131,072 / 131,072 keys | - |
+
+A row qualifies when it is one token chunk (`T <= 4224` tokens at top-k
+2048: the chunk is the largest multiple of 128 whose pass scratch fits the
+workspace budget) or, where the rule admits tail rows, when `2 T <= S`; a
+qualifying row below its floor stays single-pass, and the count is the rule's
+fixed value or `P`, capped for tail rows of more than one chunk.  So at top-k
+2048 on `sm_100a`: `T <= 4224` and `S >= 45,512`, two passes at `S = 65,536`,
+three at `131,072`, 4k x 4k rows and 32k-token rows single-pass; on `sm_103a`
+also three passes on the 32k-token rows of 131,072 or more keys; on `sm_107a`
+two passes on every qualifying row of 131,072 or more keys and one pass
+below.  A record without `rules` (the first release) is the `sm_100a` rule
+everywhere.  The tokens of a multi-pass backward run in chunks of 4224 (every
+chunk through every pass, `token_base` = the chunk's first token), so the pass
+scratch holds one chunk.  The passes split the whole key row
 into equal ranges, which matches an index row whose keys spread over the whole
 row (one document); in a packed multi-segment row every token's keys lie
 inside its own segment, so the policy applies to one-segment rows only
 (`num_segments > 1`, the varlen entry's `len(cu_seqlens_k) - 1`, plans one
 pass unless `key_passes` overrides).  The passes add
-`T * (147,456 + 4 * topk + 4)` B to the workspace (`dq_partial`,
+`min(T, 4224) * (147,456 + 4 * topk + 4)` B to the workspace (`dq_partial`,
 `key_scratch`, `pass_counts`; 608 MiB at `T = 4096`, top-k 2048;
 `dsa_train_workspace_size` includes them).  dQ is
 still written once per row from the carried FP32 partial (bitwise

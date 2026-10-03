@@ -94,20 +94,32 @@ TMA_ADDRESS_ALIGN = 16  # bytes: the descriptor's global address
 # between passes (dq_mode 1 store, 2 load-add-store, 3 load-add and BF16
 # output) -- ``dq`` stays bitwise deterministic; the dK/dV reductions are
 # unchanged (a pass only selects which keys a tile carries).  The pass count
-# follows the policy the record carries (``key_pass_policy``): P = ceil(S *
-# key_bytes / l2_budget_bytes), the FP32 accumulator slice one pass touches
-# fitting the L2, when P > 1 AND the whole row runs as one launch
-# (num_queries <= the token chunk the workspace budget allows); otherwise the
-# single-pass stage.  Passes run over the whole row only (grid = num_queries
-# per pass; no token chunking), so the workspace grows by num_queries *
-# (147,456 + 4 * topk + 4) bytes.  The passes split the whole key row ``[0, S)``
-# into equal ranges, which matches an index row whose keys spread over the
-# whole row (one document); in a packed multi-segment row every token's keys
-# lie inside its own segment, so whole-row ranges leave most passes empty for
-# most tokens while the per-pass fixed cost is still paid.  The policy
-# therefore applies to one-segment rows only: ``num_segments > 1`` (the varlen
-# entry passes ``len(cu_seqlens_k) - 1``, host metadata, no device sync) plans
-# one pass unless ``key_passes`` overrides.
+# follows the policy the record carries (``key_pass_policy``, evaluated by
+# ``KeyPassPolicy``): the L2 formula P = ceil(S * key_bytes / l2_budget_bytes)
+# (the FP32 accumulator slice one pass touches fits the L2), the token chunk =
+# the largest multiple of ``token_chunk_multiple`` whose pass scratch (147,456
+# + 4 * topk + 4 B per token) fits ``workspace_budget_bytes`` (4224 tokens at
+# top-k 2048), and the rule of the device's architecture from the paired sweeps
+# of the second optimisation round (``rules[arch]``: ``tail_rows``,
+# ``fixed_passes``, ``min_kv``, ``tail_min_kv``, ``tail_cap``): passes apply to
+# a one-segment key row when P > 1 and the row is one chunk (``T <= chunk``) or
+# -- with ``tail_rows`` -- ``2 T <= S``; one-chunk rows below ``min_kv`` keys
+# and the other tail rows below ``tail_min_kv`` keys stay single-pass; the
+# count is ``fixed_passes`` when set, else P, capped at ``tail_cap`` for tail
+# rows that are not one chunk.  The tokens of a multi-pass backward run in
+# chunks of ``chunk`` tokens, every chunk through every pass in order (grid =
+# the chunk's tokens, ``token_base`` = its first token), exactly as the Cake
+# launcher, so the workspace grows by min(T, chunk) * (147,456 + 4 * topk + 4)
+# bytes.  The passes split the whole key row ``[0, S)`` into equal ranges,
+# which matches an index row whose keys spread over the whole row (one
+# document); in a packed multi-segment row every token's keys lie inside its
+# own segment, so whole-row ranges leave most passes empty for most tokens
+# while the per-pass fixed cost is still paid.  The policy therefore applies
+# to one-segment rows only: ``num_segments > 1`` (the varlen entry passes
+# ``len(cu_seqlens_k) - 1``, host metadata, no device sync) plans one pass
+# unless ``key_passes`` overrides.  A record without ``rules`` (the first
+# release) takes the R1 rule everywhere: one-chunk rows, the formula, no tail
+# rows.
 KEY_PASS_STAGES = ("bwd_compact", "bwd_main_pass")
 DQ_PARTIAL_BYTES_PER_TOKEN = (
     NUM_HEADS * D_QK * 4
@@ -118,6 +130,16 @@ KEY_PASS_POLICY_FIELDS = (
     "workspace_budget_bytes",
     "token_chunk_multiple",
 )
+# The per-target rule fields of ``key_pass_policy["rules"][arch]`` (absent in
+# first-release records: the R1 rule).
+KEY_PASS_RULE_FIELDS = (
+    "tail_rows",
+    "fixed_passes",
+    "min_kv",
+    "tail_min_kv",
+    "tail_cap",
+)
+_R1_RULE: dict[str, int] = dict.fromkeys(KEY_PASS_RULE_FIELDS, 0)
 
 
 @dataclass(frozen=True)
@@ -130,6 +152,8 @@ class KeyPassPolicy:
     token_chunk_multiple: (
         int  # the token chunk is a multiple of this and at least this (128)
     )
+    # the per-target rules: ((arch, (tail_rows, fixed_passes, min_kv, tail_min_kv, tail_cap)), ...)
+    rules: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> Optional["KeyPassPolicy"]:
@@ -144,7 +168,31 @@ class KeyPassPolicy:
             raise ValueError(
                 f"registry record: key_pass_policy needs positive values, got {raw}"
             )
-        return cls(**values)
+        rules = []
+        for arch, rule in (raw.get("rules") or {}).items():
+            if not isinstance(rule, dict) or set(rule) != set(KEY_PASS_RULE_FIELDS):
+                raise ValueError(
+                    f"registry record: key_pass_policy.rules[{arch!r}] must map exactly "
+                    f"{KEY_PASS_RULE_FIELDS}, got {rule!r}"
+                )
+            for name in KEY_PASS_RULE_FIELDS:
+                value = rule[name]
+                if isinstance(value, bool) or int(value) != value or int(value) < 0:
+                    raise ValueError(
+                        f"registry record: key_pass_policy.rules[{arch!r}].{name} must be "
+                        f"a non-negative integer, got {value!r}"
+                    )
+            rules.append(
+                (str(arch), tuple(int(rule[name]) for name in KEY_PASS_RULE_FIELDS))
+            )
+        return cls(**values, rules=tuple(rules))
+
+    def rule_for(self, arch: Optional[str]) -> dict[str, int]:
+        """The rule of ``arch`` (an architecture without one, or ``None``: the R1 rule)."""
+        for name, fields in self.rules:
+            if name == arch:
+                return dict(zip(KEY_PASS_RULE_FIELDS, fields, strict=True))
+        return dict(_R1_RULE)
 
     def formula_passes(self, num_kv: int) -> int:
         return max(1, -(-int(num_kv) * self.key_bytes // self.l2_budget_bytes))
@@ -155,19 +203,46 @@ class KeyPassPolicy:
         m = self.token_chunk_multiple
         return max(m, (self.workspace_budget_bytes // per_token) // m * m)
 
+    def token_chunks(self, num_queries: int, topk: int) -> tuple[tuple[int, int], ...]:
+        """``(token_base, num_tokens)`` of every token chunk of a multi-pass backward, in launch order."""
+        T, chunk = int(num_queries), self.token_chunk(topk)
+        return tuple((base, min(chunk, T - base)) for base in range(0, T, chunk))
+
     def passes(
-        self, num_queries: int, num_kv: int, topk: int, *, num_segments: int = 1
+        self,
+        num_queries: int,
+        num_kv: int,
+        topk: int,
+        *,
+        num_segments: int = 1,
+        arch: Optional[str] = None,
     ) -> int:
-        """Passes of a binding: the formula when the key row is one segment, the
-        whole row is one launch and the formula gives more than one; else 1."""
+        """Passes of a binding under the rule of ``arch`` (see the comment above
+        ``KEY_PASS_STAGES``): 1 for a multi-segment key row, a formula of 1, a
+        row that is neither one chunk nor (with ``tail_rows``) ``2 T <= S``, or
+        fewer keys than the row's floor (``min_kv`` for a one-chunk row,
+        ``tail_min_kv`` for a tail row of more than one chunk); else
+        ``fixed_passes`` or the formula, capped at ``tail_cap`` for a tail row
+        of more than one chunk."""
         if int(num_segments) < 1:
             raise ValueError(f"num_segments must be >= 1, got {num_segments}")
         if int(num_segments) > 1:
             return 1
-        formula = self.formula_passes(num_kv)
+        T, S = int(num_queries), int(num_kv)
+        formula = self.formula_passes(S)
         if formula == 1:
             return 1
-        return formula if int(num_queries) <= self.token_chunk(topk) else 1
+        rule = self.rule_for(arch)
+        one_chunk = self.token_chunk(topk) >= T
+        tail = bool(rule["tail_rows"]) and 2 * T <= S
+        if not (one_chunk or tail):
+            return 1
+        if (rule["min_kv"] if one_chunk else rule["tail_min_kv"]) > S:
+            return 1
+        passes = rule["fixed_passes"] or formula
+        if tail and not one_chunk and rule["tail_cap"]:
+            passes = min(passes, rule["tail_cap"])
+        return passes
 
 
 def plan_key_passes(
@@ -179,6 +254,7 @@ def plan_key_passes(
     key_passes: Optional[int] = None,
     *,
     num_segments: int = 1,
+    arch: Optional[str] = None,
 ) -> int:
     """Number of key-range passes of one backward binding.
 
@@ -187,7 +263,8 @@ def plan_key_passes(
     without a ``key_pass_policy`` never takes the pass path by default.
     ``num_segments`` is the packed segment count of the key row (see the
     comment above ``KEY_PASS_STAGES``): the policy plans one pass for more
-    than one segment.
+    than one segment.  ``arch`` selects the record's per-target rule (``None``:
+    the R1 rule).
     """
     multi_pass = all(stage in stages for stage in KEY_PASS_STAGES)
     if key_passes is not None:
@@ -211,7 +288,25 @@ def plan_key_passes(
     policy = KeyPassPolicy.from_record(record)
     if policy is None:
         return 1
-    return policy.passes(num_queries, num_kv, topk, num_segments=num_segments)
+    return policy.passes(
+        num_queries, num_kv, topk, num_segments=num_segments, arch=arch
+    )
+
+
+def _record_token_chunk(record: dict[str, Any], topk: int) -> Optional[int]:
+    """Tokens per launch chunk of a multi-pass backward under the record's policy (``None``: no policy, the whole row)."""
+    policy = KeyPassPolicy.from_record(record)
+    return None if policy is None else policy.token_chunk(topk)
+
+
+def _pass_token_chunks(
+    record: dict[str, Any], num_queries: int, topk: int
+) -> tuple[tuple[int, int], ...]:
+    """``(token_base, num_tokens)`` of the token chunks a multi-pass backward runs (one whole-row chunk without a policy)."""
+    policy = KeyPassPolicy.from_record(record)
+    if policy is None:
+        return ((0, int(num_queries)),)
+    return policy.token_chunks(num_queries, topk)
 
 
 def key_pass_ranges(num_kv: int, passes: int) -> tuple[tuple[int, int], ...]:
@@ -504,14 +599,17 @@ def workspace_layout(
     *,
     backward: bool = True,
     key_passes: int = 1,
+    token_chunk: Optional[int] = None,
 ) -> dict:
     """Byte ``(offset, size)`` of every workspace region plus ``"total"``.
 
     The ``topk_length`` region backs a full-length vector when the caller
     passes none; ``delta`` and the FP32 dK/dV accumulators exist for the
     backward.  A backward with more than one key-range pass adds the FP32 dQ
-    partials (``num_queries`` x 147,456 B), the compacted keys of one pass
-    (``num_queries`` x ``topk`` int32) and their per-token counts.
+    partials (147,456 B per token), the compacted keys of one pass (``topk``
+    int32 per token) and the per-token counts for the tokens of one launch
+    chunk: ``min(num_queries, token_chunk)`` rows (the whole row without a
+    ``token_chunk``).
     """
     sizes = [("topk_length", num_queries * 4)]
     if backward:
@@ -521,10 +619,15 @@ def workspace_layout(
             ("dk_rope_acc", num_kv * D_ROPE * 4),
         ]
         if int(key_passes) > 1:
+            rows = (
+                int(num_queries)
+                if token_chunk is None
+                else min(int(num_queries), int(token_chunk))
+            )
             sizes += [
-                ("dq_partial", num_queries * DQ_PARTIAL_BYTES_PER_TOKEN),
-                ("key_scratch", num_queries * int(topk) * 4),
-                ("pass_counts", num_queries * 4),
+                ("dq_partial", rows * DQ_PARTIAL_BYTES_PER_TOKEN),
+                ("key_scratch", rows * int(topk) * 4),
+                ("pass_counts", rows * 4),
             ]
     layout: dict = {}
     offset = 0
@@ -551,6 +654,7 @@ def dsa_train_workspace_size(
     (``None`` = the record's policy; the packed segment count of the key row).
     """
     _, record = record_for(device)
+    arch = arch_for(device)
     stages = cake_jit.registered_stages()
     passes = (
         plan_key_passes(
@@ -561,13 +665,19 @@ def dsa_train_workspace_size(
             topk,
             key_passes,
             num_segments=num_segments,
+            arch=arch,
         )
         if backward
         else 1
     )
     return int(
         workspace_layout(
-            num_queries, num_kv, topk, backward=backward, key_passes=passes
+            num_queries,
+            num_kv,
+            topk,
+            backward=backward,
+            key_passes=passes,
+            token_chunk=_record_token_chunk(record, topk),
         )["total"]
     )
 
@@ -824,13 +934,22 @@ class _Plan:
     scalars: dict = field(repr=False)
     # Launch values that follow from the geometry alone (every stage selects from them).
     constants: dict[str, Any] = field(repr=False)
-    # ``(pass_lo, pass_hi, dq_mode)`` overrides of every key-range pass (empty for one pass).
-    pass_overrides: tuple[dict[str, int], ...]
-    entries: dict[str, _StageEntry] = field(repr=False)
+    # ``(pass_lo, pass_hi, dq_mode, token_base, num_tokens)`` overrides of every
+    # (token chunk, key-range pass) of a multi-pass backward (empty for one pass).
+    pass_overrides: tuple[tuple[dict[str, int], ...], ...]
+    # stage name -> entry; the pass stages of a multi-pass backward are keyed ``(stage, chunk index)``
+    entries: dict[Any, _StageEntry] = field(repr=False)
     backward_order: tuple
 
     def launch_keys(self) -> tuple:
         return tuple(FORWARD_STAGES) + self.backward_order
+
+    @property
+    def pass_rows(self) -> int:
+        """Token rows of the pass scratch regions (one launch chunk; 0 without passes)."""
+        if "dq_partial" not in self.layout:
+            return 0
+        return self.layout["dq_partial"][1] // DQ_PARTIAL_BYTES_PER_TOKEN
 
 
 def _geometry(t: Optional[torch.Tensor]) -> Optional[tuple]:
@@ -914,6 +1033,7 @@ def _plan(
             topk,
             key_passes,
             num_segments=num_segments,
+            arch=arch,
         )
         if backward
         else 1
@@ -942,7 +1062,12 @@ def _plan(
     )
     _check_output(outputs.get("dk_rope"), "dk_rope", (num_kv, D_ROPE), torch.bfloat16)
     layout = workspace_layout(
-        num_queries, num_kv, topk, backward=backward, key_passes=passes
+        num_queries,
+        num_kv,
+        topk,
+        backward=backward,
+        key_passes=passes,
+        token_chunk=_record_token_chunk(record, topk),
     )
     has_topk_length = topk_length is not None
     scalars = dict(
@@ -979,19 +1104,33 @@ def _plan(
         accumulate=scalars["accumulate"],
         token_base=0,  # one CTA per token, token = blockIdx.x
         token_step=1,
-        num_tokens=T,  # bwd_compact: the whole row per pass
+        num_tokens=T,  # bwd_compact: the whole row; a multi-pass backward overrides it per token chunk
     )
-    pass_overrides: tuple[dict[str, int], ...] = ()
+    # per (token chunk, key-range pass) overrides of a multi-pass backward: the key range, ``dq_mode``,
+    # the chunk's first token and its token count
+    pass_overrides: tuple[tuple[dict[str, int], ...], ...] = ()
+    token_chunks: tuple[tuple[int, int], ...] = ()
     if backward and passes == 1:
         # The single-pass kernel never reads the pass operands; it receives, like its
         # production launcher, the whole key range and dq_mode 0.
         constants.update(pass_lo=0, pass_hi=S, dq_mode=0)
     elif backward:
+        token_chunks = _pass_token_chunks(record, num_queries, topk)
+        ranges = key_pass_ranges(num_kv, passes)
         pass_overrides = tuple(
-            dict(pass_lo=lo, pass_hi=hi, dq_mode=key_pass_dq_mode(index, passes))
-            for index, (lo, hi) in enumerate(key_pass_ranges(num_kv, passes))
+            tuple(
+                dict(
+                    pass_lo=lo,
+                    pass_hi=hi,
+                    dq_mode=key_pass_dq_mode(index, passes),
+                    token_base=int(base),
+                    num_tokens=int(num_tokens),
+                )
+                for index, (lo, hi) in enumerate(ranges)
+            )
+            for base, num_tokens in token_chunks
         )
-    entries = {"fwd": _stage_entry("fwd", arch, scalars)}
+    entries: dict[Any, _StageEntry] = {"fwd": _stage_entry("fwd", arch, scalars)}
     backward_order: list = []
     if backward:
         entries["bwd_delta"] = _stage_entry("bwd_delta", arch, scalars)
@@ -1000,10 +1139,18 @@ def _plan(
             entries["bwd_main"] = _stage_entry("bwd_main", arch, scalars)
             backward_order.append("bwd_main")
         else:
-            for stage in KEY_PASS_STAGES:
-                entries[stage] = _stage_entry(stage, arch, scalars)
-            for index in range(passes):
-                backward_order += [(stage, index) for stage in KEY_PASS_STAGES]
+            # token chunks in order, every chunk through every pass (the Cake launcher's loop);
+            # the grid rules (``num_queries`` / ``num_queries/W``) take the chunk's token count
+            for chunk_index, (_base, num_tokens) in enumerate(token_chunks):
+                chunk_scalars = dict(scalars, num_queries=int(num_tokens))
+                for stage in KEY_PASS_STAGES:
+                    entries[(stage, chunk_index)] = _stage_entry(
+                        stage, arch, chunk_scalars
+                    )
+                for index in range(passes):
+                    backward_order += [
+                        (stage, chunk_index, index) for stage in KEY_PASS_STAGES
+                    ]
         entries["bwd_cast"] = _stage_entry("bwd_cast", arch, scalars)
         backward_order.append("bwd_cast")
     return _Plan(
@@ -1071,9 +1218,11 @@ def _launches(plan: _Plan, values: dict[str, Any]) -> dict[Any, _Launch]:
     for key in plan.launch_keys():
         stage, stage_values = key, values
         if isinstance(key, tuple):
-            stage, index = key
-            stage_values = dict(values, **plan.pass_overrides[index])
-        e = plan.entries[stage]
+            stage, chunk, index = key
+            stage_values = dict(values, **plan.pass_overrides[chunk][index])
+            e = plan.entries[(stage, chunk)]
+        else:
+            e = plan.entries[stage]
         launches[key] = _Launch(stage, e.launcher, e.run, stage_values, e.grid)
     return launches
 
@@ -1089,16 +1238,17 @@ def _scratch(plan: _Plan, flat: torch.Tensor) -> dict[str, torch.Tensor]:
         dk_rope_acc=_carve(flat, layout, "dk_rope_acc", torch.float32, (S, D_ROPE)),
     )
     if plan.key_passes > 1:
+        rows = plan.pass_rows  # the tokens of one launch chunk
         t.update(
             dq_partial=_carve(
                 flat,
                 layout,
                 "dq_partial",
                 torch.float32,
-                (T, DQ_PARTIAL_BYTES_PER_TOKEN // 4),
+                (rows, DQ_PARTIAL_BYTES_PER_TOKEN // 4),
             ),
-            key_scratch=_carve(flat, layout, "key_scratch", torch.int32, (T, topk)),
-            pass_counts=_carve(flat, layout, "pass_counts", torch.int32, (T,)),
+            key_scratch=_carve(flat, layout, "key_scratch", torch.int32, (rows, topk)),
+            pass_counts=_carve(flat, layout, "pass_counts", torch.int32, (rows,)),
         )
     return t
 
@@ -1123,10 +1273,10 @@ class DSATrainRunner:
     freely.
 
     ``launches`` is keyed by stage name; the launches of a multi-pass backward
-    are keyed ``(stage, pass index)`` and ``backward_order`` lists every
-    backward launch key in launch order (``bwd_delta``, then per pass
-    ``bwd_compact`` and ``bwd_main_pass`` -- or the single ``bwd_main`` --,
-    then ``bwd_cast``).
+    are keyed ``(stage, chunk index, pass index)`` and ``backward_order`` lists
+    every backward launch key in launch order (``bwd_delta``, then per token
+    chunk and per pass ``bwd_compact`` and ``bwd_main_pass`` -- or the single
+    ``bwd_main`` --, then ``bwd_cast``).
     """
 
     module_name: str
@@ -1502,10 +1652,12 @@ class _Binding:
         with _ffi_stream_context(plan.device_index):
             for key in keys:
                 if isinstance(key, tuple):
-                    stage, index = key
-                    e = plan.entries[stage]
+                    stage, chunk, index = key
+                    e = plan.entries[(stage, chunk)]
                     e.launcher(
-                        e.run, dict(values, **plan.pass_overrides[index]), e.grid
+                        e.run,
+                        dict(values, **plan.pass_overrides[chunk][index]),
+                        e.grid,
                     )
                 else:
                     e = plan.entries[key]
@@ -1571,9 +1723,12 @@ class _Binding:
         t["dkv_latent_acc"] = _alloc((S, D_LATENT), torch.float32, device, zero=True)
         t["dk_rope_acc"] = _alloc((S, D_ROPE), torch.float32, device, zero=True)
         if plan.key_passes > 1:
-            t["dq_partial"] = fresh((T, DQ_PARTIAL_BYTES_PER_TOKEN // 4), torch.float32)
-            t["key_scratch"] = fresh((T, plan.topk), torch.int32)
-            t["pass_counts"] = fresh((T,), torch.int32)
+            rows = plan.pass_rows  # the tokens of one launch chunk
+            t["dq_partial"] = fresh(
+                (rows, DQ_PARTIAL_BYTES_PER_TOKEN // 4), torch.float32
+            )
+            t["key_scratch"] = fresh((rows, plan.topk), torch.int32)
+            t["pass_counts"] = fresh((rows,), torch.int32)
         if plan.accumulate_dkv:
             if dkv_acc is None:
                 raise RuntimeError(

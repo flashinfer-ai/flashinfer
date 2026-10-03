@@ -53,6 +53,29 @@ MODULES: dict[str, dict[str, Any]] = {
             "key_bytes": 2304,
             "workspace_budget_bytes": 671088640,
             "token_chunk_multiple": 128,
+            "rules": {
+                "sm_100a": {
+                    "tail_rows": 0,
+                    "fixed_passes": 0,
+                    "min_kv": 0,
+                    "tail_min_kv": 0,
+                    "tail_cap": 0,
+                },
+                "sm_103a": {
+                    "tail_rows": 1,
+                    "fixed_passes": 0,
+                    "min_kv": 0,
+                    "tail_min_kv": 131072,
+                    "tail_cap": 3,
+                },
+                "sm_107a": {
+                    "tail_rows": 1,
+                    "fixed_passes": 2,
+                    "min_kv": 131072,
+                    "tail_min_kv": 131072,
+                    "tail_cap": 0,
+                },
+            },
         },
         "fwd": {
             "module": "cake_dsa_h64_train_877b7797bb6b1bd6a37e",
