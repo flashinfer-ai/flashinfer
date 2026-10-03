@@ -1233,7 +1233,6 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                 if (publish_split != 0) {
                     asm volatile("barrier.sync 10, 128;" ::: "memory");
                     if (wg_tid_c == 0) {
-                        asm volatile("fence.release.gpu;" ::: "memory");
                         unsigned int _atomic_old_2;
                         asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
                             : "=r"(_atomic_old_2) : "l"(&tile_counters[counter_idx_c]), "r"(static_cast<uint32_t>(1)) : "memory");
@@ -1245,12 +1244,24 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                     if (merge_flag != 0) {
                         asm volatile("fence.acquire.gpu;" ::: "memory");
                         float merge_max = -CAKE_FMHA_INF;
+                        int n_batch_a = (n_chunks_c + 3) / 4;
                         #pragma unroll 1
-                        for (int c_a = 0; c_a < n_chunks_c; c_a++) {
-                            if (lane < 8) {
-                                int slot_a = slot_tile_base_c + c_a * slot_stride;
-                                float m_a = partial_stats[slot_a * 32 + lane];
-                                float _max_15 = max_noftz(merge_max, m_a);
+                        for (int cb_a = 0; cb_a < n_batch_a; cb_a++) {
+                            float m_bat[4];
+                            #pragma unroll
+                            for (int j_a = 0; j_a < 4; j_a++) {
+                                m_bat[j_a] = -CAKE_FMHA_INF;
+                                int c_aj = cb_a * 4 + j_a;
+                                if (c_aj < n_chunks_c) {
+                                    if (lane < 8) {
+                                        int slot_aj = slot_tile_base_c + c_aj * slot_stride;
+                                        m_bat[j_a] = partial_stats[slot_aj * 32 + lane];
+                                    }
+                                }
+                            }
+                            #pragma unroll
+                            for (int j_a_1 = 0; j_a_1 < 4; j_a_1++) {
+                                float _max_15 = max_noftz(merge_max, m_bat[j_a_1]);
                                 merge_max = _max_15;
                             }
                         }
@@ -1260,56 +1271,76 @@ kernel_cake_fmha_decode_balanced_bf16_hd64(CakeFmhaTensorMap const* Qt, CakeFmha
                             merge_acc[r_1] = 0.0f;
                         }
                         float merge_den = 0.0f;
+                        int n_batch_b = (n_chunks_c + 3) / 4;
                         #pragma unroll 1
-                        for (int c_b = 0; c_b < n_chunks_c; c_b++) {
-                            int slot_b = slot_tile_base_c + c_b * slot_stride;
-                            float w_lane = 0.0f;
-                            if (lane < 8) {
-                                float m_b = partial_stats[slot_b * 32 + lane];
-                                float l_b = partial_stats[slot_b * 32 + 16 + lane];
-                                if (m_b > -CAKE_FMHA_INF) {
-                                    float _exp2_4 = approx_exp2(softmax_scale_log2 * (m_b - merge_max));
-                                    w_lane = _exp2_4;
+                        for (int cb_b = 0; cb_b < n_batch_b; cb_b++) {
+                            float mb_bat[4];
+                            float lb_bat[4];
+                            float ob_bat[32];
+                            #pragma unroll
+                            for (int j_b = 0; j_b < 4; j_b++) {
+                                mb_bat[j_b] = -CAKE_FMHA_INF;
+                                lb_bat[j_b] = 0.0f;
+                                #pragma unroll
+                                for (int r_b = 0; r_b < 8; r_b++) {
+                                    ob_bat[8 * j_b + r_b] = 0.0f;
                                 }
-                                merge_den = merge_den + w_lane * l_b;
+                                int c_bj = cb_b * 4 + j_b;
+                                if (c_bj < n_chunks_c) {
+                                    int slot_bj = slot_tile_base_c + c_bj * slot_stride;
+                                    if (lane < 8) {
+                                        mb_bat[j_b] = partial_stats[slot_bj * 32 + lane];
+                                        lb_bat[j_b] = partial_stats[slot_bj * 32 + 16 + lane];
+                                    }
+                                    int o_base_bj = slot_bj * 1024 + wg_tid_c;
+                                    #pragma unroll
+                                    for (int r_b_1 = 0; r_b_1 < 8; r_b_1++) {
+                                        ob_bat[8 * j_b + r_b_1] = partial_o[o_base_bj + r_b_1 * 128];
+                                    }
+                                }
                             }
-                            float _shfl_16;
-                            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_16) : "f"(w_lane), "r"(col_lo));
-                            float w_lo0 = _shfl_16;
-                            float _shfl_17;
-                            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_17) : "f"(w_lane), "r"(col_lo + 1));
-                            float w_lo1 = _shfl_17;
-                            float _shfl_18;
-                            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_18) : "f"(w_lane), "r"(col_hi));
-                            float w_hi0 = _shfl_18;
-                            float _shfl_19;
-                            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_19) : "f"(w_lane), "r"(col_hi + 1));
-                            float w_hi1 = _shfl_19;
-                            int o_base_b = slot_b * 1024 + wg_tid_c;
-                            float o_b0 = partial_o[o_base_b];
-                            float o_b1 = partial_o[o_base_b + 128];
-                            float o_b2 = partial_o[o_base_b + 256];
-                            float o_b3 = partial_o[o_base_b + 384];
-                            float o_b4 = partial_o[o_base_b + 512];
-                            float o_b5 = partial_o[o_base_b + 640];
-                            float o_b6 = partial_o[o_base_b + 768];
-                            float o_b7 = partial_o[o_base_b + 896];
-                            float _fma_0 = __fmaf_rn(o_b0, w_lo0, merge_acc[0]);
-                            merge_acc[0] = _fma_0;
-                            float _fma_1 = __fmaf_rn(o_b1, w_lo1, merge_acc[1]);
-                            merge_acc[1] = _fma_1;
-                            float _fma_2 = __fmaf_rn(o_b2, w_lo0, merge_acc[2]);
-                            merge_acc[2] = _fma_2;
-                            float _fma_3 = __fmaf_rn(o_b3, w_lo1, merge_acc[3]);
-                            merge_acc[3] = _fma_3;
-                            float _fma_4 = __fmaf_rn(o_b4, w_hi0, merge_acc[4]);
-                            merge_acc[4] = _fma_4;
-                            float _fma_5 = __fmaf_rn(o_b5, w_hi1, merge_acc[5]);
-                            merge_acc[5] = _fma_5;
-                            float _fma_6 = __fmaf_rn(o_b6, w_hi0, merge_acc[6]);
-                            merge_acc[6] = _fma_6;
-                            float _fma_7 = __fmaf_rn(o_b7, w_hi1, merge_acc[7]);
-                            merge_acc[7] = _fma_7;
+                            #pragma unroll
+                            for (int j_b_1 = 0; j_b_1 < 4; j_b_1++) {
+                                int c_bk = cb_b * 4 + j_b_1;
+                                if (c_bk < n_chunks_c) {
+                                    float w_lane_j = 0.0f;
+                                    if (lane < 8) {
+                                        if (mb_bat[j_b_1] > -CAKE_FMHA_INF) {
+                                            float _exp2_4 = approx_exp2(softmax_scale_log2 * (mb_bat[j_b_1] - merge_max));
+                                            w_lane_j = _exp2_4;
+                                        }
+                                        merge_den = merge_den + w_lane_j * lb_bat[j_b_1];
+                                    }
+                                    float _shfl_16;
+                                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_16) : "f"(w_lane_j), "r"(col_lo));
+                                    float w_lo0_j = _shfl_16;
+                                    float _shfl_17;
+                                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_17) : "f"(w_lane_j), "r"(col_lo + 1));
+                                    float w_lo1_j = _shfl_17;
+                                    float _shfl_18;
+                                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_18) : "f"(w_lane_j), "r"(col_hi));
+                                    float w_hi0_j = _shfl_18;
+                                    float _shfl_19;
+                                    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_19) : "f"(w_lane_j), "r"(col_hi + 1));
+                                    float w_hi1_j = _shfl_19;
+                                    float _fma_0 = __fmaf_rn(ob_bat[8 * j_b_1], w_lo0_j, merge_acc[0]);
+                                    merge_acc[0] = _fma_0;
+                                    float _fma_1 = __fmaf_rn(ob_bat[8 * j_b_1 + 1], w_lo1_j, merge_acc[1]);
+                                    merge_acc[1] = _fma_1;
+                                    float _fma_2 = __fmaf_rn(ob_bat[8 * j_b_1 + 2], w_lo0_j, merge_acc[2]);
+                                    merge_acc[2] = _fma_2;
+                                    float _fma_3 = __fmaf_rn(ob_bat[8 * j_b_1 + 3], w_lo1_j, merge_acc[3]);
+                                    merge_acc[3] = _fma_3;
+                                    float _fma_4 = __fmaf_rn(ob_bat[8 * j_b_1 + 4], w_hi0_j, merge_acc[4]);
+                                    merge_acc[4] = _fma_4;
+                                    float _fma_5 = __fmaf_rn(ob_bat[8 * j_b_1 + 5], w_hi1_j, merge_acc[5]);
+                                    merge_acc[5] = _fma_5;
+                                    float _fma_6 = __fmaf_rn(ob_bat[8 * j_b_1 + 6], w_hi0_j, merge_acc[6]);
+                                    merge_acc[6] = _fma_6;
+                                    float _fma_7 = __fmaf_rn(ob_bat[8 * j_b_1 + 7], w_hi1_j, merge_acc[7]);
+                                    merge_acc[7] = _fma_7;
+                                }
+                            }
                         }
                         float inv_den = 0.0f;
                         if (lane < 8) {
