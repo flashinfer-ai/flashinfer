@@ -144,6 +144,26 @@ def _canonicalize_quant_mode(quant_mode: str) -> str:
 _validated_gemm2_input_scales: set[tuple[int, int, float, int]] = set()
 
 
+def _check_sm110_quant_mode(device: torch.device, quant_mode: str) -> None:
+    """SM110 (Jetson Thor) runs the W4A16 kernels only.
+
+    W4A16 decodes the NVFP4 weights to BF16 and runs BF16 tcgen05 MMAs, which
+    CuTe DSL compiles for sm_110a. W4A4 and W4A8 use the block-scaled tcgen05
+    MMA, which CuTe DSL 4.8 refuses for sm_110a, so they raise here rather than
+    in the kernel compile.
+    """
+    if (
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device) == (11, 0)
+        and quant_mode != "w4a16"
+    ):
+        raise ValueError(
+            f"quant_mode={quant_mode!r} is not supported on SM110; "
+            "use quant_mode='w4a16'"
+        )
+
+
 def _check_gemm2_input_scale(
     fc2_input_scale: torch.Tensor | float,
     nvfp4_4over6_config: Optional[NVFP44Over6Config],
@@ -622,7 +642,7 @@ class CuteDslMoEWrapper:
     parameter or `autotune()` context.
 
     Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
-    SM100 and SM103.
+    SM100 and SM103. SM110 (Jetson Thor) supports W4A16 only.
 
     Attributes:
         num_experts: Total number of experts.
@@ -660,7 +680,7 @@ class CuteDslMoEWrapper:
         ...     output = moe.run(x, x_sf, topk_ids, topk_weights, w1, w1_sf, ...)
     """
 
-    @supported_compute_capability([100, 103, 107])
+    @supported_compute_capability([100, 103, 107, 110])
     @flashinfer_api
     def __init__(
         self,
@@ -779,6 +799,7 @@ class CuteDslMoEWrapper:
                 and torch.cuda.get_device_capability(device_obj) == (10, 7)
             ):
                 raise ValueError("quant_mode='w4a8' is not supported on SM107")
+        _check_sm110_quant_mode(torch.device(device), quant_mode)
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -1212,7 +1233,7 @@ def _cute_dsl_fused_moe_impl(
     )
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([100, 103, 107, 110])
 @flashinfer_api(trace=cute_dsl_fused_moe_trace)
 def cute_dsl_fused_moe(
     x: torch.Tensor,
@@ -1249,8 +1270,9 @@ def cute_dsl_fused_moe(
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
     Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
-    SM100 and SM103. This is the simple functional API; for CUDA-graph support
-    use :class:`CuteDslMoEWrapper` instead.
+    SM100 and SM103. SM110 (Jetson Thor) supports W4A16 only. This is the
+    simple functional API; for CUDA-graph support use
+    :class:`CuteDslMoEWrapper` instead.
 
     Auto-tuning is controlled by the :func:`autotune` context manager::
 
@@ -1336,6 +1358,7 @@ def cute_dsl_fused_moe(
     quant_mode = _canonicalize_quant_mode(quant_mode)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
+    _check_sm110_quant_mode(x.device, quant_mode)
     if quant_mode == "w4a8":
         if x.dtype is not torch.float8_e4m3fn:
             raise TypeError("quant_mode='w4a8' requires float8_e4m3fn input")
