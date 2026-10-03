@@ -138,6 +138,13 @@ main() {
         # shellcheck disable=SC1091
         source "${SCRIPT_DIR}/setup_test_env.sh"
 
+        # Print the resolved TVM-FFI version right after the overrides are
+        # applied (traceability for the pre-release verification in PR #2599;
+        # the override itself comes from ci/setup_python.env).
+        echo "Checking TVM-FFI version before tests..."
+        python -c "import tvm_ffi; print(f'TVM-FFI version: {tvm_ffi.__version__}')" || true
+        echo ""
+
         # tests/moe_ep needs its additional runtime stack only on CUDA 13 images.
         local cuda_major
         cuda_major=$(python -c \
