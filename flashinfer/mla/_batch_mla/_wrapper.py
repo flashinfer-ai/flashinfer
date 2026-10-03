@@ -460,6 +460,14 @@ class BatchMLAPagedAttentionWrapper:
         in place for replay; CPU and CSR-only graph metadata are rejected.
         Query offsets and lengths must remain fixed after graph planning.
 
+        Non-causal FA3 plans may use host KV-length upper bounds in CSR
+        metadata. Supply exact device lengths through ``run(kv_len=...)`` on
+        each execution. Each exact length must be between zero and its planned
+        bound. Page offsets, query offsets, and allocated page capacity remain
+        fixed; lengths may shrink and grow within that capacity during graph
+        replay. The attention kernel clips each work item using these device
+        lengths, and the host planner never needs to read them.
+
         The plan also declares the later :meth:`run` contract. In particular,
         ``query_layout``, ``kv_cache_layout``, ``lse_mode``, ``output_dtype``,
         ``output_scale``, ``scale_mode``, ``skip_softmax``, and ``use_sinks``
@@ -925,8 +933,16 @@ class BatchMLAPagedAttentionWrapper:
             Return the LSE tensor in addition to the output.
         profiler_buffer : Optional[torch.Tensor]
             Backend profiler output buffer.
-        kv_len, page_table : Optional[torch.Tensor]
-            CUTLASS/cuTile metadata aliases. A planned request may omit them;
+        kv_len : Optional[torch.Tensor]
+            For non-causal FA3, contiguous ``int32`` exact KV lengths of shape
+            ``[batch_size]`` on the wrapper device. Each length must fit within
+            the corresponding upper bound supplied to :meth:`plan`. Retain
+            and update this tensor in place for CUDA graph replay. Values are
+            read in the attention kernel without a host synchronization.
+            Omission uses the lengths recorded in the plan.
+        page_table : Optional[torch.Tensor]
+            CUTLASS and cuTile page-table metadata alias.
+            ``kv_len`` also serves as their sequence-length metadata alias. A planned request may omit them;
             the deprecated unplanned CUTLASS path requires both. Runtime
             metadata is a trusted hot-path input: every length must be
             nonnegative and fit within its page-table row, every live page ID

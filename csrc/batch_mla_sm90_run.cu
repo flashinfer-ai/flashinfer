@@ -26,19 +26,26 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void BatchMLAPagedAttentionSM90Run(
-    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
-    Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
-    TensorView kpe_cache, TensorView kv_indices, TensorView o, Optional<TensorView> maybe_lse,
-    int64_t mask_mode_code, int64_t num_heads, int64_t page_size, double sm_scale,
-    bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
-    Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
+static void BatchMLAPagedAttentionSM90RunImpl(
+    Optional<TensorView> maybe_kv_len, TensorView float_workspace_buffer,
+    TensorView int_workspace_buffer, Array<int64_t> plan_info_vec, TensorView q_nope,
+    TensorView q_pe, TensorView ckv_cache, TensorView kpe_cache, TensorView kv_indices,
+    TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code, int64_t num_heads,
+    int64_t page_size, double sm_scale, bool return_lse_base_on_e, double ckv_scale,
+    double kpe_scale, Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
   // kpe_cache: [num_pages, page_size, head_dim_kpe]
   MLAPlanInfo plan_info;
-  plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
+  TVM_FFI_ICHECK(plan_info_vec.size() == 18 || plan_info_vec.size() == 20)
+      << "SM90 MLA plan info must contain 18 offsets, with optional batch metadata";
+  const bool has_batch_metadata = plan_info_vec.size() == 20;
+  const int64_t batch_q_indptr_offset = has_batch_metadata ? plan_info_vec[18] : 0;
+  const int64_t plan_batch_size = has_batch_metadata ? plan_info_vec[19] : 0;
+  std::vector<int64_t> plan_info_values(plan_info_vec.begin(), plan_info_vec.end());
+  plan_info_values.resize(18);
+  plan_info.FromVector(plan_info_values);
 
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
@@ -68,6 +75,25 @@ void BatchMLAPagedAttentionSM90Run(
         params.ckv = static_cast<DTypeKV*>(ckv_cache.data_ptr());
         params.kpe = static_cast<DTypeKV*>(kpe_cache.data_ptr());
 
+        if (maybe_kv_len.has_value()) {
+          TVM_FFI_ICHECK(has_batch_metadata) << "device KV lengths require planned batch metadata";
+          const TensorView& kv_len = maybe_kv_len.value();
+          TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(kv_len.dtype()), int32_code)
+              << "kv_len must have dtype int32";
+          TVM_FFI_ICHECK_EQ(kv_len.device().device_type, q_nope.device().device_type)
+              << "kv_len must be on the same device as q_nope";
+          TVM_FFI_ICHECK_EQ(kv_len.device().device_id, q_nope.device().device_id)
+              << "kv_len must be on the same device as q_nope";
+          TVM_FFI_ICHECK_EQ(kv_len.ndim(), 1) << "kv_len must be a 1-D tensor";
+          TVM_FFI_ICHECK(kv_len.IsContiguous()) << "kv_len must be contiguous";
+          TVM_FFI_ICHECK_EQ(kv_len.size(0), plan_batch_size)
+              << "kv_len batch size must match the planned batch size";
+          TVM_FFI_ICHECK(plan_info.num_blks_x == 0 || plan_info.num_blks_y == 0 ||
+                         plan_batch_size > 0)
+              << "kv_len must contain one entry for a non-empty plan";
+          TVM_FFI_ICHECK(mask_mode == MaskMode::kNone);
+          params.device_kv_len = static_cast<IdType*>(kv_len.data_ptr());
+        }
         params.q_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_indptr_offset);
         params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
         params.partial_indptr =
@@ -78,6 +104,11 @@ void BatchMLAPagedAttentionSM90Run(
         params.q_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_start_offset);
         params.kv_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_start_offset);
         params.kv_end = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_end_offset);
+        if (maybe_kv_len.has_value()) {
+          params.batch_q_indptr =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, batch_q_indptr_offset);
+          params.batch_size = plan_batch_size;
+        }
         params.work_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
         params.merge_packed_offset_start = GetPtrFromBaseOffset<IdType>(
@@ -130,4 +161,31 @@ void BatchMLAPagedAttentionSM90Run(
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "Failed to run MLA, error: " << cudaGetErrorString(status);
       });
+}
+
+void BatchMLAPagedAttentionSM90Run(
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
+    TensorView kpe_cache, TensorView kv_indices, TensorView o, Optional<TensorView> maybe_lse,
+    int64_t mask_mode_code, int64_t num_heads, int64_t page_size, double sm_scale,
+    bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
+    Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
+  BatchMLAPagedAttentionSM90RunImpl(std::nullopt, float_workspace_buffer, int_workspace_buffer,
+                                    plan_info_vec, q_nope, q_pe, ckv_cache, kpe_cache, kv_indices,
+                                    o, maybe_lse, mask_mode_code, num_heads, page_size, sm_scale,
+                                    return_lse_base_on_e, ckv_scale, kpe_scale,
+                                    maybe_ckv_scale_arr ADDITIONAL_FUNC_ARGS);
+}
+
+void BatchMLAPagedAttentionSM90RunWithKVLen(
+    TensorView kv_len, TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
+    TensorView kpe_cache, TensorView kv_indices, TensorView o, Optional<TensorView> maybe_lse,
+    int64_t mask_mode_code, int64_t num_heads, int64_t page_size, double sm_scale,
+    bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
+    Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
+  BatchMLAPagedAttentionSM90RunImpl(
+      kv_len, float_workspace_buffer, int_workspace_buffer, plan_info_vec, q_nope, q_pe, ckv_cache,
+      kpe_cache, kv_indices, o, maybe_lse, mask_mode_code, num_heads, page_size, sm_scale,
+      return_lse_base_on_e, ckv_scale, kpe_scale, maybe_ckv_scale_arr ADDITIONAL_FUNC_ARGS);
 }

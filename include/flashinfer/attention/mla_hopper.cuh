@@ -762,10 +762,25 @@ __device__ __forceinline__ void write_o(
 
 template <typename Params>
 __device__ __forceinline__ auto get_block_coord(const Params& params, const uint32_t work_idx) {
+  auto kv_len = params.kv_len[work_idx];
+  auto kv_end = params.kv_end[work_idx];
+  if (params.device_kv_len != nullptr) {
+    uint32_t first = 0, last = params.batch_size;
+    const auto q_offset = params.q_indptr[work_idx];
+    while (first + 1 < last) {
+      const uint32_t mid = first + (last - first) / 2;
+      if (params.batch_q_indptr[mid] <= q_offset) {
+        first = mid;
+      } else {
+        last = mid;
+      }
+    }
+    kv_len = min(kv_len, max(params.device_kv_len[first], 0));
+    kv_end = min(kv_end, kv_len);
+  }
   return std::tuple(params.q_indptr[work_idx], params.kv_indptr[work_idx],
-                    params.partial_indptr[work_idx], params.q_len[work_idx],
-                    params.kv_len[work_idx], params.q_start[work_idx], params.kv_start[work_idx],
-                    params.kv_end[work_idx]);
+                    params.partial_indptr[work_idx], params.q_len[work_idx], kv_len,
+                    params.q_start[work_idx], params.kv_start[work_idx], kv_end);
 }
 
 template <typename KTraits>

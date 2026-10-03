@@ -1561,6 +1561,7 @@ struct MLAPlanInfo {
   int64_t work_indptr_offset;
   int64_t partial_o_offset;
   int64_t partial_lse_offset;
+  int64_t batch_q_indptr_offset = 0;
 
   std::vector<int64_t> ToVector() const {
     return {num_blks_x,
@@ -1817,6 +1818,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "mla_kv_end");
   plan_info.work_indptr_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "mla_work_indptr");
+  plan_info.batch_q_indptr_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * (batch_size + 1), 16, "mla_batch_q_indptr");
 
   IdType* cluster_q_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.q_indptr_offset);
@@ -1846,6 +1849,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_end_offset);
   IdType* cluster_work_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.work_indptr_offset);
+  IdType* batch_q_indptr_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.batch_q_indptr_offset);
 
   std::copy(q_indptr_vec.begin(), q_indptr_vec.end(), cluster_q_indptr_h);
   std::copy(kv_indptr_vec.begin(), kv_indptr_vec.end(), cluster_kv_indptr_h);
@@ -1866,6 +1871,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   std::copy(kv_start_vec.begin(), kv_start_vec.end(), cluster_kv_start_h);
   std::copy(kv_end_vec.begin(), kv_end_vec.end(), cluster_kv_end_h);
   std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), cluster_work_indptr_h);
+  std::copy(qo_indptr_h, qo_indptr_h + batch_size + 1, batch_q_indptr_h);
 
   staged_int_workspace_bytes = int_allocator.num_allocated_bytes();
 
