@@ -3739,11 +3739,12 @@ KERNELS: dict[str, dict[str, str]] = {
     },
 }
 
-# PLACEHOLDER (generated file list): the device / binding translation units of
-# every registered module live under ``csrc/cake_dense_projection_gemm/<arch>/``
-# next to this file and are named in each record's ``sources``.  They are
-# written by the Cake exporter together with the two registries above; this
-# checkout registers no program until that delivery lands.
+# Generated file list: the device / binding translation units of every registered
+# module live flat under ``csrc/cake_dense_projection_gemm/`` next to this file
+# (``<module>_kernel.cu`` / ``<module>_binding.cu``, one architecture-neutral pair
+# per program; each record's ``sources`` names them and ``arches`` lists the
+# architectures it is compiled for).  They are written by the Cake exporter
+# together with the two registries above.
 
 ARCH_NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,

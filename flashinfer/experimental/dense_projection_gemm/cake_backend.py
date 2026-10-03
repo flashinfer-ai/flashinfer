@@ -398,7 +398,6 @@ def instance_key(
     box_rows: Optional[int] = None,
     cta_rows: int = 128,
     pf: int = 0,
-    promo: str = "none",
     hints: tuple = ("none", "none"),
     f32_v8: bool = False,
     quad_store: bool = False,
@@ -406,18 +405,16 @@ def instance_key(
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
-    promo, hints, f32_v8, quad_store)``; the raster group width is a launch parameter since round 11.  ``smem_limit`` (bytes; default = the largest
+    hints, f32_v8, quad_store)``; the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
     architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
     the key, so an instance has one symbol on every architecture (the planner passes
     ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
     exported.  [Cake ``instance_key`` L873-L905]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
-    promo, hints = str(promo), (str(hints[0]), str(hints[1]))
-    if promo not in L2_PROMOS or any(h not in L2_HINTS for h in hints):
-        raise ValueError(
-            f"promo must be one of {L2_PROMOS} and hints in {L2_HINTS}, got {promo!r} / {hints!r}"
-        )
+    hints = (str(hints[0]), str(hints[1]))
+    if any(h not in L2_HINTS for h in hints):
+        raise ValueError(f"hints must be in {L2_HINTS}, got {hints!r}")
     if pf < 0 or pf > 16:
         raise ValueError(f"prefetch distance must be in 0..16 K steps, got {pf}")
     if cta_rows not in CTA_ROWS_CHOICES:
@@ -469,7 +466,6 @@ def instance_key(
         box_rows,
         cta_rows,
         pf,
-        promo,
         hints,
         bool(f32_v8)
         and out_f32
@@ -488,8 +484,7 @@ def instance_key(
 def instance_symbol(key: tuple) -> str:
     """Kernel symbol / registry template of an instance key (``dense_proj_gemm_<a><b>_n<N>``
     followed by ``_m256`` for tall tiles / ``_m64`` for the 64-row Layout-B family, ``_pf<n>`` for a
-    prefetch distance, ``_<promo>`` for an
-    L2 promotion, ``_h<a><b>`` for non-default (A, B) eviction hints (first letters, e.g.
+    prefetch distance, ``_h<a><b>`` for non-default (A, B) eviction hints (first letters, e.g.
     ``_hen`` = A evict_first / B none), ``_f32``, ``_v8`` for the 256-bit fp32 register stores, ``_t``,
     ``_<epi><slots>`` for the TMA-store epilogue, ``_s<stages>`` for a non-default stage count and
     ``_box<rows>``).  [Cake ``instance_symbol`` L908-L912]"""
@@ -506,7 +501,6 @@ def instance_symbol(key: tuple) -> str:
         box_rows,
         cta_rows,
         pf,
-        promo,
         hints,
         f32_v8,
         quad_store,
@@ -518,7 +512,6 @@ def instance_symbol(key: tuple) -> str:
         + f"_n{block_n}"
         + ("_m256" if cta_rows == 256 else "_m64" if cta_rows == 64 else "")
         + (f"_pf{pf}" if pf else "")
-        + (f"_{promo}" if promo != "none" else "")
         + (f"_h{hints[0][0]}{hints[1][0]}" if hints != ("none", "none") else "")
         + ("_f32" if out_f32 else "")
         + ("_v8" if f32_v8 else "")
@@ -1153,8 +1146,8 @@ def plan_dense_projection_gemm(
         epi=mode,
         slots=int(nslots),
         pf=int(pf),
-        promo=str(key[12]),
-        hints=tuple(key[13]),
+        promo=str(promo),
+        hints=tuple(key[12]),
         group_m=int(group_m),
         m_tiles=m_tiles,
         n_tiles=n_tiles,
@@ -1473,6 +1466,7 @@ def prepare_dense_projection_gemm(
         m_tiles=plan.m_tiles,
         n_tiles=plan.n_tiles,
         group_m=plan.group_m,
+        promo_code=L2_PROMOS.index(plan.promo),
         k_iters=plan.k_blocks,
         ldo=int(O3.stride(1)),
         out_l=int(O3.stride(0)) if O3.shape[0] > 1 else 0,
