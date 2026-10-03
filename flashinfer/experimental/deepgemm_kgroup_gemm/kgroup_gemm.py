@@ -576,7 +576,10 @@ def fast_division(divisor: int) -> tuple[int, int]:
 
 def swizzle_m_blocks(sm_count: int, tile_n: int) -> int:
     """M tiles per swizzle group (8 or 16): the strict minimum of the per-wave A+B footprint, 8 on a tie."""
-    return min((8, 16), key=lambda blocks: blocks * 128 + ((sm_count + blocks - 1) // blocks) * tile_n)
+    return min(
+        (8, 16),
+        key=lambda blocks: blocks * 128 + ((sm_count + blocks - 1) // blocks) * tile_n,
+    )
 
 
 def division_values(tier: str, grid_m: int, grid_n: int, sm_count: int) -> list[int]:
@@ -592,7 +595,9 @@ def division_values(tier: str, grid_m: int, grid_n: int, sm_count: int) -> list[
     kernel reads the slots as u32).
     """
     if tier in ("n256", "small"):
-        swizzle = swizzle_m_blocks(sm_count, 256) if tier == "n256" else _SWIZZLE_M_BLOCKS
+        swizzle = (
+            swizzle_m_blocks(sm_count, 256) if tier == "n256" else _SWIZZLE_M_BLOCKS
+        )
         divisors = (grid_m * grid_n, grid_n * swizzle, grid_m % swizzle or swizzle)
     elif tier == "swapped":
         divisors = (1, grid_m * 16, grid_n % 16 or 16)
@@ -601,7 +606,10 @@ def division_values(tier: str, grid_m: int, grid_n: int, sm_count: int) -> list[
     values: list[int] = []
     for divisor in divisors:
         multiplier, shift = fast_division(divisor)
-        values += [multiplier - (1 << 32) if multiplier >= 1 << 31 else multiplier, shift]
+        values += [
+            multiplier - (1 << 32) if multiplier >= 1 << 31 else multiplier,
+            shift,
+        ]
     return values
 
 
@@ -624,8 +632,15 @@ def output_mode(output_dtype: str, accumulate: bool) -> str:
     return f"{output_dtype}_acc" if accumulate else output_dtype
 
 
-def schedule_tier(m: int, n: int, num_groups: int, sm_count: int, mode: str, max_k_blocks: int,
-                  swapped: bool = True) -> str:
+def schedule_tier(
+    m: int,
+    n: int,
+    num_groups: int,
+    sm_count: int,
+    mode: str,
+    max_k_blocks: int,
+    swapped: bool = True,
+) -> str:
     """Physical schedule for one problem.
 
     Only the tile counts and the largest group's k-block count enter the
@@ -648,7 +663,9 @@ def schedule_tier(m: int, n: int, num_groups: int, sm_count: int, mode: str, max
     return "general"
 
 
-def route_candidates(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256) -> list[str]:
+def route_candidates(
+    m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256
+) -> list[str]:
     """Routes for one problem, preferred first.
 
     The first entry is the schedule the decision chain picks for this SM
@@ -666,26 +683,56 @@ def route_candidates(m, n, group_ks, sm_count, output_dtype, accumulate, k_align
     tier = schedule_tier(m, n, len(group_ks), sm_count, mode, max_k_blocks)
     if tier == "swapped":
         tiers.append("swapped")
-        tier = schedule_tier(m, n, len(group_ks), sm_count, mode, max_k_blocks, swapped=False)
+        tier = schedule_tier(
+            m, n, len(group_ks), sm_count, mode, max_k_blocks, swapped=False
+        )
     if tier == "n256":
         tiers.append("n256")
     elif tier == "small":
-        grid_m, grid_n, _grid = launch_geometry(tier, physical_m, n, len(group_ks), sm_count)
+        grid_m, grid_n, _grid = launch_geometry(
+            tier, physical_m, n, len(group_ks), sm_count
+        )
         if (grid_m, grid_n, len(group_ks)) in _SMALL_EXACT_GEOMETRIES:
             tiers.append(f"small_{grid_m}x{grid_n}x{len(group_ks)}")
         tiers.append("small")
     k_blocks = sum(padded_ks) // len(group_ks) // 256
     threshold = {"bf16": 16, "fp32_acc": 24, "fp32": 32}[mode]
-    tiers += ["general_s1", "general_s2"] if k_blocks >= threshold else ["general_s2", "general_s1"]
+    tiers += (
+        ["general_s1", "general_s2"]
+        if k_blocks >= threshold
+        else ["general_s2", "general_s1"]
+    )
     return [f"{tier}:{mode}" for tier in tiers]
 
 
-def route_key(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256) -> str:
+def route_key(
+    m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256
+) -> str:
     """The preferred route of one problem (``route_candidates(...)[0]``)."""
-    return route_candidates(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment)[0]
+    return route_candidates(
+        m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment
+    )[0]
 
 
-def select_route(arch, m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256) -> tuple[str, str]:
+def route_table(arch: str) -> dict[str, str]:
+    """Route -> program of one architecture.
+
+    ``ROUTES`` is keyed by architecture when the architectures name different
+    programs for a route, and is one flat table otherwise.
+    """
+    flat: dict[str, str] = {}
+    for key, value in ROUTES.items():
+        if isinstance(value, dict):
+            if key == arch:
+                return dict(value)
+        else:
+            flat[key] = value
+    return flat
+
+
+def select_route(
+    arch, m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment=256
+) -> tuple[str, str]:
     """``(route, program)`` for one device: the first candidate route whose
     program the export measured on ``arch``.
 
@@ -696,8 +743,10 @@ def select_route(arch, m, n, group_ks, sm_count, output_dtype, accumulate, k_ali
     SM100a part such as GB200) takes the next schedule of the decision chain
     instead of failing the lookup.
     """
-    table = ROUTES.get(arch, ROUTES)
-    candidates = route_candidates(m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment)
+    table = route_table(arch)
+    candidates = route_candidates(
+        m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment
+    )
     for route in candidates:
         program = table.get(route)
         if program is not None:
@@ -746,7 +795,9 @@ def program_spec(arch: str, name: str):
     record = MODULES[name]
     return gen_jit_spec(
         name=f"{name}_{arch}",
-        sources=[env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]],
+        sources=[
+            env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
+        ],
         extra_cuda_cflags=[
             *_nvcc_flags(arch),
             *record["compile_flags"],
@@ -791,10 +842,14 @@ class GroupedFP4Plan:
 
         group_ks = tuple(int(k) for k in group_ks)
         if m < 1 or not group_ks or any(k < 0 for k in group_ks):
-            raise ValueError("m must be positive and group_ks a nonempty list of nonnegative K sizes")
+            raise ValueError(
+                "m must be positive and group_ks a nonempty list of nonnegative K sizes"
+            )
         if k_alignment < 256 or k_alignment % 256:
             raise ValueError("k_alignment must be a positive multiple of 256")
-        if output_dtype not in ("bf16", "fp32") or (accumulate and output_dtype != "fp32"):
+        if output_dtype not in ("bf16", "fp32") or (
+            accumulate and output_dtype != "fp32"
+        ):
             raise ValueError("Output must be bf16/fp32; accumulation requires fp32")
         if num_stages != 7:
             raise ValueError("The generated schedules use seven load stages")
@@ -811,9 +866,14 @@ class GroupedFP4Plan:
         if n < 1 or n % 128:
             raise ValueError("N must be positive and divisible by 128")
         physical_m = (m + 255) // 256 * 256
-        padded_ks = [(k + k_alignment - 1) // k_alignment * k_alignment for k in group_ks]
+        padded_ks = [
+            (k + k_alignment - 1) // k_alignment * k_alignment for k in group_ks
+        ]
         total_k = sum(padded_ks)
-        if tuple(a.shape) != (physical_m, total_k // 2) or tuple(b.shape) != (n, total_k // 2):
+        if tuple(a.shape) != (physical_m, total_k // 2) or tuple(b.shape) != (
+            n,
+            total_k // 2,
+        ):
             raise ValueError(
                 "A/B must use independently padded concatenated groups and physical M aligned to 256"
             )
@@ -821,40 +881,76 @@ class GroupedFP4Plan:
             (a_scales, ((total_k + 127) // 128, physical_m)),
             (b_scales, ((total_k + 127) // 128, n)),
         ):
-            if tensor.dtype not in (torch.int32, torch.uint32) or tuple(tensor.shape) != shape:
-                raise ValueError(f"Packed UE8M0 scales must be int32/uint32 with shape {shape}")
+            if (
+                tensor.dtype not in (torch.int32, torch.uint32)
+                or tuple(tensor.shape) != shape
+            ):
+                raise ValueError(
+                    f"Packed UE8M0 scales must be int32/uint32 with shape {shape}"
+                )
         dtype = torch.bfloat16 if output_dtype == "bf16" else torch.float32
         if out is None:
             if accumulate:
-                raise ValueError("In-place accumulation requires caller-provided initialized out")
-            out = torch.empty((len(group_ks), physical_m, n), dtype=dtype, device=a.device)
+                raise ValueError(
+                    "In-place accumulation requires caller-provided initialized out"
+                )
+            out = torch.empty(
+                (len(group_ks), physical_m, n), dtype=dtype, device=a.device
+            )
         if out.dtype != dtype or tuple(out.shape) != (len(group_ks), physical_m, n):
             raise ValueError("out must match output_dtype and [groups, physical_M, N]")
         tensors = (a, b, a_scales, b_scales, out)
         if any(t.device != a.device or not t.is_contiguous() for t in tensors):
-            raise ValueError("Operands, scales and output must be contiguous on one CUDA device")
-        arch, sm_count = device_facts(a.device.index if a.device.index is not None else torch.cuda.current_device())
-        self.route, self.program = select_route(arch, m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment)
+            raise ValueError(
+                "Operands, scales and output must be contiguous on one CUDA device"
+            )
+        arch, sm_count = device_facts(
+            a.device.index
+            if a.device.index is not None
+            else torch.cuda.current_device()
+        )
+        self.route, self.program = select_route(
+            arch, m, n, group_ks, sm_count, output_dtype, accumulate, k_alignment
+        )
         self.storage, self.output = out, out[:, :m]
         self.empty, self.accumulate = total_k == 0, bool(accumulate)
         self.options = dict(
-            M=m, N=n, group_ks=group_ks, k_alignment=k_alignment, use_psum_layout=bool(use_psum_layout),
-            output_dtype=output_dtype, accumulate=bool(accumulate), num_stages=num_stages,
+            M=m,
+            N=n,
+            group_ks=group_ks,
+            k_alignment=k_alignment,
+            use_psum_layout=bool(use_psum_layout),
+            output_dtype=output_dtype,
+            accumulate=bool(accumulate),
+            num_stages=num_stages,
         )
         if self.empty:
             self._retained = tensors
             return
         tier = self.route.split(":")[0]
-        grid_m, grid_n, grid = launch_geometry(tier, physical_m, n, len(group_ks), sm_count)
+        grid_m, grid_n, grid = launch_geometry(
+            tier, physical_m, n, len(group_ks), sm_count
+        )
         self.grid = grid
         grouped_layout = torch.tensor(
-            grouped_layout_values(group_ks, k_alignment) + division_values(tier, grid_m, grid_n, sm_count),
-            dtype=torch.int32, device=a.device,
+            grouped_layout_values(group_ks, k_alignment)
+            + division_values(tier, grid_m, grid_n, sm_count),
+            dtype=torch.int32,
+            device=a.device,
         )
         bindings = dict(
-            A=a.view(torch.uint8), B=b.view(torch.uint8), SFA=a_scales.view(torch.uint32),
-            SFB=b_scales.view(torch.uint32), C_tma=out, grouped_layout=grouped_layout,
-            M=physical_m, N=n, K=total_k, grid_m=grid_m, grid_n=grid_n, num_groups=len(group_ks),
+            A=a.view(torch.uint8),
+            B=b.view(torch.uint8),
+            SFA=a_scales.view(torch.uint32),
+            SFB=b_scales.view(torch.uint32),
+            C_tma=out,
+            grouped_layout=grouped_layout,
+            M=physical_m,
+            N=n,
+            K=total_k,
+            grid_m=grid_m,
+            grid_n=grid_n,
+            num_groups=len(group_ks),
         )
         grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
         record = MODULES[self.program]
@@ -865,7 +961,9 @@ class GroupedFP4Plan:
             elif name in bindings:
                 args.append(bindings[name])
             else:
-                raise RuntimeError(f"generated program {self.program} binds {name!r}, which this plan does not declare")
+                raise RuntimeError(
+                    f"generated program {self.program} binds {name!r}, which this plan does not declare"
+                )
         module = load_program(arch, self.program)
         self._submission = getattr(module, record["ffi_entry"]), tuple(args)
         self._retained = (module, tensors, grouped_layout)
