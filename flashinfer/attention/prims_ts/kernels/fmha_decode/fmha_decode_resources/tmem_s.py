@@ -51,7 +51,7 @@ from ..fmha_decode_constants import (
     INT32_SCORE_SEED_TILE_WORDS,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,
 )
-from ...tcgen05_compat import tcgen05_mma_ws
+from ...tcgen05_compat import tcgen05_ld_32x32b_max, tcgen05_mma_ws
 from ...placeholder_helpers import (
     _placeholder_local_array,
     _placeholder_smem_array,
@@ -2557,6 +2557,13 @@ class TmemSResource(DecodeGenResourceBase):
         exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
             proxy=False
         )
+        # With LDTM.STAT the unmasked pass takes each fragment's maximum, or
+        # each Sage scale group's, from the TMEM load itself; finer Sage
+        # groups and INT32 scores keep the register reduction.
+        groups: Constexpr[int] = cfg.sage_k_groups_per_fragment
+        loads_group_maxima: Constexpr[bool] = (
+            cfg.uses_ldtm_stat and groups <= 2 and not cfg.uses_int32_scores
+        )
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             # A warp-uniform route kind keeps the fold and the load/store
             # branch below on the uniform datapath.
@@ -2636,57 +2643,71 @@ class TmemSResource(DecodeGenResourceBase):
                     fragment_scales = self.sage_k_scales.fragment(
                         scales_view, Int32(fragment_idx)
                     )
-                loaded = _keeps_tcgen05_ld(
-                    cfg,
-                    prims.make_tmem_ptr(
-                        score_tmem_addr + Int32(fragment_idx * fragment_regs),
-                        Float32,
-                    ),
-                    num=fragment_regs,
-                    offset=cfg.tile_size_kv // 2,
-                )
-                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                if cutlass.const_expr(exact_dequantized):
-                    scores = cutlass.Array(
-                        Float32, fragment_regs, space=cutlass.AddressSpace.rmem
-                    )
-                    for score_idx in cutlass.range_constexpr(fragment_regs):
-                        scores[score_idx] = Float32(loaded[score_idx])
-                    self._dequantize_fragment_scores(
-                        scores, fragment_scales, cfg.sage_k_groups_per_fragment
-                    )
-                    self.sage_k_scales.advance(scales_view)
-                    for score_idx in cutlass.range_constexpr(fragment_regs):
-                        chain_idx: Constexpr[int] = score_idx % 4
-                        max_chains[chain_idx] = cute.math.max(
-                            max_chains[chain_idx], Float32(scores[score_idx]), ftz=True
+                fragment_addr = score_tmem_addr + Int32(fragment_idx * fragment_regs)
+                if cutlass.const_expr(loads_group_maxima):
+                    maxima = self._load_fragment_group_maxima(fragment_addr, groups)
+                    if cutlass.const_expr(cfg.use_sage_attention):
+                        self._fold_sage_group_maxima(
+                            max_chains,
+                            maxima,
+                            fragment_scales=fragment_scales,
+                            chain_base=fragment_idx * groups,
+                            groups=groups,
                         )
-                    _keeps_tcgen05_st(
+                        self.sage_k_scales.advance(scales_view)
+                    else:
+                        chain_idx: Constexpr[int] = fragment_idx % 4
+                        max_chains[chain_idx] = cute.math.max(
+                            max_chains[chain_idx], Float32(maxima[0]), ftz=True
+                        )
+                else:
+                    loaded = _keeps_tcgen05_ld(
                         cfg,
-                        prims.make_tmem_ptr(
-                            score_tmem_addr + Int32(fragment_idx * fragment_regs),
-                            Float32,
-                        ),
-                        scores.data_ptr().load(count=fragment_regs, alignment=4),
+                        prims.make_tmem_ptr(fragment_addr, Float32),
+                        num=fragment_regs,
                         offset=cfg.tile_size_kv // 2,
                     )
-                elif cutlass.const_expr(cfg.use_sage_attention):
-                    self._fold_sage_fragment_max(
-                        max_chains,
-                        loaded,
-                        fragment_scales=fragment_scales,
-                        chain_base=fragment_idx * cfg.sage_k_groups_per_fragment,
-                        groups=cfg.sage_k_groups_per_fragment,
-                    )
-                    self.sage_k_scales.advance(scales_view)
-                else:
-                    for score_idx in cutlass.range_constexpr(fragment_regs):
-                        chain_idx: Constexpr[int] = score_idx % 4
-                        max_chains[chain_idx] = cute.math.max(
-                            max_chains[chain_idx],
-                            Float32(loaded[score_idx]),
-                            ftz=True,
+                    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                    if cutlass.const_expr(exact_dequantized):
+                        scores = cutlass.Array(
+                            Float32, fragment_regs, space=cutlass.AddressSpace.rmem
                         )
+                        for score_idx in cutlass.range_constexpr(fragment_regs):
+                            scores[score_idx] = Float32(loaded[score_idx])
+                        self._dequantize_fragment_scores(
+                            scores, fragment_scales, groups
+                        )
+                        self.sage_k_scales.advance(scales_view)
+                        for score_idx in cutlass.range_constexpr(fragment_regs):
+                            chain_idx: Constexpr[int] = score_idx % 4
+                            max_chains[chain_idx] = cute.math.max(
+                                max_chains[chain_idx],
+                                Float32(scores[score_idx]),
+                                ftz=True,
+                            )
+                        _keeps_tcgen05_st(
+                            cfg,
+                            prims.make_tmem_ptr(fragment_addr, Float32),
+                            scores.data_ptr().load(count=fragment_regs, alignment=4),
+                            offset=cfg.tile_size_kv // 2,
+                        )
+                    elif cutlass.const_expr(cfg.use_sage_attention):
+                        self._fold_sage_fragment_max(
+                            max_chains,
+                            loaded,
+                            fragment_scales=fragment_scales,
+                            chain_base=fragment_idx * groups,
+                            groups=groups,
+                        )
+                        self.sage_k_scales.advance(scales_view)
+                    else:
+                        for score_idx in cutlass.range_constexpr(fragment_regs):
+                            chain_idx: Constexpr[int] = score_idx % 4
+                            max_chains[chain_idx] = cute.math.max(
+                                max_chains[chain_idx],
+                                Float32(loaded[score_idx]),
+                                ftz=True,
+                            )
             if cutlass.const_expr(exact_dequantized):
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
                 cute.arch.fence_view_async_tmem_store()
@@ -2949,54 +2970,78 @@ class TmemSResource(DecodeGenResourceBase):
         chain_base: Constexpr[int],
         groups: Constexpr[int],
     ) -> None:
+        """Reduce one fragment's scale groups on the quantized scores and fold them.
+
+        Groups of four or more scores reduce over four chains; masked ``-inf``
+        scores need no special case. ``_fold_sage_group_maxima`` dequantizes
+        and folds the group maxima.
+        """
+        group_regs = self.cfg.softmax_score_fragment_regs // groups
+        maxima: tuple = ()
+        for group_idx in cutlass.range_constexpr(groups):
+            first: Constexpr[int] = group_idx * group_regs
+            if cutlass.const_expr(group_regs < 4):
+                group_max = Float32(scores[first])
+                for score_elem in cutlass.range_constexpr(1, group_regs):
+                    group_max = cute.math.max(
+                        group_max, Float32(scores[first + score_elem]), ftz=True
+                    )
+            else:
+                chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
+                for chain_idx in cutlass.range_constexpr(4):
+                    chains[chain_idx] = Float32(scores[first + chain_idx])
+                for score_elem in cutlass.range_constexpr(4, group_regs):
+                    chain_idx: Constexpr[int] = score_elem % 4
+                    chains[chain_idx] = cute.math.max(
+                        chains[chain_idx],
+                        Float32(scores[first + score_elem]),
+                        ftz=True,
+                    )
+                group_max = cute.math.max(
+                    cute.math.max(chains[0], chains[1], ftz=True),
+                    cute.math.max(chains[2], chains[3], ftz=True),
+                    ftz=True,
+                )
+            maxima += (group_max,)
+        self._fold_sage_group_maxima(
+            max_chains,
+            maxima,
+            fragment_scales=fragment_scales,
+            chain_base=chain_base,
+            groups=groups,
+        )
+
+    @cute.jit
+    def _fold_sage_group_maxima(
+        self,
+        max_chains: cutlass.Array,
+        maxima: tuple,
+        *,
+        fragment_scales: cutlass.Array,
+        chain_base: Constexpr[int],
+        groups: Constexpr[int],
+    ) -> None:
         """Fold one fragment's dequantized group maxima into the max chains.
 
-        Each scale group is reduced on the quantized scores, then
-        ``(group_max - bias) * sfK_g`` is folded; the caller applies ``sfQ``
-        to the tile maximum. Groups of four or more scores reduce over four
-        chains; masked ``-inf`` scores need no special case. Group maxima
-        leave in pairs through a packed bias add (exact on the biased scores'
-        unit spacing) and a packed scale multiply. Group ``g`` folds into
-        chain ``(chain_base + g) % 4``.
+        Folds ``(group_max - bias) * sfK_g``; the caller applies ``sfQ`` to
+        the tile maximum. Group maxima leave in pairs through a packed bias
+        add (exact on the biased scores' unit spacing) and a packed scale
+        multiply. Group ``g`` folds into chain ``(chain_base + g) % 4``.
         """
         cfg = self.cfg
-        group_regs = cfg.softmax_score_fragment_regs // groups
         width: Constexpr[int] = 1 if groups == 1 else 2
         assert groups % width == 0
         for group_base in cutlass.range_constexpr(0, groups, width):
-            maxima: tuple = ()
-            for elem in cutlass.range_constexpr(width):
-                first: Constexpr[int] = (group_base + elem) * group_regs
-                if cutlass.const_expr(group_regs < 4):
-                    group_max = Float32(scores[first])
-                    for score_elem in cutlass.range_constexpr(1, group_regs):
-                        group_max = cute.math.max(
-                            group_max, Float32(scores[first + score_elem]), ftz=True
-                        )
-                else:
-                    chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
-                    for chain_idx in cutlass.range_constexpr(4):
-                        chains[chain_idx] = Float32(scores[first + chain_idx])
-                    for score_elem in cutlass.range_constexpr(4, group_regs):
-                        chain_idx: Constexpr[int] = score_elem % 4
-                        chains[chain_idx] = cute.math.max(
-                            chains[chain_idx],
-                            Float32(scores[first + score_elem]),
-                            ftz=True,
-                        )
-                    group_max = cute.math.max(
-                        cute.math.max(chains[0], chains[1], ftz=True),
-                        cute.math.max(chains[2], chains[3], ftz=True),
-                        ftz=True,
-                    )
-                maxima += (group_max,)
             if cutlass.const_expr(width == 1):
-                scaled_one = Float32(maxima[0])
+                scaled_one = Float32(maxima[group_base])
                 if cutlass.const_expr(cfg.uses_int32_scores):
                     scaled_one = scaled_one - Float32(INT32_SCORE_BIAS)
                 scaled = (scaled_one * Float32(fragment_scales[group_base]),)
             else:
-                scaled = maxima
+                scaled = (
+                    Float32(maxima[group_base]),
+                    Float32(maxima[group_base + 1]),
+                )
                 if cutlass.const_expr(cfg.uses_int32_scores):
                     scaled = cute.arch.add_packed_f32x2(
                         scaled, (Float32(-INT32_SCORE_BIAS), Float32(-INT32_SCORE_BIAS))
@@ -3014,6 +3059,25 @@ class TmemSResource(DecodeGenResourceBase):
                 max_chains[fold_chain] = cute.math.max(
                     max_chains[fold_chain], scaled_max, ftz=True
                 )
+
+    @cute.jit
+    def _load_fragment_group_maxima(
+        self, fragment_addr: Int32, groups: Constexpr[int]
+    ) -> tuple:
+        """Return the maxima of a score fragment's column groups via LDTM.STAT.
+
+        Each group loads together with its hardware maximum, so no score goes
+        through a register reduction; the P pass reloads the scores.
+        """
+        group_cols: Constexpr[int] = self.cfg.softmax_score_fragment_regs // groups
+        maxima: tuple = ()
+        for group_idx in cutlass.range_constexpr(groups):
+            loaded = tcgen05_ld_32x32b_max(
+                fragment_addr + Int32(group_idx * group_cols), group_cols
+            )
+            maxima += (loaded[group_cols],)
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        return maxima
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
     @cute.jit

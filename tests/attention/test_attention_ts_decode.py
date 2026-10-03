@@ -67,6 +67,7 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     get_q_token_kv_block_sparse_workspace_size,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+from flashinfer.attention.prims_ts.kernels import tcgen05_compat
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
     FmhaDecodeConfig,
     make_decode_config,
@@ -3821,6 +3822,24 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert q128_fp8.streams_tmem_p_fragments
 
 
+def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
+    """SM103 keeps exponentials on MUFU and takes score maxima from LDTM.STAT.
+
+    SM103 doubles the MUFU ex2 rate, so FMA polynomials only add
+    instructions there, and its TMEM loads can return the fragment maximum.
+    Configs built without a device keep the SM100 values.
+    """
+
+    arch_args = fmha_decode_config.arch_config_args
+    assert arch_args((10, 0)) == {"ex2_emulated_pairs": 4, "uses_ldtm_stat": False}
+    assert arch_args((10, 3)) == {
+        "ex2_emulated_pairs": 0,
+        "uses_ldtm_stat": tcgen05_compat.dsl_supports_ldtm_stat(),
+    }
+    cfg = _make_contiguous_kv256_config(persistent=False)
+    assert cfg.ex2_emulated_pairs == 4 and not cfg.uses_ldtm_stat
+
+
 def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (
     None
 ):
@@ -4485,12 +4504,15 @@ def test_attention_ts_decode_mixed_precision_more_loaders_than_pages(
     original_make_decode_config = fmha_decode_config.make_decode_config
 
     def make_multiwarp_config(*args, **kwargs):
-        kwargs["args"] = {
-            **(kwargs.get("args") or {}),
-            "load_warp_idx": 16,
-            "load_num_warps": 8,
-            "use_persistent_scheduler": False,
-        }
+        # Config sources are layered; the last layer takes precedence.
+        kwargs["args"] = (
+            kwargs.get("args"),
+            {
+                "load_warp_idx": 16,
+                "load_num_warps": 8,
+                "use_persistent_scheduler": False,
+            },
+        )
         cfg = original_make_decode_config(*args, **kwargs)
         assert cfg.tile_size_kv // cfg.num_tokens_per_page < cfg.load_num_warps
         return cfg
