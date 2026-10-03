@@ -507,11 +507,15 @@ Prims-TS Unified MoE (SM100/SM103)
 
 The Prims-TS runner is an explicit unified-MoE backend for SM100 and SM103.
 Select it with ``PrimsTsConfig()``; it is not in the default backend list.
-MVP coverage is NVFP4×NVFP4 and BF16×BF16. Routing and finalize stay on the
-TRT-LLM Gen path; only the GEMM middle stage uses Prims-TS. The backend
-reuses the physical layouts prepared by ``TrtllmFp4Config`` (MajorK) and
-``TrtllmBf16Config`` (BlockMajorK), so one view can be registered for both
-keys::
+Coverage is NVFP4×NVFP4, MXFP4×MXFP8, MXFP4×BF16, BF16×BF16,
+FP8PerTensor×FP8PerTensor, DeepSeekFp8×DeepSeekFp8, and MXFP8×MXFP8.
+Routing and finalize stay on the TRT-LLM Gen path; only the GEMM middle stage
+uses Prims-TS. NVFP4 and MXFP4 reuse ``TrtllmFp4Config``, BF16 reuses
+``TrtllmBf16Config``, MXFP8 reuses ``TrtllmFp8BlockConfig``, and per-tensor FP8
+reuses ``TrtllmFp8PerTensorConfig``. DeepSeekFp8 activations and scales match
+``TrtllmFp8BlockConfig``, but the weight payloads are shuffled with epilogue
+tile 64 and must not be registered under ``trtllm_fp8_block``. One shared view
+can be registered for both keys::
 
     backend = PrimsTsConfig()
     quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
@@ -540,7 +544,7 @@ keys::
     output = MoELayer(config)(activations, weights)
 
 ``intermediate_size`` must be a multiple of 128. Fused shared experts and
-LoRA are out of scope for this MVP.
+LoRA stay out of scope.
 
 .. autosummary::
     :toctree: ../generated
