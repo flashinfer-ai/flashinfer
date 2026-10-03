@@ -9,11 +9,14 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_prefill_trace
-from ..utils import check_lse_base, log2e
+from ..utils import check_lse_base, ln2, log2e
 from .utils import (
     get_cudnn_fmha_gen_module,
     get_cudnn_attention_handle,
     supports_ordered_cudnn_execution,
+    supports_native_cudnn_log2,
+    build_cudnn_graph_with_log2,
+    require_native_cudnn_log2,
 )
 
 try:
@@ -321,7 +324,15 @@ def _prefill_override_descriptor_key(key, override_cache):
 
 
 def _sdpa_prefill_key_fn(
-    q, k_cache, v_cache, scale, *, o_data_type=None, stats_head_stride=0, **metadata
+    q,
+    k_cache,
+    v_cache,
+    scale,
+    *,
+    o_data_type=None,
+    stats_head_stride=0,
+    stats_use_log2=False,
+    **metadata,
 ):
     return (
         _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type),
@@ -329,14 +340,20 @@ def _sdpa_prefill_key_fn(
         bool(stats_head_stride)
         if metadata.get("override_cache") is not None and _CUDNN_NATIVE_HN_SUPPORTED
         else stats_head_stride,
+        stats_use_log2,
     )
 
 
 if CUDNN_AVAILABLE:
 
-    @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
     @cudnn.graph_cache(key_fn=_sdpa_prefill_key_fn)
-    def _build_prefill_graph(
+    def _build_prefill_graph(*args, stats_use_log2=False, **kwargs):
+        return build_cudnn_graph_with_log2(
+            cudnn, _make_prefill_graph, args, kwargs, stats_use_log2
+        )
+
+    @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
+    def _make_prefill_graph(
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -361,6 +378,7 @@ if CUDNN_AVAILABLE:
         o_data_type: Optional[torch.dtype] = None,
         override_cache: Optional[tuple[int, int, int]] = None,
         stats_head_stride: int = 0,
+        stats_use_log2: bool = False,
     ):
         global _prefill_graph_builds
         _prefill_graph_builds += 1
@@ -696,6 +714,7 @@ if CUDNN_AVAILABLE:
                     use_padding_mask=padding_mask,
                     attn_scale=scale,
                     generate_stats=return_lse,
+                    **({"stats_use_log2": True} if stats_use_log2 else {}),
                     use_causal_mask_bottom_right=bottom_right_causal_mask,
                     paged_attention_k_table=(
                         cudnn_k_block_tables if block_tables is not None else None
@@ -798,6 +817,8 @@ if CUDNN_AVAILABLE:
                 if actual_seq_lens_kv is not None:
                     tensors_to_return.append(cudnn_actual_seq_lens_kv)
 
+            if stats_use_log2:
+                require_native_cudnn_log2(g, cudnn)
             return g, tensors_to_return
 
 
@@ -1237,6 +1258,8 @@ class CudnnPrefillGraph:
         "ordered_execution",
         "stats_head_stride",
         "requested_stats_head_stride",
+        "lse_base",
+        "stats_use_log2",
     )
 
     def __init__(
@@ -1248,6 +1271,7 @@ class CudnnPrefillGraph:
         return_lse: bool,
         stats_head_stride=0,
         requested_stats_head_stride=0,
+        lse_base="log2",
     ):
         self.key = key
         self.graph = graph
@@ -1256,10 +1280,24 @@ class CudnnPrefillGraph:
         self.ordered_execution = supports_ordered_cudnn_execution(type(graph))
         self.stats_head_stride = stats_head_stride
         self.requested_stats_head_stride = requested_stats_head_stride
+        self.lse_base = lse_base
+        self.stats_use_log2 = return_lse and getattr(
+            graph, "_flashinfer_stats_use_log2", False
+        )
 
     def matches_plan(
-        self, q, k_cache, v_cache, scale, plan, return_lse, stats_head_stride=0
+        self,
+        q,
+        k_cache,
+        v_cache,
+        scale,
+        plan,
+        return_lse,
+        stats_head_stride=0,
+        lse_base="log2",
     ):
+        if return_lse and lse_base != self.lse_base:
+            return False
         if self.override_cache is not None and _CUDNN_NATIVE_HN_SUPPORTED:
             if bool(stats_head_stride) != bool(self.requested_stats_head_stride):
                 return False
@@ -1431,12 +1469,11 @@ class CudnnPrefillGraph:
             )
 
         if self.return_lse:
-            # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer
-            # backend returns base-2 LSE (they fold log2e into the softmax scale, so
-            # their kernels emit base-2 directly). Convert here so the cuDNN backend
-            # matches that contract. log2(sum exp(x)) = ln(sum exp(x)) * log2(e).
-            # A caller that wants natural log gets the stats as written.
-            if lse_base == "log2":
+            # The built graph's Stats base is immutable, including after a
+            # capability fallback. Convert only when the caller needs the other base.
+            if self.stats_use_log2 and lse_base == "ln":
+                lse.mul_(ln2)
+            elif not self.stats_use_log2 and lse_base == "log2":
                 lse.mul_(log2e)
             return out, lse
         return out, None
@@ -1451,6 +1488,7 @@ def prepare_cudnn_batch_prefill(
     *,
     metadata: _PrefillMetadata,
     stats_head_stride: int = 0,
+    lse_base: str = "log2",
 ) -> CudnnPrefillGraph:
     """Fetch (or build into the graph cache) the prefill graph for this call's
     signature and wrap it for execution.
@@ -1466,6 +1504,12 @@ def prepare_cudnn_batch_prefill(
     """
     override_cache = metadata.override_shape(q, k_cache)
 
+    stats_use_log2 = (
+        metadata.return_lse
+        and lse_base == "log2"
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and supports_native_cudnn_log2(cudnn, q.device)
+    )
     requested_stats_head_stride = stats_head_stride
     try:
         graph, _ = _build_prefill_graph(
@@ -1473,6 +1517,7 @@ def prepare_cudnn_batch_prefill(
             k_cache=k_cache,
             v_cache=v_cache,
             scale=scale,
+            stats_use_log2=stats_use_log2,
             stats_head_stride=stats_head_stride,
             **metadata.graph_kwargs(override_cache),
         )
@@ -1500,6 +1545,7 @@ def prepare_cudnn_batch_prefill(
             k_cache=k_cache,
             v_cache=v_cache,
             scale=scale,
+            stats_use_log2=stats_use_log2,
             **metadata.graph_kwargs(override_cache),
         )
     key = _sdpa_prefill_key_fn(
@@ -1508,6 +1554,7 @@ def prepare_cudnn_batch_prefill(
         v_cache,
         scale,
         stats_head_stride=stats_head_stride,
+        stats_use_log2=stats_use_log2,
         **metadata.graph_kwargs(override_cache),
     )
     if override_cache is not None:
@@ -1523,6 +1570,7 @@ def prepare_cudnn_batch_prefill(
                 v_cache=v_cache,
                 scale=scale,
                 stats_head_stride=stats_head_stride,
+                stats_use_log2=stats_use_log2,
                 **metadata.graph_kwargs(None),
             )
             key = _sdpa_prefill_key_fn(
@@ -1531,6 +1579,7 @@ def prepare_cudnn_batch_prefill(
                 v_cache,
                 scale,
                 stats_head_stride=stats_head_stride,
+                stats_use_log2=stats_use_log2,
                 **metadata.graph_kwargs(None),
             )
     return CudnnPrefillGraph(
@@ -1540,6 +1589,7 @@ def prepare_cudnn_batch_prefill(
         return_lse=metadata.return_lse,
         stats_head_stride=stats_head_stride,
         requested_stats_head_stride=requested_stats_head_stride,
+        lse_base=lse_base,
     )
 
 
@@ -1810,7 +1860,13 @@ def cudnn_batch_prefill_with_kv_cache(
             batch_offsets_stats=batch_offsets_stats,
         ).resolve(q, k_cache, v_cache, batch_offsets_units=batch_offsets_units)
         prepared = prepare_cudnn_batch_prefill(
-            q, k_cache, v_cache, scale, workspace_buffer, metadata=metadata
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            workspace_buffer,
+            metadata=metadata,
+            lse_base=lse_base,
         )
         return prepared.run(
             q,

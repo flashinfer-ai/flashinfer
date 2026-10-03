@@ -11,6 +11,9 @@ from .utils import (
     get_cudnn_fmha_gen_module,
     get_cudnn_attention_handle,
     supports_ordered_cudnn_execution,
+    supports_native_cudnn_log2,
+    build_cudnn_graph_with_log2,
+    require_native_cudnn_log2,
 )
 
 try:
@@ -71,6 +74,7 @@ def _sdpa_decode_key_fn(
     q_len_per_req: int = 1,
     window_left: int = -1,
     sinks: Optional[torch.Tensor] = None,
+    stats_use_log2: bool = False,
 ):
     return (
         "decode",
@@ -122,14 +126,20 @@ def _sdpa_decode_key_fn(
         q_len_per_req,
         window_left,
         _tensor_layout_key(sinks),
+        stats_use_log2,
     )
 
 
 if CUDNN_AVAILABLE:
 
-    @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
     @cudnn.graph_cache(key_fn=_sdpa_decode_key_fn)
-    def _build_decode_graph(
+    def _build_decode_graph(*args, stats_use_log2=False, **kwargs):
+        return build_cudnn_graph_with_log2(
+            cudnn, _make_decode_graph, args, kwargs, stats_use_log2
+        )
+
+    @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
+    def _make_decode_graph(
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
@@ -143,6 +153,7 @@ if CUDNN_AVAILABLE:
         q_len_per_req: int = 1,
         window_left: int = -1,
         sinks: Optional[torch.Tensor] = None,
+        stats_use_log2: bool = False,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
@@ -261,6 +272,7 @@ if CUDNN_AVAILABLE:
                 paged_attention_max_seq_len_kv=max_sequence_kv,
                 compute_data_type=cudnn.data_type.FLOAT,
                 **mask_kwargs,
+                **({"stats_use_log2": True} if stats_use_log2 else {}),
             )
 
             # O is bound to a contiguous (batch * s_qo, h_qo, d_vo) buffer:
@@ -290,6 +302,8 @@ if CUDNN_AVAILABLE:
         if actual_seq_lens_kv is not None:
             tensors_to_return.append(cudnn_actual_seq_lens_kv)
 
+        if stats_use_log2:
+            require_native_cudnn_log2(g, cudnn)
         return g, tensors_to_return
 
 
@@ -484,6 +498,7 @@ def _execute_decode(
     return_lse,
     sinks,
     execution_bindings=None,
+    stats_use_log2=False,
 ):
     """Bind call-local pointers and apply the public base-2 LSE contract."""
     device = q.device
@@ -529,7 +544,7 @@ def _execute_decode(
             var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
 
         graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
-    if return_lse:
+    if return_lse and not stats_use_log2:
         # cuDNN emits natural-log softmax stats; FlashInfer's LSE contract is
         # base-2 (the cascade-merge kernels consume it), as in the prefill path.
         lse.mul_(log2e)
@@ -565,6 +580,8 @@ class CudnnDecodeGraph:
         "sinks_view",
         "seq_lens_q",
         "execution_bindings",
+        "requested_stats_use_log2",
+        "stats_use_log2",
     )
 
     def __init__(
@@ -581,6 +598,10 @@ class CudnnDecodeGraph:
         seq_lens_q: torch.Tensor,
     ):
         self.key = key
+        self.requested_stats_use_log2 = key[-1]
+        self.stats_use_log2 = return_lse and getattr(
+            graph, "_flashinfer_stats_use_log2", False
+        )
         self.graph = graph
         self.return_lse = return_lse
         self.batch_size = batch_size
@@ -673,6 +694,7 @@ class CudnnDecodeGraph:
             q_len_per_req=q_len_per_req,
             window_left=window_left,
             sinks=self.sinks_view,
+            stats_use_log2=self.requested_stats_use_log2,
         )
         return key == self.key
 
@@ -719,6 +741,7 @@ class CudnnDecodeGraph:
             # strided sink's copy is captured too, rather than cached stale.
             sinks=self.sinks_view if sinks is None else _decode_sinks(q, sinks),
             execution_bindings=self.execution_bindings,
+            stats_use_log2=self.stats_use_log2,
         )
 
 
@@ -792,6 +815,9 @@ def prepare_cudnn_batch_decode(
         q_len_per_req=q_len_per_req,
         window_left=window_left,
         sinks=sinks_view,
+    )
+    kwargs["stats_use_log2"] = return_lse and supports_native_cudnn_log2(
+        cudnn, q.device
     )
     graph, _ = _build_decode_graph(q_graph, k_cache, v_cache, scale, **kwargs)
     key = _sdpa_decode_key_fn(q_graph, k_cache, v_cache, scale, **kwargs)
@@ -1015,6 +1041,7 @@ def cudnn_batch_decode_with_kv_cache(
             q_len_per_req=q_len_per_req,
             window_left=window_left,
             sinks=sinks_view,
+            stats_use_log2=return_lse and supports_native_cudnn_log2(cudnn, q.device),
         )
         _execute_decode(
             graph,
@@ -1029,6 +1056,8 @@ def cudnn_batch_decode_with_kv_cache(
             block_tables=block_tables,
             return_lse=return_lse,
             sinks=sinks_view,
+            stats_use_log2=return_lse
+            and getattr(graph, "_flashinfer_stats_use_log2", False),
         )
 
     if return_lse:

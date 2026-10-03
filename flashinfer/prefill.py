@@ -3766,6 +3766,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     plan,
                     return_lse,
                     q.size(0) if native_hn else 0,
+                    lse_base=lse_base,
                 ):
                     prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
                         q,
@@ -3775,6 +3776,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         self._float_workspace_buffer,
                         metadata=plan.build_metadata(return_lse),
                         stats_head_stride=q.size(0) if native_hn else 0,
+                        lse_base=lse_base,
                     )
                 if native_hn and not prepared.stats_head_stride:
                     lse_out = lse
@@ -5620,7 +5622,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ):
                 prepared = self._cudnn_prepared
                 if prepared is None or not prepared.matches_plan(
-                    q, k, v, sm_scale, plan, return_lse, q.size(0) if native_hn else 0
+                    q,
+                    k,
+                    v,
+                    sm_scale,
+                    plan,
+                    return_lse,
+                    q.size(0) if native_hn else 0,
+                    lse_base=lse_base,
                 ):
                     prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
                         q,
@@ -5630,6 +5639,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         self._float_workspace_buffer,
                         metadata=plan.build_metadata(return_lse),
                         stats_head_stride=q.size(0) if native_hn else 0,
+                        lse_base=lse_base,
                     )
                 if native_hn and not prepared.stats_head_stride:
                     lse_out = lse

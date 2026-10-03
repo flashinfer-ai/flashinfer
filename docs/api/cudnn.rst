@@ -14,6 +14,14 @@ or fp8/NVFP4 KV. A sink at ``q_len_per_req == 1`` is served when the cuDNN
 stack's SDPA engines accept it (cudnn-frontend 1.30+ with the FROST engines
 enabled); the backend engine raises a not-supported error at the first run.
 
+FP16/BF16 graph execution can write base-2 LSE directly, avoiding a separate
+conversion. This requires cuDNN 9.27+ headers and runtime, an FE exposing the
+capability, and backend support for the requested graph. Older or unsupported
+configurations retain natural-log Stats plus conversion; FP8 handling is
+unchanged. Prefill callers requesting ``lse_base="ln"`` still receive the
+natural-log output directly. Each requested LSE base/layout is a graph
+specialization: warm it before CUDA graph capture.
+
 .. currentmodule:: flashinfer.cudnn
 
 .. autosummary::
