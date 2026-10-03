@@ -3,7 +3,7 @@
   "description": "Causal packed-FP8 MSA decode with independent per-query sparse rows, BF16 Q/O and device scalar K/V scales of ranks 0/0. K/V are split HND views of one cache with token stride 256.",
   "op_type": "msa_sparse",
   "tags": [
-    "fi_api:flashinfer.msa_ops.sparse_decode.msa_sparse_decode_attention",
+    "fi_api:flashinfer.msa_ops.sparse_decode.msa_packed_fp8_sparse_decode",
     "stage:decode"
   ],
   "axes": {

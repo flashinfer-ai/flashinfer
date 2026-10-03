@@ -38,7 +38,7 @@ import triton.language as tl
 
 from flashinfer.msa_ops import (
     MSASparseAttentionWorkspace,
-    msa_sparse_decode_attention,
+    msa_packed_fp8_sparse_decode,
 )
 
 
@@ -203,7 +203,7 @@ def main():
                     ref = torch.empty_like(case["out"])
 
                     def candidate(case=case):
-                        return msa_sparse_decode_attention(**case)
+                        return msa_packed_fp8_sparse_decode(**case)
 
                     def baseline(case=case, ref=ref, packed=packed):
                         return reference(

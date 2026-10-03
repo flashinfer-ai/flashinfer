@@ -913,25 +913,12 @@ _PACKED_FP8_DECODE_TRACES = {
 }
 
 
-def msa_sparse_decode_attention_trace_dispatch(**kwargs):
-    k = kwargs.get("k")
-    if (
-        isinstance(k, torch.Tensor)
-        and k.ndim == 4
-        and k.dtype == torch.float8_e4m3fn
-        and kwargs.get("page_table") is not None
-        and kwargs.get("k_scale") is not None
-        and kwargs.get("v_scale") is not None
-    ):
-        ranks = tuple(
-            getattr(kwargs[name], "ndim", -1) for name in ("k_scale", "v_scale")
-        )
-        return _PACKED_FP8_DECODE_TRACES.get(ranks)
-    return msa_sparse_decode_attention_trace
+def msa_packed_fp8_sparse_decode_trace(**kwargs):
+    ranks = tuple(getattr(kwargs[name], "ndim", -1) for name in ("k_scale", "v_scale"))
+    return _PACKED_FP8_DECODE_TRACES.get(ranks)
 
 
-msa_sparse_decode_attention_trace_dispatch.templates = (  # type: ignore[attr-defined]
-    msa_sparse_decode_attention_trace,
+msa_packed_fp8_sparse_decode_trace.templates = (  # type: ignore[attr-defined]
     *_PACKED_FP8_DECODE_TRACES.values(),
 )
 

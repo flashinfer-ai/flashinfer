@@ -24,7 +24,10 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api, flashinfer_experimental_api
-from ..trace.templates.msa import msa_sparse_decode_attention_trace_dispatch
+from ..trace.templates.msa import (
+    msa_packed_fp8_sparse_decode_trace,
+    msa_sparse_decode_attention_trace,
+)
 from ._blackwell_sm100 import (
     MSASparseAttentionWorkspace,
     blackwell_msa_sparse_decode_attention,
@@ -172,7 +175,7 @@ def _decode_num_chunks(
     return max(1, min(pow2, topk))
 
 
-@flashinfer_api(trace=msa_sparse_decode_attention_trace_dispatch)
+@flashinfer_api(trace=msa_sparse_decode_attention_trace)
 def msa_sparse_decode_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -203,9 +206,7 @@ def msa_sparse_decode_attention(
     KV blocks selected in ``q2k_indices``. Decode tokens are right-aligned:
     token ``i`` of a request sits at position ``seqlen_k - seqlen_q + i``.
     On compute capability 10.0/10.3/10.7, ``topk`` must be 16 and Q1 through
-    multi-token decode use the direct persistent M16 path, except packed FP8
-    K/V with device scalar scales on SM100/SM103, which uses TRT-LLM
-    block-sparse attention.
+    multi-token decode use the direct persistent M16 path.
 
     Parameters
     ----------
@@ -219,15 +220,8 @@ def msa_sparse_decode_attention(
         that packs K and V in one ``2 * head_dim`` content dim per token
         on SM120/SM121 (see ``supports_packed_kv``). Compute capability
         10.0/10.3/10.7 requires separate contiguous K and V tensors and never
-        copies packed views implicitly, with two specialized exceptions.
-        Packed FP8 HND cache ``(num_pages, Hkv, 128, 256)`` is supported as
-        ``k=cache[..., :128]`` and ``v=cache[..., 128:]`` with BF16 Q, device
-        scalar ``k_scale``/``v_scale`` and an explicit workspace. This path
-        accepts head layouts 64/4 or 16/1, batch size 1–256, query length 1–8
-        and contexts up to 262144. It requires causal attention, no explicit
-        ``q_offset``, no global scales/LSE output and default split settings.
-        The other exception, packed NVFP4
-        paged K/V (uint8, ``(num_pages, 4, 128, 64)``), is consumed in place
+        copies packed views implicitly, with one exception: packed NVFP4
+        paged K/V (uint8, ``(num_pages, 4, 128, 64)``) is consumed in place
         as strided views of a planar ``[K data | K scale | V data | V scale]``
         page, together with ``k_scale``/``v_scale`` and the two global
         scales.
@@ -235,10 +229,6 @@ def msa_sparse_decode_attention(
         ``(num_kv_heads, batch_size * seqlen_q, topk)`` int32, ascending,
         ``-1`` tail-padded (the format produced by
         :func:`msa_topk_select`).
-        The packed-FP8 SM100/SM103 path also accepts strided, unsorted rows.
-        Only the first ``min(16, ceil(causal_length / 128))`` entries are read;
-        these must be distinct valid logical page IDs. Unused slots are ignored,
-        and neither sharing/union across query rows nor adding the tail page occurs.
     seqlen_q : int
         Uniform query length per request (e.g. 1, or >1 for speculative
         decoding).
@@ -246,22 +236,16 @@ def msa_sparse_decode_attention(
         Page-table mapping for paged KV layout.
     seqused_k : torch.Tensor, optional
         Per-sequence valid KV-token counts for paged KV layout.
-        For packed FP8 on SM100/SM103, zero-length graph-padding rows are allowed;
-        their outputs are unspecified and must be ignored.
     cu_seqlens_k : torch.Tensor, optional
         ``(batch_size + 1,)`` int32 cumulative KV lengths for ragged KV layout.
     causal : bool
         Right-aligned causal masking (default True for decode).
     softmax_scale : float, optional
         Overrides the default attention scaling factor.
-        Packed FP8 on SM100/SM103 requires a finite positive host scalar, not a Tensor.
     return_softmax_lse : bool
         If ``True``, also return per-query log-sum-exp values.
     k_scale, v_scale : torch.Tensor, optional
-        Packed FP8 on SM100/SM103: required CUDA float32 scalars (one element
-        each); values may change in place between graph replays. Tracing
-        preserves 0D/1D ranks; higher-rank singleton scales are decode-only.
-        For NVFP4: e4m3 block scales, one per 16 elements. The layout is
+        NVFP4 only: e4m3 block scales, one per 16 elements. The layout is
         per architecture. On SM120/SM121 they are uint8 bytes in the swizzled
         128x4 layout produced by :func:`flashinfer.nvfp4_quantize` (rows
         padded to a multiple of 128), with scale rows following the cache
@@ -301,11 +285,6 @@ def msa_sparse_decode_attention(
         tensors, options, and capture stream before capture. It is not used by
         the SM120/SM121 backend.
 
-        Packed FP8 decode requires a workspace for eager calls as well. Its
-        output and temporary buffers are allocated on warmup, then reused.
-        As with other workspace-backed MSA paths, warm and capture on the same
-        stream and do not pass the workspace through Python after capture.
-
         The packed NVFP4 paged-KV route on compute capability 10.0/10.3/10.7 is the
         one exception: it captures without a workspace, because everything
         before its single kernel launch is host-side arithmetic over shapes and
@@ -325,8 +304,7 @@ def msa_sparse_decode_attention(
         this parameter exists to remove.
 
         Supported by the packed-NVFP4 paged-KV route on compute capability
-        10.0/10.3/10.7 and the packed-FP8 route on SM100/SM103. Every other
-        route raises ``NotImplementedError`` when it is
+        10.0/10.3/10.7. Every other route raises ``NotImplementedError`` when it is
         passed -- deliberately, so that a caller cannot be handed the copy back
         without being told.
 
@@ -337,16 +315,6 @@ def msa_sparse_decode_attention(
         uniform FP8 Q/K/V returns BF16; plus the natural-log LSE if
         ``return_softmax_lse``. When ``out`` is given it IS the returned
         tensor.
-
-    Notes
-    -----
-    Packed-FP8 SM100/SM103 metadata, page tables and scalar scale values may
-    change in place between graph replays. The native backend folds scales
-    into attention, while the Triton reference rounds scaled K/V to BF16 first.
-    Tests use ``atol=rtol=0.02`` and a per-query/head bound
-    ``RMS(error) <= 0.015 * RMS(reference) + 1e-5``; bitwise equality and strict
-    ``atol=0.01`` are not guaranteed. Validation does not read device values:
-    callers must provide valid lengths and indexer output.
     """
     if is_blackwell_msa_device(q.device):
         return blackwell_msa_sparse_decode_attention(
@@ -798,4 +766,110 @@ def prepare_msa_nvfp4_sparse_decode(
         out=out,
         lse=lse,
         backend="cake",
+    )
+
+
+@flashinfer_experimental_api(
+    trace=msa_packed_fp8_sparse_decode_trace,
+    feature="packed-FP8 MSA sparse decode (SM100/SM103)",
+)
+def msa_packed_fp8_sparse_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    *,
+    page_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    seqlen_q: int = 1,
+    softmax_scale: Optional[float] = None,
+    workspace: Optional[MSASparseAttentionWorkspace] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Run packed-FP8 MSA sparse decode on SM100/SM103 via TRT-LLM block-sparse attention.
+
+    Packed FP8 HND cache ``(num_pages, Hkv, 128, 256)`` is consumed in place as
+    ``k=cache[..., :128]`` and ``v=cache[..., 128:]`` with BF16 Q, device
+    scalar ``k_scale``/``v_scale`` and an explicit workspace. This path
+    accepts head layouts 64/4 or 16/1, batch size 1–256, query length 1–8
+    and contexts up to 262144. It requires causal attention, no explicit
+    ``q_offset``, no global scales/LSE output and default split settings.
+    K/V remain views into the original cache; only metadata is prepared
+    before the existing TRT-LLM block-sparse attention call.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        ``(batch_size * seqlen_q, num_qo_heads, 128)`` bf16.
+    k, v : torch.Tensor
+        Strided FP8 E4M3 views ``(num_pages, num_kv_heads, 128, 128)`` split
+        from one packed HND allocation with token stride 256.
+    q2k_indices : torch.Tensor
+        ``(num_kv_heads, batch_size * seqlen_q, topk)`` int32. This path
+        accepts strided, unsorted rows. Only the first
+        ``min(16, ceil(causal_length / 128))`` entries are read; these must be
+        distinct valid logical page IDs. Unused slots are ignored, and neither
+        sharing/union across query rows nor adding the tail page occurs.
+    page_table : torch.Tensor
+        Page-table mapping for paged KV layout.
+    seqused_k : torch.Tensor
+        Per-sequence valid KV-token counts for paged KV layout. Zero-length
+        graph-padding rows are allowed; their outputs are unspecified and
+        must be ignored.
+    k_scale, v_scale : torch.Tensor
+        Required CUDA float32 scalars (one element each); values may change
+        in place between graph replays. Tracing preserves 0D/1D ranks;
+        higher-rank singleton scales are decode-only.
+    seqlen_q : int
+        Uniform query length per request (e.g. 1, or >1 for speculative
+        decoding), in [1, 8].
+    softmax_scale : float, optional
+        Overrides the default attention scaling factor. Requires a finite
+        positive host scalar, not a Tensor.
+    workspace : MSASparseAttentionWorkspace
+        Packed FP8 decode requires a workspace for eager calls as well. Its
+        output and temporary buffers are allocated on warmup, then reused.
+        As with other workspace-backed MSA paths, warm and capture on the same
+        stream and do not pass the workspace through Python after capture.
+    out : torch.Tensor, optional
+        Destination for the attention output. When given, the kernel writes
+        straight into it and it is what this function returns -- no temporary
+        is allocated and nothing is copied. It must be contiguous, BF16, on
+        q's device, and exactly ``q.shape``; anything else raises rather than
+        being copied into, because a silent copy here is precisely the cost
+        this parameter exists to remove.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(batch_size * seqlen_q, num_qo_heads, 128)`` BF16. When ``out`` is
+        given it IS the returned tensor.
+
+    Notes
+    -----
+    Packed-FP8 metadata, page tables and scalar scale values may change in
+    place between graph replays. The native backend folds scales into
+    attention, while the Triton reference rounds scaled K/V to BF16 first.
+    Tests use ``atol=rtol=0.02`` and a per-query/head bound
+    ``RMS(error) <= 0.015 * RMS(reference) + 1e-5``; bitwise equality and strict
+    ``atol=0.01`` are not guaranteed. Validation does not read device values:
+    callers must provide valid lengths and indexer output.
+    """
+    from ..experimental.msa_fp8_decode.backend import run_packed_fp8_decode
+
+    return run_packed_fp8_decode(
+        q,
+        k,
+        v,
+        q2k_indices,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        seqlen_q=seqlen_q,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        softmax_scale=softmax_scale,
+        workspace=workspace,
+        out=out,
     )

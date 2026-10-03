@@ -2894,14 +2894,14 @@ with contextlib.suppress(Exception):
 with contextlib.suppress(Exception):
     from flashinfer.msa_ops import (
         MSASparseAttentionWorkspace,
-        msa_sparse_decode_attention,
+        msa_packed_fp8_sparse_decode,
     )
 
     _q = torch.randn(8, 64, 128, dtype=torch.bfloat16, device=device)
     _kv = torch.randn(32, 4, 128, 256, dtype=torch.bfloat16, device=device).to(
         torch.float8_e4m3fn
     )
-    msa_sparse_decode_attention(
+    msa_packed_fp8_sparse_decode(
         _q,
         _kv[..., :128],
         _kv[..., 128:],

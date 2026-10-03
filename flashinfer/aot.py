@@ -67,7 +67,6 @@ from .jit.blackwell_msa import (
     BLACKWELL_MSA_VARIANTS_BY_TARGET,
     BlackwellMSATarget,
     gen_blackwell_msa_module,
-    gen_msa_decode_metadata_module,
 )
 from .jit.cake_kda import (
     CAKE_KDA_AFFINE_ROLES,
@@ -673,7 +672,6 @@ def gen_all_modules(
     )
     for blackwell_msa_target, enabled in blackwell_msa_targets:
         if enabled:
-            jit_specs.append(gen_msa_decode_metadata_module(blackwell_msa_target))
             jit_specs.extend(
                 gen_blackwell_msa_module(variant, blackwell_msa_target)
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]

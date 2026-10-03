@@ -475,9 +475,9 @@ def _packed_fp8_decode_trace_inputs(k_rank=0, v_rank=0):
 
 @pytest.mark.parametrize("k_rank,v_rank", [(0, 0), (0, 1), (1, 0), (1, 1)])
 def test_msa_packed_fp8_trace_scale_ranks(k_rank, v_rank, tmp_path):
-    from flashinfer.msa_ops import msa_sparse_decode_attention
+    from flashinfer.msa_ops import msa_packed_fp8_sparse_decode
 
-    definition = msa_sparse_decode_attention.fi_trace(
+    definition = msa_packed_fp8_sparse_decode.fi_trace(
         save_dir=tmp_path, **_packed_fp8_decode_trace_inputs(k_rank, v_rank)
     )
     assert definition["name"] == (
@@ -498,28 +498,22 @@ def test_msa_packed_fp8_trace_scale_ranks(k_rank, v_rank, tmp_path):
 
 
 def test_msa_packed_fp8_trace_names_do_not_collide(tmp_path):
-    from flashinfer.msa_ops import msa_sparse_decode_attention
+    from flashinfer.msa_ops import msa_packed_fp8_sparse_decode
 
     for kr, vr in ((0, 0), (0, 1), (1, 0), (1, 1)):
-        msa_sparse_decode_attention.fi_trace(
+        msa_packed_fp8_sparse_decode.fi_trace(
             save_dir=tmp_path, **_packed_fp8_decode_trace_inputs(kr, vr)
         )
     assert len(list(tmp_path.glob("*.json"))) == 4
 
 
-def test_msa_decode_trace_keeps_flat_schema_and_rejects_higher_scale_rank():
-    from flashinfer.trace.templates.msa import (
-        msa_sparse_decode_attention_trace,
-        msa_sparse_decode_attention_trace_dispatch,
-    )
+def test_msa_packed_fp8_trace_rejects_higher_scale_rank():
+    from flashinfer.trace.templates.msa import msa_packed_fp8_sparse_decode_trace
 
-    assert (
-        msa_sparse_decode_attention_trace_dispatch()
-        is msa_sparse_decode_attention_trace
-    )
     inputs = _packed_fp8_decode_trace_inputs()
+    assert msa_packed_fp8_sparse_decode_trace(**inputs) is not None
     inputs["k_scale"] = torch.ones(1, 1)
-    assert msa_sparse_decode_attention_trace_dispatch(**inputs) is None
+    assert msa_packed_fp8_sparse_decode_trace(**inputs) is None
 
 
 def assert_fi_trace_complete(

@@ -22,6 +22,7 @@ from .proxy_score import (
 )
 from .sparse_prefill import msa_sparse_attention
 from .sparse_decode import (
+    msa_packed_fp8_sparse_decode,
     msa_sparse_decode_attention,
     prepare_msa_nvfp4_sparse_decode,
 )
@@ -33,10 +34,7 @@ SUPPORTS_PACKED_KV = True
 
 
 def supports_packed_kv(device: torch.device | str) -> bool:
-    """Return generic packed-KV support; SM100/SM103 has narrower decode routes.
-
-    See :func:`msa_sparse_decode_attention` for packed FP8/NVFP4 requirements.
-    """
+    """Return whether MSA accepts packed paged K/V views on ``device``."""
 
     normalized_device = torch.device(device)
     return normalized_device.type == "cuda" and get_compute_capability(
@@ -49,6 +47,7 @@ __all__ = [
     "SUPPORTS_PACKED_KV",
     "msa_decode_nvfp4_specialized_stats",
     "msa_decode_nvfp4_specialized_warmup",
+    "msa_packed_fp8_sparse_decode",
     "msa_prefill_nvfp4_specialized_stats",
     "msa_prefill_nvfp4_specialized_warmup",
     "msa_proxy_score",

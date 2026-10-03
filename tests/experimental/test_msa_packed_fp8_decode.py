@@ -13,7 +13,7 @@ import torch
 
 from flashinfer.msa_ops import (
     MSASparseAttentionWorkspace,
-    msa_sparse_decode_attention,
+    msa_packed_fp8_sparse_decode,
 )
 from flashinfer.utils import get_compute_capability
 
@@ -139,32 +139,35 @@ def test_numeric_check_rejects_small_incorrect_rows():
     "scale", [0, -0.125, float("inf"), float("-inf"), float("nan"), torch.tensor(0.1)]
 )
 def test_packed_fp8_host_scale_rejected_before_cuda_work(monkeypatch, scale):
+    import flashinfer.experimental.msa_fp8_decode.jit as fp8_jit
     import flashinfer.msa_ops.sparse_decode as decode
-    import flashinfer.jit.blackwell_msa as jit_msa
 
     def forbidden(*args, **kwargs):
         raise AssertionError(
             "invalid scale must not be converted from a Tensor or launch work"
         )
 
-    monkeypatch.setattr(decode, "is_blackwell_msa_device", lambda device: True)
     monkeypatch.setattr(torch.Tensor, "__float__", forbidden)
-    monkeypatch.setattr(jit_msa, "load_msa_decode_metadata_module", forbidden)
+    monkeypatch.setattr(fp8_jit, "load_msa_decode_metadata_module", forbidden)
     packed = torch.empty(1, 1, 128, 256, dtype=torch.float8_e4m3fn)
     error = TypeError if isinstance(scale, torch.Tensor) else ValueError
     with pytest.raises(error, match="softmax_scale"):
-        decode.msa_sparse_decode_attention(
+        decode.msa_packed_fp8_sparse_decode(
             torch.empty(4, 16, 128, dtype=torch.bfloat16),
             packed[..., :128],
             packed[..., 128:],
             torch.empty(1, 4, 16, dtype=torch.int32),
+            page_table=torch.empty(1, 1, dtype=torch.int32),
+            seqused_k=torch.empty(1, dtype=torch.int32),
+            k_scale=torch.empty(1),
+            v_scale=torch.empty(1),
             softmax_scale=scale,
         )
 
 
-def test_packed_fp8_dispatch_reuses_existing_msa_interface(monkeypatch):
+def test_packed_fp8_api_hands_off_to_experimental_backend(monkeypatch):
+    import flashinfer.experimental.msa_fp8_decode.backend as backend
     import flashinfer.msa_ops.sparse_decode as decode
-    from flashinfer.msa_ops import _blackwell_sm100 as backend
 
     packed = torch.empty(1, 1, 128, 256, dtype=torch.float8_e4m3fn)
     q = torch.empty(4, 16, 128, dtype=torch.bfloat16)
@@ -178,14 +181,17 @@ def test_packed_fp8_dispatch_reuses_existing_msa_interface(monkeypatch):
         assert kwargs["workspace"] is workspace
         return q
 
-    monkeypatch.setattr(decode, "is_blackwell_msa_device", lambda device: True)
-    monkeypatch.setattr(backend, "_run_packed_fp8_decode", route)
+    monkeypatch.setattr(backend, "run_packed_fp8_decode", route)
     assert (
-        decode.msa_sparse_decode_attention(
+        decode.msa_packed_fp8_sparse_decode(
             q,
             packed[..., :128],
             packed[..., 128:],
             indices,
+            page_table=torch.empty(1, 1, dtype=torch.int32),
+            seqused_k=torch.empty(1, dtype=torch.int32),
+            k_scale=torch.empty(1),
+            v_scale=torch.empty(1),
             seqlen_q=4,
             workspace=workspace,
         )
@@ -198,7 +204,7 @@ def require_blackwell(request):
     # These descriptor/dispatch tests also run without a CUDA device.
     if request.function in (
         test_packed_fp8_host_scale_rejected_before_cuda_work,
-        test_packed_fp8_dispatch_reuses_existing_msa_interface,
+        test_packed_fp8_api_hands_off_to_experimental_backend,
     ):
         return
     if not torch.cuda.is_available() or get_compute_capability(
@@ -212,7 +218,7 @@ def require_blackwell(request):
 def test_independent_rows(hkv, qlen):
     case = make_case(qlen=qlen, hkv=hkv, context=8193)
     assert not torch.equal(case["q2k_indices"][:, 0], case["q2k_indices"][:, 1])
-    assert_numerics(msa_sparse_decode_attention(**case), torch_reference(case))
+    assert_numerics(msa_packed_fp8_sparse_decode(**case), torch_reference(case))
 
 
 @pytest.mark.parametrize(
@@ -221,7 +227,7 @@ def test_independent_rows(hkv, qlen):
 @pytest.mark.parametrize("hkv", [1, 4])
 def test_lengths_and_shared_pages(context, hkv):
     case = make_case(context=context, hkv=hkv)
-    result = msa_sparse_decode_attention(**case)
+    result = msa_packed_fp8_sparse_decode(**case)
     assert result is case["out"]
     assert_numerics(result, torch_reference(case))
     # Independently inspect the metadata; poisoned unused slots must be ignored.
@@ -254,11 +260,11 @@ def test_graph_replay_updates_every_metadata_input(hkv):
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            msa_sparse_decode_attention(**case)
+            msa_packed_fp8_sparse_decode(**case)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        msa_sparse_decode_attention(**case)
+        msa_packed_fp8_sparse_decode(**case)
     pointers = {k: v.data_ptr() for k, v in case.items() if isinstance(v, torch.Tensor)}
     original_q = case["q"].clone()
     original_kv = packed_kv_cache(case).view(torch.uint8).clone()
@@ -313,7 +319,7 @@ def test_no_steady_state_tensor_allocations(monkeypatch, strided):
         storage = torch.empty(4, total * 2 + 7, 16, dtype=torch.int32, device="cuda")
         storage[:, :total].copy_(case["q2k_indices"])
         case["q2k_indices"] = storage[:, :total]
-    msa_sparse_decode_attention(**case)
+    msa_packed_fp8_sparse_decode(**case)
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()["allocation.all.allocated"]
 
@@ -326,16 +332,16 @@ def test_no_steady_state_tensor_allocations(monkeypatch, strided):
         for name in ("item", "cpu", "tolist"):
             m.setattr(torch.Tensor, name, forbidden)
         for _ in range(4):
-            msa_sparse_decode_attention(**case)
+            msa_packed_fp8_sparse_decode(**case)
     torch.cuda.synchronize()
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
 
 
 def test_changing_one_row_does_not_change_other_tokens():
     case = make_case(hkv=4)
-    original = msa_sparse_decode_attention(**case).clone()
+    original = msa_packed_fp8_sparse_decode(**case).clone()
     case["q2k_indices"][2, 3] = torch.arange(16, device="cuda", dtype=torch.int32)
-    result = msa_sparse_decode_attention(**case).clone()
+    result = msa_packed_fp8_sparse_decode(**case).clone()
     delta = (result != original).any(-1)
     expected_mask = torch.zeros_like(delta)
     expected_mask[3, 32:48] = True
@@ -351,21 +357,21 @@ def test_invalid_tensor_contract_rejected(name):
     case = make_case(context=129)
     case[name] = case[name].to(torch.float64)
     with pytest.raises(ValueError, match=name):
-        msa_sparse_decode_attention(**case)
+        msa_packed_fp8_sparse_decode(**case)
 
 
 def test_per_token_scale_rejected_explicitly():
     case = make_case(context=129)
     case["k_scale"] = torch.ones(1, 256, device="cuda")
     with pytest.raises(ValueError, match="scalar"):
-        msa_sparse_decode_attention(**case)
+        msa_packed_fp8_sparse_decode(**case)
 
 
 def test_zero_dimensional_scales():
     case = make_case(context=129)
     case["k_scale"] = case["k_scale"].reshape(())
     case["v_scale"] = case["v_scale"].reshape(())
-    assert_numerics(msa_sparse_decode_attention(**case), torch_reference(case))
+    assert_numerics(msa_packed_fp8_sparse_decode(**case), torch_reference(case))
 
 
 @pytest.mark.parametrize("scale_device", ["cpu", "cuda"])
@@ -373,7 +379,7 @@ def test_zero_dimensional_scales():
 def test_tensor_softmax_scale_rejected_without_sync(
     monkeypatch, scale_device, capturing
 ):
-    import flashinfer.jit.blackwell_msa as jit_msa
+    import flashinfer.experimental.msa_fp8_decode.jit as jit_msa
 
     case = make_case(context=129)
     case["softmax_scale"] = torch.tensor(0.1, device=scale_device)
@@ -391,7 +397,7 @@ def test_tensor_softmax_scale_rejected_without_sync(
         torch.cuda.set_sync_debug_mode("error")
         try:
             with pytest.raises(TypeError, match="softmax_scale must be a host float"):
-                msa_sparse_decode_attention(**case)
+                msa_packed_fp8_sparse_decode(**case)
         finally:
             torch.cuda.set_sync_debug_mode(previous)
 
@@ -410,14 +416,14 @@ def test_tensor_softmax_scale_rejected_without_sync(
 def test_host_softmax_scale_still_works(softmax_scale):
     case = make_case(context=129)
     case["softmax_scale"] = softmax_scale
-    assert_numerics(msa_sparse_decode_attention(**case), torch_reference(case))
+    assert_numerics(msa_packed_fp8_sparse_decode(**case), torch_reference(case))
 
 
 def test_unrelated_packed_views_rejected_without_copy():
     case = make_case(hkv=4, context=129)
     case["v"] = case["v"].clone()
     with pytest.raises(ValueError, match="packed"):
-        msa_sparse_decode_attention(**case)
+        msa_packed_fp8_sparse_decode(**case)
 
 
 @pytest.mark.parametrize("hkv", [1, 4])
@@ -447,13 +453,13 @@ def test_strided_metadata_graph(hkv, layout):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        msa_sparse_decode_attention(**case)
+        msa_packed_fp8_sparse_decode(**case)
     torch.cuda.current_stream().wait_stream(stream)
     assert_numerics(case["out"], torch_reference(case))
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        msa_sparse_decode_attention(**case)
+        msa_packed_fp8_sparse_decode(**case)
     case["page_table"].copy_(case["page_table"].roll(1, 1))
     case["k_scale"].fill_(0.9)
     graph.replay()
@@ -467,11 +473,11 @@ def test_graph_padding_rows_can_become_active():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        msa_sparse_decode_attention(**case)
+        msa_packed_fp8_sparse_decode(**case)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        msa_sparse_decode_attention(**case)
+        msa_packed_fp8_sparse_decode(**case)
     for lengths in (
         [0, 8, 0, 129],
         [8193, 0, 17, 0],
