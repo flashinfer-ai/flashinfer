@@ -1,5 +1,21 @@
-// Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
-// DeepGEMM portions are licensed under MIT; see ../DEEPGEMM_NOTICE.txt.
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
+ * DeepGEMM portions are licensed under MIT; see DEEPGEMM_NOTICE.txt.
+ */
 
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
@@ -10,15 +26,15 @@ typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
 #endif
-static_assert(sizeof(uint64_t) == 8, "Deepgemm requires an LP64 CUDA host ABI");
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) DeepgemmTensorMap { uint64_t opaque[16]; };
-struct __align__(64) DeepgemmTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(DeepgemmTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(DeepgemmTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) DeepgemmTensorMapPack { DeepgemmTensorMap maps[N]; };
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+struct CakeFastDivmod { int32_t divisor; uint32_t multiplier; uint32_t shift_right; };
+static_assert(sizeof(CakeFastDivmod) == 12, "CakeFastDivmod CUDA ABI must be 12 bytes");
+static_assert(alignof(CakeFastDivmod) == 4, "CakeFastDivmod CUDA ABI must be 4-byte aligned");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -27,18 +43,10 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(DeepgemmTensorMap) >= alignof(CUtensorMap), "DeepgemmTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define DEEPGEMM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_LOGICAL_OFF 0
 #define SMEM_LOGICAL_STAGE_BYTES 16384
@@ -46,17 +54,18 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_PACKED_BLOCKS_OFF 16384
 #define SMEM_PACKED_BLOCKS_STAGE_BYTES 16384
 #define SMEM_PACKED_BLOCKS_STRIDE 16384
-#define SMEM_WARP_SUMS_OFF 33024
+#define SMEM_WARP_SUMS_OFF 32768
 #define SMEM_WARP_SUMS_STAGE_BYTES 32
 #define SMEM_WARP_SUMS_STRIDE 32
-#define SMEM_HIST_OFF 33056
+#define SMEM_HIST_OFF 32800
 #define SMEM_HIST_STAGE_BYTES 288
 #define SMEM_HIST_STRIDE 288
-#define SMEM_STATE_OFF 33344
+#define SMEM_STATE_OFF 33088
 #define SMEM_STATE_STAGE_BYTES 32
 #define SMEM_STATE_STRIDE 32
-#define SMEM_TOTAL 33408
+#define SMEM_TOTAL 33152
 #define THREADS 256
+#define NUM_SMS 152
 
 #include <math_constants.h>
 
@@ -73,22 +82,14 @@ __device__ __forceinline__ uint32_t elect_sync() {
     return pred;
 }
 
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
 extern "C" {
 
 __global__ __launch_bounds__(256, 4) void
-kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Context, unsigned int* __restrict__ BlockTable, unsigned int* __restrict__ Requests, unsigned int* __restrict__ Sparse, unsigned int* __restrict__ Metadata, unsigned int* __restrict__ Workspace, unsigned int num_q_tokens, unsigned int num_kv_tokens, unsigned int block_table_stride, unsigned int num_ctas)
+kernel_cake_deepgemm_sparse_mqa_ff8c1a20aeba51091b1e(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Context, unsigned int* __restrict__ BlockTable, unsigned int* __restrict__ Requests, unsigned int* __restrict__ Sparse, unsigned int* __restrict__ Metadata, unsigned int* __restrict__ Workspace, unsigned int num_q_tokens, unsigned int num_kv_tokens, unsigned int block_table_stride, unsigned int num_ctas, unsigned int num_sms, CakeFastDivmod sms_divmod, unsigned int num_max_sparse_blocks, unsigned int blocks_per_split, CakeFastDivmod split_divmod, unsigned int sparse_block_kv, unsigned int block_shift, unsigned int blocks_per_page, unsigned int page_shift)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    uint32_t lane;
-    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+    const uint32_t lane = static_cast<uint32_t>(tid) & 31u;
 
     extern __shared__ __align__(128) char smem_raw[];
     int smem;
@@ -97,17 +98,19 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
+    const int cta_rank = 0;
+
     // Kernel setup ops
     unsigned int* logical = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int logical_addr = smem + 0;
     unsigned int* packed_blocks = reinterpret_cast<unsigned int*>(smem_raw + 16384);
     const int packed_blocks_addr = smem + 16384;
-    unsigned int* warp_sums = reinterpret_cast<unsigned int*>(smem_raw + 33024);
-    const int warp_sums_addr = smem + 33024;
-    unsigned int* hist = reinterpret_cast<unsigned int*>(smem_raw + 33056);
-    const int hist_addr = smem + 33056;
-    unsigned int* state = reinterpret_cast<unsigned int*>(smem_raw + 33344);
-    const int state_addr = smem + 33344;
+    unsigned int* warp_sums = reinterpret_cast<unsigned int*>(smem_raw + 32768);
+    const int warp_sums_addr = smem + 32768;
+    unsigned int* hist = reinterpret_cast<unsigned int*>(smem_raw + 32800);
+    const int hist_addr = smem + 32800;
+    unsigned int* state = reinterpret_cast<unsigned int*>(smem_raw + 33088);
+    const int state_addr = smem + 33088;
 
     // === Task calls (dependency order) ===
     unsigned int qidx = bid;
@@ -192,7 +195,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
                         if (nq > (unsigned int)qi) {
                             unsigned int begin = 0;
                             unsigned int end = Context[qidx + (unsigned int)qi];
-                            int _min_7 = ((2048) < ((end - begin + 8 - 1) / 8) ? (2048) : ((end - begin + 8 - 1) / 8));
+                            int _min_7 = ((2048) < (end - begin + 8 - 1 >> 3) ? (2048) : (end - begin + 8 - 1 >> 3));
                             nblocks = _min_7;
                         }
                         state[2 + qi] = nblocks;
@@ -345,7 +348,9 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
         unsigned int total = _shfl_1;
         unsigned int _shfl_2 = __shfl_sync(0xFFFFFFFF, warp_sum - warp_total, warp);
         unsigned int preceding = _shfl_2;
-        unsigned int nsplits = (total + 64 - 1) / 64;
+        uint32_t _fast_div_q_0 = (split_divmod.divisor != 1) ? (__umulhi((uint32_t)(total + blocks_per_split - 1), split_divmod.multiplier) >> split_divmod.shift_right) : (uint32_t)(total + blocks_per_split - 1);
+        uint32_t _fast_div_r_0 = (uint32_t)(total + blocks_per_split - 1) - _fast_div_q_0 * (uint32_t)(split_divmod.divisor);
+        unsigned int nsplits = _fast_div_q_0;
         if (tid == 0) {
             state[4] = 0;
             if (nsplits != 0) {
@@ -376,14 +381,16 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
             for (int kk = 0; kk < 2; kk++) {
                 unsigned int pair_idx = tid + (kc * 2 + kk) * 256;
                 if (pair_idx < npairs) {
+                    unsigned int page_mask = 7;
                     unsigned int first = pair_idx * 2;
                     unsigned int packed_value = packed_blocks[first];
                     unsigned int s0 = packed_value & 32767;
                     unsigned int s1 = packed_value >> 16 & 32767;
                     unsigned int in0_1 = packed_value & 32768;
                     unsigned int logical_block = ((in0_1 != 0) ? logical[s0] : logical[2048 + s1]);
-                    unsigned int logical_page = logical_block / 8;
-                    unsigned int physical0 = BlockTable[(unsigned long long)qbase * (unsigned long long)block_table_stride + (unsigned long long)logical_page] * 8 + logical_block % 8;
+                    unsigned int logical_page = logical_block >> 3;
+                    unsigned int in_page = logical_block & page_mask;
+                    unsigned int physical0 = (BlockTable[(unsigned long long)qbase * (unsigned long long)block_table_stride + (unsigned long long)logical_page] << 3) + in_page;
                     unsigned int physical1 = 0;
                     if (total > first + 1) {
                         unsigned int next_value = packed_blocks[first + 1];
@@ -391,8 +398,9 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
                         unsigned int t1 = next_value >> 16 & 32767;
                         unsigned int next_in0 = next_value & 32768;
                         unsigned int next_block = ((next_in0 != 0) ? logical[t0] : logical[2048 + t1]);
-                        unsigned int next_page = next_block / 8;
-                        physical1 = BlockTable[(unsigned long long)qbase * (unsigned long long)block_table_stride + (unsigned long long)next_page] * 8 + next_block % 8;
+                        unsigned int next_page = next_block >> 3;
+                        unsigned int next_in_page = next_block & page_mask;
+                        physical1 = (BlockTable[(unsigned long long)qbase * (unsigned long long)block_table_stride + (unsigned long long)next_page] << 3) + next_in_page;
                     }
                     pr_phys0[kk] = physical0;
                     pr_phys1[kk] = physical1;
@@ -403,9 +411,11 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
                 unsigned int pair_idx_1 = tid + (kc * 2 + kk_1) * 256;
                 if (pair_idx_1 < npairs) {
                     unsigned int first_1 = pair_idx_1 * 2;
-                    unsigned int split_off = first_1 / 64;
+                    uint32_t _fast_div_q_1 = (split_divmod.divisor != 1) ? (__umulhi((uint32_t)(first_1), split_divmod.multiplier) >> split_divmod.shift_right) : (uint32_t)(first_1);
+                    uint32_t _fast_div_r_1 = (uint32_t)(first_1) - _fast_div_q_1 * (uint32_t)(split_divmod.divisor);
+                    unsigned int split_off = _fast_div_q_1;
+                    unsigned int block = _fast_div_r_1;
                     unsigned int split = split_base + split_off;
-                    unsigned int block = first_1 % 64;
                     unsigned int bases = packed_blocks[first_1 - block];
                     unsigned int b0 = bases & 32767;
                     unsigned int b1 = bases >> 16 & 32767;
@@ -413,12 +423,11 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
                     unsigned int s0_1 = packed_value_1 & 32767;
                     unsigned int s1_1 = packed_value_1 >> 16 & 32767;
                     unsigned int in0_2 = packed_value_1 & 32768;
-                    unsigned int in1_1 = packed_value_1 & 2147483648;
+                    unsigned int in1_1 = packed_value_1 & 2147483648u;
                     unsigned int logical_block_1 = ((in0_2 != 0) ? logical[s0_1] : logical[2048 + s1_1]);
                     unsigned int o0 = ((in0_2 != 0) ? s0_1 - b0 : (unsigned int)65535);
                     unsigned int o1 = ((in1_1 != 0) ? s1_1 - b1 : (unsigned int)65535);
                     unsigned int pair[4];
-                    unsigned int logical_page_1 = logical_block_1 / 8;
                     pair[0] = pr_phys0[kk_1];
                     pair[1] = o0 | o1 << 16;
                     unsigned int second_physical = 0;
@@ -428,9 +437,8 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
                         unsigned int t0_1 = next_value_1 & 32767;
                         unsigned int t1_1 = next_value_1 >> 16 & 32767;
                         unsigned int next_in0_1 = next_value_1 & 32768;
-                        unsigned int next_in1 = next_value_1 & 2147483648;
+                        unsigned int next_in1 = next_value_1 & 2147483648u;
                         unsigned int next_block_1 = ((next_in0_1 != 0) ? logical[t0_1] : logical[2048 + t1_1]);
-                        unsigned int next_page_1 = next_block_1 / 8;
                         second_physical = pr_phys1[kk_1];
                         unsigned int p0 = ((next_in0_1 != 0) ? t0_1 - b0 : (unsigned int)65535);
                         unsigned int p1 = ((next_in1 != 0) ? t1_1 - b1 : (unsigned int)65535);
@@ -438,9 +446,9 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
                     }
                     pair[2] = second_physical;
                     pair[3] = second_offsets;
-                    unsigned int dst = 4 + split * 132;
+                    unsigned int dst = 4 + split * 4 + split * (blocks_per_split * 2);
                     if (block == 0) {
-                        int _min_9 = ((64) < (total - first_1) ? (64) : (total - first_1));
+                        unsigned int _min_9 = ((blocks_per_split) < (total - first_1) ? (blocks_per_split) : (total - first_1));
                         unsigned int num_1 = _min_9;
                         unsigned int contiguous = 0;
                         unsigned int split_header[4];
@@ -455,8 +463,12 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
             }
         }
         #pragma unroll 1
-        for (unsigned int padded = (total + 1) / 2 * 2 + (unsigned int)(tid * 2); padded < nsplits * 64; padded += 512) {
-            unsigned int dst_1 = 4 + (split_base + padded / 64) * 132 + 4 + padded % 64 * 2;
+        for (unsigned int padded = (total + 1) / 2 * 2 + (unsigned int)(tid * 2); padded < nsplits * blocks_per_split; padded += 512) {
+            uint32_t _fast_div_q_2 = (split_divmod.divisor != 1) ? (__umulhi((uint32_t)(padded), split_divmod.multiplier) >> split_divmod.shift_right) : (uint32_t)(padded);
+            uint32_t _fast_div_r_2 = (uint32_t)(padded) - _fast_div_q_2 * (uint32_t)(split_divmod.divisor);
+            unsigned int pad_split = split_base + _fast_div_q_2;
+            unsigned int pad_block = _fast_div_r_2;
+            unsigned int dst_1 = 4 + pad_split * 4 + pad_split * (blocks_per_split * 2) + 4 + pad_block * 2;
             unsigned int pad_pair[4];
             pad_pair[0] = 0;
             pad_pair[1] = (unsigned int)4294967295;
@@ -492,7 +504,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
     __syncthreads();
     if (state[5] != 0) {
         unsigned int total_1 = Workspace[0];
-        unsigned int sched = 4 + total_1 * 132;
+        unsigned int sched = 4 + total_1 * 4 + total_1 * (blocks_per_split * 2);
         unsigned int nentries = 0;
         #pragma unroll 1
         for (unsigned int qbatch = 0; qbatch < num_q_tokens; qbatch += 512) {
@@ -505,7 +517,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
             if (qi_2 < num_q_tokens) {
                 unsigned long long _vec_load_0[1];
                 {
-                    _vec_load_0[0] = *reinterpret_cast<const unsigned long long*>(Workspace + 96 + qi_2 * 2);
+                    _vec_load_0[0] = *reinterpret_cast<const unsigned long long*>(Workspace + (96 + qi_2 * 2));
                 }
                 qsplit = (unsigned int)_vec_load_0[0];
                 qcount = (unsigned int)(_vec_load_0[0] >> 32);
@@ -513,7 +525,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
             if (qj < num_q_tokens) {
                 unsigned long long _vec_load_1[1];
                 {
-                    _vec_load_1[0] = *reinterpret_cast<const unsigned long long*>(Workspace + 96 + qj * 2);
+                    _vec_load_1[0] = *reinterpret_cast<const unsigned long long*>(Workspace + (96 + qj * 2));
                 }
                 qsplit2 = (unsigned int)_vec_load_1[0];
                 qcount2 = (unsigned int)(_vec_load_1[0] >> 32);
@@ -695,10 +707,10 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
             nentries += total_23;
             __syncthreads();
         }
-        int _max_1 = ((1) > ((nentries + 152 - 1) / 152) ? (1) : ((nentries + 152 - 1) / 152));
+        int _max_1 = ((1) > ((nentries + (unsigned int)NUM_SMS - 1) / (unsigned int)NUM_SMS) ? (1) : ((nentries + (unsigned int)NUM_SMS - 1) / (unsigned int)NUM_SMS));
         unsigned int waves = _max_1;
         #pragma unroll 1
-        for (unsigned int entry_2 = nentries + (unsigned int)tid; entry_2 < waves * 152; entry_2 += 256) {
+        for (unsigned int entry_2 = nentries + (unsigned int)tid; entry_2 < waves * (unsigned int)NUM_SMS; entry_2 += 256) {
             unsigned int empty_entry[4];
             #pragma unroll
             for (int j_2 = 0; j_2 < 4; j_2++) {
@@ -715,16 +727,14 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
                 #pragma unroll
                 for (int ei = 0; ei < 5; ei++) {
                     unsigned int sm = lane + (unsigned int)(ei * 32);
-                    if (sm < 152) {
+                    if (sm < (unsigned int)NUM_SMS) {
                         unsigned int _vec_load_2[4];
                         {
-                            const uint4* _ivptr_0 = reinterpret_cast<const uint4*>(Metadata + sched + (wave * 152 + sm) * 4);
-                            uint4 _ivld_0;
-                            _ivld_0 = *_ivptr_0;
-                            _vec_load_2[0 + 0] = _ivld_0.x;
-                            _vec_load_2[0 + 1] = _ivld_0.y;
-                            _vec_load_2[0 + 2] = _ivld_0.z;
-                            _vec_load_2[0 + 3] = _ivld_0.w;
+                            uint4 _uv4_0 = *reinterpret_cast<const uint4*>(Metadata + sched + (wave * (unsigned int)NUM_SMS + sm) * 4);
+                            _vec_load_2[0 + 0] = _uv4_0.x;
+                            _vec_load_2[0 + 1] = _uv4_0.y;
+                            _vec_load_2[0 + 2] = _uv4_0.z;
+                            _vec_load_2[0 + 3] = _uv4_0.w;
                         }
                         #pragma unroll
                         for (int j_3 = 0; j_3 < 4; j_3++) {
@@ -739,7 +749,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
                 __syncwarp();
                 #pragma unroll
                 for (int ei_1 = 0; ei_1 < 5; ei_1++) {
-                    if (lane + (unsigned int)(ei_1 * 32) < 152) {
+                    if (lane + (unsigned int)(ei_1 * 32) < (unsigned int)NUM_SMS) {
                         unsigned int count_1 = entry_regs[ei_1 * 4 + 1] - entry_regs[ei_1 * 4];
                         uint32_t _shared_atomic_old_0;
                         asm volatile("atom.shared.add.u32 %0, [%1], %2;" : "=r"(_shared_atomic_old_0) : "r"(static_cast<uint32_t>((hist_addr + 4 * (warp * 9 + count_1)))), "r"(static_cast<uint32_t>(1)) : "memory");
@@ -759,16 +769,16 @@ kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict_
                 __syncwarp();
                 #pragma unroll
                 for (int ei_2 = 0; ei_2 < 5; ei_2++) {
-                    if (lane + (unsigned int)(ei_2 * 32) < 152) {
+                    if (lane + (unsigned int)(ei_2 * 32) < (unsigned int)NUM_SMS) {
                         unsigned int count_3 = entry_regs[ei_2 * 4 + 1] - entry_regs[ei_2 * 4];
                         unsigned int rank = hist[warp * 9 + count_3] + ranks[ei_2];
-                        unsigned int dst_sm = ((wave % 2 == 0) ? rank : 151 - rank);
+                        unsigned int dst_sm = ((wave % 2 == 0) ? rank : (unsigned int)(NUM_SMS - 1) - rank);
                         unsigned int entry_store[4];
                         #pragma unroll
                         for (int j_4 = 0; j_4 < 4; j_4++) {
                             entry_store[j_4] = entry_regs[ei_2 * 4 + j_4];
                         }
-                        reinterpret_cast<int4*>(Metadata + (sched + (wave * 152 + dst_sm) * 4))[0] = reinterpret_cast<int4*>(entry_store)[0];
+                        reinterpret_cast<int4*>(Metadata + (sched + (wave * (unsigned int)NUM_SMS + dst_sm) * 4))[0] = reinterpret_cast<int4*>(entry_store)[0];
                     }
                 }
             }

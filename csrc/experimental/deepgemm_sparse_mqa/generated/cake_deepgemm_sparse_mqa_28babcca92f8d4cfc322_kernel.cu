@@ -1,5 +1,21 @@
-// Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
-// DeepGEMM portions are licensed under MIT; see ../DEEPGEMM_NOTICE.txt.
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
+ * DeepGEMM portions are licensed under MIT; see DEEPGEMM_NOTICE.txt.
+ */
 
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
@@ -10,13 +26,12 @@ typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
 #endif
-static_assert(sizeof(uint64_t) == 8, "Deepgemm requires an LP64 CUDA host ABI");
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) DeepgemmTensorMap { uint64_t opaque[16]; };
-struct __align__(64) DeepgemmTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(DeepgemmTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(DeepgemmTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -25,18 +40,10 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(DeepgemmTensorMap) >= alignof(CUtensorMap), "DeepgemmTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define DEEPGEMM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 376
 #define TMEM_TMEM_ACC_OFFSET 0
 #define TMEM_TMEM_SFQ_OFFSET 320
@@ -96,39 +103,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
@@ -146,136 +120,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "DONE:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
 }
 
 
@@ -300,16 +144,11 @@ __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
 }
 
 
-__device__ __forceinline__ void elect_commit(int mbar_addr) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one"
-        ".shared::cluster.b64 [%0];\n\t"
-        "}\n"
-        :: "r"(mbar_addr));
-}
+union MmaSmemDesc {
+    uint64_t u64;
+    uint32_t u32[2];
+};
+
 
 
 __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
@@ -326,17 +165,6 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-
-__device__ __forceinline__ uint64_t make_sf_cp_desc_sbo128(int addr) {
-    const int SBO = 128;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL);
-}
 
 
 __device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo128(int lo) {
@@ -354,14 +182,6 @@ __device__ __forceinline__ void tcgen05_cp_32x128b_warpx4(
         :: "r"(taddr), "l"(s_desc));
 }
 
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
 
 
 __device__ __forceinline__ void tma_2d_gmem2smem(
@@ -396,20 +216,14 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 }
 
 
-__device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
-    tmem_ld_x16(dst, addr);
-    asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
-
 extern "C" {
 
 __global__ __launch_bounds__(768, 1) void
-kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap KV_TMA, const __grid_constant__ CUtensorMap SF_KV_TMA, uint8_t* __restrict__ KV, unsigned int* __restrict__ SF_KV, unsigned int* __restrict__ Metadata, __nv_bfloat16* __restrict__ Logits, unsigned int logits_stride, unsigned int kv_page_stride_bytes, unsigned int num_sms)
+kernel_cake_deepgemm_sparse_mqa_28babcca92f8d4cfc322(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap KV_TMA, const __grid_constant__ CUtensorMap SF_KV_TMA, uint8_t* __restrict__ KV, unsigned int* __restrict__ SF_KV, unsigned int* __restrict__ Metadata, __nv_bfloat16* __restrict__ Logits, unsigned int logits_stride, unsigned int kv_page_stride_bytes, unsigned int num_sms)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    uint32_t lane;
-    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+    const uint32_t lane = static_cast<uint32_t>(tid) & 31u;
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -429,6 +243,8 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     uint8_t* q = reinterpret_cast<uint8_t*>(smem_raw + 0);
@@ -452,6 +268,8 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
     if (warp == 16) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 16) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SF_Q))) : "memory"); }
     if (warp == 16) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Weights))) : "memory"); }
+    if (warp == 16) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV_TMA))) : "memory"); }
+    if (warp == 16) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SF_KV_TMA))) : "memory"); }
 
     // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 55 barriers)
     // Mbarriers at smem_raw[228368..228808)
@@ -561,7 +379,7 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
     // ---- Role: math ----
     if (warp <= 15) {
         { // math_main
-            asm volatile("setmaxnreg.inc.sync.aligned.u32 96;");
+            asm volatile("setmaxnreg.inc.sync.aligned.u32 88;");
             unsigned int asq = 0;
             unsigned int ask = 0;
             unsigned int ams = 0;
@@ -582,9 +400,16 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
                 if (nq == 0) {
                     break;
                 }
+                uint16_t* output_row0 = logits_bits;
+                uint16_t* output_row1 = logits_bits;
                 #pragma unroll
                 for (int qi = 0; qi < 2; qi++) {
                     if (nq > (unsigned int)qi) {
+                        if (qi == 0) {
+                            output_row0 = logits_bits + ((unsigned long long)(qbase + (unsigned int)qi) * (unsigned long long)logits_stride);
+                        } else {
+                            output_row1 = logits_bits + ((unsigned long long)(qbase + (unsigned int)qi) * (unsigned long long)logits_stride);
+                        }
                         #pragma unroll
                         for (int wi = 0; wi < 16; wi++) {
                             asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&wreg[qi * 16 + wi])) : "r"(weights_addr + asq * 128 + (unsigned int)(qi * 64) + (unsigned int)(wi * 4)));
@@ -636,8 +461,9 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
                             if (slot != 65535) {
                                 unsigned int base = ((qi_1 == 0) ? q0base : q1base);
                                 unsigned int col = (base + slot) * 8 + token % 8;
-                                unsigned long long out = (unsigned long long)(qbase + (unsigned int)qi_1) * (unsigned long long)logits_stride + (unsigned long long)col;
-                                logits_bits[out] = _bf16_add_0;
+                                uint16_t* output_row = ((qi_1 == 0) ? (output_row0) : (output_row1));
+                                unsigned long long out = (unsigned long long)col;
+                                output_row[out] = _bf16_add_0;
                             }
                         }
                     }
@@ -664,7 +490,7 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
     // ---- Role: producer ----
     } else if (warp == 16) {
         { // producer_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
             unsigned int psq = 0;
             unsigned int psk = 0;
             unsigned int nwaves = Metadata[1];
@@ -728,7 +554,7 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
     // ---- Role: transpose ----
     } else if (warp == 17) {
         { // transpose_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
             unsigned int tsq = 0;
             unsigned int tsk = 0;
             unsigned int _phase_qfull_1 = 0;
@@ -787,7 +613,7 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
     // ---- Role: mma ----
     } else if (warp == 18) {
         { // mma_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
             unsigned int msq = 0;
             unsigned int msk = 0;
             unsigned int mst = 0;
@@ -904,7 +730,7 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
     // ---- Role: copy ----
     } else if (warp >= 20 && warp <= 23) {
         { // copy_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
             unsigned int csk = 0;
             unsigned int cms = 0;
             unsigned int cwarp = warp - 20;
@@ -920,6 +746,34 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
                     break;
                 }
                 unsigned int gathered = 1;
+                if ((packed & 2147483648u) != 0) {
+                    if (cwarp == 0) {
+                        if (elect_sync()) {
+                            unsigned int token_1 = infos[cms * 64 * 2];
+                            #pragma unroll
+                            for (int off = 0; off < 512; off += 128) {
+                                tma_2d_gmem2smem(sfkv_addr + csk * 2048 + (unsigned int)(off * 4), (&SF_KV_TMA), token_1 + (unsigned int)off, 0, sfcopied_addr + (csk) * 8);
+                            }
+                            mbarrier_arrive_expect_tx(sfcopied_addr + (csk) * 8, 2048);
+                            #pragma unroll
+                            for (int off_1 = 0; off_1 < 512; off_1 += 128) {
+                                tma_2d_gmem2smem(kv_addr + csk * 65536 + (unsigned int)(off_1 * 128), (&KV_TMA), 0, token_1 + (unsigned int)off_1, kvfull_addr + (csk) * 8);
+                            }
+                            mbarrier_arrive_expect_tx(kvfull_addr + (csk) * 8, 65536);
+                        }
+                    }
+                    __syncwarp();
+                    if (elect_sync()) {
+                        unsigned int arrivals = ((cwarp == 0) ? 31 : 32);
+                        asm volatile(
+                            "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;"
+                            :: "r"(kvfull_addr + (csk) * 8), "r"((uint32_t)(arrivals)) : "memory");
+                        asm volatile(
+                            "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;"
+                            :: "r"(sfcopied_addr + (csk) * 8), "r"((uint32_t)(arrivals)) : "memory");
+                    }
+                    gathered = 0;
+                }
                 if (gathered != 0) {
                     unsigned int block_base = cwarp * 16;
                     if (block_base < nblocks) {
@@ -927,16 +781,11 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
                         if (lane < 16) {
                             physical = infos[(cms * 64 + block_base + lane) * 2];
                         }
-                        unsigned int page = physical / 8;
-                        unsigned int token_1 = physical % 8 * 8;
-                        unsigned long long data_offset = (unsigned long long)page * (unsigned long long)kv_page_stride_bytes + (unsigned long long)(token_1 * 128);
-                        unsigned long long sf_offset = (unsigned long long)page * (unsigned long long)kv_page_stride_bytes + 8192 + (unsigned long long)(token_1 * 4);
                         unsigned int bo = lane / 2;
                         unsigned int chunk_1 = lane % 2;
-                        unsigned long long _shfl_0 = __shfl_sync(0xFFFFFFFF, sf_offset, bo);
-                        unsigned long long src_sf = _shfl_0;
+                        unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, physical, bo);
                         asm volatile("cp.async.cg.shared::cta.global.L2::64B [%0], [%1], 16;"
-                            :: "r"(sfkv_addr + csk * 2048 + (block_base + bo) * 8 * 4 + chunk_1 * 16), "l"(KV + (src_sf + (unsigned long long)(chunk_1 * 16))));
+                            :: "r"(sfkv_addr + csk * 2048 + (block_base + bo) * 8 * 4 + chunk_1 * 16), "l"(SF_KV + ((unsigned long long)_shfl_0 + (unsigned long long)(chunk_1 * 4))));
                         asm volatile(
                             "{\n\t"
                             "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"
@@ -945,12 +794,12 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
                         #pragma unroll
                         for (int pair = 0; pair < 16; pair += 2) {
                             unsigned int bo_0 = (unsigned int)pair + lane / 16;
-                            unsigned long long _shfl_1 = __shfl_sync(0xFFFFFFFF, data_offset, bo_0);
-                            unsigned long long src_kv = _shfl_1;
+                            unsigned int _shfl_1 = __shfl_sync(0xFFFFFFFF, physical, bo_0);
+                            unsigned long long src_kv = (unsigned long long)_shfl_1 * 128;
                             #pragma unroll
                             for (int chunk_base = 0; chunk_base < 64; chunk_base += 16) {
                                 unsigned int chunk_0 = (unsigned int)chunk_base + lane % 16;
-                                unsigned int swizzled = chunk_0 & 4294967288 | chunk_0 & 7 ^ chunk_0 >> 3 & 7;
+                                unsigned int swizzled = chunk_0 & 4294967288u | chunk_0 & 7 ^ chunk_0 >> 3 & 7;
                                 asm volatile("cp.async.cg.shared::cta.global.L2::256B [%0], [%1], 16;"
                                     :: "r"(kv_addr + csk * 65536 + ((block_base + bo_0) * 8 * 128 / 16 + swizzled) * 16), "l"(KV + (src_kv + (unsigned long long)(chunk_0 * 16))));
                             }
@@ -977,7 +826,7 @@ kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ C
     // ---- Role: idle ----
     } else if (warp == 19) {
         { // idle_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
         }
     }
 
