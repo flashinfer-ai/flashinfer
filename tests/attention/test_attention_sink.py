@@ -1132,6 +1132,21 @@ _NVFP4_KV_DTYPES = [torch.uint8] + (
 
 
 @pytest.mark.parametrize("kv_data_type", _NVFP4_KV_DTYPES)
+def test_attention_sink_nvfp4_auto_selects_fa2(monkeypatch, kv_data_type):
+    monkeypatch.setattr(
+        "flashinfer.attention._core.determine_attention_backend",
+        lambda *args, **kwargs: "fa3",
+    )
+    wrapper = flashinfer.BatchAttentionWithAttentionSinkWrapper(
+        torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        kv_layout="HND",
+        backend="auto",
+        kv_data_type=kv_data_type,
+    )
+    assert wrapper._backend == "fa2"
+
+
+@pytest.mark.parametrize("kv_data_type", _NVFP4_KV_DTYPES)
 @pytest.mark.parametrize("window_left", [-1, 128])
 def test_attention_sink_nvfp4_paged_kv(window_left, kv_data_type):
     """BatchAttentionWithAttentionSinkWrapper accepts a packed NVFP4 KV cache.

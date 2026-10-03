@@ -420,20 +420,22 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
         assert backend in ["fa2", "fa3", "auto"]
         q_data_type = canonicalize_torch_dtype(q_data_type)
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        packed_fp4_kv = dtype_map_kv[kv_data_type] == "__nv_fp4x2_e2m1"
         if backend == "auto":
             # dispatch backend before init jit module
-            backend = determine_attention_backend(
-                float_workspace_buffer.device,
-                PosEncodingMode[pos_encoding_mode].value,
-                use_fp16_qk_reduction,  # use_fp16_qk_reduction
-                custom_mask_buf is not None,  # use_custom_mask
-                q_data_type,
-                kv_data_type,
-                head_dim_qk=head_dim_qk,
-                head_dim_vo=head_dim_vo,
-            )
-
-        packed_fp4_kv = dtype_map_kv[kv_data_type] == "__nv_fp4x2_e2m1"
+            if packed_fp4_kv:
+                backend = "fa2"
+            else:
+                backend = determine_attention_backend(
+                    float_workspace_buffer.device,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    use_fp16_qk_reduction,  # use_fp16_qk_reduction
+                    custom_mask_buf is not None,  # use_custom_mask
+                    q_data_type,
+                    kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
+                )
         if packed_fp4_kv and backend != "fa2":
             raise NotImplementedError(
                 "packed FP4 KV is only supported by the fa2 attention-sink "
