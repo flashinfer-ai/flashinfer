@@ -13,12 +13,7 @@ preflight owns eligibility; candidate preparation may compile a native plan.
 
 from typing import TYPE_CHECKING, cast
 
-import torch
-
-from ...api_logging import (
-    _warn_from_external_caller,
-    experimental_auto_backends_allowed,
-)
+from ...api_logging import experimental_auto_backends_allowed
 from ...utils import (
     get_compute_capability as _get_compute_capability,
     is_sm90a_supported,
@@ -26,7 +21,6 @@ from ...utils import (
     is_sm121a_supported,
 )
 from ._backends._capabilities import _BackendPlanUnsupportedError
-from ._backends.cutile_backend import _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES
 from ._planning import _MLAPlanArguments
 
 if TYPE_CHECKING:
@@ -35,33 +29,6 @@ if TYPE_CHECKING:
 
 class _BatchMLAPagedAttentionAutoBackend:
     """Resolve the automatic policy to a prepared concrete backend."""
-
-    _blackwell_auto_fallback_warned: bool = False
-
-    @classmethod
-    def _maybe_warn_blackwell_auto_fallback(cls, device: torch.device) -> None:
-        if cls._blackwell_auto_fallback_warned:
-            return
-        major, minor = _get_compute_capability(device)
-        if major < 10 or (major, minor) in ((12, 0), (12, 1)):
-            return
-        cls._blackwell_auto_fallback_warned = True
-        if (major, minor) in _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES:
-            in_wrapper_alternative = (
-                "backend='cutile' is the native in-wrapper cuda.tile alternative."
-            )
-        else:
-            in_wrapper_alternative = (
-                "backend='cutlass' is another in-wrapper alternative."
-            )
-        _warn_from_external_caller(
-            f"BatchMLAPagedAttentionWrapper: backend='auto' has no Blackwell-native "
-            f"policy for SM{major}{minor}; trying the default backend order. "
-            f"For decode, consider "
-            f"flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla "
-            f"(Blackwell-native trtllm-gen); {in_wrapper_alternative}",
-            UserWarning,
-        )
 
     @classmethod
     def plan_from_wrapper(cls, plan_args: _MLAPlanArguments) -> "_PlannedBackend":
@@ -80,13 +47,14 @@ class _BatchMLAPagedAttentionAutoBackend:
                 candidates = ordered_sm80_backends(plan_args)
             elif is_sm90a_supported(device):
                 candidates = ordered_sm90_backends(plan_args)
-            elif _get_compute_capability(device) == (10, 0):
+            elif _get_compute_capability(device) in ((10, 0), (10, 3)):
                 candidates = ordered_sm100_backends(plan_args)
+            elif _get_compute_capability(device) == (10, 7):
+                candidates = _ordered_sm107_backends(plan_args)
             elif is_sm120a_supported(device) or is_sm121a_supported(device):
                 candidates = ordered_sm12x_backends(plan_args)
             else:
                 candidates = _AUTO_BACKEND_CANDIDATES
-                cls._maybe_warn_blackwell_auto_fallback(device)
         rejections: list[str] = []
         for candidate in candidates:
             try:
@@ -260,11 +228,20 @@ def ordered_sm100_backends(args):
         order = _prefer("cute-dsl-monolithic", "trtllm-gen")
     # Larger multi-query work or aggregate KV volume can favor modular CuTe
     # after earlier implementations reject. Keep the eager guards authoritative.
-    if max_q > 1 and (work >= 5 * 2**20 or total_kv >= 5 * 2**14):
+    # Small-head Q4 requests favor FA2 after earlier native candidates reject.
+    # Keep modular's measured Q2/Q3 and larger-head advantages.
+    prefer_fa2_q4 = heads <= 16 and max_q == 4 and min(q_lens) == 4 and not args.causal
+    if max_q > 1 and not prefer_fa2_q4 and (work >= 5 * 2**20 or total_kv >= 5 * 2**14):
         remaining = tuple(backend for backend in order if backend != "cute-dsl-modular")
         position = remaining.index("fa2")
         return remaining[:position] + ("cute-dsl-modular",) + remaining[position:]
     return order
+
+
+def _ordered_sm107_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
+    # The SM100 policy performed well in SM107 development measurements.
+    # Further investigation may identify useful SM107-specific ordering rules.
+    return ordered_sm100_backends(args)
 
 
 def ordered_sm12x_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
