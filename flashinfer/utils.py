@@ -336,6 +336,30 @@ def check_trtllm_gen_sm107_only_feature(
         )
 
 
+# Mirrors the architecture assert in include/flashinfer/trtllm/fmha/fmhaRunner.cuh.
+_TRTLLM_GEN_FMHA_COMPUTE_CAPABILITIES = frozenset({(10, 0), (10, 3), (10, 7)})
+
+
+def check_trtllm_gen_fmha_arch(
+    device: torch.device, sm12x_alternative: Optional[str] = None
+) -> None:
+    """Raise ``ValueError`` if ``device`` cannot run the trtllm-gen FMHA cubins.
+
+    ``sm12x_alternative`` names the backend(s) that serve the same call on
+    SM120/SM121; it is appended to the message on those devices.
+    """
+    major, minor = get_compute_capability(device)
+    if (major, minor) in _TRTLLM_GEN_FMHA_COMPUTE_CAPABILITIES:
+        return
+    message = (
+        f"backend='trtllm-gen' requires SM100, SM103 or SM107, got SM{major}{minor}: "
+        "trtllm-gen ships its FMHA cubins for those architectures only."
+    )
+    if sm12x_alternative is not None and major == 12:
+        message += f" On SM120/SM121 use {sm12x_alternative}."
+    raise ValueError(message)
+
+
 @functools.cache
 def get_gpu_memory_bandwidth(device: torch.device) -> float:
     """

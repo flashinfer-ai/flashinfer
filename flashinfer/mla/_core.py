@@ -40,6 +40,7 @@ from ..utils import (
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     check_shape_dtype_device,
+    check_trtllm_gen_fmha_arch,
     check_trtllm_gen_sm107_only_feature,
     device_support_pdl,
     get_compute_capability,
@@ -4100,6 +4101,12 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             backend = "sparse"
         elif cc[0] != 10:
             backend = "xqa"
+    elif backend == "trtllm-gen":
+        check_trtllm_gen_fmha_arch(
+            query.device,
+            sm12x_alternative="backend='sparse' (sparse_mla_top_k > 0) or "
+            "backend='xqa' (dense decode); backend='auto' picks between them",
+        )
 
     if backend == "cake":
         # Cake-generated Kimi-K3 MLA over the FP8 paged latent cache (SM100 / SM103): dense
