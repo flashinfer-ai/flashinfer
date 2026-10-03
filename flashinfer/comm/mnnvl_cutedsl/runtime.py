@@ -17,6 +17,7 @@
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 import torch
+from cutlass import Float8E4M3FN
 from cutlass.cute.runtime import from_dlpack, make_fake_compact_tensor
 
 
@@ -35,6 +36,16 @@ class _GraphSafeDLPack:
 
 
 def to_cute(tensor: torch.Tensor, alignment: int) -> cute.Tensor:
+    if tensor.dtype == torch.float8_e4m3fn:
+        # Some supported PyTorch versions cannot export FP8 through DLPack.
+        # Export the same storage as bytes, then restore the CuTe element type.
+        # Keep the graph-safe adapter: exporting must not synchronize streams.
+        result = from_dlpack(
+            _GraphSafeDLPack(tensor.view(torch.uint8).detach()),
+            assumed_align=alignment,
+        )
+        result.element_type = Float8E4M3FN
+        return result
     return from_dlpack(
         _GraphSafeDLPack(tensor.detach()),
         assumed_align=alignment,
