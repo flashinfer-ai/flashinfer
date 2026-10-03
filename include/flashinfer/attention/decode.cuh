@@ -163,8 +163,10 @@ __device__ __forceinline__ void sync_state(AttentionVariant variant, state_t<vec
     auto block = cg::this_thread_block();
     st.o.store(smem + (tz * bdy + ty) * head_dim + tx * vec_size);
     if constexpr (variant.use_softmax) {
-      smem_md[(tz * bdy + ty) * 2] = st.m;
-      smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
+      if (tx == 0) {
+        smem_md[(tz * bdy + ty) * 2] = st.m;
+        smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
+      }
       block.sync();
       st.init();
 #pragma unroll
@@ -369,9 +371,12 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
                                             qo_head_idx, st_local.m, st_local.d, /*scale=*/1.0f);
   }
 
-  st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
-  if (lse != nullptr) {
-    lse[kv_chunk_idx * num_qo_heads + qo_head_idx] = st_local.get_lse();
+  if (tz == 0) {
+    st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim +
+                          tx * vec_size);
+    if (lse != nullptr) {
+      lse[kv_chunk_idx * num_qo_heads + qo_head_idx] = st_local.get_lse();
+    }
   }
 }
 
