@@ -297,10 +297,7 @@ _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     or not is_sm100a_supported(torch.device("cuda")),
-    reason=(
-        "PrimTS FMHA decode is signoff-qualified on SM100; "
-        "SM103/B300 and GB300 qualification is pending"
-    ),
+    reason="PrimTS FMHA decode requires an SM100a, SM103a or SM107a GPU",
 )
 
 _REQUIRES_PAGE4_PRIMTS_GPU = pytest.mark.skipif(
