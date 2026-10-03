@@ -878,17 +878,26 @@ def autotune(
         round_up: Controls how runtime sizes map to profiled buckets.
 
             * ``None`` (default) -- inherit from enclosing ``autotune()``
-              context, or ``False`` if there is none.
+              context.  If there is none: ``True`` when ``tuning_buckets``
+              is also provided (a tactic profiled at bucket ``b`` is only
+              valid for runtime sizes ``<= b``, which matches SM100
+              cute-dsl block-scaled GEMM envelopes), otherwise ``False``.
             * ``False`` -- round **down** to the largest bucket <= the
-              runtime size (floor semantics, the historical default).
+              runtime size (floor semantics).  Pass explicitly to keep
+              historical floor mapping under a ``tuning_buckets`` override.
             * ``True`` -- round **up** to the smallest bucket >= the runtime
               size (ceil semantics).
 
             For example, with buckets ``(128, 256, 512)`` and a runtime batch
             of 200: ``round_up=False`` selects 128 while ``round_up=True``
-            selects 256.  Rounding up can improve performance when the best
-            kernel for a larger bucket also performs well at nearby smaller
-            sizes (see the PR discussion for benchmark data on cuDNN plans).
+            selects 256.  When some bucket is >= the runtime size, rounding up
+            keeps apply-time M inside that tuned bucket (a tactic profiled at
+            ``b`` is used only for M <= ``b``).  If M is larger than every
+            bucket, mapping clamps to the largest bucket, so the envelope does
+            not cover the raw size.  Rounding up can also improve performance
+            when the best kernel for a larger bucket also performs well at
+            nearby smaller sizes (see the PR discussion for benchmark data on
+            cuDNN plans).
 
         skip_ops: Optional set of ``custom_op`` names to exclude from
             autotuning.  Operations whose ``custom_op`` string matches an
@@ -947,7 +956,7 @@ def autotune(
         with autotune(True, cache="my_configs.json"):
             model(inputs)
 
-        # Use custom measurement points
+        # Use custom measurement points (defaults to round_up=True)
         with autotune(True, tuning_buckets=(64, 128, 256, 512)):
             model(inputs)
 
@@ -1012,14 +1021,25 @@ def autotune(
     # current top-of-stack when a parameter is not explicitly supplied.
     override_stack = tuner._get_override_stack()
     current_buckets = override_stack[-1][0] if override_stack else None
-    current_round_up = override_stack[-1][1] if override_stack else False
     current_profile_replays = override_stack[-1][2] if override_stack else None
     new_buckets = (
         tuple(sorted(set(tuning_buckets)))
         if tuning_buckets is not None
         else current_buckets
     )
-    new_round_up = round_up if round_up is not None else current_round_up
+    # When seeding a fresh override stack, default round_up=True alongside
+    # tuning_buckets so a tactic tuned at bucket b is applied to M <= b when
+    # some bucket is >= M (issue #5450 / #5449). M above the largest bucket
+    # still clamps to that bucket. Nested contexts inherit the outer value;
+    # pass round_up=False explicitly to keep floor mapping.
+    if round_up is not None:
+        new_round_up = round_up
+    elif override_stack:
+        new_round_up = override_stack[-1][1]
+    elif tuning_buckets is not None:
+        new_round_up = True
+    else:
+        new_round_up = False
     new_profile_replays = (
         cuda_graph_profile_replays
         if cuda_graph_profile_replays is not None

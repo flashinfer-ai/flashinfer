@@ -1511,6 +1511,130 @@ def test_autotune_context_restores_overrides():
     assert tuner._override_cuda_graph_profile_replays is None
 
 
+def test_tuning_buckets_default_round_up_maps_m_to_ceil_bucket():
+    """autotune(tuning_buckets=...) defaults to round_up so M stays in envelope.
+
+    Reproduces the issue #5450 / #5449 mapper direction: SM100 cute-dsl
+    tactics tuned at bucket b are only valid for runtime M <= b. Floor
+    mapping M=24 -> 16 would apply a (tile_n=16) split-K winner outside
+    its envelope. Default ceil maps 24 -> 32.
+    """
+    tuner = reset_autotuner()
+    buckets = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+
+    # Op-native mapper rounds UP (same direction as mm_mxfp8 hybrid buckets).
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=buckets,
+                map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=True),
+            ),
+        ),
+    )
+
+    # Outside any override: op mapper already ceils.
+    assert config.dynamic_tensor_specs[0].map_to_tuning_buckets(24) == 32
+
+    # Default override (no round_up arg) must ceil, matching the envelope.
+    with autotune(tune_mode=False, tuning_buckets=buckets):
+        assert tuner._override_round_up is True
+        mapper = tuner.get_effective_map_to_tuning_buckets(config)
+        assert mapper(24) == 32
+        assert mapper(12) == 16
+        assert mapper(40) == 64
+
+    # Explicit floor still available for callers that need it.
+    with autotune(tune_mode=False, tuning_buckets=buckets, round_up=False):
+        assert tuner._override_round_up is False
+        mapper = tuner.get_effective_map_to_tuning_buckets(config)
+        assert mapper(24) == 16
+        assert mapper(12) == 8
+        assert mapper(40) == 32
+
+
+def test_tuning_buckets_floor_mapping_breaks_splitk_tile_envelope(monkeypatch):
+    """Floor-mapped bucket-16 tactic is invalid at M=24; default ceil is valid.
+
+    Unit stand-in for the gist / vLLM warmup raise
+    ``Invalid MXFP8 split-K tactic: ((128, 16), ...)`` without needing a
+    Blackwell GPU: tactics encode tile_n == bucket, and apply rejects when
+    runtime M requires a larger tile than the cached tactic provides.
+    """
+    tuner = reset_autotuner()
+    buckets = (8, 16, 32, 64)
+
+    def tile_n_for_m(m: int) -> int:
+        # Mirrors mma_tiler_mn_for_m: round M up into {8, 16, 32}+.
+        if m <= 8:
+            return 8
+        if m <= 16:
+            return 16
+        if m <= 32:
+            return 32
+        return 64
+
+    class SplitKEnvelopeRunner(DummyRunner):
+        def __init__(self):
+            # tactic value == tile_n that won at the profiled bucket
+            super().__init__(valid_tactics=(8, 16, 32, 64))
+
+        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+            # tactic -1 is the untuned fallback used during preparation.
+            if tactic == -1:
+                return inputs[0]
+            m = inputs[0].shape[0]
+            required = tile_n_for_m(m)
+            if tactic != required:
+                raise ValueError(
+                    f"Invalid MXFP8 split-K tactic: ((128, {tactic}), "
+                    f"(1, 1), True, False, 4)"
+                )
+            return inputs[0]
+
+    runner = SplitKEnvelopeRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=buckets,
+                map_to_tuning_buckets=make_bucket_mapper(buckets, round_map=True),
+            ),
+        ),
+    )
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        # Winner at each bucket is the tile sized for that bucket M.
+        n = prof_inputs[0].shape[0]
+        winner = tile_n_for_m(n)
+        return 1.0 if tactic == winner else 10.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    # CPU torch stubs raise on is_current_stream_capturing; choose_one only
+    # needs a False answer here.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    tune_inputs = [torch.empty((64, 32), dtype=torch.float32)]
+    with autotune(tune_mode=True, tuning_buckets=buckets):
+        tuner.choose_one("splitk_envelope", [runner], config, tune_inputs)
+
+    # Default (round_up=True): M=24 -> bucket 32 -> tile 32 -> OK
+    infer = [torch.empty((24, 32), dtype=torch.float32)]
+    with autotune(tune_mode=False, tuning_buckets=buckets):
+        runner_id, tactic = tuner.choose_one("splitk_envelope", [runner], config, infer)
+        assert tactic == 32
+        runner.forward(infer, tactic=tactic)  # must not raise
+
+    # Explicit floor reproduces the issue raise at M=24 -> bucket 16.
+    with autotune(tune_mode=False, tuning_buckets=buckets, round_up=False):
+        runner_id, tactic = tuner.choose_one("splitk_envelope", [runner], config, infer)
+        assert tactic == 16
+        with pytest.raises(ValueError, match="Invalid MXFP8 split-K tactic"):
+            runner.forward(infer, tactic=tactic)
+
+
 def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
     """Full choose_one flow with custom buckets: profile, cache, retrieve."""
     tuner = reset_autotuner()
@@ -1540,7 +1664,8 @@ def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
 
     custom_buckets = (100, 300, 500)
     tune_inputs = [torch.empty((500, 64), dtype=torch.float32)]
-    with autotune(tune_mode=True, tuning_buckets=custom_buckets):
+    # Explicit round_up=False keeps floor mapping for this selection test.
+    with autotune(tune_mode=True, tuning_buckets=custom_buckets, round_up=False):
         tuner.choose_one("custom_select_test", [runner], config, tune_inputs)
 
     # Inference with custom buckets (floor rounding):
@@ -1556,7 +1681,7 @@ def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
     ]
     for actual_n, expected_tactic in test_cases:
         infer_inputs = [torch.empty((actual_n, 64), dtype=torch.float32)]
-        with autotune(tune_mode=False, tuning_buckets=custom_buckets):
+        with autotune(tune_mode=False, tuning_buckets=custom_buckets, round_up=False):
             _, tactic = tuner.choose_one(
                 "custom_select_test", [runner], config, infer_inputs
             )
