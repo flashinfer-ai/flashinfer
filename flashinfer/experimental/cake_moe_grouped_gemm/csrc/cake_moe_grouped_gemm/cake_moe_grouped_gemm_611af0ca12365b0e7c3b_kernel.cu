@@ -26,12 +26,9 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -40,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -54,21 +50,25 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 7
-#define NUM_MAINLOOP_PIPE_STAGES 2
+#define NUM_TMA_PIPE_STAGES 4
+#define NUM_MAINLOOP_PIPE_STAGES 1
 #define SMEM_SMEM_A_OFF 1024
 #define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_B_OFF 17408
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 32768
-#define SMEM_TOTAL 230400
+#define SMEM_SMEM_A_STRIDE 49152
+#define SMEM_SMEM_B0_OFF 17408
+#define SMEM_SMEM_B0_STAGE_BYTES 16384
+#define SMEM_SMEM_B0_STRIDE 49152
+#define SMEM_SMEM_B1_OFF 33792
+#define SMEM_SMEM_B1_STAGE_BYTES 16384
+#define SMEM_SMEM_B1_STRIDE 49152
+#define SMEM_TOTAL 197632
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define BLOCK_K 64
 #define MMA_K 16
 #define CTA_GROUP 2
-#define NUM_STAGES 7
+#define NUM_STAGES 4
+#define TILE_K 512
 #define NUM_EPILOGUE_WARPS 4
 #define CLUSTER_M 256
 #define EPI_CHUNK 16
@@ -94,52 +94,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count) : "memory");
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
@@ -159,171 +113,13 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
 
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
-        "DONE_CLUSTER_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-
-__device__ __forceinline__ void tcgen05_mma_f16_cta2(
-    int taddr, uint64_t a_desc, uint64_t b_desc,
-    uint32_t i_desc, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        ".reg .b32 m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\t"
-        "mov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, {m0, m1, m2, m3, m4, m5, m6, m7}, p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(enable_input_d)
-         : "memory");
-}
-
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
 
 
 union MmaSmemDesc {
     uint64_t u64;
     uint32_t u32[2];
 };
-
-__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
-}
 
 
 __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
@@ -338,51 +134,8 @@ __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16
 }
 
 
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
 
 
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-__device__ __forceinline__ uint32_t smem_addr(const void* ptr) {
-    uint32_t addr;
-    asm("{\n\t"
-        ".reg .u64 u64addr;\n\t"
-        "cvta.to.shared.u64 u64addr, %1;\n\t"
-        "cvt.u32.u64 %0, u64addr;\n\t"
-        "}\n" : "=r"(addr) : "l"(ptr));
-    return addr;
-}
-
-
-__device__ __forceinline__ uint32_t mapa_to_rank(uint32_t local_addr, uint32_t rank) {
-    uint32_t remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
-        : "=r"(remote) : "r"(local_addr), "r"(rank));
-    return remote;
-}
-
-
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
 
 
 __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
@@ -395,17 +148,6 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
            "r"(mbar_addr) : "memory");
 }
 
-
-__device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
-    asm volatile(
-        "{\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "mov.b32 {lo, hi}, %1;\n\t"
-        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], lo;\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"((uint32_t)cta_mask) : "memory");
-}
 
 
 __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
@@ -421,15 +163,10 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 }
 
 
-__device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
-    tmem_ld_x16(dst, addr);
-    asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
-
 extern "C" {
 
 __global__ __launch_bounds__(192) __cluster_dims__(2,1,1) void
-kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTensorMap const* B, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, uint8_t* __restrict__ tensormap_workspace, float* __restrict__ partials, int tail_splits, int raster_rows, int num_groups, int sum_m, int N, int K, int ldc, int stride_e)
+kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, uint8_t* __restrict__ tensormap_workspace, float* __restrict__ partials, int tail_splits, int raster_rows, int num_groups, int sum_m, int N, int K, int ldc, int stride_e)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -437,13 +174,18 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
-    #define mma_done_addr (mbar_base + 56)
-    #define mainloop_done_addr (mbar_base + 112)
-    #define epilogue_done_addr (mbar_base + 128)
+    #define mma_done_addr (mbar_base + 32)
+    #define mainloop_done_addr (mbar_base + 64)
+    #define epilogue_done_addr (mbar_base + 72)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -453,49 +195,37 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
 
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
-    }
-    __syncthreads();
-
 
     // Kernel setup ops
     __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
-    __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
-    const int smem_b_addr = smem + 17408;
+    __nv_bfloat16* smem_b0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+    const int smem_b0_addr = smem + 17408;
+    __nv_bfloat16* smem_b1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+    const int smem_b1_addr = smem + 33792;
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 18 barriers)
-    // Mbarriers at smem_raw[0..144)
+    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 10 barriers)
+    // Mbarriers at smem_raw[0..80)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // tma_full: 7 barriers, init_count=2
+            // tma_full: 4 barriers, init_count=2
             mbarrier_init(smem + 0, 2);
             mbarrier_init(smem + 8, 2);
             mbarrier_init(smem + 16, 2);
             mbarrier_init(smem + 24, 2);
-            mbarrier_init(smem + 32, 2);
-            mbarrier_init(smem + 40, 2);
-            mbarrier_init(smem + 48, 2);
-            // mma_done: 7 barriers, init_count=1
+            // mma_done: 4 barriers, init_count=1
+            mbarrier_init(smem + 32, 1);
+            mbarrier_init(smem + 40, 1);
+            mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
-            mbarrier_init(smem + 64, 1);
-            mbarrier_init(smem + 72, 1);
-            mbarrier_init(smem + 80, 1);
-            mbarrier_init(smem + 88, 1);
-            mbarrier_init(smem + 96, 1);
-            mbarrier_init(smem + 104, 1);
             // --- pipeline 'mainloop_pipe' ---
-            // mainloop_done: 2 barriers, init_count=1
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 120, 1);
-            // epilogue_done: 2 barriers, init_count=8
-            mbarrier_init(smem + 128, 8);
-            mbarrier_init(smem + 136, 8);
+            // mainloop_done: 1 barriers, init_count=1
+            mbarrier_init(smem + 64, 1);
+            // epilogue_done: 1 barriers, init_count=8
+            mbarrier_init(smem + 72, 8);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -506,9 +236,9 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 144);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 80);
     if (warp == 0) {
-        int _tmem_hold = smem + 144;
+        int _tmem_hold = smem + 80;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -529,7 +259,7 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
         { // load_main
             unsigned int load_stage = 0;
             unsigned int grid_n_u = (unsigned int)(N / BLOCK_N);
-            unsigned int grid_k_u = (unsigned int)(K / BLOCK_N);
+            unsigned int grid_k_u = (unsigned int)(K / TILE_K);
             unsigned int tiles_per_group = grid_n_u * grid_k_u;
             unsigned int total_tiles = (unsigned int)num_groups * tiles_per_group;
             unsigned int num_clusters_u = (unsigned int)num_clusters;
@@ -539,7 +269,7 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
             unsigned int _phase_mma_done = 1;
             if (elect_sync()) {
                 {
-                const uint64_t* __tm_src = reinterpret_cast<const uint64_t*>(A);
+                const uint64_t* __tm_src = reinterpret_cast<const uint64_t*>((&A));
                 uint64_t* __tm_dst = reinterpret_cast<uint64_t*>((uint64_t)(tensormap_workspace + (cta_linear * 256)));
                 #pragma unroll
                 for (int __tm_i = 0; __tm_i < 16; ++__tm_i) {
@@ -547,7 +277,7 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                 }
             }
                 {
-                const uint64_t* __tm_src = reinterpret_cast<const uint64_t*>(B);
+                const uint64_t* __tm_src = reinterpret_cast<const uint64_t*>((&B));
                 uint64_t* __tm_dst = reinterpret_cast<uint64_t*>((uint64_t)(tensormap_workspace + (cta_linear * 256 + 128)));
                 #pragma unroll
                 for (int __tm_i = 0; __tm_i < 16; ++__tm_i) {
@@ -612,20 +342,22 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                         }
                     }
                     int n_chunk0 = (int)n_block * (BLOCK_N / 64) + cta_rank * 2;
-                    int k_chunk0 = (int)k_block * (BLOCK_N / 64) + cta_rank * 2;
+                    int k_chunk0 = (int)k_block * (TILE_K / 64) + cta_rank * 2;
                     #pragma unroll 1
                     for (int iter_m = 0; iter_m < k_iters_eff; iter_m++) {
                         int m_coord = m_base + iter_m * BLOCK_K;
                         mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
-                        tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 32768, tensormap_workspace + (cta_linear * 256), 0, m_coord, n_chunk0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                        tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 32768 + 8192, tensormap_workspace + (cta_linear * 256), 0, m_coord, n_chunk0 + 1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                        tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 32768, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coord, k_chunk0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                        tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 32768 + 8192, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coord, k_chunk0 + 1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 49152, tensormap_workspace + (cta_linear * 256), 0, m_coord, n_chunk0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 49152 + 8192, tensormap_workspace + (cta_linear * 256), 0, m_coord, n_chunk0 + 1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_b0_addr + load_stage * 49152, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coord, k_chunk0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_b0_addr + load_stage * 49152 + 8192, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coord, k_chunk0 + 1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_b1_addr + load_stage * 49152, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coord, k_chunk0 + 4, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_b1_addr + load_stage * 49152 + 8192, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coord, k_chunk0 + 5, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         asm volatile(
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                            :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
+                            :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(49152)) : "memory");
                         load_stage += 1;
-                        if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
+                        if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
                     }
                 }
                 if (tail_splits > 1) {
@@ -680,20 +412,22 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                                 }
                             }
                             int n_chunk0t = (int)n_blockt * (BLOCK_N / 64) + cta_rank * 2;
-                            int k_chunk0t = (int)k_blockt * (BLOCK_N / 64) + cta_rank * 2;
+                            int k_chunk0t = (int)k_blockt * (TILE_K / 64) + cta_rank * 2;
                             #pragma unroll 1
                             for (int iter_mt = 0; iter_mt < n_steps_tl; iter_mt++) {
                                 int m_coordt = m_baset + (lo_tl + iter_mt) * BLOCK_K;
                                 mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
-                                tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 32768, tensormap_workspace + (cta_linear * 256), 0, m_coordt, n_chunk0t, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                                tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 32768 + 8192, tensormap_workspace + (cta_linear * 256), 0, m_coordt, n_chunk0t + 1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                                tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 32768, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coordt, k_chunk0t, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                                tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 32768 + 8192, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coordt, k_chunk0t + 1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 49152, tensormap_workspace + (cta_linear * 256), 0, m_coordt, n_chunk0t, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 49152 + 8192, tensormap_workspace + (cta_linear * 256), 0, m_coordt, n_chunk0t + 1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                tma_3d_gmem2smem_cta2(smem_b0_addr + load_stage * 49152, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coordt, k_chunk0t, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                tma_3d_gmem2smem_cta2(smem_b0_addr + load_stage * 49152 + 8192, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coordt, k_chunk0t + 1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                tma_3d_gmem2smem_cta2(smem_b1_addr + load_stage * 49152, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coordt, k_chunk0t + 4, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                tma_3d_gmem2smem_cta2(smem_b1_addr + load_stage * 49152 + 8192, tensormap_workspace + (cta_linear * 256 + 128), 0, m_coordt, k_chunk0t + 5, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                                 asm volatile(
                                     "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                                    :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
+                                    :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(49152)) : "memory");
                                 load_stage += 1;
-                                if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
+                                if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
                             }
                         }
                     }
@@ -707,7 +441,7 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
             unsigned int mma_tma_stage = 0;
             unsigned int mma_epi_stage = 0;
             unsigned int grid_n_m = (unsigned int)(N / BLOCK_N);
-            unsigned int grid_k_m = (unsigned int)(K / BLOCK_N);
+            unsigned int grid_k_m = (unsigned int)(K / TILE_K);
             unsigned int tiles_per_group_m = grid_n_m * grid_k_m;
             unsigned int total_tiles_m = (unsigned int)num_groups * tiles_per_group_m;
             unsigned int num_clusters_m = (unsigned int)num_clusters;
@@ -752,8 +486,8 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                         mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init_flag = ((iter_k_m == 0) ? 1 : 0);
-                        int _mma_a_lo_0 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
-                        int _mma_b_lo_0 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
+                        int _mma_a_lo_0 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _mma_b_lo_0 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -787,14 +521,49 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accum + (mma_epi_stage * 256))), "r"(((init_flag) ? 0 : 1)));
+                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_accum), "r"(((init_flag) ? 0 : 1)));
+                        int _mma_a_lo_1 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _mma_b_lo_1 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 272729232;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "}\n"
+                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_accum + (256))), "r"(((init_flag) ? 0 : 1)));
                         elect_commit_cg2_multicast(mma_done_addr + (mma_tma_stage) * 8, (uint16_t)(3));
                         mma_tma_stage += 1;
-                        if (mma_tma_stage == 7) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
+                        if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                     }
                     elect_commit_cg2_multicast(mainloop_done_addr + (mma_epi_stage) * 8, (uint16_t)(3));
-                    mma_epi_stage += 1;
-                    if (mma_epi_stage == 2) { mma_epi_stage = 0; _phase_epilogue_done ^= 1; }
+                    _phase_epilogue_done ^= 1;
                 }
                 if (tail_splits > 1) {
                     unsigned int num_tail_tm = total_tiles_m - tail_base_m;
@@ -830,8 +599,8 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                                 mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 int init_flagt = ((iter_k_mt == 0) ? 1 : 0);
-                                int _mma_a_lo_1 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
-                                int _mma_b_lo_1 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
+                                int _mma_a_lo_2 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _mma_b_lo_2 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -865,14 +634,49 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_accum + (mma_epi_stage * 256))), "r"(((init_flagt) ? 0 : 1)));
+                    :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_accum), "r"(((init_flagt) ? 0 : 1)));
+                                int _mma_a_lo_3 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _mma_b_lo_3 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 272729232;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "}\n"
+                    :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_3), "r"((tmem_accum + (256))), "r"(((init_flagt) ? 0 : 1)));
                                 elect_commit_cg2_multicast(mma_done_addr + (mma_tma_stage) * 8, (uint16_t)(3));
                                 mma_tma_stage += 1;
-                                if (mma_tma_stage == 7) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
+                                if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                             }
                             elect_commit_cg2_multicast(mainloop_done_addr + (mma_epi_stage) * 8, (uint16_t)(3));
-                            mma_epi_stage += 1;
-                            if (mma_epi_stage == 2) { mma_epi_stage = 0; _phase_epilogue_done ^= 1; }
+                            _phase_epilogue_done ^= 1;
                         }
                     }
                 }
@@ -886,7 +690,7 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
             const int epi_warp = warp % 4;
             const int epi_tid = epi_warp * 32 + lane;
             unsigned int grid_n_e = (unsigned int)(N / BLOCK_N);
-            unsigned int grid_k_e = (unsigned int)(K / BLOCK_N);
+            unsigned int grid_k_e = (unsigned int)(K / TILE_K);
             unsigned int tiles_per_group_e = grid_n_e * grid_k_e;
             unsigned int total_tiles_e = (unsigned int)num_groups * tiles_per_group_e;
             unsigned int num_clusters_e = (unsigned int)num_clusters;
@@ -920,13 +724,13 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                     k_block_e = (rem_e - nc_n_block_e * grid_k_e) * (1 - rr_n_block_e) + kr_n_block_e * rr_n_block_e;
                 }
                 int row_n = (int)n_block_e * BLOCK_N + cta_rank * BLOCK_M + epi_tid;
-                int col0 = (int)k_block_e * BLOCK_N;
+                int col0 = (int)k_block_e * TILE_K;
                 mbarrier_wait(mainloop_done_addr + (epi_stage) * 8, _phase_mainloop_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 #pragma unroll
-                for (int n_chunk = 0; n_chunk < BLOCK_N / EPI_CHUNK; n_chunk++) {
+                for (int n_chunk = 0; n_chunk < TILE_K / EPI_CHUNK; n_chunk++) {
                     int row = cta_rank * 128 + epi_warp * 32;
-                    int col = epi_stage * (unsigned int)BLOCK_N + (unsigned int)(n_chunk * EPI_CHUNK);
+                    int col = n_chunk * EPI_CHUNK;
                     int tmem_addr = taddr + (unsigned int)(row << 16) + (unsigned int)col;
                     float _tmem_load_0[16];
                     tmem_ld_x16(&_tmem_load_0[0], tmem_addr);
@@ -962,8 +766,7 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((epilogue_done_addr + (epi_stage) * 8) & 0xFEFFFFFF) : "memory");
                 }
-                epi_stage += 1;
-                if (epi_stage == 2) { epi_stage = 0; _phase_mainloop_done ^= 1; }
+                _phase_mainloop_done ^= 1;
             }
             if (tail_splits > 1) {
                 unsigned int num_tail_te = total_tiles_e - tail_base_e;
@@ -985,7 +788,7 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                         k_block_et = (rem_et - nc_n_block_et * grid_k_e) * (1 - rr_n_block_et) + kr_n_block_et * rr_n_block_et;
                     }
                     int row_nt = (int)n_block_et * BLOCK_N + cta_rank * BLOCK_M + epi_tid;
-                    int col0t = (int)k_block_et * BLOCK_N;
+                    int col0t = (int)k_block_et * TILE_K;
                     int e_kb_te = (int)e_uet;
                     int end_te = offs[e_kb_te];
                     int prev_te = e_kb_te - 1;
@@ -1015,9 +818,9 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                         mbarrier_wait(mainloop_done_addr + (epi_stage) * 8, _phase_mainloop_done);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         #pragma unroll
-                        for (int n_chunkt = 0; n_chunkt < BLOCK_N / EPI_CHUNK; n_chunkt++) {
+                        for (int n_chunkt = 0; n_chunkt < TILE_K / EPI_CHUNK; n_chunkt++) {
                             int rowt = cta_rank * 128 + epi_warp * 32;
-                            int colt = epi_stage * (unsigned int)BLOCK_N + (unsigned int)(n_chunkt * EPI_CHUNK);
+                            int colt = n_chunkt * EPI_CHUNK;
                             int tmem_addrt = taddr + (unsigned int)(rowt << 16) + (unsigned int)colt;
                             float _tmem_load_1[16];
                             tmem_ld_x16(&_tmem_load_1[0], tmem_addrt);
@@ -1052,19 +855,19 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                             if (whole_te == 0) {
                                 {
                                     float4 _v4 = make_float4(_tmem_load_1[0 + 0], _tmem_load_1[0 + 1], _tmem_load_1[0 + 2], _tmem_load_1[0 + 3]);
-                                    *reinterpret_cast<float4*>(partials + (slot_te * (CLUSTER_M * BLOCK_N) + (cta_rank * BLOCK_M + epi_tid) * BLOCK_N + n_chunkt * EPI_CHUNK) + 0) = _v4;
+                                    *reinterpret_cast<float4*>(partials + (slot_te * (CLUSTER_M * TILE_K) + (cta_rank * BLOCK_M + epi_tid) * TILE_K + n_chunkt * EPI_CHUNK) + 0) = _v4;
                                 }
                                 {
                                     float4 _v4 = make_float4(_tmem_load_1[4 + 0], _tmem_load_1[4 + 1], _tmem_load_1[4 + 2], _tmem_load_1[4 + 3]);
-                                    *reinterpret_cast<float4*>(partials + (slot_te * (CLUSTER_M * BLOCK_N) + (cta_rank * BLOCK_M + epi_tid) * BLOCK_N + n_chunkt * EPI_CHUNK + 4) + 0) = _v4;
+                                    *reinterpret_cast<float4*>(partials + (slot_te * (CLUSTER_M * TILE_K) + (cta_rank * BLOCK_M + epi_tid) * TILE_K + n_chunkt * EPI_CHUNK + 4) + 0) = _v4;
                                 }
                                 {
                                     float4 _v4 = make_float4(_tmem_load_1[8 + 0], _tmem_load_1[8 + 1], _tmem_load_1[8 + 2], _tmem_load_1[8 + 3]);
-                                    *reinterpret_cast<float4*>(partials + (slot_te * (CLUSTER_M * BLOCK_N) + (cta_rank * BLOCK_M + epi_tid) * BLOCK_N + n_chunkt * EPI_CHUNK + 8) + 0) = _v4;
+                                    *reinterpret_cast<float4*>(partials + (slot_te * (CLUSTER_M * TILE_K) + (cta_rank * BLOCK_M + epi_tid) * TILE_K + n_chunkt * EPI_CHUNK + 8) + 0) = _v4;
                                 }
                                 {
                                     float4 _v4 = make_float4(_tmem_load_1[12 + 0], _tmem_load_1[12 + 1], _tmem_load_1[12 + 2], _tmem_load_1[12 + 3]);
-                                    *reinterpret_cast<float4*>(partials + (slot_te * (CLUSTER_M * BLOCK_N) + (cta_rank * BLOCK_M + epi_tid) * BLOCK_N + n_chunkt * EPI_CHUNK + 12) + 0) = _v4;
+                                    *reinterpret_cast<float4*>(partials + (slot_te * (CLUSTER_M * TILE_K) + (cta_rank * BLOCK_M + epi_tid) * TILE_K + n_chunkt * EPI_CHUNK + 12) + 0) = _v4;
                                 }
                             }
                         }
@@ -1073,8 +876,7 @@ kernel_cake_moe_grouped_gemm_bca4ce736574bed1c298(CakeTensorMap const* A, CakeTe
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                                 :: "r"((epilogue_done_addr + (epi_stage) * 8) & 0xFEFFFFFF) : "memory");
                         }
-                        epi_stage += 1;
-                        if (epi_stage == 2) { epi_stage = 0; _phase_mainloop_done ^= 1; }
+                        _phase_mainloop_done ^= 1;
                     }
                 }
             }

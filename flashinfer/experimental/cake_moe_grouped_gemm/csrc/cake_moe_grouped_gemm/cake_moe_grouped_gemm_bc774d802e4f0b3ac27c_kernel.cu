@@ -26,12 +26,9 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -40,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -59,13 +55,16 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define BLOCK_K 64
 #define CLUSTER_M 256
 #define EPI_CHUNK 16
+#ifndef WGRAD_TILE
+#error "WGRAD_TILE is a downstream specialization of this program; define it on the compile line"
+#endif
 
 #include <math_constants.h>
 
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_moe_grouped_gemm_b2d20946be54fd09c880(float* __restrict__ partials, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, int num_groups, int N, int K, int ldc, int stride_e, int num_clusters_1, int tail_splits, int raster_rows)
+kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c(float* __restrict__ partials, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, int num_groups, int N, int K, int ldc, int stride_e, int num_clusters_1, int tail_splits, int raster_rows)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -78,7 +77,7 @@ kernel_cake_moe_grouped_gemm_b2d20946be54fd09c880(float* __restrict__ partials, 
     const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
-    const int threads_per_row = 256 / EPI_CHUNK;
+    const int threads_per_row = WGRAD_TILE / EPI_CHUNK;
     const int rows_per_cta = THREADS / threads_per_row;
     const int row_blocks = CLUSTER_M / rows_per_cta;
     int tid_r = tid;
@@ -88,7 +87,7 @@ kernel_cake_moe_grouped_gemm_b2d20946be54fd09c880(float* __restrict__ partials, 
     int row_in_tile = rb_r * rows_per_cta + tid_r / threads_per_row;
     int col_r = tid_r % threads_per_row * EPI_CHUNK;
     int grid_n_r = N / BLOCK_N;
-    int grid_k_r = K / 256;
+    int grid_k_r = K / WGRAD_TILE;
     int tiles_per_group_r = grid_n_r * grid_k_r;
     int total_tiles_r = num_groups * tiles_per_group_r;
     int tail_base_r = total_tiles_r / num_clusters_1 * num_clusters_1;
@@ -131,7 +130,7 @@ kernel_cake_moe_grouped_gemm_b2d20946be54fd09c880(float* __restrict__ partials, 
             int slot_r = j_r * tail_splits + s_r;
             float _vec_load_0[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(partials + (slot_r * (CLUSTER_M * 256) + row_in_tile * 256 + col_r) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(partials + (slot_r * (CLUSTER_M * WGRAD_TILE) + row_in_tile * WGRAD_TILE + col_r) + 0);
                 _vec_load_0[0 + 0] = _v4.x;
                 _vec_load_0[0 + 1] = _v4.y;
                 _vec_load_0[0 + 2] = _v4.z;
@@ -139,7 +138,7 @@ kernel_cake_moe_grouped_gemm_b2d20946be54fd09c880(float* __restrict__ partials, 
             }
             float _vec_load_1[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(partials + (slot_r * (CLUSTER_M * 256) + row_in_tile * 256 + col_r + 4) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(partials + (slot_r * (CLUSTER_M * WGRAD_TILE) + row_in_tile * WGRAD_TILE + col_r + 4) + 0);
                 _vec_load_1[0 + 0] = _v4.x;
                 _vec_load_1[0 + 1] = _v4.y;
                 _vec_load_1[0 + 2] = _v4.z;
@@ -147,7 +146,7 @@ kernel_cake_moe_grouped_gemm_b2d20946be54fd09c880(float* __restrict__ partials, 
             }
             float _vec_load_2[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(partials + (slot_r * (CLUSTER_M * 256) + row_in_tile * 256 + col_r + 8) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(partials + (slot_r * (CLUSTER_M * WGRAD_TILE) + row_in_tile * WGRAD_TILE + col_r + 8) + 0);
                 _vec_load_2[0 + 0] = _v4.x;
                 _vec_load_2[0 + 1] = _v4.y;
                 _vec_load_2[0 + 2] = _v4.z;
@@ -155,7 +154,7 @@ kernel_cake_moe_grouped_gemm_b2d20946be54fd09c880(float* __restrict__ partials, 
             }
             float _vec_load_3[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(partials + (slot_r * (CLUSTER_M * 256) + row_in_tile * 256 + col_r + 12) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(partials + (slot_r * (CLUSTER_M * WGRAD_TILE) + row_in_tile * WGRAD_TILE + col_r + 12) + 0);
                 _vec_load_3[0 + 0] = _v4.x;
                 _vec_load_3[0 + 1] = _v4.y;
                 _vec_load_3[0 + 2] = _v4.z;
@@ -192,7 +191,7 @@ kernel_cake_moe_grouped_gemm_b2d20946be54fd09c880(float* __restrict__ partials, 
                     unsigned _pk_u7 = *reinterpret_cast<unsigned*>(&_pk7);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(&((__nv_bfloat16*)(C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * 256 + col_r)))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
+                        :: "l"((void*)(&((__nv_bfloat16*)(C + (e_r * stride_e + (n_block_r * BLOCK_N + row_in_tile) * ldc + k_block_r * WGRAD_TILE + col_r)))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
                 }
             }
         }
