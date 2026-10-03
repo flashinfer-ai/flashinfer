@@ -1917,9 +1917,11 @@ def _blackwell_ragged_auto_upgrade(
                 and (head_dim_qk, head_dim_vo) in _CUTLASS_RAGGED_AUTO_HEAD_DIMS
                 and cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY
                 # `fmha_varlen_plan` allocates fresh work-index buffers on every
-                # call, so a re-plan silently leaves a captured graph pointing at
-                # the previous allocation. Until those buffers are updated in
-                # place, CUTLASS is not graph-safe and `auto` stays away.
+                # call, so a re-plan leaves a captured graph pointing at the
+                # previous allocation. An explicit `cutlass` wrapper may plan
+                # once before capture, but `auto` is re-resolved on every plan()
+                # and graph-mode callers re-plan before each replay, so `auto`
+                # stays away until those buffers are updated in place.
                 and not cuda_graph_enabled
             ):
                 return backend
@@ -4252,6 +4254,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             device="cpu",
         )
         self._use_cuda_graph = use_cuda_graph
+        # Set once an explicit-CUTLASS plan exists: `fmha_varlen_plan` allocates
+        # fresh work-index buffers per call, so in CUDA-graph mode the first
+        # plan is safe (nothing captured yet) but a re-plan is not.
+        self._cutlass_graph_planned = False
         if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
                 raise ValueError(
@@ -4533,6 +4539,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 custom_mask.contiguous().view(-1),
                 mask_indptr.to(custom_mask.device),
                 bitorder="little",
+            )
+
+        if (
+            self.is_cuda_graph_enabled
+            and self._requested_backend == "cutlass"
+            and self._cutlass_graph_planned
+        ):
+            # Reject before updating cached plan state or registered buffers
+            # so the original plan remains usable after a refused re-plan.
+            raise ValueError(
+                "the cutlass backend allocates fresh plan buffers on every "
+                "plan() call, so re-planning in CUDA-graph mode would leave "
+                "a captured graph pointing at the previous ones; plan once "
+                "before capture, or use backend='auto' or an explicit "
+                "'cudnn'/'fa2' if you need to re-plan"
             )
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
@@ -5032,17 +5053,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
 
         if self._backend == "cutlass":
-            if self.is_cuda_graph_enabled:
-                # `fmha_varlen_plan` allocates new work-index buffers per call,
-                # so a captured graph keeps pointing at the previous ones. The
-                # fix is to update them in place; until then, refuse rather than
-                # replay against a stale plan. `auto` never lands here -- it
-                # treats graph mode as CUTLASS-ineligible and routes elsewhere.
-                raise ValueError(
-                    "the cutlass backend allocates its plan buffers per plan() "
-                    "call and is not CUDA-graph safe; use backend='auto' to get "
-                    "a graph-safe backend, or an explicit 'cudnn'/'fa2'"
-                )
+            # In CUDA-graph mode only the first plan reaches here: a re-plan is
+            # refused above, before the indptr copies, because the captured
+            # graph would keep the previous work-index buffers and max_qo_len.
+            # `auto` never lands here in graph mode -- it re-resolves on every
+            # plan(), so it treats graph mode as CUTLASS-ineligible.
             # Device mirrors, not the caller's tensors: in CUDA-graph mode the
             # kernel reads the registered buffers, and a host-side indptr would
             # otherwise be planned against.
@@ -5054,6 +5069,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 causal,
             )
             self._max_qo_len = max_qo_len
+            self._cutlass_graph_planned = True
         elif self._backend == "fmha_v2":
             # fmha_v2 handles planning internally — no JIT module plan needed
             pass
