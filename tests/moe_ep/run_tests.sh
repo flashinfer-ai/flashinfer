@@ -135,6 +135,8 @@ run_unit() {
     --ignore=tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm107_kernel_boundaries.py \
+    --ignore=tests/moe_ep/test_sm107_genphase_kernel.py \
+    --ignore=tests/moe_ep/test_sm107_combine_kernel.py \
     --ignore=tests/moe_ep/test_sm90_pull_fp8_tuner.py \
     --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
@@ -348,6 +350,8 @@ run_oracle_sm107() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py -v -s \
     tests/moe_ep/test_sm107_kernel_boundaries.py \
+    tests/moe_ep/test_sm107_genphase_kernel.py \
+    tests/moe_ep/test_sm107_combine_kernel.py \
     -m arch_rubin
 }
 
