@@ -468,6 +468,49 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
 
 
+@pytest.mark.parametrize(
+    "times,expected",
+    [
+        ({0: 1.00, 1: 0.98, 2: 3.0}, 0),  # 2% faster: keep the first tactic
+        ({0: 1.00, 1: 0.95, 2: 3.0}, 1),  # 5% faster: take it
+    ],
+)
+def test_choose_one_first_tactic_margin(monkeypatch, times, expected):
+    """first_tactic_margin keeps runners[0]'s first tactic unless beaten by the margin."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig(first_tactic_margin=0.03)
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        return times[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        _, tactic = tuner.choose_one("dummy_margin", [runner], config, inputs)
+    assert tactic == expected
+
+
+def test_tuning_config_timer_routes_to_cupti(monkeypatch):
+    """TuningConfig(timer="cupti") uses the CUPTI span path when it is available."""
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    calls = []
+    monkeypatch.setattr(autotuner_module, "_load_cupti", lambda: object())
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel_cupti",
+        lambda self, r, inputs, tactic, config, **kw: calls.append(tactic) or 1.0,
+    )
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    t = tuner._profile_single_kernel(runner, inputs, 1, TuningConfig(timer="cupti"))
+    assert t == 1.0 and calls == [1]
+
+
 @pytest.mark.parametrize("phase", ("forward", "precompile"))
 def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch, phase):
     class PreparationMemoryErrorRunner(DummyRunner):
