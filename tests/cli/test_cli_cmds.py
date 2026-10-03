@@ -14,6 +14,7 @@ the other logging/replay functionality tests, since it's tightly coupled with th
 """
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -889,6 +890,65 @@ def test_download_kernels_cmd_attempts_jit_cache_after_cubin_failure(monkeypatch
     assert len(recorded) == 2
     assert recorded[0][0][-1] == "flashinfer-cubin==0.4.1"
     assert recorded[1][0][-1] == "flashinfer-jit-cache==0.4.1+cu129"
+
+
+def test_download_kernels_cmd_with_stale_kernel_wheels_real(tmp_path):
+    """Kernel wheels left behind by an upgrade must not block their replacement.
+
+    Regression test for #5886. The mismatch is detected while ``flashinfer`` is
+    imported, before the CLI runs, so this has to start a fresh interpreter.
+    """
+    import flashinfer
+
+    if flashinfer.__version__ == "0.0.0+unknown":
+        pytest.skip("Source checkouts without build metadata skip the version check.")
+
+    for package, version, entry_point in (
+        ("flashinfer_cubin", "0.0.1", "get_cubin_dir"),
+        ("flashinfer_jit_cache", "0.0.1+cu130", "get_jit_cache_providers"),
+    ):
+        (tmp_path / package).mkdir()
+        (tmp_path / package / "__init__.py").write_text(
+            f"__version__ = {version!r}\n"
+            f"def {entry_point}():\n"
+            f"    raise AssertionError('stale {package} must not be used')\n"
+        )
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in ("FLASHINFER_CUBIN_DIR", "FLASHINFER_DISABLE_VERSION_CHECK")
+    }
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(tmp_path), env.get("PYTHONPATH")))
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "flashinfer",
+            "download-kernels",
+            "--cuda-version",
+            "13.0",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    public_version = Version(flashinfer.__version__).public
+    _assert_output_contains_all(
+        output,
+        "Ignoring incompatible flashinfer-cubin package",
+        "Ignoring incompatible flashinfer-jit-cache package",
+        "flashinfer download-kernels",
+        f"flashinfer-cubin=={public_version}",
+        f"flashinfer-jit-cache=={public_version}+cu130",
+    )
 
 
 class MockJitSpec:
