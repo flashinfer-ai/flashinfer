@@ -270,7 +270,8 @@ void nvfp4_quantize_append_paged_kv_cache(TensorView append_key, TensorView appe
 void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     TensorView append_key, TensorView append_value, TensorView slot_mapping,
     TensorView paged_k_cache, TensorView paged_v_cache, TensorView k_scale_cache,
-    TensorView v_scale_cache, TensorView k_scale, TensorView v_scale, int64_t layout) {
+    TensorView v_scale_cache, TensorView k_scale, TensorView v_scale, int64_t layout,
+    bool nvfp4_4over6) {
   CHECK_LAST_DIM_CONTIGUOUS(append_key);
   CHECK_LAST_DIM_CONTIGUOUS(append_value);
   CHECK_INPUT(slot_mapping);
@@ -394,7 +395,7 @@ void nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
           static_cast<uint8_t*>(v_scale_cache.data_ptr()), k_stride_page, k_stride_n, k_stride_h,
           v_stride_page, v_stride_n, v_stride_h, k_sf_stride_page, k_sf_stride_n, k_sf_stride_h,
           v_sf_stride_page, v_sf_stride_n, v_sf_stride_h, static_cast<float*>(k_scale.data_ptr()),
-          static_cast<float*>(v_scale.data_ptr()), stream);
+          static_cast<float*>(v_scale.data_ptr()), stream, nvfp4_4over6);
       TVM_FFI_ICHECK(status == cudaSuccess)
           << "NVFP4QuantizeAppendPagedKVCacheWithSlotMapping failed with error: "
           << cudaGetErrorString(status);
