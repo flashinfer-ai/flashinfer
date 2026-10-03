@@ -5028,6 +5028,8 @@ def _cudnn_gemm_fp8(
 
 
 def _cudnn_gemm_fp8_runner():
+    # Keep the mapper in the closure so bucket overrides don't change the
+    # runner's hash, which includes its instance attributes.
     m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
         _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
     )
@@ -5035,7 +5037,6 @@ def _cudnn_gemm_fp8_runner():
     class CudnnFp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -5047,7 +5048,7 @@ def _cudnn_gemm_fp8_runner():
             actual_m = a.shape[-2]
             k = a.shape[-1]
             n = b.shape[-1]
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = m_bucket_mapper(actual_m)
 
             # tactic value only be 0 or -1 to hit the graph cache
             return build_cudnn_gemm_fp8_graph_override_shape(
@@ -5522,7 +5523,6 @@ def _cudnn_gemm_bf16_runner(
             is_b_k_major: Optional[bool],
         ):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
             # Default to k-major (the convention torch.rand-synthesized
             # profile tensors use) when caller didn't specify.
             self._is_a_k_major = True if is_a_k_major is None else is_a_k_major
@@ -5549,7 +5549,7 @@ def _cudnn_gemm_bf16_runner(
             # contiguous tensor regardless of the real layout, so reading
             # its stride would build a different graph than the runtime
             # call, breaking tactic-index alignment.
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = m_bucket_mapper(actual_m)
 
             graph = build_cudnn_gemm_bf16_graph_override_shape(
                 batch=batch,
@@ -6666,7 +6666,6 @@ def _cudnn_mm_mxfp8_runner():
     class CudnnMmMxfp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -6678,7 +6677,7 @@ def _cudnn_mm_mxfp8_runner():
             actual_m = a.shape[0]
             k = a.shape[1]
             n = b.shape[1]
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = m_bucket_mapper(actual_m)
             return build_cudnn_gemm_mxfp8_graph_override_shape(
                 batch=1,
                 n=n,
@@ -7084,7 +7083,6 @@ def _cudnn_gemm_fp4_runner(tuning_config):
     class CudnnFp4GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def _get_override_graph(
@@ -7100,14 +7098,14 @@ def _cudnn_gemm_fp4_runner(tuning_config):
 
             # cache_m must match the AutoTuner cache key so the runtime
             # graph is the SAME graph the autotuner profiled tactics on.
-            # ``self._m_bucket_mapper`` is the *currently effective*
+            # ``m_bucket_mapper`` is the *currently effective*
             # ``map_to_tuning_buckets`` (with any
             # ``autotune(tuning_buckets=..., round_up=...)`` override
             # applied).  Sharing the mapper keeps cache_m and the tactic
             # cache key in lockstep -- otherwise a tactic profiled on
             # graph ``cache_m=A`` is silently applied to graph ``cache_m=B``
             # at runtime, which has a different plan-index meaning.
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = m_bucket_mapper(actual_m)
 
             graph = build_cudnn_gemm_fp4_graph_override_shape(
                 batch=batch,
@@ -11711,7 +11709,6 @@ def _cudnn_gemm_mxfp8_runner():
     class CudnnMxfp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -11723,7 +11720,7 @@ def _cudnn_gemm_mxfp8_runner():
             actual_m = a.shape[-2]
             k = a.shape[-1]
             n = b.shape[-1]
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = m_bucket_mapper(actual_m)
 
             return build_cudnn_gemm_mxfp8_graph_override_shape(
                 batch=batch,
