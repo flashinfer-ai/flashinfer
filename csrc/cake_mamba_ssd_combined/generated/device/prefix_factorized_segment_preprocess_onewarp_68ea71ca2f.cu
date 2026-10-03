@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -22,7 +26,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define THREADS 128
+#define THREADS 32
 
 #include <math_constants.h>
 
@@ -32,10 +36,17 @@ __device__ __forceinline__ float approx_exp2(float x) {
     return y;
 }
 
+
+__device__ __forceinline__ float approx_rcp(float x) {
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
 extern "C" {
 
-__global__ __launch_bounds__(128) void
-kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* __restrict__ A, float* __restrict__ dt_bias, int* __restrict__ segment_starts, int* __restrict__ segment_lengths, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, __nv_bfloat16* __restrict__ delta, float* __restrict__ cumsum, int num_segments, int nheads, int seqlen, int direct_varlen_metadata, int dt_softplus, float dt_min, float dt_max)
+__global__ __launch_bounds__(32) void
+kernel_prefix_factorized_segment_preprocess_onewarp(float* __restrict__ dt, float* __restrict__ A, float* __restrict__ dt_bias, int* __restrict__ segment_starts, int* __restrict__ segment_lengths, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, __nv_bfloat16* __restrict__ delta, float* __restrict__ cumsum, int num_segments, int nheads, int seqlen, int direct_varlen_metadata, int dt_softplus, float dt_min, float dt_max)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -46,9 +57,11 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    int tile = bid * 128 + tid;
     int total_tiles = num_segments * nheads;
-    if (tile < total_tiles) {
+    int cta_base = bid * 32;
+    int grid_stride = num_bids * 32;
+    #pragma unroll 1
+    for (int tile = cta_base + tid; tile < total_tiles; tile += grid_stride) {
         int segment = tile / nheads;
         int head = tile % nheads;
         int start = 0;
@@ -101,10 +114,6 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                     }
                     group_dt[local] = transformed;
                     group_product[local] = transformed * a_value;
-                    if (physical_token >= segment_offset && physical_token < segment_offset + length) {
-                        int local_token = physical_token - segment_offset;
-                        delta[tile * 128 + local_token] = transformed;
-                    }
                 }
                 scan_offset_1[0] = group_product[0];
                 #pragma unroll
@@ -147,8 +156,13 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                         segment_base = physical_cumsum;
                     }
                     if (physical_token_1 >= segment_offset && physical_token_1 < segment_offset + length) {
-                        int local_token_1 = physical_token_1 - segment_offset;
-                        cumsum[tile * 128 + local_token_1] = physical_cumsum - segment_base;
+                        int local_token = physical_token_1 - segment_offset;
+                        float local_cumsum = physical_cumsum - segment_base;
+                        float _exp2_1 = approx_exp2(local_cumsum * 1.4426950408889634f);
+                        float prefix = _exp2_1;
+                        delta[tile * 128 + local_token] = group_dt[local_5];
+                        float _rcp_0 = approx_rcp(prefix);
+                        cumsum[tile * 128 + local_token] = _rcp_0;
                     }
                 }
                 if (group_start == 0) {
@@ -167,8 +181,8 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                     float transformed_1 = biased_1;
                     if (dt_softplus != 0) {
                         if (biased_1 <= 20.0f) {
-                            float _exp2_1 = approx_exp2(biased_1 * 1.4426950408889634f);
-                            float _log_1 = logf(_exp2_1 + 1.0f);
+                            float _exp2_2 = approx_exp2(biased_1 * 1.4426950408889634f);
+                            float _log_1 = logf(_exp2_2 + 1.0f);
                             transformed_1 = _log_1;
                         }
                     }
@@ -180,10 +194,6 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                     }
                     group_dt_4[local_6] = transformed_1;
                     group_product_4[local_6] = transformed_1 * a_value;
-                    if (physical_token_2 >= segment_offset && physical_token_2 < segment_offset + length) {
-                        int local_token_2 = physical_token_2 - segment_offset;
-                        delta[tile * 128 + local_token_2] = transformed_1;
-                    }
                 }
                 group_scan_4[0] = group_product_4[0];
                 float _fma_1 = __fmaf_rn(group_dt_4[1], a_value, group_product_4[0]);
@@ -205,8 +215,13 @@ kernel_factorized_persistent_segment_preprocess(float* __restrict__ dt, float* _
                         segment_base = physical_cumsum_1;
                     }
                     if (physical_token_3 >= segment_offset && physical_token_3 < segment_offset + length) {
-                        int local_token_3 = physical_token_3 - segment_offset;
-                        cumsum[tile * 128 + local_token_3] = physical_cumsum_1 - segment_base;
+                        int local_token_1 = physical_token_3 - segment_offset;
+                        float local_cumsum_1 = physical_cumsum_1 - segment_base;
+                        float _exp2_3 = approx_exp2(local_cumsum_1 * 1.4426950408889634f);
+                        float prefix_1 = _exp2_3;
+                        delta[tile * 128 + local_token_1] = group_dt_4[local_7];
+                        float _rcp_1 = approx_rcp(prefix_1);
+                        cumsum[tile * 128 + local_token_1] = _rcp_1;
                     }
                 }
                 if (group_start_1 == 0) {

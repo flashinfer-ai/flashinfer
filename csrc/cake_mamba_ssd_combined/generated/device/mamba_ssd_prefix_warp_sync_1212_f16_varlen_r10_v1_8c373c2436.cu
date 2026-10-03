@@ -1,3 +1,7 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -10,6 +14,7 @@ struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
@@ -246,13 +251,6 @@ __device__ __forceinline__ void tmem_ld_x32(float* dst, int tmem_addr) {
 }
 
 
-__device__ __forceinline__ float approx_exp2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
 __device__ __forceinline__ float approx_rcp(float x) {
     float y;
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
@@ -428,7 +426,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __nv_bfloat16* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ initial_states, __nv_bfloat16* __restrict__ final_states, __nv_bfloat16* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int has_seq_chunk_cumsum, int seq_idx_int64, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
+kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __nv_bfloat16* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __half* __restrict__ initial_states, __half* __restrict__ final_states, __half* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int has_seq_chunk_cumsum, int seq_idx_int64, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -461,8 +459,8 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
     __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 116480);
     const int smem_y_addr = smem + 116480;
 
-    // Mbarrier init (17 groups, 19 barriers)
-    // Mbarriers at smem_raw[0..152)
+    // Mbarrier init (16 groups, 18 barriers)
+    // Mbarriers at smem_raw[0..144)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -472,39 +470,37 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
             mbarrier_init(smem + 0, 1);
             // bc_empty: 1 barriers, init_count=6
             mbarrier_init(smem + 8, 6);
-            // x_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 16, 1);
+            // x_full: 1 barriers, init_count=2
+            mbarrier_init(smem + 16, 2);
             // x_empty: 1 barriers, init_count=6
             mbarrier_init(smem + 24, 6);
-            // aux_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 32, 1);
             // aux_empty: 1 barriers, init_count=8
-            mbarrier_init(smem + 40, 8);
+            mbarrier_init(smem + 32, 8);
             // --- pipeline 'intra1_acc_pipe' ---
             // cb_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 48, 1);
-            mbarrier_init(smem + 56, 1);
             // cb_empty: 2 barriers, init_count=4
+            mbarrier_init(smem + 56, 4);
             mbarrier_init(smem + 64, 4);
-            mbarrier_init(smem + 72, 4);
             // q_full: 1 barriers, init_count=4
-            mbarrier_init(smem + 80, 4);
+            mbarrier_init(smem + 72, 4);
             // q_empty: 1 barriers, init_count=1
-            mbarrier_init(smem + 88, 1);
+            mbarrier_init(smem + 80, 1);
             // scaled_b_full: 1 barriers, init_count=4
-            mbarrier_init(smem + 96, 4);
+            mbarrier_init(smem + 88, 4);
             // state_operand_full: 1 barriers, init_count=4
-            mbarrier_init(smem + 104, 4);
+            mbarrier_init(smem + 96, 4);
             // state_read_released: 1 barriers, init_count=1
-            mbarrier_init(smem + 112, 1);
+            mbarrier_init(smem + 104, 1);
             // state_delta_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 120, 1);
+            mbarrier_init(smem + 112, 1);
             // intra_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 128, 1);
+            mbarrier_init(smem + 120, 1);
             // inter_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 136, 1);
+            mbarrier_init(smem + 128, 1);
             // outputs_empty: 1 barriers, init_count=4
-            mbarrier_init(smem + 144, 4);
+            mbarrier_init(smem + 136, 4);
             asm volatile("fence.mbarrier_init.release.cluster;");
         }
     }
@@ -512,9 +508,9 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 152);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 144);
     if (warp == 12) {
-        int _tmem_hold = smem + 152;
+        int _tmem_hold = smem + 144;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -527,19 +523,18 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
     #define bc_empty_addr (mbar_base + 8)
     #define x_full_addr (mbar_base + 16)
     #define x_empty_addr (mbar_base + 24)
-    #define aux_full_addr (mbar_base + 32)
-    #define aux_empty_addr (mbar_base + 40)
-    #define cb_full_addr (mbar_base + 48)
-    #define cb_empty_addr (mbar_base + 64)
-    #define q_full_addr (mbar_base + 80)
-    #define q_empty_addr (mbar_base + 88)
-    #define scaled_b_full_addr (mbar_base + 96)
-    #define state_operand_full_addr (mbar_base + 104)
-    #define state_read_released_addr (mbar_base + 112)
-    #define state_delta_full_addr (mbar_base + 120)
-    #define intra_full_addr (mbar_base + 128)
-    #define inter_full_addr (mbar_base + 136)
-    #define outputs_empty_addr (mbar_base + 144)
+    #define aux_empty_addr (mbar_base + 32)
+    #define cb_full_addr (mbar_base + 40)
+    #define cb_empty_addr (mbar_base + 56)
+    #define q_full_addr (mbar_base + 72)
+    #define q_empty_addr (mbar_base + 80)
+    #define scaled_b_full_addr (mbar_base + 88)
+    #define state_operand_full_addr (mbar_base + 96)
+    #define state_read_released_addr (mbar_base + 104)
+    #define state_delta_full_addr (mbar_base + 112)
+    #define intra_full_addr (mbar_base + 120)
+    #define inter_full_addr (mbar_base + 128)
+    #define outputs_empty_addr (mbar_base + 136)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -668,9 +663,10 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
                         if (elect_sync()) {
                             mbarrier_arrive(state_operand_full_addr);
                         }
-                        mbarrier_wait(aux_full_addr + (input_stage) * 8, _phase_aux_full);
+                        mbarrier_wait(x_full_addr + (input_stage) * 8, _phase_aux_full);
                         mbarrier_wait(bc_full_addr + (input_stage) * 8, _phase_bc_full);
                         float last_cumsum = smem_cumsum_all[input_stage * 128 + (unsigned int)(segment_limit - 1)];
+                        float _exp2_1 = approx_rcp(last_cumsum);
                         mbarrier_wait(state_read_released_addr, _phase_state_read_released_0);
                         _phase_state_read_released_0 ^= 1;
                         int b_state_base = (warp % 4 * 4 + lane / 8) * 8;
@@ -698,8 +694,7 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
                                         : "=f"((&scaled_b_values[_pair * 2])[0]), "=f"((&scaled_b_values[_pair * 2])[1])
                                         : "r"(b_packed[_pair]));
                                 }
-                                float _exp2_1 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage * 128 + (unsigned int)col]) * 1.4426950408889634f);
-                                float b_scale = _exp2_1;
+                                float b_scale = _exp2_1 * smem_cumsum_all[input_stage * 128 + (unsigned int)col];
                                 float _cvt_f32_0 = __bfloat162float(smem_delta_all[input_stage * 128 + (unsigned int)col]);
                                 b_scale *= _cvt_f32_0;
                                 const float2 _scale2_1 = {b_scale, b_scale};
@@ -728,8 +723,7 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
                         if (segment_offset > 0) {
                             segment_base = smem_cumsum_all[input_stage * 128 + (unsigned int)(segment_offset - 1)];
                         }
-                        float _exp2_2 = approx_exp2((last_cumsum - segment_base) * 1.4426950408889634f);
-                        float last_decay = _exp2_2;
+                        float last_decay = _exp2_1;
                         const float2 _scale2_3 = {last_decay, last_decay};
                         #pragma unroll
                         for (int _ls = 0; _ls < 32; _ls++)
@@ -1303,7 +1297,7 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
                     __syncwarp();
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        mbarrier_arrive(aux_full_addr + (input_stage_4) * 8);
+                        mbarrier_arrive(x_full_addr + (input_stage_4) * 8);
                     }
                     input_stage_4 += 1;
                     if (input_stage_4 == 1) { input_stage_4 = 0; _phase_aux_empty ^= 1; _phase_x_empty ^= 1; }
@@ -1370,10 +1364,11 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
                     }
                     {
                         mbarrier_wait(cb_full_addr + (acc_stage_1) * 8, _phase_cb_full);
-                        mbarrier_wait(aux_full_addr + (input_stage_5) * 8, _phase_aux_full_1);
+                        mbarrier_wait(x_full_addr + (input_stage_5) * 8, _phase_aux_full_1);
                         mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                         _phase_q_empty_0 ^= 1;
                         float row_cumsum = smem_cumsum_all[input_stage_5 * 128 + (unsigned int)row];
+                        float _exp2_0 = approx_rcp(row_cumsum);
                         float segment_base_1 = 0.0f;
                         if (segment_offset_3 > 0) {
                             segment_base_1 = smem_cumsum_all[input_stage_5 * 128 + (unsigned int)(segment_offset_3 - 1)];
@@ -1389,8 +1384,7 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
                                 int col_1 = col_chunk * 32 + local_col;
                                 float q_value = 0.0f;
                                 if (row >= segment_offset_3 && row < segment_limit_3 && col_1 >= segment_offset_3 && col_1 <= row) {
-                                    float _exp2_0 = approx_exp2((row_cumsum - smem_cumsum_all[input_stage_5 * 128 + (unsigned int)col_1]) * 1.4426950408889634f);
-                                    float decay = _exp2_0;
+                                    float decay = _exp2_0 * smem_cumsum_all[input_stage_5 * 128 + (unsigned int)col_1];
                                     q_value = decay * (float)smem_delta_all[input_stage_5 * 128 + (unsigned int)col_1];
                                     q_value *= _tmem_load_0[local_col];
                                 }
@@ -1490,8 +1484,7 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
                         _phase_intra_full_0 ^= 1;
                         mbarrier_wait(inter_full_addr, _phase_inter_full_0);
                         _phase_inter_full_0 ^= 1;
-                        mbarrier_wait(aux_full_addr + (input_stage_6) * 8, _phase_aux_full_2);
-                        mbarrier_wait(x_full_addr + (input_stage_6) * 8, _phase_x_full_2);
+                        mbarrier_wait(x_full_addr + (input_stage_6) * 8, _phase_aux_full_2);
                         int physical_batch_2 = 0;
                         float segment_base_2 = 0.0f;
                         if (segment_offset_4 > 0) {
@@ -1515,7 +1508,7 @@ kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen(const __grid_const
                             if (row_1 >= segment_offset_4 && row_1 < segment_limit_4) {
                                 int token_in_batch_2 = physical_chunk_6 * 128 + row_1;
                                 int token = physical_batch_2 * seqlen + token_in_batch_2;
-                                float _exp2_3 = approx_exp2((smem_cumsum_all[input_stage_6 * 128 + (unsigned int)row_1] - segment_base_2) * 1.4426950408889634f);
+                                float _exp2_3 = approx_rcp(smem_cumsum_all[input_stage_6 * 128 + (unsigned int)row_1]);
                                 float decay_1 = _exp2_3;
                                 #pragma unroll
                                 for (int local_pair = 0; local_pair < 16; local_pair++) {
