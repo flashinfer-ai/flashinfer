@@ -766,7 +766,7 @@ class _BatchMLAGeneratedFaMechanics:
         device_length_args: tuple[object, ...] = ()
         if kv_len is not None:
             run = self._cached_module.run_with_kv_len
-            device_length_args = (self._qo_indptr_buf, kv_len)
+            device_length_args = (kv_len,)
         run(
             *device_length_args,
             self._float_workspace_buffer,

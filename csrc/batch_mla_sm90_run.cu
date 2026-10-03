@@ -27,13 +27,12 @@ using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
 static void BatchMLAPagedAttentionSM90RunImpl(
-    Optional<TensorView> maybe_qo_indptr, Optional<TensorView> maybe_kv_len,
-    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
-    Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
-    TensorView kpe_cache, TensorView kv_indices, TensorView o, Optional<TensorView> maybe_lse,
-    int64_t mask_mode_code, int64_t num_heads, int64_t page_size, double sm_scale,
-    bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
-    Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
+    Optional<TensorView> maybe_kv_len, TensorView float_workspace_buffer,
+    TensorView int_workspace_buffer, Array<int64_t> plan_info_vec, TensorView q_nope,
+    TensorView q_pe, TensorView ckv_cache, TensorView kpe_cache, TensorView kv_indices,
+    TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code, int64_t num_heads,
+    int64_t page_size, double sm_scale, bool return_lse_base_on_e, double ckv_scale,
+    double kpe_scale, Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
@@ -78,30 +77,17 @@ static void BatchMLAPagedAttentionSM90RunImpl(
 
         if (maybe_kv_len.has_value()) {
           TVM_FFI_ICHECK(has_batch_metadata) << "device KV lengths require planned batch metadata";
-          TVM_FFI_ICHECK(maybe_qo_indptr.has_value())
-              << "qo_indptr is required when kv_len is provided";
-          const TensorView& qo_indptr = maybe_qo_indptr.value();
           const TensorView& kv_len = maybe_kv_len.value();
-          TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(qo_indptr.dtype()), int32_code)
-              << "qo_indptr must have dtype int32";
           TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(kv_len.dtype()), int32_code)
               << "kv_len must have dtype int32";
-          TVM_FFI_ICHECK_EQ(qo_indptr.device().device_type, q_nope.device().device_type)
-              << "qo_indptr must be on the same device as q_nope";
-          TVM_FFI_ICHECK_EQ(qo_indptr.device().device_id, q_nope.device().device_id)
-              << "qo_indptr must be on the same device as q_nope";
           TVM_FFI_ICHECK_EQ(kv_len.device().device_type, q_nope.device().device_type)
               << "kv_len must be on the same device as q_nope";
           TVM_FFI_ICHECK_EQ(kv_len.device().device_id, q_nope.device().device_id)
               << "kv_len must be on the same device as q_nope";
-          TVM_FFI_ICHECK_EQ(qo_indptr.ndim(), 1) << "qo_indptr must be a 1-D tensor";
           TVM_FFI_ICHECK_EQ(kv_len.ndim(), 1) << "kv_len must be a 1-D tensor";
-          TVM_FFI_ICHECK(qo_indptr.IsContiguous()) << "qo_indptr must be contiguous";
           TVM_FFI_ICHECK(kv_len.IsContiguous()) << "kv_len must be contiguous";
           TVM_FFI_ICHECK_EQ(kv_len.size(0), plan_batch_size)
               << "kv_len batch size must match the planned batch size";
-          TVM_FFI_ICHECK_GE(qo_indptr.size(0), plan_batch_size + 1)
-              << "qo_indptr must contain the planned batch offsets";
           TVM_FFI_ICHECK(plan_info.num_blks_x == 0 || plan_info.num_blks_y == 0 ||
                          plan_batch_size > 0)
               << "kv_len must contain one entry for a non-empty plan";
@@ -184,23 +170,22 @@ void BatchMLAPagedAttentionSM90Run(
     int64_t mask_mode_code, int64_t num_heads, int64_t page_size, double sm_scale,
     bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
     Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
-  BatchMLAPagedAttentionSM90RunImpl(std::nullopt, std::nullopt, float_workspace_buffer,
-                                    int_workspace_buffer, plan_info_vec, q_nope, q_pe, ckv_cache,
-                                    kpe_cache, kv_indices, o, maybe_lse, mask_mode_code, num_heads,
-                                    page_size, sm_scale, return_lse_base_on_e, ckv_scale, kpe_scale,
-                                    maybe_ckv_scale_arr ADDITIONAL_FUNC_ARGS);
-}
-
-void BatchMLAPagedAttentionSM90RunWithKVLen(
-    TensorView qo_indptr, TensorView kv_len, TensorView float_workspace_buffer,
-    TensorView int_workspace_buffer, Array<int64_t> plan_info_vec, TensorView q_nope,
-    TensorView q_pe, TensorView ckv_cache, TensorView kpe_cache, TensorView kv_indices,
-    TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code, int64_t num_heads,
-    int64_t page_size, double sm_scale, bool return_lse_base_on_e, double ckv_scale,
-    double kpe_scale, Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
-  BatchMLAPagedAttentionSM90RunImpl(qo_indptr, kv_len, float_workspace_buffer, int_workspace_buffer,
+  BatchMLAPagedAttentionSM90RunImpl(std::nullopt, float_workspace_buffer, int_workspace_buffer,
                                     plan_info_vec, q_nope, q_pe, ckv_cache, kpe_cache, kv_indices,
                                     o, maybe_lse, mask_mode_code, num_heads, page_size, sm_scale,
                                     return_lse_base_on_e, ckv_scale, kpe_scale,
                                     maybe_ckv_scale_arr ADDITIONAL_FUNC_ARGS);
+}
+
+void BatchMLAPagedAttentionSM90RunWithKVLen(
+    TensorView kv_len, TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
+    TensorView kpe_cache, TensorView kv_indices, TensorView o, Optional<TensorView> maybe_lse,
+    int64_t mask_mode_code, int64_t num_heads, int64_t page_size, double sm_scale,
+    bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
+    Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
+  BatchMLAPagedAttentionSM90RunImpl(
+      kv_len, float_workspace_buffer, int_workspace_buffer, plan_info_vec, q_nope, q_pe, ckv_cache,
+      kpe_cache, kv_indices, o, maybe_lse, mask_mode_code, num_heads, page_size, sm_scale,
+      return_lse_base_on_e, ckv_scale, kpe_scale, maybe_ckv_scale_arr ADDITIONAL_FUNC_ARGS);
 }
