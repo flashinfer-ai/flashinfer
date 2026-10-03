@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 // Generated source for FlashInfer.
-// Bundle: Blackwell BGMV MoE shrink and deterministic expand portfolio.
-// Target: sm_90a, sm_100a, sm_103a (cp.async, shuffles, FMA only); compile flags: none.
+// Bundle: Blackwell BGMV MoE shrink and deterministic expand portfolio, f16 hidden 2688 rank 32.
+// Target: sm_90a, sm_100a, sm_103a (cp.async, shuffles, atomics, FMA only); compile flags: none.
 // Generated file; do not edit manually.
 typedef signed char int8_t;
 typedef unsigned char uint8_t;
@@ -66,7 +66,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
-    int num_experts, int num_tokens) {
+    int num_experts, int num_tokens, unsigned int* __restrict__ route_index_raw, int route_build) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -77,6 +77,8 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
 
   const int bid = blockIdx.x;
   const int num_bids = gridDim.x;
+
+  const int cta_rank = 0;
 
   // Kernel setup ops
   __half* x_smem = reinterpret_cast<__half*>(smem_raw + 0);
@@ -144,6 +146,45 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
     }
     asm volatile("cp.async.commit_group;");
   }
+  unsigned int route_launch = 0;
+  unsigned int route_old[4];
+  unsigned int route_base_even[4];
+  unsigned int route_base_odd[4];
+  int route_publish[4];
+#pragma unroll
+  for (int pp_2 = 0; pp_2 < 4; pp_2++) {
+    route_publish[pp_2] = 0;
+  }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+        route_launch = route_index_raw[0];
+#pragma unroll
+        for (int pp_3 = 0; pp_3 < 4; pp_3++) {
+          if (valid[pp_3] != 0) {
+            int route_token = (int)tokens[pp_3];
+            route_publish[pp_3] = 1;
+            if (num_pairs == num_tokens * 2) {
+              int route_offset = pair_block * 4 + pp_3 - route_token * 2;
+              if (route_offset >= 0) {
+                if (route_offset < 2) {
+                  route_publish[pp_3] = 0;
+                }
+              }
+            }
+          }
+          if (route_publish[pp_3] != 0) {
+            int publish_token = (int)tokens[pp_3];
+            unsigned int _atomic_old_0 =
+                atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[4 + publish_token], 1);
+            route_old[pp_3] = _atomic_old_0;
+            route_base_even[pp_3] = route_index_raw[4 + num_tokens + publish_token];
+            route_base_odd[pp_3] = route_index_raw[4 + 2 * num_tokens + publish_token];
+          }
+        }
+      }
+    }
+  }
   float owned_accum = 0.0f;
   unsigned int x_carriers[4];
   unsigned int w_carriers[4];
@@ -161,9 +202,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
     __syncthreads();
     int k_base_1 = tile_1 * 1024 + tid * 8;
 #pragma unroll
-    for (int pp_2 = 0; pp_2 < 4; pp_2++) {
-      int x_thread_base = tile_1 % 3 * 4 * 1024 + pp_2 * 1024 + tid * 8;
-      if (valid[pp_2] != 0) {
+    for (int pp_4 = 0; pp_4 < 4; pp_4++) {
+      int x_thread_base = tile_1 % 3 * 4 * 1024 + pp_4 * 1024 + tid * 8;
+      if (valid[pp_4] != 0) {
         if (k_base_1 < 2688) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
@@ -192,9 +233,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
 #pragma unroll
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
-        if (valid[pp_2] != 0) {
+        if (valid[pp_4] != 0) {
           if (k_base_1 < 2688) {
-            int w_thread_base = tile_1 % 3 * 4 * 8 * 1024 + pp_2 * 8 * 1024 + rr_1 * 1024 + tid * 8;
+            int w_thread_base = tile_1 % 3 * 4 * 8 * 1024 + pp_4 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
                            "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[(0) + 1])),
@@ -230,7 +271,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
           _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
         partial = _warp_reduce_0;
         if (lane == 0) {
-          warp_partials[(pp_2 * 8 + rr_1) * 4 + warp] = partial;
+          warp_partials[(pp_4 * 8 + rr_1) * 4 + warp] = partial;
         }
       }
     }
@@ -250,27 +291,27 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
     if (tile_1 + ((1) ? 3 : 3) < 3) {
       int refill_k = (tile_1 + ((1) ? 3 : 3)) * 1024 + tid * 8;
 #pragma unroll
-      for (int pp_3 = 0; pp_3 < 4; pp_3++) {
-        if (valid[pp_3] != 0) {
+      for (int pp_5 = 0; pp_5 < 4; pp_5++) {
+        if (valid[pp_5] != 0) {
           if (refill_k < 2688) {
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              x_smem_addr + (unsigned int)(((tile_1 + ((1) ? 3 : 3)) % 3 * 4 * 1024 +
-                                                           pp_3 * 1024 + tid * 8) *
+                                                           pp_5 * 1024 + tid * 8) *
                                                           2)),
                          "l"(reinterpret_cast<const __half*>(x_raw) +
-                             (tokens[pp_3] * 2688 + (long long)refill_k)));
+                             (tokens[pp_5] * 2688 + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
-                  ((loras[pp_3] * (long long)num_experts + experts[pp_3]) * 32 +
+                  ((loras[pp_5] * (long long)num_experts + experts[pp_5]) * 32 +
                    (long long)rank_row_1) *
                       2688 +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                       w_smem_addr + (unsigned int)(((tile_1 + ((1) ? 3 : 3)) % 3 * 4 * 8 * 1024 +
-                                                    pp_3 * 8 * 1024 + rr_2 * 1024 + tid * 8) *
+                                                    pp_5 * 8 * 1024 + rr_2 * 1024 + tid * 8) *
                                                    2)),
                   "l"(reinterpret_cast<const __half*>(lora_a_raw) + weight_index_1));
             }
@@ -292,6 +333,34 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
       }
     }
   }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+        int route_parity = (int)(route_launch & 1);
+        if (blockIdx.x == 0) {
+          *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
+            (0)) = (unsigned int)route_parity;
+        }
+#pragma unroll
+        for (int pp_6 = 0; pp_6 < 4; pp_6++) {
+          if (route_publish[pp_6] != 0) {
+            int publish_token_1 = (int)tokens[pp_6];
+            unsigned int route_base = route_base_even[pp_6];
+            if (route_parity != 0) {
+              route_base = route_base_odd[pp_6];
+            }
+            unsigned int route_slot = route_old[pp_6] - route_base;
+            if (route_slot < 16) {
+              *(reinterpret_cast<unsigned int*>(
+                    reinterpret_cast<unsigned int*>(route_index_raw) +
+                    (4 + 3 * num_tokens + publish_token_1 * 16 + (int)route_slot)) +
+                (0)) = (unsigned int)(pair_block * 4 + pp_6);
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 }  // extern "C"
@@ -309,9 +378,6 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
 #undef SMEM_X_SMEM_STAGE_BYTES
 #undef SMEM_X_SMEM_STRIDE
 #undef THREADS
-#undef w_smem_addr
-#undef warp_partials_addr
-#undef x_smem_addr
 
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -333,7 +399,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
-    int num_experts, int num_tokens) {
+    int num_experts, int num_tokens, unsigned int* __restrict__ route_index_raw, int route_build) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -344,6 +410,8 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
 
   const int bid = blockIdx.x;
   const int num_bids = gridDim.x;
+
+  const int cta_rank = 0;
 
   // Kernel setup ops
   __half* x_smem = reinterpret_cast<__half*>(smem_raw + 0);
@@ -411,6 +479,45 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
     }
     asm volatile("cp.async.commit_group;");
   }
+  unsigned int route_launch = 0;
+  unsigned int route_old[1];
+  unsigned int route_base_even[1];
+  unsigned int route_base_odd[1];
+  int route_publish[1];
+#pragma unroll
+  for (int pp_2 = 0; pp_2 < 1; pp_2++) {
+    route_publish[pp_2] = 0;
+  }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+        route_launch = route_index_raw[0];
+#pragma unroll
+        for (int pp_3 = 0; pp_3 < 1; pp_3++) {
+          if (valid[pp_3] != 0) {
+            int route_token = (int)tokens[pp_3];
+            route_publish[pp_3] = 1;
+            if (num_pairs == num_tokens * 2) {
+              int route_offset = pair_block + pp_3 - route_token * 2;
+              if (route_offset >= 0) {
+                if (route_offset < 2) {
+                  route_publish[pp_3] = 0;
+                }
+              }
+            }
+          }
+          if (route_publish[pp_3] != 0) {
+            int publish_token = (int)tokens[pp_3];
+            unsigned int _atomic_old_0 =
+                atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[4 + publish_token], 1);
+            route_old[pp_3] = _atomic_old_0;
+            route_base_even[pp_3] = route_index_raw[4 + num_tokens + publish_token];
+            route_base_odd[pp_3] = route_index_raw[4 + 2 * num_tokens + publish_token];
+          }
+        }
+      }
+    }
+  }
   float owned_accum = 0.0f;
   unsigned int x_carriers[4];
   unsigned int w_carriers[4];
@@ -428,9 +535,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
     __syncthreads();
     int k_base_1 = tile_1 * 1024 + tid * 8;
 #pragma unroll
-    for (int pp_2 = 0; pp_2 < 1; pp_2++) {
-      int x_thread_base = tile_1 % 2 * 1024 + pp_2 * 1024 + tid * 8;
-      if (valid[pp_2] != 0) {
+    for (int pp_4 = 0; pp_4 < 1; pp_4++) {
+      int x_thread_base = tile_1 % 2 * 1024 + pp_4 * 1024 + tid * 8;
+      if (valid[pp_4] != 0) {
         if (k_base_1 < 2688) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
@@ -459,9 +566,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
 #pragma unroll
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
-        if (valid[pp_2] != 0) {
+        if (valid[pp_4] != 0) {
           if (k_base_1 < 2688) {
-            int w_thread_base = tile_1 % 2 * 8 * 1024 + pp_2 * 8 * 1024 + rr_1 * 1024 + tid * 8;
+            int w_thread_base = tile_1 % 2 * 8 * 1024 + pp_4 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
                            "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[(0) + 1])),
@@ -497,7 +604,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
           _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
         partial = _warp_reduce_0;
         if (lane == 0) {
-          warp_partials[(pp_2 * 8 + rr_1) * 4 + warp] = partial;
+          warp_partials[(pp_4 * 8 + rr_1) * 4 + warp] = partial;
         }
       }
     }
@@ -517,27 +624,27 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
     if (tile_1 + ((1) ? 2 : 3) < 3) {
       int refill_k = (tile_1 + ((1) ? 2 : 3)) * 1024 + tid * 8;
 #pragma unroll
-      for (int pp_3 = 0; pp_3 < 1; pp_3++) {
-        if (valid[pp_3] != 0) {
+      for (int pp_5 = 0; pp_5 < 1; pp_5++) {
+        if (valid[pp_5] != 0) {
           if (refill_k < 2688) {
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              x_smem_addr + (unsigned int)(((tile_1 + ((1) ? 2 : 3)) % 2 * 1024 +
-                                                           pp_3 * 1024 + tid * 8) *
+                                                           pp_5 * 1024 + tid * 8) *
                                                           2)),
                          "l"(reinterpret_cast<const __half*>(x_raw) +
-                             (tokens[pp_3] * 2688 + (long long)refill_k)));
+                             (tokens[pp_5] * 2688 + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
-                  ((loras[pp_3] * (long long)num_experts + experts[pp_3]) * 32 +
+                  ((loras[pp_5] * (long long)num_experts + experts[pp_5]) * 32 +
                    (long long)rank_row_1) *
                       2688 +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                       w_smem_addr + (unsigned int)(((tile_1 + ((1) ? 2 : 3)) % 2 * 8 * 1024 +
-                                                    pp_3 * 8 * 1024 + rr_2 * 1024 + tid * 8) *
+                                                    pp_5 * 8 * 1024 + rr_2 * 1024 + tid * 8) *
                                                    2)),
                   "l"(reinterpret_cast<const __half*>(lora_a_raw) + weight_index_1));
             }
@@ -559,6 +666,34 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
       }
     }
   }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+        int route_parity = (int)(route_launch & 1);
+        if (blockIdx.x == 0) {
+          *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
+            (0)) = (unsigned int)route_parity;
+        }
+#pragma unroll
+        for (int pp_6 = 0; pp_6 < 1; pp_6++) {
+          if (route_publish[pp_6] != 0) {
+            int publish_token_1 = (int)tokens[pp_6];
+            unsigned int route_base = route_base_even[pp_6];
+            if (route_parity != 0) {
+              route_base = route_base_odd[pp_6];
+            }
+            unsigned int route_slot = route_old[pp_6] - route_base;
+            if (route_slot < 16) {
+              *(reinterpret_cast<unsigned int*>(
+                    reinterpret_cast<unsigned int*>(route_index_raw) +
+                    (4 + 3 * num_tokens + publish_token_1 * 16 + (int)route_slot)) +
+                (0)) = (unsigned int)(pair_block + pp_6);
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 }  // extern "C"
@@ -576,16 +711,16 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_f16_
 #undef SMEM_X_SMEM_STAGE_BYTES
 #undef SMEM_X_SMEM_STRIDE
 #undef THREADS
-#undef w_smem_addr
-#undef warp_partials_addr
-#undef x_smem_addr
 
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SHRINK_STAGE_OFF 0
 #define SMEM_SHRINK_STAGE_STAGE_BYTES 128
 #define SMEM_SHRINK_STAGE_STRIDE 128
-#define SMEM_TOTAL 128
+#define SMEM_ROUTE_LIST_OFF 128
+#define SMEM_ROUTE_LIST_STAGE_BYTES 72
+#define SMEM_ROUTE_LIST_STRIDE 72
+#define SMEM_TOTAL 256
 #define THREADS 64
 
 extern "C" {
@@ -595,7 +730,8 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
     float* __restrict__ topk_weights, int num_pairs, int num_experts, int num_tokens,
-    int output_stride, int output_offset) {
+    int output_stride, int output_offset, unsigned int* __restrict__ route_index_raw,
+    int route_lookup, int route_advance) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -607,9 +743,13 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
   const int bid = blockIdx.x;
   const int num_bids = gridDim.x;
 
+  const int cta_rank = 0;
+
   // Kernel setup ops
   __half* shrink_stage = reinterpret_cast<__half*>(smem_raw + 0);
   const int shrink_stage_addr = smem + 0;
+  int* route_list = reinterpret_cast<int*>(smem_raw + 128);
+  const int route_list_addr = smem + 128;
 
   // === Task calls (dependency order) ===
   int token = blockIdx.x;
@@ -617,6 +757,18 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
   unsigned int activation_carriers[4];
   float activation_values[8];
   if (token < num_tokens) {
+    int advance_parity = 0;
+    unsigned int advance_count = 0;
+    unsigned int advance_launch = 0;
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          advance_parity = (int)route_index_raw[1];
+          advance_count = route_index_raw[4 + token];
+          advance_launch = route_index_raw[0];
+        }
+      }
+    }
     long long lora_id = lora_indices[token];
     if (lora_id >= 0) {
       int pair_base = token * 2;
@@ -721,9 +873,73 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
         }
       } else if (output_col < 2688) {
         float total_1 = 0.0f;
+        int route_count = num_pairs;
+        int use_index = 0;
+        if (route_lookup != 0) {
+          int indexed_parity = (int)route_index_raw[1];
+          int indexed_count =
+              (int)(route_index_raw[4 + token] -
+                    route_index_raw[4 + num_tokens + indexed_parity * num_tokens + token]);
+          if (indexed_count <= 16) {
+            use_index = 1;
+            int direct_first = -1;
+            int direct_second = -1;
+            int direct_count = 0;
+            if (num_pairs == num_tokens * 2) {
+              if (sorted_token_ids[pair_base] == (long long)token) {
+                direct_first = pair_base;
+                direct_count = 1;
+              }
+              if (sorted_token_ids[pair_base + 1] == (long long)token) {
+                if (direct_count == 0) {
+                  direct_first = pair_base + 1;
+                } else {
+                  direct_second = pair_base + 1;
+                }
+                direct_count += 1;
+              }
+            }
+            route_count = indexed_count + direct_count;
+            int table_base = 4 + 3 * num_tokens + token * 16;
+            if (route_count > tid) {
+              int own_pair = direct_first;
+              if (indexed_count > tid) {
+                own_pair = (int)route_index_raw[table_base + tid];
+              } else if (tid == indexed_count + 1) {
+                own_pair = direct_second;
+              }
+              int own_order = 0;
 #pragma unroll 1
-        for (int pair_1 = 0; pair_1 < num_pairs; pair_1++) {
-          if (sorted_token_ids[pair_1] == (long long)token) {
+              for (int probe = 0; probe < indexed_count; probe++) {
+                if (own_pair > (int)route_index_raw[table_base + probe]) {
+                  own_order += 1;
+                }
+              }
+              if (direct_count > 0) {
+                if (direct_first < own_pair) {
+                  own_order += 1;
+                }
+              }
+              if (direct_count > 1) {
+                if (direct_second < own_pair) {
+                  own_order += 1;
+                }
+              }
+              route_list[own_order] = own_pair;
+            }
+            __syncthreads();
+          }
+        }
+#pragma unroll 1
+        for (int route_step = 0; route_step < route_count; route_step++) {
+          int pair_1 = route_step;
+          int route_match = 1;
+          if (use_index != 0) {
+            pair_1 = route_list[route_step];
+          } else if (sorted_token_ids[route_step] != (long long)token) {
+            route_match = 0;
+          }
+          if (route_match != 0) {
             long long expert_1 = expert_ids[pair_1];
             float route_partial_1 = 0.0f;
 #pragma unroll
@@ -803,6 +1019,20 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
       *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
         (0)) = 0.0f;
     }
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          *(reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned int*>(route_index_raw) +
+                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
+            (0)) = advance_count;
+          if (token == 0) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
+              (0)) = advance_launch + 1;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -810,19 +1040,24 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
 
 #undef BLACKWELL_INF
 #undef NUM_MAIN_STAGES
+#undef SMEM_ROUTE_LIST_OFF
+#undef SMEM_ROUTE_LIST_STAGE_BYTES
+#undef SMEM_ROUTE_LIST_STRIDE
 #undef SMEM_SHRINK_STAGE_OFF
 #undef SMEM_SHRINK_STAGE_STAGE_BYTES
 #undef SMEM_SHRINK_STAGE_STRIDE
 #undef SMEM_TOTAL
 #undef THREADS
-#undef shrink_stage_addr
 
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SHRINK_STAGE_OFF 0
 #define SMEM_SHRINK_STAGE_STAGE_BYTES 128
 #define SMEM_SHRINK_STAGE_STRIDE 128
-#define SMEM_TOTAL 128
+#define SMEM_ROUTE_LIST_OFF 128
+#define SMEM_ROUTE_LIST_STAGE_BYTES 72
+#define SMEM_ROUTE_LIST_STRIDE 72
+#define SMEM_TOTAL 256
 #define THREADS 128
 
 extern "C" {
@@ -832,7 +1067,8 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
     float* __restrict__ topk_weights, int num_pairs, int num_experts, int num_tokens,
-    int output_stride, int output_offset) {
+    int output_stride, int output_offset, unsigned int* __restrict__ route_index_raw,
+    int route_lookup, int route_advance) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -844,9 +1080,13 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
   const int bid = blockIdx.x;
   const int num_bids = gridDim.x;
 
+  const int cta_rank = 0;
+
   // Kernel setup ops
   __half* shrink_stage = reinterpret_cast<__half*>(smem_raw + 0);
   const int shrink_stage_addr = smem + 0;
+  int* route_list = reinterpret_cast<int*>(smem_raw + 128);
+  const int route_list_addr = smem + 128;
 
   // === Task calls (dependency order) ===
   int token = blockIdx.x;
@@ -854,6 +1094,18 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
   unsigned int activation_carriers[4];
   float activation_values[8];
   if (token < num_tokens) {
+    int advance_parity = 0;
+    unsigned int advance_count = 0;
+    unsigned int advance_launch = 0;
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          advance_parity = (int)route_index_raw[1];
+          advance_count = route_index_raw[4 + token];
+          advance_launch = route_index_raw[0];
+        }
+      }
+    }
     if (output_col < 2688) {
       long long lora_id = lora_indices[token];
       if (lora_id >= 0) {
@@ -953,9 +1205,73 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
             total = _fma_1;
           }
         } else {
+          int route_count = num_pairs;
+          int use_index = 0;
+          if (route_lookup != 0) {
+            int indexed_parity = (int)route_index_raw[1];
+            int indexed_count =
+                (int)(route_index_raw[4 + token] -
+                      route_index_raw[4 + num_tokens + indexed_parity * num_tokens + token]);
+            if (indexed_count <= 16) {
+              use_index = 1;
+              int direct_first = -1;
+              int direct_second = -1;
+              int direct_count = 0;
+              if (num_pairs == num_tokens * 2) {
+                if (sorted_token_ids[pair_base] == (long long)token) {
+                  direct_first = pair_base;
+                  direct_count = 1;
+                }
+                if (sorted_token_ids[pair_base + 1] == (long long)token) {
+                  if (direct_count == 0) {
+                    direct_first = pair_base + 1;
+                  } else {
+                    direct_second = pair_base + 1;
+                  }
+                  direct_count += 1;
+                }
+              }
+              route_count = indexed_count + direct_count;
+              int table_base = 4 + 3 * num_tokens + token * 16;
+              if (route_count > tid) {
+                int own_pair = direct_first;
+                if (indexed_count > tid) {
+                  own_pair = (int)route_index_raw[table_base + tid];
+                } else if (tid == indexed_count + 1) {
+                  own_pair = direct_second;
+                }
+                int own_order = 0;
 #pragma unroll 1
-          for (int pair_1 = 0; pair_1 < num_pairs; pair_1++) {
-            if (sorted_token_ids[pair_1] == (long long)token) {
+                for (int probe = 0; probe < indexed_count; probe++) {
+                  if (own_pair > (int)route_index_raw[table_base + probe]) {
+                    own_order += 1;
+                  }
+                }
+                if (direct_count > 0) {
+                  if (direct_first < own_pair) {
+                    own_order += 1;
+                  }
+                }
+                if (direct_count > 1) {
+                  if (direct_second < own_pair) {
+                    own_order += 1;
+                  }
+                }
+                route_list[own_order] = own_pair;
+              }
+              __syncthreads();
+            }
+          }
+#pragma unroll 1
+          for (int route_step = 0; route_step < route_count; route_step++) {
+            int pair_1 = route_step;
+            int route_match = 1;
+            if (use_index != 0) {
+              pair_1 = route_list[route_step];
+            } else if (sorted_token_ids[route_step] != (long long)token) {
+              route_match = 0;
+            }
+            if (route_match != 0) {
               long long expert_1 = expert_ids[pair_1];
               float route_partial_1 = 0.0f;
 #pragma unroll
@@ -1036,6 +1352,20 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
           (0)) = 0.0f;
       }
     }
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          *(reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned int*>(route_index_raw) +
+                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
+            (0)) = advance_count;
+          if (token == 0) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
+              (0)) = advance_launch + 1;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -1043,19 +1373,24 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
 
 #undef BLACKWELL_INF
 #undef NUM_MAIN_STAGES
+#undef SMEM_ROUTE_LIST_OFF
+#undef SMEM_ROUTE_LIST_STAGE_BYTES
+#undef SMEM_ROUTE_LIST_STRIDE
 #undef SMEM_SHRINK_STAGE_OFF
 #undef SMEM_SHRINK_STAGE_STAGE_BYTES
 #undef SMEM_SHRINK_STAGE_STRIDE
 #undef SMEM_TOTAL
 #undef THREADS
-#undef shrink_stage_addr
 
 #define BLACKWELL_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_SHRINK_STAGE_OFF 0
 #define SMEM_SHRINK_STAGE_STAGE_BYTES 128
 #define SMEM_SHRINK_STAGE_STRIDE 128
-#define SMEM_TOTAL 128
+#define SMEM_ROUTE_LIST_OFF 128
+#define SMEM_ROUTE_LIST_STAGE_BYTES 72
+#define SMEM_ROUTE_LIST_STRIDE 72
+#define SMEM_TOTAL 256
 #define THREADS 128
 
 extern "C" {
@@ -1066,7 +1401,8 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
     float* __restrict__ topk_weights, int num_pairs, int num_experts, int num_tokens,
-    int output_stride, int output_offset) {
+    int output_stride, int output_offset, unsigned int* __restrict__ route_index_raw,
+    int route_lookup, int route_advance) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -1078,9 +1414,13 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
   const int bid = blockIdx.x;
   const int num_bids = gridDim.x;
 
+  const int cta_rank = 0;
+
   // Kernel setup ops
   __half* shrink_stage = reinterpret_cast<__half*>(smem_raw + 0);
   const int shrink_stage_addr = smem + 0;
+  int* route_list = reinterpret_cast<int*>(smem_raw + 128);
+  const int route_list_addr = smem + 128;
 
   // === Task calls (dependency order) ===
   int token = blockIdx.x;
@@ -1089,6 +1429,18 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
   unsigned int activation_carriers[4];
   float activation_values[8];
   if (token < num_tokens) {
+    int advance_parity = 0;
+    unsigned int advance_count = 0;
+    unsigned int advance_launch = 0;
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          advance_parity = (int)route_index_raw[1];
+          advance_count = route_index_raw[4 + token];
+          advance_launch = route_index_raw[0];
+        }
+      }
+    }
     long long lora_id = lora_indices[token];
     if (lora_id >= 0) {
       int pair_base = token * 2;
@@ -1243,9 +1595,73 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
           }
         }
       } else {
+        int route_count = num_pairs;
+        int use_index = 0;
+        if (route_lookup != 0) {
+          int indexed_parity = (int)route_index_raw[1];
+          int indexed_count =
+              (int)(route_index_raw[4 + token] -
+                    route_index_raw[4 + num_tokens + indexed_parity * num_tokens + token]);
+          if (indexed_count <= 16) {
+            use_index = 1;
+            int direct_first = -1;
+            int direct_second = -1;
+            int direct_count = 0;
+            if (num_pairs == num_tokens * 2) {
+              if (sorted_token_ids[pair_base] == (long long)token) {
+                direct_first = pair_base;
+                direct_count = 1;
+              }
+              if (sorted_token_ids[pair_base + 1] == (long long)token) {
+                if (direct_count == 0) {
+                  direct_first = pair_base + 1;
+                } else {
+                  direct_second = pair_base + 1;
+                }
+                direct_count += 1;
+              }
+            }
+            route_count = indexed_count + direct_count;
+            int table_base = 4 + 3 * num_tokens + token * 16;
+            if (route_count > tid) {
+              int own_pair = direct_first;
+              if (indexed_count > tid) {
+                own_pair = (int)route_index_raw[table_base + tid];
+              } else if (tid == indexed_count + 1) {
+                own_pair = direct_second;
+              }
+              int own_order = 0;
 #pragma unroll 1
-        for (int pair_1 = 0; pair_1 < num_pairs; pair_1++) {
-          if (sorted_token_ids[pair_1] == (long long)token) {
+              for (int probe = 0; probe < indexed_count; probe++) {
+                if (own_pair > (int)route_index_raw[table_base + probe]) {
+                  own_order += 1;
+                }
+              }
+              if (direct_count > 0) {
+                if (direct_first < own_pair) {
+                  own_order += 1;
+                }
+              }
+              if (direct_count > 1) {
+                if (direct_second < own_pair) {
+                  own_order += 1;
+                }
+              }
+              route_list[own_order] = own_pair;
+            }
+            __syncthreads();
+          }
+        }
+#pragma unroll 1
+        for (int route_step = 0; route_step < route_count; route_step++) {
+          int pair_1 = route_step;
+          int route_match = 1;
+          if (use_index != 0) {
+            pair_1 = route_list[route_step];
+          } else if (sorted_token_ids[route_step] != (long long)token) {
+            route_match = 0;
+          }
+          if (route_match != 0) {
             long long expert_1 = expert_ids[pair_1];
             float route_partial0_1 = 0.0f;
             float route_partial1_1 = 0.0f;
@@ -1388,6 +1804,20 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
           (0)) = 0.0f;
       }
     }
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          *(reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned int*>(route_index_raw) +
+                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
+            (0)) = advance_count;
+          if (token == 0) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
+              (0)) = advance_launch + 1;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -1395,9 +1825,18 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
 
 #undef BLACKWELL_INF
 #undef NUM_MAIN_STAGES
+#undef SMEM_ROUTE_LIST_OFF
+#undef SMEM_ROUTE_LIST_STAGE_BYTES
+#undef SMEM_ROUTE_LIST_STRIDE
 #undef SMEM_SHRINK_STAGE_OFF
 #undef SMEM_SHRINK_STAGE_STAGE_BYTES
 #undef SMEM_SHRINK_STAGE_STRIDE
 #undef SMEM_TOTAL
 #undef THREADS
-#undef shrink_stage_addr
+
+// Dynamic shared memory per launch, in bytes.
+#define CAKE_BGMV_MOE_SMEM_SHRINK_DECODE 221696
+#define CAKE_BGMV_MOE_SMEM_SHRINK_PREFILL 36992
+#define CAKE_BGMV_MOE_SMEM_EXPAND_T64 256
+#define CAKE_BGMV_MOE_SMEM_EXPAND_TOKEN 256
+#define CAKE_BGMV_MOE_SMEM_EXPAND_DUAL 256

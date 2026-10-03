@@ -136,13 +136,18 @@ def test_arch_modules_do_not_share_a_uri():
 
 def test_binding_preserves_graph_and_tensor_contracts():
     binding = (cake_bgmv_moe._get_csrc_dir() / "cake_bgmv_moe_binding.cuh").read_text()
+    assert "TensorView route_index" in binding
+    assert "kExpandT64SmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_T64" in binding
+    assert "kExpandDualSmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_DUAL" in binding
     assert "CheckCompiledArch" in binding
     assert "CheckExactSM100" not in binding
     assert (
         "major == CAKE_BGMV_MOE_CC_MAJOR && minor == CAKE_BGMV_MOE_CC_MINOR" in binding
     )
-    assert "kShrinkDecodeSmemBytes = 221696" in binding
-    assert "kShrinkPrefillSmemBytes = 36992" in binding
+    assert "kShrinkDecodeSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_DECODE" in binding
+    assert "kShrinkPrefillSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_PREFILL" in binding
+    assert "static_assert(kShrinkDecodeSmemBytes == 221696" in binding
+    assert "static_assert(kShrinkPrefillSmemBytes == 36992" in binding
     assert "cudaDevAttrMaxSharedMemoryPerBlockOptin" in binding
     assert "cudaFuncAttributeMaxDynamicSharedMemorySize" in binding
     assert "cudaMemsetAsync" not in binding
@@ -160,5 +165,230 @@ def test_binding_preserves_graph_and_tensor_contracts():
             ).read_text()
             smem_totals = re.findall(r"#define SMEM_TOTAL (\d+)", body)
             assert smem_totals[:2] == ["221696", "36992"]
-            assert "atomicAdd(" not in body
+            # The shrink kernels publish the token->pair route index; the expand
+            # kernels keep one owner per output (no output atomics).
+            assert body.count("atomicAdd(") == 2
+            assert "atomicAdd(&reinterpret_cast<float" not in body
             assert "expand_pair_owned" not in body
+
+
+# ---- generic-shape bundles -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "rank", "expected"),
+    [
+        (2688, 32, "specialized"),
+        (3072, 32, "specialized"),
+        (3072, 16, "generic"),
+        (2688, 64, "generic"),
+        (2048, 32, "generic"),
+        (736, 8, "generic"),
+        (8, 8, "generic"),
+        (2052, 32, None),
+        (0, 32, None),
+        (3072, 12, None),
+        (3072, 128, None),
+    ],
+)
+def test_variant_routing(hidden_size, rank, expected):
+    assert cake_bgmv_moe.cake_bgmv_moe_variant(hidden_size, rank) == expected
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "num_tokens", "expected"),
+    [
+        (3072, 1, "specialized"),
+        (3072, 2048, "specialized"),
+        (2688, 2049, "generic"),
+        (3072, 4096, "generic"),
+        (2048, 4096, "generic"),
+    ],
+)
+def test_variant_routing_by_token_count(hidden_size, num_tokens, expected):
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS == 2048
+    assert cake_bgmv_moe.cake_bgmv_moe_variant(hidden_size, 32, num_tokens) == expected
+
+
+@pytest.mark.parametrize("arch", cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES)
+@pytest.mark.parametrize(
+    ("hidden_size", "num_tokens", "expected"),
+    [
+        (2048, 1, "token_owned_t64"),
+        (2048, 8, "token_owned_t64"),
+        (2048, 9, "token_owned_t128"),
+        (736, 512, "token_owned_t128"),
+    ],
+)
+def test_generic_selector(arch, hidden_size, num_tokens, expected):
+    assert (
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_schedule(
+            hidden_size, num_tokens, arch
+        )
+        == expected
+    )
+
+
+def test_generic_selector_rejects_unsupported_inputs():
+    with pytest.raises(ValueError, match="multiple of 8"):
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_schedule(2052, 8)
+    with pytest.raises(ValueError, match="positive"):
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_schedule(2048, 0)
+    with pytest.raises(ValueError, match="arch"):
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_schedule(2048, 8, "sm120a")
+    with pytest.raises(ValueError, match="rank"):
+        cake_bgmv_moe.get_cake_bgmv_moe_generic_uri(12, "bfloat16")
+
+
+@pytest.mark.parametrize(
+    ("arch", "cuda_arch", "gencode", "cc"),
+    [
+        ("sm90a", (9, "0a"), "-gencode=arch=compute_90a,code=sm_90a", (9, 0)),
+        ("sm100a", (10, "0a"), "-gencode=arch=compute_100a,code=sm_100a", (10, 0)),
+        ("sm103a", (10, "3a"), "-gencode=arch=compute_103a,code=sm_103a", (10, 3)),
+    ],
+)
+@pytest.mark.parametrize("rank", cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS)
+@pytest.mark.parametrize("dtype", cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES)
+def test_generic_jit_spec_binds_generated_source_per_arch(
+    monkeypatch, tmp_path, arch, cuda_arch, gencode, cc, rank, dtype
+):
+    monkeypatch.setattr(
+        jit_core.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {cuda_arch},
+    )
+    monkeypatch.setattr(cake_bgmv_moe.jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
+    cake_bgmv_moe.gen_cake_bgmv_moe_generic_module.cache_clear()
+
+    spec = cake_bgmv_moe.gen_cake_bgmv_moe_generic_module(rank, dtype, arch)
+    uri = cake_bgmv_moe.get_cake_bgmv_moe_generic_uri(rank, dtype, arch)
+    metadata = cake_bgmv_moe._generic_metadata(rank, dtype)
+
+    assert spec.name == uri
+    assert (
+        uri == f"cake_bgmv_moe_generic_{cake_bgmv_moe._dtype_tag(dtype)}_r{rank}_{arch}"
+    )
+    assert spec.sources == [tmp_path / uri / "cake_bgmv_moe_generic_binding.cu"]
+    assert gencode in spec.extra_cuda_cflags
+    assert "-use_fast_math" in spec.extra_cuda_cflags
+    body = (cake_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
+    for symbol in metadata[1:]:
+        assert symbol in body
+    for macro in (
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE 221824",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL 37120",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64 ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128 ",
+    ):
+        assert macro in body
+    # Route-index publication in both shrink kernels; the expand keeps one
+    # owner per output (no output atomics).
+    assert body.count("atomicAdd(") == 2
+    assert "atomicAdd(&reinterpret_cast<float" not in body
+    binding = spec.sources[0].read_text()
+    assert f'#define CAKE_BGMV_MOE_BODY_FILE "{metadata.body}"' in binding
+    assert f"#define CAKE_BGMV_MOE_RANK {rank}" in binding
+    assert f"#define CAKE_BGMV_MOE_CC_MAJOR {cc[0]}" in binding
+    assert f"#define CAKE_BGMV_MOE_CC_MINOR {cc[1]}" in binding
+    assert '#include "cake_bgmv_moe_generic_binding.cuh"' in binding
+    cake_bgmv_moe.gen_cake_bgmv_moe_generic_module.cache_clear()
+
+
+def test_generic_and_specialized_modules_do_not_share_a_uri():
+    specialized = {
+        cake_bgmv_moe.get_cake_bgmv_moe_uri(hidden_size, dtype, arch)
+        for arch in cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES
+        for hidden_size in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES
+        for dtype in cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES
+    }
+    generic = {
+        cake_bgmv_moe.get_cake_bgmv_moe_generic_uri(rank, dtype, arch)
+        for arch in cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES
+        for rank in cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS
+        for dtype in cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES
+    }
+    assert len(generic) == (
+        len(cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES)
+        * len(cake_bgmv_moe.CAKE_BGMV_MOE_GENERIC_RANKS)
+        * len(cake_bgmv_moe.CAKE_BGMV_MOE_DTYPES)
+    )
+    assert not (specialized & generic)
+
+
+def test_generic_binding_preserves_graph_and_tensor_contracts():
+    binding = (
+        cake_bgmv_moe._get_csrc_dir() / "cake_bgmv_moe_generic_binding.cuh"
+    ).read_text()
+    assert "CheckCompiledArch" in binding
+    assert (
+        "major == CAKE_BGMV_MOE_CC_MAJOR && minor == CAKE_BGMV_MOE_CC_MINOR" in binding
+    )
+    assert (
+        "kShrinkDecodeSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE" in binding
+    )
+    assert "cudaDevAttrMaxSharedMemoryPerBlockOptin" in binding
+    assert "cudaFuncAttributeMaxDynamicSharedMemorySize" in binding
+    assert "cudaMemsetAsync" not in binding
+    assert "x.size(1) % kVec == 0" in binding
+    assert "CAKE_BGMV_MOE_SHRINK_DECODE<<<" in binding
+    assert "CAKE_BGMV_MOE_SHRINK_PREFILL<<<" in binding
+    assert "CAKE_BGMV_MOE_EXPAND_T64<<<" in binding
+    assert "CAKE_BGMV_MOE_EXPAND_T128<<<" in binding
+    assert "TensorView route_index" in binding
+    assert "CHECK_INPUT_TYPE(route_index, dl_int32)" in binding
+    assert "kRouteIndexWordsPerToken = 3 + kRouteIndexMaxRoutes" in binding
+    assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure" in binding
+    assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
+
+
+def test_route_index_workspace_sizing():
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES == 16
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_HEADER_WORDS == 4
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN == 19
+    split_words = 8 * 128 * 64 + 128 * 8
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SHRINK_SPLIT_MAX == 8
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS == 128
+    assert cake_bgmv_moe.cake_bgmv_moe_route_index_words(1) == 4 + 19
+    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(1) == 4 + 19 + split_words
+    assert (
+        cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096)
+        == 4 + 4096 * 19 + split_words
+    )
+    for hidden in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES:
+        body = (
+            cake_bgmv_moe._get_csrc_dir() / f"cake_bgmv_moe_bf16_h{hidden}.cu"
+        ).read_text()
+        assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_T64 " in body
+        assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_TOKEN " in body
+        assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_DUAL " in body
+
+
+@pytest.mark.parametrize(
+    ("num_pairs", "rank", "hidden_size", "expected"),
+    [
+        # 16 tokens x top-k 2 at hidden 7168, rank 32: 128 CTAs already -> no split
+        (32, 32, 7168, (0, 1)),
+        # rank 8 at 32 pairs: 32 CTAs -> 4 splits (7 tiles available)
+        (32, 8, 7168, (0, 4)),
+        # 4 tokens at hidden 5888: 32 CTAs -> 4 of the 6 tiles' worth of splits
+        (8, 32, 5888, (0, 4)),
+        # hidden 736 has one tile: no split possible
+        (8, 64, 736, (0, 1)),
+        # wide prefill grids never split
+        (8192, 32, 3072, (0, 1)),
+        (256, 64, 4096, (0, 1)),
+    ],
+)
+def test_generic_shrink_launch_selection(num_pairs, rank, hidden_size, expected):
+    assert (
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(num_pairs, rank, hidden_size)
+        == expected
+    )
+
+
+def test_generic_shrink_launch_selection_rejects_bad_inputs():
+    with pytest.raises(ValueError):
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(0, 32, 3072)
+    with pytest.raises(ValueError):
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(8, 24, 3072)

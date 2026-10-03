@@ -14,35 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from dataclasses import dataclass
 import functools
 import os
-from typing import List, Literal, Optional, Sequence, Tuple, Union, cast
+from dataclasses import dataclass
+from typing import Callable, List, Literal, Optional, Sequence, Tuple, Union, cast
 
 import torch
 
-from ..api_logging import flashinfer_api, flashinfer_experimental_api
 from flashinfer.autotuner import (
     AutoTuner,
+    DynamicTensorSpec,
     TunableRunner,
     TuningConfig,
     make_bucket_mapper,
-    DynamicTensorSpec,
 )
+
+from ..api_logging import flashinfer_api, flashinfer_experimental_api
+from ..jit import gen_trtllm_gen_fmha_module, setup_cubin_loader
 from ..trace.templates.attention import (
     trtllm_batch_decode_mla_trace_dispatch,
     xqa_batch_decode_mla_trace,
 )
-from ..jit import gen_trtllm_gen_fmha_module, setup_cubin_loader
 from ..utils import (
     _check_block_tables_shape,
+    _get_trtllm_gen_multi_ctas_kv_counter_buffer,
+    _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     check_shape_dtype_device,
     check_trtllm_gen_sm107_only_feature,
     device_support_pdl,
     get_compute_capability,
     get_device_sm_count,
-    _get_trtllm_gen_multi_ctas_kv_counter_buffer,
-    _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_sm12x_supported,
     log2e,
@@ -348,7 +349,7 @@ def _nvfp4_sparse_mla_workspace(
         )
 
     from ._sparse_mla_sm120._execution import dsv4_nvfp4_format_info, resolve_dsv4_nvfp4
-    from ._sparse_mla_sm120._prepared import device_caps, _workspace_tensor_view
+    from ._sparse_mla_sm120._prepared import _workspace_tensor_view, device_caps
 
     info = dsv4_nvfp4_format_info()
     page = info["page_size"]
@@ -408,6 +409,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     kv_scale_format: str,
     kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
     backend: Literal["sparse", "cake"] = "sparse",
+    enable_pdl: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if not is_sm12x_supported(query.device):
         raise ValueError(
@@ -495,10 +497,10 @@ def _trtllm_batch_decode_sparse_mla_sm120(
             flat_lse_shape, dtype=torch.float32, device=query.device
         )
     if backend == "cake":
-        from ._sparse_mla_sm120._cake_dsv4_nvfp4 import (
-            functional_run as cake_functional_run,
-        )
-
+        # Two Cake SM120 families answer to backend="cake": the DSv4 NVFP4 decode
+        # (kv_cache_format="nvfp4") and the DeepSeek-V4.1 mixed-cache decode
+        # (kv_cache_format="fp8_dsv41_fp4_ca", BF16 numerics route).
+        cake_functional_run = _cake_sm120_functional_run(kv_cache_format)
         out_lse = cake_functional_run(
             query_flat,
             kv_cache,
@@ -517,6 +519,13 @@ def _trtllm_batch_decode_sparse_mla_sm120(
             ),
             lse=out_lse_arg,
             lse_scale=lse_scale,
+            # Only the mixed-cache family launches its split merge with PDL; the
+            # NVFP4 family has no such launch option.
+            **(
+                {"enable_pdl": enable_pdl}
+                if kv_cache_format == "fp8_dsv41_fp4_ca"
+                else {}
+            ),
         )
         if return_lse:
             return out, user_lse if user_lse is not None else out_lse
@@ -546,6 +555,21 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     if return_lse:
         return out, user_lse if user_lse is not None else out_lse
     return out
+
+
+def _cake_sm120_functional_run(kv_cache_format: str) -> Callable[..., torch.Tensor]:
+    """Select the Cake SM120 sparse-MLA public-API route for ``kv_cache_format``."""
+    if kv_cache_format == "fp8_dsv41_fp4_ca":
+        from ._sparse_mla_sm120.cake_dsv41_mixed import (
+            functional_run as cake_dsv41_mixed_functional_run,
+        )
+
+        return cake_dsv41_mixed_functional_run
+    from ._sparse_mla_sm120._cake_dsv4_nvfp4 import (
+        functional_run as cake_dsv4_nvfp4_functional_run,
+    )
+
+    return cake_dsv4_nvfp4_functional_run
 
 
 def _check_sm120_sparse_v32_kv_cache(
@@ -1292,14 +1316,17 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     kv_layout: Literal["HND", "NHD"],
     kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"],
     backend: Literal["sparse", "cake"] = "sparse",
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     if bmm2_scale != 1.0:
         raise ValueError("SM120 DSv4 sparse MLA does not support bmm2_scale")
     cake = backend == "cake"
-    if cake and kv_cache_format != "nvfp4":
+    cake_mixed = cake and kv_cache_format == "fp8_dsv41_fp4_ca"
+    if cake and kv_cache_format not in ("nvfp4", "fp8_dsv41_fp4_ca"):
         raise ValueError(
-            "backend='cake' on SM120/SM121 serves the NVFP4 DSv4 cache only; "
-            f"pass kv_cache_format='nvfp4' (got {kv_cache_format!r})"
+            "backend='cake' on SM120/SM121 serves the DSv4 NVFP4 cache "
+            "(kv_cache_format='nvfp4') and the DeepSeek-V4.1 mixed cache "
+            f"(kv_cache_format='fp8_dsv41_fp4_ca'); got {kv_cache_format!r}"
         )
     if query.ndim in (3, 4):
         num_heads, head_dim = query.shape[-2:]
@@ -1311,7 +1338,18 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
         )
     if head_dim != 512:
         raise ValueError(f"Expected DSv4 query head dim 512, got {head_dim}")
-    if cake:
+    if cake_mixed:
+        from ._sparse_mla_sm120.cake_dsv41_mixed import (
+            cake_sparse_mla_sm120_dsv41_mixed_supported_heads,
+        )
+
+        cake_heads = cake_sparse_mla_sm120_dsv41_mixed_supported_heads()
+        if num_heads not in cake_heads:
+            raise ValueError(
+                "backend='cake' SM120 DSv4.1 mixed-cache sparse MLA supports "
+                f"{cake_heads} query heads, got {num_heads}"
+            )
+    elif cake:
         from ._sparse_mla_sm120._cake_dsv4_nvfp4 import (
             cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads,
         )
@@ -1374,6 +1412,11 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
                 f"{primary_page_size}"
             )
     else:
+        if cake_mixed and swa_kv_cache.dtype != torch.uint8:
+            raise ValueError(
+                "backend='cake' with kv_cache_format='fp8_dsv41_fp4_ca' reads the packed "
+                f"uint8 {packed_row_bytes}-byte swa_kv_cache only, got {swa_kv_cache.dtype}"
+            )
         if swa_kv_cache.dtype == torch.uint8:
             if swa_kv_cache.size(-1) != packed_row_bytes:
                 raise ValueError(
@@ -1441,6 +1484,12 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
                     f"got {extra_page_size}"
                 )
         else:
+            if cake_mixed and compressed_kv_cache.dtype != torch.uint8:
+                raise ValueError(
+                    "backend='cake' with kv_cache_format='fp8_dsv41_fp4_ca' reads the packed "
+                    f"uint8 {packed_row_bytes_extra}-byte compressed_kv_cache only, got "
+                    f"{compressed_kv_cache.dtype}"
+                )
             if compressed_kv_cache.dtype == torch.uint8:
                 if compressed_kv_cache.size(-1) != packed_row_bytes_extra:
                     raise ValueError(
@@ -1489,6 +1538,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             ),
             kv_cache_format=kv_cache_format,
             backend=backend,
+            enable_pdl=enable_pdl,
         ),
     )
     if query.ndim == 3:
@@ -1882,6 +1932,21 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`
     from the measured crossover of the two sm_120a SKUs.
 
+    With ``backend="cake"`` on SM120/SM121 and
+    ``kv_cache_format="fp8_dsv41_fp4_ca"``, this calls the Cake SM120
+    DeepSeek-V4.1 mixed-cache sparse-MLA decode kernels: the 528-byte FP8
+    main (SWA) pool (``swa_kv_cache``) and the optional 288-byte V41_FP4
+    compressed pool (``compressed_kv_cache``), each with its own positive
+    runtime page size and 16-byte-multiple page stride, read with the BF16
+    numerics route (BF16 query, exact on-chip dequantization of both caches,
+    fp32 accumulation and softmax). The call surface is the SM120 ``"sparse"``
+    one; ``workspace_buffer`` holds the split-K partials and the LSE (size it
+    with :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes`).
+    Write the main pool with
+    :func:`flashinfer.mla.dsv41_fp8_quantize_pack_sparse_mla_cache` and the
+    compressed pool with
+    :func:`flashinfer.mla.dsv41_fp4_quantize_pack_sparse_mla_cache`.
+
     With ``backend="cake"`` on SM100/SM103, this calls the source-level CAKE
     kernels (``flashinfer.mla.cake_dsv4``). The metadata may describe fewer
     tokens than ``query`` provides: with dense ``[B, Q, H, D]`` input the
@@ -1988,7 +2053,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``cum_seq_lens_q``.
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch. Used by the
-        TRTLLM-GEN path.
+        TRTLLM-GEN path and, on SM120/SM121, by ``backend="cake"`` with
+        ``kv_cache_format="fp8_dsv41_fp4_ca"`` (its split merge is launched as a
+        programmatic dependent of the decode grid; ``None`` follows the device
+        default). The NVFP4 Cake family rejects ``True``.
     swa_topk_lens : Optional[torch.Tensor]
         Active SWA segment lengths, shape ``[sum_q]`` INT32. On SM120/SM121
         these are sparse-segment lengths. HCA requires them as its per-row
@@ -2115,6 +2183,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         runtime page sizes for main and extra caches, including 256/64 and
         61/53 layouts; page strides may include padding.
         FP4 upconversion is lossy relative to direct cache dequantization.
+        With ``backend="cake"`` on SM120/SM121 the ``fp8_dsv41_fp4_ca`` form
+        selects the Cake mixed-cache decode instead (BF16 numerics route,
+        both caches dequantized exactly on chip).
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     if kv_cache_format not in ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"):
@@ -2125,7 +2196,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     if kv_cache_format == "fp8_dsv41" and backend != "sparse":
         raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
     if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
-        raise ValueError("kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse'")
+        if backend != "cake" or not _is_sm120_family(query.device):
+            raise ValueError(
+                "kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse' (or "
+                "backend='cake' on SM120/SM121)"
+            )
     if kv_cache_format == "nvfp4" and backend != "sparse":
         if backend != "cake" or not _is_sm120_family(query.device):
             raise ValueError(
@@ -2310,9 +2385,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     # which shares the SM120 "sparse" call surface (swa_topk_lens, dual cache).
     cake_sm120 = backend == "cake" and _is_sm120_family(query.device)
     if backend == "cake":
-        if enable_pdl:
-            raise ValueError("backend='cake' does not support enable_pdl")
-        enable_pdl = False
+        # The DeepSeek-V4.1 mixed-cache Cake family launches its split merge as a
+        # programmatic dependent of the decode grid (None = device default); the
+        # NVFP4 Cake family has no PDL launch option.
+        if not (cake_sm120 and kv_cache_format == "fp8_dsv41_fp4_ca"):
+            if enable_pdl:
+                raise ValueError("backend='cake' does not support enable_pdl")
+            enable_pdl = False
     elif enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
@@ -2352,6 +2431,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             kv_layout=kv_layout,
             kv_cache_format=kv_cache_format,
             backend="cake" if cake_sm120 else "sparse",
+            enable_pdl=enable_pdl if cake_sm120 else None,
         )
 
     if backend != "cake":
@@ -2648,7 +2728,6 @@ from ._batch_mla._contracts import MLAPlanMetadata as MLAPlanMetadata
 from ._batch_mla._wrapper import (
     BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper,
 )
-
 
 # ---------------------------------------------------------------------------
 # Autotuning support for trtllm_batch_decode_with_kv_cache_mla

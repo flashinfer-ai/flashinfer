@@ -52,6 +52,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     key_pass_dq_mode,
     key_pass_ranges,
     offset_gather_kv_indices,
+    derive_topk_length,
     plan_key_passes,
     prepare_dsa_train,
     record_abi,
@@ -256,6 +257,12 @@ def test_key_pass_policy_rule():
         (4096, 45512): 2,
     }
     assert {k: policy.passes(k[0], k[1], 2048) for k in expected} == expected
+    # a packed multi-segment key row plans one pass: whole-row ranges do not match segment-confined index rows
+    assert policy.passes(4096, 65536, 2048, num_segments=1) == 2
+    assert policy.passes(4096, 65536, 2048, num_segments=2) == 1
+    assert policy.passes(4096, 268757, 2048, num_segments=9) == 1
+    with pytest.raises(ValueError, match="num_segments"):
+        policy.passes(4096, 65536, 2048, num_segments=0)
     assert key_pass_ranges(65536, 2) == ((0, 32768), (32768, 65536))
     assert key_pass_ranges(131072, 3) == ((0, 43691), (43691, 87382), (87382, 131072))
     assert key_pass_ranges(10, 1) == ((0, 10),)
@@ -278,6 +285,14 @@ def test_plan_key_passes_override_and_policy():
     # no registered policy, or no pass stages: the single-pass stage
     assert plan_key_passes({}, _ALL_STAGES, 4096, 65536, 2048) == 1
     assert plan_key_passes(record, _SINGLE_PASS_STAGES, 4096, 65536, 2048) == 1
+    # a packed multi-segment row: one pass by policy, an explicit override still counts
+    assert plan_key_passes(record, _ALL_STAGES, 4096, 65536, 2048, num_segments=2) == 1
+    assert (
+        plan_key_passes(
+            record, _ALL_STAGES, 4096, 65536, 2048, key_passes=2, num_segments=2
+        )
+        == 2
+    )
     # explicit override
     assert plan_key_passes(record, _ALL_STAGES, 4096, 65536, 2048, key_passes=1) == 1
     assert plan_key_passes(record, _ALL_STAGES, 4096, 4096, 2048, key_passes=5) == 5
@@ -1548,6 +1563,97 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
     assert max(rel_l2(grads[2], single[2]), rel_l2(grads[3], single[3])) < 1e-2
 
 
+def test_public_entry_derives_row_lengths_and_matches_full_rows():
+    """Without ``topk_length`` the public entry derives the per-row length (last valid slot + 1) and the kernels skip
+    the trailing invalid blocks: on documents shorter than top-k (most slots ``-1``) the forward / backward equal the
+    explicit full-length call bitwise (out, lse, dq) and within the FP32 reduction spread (dkv), and match the
+    reference."""
+    _require_program(backward=True)
+    inp = make_inputs([200, 96, 300], [200, 96, 4096], seed=SEED + 752, topk=256)
+    S = inp.kv_latent.shape[0]
+    derived = derive_topk_length(inp.idx_global, S)
+    assert torch.equal(
+        derived, inp.topk_length
+    )  # the generator's rows are valid-first: last valid + 1 == count
+    assert int(derived.max()) <= 256 and int((derived < 256).sum()) > 0
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    leaves_a = [t.detach().clone().requires_grad_() for t in args]
+    leaves_b = [t.detach().clone().requires_grad_() for t in args]
+    full = torch.full(
+        (inp.q_latent.shape[0],), 256, dtype=torch.int32, device=inp.q_latent.device
+    )
+    with _quiet_experimental():
+        out_a, lse_a = dsa_sparse_attention(*leaves_a, inp.idx_global, return_lse=True)
+        out_b, lse_b = dsa_sparse_attention(
+            *leaves_b, inp.idx_global, topk_length=full, return_lse=True
+        )
+    grads_a = torch.autograd.grad(out_a, leaves_a, inp.dout)
+    grads_b = torch.autograd.grad(out_b, leaves_b, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out_a.detach(), out_b.detach()) and torch.equal(lse_a, lse_b)
+    assert torch.equal(grads_a[0], grads_b[0]) and torch.equal(grads_a[1], grads_b[1])
+    # dkv: fp32 atomics summed in a different key-block order round to bf16 differently on a few elements
+    # (the cross-path spread used throughout this file); both paths must also meet the reference gates
+    assert max(rel_l2(grads_a[2], grads_b[2]), rel_l2(grads_a[3], grads_b[3])) < 1e-3
+    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
+    _check_forward(inp, out_a, lse_a, ref)
+    _check_backward(grads_a, ref)
+    _check_backward(grads_b, ref)
+
+
+def test_varlen_multi_segment_row_plans_single_pass():
+    """A packed two-segment key row whose total length triggers the whole-row formula (2 x 23,000 keys >
+    45,511) plans the single-pass stage through the varlen entry (``num_segments = len(cu_seqlens_k) - 1``:
+    whole-row ranges do not match segment-confined index rows), while the flat call on the same global
+    indices plans two whole-row passes; the forward is untouched, both backwards agree (dq differs in the
+    FP32 summation order only) and match the FP64 reference."""
+    record, stages = _require_key_pass_program()
+    device = torch.device("cuda")
+    assert plan_key_passes(record, stages, 256, 46000, 128) == 2
+    assert plan_key_passes(record, stages, 256, 46000, 128, num_segments=2) == 1
+    assert dsa_train_workspace_size(
+        256, 46000, 128, device, num_segments=2
+    ) == dsa_train_workspace_size(256, 46000, 128, device, key_passes=1)
+    inp = make_inputs([128, 128], [23000, 23000], seed=SEED + 751, topk=128)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    flat_leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _cache(True) as cache:
+        cache.clear()
+        with _quiet_experimental():
+            out_v, lse_v = dsa_sparse_attention_varlen(
+                *leaves,
+                inp.idx_local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                inp.max_seqlen_q,
+                inp.max_seqlen_k,
+                return_lse=True,
+            )
+        grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
+        torch.cuda.synchronize()
+        remembered = [b for b in cache._bindings.values() if b.backward_order]
+        assert [b.key_passes for b in remembered] == [1]
+        assert not any(isinstance(k, tuple) for k in remembered[0].backward_order)
+        with _quiet_experimental():
+            out_f, lse_f = dsa_sparse_attention(
+                *flat_leaves, inp.idx_global, return_lse=True
+            )
+        grads_f = torch.autograd.grad(out_f, flat_leaves, inp.dout)
+        torch.cuda.synchronize()
+        # the segment count is part of the binding key: the flat call binds anew and plans the two passes
+        assert sorted(
+            b.key_passes for b in cache._bindings.values() if b.backward_order
+        ) == [1, 2]
+    assert torch.equal(out_v.detach(), out_f.detach()) and torch.equal(lse_v, lse_f)
+    for a, b in zip(grads_v, grads_f, strict=True):
+        assert rel_l2(a, b) < 1e-3
+    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
+    _check_forward(inp, out_v, lse_v, ref)
+    _check_backward(grads_v, ref)
+    _check_backward(grads_f, ref)
+
+
 def _indices_view_inside_storage(indices: torch.Tensor, offset: int) -> torch.Tensor:
     """A contiguous copy of ``indices`` that starts ``offset`` elements inside a larger buffer."""
     n = indices.numel()
@@ -2094,6 +2200,37 @@ def test_offset_gather_kv_indices_causal_tail_of_prefix():
     out = torch.empty_like(local)
     assert offset_gather_kv_indices(local, cu_q, cu_k, causal=True, out=out) is out
     assert torch.equal(out, strict)
+    # the fused per-row lengths (varlen entry default) equal the derivation on the result, bitwise
+    strict2, lengths = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=True, return_topk_length=True
+    )
+    assert torch.equal(strict2, strict)
+    expected_lengths = [3, 3, 4, 3, 3, 1, 4, 0, 5]  # last valid slot + 1 per strict row
+    assert lengths.dtype == torch.int32 and lengths.tolist() == expected_lengths
+    assert torch.equal(lengths, derive_topk_length(strict, 18))
+    loose2, loose_len = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=False, return_topk_length=True
+    )
+    assert torch.equal(loose2, loose) and torch.equal(
+        loose_len, derive_topk_length(loose, 18)
+    )
+    # more queries than keys: own positions -1, 0, 1 -> the first row is fully masked under the causal rule
+    cu_q2 = torch.tensor([0, 3], dtype=torch.int32)
+    cu_k2 = torch.tensor([0, 2], dtype=torch.int32)
+    local2 = torch.tensor([[0, 1], [0, 1], [1, 0]], dtype=torch.int32)
+    strict3, len3 = offset_gather_kv_indices(
+        local2, cu_q2, cu_k2, causal=True, return_topk_length=True
+    )
+    assert strict3.tolist() == [[-1, -1], [0, -1], [1, 0]] and len3.tolist() == [
+        0,
+        1,
+        2,
+    ]
+    assert offset_gather_kv_indices(local2, cu_q2, cu_k2, causal=False).tolist() == [
+        [0, 1],
+        [0, 1],
+        [1, 0],
+    ]
 
 
 def _trainer_host_inputs(total_q=8, total_k=16, topk=5):

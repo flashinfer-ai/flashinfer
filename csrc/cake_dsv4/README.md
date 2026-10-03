@@ -263,3 +263,70 @@ pytest tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4.py -q          # de
 pytest tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py -q  # prefill + CPU planner tests
 python benchmarks/bench_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py         # paired sparse / cake prefill rows
 ```
+
+## SM120 / SM121: DeepSeek-V4.1 mixed-cache sparse-MLA decode
+
+`sm_120a/` also holds the Cake-generated DeepSeek-V4.1 mixed-cache decode
+family `cake_sparse_mla_dsv41_mixed_*`: a 528-byte FP8 + UE8M0 group-32 main
+(SWA) cache, a 288-byte V41_FP4 extra (compressed) cache (512 E2M1 dims
+including RoPE, 256-byte payload + 32-byte E4M3 group-16 footer scales; never
+read as the 384-byte NVFP4 layout) and a BF16 query. QK runs in BF16
+(`mma.sync m16n8k16`) on exactly dequantized K (E4M3 x 2^e, E2M1 x E4M3), P and
+V are BF16, accumulation / softmax / split merge are fp32; output BF16, LSE
+base-2 with the public sink and `lse_scale` semantics. One translation unit per
+query head count (8, 16, 32, 48, 64, 80, 96, 112, 128: single-cache decode,
+dual-cache decode and the split merge kernel; 32 heads and up run two 16-head
+tiles per CTA sharing one gather), the TVM-FFI binding
+`cake_sparse_mla_dsv41_mixed_binding.cu` and
+`cake_sparse_mla_dsv41_mixed_manifest.json` (identity, kernel commit, ABI,
+planner geometry). The split merge runs one 64-thread CTA per (token, head) and
+is launched as a programmatic dependent of the decode grid when `enable_pdl`
+is set (`None` = device default; the merge waits for the decode's memory before
+its first load, so both settings are bitwise identical). The names are distinct
+from the NVFP4 family above so the two generated kernel sets never share a
+translation unit, header, manifest or JIT module name. Without the manifest,
+`flashinfer.mla.cake_sparse_mla_sm120_dsv41_mixed_format_info()["kernels_available"]`
+is `False`, the planners run on the provisional geometry and the first launch
+raises `FileNotFoundError` naming the expected manifest location.
+
+Select it through the existing SM120 entry points:
+
+```python
+from flashinfer.mla import (
+    SparseMLASm120Wrapper,
+    dsv41_fp4_quantize_pack_sparse_mla_cache,
+    dsv41_fp8_quantize_pack_sparse_mla_cache,
+    trtllm_batch_decode_sparse_mla_dsv4,
+)
+
+main_cache = dsv41_fp8_quantize_pack_sparse_mla_cache(latent_pages)   # [P, 1, page, 528]
+extra_cache = dsv41_fp4_quantize_pack_sparse_mla_cache(extra_pages)   # [P', 1, page', 288]
+out = trtllm_batch_decode_sparse_mla_dsv4(
+    query=q, swa_kv_cache=main_cache, workspace_buffer=workspace,
+    sparse_indices=indices, swa_topk_lens=lengths,
+    compressed_kv_cache=extra_cache, extra_sparse_indices=extra_indices,
+    extra_sparse_topk_lens=extra_lengths, bmm1_scale=sm_scale,
+    backend="cake", kv_cache_format="fp8_dsv41_fp4_ca",
+    enable_pdl=None,  # or True / False: merge launch attribute only
+)
+runner = SparseMLASm120Wrapper(
+    backend="cake", kv_cache_format="fp8", kv_scale_format="ue8m0_g32",
+    extra_kv_fp4=True, compute_precision="bf16",  # or "fp8" once exported
+)
+```
+
+Both caches keep their own positive page size and 16-byte-multiple page stride
+(`[P, page_bytes]`, `[P, page, bytes]`, HND or NHD views; rows stay packed
+inside a page because the footer layout stores `page * data` bytes followed by
+`page * scale` bytes). `compute_precision` is explicit: `"default"` and
+`"bf16"` select the BF16 route (Q unquantized, both caches dequantized exactly
+on chip), `"fp8"` the FP8 route when the family exports it; `"nvfp4"` is
+rejected. Split-K scratch is caller-owned or carved from `workspace_buffer`;
+size it with `cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes`. The planners
+`cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles` /
+`cake_sparse_mla_sm120_dsv41_mixed_plan_splits` are pure functions of
+`(num_tokens, num_heads, topk, extra_topk, num_sms)` and the manifest
+geometry. `backend="auto"` and `backend="sparse"` keep the hand-written SM120
+kernels; the main-cache writers `dsv41_fp8_quantize_pack_sparse_mla_cache` /
+`dsv41_fp8_quantize_append_sparse_mla_cache` are bit-identical to the torch
+reference quantizer used by the FlashInfer tests.
