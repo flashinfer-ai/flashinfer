@@ -17,6 +17,7 @@ limitations under the License.
 import contextlib
 import ctypes
 import functools
+import inspect
 import warnings
 from typing import Tuple, Union
 
@@ -40,6 +41,22 @@ from .availability import (  # noqa: F401
 if not hasattr(cute.nvgpu, "OperandMajorMode"):
     with contextlib.suppress(AttributeError):
         cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
+
+
+@functools.cache
+def task_body_accepts_resource_context() -> bool:
+    """Return whether the installed CUTLASS DSL Task body accepts context."""
+
+    from cutlass.experimental.task_scheduling.task import Task
+
+    # CUTLASS DSL 4.8 removed the ``context`` parameter from the Task body
+    # methods. Select the call form from the installed method signature.
+    return "context" in inspect.signature(Task._run_task_body_impl).parameters
+
+
+def task_context_kwargs(context) -> dict:
+    """Thread ResourceContext only for the installed Task body ABI."""
+    return {"context": context} if task_body_accepts_resource_context() else {}
 
 
 def ceil_div(a: int, b: int) -> int:
