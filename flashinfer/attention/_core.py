@@ -543,6 +543,14 @@ class BatchDecodeWithAttentionSinkWrapper(BatchDecodeWithPagedKVCacheWrapper):
             **kwargs,
         )
 
+    def plan(self, *args: Any, **kwargs: Any) -> None:
+        super().plan(*args, **kwargs)
+        if self._pos_encoding_mode != "NONE":
+            raise NotImplementedError(
+                "Attention-sink decode applies no position encoding; "
+                "pos_encoding_mode must be 'NONE'."
+            )
+
 
 # The parent's ``run`` carries ``@flashinfer_api(trace=gqa_paged_prefill_trace)``.
 # That template describes a plain causal prefill -- no ranges, no windows -- and

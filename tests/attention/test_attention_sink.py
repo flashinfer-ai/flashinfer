@@ -29,7 +29,11 @@ import flashinfer
 from flashinfer.jit.utils import filename_safe_dtype_map
 from flashinfer.jit.attention import gen_batch_prefill_attention_sink_module
 from flashinfer.jit.attention.variants import attention_sink_decl
-from flashinfer.utils import has_flashinfer_jit_cache, is_sm90a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    has_flashinfer_jit_cache,
+    is_sm90a_supported,
+)
 
 pytestmark = pytest.mark.solo
 
@@ -1129,6 +1133,8 @@ def test_attention_sink_varlen(
 @pytest.mark.parametrize("window_left", [-1, 128])
 def test_attention_sink_nvfp4_kv(window_left):
     device = torch.device("cuda:0")
+    if get_compute_capability(device) == (10, 7):
+        pytest.skip("KV Cache NVFP4 is not supported on SM107")
     torch.manual_seed(42)
     k, v = (create_nvfp4_kv((99, 8, 16, 64), device) for _ in range(2))
     kv_ref = tuple(nvfp4_to_float(*x).to(torch.bfloat16) for x in (k, v))
