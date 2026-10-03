@@ -18,7 +18,7 @@ import functools
 import math
 import warnings
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -1042,6 +1042,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        jit_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -1104,6 +1105,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        jit_kwargs : Optional[Dict[str, Any]]
+            The keyword arguments to create the JIT module, defaults to None.
         """
         if backend == "prims-ts":
             raise NotImplementedError(
@@ -1127,13 +1131,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._jit_module = get_batch_prefill_jit_module(
                     jit_args[0],
                     gen_customize_batch_prefill_module(
-                        backend, *jit_args
+                        backend, *jit_args, **(jit_kwargs or {})
                     ).build_and_load(),
                 )
             else:
                 self._jit_module = get_batch_decode_jit_module(
                     jit_args[0],
-                    gen_customize_batch_decode_module(*jit_args).build_and_load(),
+                    gen_customize_batch_decode_module(
+                        *jit_args, **(jit_kwargs or {})
+                    ).build_and_load(),
                 )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_decode/prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
@@ -2806,6 +2812,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                             "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
+                            "maybe_k_cache_sf": key_block_scales,
+                            "maybe_v_cache_sf": value_block_scales,
                         },
                         args,
                     )
