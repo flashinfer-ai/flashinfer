@@ -11,6 +11,7 @@ from ..trace.templates.quantize import (
     mxfp8_quantize_trace,
 )
 from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from ..jit.quantization import gen_quantization_module
 from ..utils import (
     device_support_pdl,
     get_compute_capability,
@@ -22,6 +23,88 @@ from ..tllm_enums import SfLayout
 
 def _round_up(x: int, y: int) -> int:
     return (x + y - 1) // y * y
+
+
+@functools.cache
+def get_per_token_group_quant_8bit_cuda_module():
+    """Build and cache the native CUDA per-token-group quantization module."""
+    return gen_quantization_module().build_and_load()
+
+
+def _per_token_group_quant_8bit_cuda(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float,
+    dst_dtype: torch.dtype,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run the register-resident native CUDA backend."""
+    if group_size != 128:
+        raise ValueError(
+            "backend='cuda' currently requires group_size=128; "
+            "use backend='cutile' for other group sizes"
+        )
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(
+            f"backend='cuda' requires float16 or bfloat16 input; got {x.dtype}"
+        )
+    if not x.is_cuda:
+        raise ValueError("backend='cuda' requires a CUDA input tensor")
+    if not x.is_contiguous():
+        raise ValueError("backend='cuda' requires a contiguous input tensor")
+    if x.shape[-1] % group_size != 0:
+        raise ValueError(
+            f"the last dimension of x ({x.shape[-1]}) must be divisible by "
+            f"group_size ({group_size})"
+        )
+    if dst_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
+        raise TypeError(
+            f"dst_dtype must be float8_e4m3fn, float8_e5m2, or int8; got {dst_dtype}"
+        )
+    if scale_tma_aligned or scale_ue8m0:
+        if not column_major_scales:
+            raise ValueError(
+                "scale_tma_aligned or scale_ue8m0 requires column_major_scales=True"
+            )
+
+    x_q = torch.empty_like(x, dtype=dst_dtype)
+    groups_per_row = x.shape[-1] // group_size
+
+    if column_major_scales:
+        if x.dim() != 2:
+            raise ValueError(
+                "column_major_scales is only supported for 2D inputs; "
+                f"got a {x.dim()}D input"
+            )
+        num_tokens = x.shape[0]
+        scale_stride = _round_up(num_tokens, 4) if scale_tma_aligned else num_tokens
+        x_s_storage = torch.empty(
+            (groups_per_row, scale_stride), device=x.device, dtype=torch.float32
+        )
+        x_s = x_s_storage[:, :num_tokens].t()
+    else:
+        scale_shape = x.shape[:-1] + (groups_per_row,)
+        x_s_storage = torch.empty(scale_shape, device=x.device, dtype=torch.float32)
+        x_s = x_s_storage
+        scale_stride = groups_per_row
+
+    if x.numel() == 0:
+        return x_q, x_s
+
+    get_per_token_group_quant_8bit_cuda_module().per_token_group_quant_8bit(
+        x,
+        x_q,
+        x_s_storage,
+        float(eps),
+        group_size,
+        groups_per_row,
+        scale_stride,
+        column_major_scales,
+        scale_ue8m0,
+    )
+    return x_q, x_s
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
@@ -603,7 +686,7 @@ def per_token_group_quant_8bit(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
-    backend: Literal["cutile"] = "cutile",
+    backend: Literal["cutile", "cuda"] = "cutile",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Per-token group 8-bit quantization (FP8 or INT8).
 
@@ -632,8 +715,9 @@ def per_token_group_quant_8bit(
     scale_ue8m0 : bool
         If ``True``, encode scales in the UE8M0 format (Blackwell / sm100+).
     backend : str
-        Implementation backend. Currently only ``"cutile"`` (the cuda.tile
-        Python backend) is supported.
+        Implementation backend. ``"cutile"`` uses the cuda.tile Python
+        backend. ``"cuda"`` uses a register-resident native CUDA kernel and
+        currently supports ``group_size=128`` with FP16/BF16 input.
 
     Returns
     -------
@@ -641,6 +725,9 @@ def per_token_group_quant_8bit(
         ``(x_q, x_s)``: the quantized tensor (same shape as ``x``) and the
         per-group scale tensor of shape ``(*x.shape[:-1], x.shape[-1] // group_size)``.
     """
+    if dst_dtype is None:
+        dst_dtype = torch.float8_e4m3fn
+
     if backend == "cutile":
         from .kernels.cutile.per_token_group_quant_8bit_cutile import (
             per_token_group_quant_8bit_cutile,
@@ -654,6 +741,17 @@ def per_token_group_quant_8bit(
             column_major_scales=column_major_scales,
             scale_tma_aligned=scale_tma_aligned,
             scale_ue8m0=scale_ue8m0,
+        )
+
+    if backend == "cuda":
+        return _per_token_group_quant_8bit_cuda(
+            x,
+            group_size,
+            eps,
+            dst_dtype,
+            column_major_scales,
+            scale_tma_aligned,
+            scale_ue8m0,
         )
 
     raise ValueError(f"Unsupported backend for per_token_group_quant_8bit: {backend!r}")
