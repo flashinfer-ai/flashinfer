@@ -3222,8 +3222,9 @@ def _softmax_schedule_body(
         )
         tmem_softmax_local.commit()
         if cutlass.const_expr(cfg.streams_tmem_p_fragments):
-            # One rolled loop streams every K32 probability fragment; the
-            # fragment body exists once in the instruction stream.
+            # One runtime loop streams every K32 probability fragment; its
+            # body exists ``p_fragment_loop_unroll`` times in the instruction
+            # stream.
             p_fragments_kwargs = dict(new_max_arr=new_max_arr)
             if cutlass.const_expr(cfg.use_sage_attention):
                 p_fragments_kwargs["sage_q_scale"] = sage_q_scale

@@ -2383,12 +2383,12 @@ class FmhaDecodeConfig:
     def streams_tmem_p_fragments(self) -> bool:
         """Whether P is published as independently ready TMEM fragments.
 
-        Streamed profiles produce their K32 fragments from one rolled runtime
-        loop: the max pass writes masked scores back to TMEM, so the P pass
-        reloads each fragment without mask logic and the exponentiation body
-        exists once in the instruction stream. Each published fragment lets
-        the MMA warp start its PV k-slice before the row is complete, at the
-        cost of one barrier round per fragment.
+        Streamed profiles produce their K32 fragments from one runtime loop:
+        the max pass writes masked scores back to TMEM, so the P pass reloads
+        each fragment without mask logic and the exponentiation body exists
+        ``p_fragment_loop_unroll`` times in the instruction stream. Each
+        published fragment lets the MMA warp start its PV k-slice before the
+        row is complete, at the cost of one barrier round per fragment.
 
         A two-instance TMEM-P profile streams for KV256 tiles and block-sparse
         routes, whose loops wait on K/V loads that the earlier PV start hides.
@@ -2411,6 +2411,22 @@ class FmhaDecodeConfig:
                 and not self.uses_q_token_kv_block_sparse_page_membership
             )
         )
+
+    @property
+    def p_fragment_loop_unroll(self) -> int:
+        """Copies of the streamed P-fragment body in the instruction stream.
+
+        With one body, ptxas writes a fragment's scaled scores into the
+        registers the next fragment's TMEM load targets, so that load issues
+        only after the fragment's last exponential. Two bodies use disjoint
+        registers: the next load and the previous fragment's handoff overlap
+        the exponentials. The second body is replicated in both softmax
+        instances and pays only while the kernel's hot code leaves
+        instruction-cache headroom. The WS 2x2 datapath already carries K/V
+        issue code for two lane halves, and FMA ex2 emulation enlarges the
+        body, so either keeps one body.
+        """
+        return 1 if self.uses_ws_2x2_datapath or self.ex2_emulated_pairs else 2
 
     @property
     def defers_softmax_anchor_updates(self) -> bool:

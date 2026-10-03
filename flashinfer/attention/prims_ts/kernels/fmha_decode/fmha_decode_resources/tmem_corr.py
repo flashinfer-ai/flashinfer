@@ -2693,8 +2693,12 @@ class TmemCorrResource(DecodeGenResourceBase):
         # stores are legal exactly when the output base pointer is.
         o_is_32b_aligned = (self.o_ptr.toint() & Int64(31)) == Int64(0)
 
-        for fragment in cutlass.range_constexpr(cfg.headdim // 32):
-            fragment_col = fragment * 32
+        # The merge runs once per work item, so one runtime loop over the D32
+        # fragments keeps a single body in the instruction cache that the
+        # per-tile loops need. The 8-bit owned-column merge is rolled the same
+        # way.
+        for fragment in cutlass.range(cfg.headdim // 32, unroll=1):
+            fragment_col = fragment * Int32(32)
             own_vals = self._kv_tile_256_temporal_fragment(
                 base_addr0=base_addr0,
                 base_addr1=base_addr1,
@@ -2702,7 +2706,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 weight00=weight00,
                 weight10=weight10,
             )
-            if cutlass.const_expr(fragment != 0):
+            if fragment != Int32(0):
                 # The single fragment buffer is reused: lower lanes must have
                 # consumed the previous peer fragment before it is overwritten.
                 prims.barrier_cta_sync(

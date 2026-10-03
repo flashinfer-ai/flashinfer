@@ -356,7 +356,7 @@ class SmemPResource(DecodeGenResourceBase):
         *,
         new_max_arr: cutlass.Array,
     ) -> None:
-        """Stream every ordinary K32 fragment from one rolled loop."""
+        """Stream every ordinary K32 fragment from one runtime loop."""
         self._compute_p_fragments_impl(
             stage_info,
             new_max_arr=new_max_arr,
@@ -394,7 +394,7 @@ class SmemPResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         route_flags: Int32,
     ) -> None:
-        """Stream every exact or proxy K32 fragment from one rolled loop."""
+        """Stream every exact or proxy K32 fragment from one runtime loop."""
         assert self.cfg.use_block_sparse_proxy_routes
         self._compute_p_fragments_impl(
             stage_info,
@@ -436,17 +436,18 @@ class SmemPResource(DecodeGenResourceBase):
         sage_scale_arr: cutlass.Array | None = None,
         sage_summary_scale_arr: cutlass.Array | None = None,
     ) -> None:
-        """Reload, exponentiate, and publish all K32 fragments in a rolled loop.
+        """Reload, exponentiate, and publish all K32 fragments in a runtime loop.
 
         The fragment index is a runtime loop variable, so the exponentiation
-        body exists once in the instruction stream and only the TMEM column
-        offset and the fragment barrier depend on it. Unrolling the fragments
-        would replicate that body for every fragment and both softmax
-        instances and leave the softmax warps instruction-fetch bound. The max
-        pass has already written masked (and mass-shifted) scores back to
-        TMEM, so the reload needs no mask or route logic beyond the proxy
-        addend. Sage attention changes only the per-group multipliers
-        ``c * sfQ * sfK_g``, biased INT32 scores only the per-group addends.
+        body exists ``p_fragment_loop_unroll`` times in the instruction stream
+        and only the TMEM column offset and the fragment barrier depend on it.
+        Unrolling every fragment would replicate that body for each fragment
+        and both softmax instances and leave the warps instruction-fetch
+        bound. The max pass has already written masked (and mass-shifted)
+        scores back to TMEM, so the reload needs no mask or route logic beyond
+        the proxy addend. Sage attention changes only the per-group
+        multipliers ``c * sfQ * sfK_g``, biased INT32 scores only the
+        per-group addends.
         """
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
@@ -511,10 +512,10 @@ class SmemPResource(DecodeGenResourceBase):
                 if route_is_proxy:
                     score_bias = Float32(0.0)
 
-        # A fragment is scaled before its first exponential, and the next
-        # fragment's TMEM load issues once the scale FFMAs have consumed the
-        # scores, so it reuses their registers and hides behind the
-        # exponentials. The running sum stays a packed pair until the loop ends.
+        # A fragment is scaled before its first exponential; how far the next
+        # fragment's TMEM load overlaps them depends on
+        # ``p_fragment_loop_unroll``. The running sum stays a packed pair until
+        # the loop ends.
         num_fragments = cfg.num_softmax_score_fragments
         last_fragment = Int32(num_fragments - 1)
         total_sum_pair = (Float32(0.0), Float32(0.0))
@@ -523,7 +524,9 @@ class SmemPResource(DecodeGenResourceBase):
             Float32, fragment_regs, space=cutlass.AddressSpace.rmem
         )
         self._load_score_fragment(tmem_base, Int32(0), pending_scores)
-        for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
+        for fragment_idx in cutlass.range(
+            cfg.num_softmax_score_fragments, unroll=cfg.p_fragment_loop_unroll
+        ):
             fragment = Int32(fragment_idx)
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             for score_idx in cutlass.range_constexpr(fragment_regs):
@@ -819,7 +822,7 @@ class SmemPResource(DecodeGenResourceBase):
         gives paired lanes the low/high 64-column halves of one row. Each lane
         writes disjoint packed blocks into the TMEM or SMEM layout consumed by
         BMM2. Streamed profiles, including every block-sparse Keeps profile,
-        produce P through the rolled fragment loop instead.
+        produce P through the runtime fragment loop instead.
         """
         cfg = self.cfg
         # Every block-sparse Keeps profile streams P; only dense complete rows
