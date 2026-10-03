@@ -1,0 +1,735 @@
+/*
+ * Copyright (c) 2026 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef FLASHINFER_ATTENTION_QSA_ROUTE_CUH_
+#define FLASHINFER_ATTENTION_QSA_ROUTE_CUH_
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+
+#include "../../fastdiv.cuh"
+#include "../../utils.cuh"
+
+namespace flashinfer {
+
+namespace sparse_route {
+
+// Columns one thread block writes, and the threads that write them. Each thread
+// takes every kThreads-th column of the tile, so a warp always covers 32 adjacent
+// columns; giving a thread adjacent columns instead splits each warp's store across
+// more sectors. The route is thousands wide, so tiling it also keeps enough blocks
+// in flight when only a few rows are expanded -- a decode step has one per request.
+// Two shapes, picked by whether the launch fills the device.
+//
+// A wide tile with few threads gives each block more columns and each SM more
+// blocks, which wins once there are thousands of rows. It starves a decode step,
+// where a handful of rows produce only a few blocks -- there the narrow tile with
+// more threads per block keeps more lanes busy.
+constexpr uint32_t kWideTile = 512;
+constexpr uint32_t kWideThreads = 128;
+constexpr uint32_t kNarrowTile = 256;
+constexpr uint32_t kNarrowThreads = 256;
+
+// gridDim.y stops at 65535 on every compute capability, and the row count is a
+// query-token count that a long-context step can take past it. The rows a
+// launch cannot cover in one grid are walked by a stride instead; x stays on
+// the columns so consecutive blocks still write consecutive memory.
+constexpr uint32_t kMaxGridY = 65535;
+
+// Whether the wide shape fills the device is a question about this kernel on
+// this GPU, so ask the driver rather than carry a number measured on one
+// architecture. Half a wave of blocks is where the narrow shape's extra blocks
+// stop buying anything.
+//
+// Neither the multiprocessor count nor the occupancy of a given kernel changes
+// between calls on one device, and a route launch is short enough that asking
+// the driver three times for them is a measurable part of it. They are kept per
+// device, and the template gives each kernel its own copy.
+//
+// The kernel and its thread count are template parameters rather than
+// arguments, because the cache below lives in the instantiation: taking either
+// as a value would give one shared entry to every kernel of the same signature
+// and every thread count, and a second caller would read back an occupancy
+// measured for something else.
+template <auto WideKernel, uint32_t Threads>
+inline cudaError_t choose_wide(uint32_t wide_blocks, bool* wide) {
+  int dev_id = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  static thread_local int cached_dev = -1;
+  static thread_local int num_sms = 0, blocks_per_sm = 0;
+  if (cached_dev != dev_id) {
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, WideKernel, static_cast<int>(Threads), 0));
+    cached_dev = dev_id;
+  }
+  *wide = num_sms == 0 || blocks_per_sm == 0 ||
+          wide_blocks >= static_cast<uint32_t>(num_sms) * static_cast<uint32_t>(blocks_per_sm) / 2;
+  return cudaSuccess;
+}
+
+// A logical page and the entry inside it -> the physical slot, or false when the
+// table does not cover the page, does not map it, or maps it past the cache.
+//
+// The page id keeps its own width until it is bounded, and the slot is formed in
+// 64 bits: page * page_size overflows a uint32 long before either factor does, and
+// a wrapped product can land under num_slots.
+//
+// What bounds the page is the slot space, not an int32. A route of int64 can hold a
+// slot of 2^31 and the caller is allowed to ask for one, so capping the page at
+// INT32_MAX would mask a page it is entitled to.
+//
+// page < num_slots is necessary rather than sufficient -- the slot is at least the
+// page whenever a page holds anything -- so it turns no valid page away, and it is
+// what keeps the product inside 64 bits: both factors are under 2^32 by then. The
+// exact bound is the candidate.
+template <typename IdType>
+__device__ __forceinline__ bool page_slot(const IdType* row_table, uint32_t table_width,
+                                          uint32_t logical_page, uint32_t entry, uint32_t page_size,
+                                          uint32_t num_slots, uint32_t* slot) {
+  if (logical_page >= table_width) return false;
+  const IdType page = row_table[logical_page];
+  if (page < IdType(0) || static_cast<uint64_t>(page) >= static_cast<uint64_t>(num_slots)) {
+    return false;
+  }
+  const uint64_t candidate = static_cast<uint64_t>(page) * page_size + entry;
+  if (candidate >= static_cast<uint64_t>(num_slots)) return false;
+  *slot = static_cast<uint32_t>(candidate);
+  return true;
+}
+
+// Where a row's invalid entries point. The attention reads every entry before the
+// mask is applied, and a masked entry still multiplies its V row by a zero
+// probability, so what the slot holds has to be finite. Slot 0 is not that: it is
+// wherever the caller keeps padding -- vLLM's null block -- and a NaN left there comes
+// out of P @ V as 0 * NaN. A valid entry names a token the caller has written, so the
+// invalid entries read the slot of the row's first valid entry instead. Nothing ties
+// that entry to a page: a table may leave its first pages unmapped and map later ones.
+//
+// resolve(col, &slot) says whether column col is valid and, when it is, its slot.
+// Every block of a row looks for the entry on its own, a block-wide pass at a time
+// from the front, and stops at the first pass that holds one. A row with no valid
+// entry has no finite slot to offer and stays on 0: it is fully masked, its output
+// is undefined, and the caller must not keep it.
+//
+// Every thread of the block calls this, the same number of times.
+template <uint32_t THREADS, typename Resolve>
+__device__ __forceinline__ uint32_t first_valid_slot(uint32_t width, const Resolve& resolve) {
+  __shared__ uint32_t first_col;
+  __shared__ uint32_t first_slot;
+  // The previous row's readers have to be done with first_slot before it is reset.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    first_col = 0xffffffffu;
+    first_slot = 0;
+  }
+  __syncthreads();
+  for (uint32_t base = 0; base < width; base += THREADS) {
+    const uint32_t col = base + threadIdx.x;
+    uint32_t slot = 0;
+    const bool valid = col < width && resolve(col, &slot);
+    if (__syncthreads_or(valid)) {
+      if (valid) atomicMin(&first_col, col);
+      __syncthreads();
+      if (col == first_col) first_slot = slot;
+      __syncthreads();
+      break;
+    }
+  }
+  return first_slot;
+}
+
+}  // namespace sparse_route
+
+/*!
+ * \brief Expand a per-query list of selected blocks into the token route it stands for.
+ *
+ * A block-granular selector picks `block_topk` blocks of `COMPRESS_RATIO` tokens each. The
+ * attention that consumes the choice works on tokens, so every selected block becomes its
+ * `COMPRESS_RATIO` tokens, laid out in selection order.
+ *
+ * The block a query itself sits in is only partially in the past, so it is never selected as a
+ * whole. Its already-seen tokens are appended after the expanded blocks instead -- at most
+ * `COMPRESS_RATIO - 1` of them, which is why a route is `block_topk * COMPRESS_RATIO +
+ * COMPRESS_RATIO - 1` wide.
+ *
+ * Positions that no token reaches are written as -1; the consumer masks them.
+ *
+ * \tparam COMPRESS_RATIO tokens per block, a compile-time constant so the divisions
+ *   by it fold into shifts for the power-of-two ratios this is used with
+ * \tparam IdType index type of both the selection and the route
+ */
+template <uint32_t COMPRESS_RATIO, bool CONTIGUOUS_COLUMNS, uint32_t TILE, uint32_t THREADS,
+          typename IdType, typename PosType>
+__global__ void __launch_bounds__(THREADS)
+    ExpandBlockRouteKernel(const IdType* __restrict__ block_indices,
+                           const PosType* __restrict__ query_positions,
+                           const IdType* __restrict__ sequence_lengths,
+                           const IdType* __restrict__ token_to_req, IdType* __restrict__ out,
+                           uint32_t stride_blocks_row, uint32_t stride_blocks_col,
+                           uint32_t stride_out_row, uint32_t stride_out_col, uint32_t rows,
+                           uint32_t num_requests, uint32_t block_topk) {
+  // blockIdx.x walks the columns of one row so consecutive blocks write consecutive
+  // memory; putting the row on x instead interleaves unrelated rows in flight.
+  // The width follows from the selection: every block expands to COMPRESS_RATIO
+  // tokens, plus the tail of the query's own block.
+  const uint32_t output_width = block_topk * COMPRESS_RATIO + COMPRESS_RATIO - 1;
+  const uint32_t tile_base = blockIdx.x * TILE;
+  if (tile_base >= output_width) return;
+  // One grid cannot cover more rows than gridDim.y allows, so the rest are
+  // walked by a stride. Every launch that fits takes the loop once.
+  for (uint32_t row = blockIdx.y; row < rows; row += gridDim.y) {
+    // Every column of this row shares them, so they are read once per block.
+    // The index tensors may be int64 and everything below is int32, so each value
+    // is bounded in its own width before it is narrowed -- a value of exactly
+    // 2^32 would narrow to zero, which is a real request and a real position.
+    //
+    // The request is also compared against num_requests, but that is a tensor
+    // extent with no int32 cap of its own, so the comparison alone does not stand
+    // in for the bound. The position and the length have nothing above them at
+    // all.
+    constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
+    // Positions carry their own type: a position is bounded by the context
+    // length, not by what indexes the cache, and a caller that builds them
+    // beside a slot mapping keeps them in int64. Narrowed here, and anything
+    // that does not fit is not a position.
+    constexpr PosType kPosInt32Max = static_cast<PosType>(2147483647);
+    const PosType position_raw = query_positions[row];
+    const int32_t query_position = (position_raw >= PosType(0) && position_raw <= kPosInt32Max)
+                                       ? static_cast<int32_t>(position_raw)
+                                       : -1;
+    const IdType request_raw = token_to_req[row];
+    const bool request_valid = request_raw >= IdType(0) && request_raw <= kInt32Max &&
+                               request_raw < static_cast<IdType>(num_requests);
+    const int32_t request = request_valid ? static_cast<int32_t>(request_raw) : -1;
+    const int32_t safe_request =
+        request_valid ? min(request, static_cast<int32_t>(num_requests) - 1) : 0;
+    IdType length_raw = request_valid ? sequence_lengths[safe_request] : IdType(0);
+    if (length_raw < IdType(0) || length_raw > kInt32Max) length_raw = IdType(0);
+    const int32_t sequence_length = static_cast<int32_t>(length_raw);
+
+    // Blocks entirely in the past, capped by what the selector produced.
+    // One past the last block the query has entirely behind it. A selection is
+    // only expandable while it names one of these: the block the query sits in
+    // is partly ahead of it, and the tail below is what supplies its seen half.
+    // query_position + 1 in its own width: INT32_MAX is inside the range the cast
+    // above accepts, and adding one to it in int32 is signed overflow.
+    const int64_t query_end = static_cast<int64_t>(query_position) + 1;
+    const int32_t past_blocks = static_cast<int32_t>(
+        min(query_end / static_cast<int64_t>(COMPRESS_RATIO),
+            static_cast<int64_t>(sequence_length) / static_cast<int64_t>(COMPRESS_RATIO)));
+    // Every rank the selector produced gets its own columns, whether or not the
+    // block it names turns out to be usable. Sizing this by past_blocks instead
+    // made the layout depend on the query: a rank at or above it was never read,
+    // its columns were reinterpreted as tail columns, and a valid block sitting
+    // there vanished. The causal test is on the block, further down.
+    const int32_t expanded_count =
+        static_cast<int32_t>(block_topk) * static_cast<int32_t>(COMPRESS_RATIO);
+    const int32_t tail_start = static_cast<int32_t>(
+        (query_end / static_cast<int64_t>(COMPRESS_RATIO)) * static_cast<int64_t>(COMPRESS_RATIO));
+    const int32_t tail_count = static_cast<int32_t>(query_end - static_cast<int64_t>(tail_start));
+
+    const IdType* row_blocks = block_indices + row * stride_blocks_row;
+    IdType* row_out = out + row * stride_out_row;
+
+    const uint32_t blocks_stride = CONTIGUOUS_COLUMNS ? 1u : stride_blocks_col;
+    const uint32_t out_stride = CONTIGUOUS_COLUMNS ? 1u : stride_out_col;
+
+#pragma unroll
+    for (uint32_t i = 0; i < TILE / THREADS; ++i) {
+      const uint32_t col = tile_base + threadIdx.x + i * THREADS;
+      if (col >= output_width) break;
+      const int32_t column = static_cast<int32_t>(col);
+      int32_t token;
+      bool valid;
+      if (column < expanded_count) {
+        const int32_t rank = column / static_cast<int32_t>(COMPRESS_RATIO);
+        const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
+        // The whole block, not the token: keeping only the seen half of a block
+        // the query sits in would repeat exactly what the tail appends. Decided
+        // before the multiply, so a block that is not one of ours is never
+        // scaled by the ratio at all.
+        const IdType block_raw = row_blocks[rank * blocks_stride];
+        valid = block_raw >= IdType(0) && block_raw <= kInt32Max &&
+                block_raw < static_cast<IdType>(past_blocks);
+        token =
+            valid ? static_cast<int32_t>(block_raw) * static_cast<int32_t>(COMPRESS_RATIO) + offset
+                  : -1;
+      } else {
+        const int32_t tail_offset = column - expanded_count;
+        token = tail_start + tail_offset;
+        valid = tail_offset < tail_count && tail_offset < static_cast<int32_t>(COMPRESS_RATIO) - 1;
+      }
+      // A selected block is meant to be one the query has already passed, which
+      // is what the selector's own visible count bounds it to. Nothing here had
+      // been checking it, though: the block id is the caller's, and the only
+      // bound it met was the sequence length. A block past the query would have
+      // expanded into tokens the query cannot see -- with a ratio of four, a
+      // query at position 3 selecting block 2 routes tokens 8 through 11. The
+      // route drops them rather than carry them.
+      valid = valid && token >= 0 && token <= query_position && token < sequence_length;
+      row_out[static_cast<uint32_t>(column) * out_stride] =
+          valid ? static_cast<IdType>(token) : IdType(-1);
+    }
+  }
+}
+
+/*!
+ * \brief Turn a per-query block selection straight into a paged attention route.
+ *
+ * Fuses three steps that would otherwise each read and write the whole route:
+ * expanding the selected blocks into tokens (see ExpandBlockRouteKernel), mapping
+ * each token through the block table into a physical KV slot, and packing the
+ * validity of every entry into the bitmask the attention kernel reads.
+ *
+ * A route entry is valid when it names a real token: inside the request, on a
+ * logical page the block table covers, on a page the table actually maps, and in a
+ * slot the cache holds. Invalid entries keep their mask bit clear and route to the
+ * row's first valid entry, because they are read before the mask is applied (see
+ * sparse_route::first_valid_slot). A row with no valid entry is fully masked on slot
+ * 0 and its output is undefined.
+ *
+ * The logical route is written out as well: a speculative decoder reuses the
+ * selection across its steps, so it outlives the physical route derived from it.
+ *
+ * \tparam MASK_BYTES_PER_ROW ceil(output_width / 8), the stride of one mask row
+ */
+template <uint32_t COMPRESS_RATIO, bool CONTIGUOUS_COLUMNS, uint32_t TILE, uint32_t THREADS,
+          typename IdType, typename PosType>
+__global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
+    const IdType* __restrict__ block_indices, const PosType* __restrict__ query_positions,
+    const IdType* __restrict__ sequence_lengths, const IdType* __restrict__ token_to_req,
+    const IdType* __restrict__ block_table, IdType* __restrict__ out_logical,
+    IdType* __restrict__ out_route, uint8_t* __restrict__ out_mask, uint32_t stride_blocks_row,
+    uint32_t stride_blocks_col, uint32_t stride_logical_row, uint32_t stride_table_row,
+    uint32_t rows, uint32_t num_requests, uint32_t block_topk, uint32_t table_width,
+    uint32_t page_size, uint32_t num_slots, uint32_t mask_bytes_per_row) {
+  const uint32_t output_width = block_topk * COMPRESS_RATIO + COMPRESS_RATIO - 1;
+  const uint32_t tile_base = blockIdx.x * TILE;
+  if (tile_base >= output_width) return;
+  // One grid cannot cover more rows than gridDim.y allows, so the rest are
+  // walked by a stride. Every launch that fits takes the loop once.
+  for (uint32_t row = blockIdx.y; row < rows; row += gridDim.y) {
+    // The index tensors may be int64 and everything below is int32, so each value
+    // is bounded in its own width before it is narrowed -- a value of exactly
+    // 2^32 would narrow to zero, which is a real request and a real position.
+    //
+    // The request is also compared against num_requests, but that is a tensor
+    // extent with no int32 cap of its own, so the comparison alone does not stand
+    // in for the bound. The position and the length have nothing above them at
+    // all.
+    constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
+    // Positions carry their own type: a position is bounded by the context
+    // length, not by what indexes the cache, and a caller that builds them
+    // beside a slot mapping keeps them in int64. Narrowed here, and anything
+    // that does not fit is not a position.
+    constexpr PosType kPosInt32Max = static_cast<PosType>(2147483647);
+    const PosType position_raw = query_positions[row];
+    const int32_t query_position = (position_raw >= PosType(0) && position_raw <= kPosInt32Max)
+                                       ? static_cast<int32_t>(position_raw)
+                                       : -1;
+    const IdType request_raw = token_to_req[row];
+    const bool request_valid = request_raw >= IdType(0) && request_raw <= kInt32Max &&
+                               request_raw < static_cast<IdType>(num_requests);
+    const int32_t request = request_valid ? static_cast<int32_t>(request_raw) : -1;
+    const int32_t safe_request =
+        request_valid ? min(request, static_cast<int32_t>(num_requests) - 1) : 0;
+    IdType length_raw = request_valid ? sequence_lengths[safe_request] : IdType(0);
+    if (length_raw < IdType(0) || length_raw > kInt32Max) length_raw = IdType(0);
+    const int32_t sequence_length = static_cast<int32_t>(length_raw);
+
+    // One past the last block the query has entirely behind it. A selection is
+    // only expandable while it names one of these: the block the query sits in
+    // is partly ahead of it, and the tail below is what supplies its seen half.
+    // query_position + 1 in its own width: INT32_MAX is inside the range the cast
+    // above accepts, and adding one to it in int32 is signed overflow.
+    const int64_t query_end = static_cast<int64_t>(query_position) + 1;
+    const int32_t past_blocks = static_cast<int32_t>(
+        min(query_end / static_cast<int64_t>(COMPRESS_RATIO),
+            static_cast<int64_t>(sequence_length) / static_cast<int64_t>(COMPRESS_RATIO)));
+    // Every rank the selector produced gets its own columns, whether or not the
+    // block it names turns out to be usable. Sizing this by past_blocks instead
+    // made the layout depend on the query: a rank at or above it was never read,
+    // its columns were reinterpreted as tail columns, and a valid block sitting
+    // there vanished. The causal test is on the block, further down.
+    const int32_t expanded_count =
+        static_cast<int32_t>(block_topk) * static_cast<int32_t>(COMPRESS_RATIO);
+    const int32_t tail_start = static_cast<int32_t>(
+        (query_end / static_cast<int64_t>(COMPRESS_RATIO)) * static_cast<int64_t>(COMPRESS_RATIO));
+    const int32_t tail_count = static_cast<int32_t>(query_end - static_cast<int64_t>(tail_start));
+
+    const uint32_t blocks_stride = CONTIGUOUS_COLUMNS ? 1u : stride_blocks_col;
+    const IdType* row_blocks = block_indices + row * stride_blocks_row;
+    const IdType* row_table =
+        request_valid ? block_table + safe_request * stride_table_row : nullptr;
+    IdType* row_logical = out_logical + row * stride_logical_row;
+    IdType* row_route = out_route + row * output_width;
+    uint8_t* row_mask = out_mask + row * mask_bytes_per_row;
+
+    // The logical token a column of the row names, or -1.
+    const auto column_token = [&](uint32_t col) -> int32_t {
+      const int32_t column = static_cast<int32_t>(col);
+      int32_t token;
+      bool valid;
+      if (column < expanded_count) {
+        const int32_t rank = column / static_cast<int32_t>(COMPRESS_RATIO);
+        const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
+        // Same whole-block rule as the standalone expansion above, decided
+        // before the multiply for the same reason.
+        const IdType block_raw = row_blocks[rank * blocks_stride];
+        valid = block_raw >= IdType(0) && block_raw <= kInt32Max &&
+                block_raw < static_cast<IdType>(past_blocks);
+        token =
+            valid ? static_cast<int32_t>(block_raw) * static_cast<int32_t>(COMPRESS_RATIO) + offset
+                  : -1;
+      } else {
+        const int32_t tail_offset = column - expanded_count;
+        token = tail_start + tail_offset;
+        valid = tail_offset < tail_count && tail_offset < static_cast<int32_t>(COMPRESS_RATIO) - 1;
+      }
+      // Same causal bound as the standalone expansion above: a selected block
+      // the query has not reached would expand into tokens it cannot see, and
+      // the sequence length alone does not stop them.
+      valid = valid && token >= 0 && token <= query_position && token < sequence_length;
+      return valid ? token : -1;
+    };
+    // Logical token -> physical slot, folding every bound into the same validity.
+    const auto token_slot = [&](int32_t token, uint32_t* slot) -> bool {
+      return token >= 0 && row_table != nullptr &&
+             sparse_route::page_slot(
+                 row_table, table_width, static_cast<uint32_t>(token) / page_size,
+                 static_cast<uint32_t>(token) % page_size, page_size, num_slots, slot);
+    };
+    // Uniform across the block: a row without a request has nothing to look for.
+    const uint32_t fallback_slot = row_table == nullptr
+                                       ? 0u
+                                       : sparse_route::first_valid_slot<THREADS>(
+                                             output_width, [&](uint32_t col, uint32_t* slot) {
+                                               return token_slot(column_token(col), slot);
+                                             });
+
+    // A warp always covers 32 consecutive columns, so its ballot is exactly the four
+    // mask bytes that cover them and no two warps write the same byte.
+    const uint32_t lane = threadIdx.x & 31u;
+
+#pragma unroll
+    for (uint32_t i = 0; i < TILE / THREADS; ++i) {
+      const uint32_t col = tile_base + threadIdx.x + i * THREADS;
+      const bool in_row = col < output_width;
+
+      int32_t token = -1;
+      if (in_row) {
+        token = column_token(col);
+        row_logical[col] = static_cast<IdType>(token);
+      }
+      uint32_t slot = fallback_slot;
+      const bool valid = token_slot(token, &slot);
+      if (in_row) row_route[col] = static_cast<IdType>(slot);
+
+      const uint32_t bits = __ballot_sync(0xffffffffu, valid && in_row);
+      if (lane == 0) {
+        const uint32_t byte_base = (tile_base + (threadIdx.x & ~31u) + i * THREADS) >> 3;
+#pragma unroll
+        for (uint32_t b = 0; b < 4; ++b) {
+          const uint32_t byte_index = byte_base + b;
+          if (byte_index < mask_bytes_per_row) {
+            row_mask[byte_index] = static_cast<uint8_t>((bits >> (b * 8)) & 0xffu);
+          }
+        }
+      }
+    }
+  }
+}
+
+/*!
+ * \brief Map a logical token route through a block table into physical KV slots.
+ *
+ * The second half of QSARouteFromBlocksKernel, for callers whose logical route was
+ * produced earlier and outlived the physical one -- a speculative decoder reuses a
+ * selection across its steps.
+ *
+ * An entry is valid when it names a real token: non-negative, on a logical page the
+ * block table covers, on a page the table maps, and in a slot the cache holds.
+ * Invalid entries keep their mask bit clear and route to the row's first valid entry,
+ * because they are read before the mask is applied (see
+ * sparse_route::first_valid_slot). A row with no valid entry is fully masked on slot
+ * 0 and its output is undefined.
+ *
+ * out_indptr, when given, receives the row pointers of a block-sparse plan laid out
+ * over this route, width entries per row, with the rows past valid_rows given none:
+ * out_indptr[r] = min(r, valid_rows) * width. The plan's work for a padding row then
+ * finds a zero length and reads nothing, where a full length would attend over the
+ * whole of a route that is all masked.
+ */
+template <uint32_t TILE, uint32_t THREADS, typename IdType>
+__global__ void __launch_bounds__(THREADS)
+    QSARouteFromLogicalKernel(const IdType* __restrict__ logical,
+                              const IdType* __restrict__ token_to_req,
+                              const IdType* __restrict__ block_table,
+                              IdType* __restrict__ out_route, uint8_t* __restrict__ out_mask,
+                              int32_t* __restrict__ out_indptr, uint32_t stride_logical_row,
+                              uint32_t stride_table_row, uint32_t rows, uint32_t valid_rows,
+                              uint32_t num_requests, uint32_t width, uint32_t table_width,
+                              uint_fastdiv page_size, uint32_t num_slots,
+                              uint32_t mask_bytes_per_row) {
+  const uint32_t tile_base = blockIdx.x * TILE;
+  if (tile_base >= width) return;
+  // One grid cannot cover more rows than gridDim.y allows, so the rest are
+  // walked by a stride. Every launch that fits takes the loop once.
+  for (uint32_t row = blockIdx.y; row < rows; row += gridDim.y) {
+    if (out_indptr != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
+      // The host bounds rows * width to int32.
+      if (row == 0) out_indptr[0] = 0;
+      out_indptr[row + 1] = static_cast<int32_t>(min(row + 1, valid_rows) * width);
+    }
+    // Rows past the caller's token count are padding: they carry no request and must
+    // come out fully masked.
+    // Same range contract as the expansion kernels: an index is bounded in its
+    // own width before it is narrowed, or a value of 2^32 becomes request zero.
+    constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
+    const bool row_live = row < valid_rows;
+    const IdType request_raw = row_live ? token_to_req[row] : IdType(-1);
+    const bool request_valid = request_raw >= IdType(0) && request_raw <= kInt32Max &&
+                               request_raw < static_cast<IdType>(num_requests);
+    const int32_t request = request_valid ? static_cast<int32_t>(request_raw) : -1;
+    const IdType* row_table = request_valid ? block_table + request * stride_table_row : nullptr;
+    // Only a live row reads the logical route, so it needs to cover those rows and
+    // no more -- a short step can hand over its own tensor instead of padding one.
+    const IdType* row_logical = row_live ? logical + row * stride_logical_row : nullptr;
+    IdType* row_route = out_route + row * width;
+    uint8_t* row_mask = out_mask + row * mask_bytes_per_row;
+    const bool row_mapped = row_table != nullptr && row_logical != nullptr;
+
+    // A column of a mapped row -> its physical slot.
+    const auto column_slot = [&](uint32_t col, uint32_t* slot) -> bool {
+      const IdType token_raw = row_logical[col];
+      if (token_raw < IdType(0) || token_raw > kInt32Max) return false;
+      uint32_t logical_page, entry;
+      page_size.divmod(static_cast<uint32_t>(token_raw), logical_page, entry);
+      return sparse_route::page_slot(row_table, table_width, logical_page, entry,
+                                     static_cast<uint32_t>(page_size), num_slots, slot);
+    };
+    // Uniform across the block: padding and a row without a request have nothing to
+    // look for.
+    const uint32_t fallback_slot =
+        row_mapped ? sparse_route::first_valid_slot<THREADS>(width, column_slot) : 0u;
+
+    const uint32_t lane = threadIdx.x & 31u;
+
+#pragma unroll
+    for (uint32_t i = 0; i < TILE / THREADS; ++i) {
+      const uint32_t col = tile_base + threadIdx.x + i * THREADS;
+      const bool in_row = col < width;
+
+      uint32_t slot = fallback_slot;
+      const bool valid = in_row && row_mapped && column_slot(col, &slot);
+      if (in_row) row_route[col] = static_cast<IdType>(slot);
+
+      const uint32_t bits = __ballot_sync(0xffffffffu, valid);
+      if (lane == 0) {
+        const uint32_t byte_base = (tile_base + (threadIdx.x & ~31u) + i * THREADS) >> 3;
+#pragma unroll
+        for (uint32_t b = 0; b < 4; ++b) {
+          const uint32_t byte_index = byte_base + b;
+          if (byte_index < mask_bytes_per_row) {
+            row_mask[byte_index] = static_cast<uint8_t>((bits >> (b * 8)) & 0xffu);
+          }
+        }
+      }
+    }
+  }
+}
+
+template <typename IdType>
+cudaError_t QSARouteFromLogical(const IdType* logical, const IdType* token_to_req,
+                                const IdType* block_table, IdType* out_route, uint8_t* out_mask,
+                                int32_t* out_indptr, uint32_t stride_logical_row,
+                                uint32_t stride_table_row, uint32_t rows, uint32_t valid_rows,
+                                uint32_t num_requests, uint32_t width, uint32_t table_width,
+                                uint32_t page_size, uint32_t num_slots, uint32_t mask_bytes_per_row,
+                                cudaStream_t stream) {
+  if (rows == 0 || width == 0) {
+    // No row has an entry, so every row pointer is zero -- including the one a
+    // plan over an empty step still reads.
+    if (out_indptr == nullptr) return cudaSuccess;
+    return cudaMemsetAsync(out_indptr, 0, (static_cast<size_t>(rows) + 1) * sizeof(int32_t),
+                           stream);
+  }
+  const uint32_t wide_blocks = rows * ceil_div(width, sparse_route::kWideTile);
+  bool wide = true;
+  // Hoisted into a name: the kernel's own template arguments written inline
+  // inside choose_wide's argument list is more than the frontend will parse.
+  constexpr auto kWideKernel =
+      QSARouteFromLogicalKernel<sparse_route::kWideTile, sparse_route::kWideThreads, IdType>;
+  // Through a name: the comma between the template arguments would otherwise
+  // split FLASHINFER_CUDA_CALL's own argument list.
+  const cudaError_t shape_status =
+      sparse_route::choose_wide<kWideKernel, sparse_route::kWideThreads>(wide_blocks, &wide);
+  FLASHINFER_CUDA_CALL(shape_status);
+  const uint32_t tile = wide ? sparse_route::kWideTile : sparse_route::kNarrowTile;
+  const dim3 grid(ceil_div(width, tile), min(rows, sparse_route::kMaxGridY));
+  const uint_fastdiv page_div(page_size);
+
+  if (wide) {
+    QSARouteFromLogicalKernel<sparse_route::kWideTile, sparse_route::kWideThreads, IdType>
+        <<<grid, sparse_route::kWideThreads, 0, stream>>>(
+            logical, token_to_req, block_table, out_route, out_mask, out_indptr, stride_logical_row,
+            stride_table_row, rows, valid_rows, num_requests, width, table_width, page_div,
+            num_slots, mask_bytes_per_row);
+  } else {
+    QSARouteFromLogicalKernel<sparse_route::kNarrowTile, sparse_route::kNarrowThreads, IdType>
+        <<<grid, sparse_route::kNarrowThreads, 0, stream>>>(
+            logical, token_to_req, block_table, out_route, out_mask, out_indptr, stride_logical_row,
+            stride_table_row, rows, valid_rows, num_requests, width, table_width, page_div,
+            num_slots, mask_bytes_per_row);
+  }
+  return cudaGetLastError();
+}
+
+template <typename IdType, typename PosType>
+cudaError_t ExpandBlockRoute(const IdType* block_indices, const PosType* query_positions,
+                             const IdType* sequence_lengths, const IdType* token_to_req,
+                             IdType* out, uint32_t stride_blocks_row, uint32_t stride_blocks_col,
+                             uint32_t stride_out_row, uint32_t stride_out_col, uint32_t rows,
+                             uint32_t num_requests, uint32_t block_topk, uint32_t compress_ratio,
+                             uint32_t output_width, cudaStream_t stream) {
+  if (rows == 0 || output_width == 0) return cudaSuccess;
+  const uint32_t wide_blocks = rows * ceil_div(output_width, sparse_route::kWideTile);
+  bool wide = true;
+  constexpr auto kWideKernel = ExpandBlockRouteKernel<1, true, sparse_route::kWideTile,
+                                                      sparse_route::kWideThreads, IdType, PosType>;
+  const cudaError_t shape_status =
+      sparse_route::choose_wide<kWideKernel, sparse_route::kWideThreads>(wide_blocks, &wide);
+  FLASHINFER_CUDA_CALL(shape_status);
+  const uint32_t tile = wide ? sparse_route::kWideTile : sparse_route::kNarrowTile;
+  const dim3 grid(ceil_div(output_width, tile), min(rows, sparse_route::kMaxGridY));
+  // Both strides are 1 for every caller that hands over a plain route; folding them
+  // away turns the inner address into an add.
+  const bool contiguous = stride_blocks_col == 1 && stride_out_col == 1;
+
+#define _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, TILE, THREADS)                                          \
+  ExpandBlockRouteKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType, PosType>                       \
+      <<<grid, THREADS, 0, stream>>>(                                                             \
+          block_indices, query_positions, sequence_lengths, token_to_req, out, stride_blocks_row, \
+          stride_blocks_col, stride_out_row, stride_out_col, rows, num_requests, block_topk)
+
+#define _FI_LAUNCH(RATIO, CONTIGUOUS)                                                             \
+  do {                                                                                            \
+    if (wide) {                                                                                   \
+      _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, sparse_route::kWideTile, sparse_route::kWideThreads);     \
+    } else {                                                                                      \
+      _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, sparse_route::kNarrowTile, sparse_route::kNarrowThreads); \
+    }                                                                                             \
+  } while (0)
+
+#define _FI_DISPATCH_COMPRESS_RATIO(RATIO) \
+  case RATIO: {                            \
+    if (contiguous) {                      \
+      _FI_LAUNCH(RATIO, true);             \
+    } else {                               \
+      _FI_LAUNCH(RATIO, false);            \
+    }                                      \
+    break;                                 \
+  }
+
+  switch (compress_ratio) {
+    _FI_DISPATCH_COMPRESS_RATIO(1)
+    _FI_DISPATCH_COMPRESS_RATIO(2)
+    _FI_DISPATCH_COMPRESS_RATIO(4)
+    _FI_DISPATCH_COMPRESS_RATIO(8)
+    _FI_DISPATCH_COMPRESS_RATIO(16)
+    _FI_DISPATCH_COMPRESS_RATIO(32)
+    default:
+      return cudaErrorInvalidValue;
+  }
+#undef _FI_DISPATCH_COMPRESS_RATIO
+#undef _FI_LAUNCH
+#undef _FI_LAUNCH_CFG
+
+  return cudaGetLastError();
+}
+
+template <typename IdType, typename PosType>
+cudaError_t QSARouteFromBlocks(const IdType* block_indices, const PosType* query_positions,
+                               const IdType* sequence_lengths, const IdType* token_to_req,
+                               const IdType* block_table, IdType* out_logical, IdType* out_route,
+                               uint8_t* out_mask, uint32_t stride_blocks_row,
+                               uint32_t stride_blocks_col, uint32_t stride_logical_row,
+                               uint32_t stride_table_row, uint32_t rows, uint32_t num_requests,
+                               uint32_t block_topk, uint32_t table_width, uint32_t page_size,
+                               uint32_t num_slots, uint32_t mask_bytes_per_row,
+                               uint32_t compress_ratio, cudaStream_t stream) {
+  const uint32_t output_width = block_topk * compress_ratio + compress_ratio - 1;
+  if (rows == 0 || output_width == 0) return cudaSuccess;
+  const uint32_t wide_blocks = rows * ceil_div(output_width, sparse_route::kWideTile);
+  bool wide = true;
+  constexpr auto kWideKernel =
+      QSARouteFromBlocksKernel<1, true, sparse_route::kWideTile, sparse_route::kWideThreads, IdType,
+                               PosType>;
+  const cudaError_t shape_status =
+      sparse_route::choose_wide<kWideKernel, sparse_route::kWideThreads>(wide_blocks, &wide);
+  FLASHINFER_CUDA_CALL(shape_status);
+  const uint32_t tile = wide ? sparse_route::kWideTile : sparse_route::kNarrowTile;
+  const dim3 grid(ceil_div(output_width, tile), min(rows, sparse_route::kMaxGridY));
+  const bool contiguous = stride_blocks_col == 1;
+
+#define _FI_ROUTE_CFG(RATIO, CONTIGUOUS, TILE, THREADS)                                           \
+  QSARouteFromBlocksKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType, PosType>                     \
+      <<<grid, THREADS, 0, stream>>>(block_indices, query_positions, sequence_lengths,            \
+                                     token_to_req, block_table, out_logical, out_route, out_mask, \
+                                     stride_blocks_row, stride_blocks_col, stride_logical_row,    \
+                                     stride_table_row, rows, num_requests, block_topk,            \
+                                     table_width, page_size, num_slots, mask_bytes_per_row)
+
+#define _FI_ROUTE_LAUNCH(RATIO, CONTIGUOUS)                                                      \
+  do {                                                                                           \
+    if (wide) {                                                                                  \
+      _FI_ROUTE_CFG(RATIO, CONTIGUOUS, sparse_route::kWideTile, sparse_route::kWideThreads);     \
+    } else {                                                                                     \
+      _FI_ROUTE_CFG(RATIO, CONTIGUOUS, sparse_route::kNarrowTile, sparse_route::kNarrowThreads); \
+    }                                                                                            \
+  } while (0)
+
+#define _FI_ROUTE_DISPATCH(RATIO)     \
+  case RATIO: {                       \
+    if (contiguous) {                 \
+      _FI_ROUTE_LAUNCH(RATIO, true);  \
+    } else {                          \
+      _FI_ROUTE_LAUNCH(RATIO, false); \
+    }                                 \
+    break;                            \
+  }
+
+  switch (compress_ratio) {
+    _FI_ROUTE_DISPATCH(1)
+    _FI_ROUTE_DISPATCH(2)
+    _FI_ROUTE_DISPATCH(4)
+    _FI_ROUTE_DISPATCH(8)
+    _FI_ROUTE_DISPATCH(16)
+    _FI_ROUTE_DISPATCH(32)
+    default:
+      return cudaErrorInvalidValue;
+  }
+#undef _FI_ROUTE_DISPATCH
+#undef _FI_ROUTE_LAUNCH
+#undef _FI_ROUTE_CFG
+
+  return cudaGetLastError();
+}
+
+}  // namespace flashinfer
+
+#endif  // FLASHINFER_ATTENTION_QSA_ROUTE_CUH_

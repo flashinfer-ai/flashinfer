@@ -1,0 +1,240 @@
+{
+  "name": "qsa_pre_indexer_h4_d128_ring8_ps4",
+  "description": "QSA pre-indexer: RMSNorm and partial NeoX RoPE of the index queries, mean-pooled compressed keys for every completed group, and the commit of each request's raw-key suffix to its ring.",
+  "op_type": "qsa_pre_indexer",
+  "tags": [
+    "fi_api:flashinfer.qsa_ops.pre_indexer.qsa_pre_indexer",
+    "status:verified",
+    "sparse"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var"
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 4
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "q_width": {
+      "type": "const",
+      "value": 512,
+      "description": "num_heads * head_dim."
+    },
+    "max_position": {
+      "type": "var"
+    },
+    "rope_width": {
+      "type": "const",
+      "value": 64,
+      "description": "head_dim // 2."
+    },
+    "num_ring_blocks": {
+      "type": "var"
+    },
+    "ring_size": {
+      "type": "const",
+      "value": 8
+    },
+    "ring_width": {
+      "type": "const",
+      "value": 128,
+      "description": "head_dim, or head_dim + 12."
+    },
+    "one": {
+      "type": "const",
+      "value": 1
+    },
+    "num_requests": {
+      "type": "var"
+    },
+    "len_indptr": {
+      "type": "var"
+    },
+    "num_compressed_blocks": {
+      "type": "var"
+    },
+    "compressed_page": {
+      "type": "const",
+      "value": 4
+    },
+    "num_work": {
+      "type": "var"
+    },
+    "two": {
+      "type": "const",
+      "value": 2
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_tokens",
+        "q_width"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "num_tokens",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "positions": {
+      "shape": [
+        "num_tokens"
+      ],
+      "dtype": "int64",
+      "description": "Rotary coordinates; [3, num_tokens] for a three-axis rope."
+    },
+    "cos_sin_cache": {
+      "shape": [
+        "max_position",
+        "rope_width"
+      ],
+      "dtype": "bfloat16"
+    },
+    "q_norm_weight": {
+      "shape": [
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_norm_weight": {
+      "shape": [
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "eps": {
+      "shape": null,
+      "dtype": "float32"
+    },
+    "q_out": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "state_cache": {
+      "shape": [
+        "num_ring_blocks",
+        "ring_size",
+        "one",
+        "ring_width"
+      ],
+      "dtype": "bfloat16"
+    },
+    "state_slots": {
+      "shape": [
+        "num_tokens"
+      ],
+      "dtype": "int64"
+    },
+    "state_block_table": {
+      "shape": [
+        "num_requests",
+        "one"
+      ],
+      "dtype": "int32"
+    },
+    "qo_indptr": {
+      "shape": [
+        "len_indptr"
+      ],
+      "dtype": "int32"
+    },
+    "logical_positions": {
+      "shape": [
+        "num_tokens"
+      ],
+      "dtype": "int64"
+    },
+    "compressed_cache": {
+      "shape": [
+        "num_compressed_blocks",
+        "compressed_page",
+        "one",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "compressed_slots": {
+      "shape": [
+        "num_tokens"
+      ],
+      "dtype": "int64"
+    },
+    "work_metadata": {
+      "shape": [
+        "num_work",
+        "two"
+      ],
+      "dtype": "int32"
+    },
+    "compress_ratio": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "mrope_h": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "mrope_w": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "is_k_mrope": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Bool."
+    },
+    "cache_has_rope_pos": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Bool."
+    }
+  },
+  "outputs": {
+    "q_out": {
+      "shape": [
+        "num_tokens",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "param": "q_out"
+    },
+    "state_cache": {
+      "shape": [
+        "num_ring_blocks",
+        "ring_size",
+        "one",
+        "ring_width"
+      ],
+      "dtype": "bfloat16",
+      "param": "state_cache"
+    },
+    "compressed_cache": {
+      "shape": [
+        "num_compressed_blocks",
+        "compressed_page",
+        "one",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "param": "compressed_cache"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

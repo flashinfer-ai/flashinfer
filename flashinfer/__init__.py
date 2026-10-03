@@ -239,6 +239,7 @@ from .cake_minimax_h3 import MiniMaxH3QkvQuantizePack as MiniMaxH3QkvQuantizePac
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops
+from . import qsa_ops as qsa_ops
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import (
@@ -343,6 +344,7 @@ from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
 from .topk import top_k_ragged_transform as top_k_ragged_transform
+from .topk import PreparedTopKRaggedTransform as PreparedTopKRaggedTransform
 from .topk import TopKTieBreak as TopKTieBreak
 from .topk_varlen.topk_varlen import top_k_varlen as top_k_varlen
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper

@@ -131,3 +131,40 @@ dtypes, raise :class:`ValueError`.
     msa_sparse_decode_attention
     msa_topk_select
     prepare_msa_nvfp4_sparse_decode
+
+
+flashinfer.qsa_ops
+==================
+
+Qwen4Exp quantized sparse attention (QSA), one layer step at a time.
+:func:`qsa_pre_indexer` normalizes and rotates the index queries and writes the
+compressed keys. :class:`QSASelection` scores the compressed cache
+(:func:`qsa_paged_scores`), keeps the top blocks of each query and expands them
+into a token route (:func:`qsa_expand_block_route`). :class:`QSAAttention` maps
+that route through the block table (:func:`qsa_route_from_logical`), runs
+block-sparse attention over a paged dense, FP8 or NVFP4 cache, and applies the
+output gate (:func:`qsa_output_gate`). :class:`QSA` runs both halves out of one
+persistent and one transient workspace sized by
+:meth:`QSA.workspace_requirements`; once it has run, its plans are fixed, so a
+captured CUDA graph can replay them. The scorer needs SM80 or newer, and
+:func:`qsa_capabilities` reports what the build provides on a device.
+
+.. currentmodule:: flashinfer.qsa_ops
+
+.. autosummary::
+    :toctree: ../generated
+
+    QSA
+    QSAConfig
+    QSAWorkspaceRequirements
+    QSASelection
+    QSAAttention
+    qsa_pre_indexer
+    qsa_pre_indexer_dispatch_mask
+    qsa_paged_scores
+    qsa_expand_block_route
+    qsa_route_from_blocks
+    qsa_route_from_logical
+    qsa_output_gate
+    qsa_capabilities
+    qsa_capability_names

@@ -79,7 +79,14 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_page_table_transform, cub_topk_page_table
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_page_table_transform_workspace_size,
                               cub_topk_page_table_transform_workspace_size);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_ragged_transform, cub_topk_ragged_transform);
+int64_t cub_topk_ragged_transform_workspace_size_for(int64_t num_rows, int64_t max_len,
+                                                     int64_t dtype_code, int64_t device_id,
+                                                     int64_t top_k, int64_t tie_break,
+                                                     bool with_row_starts);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_ragged_transform_workspace_size,
                               cub_topk_ragged_transform_workspace_size);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_ragged_transform_workspace_size_for,
+                              cub_topk_ragged_transform_workspace_size_for);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk, cub_topk);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_workspace_size, cub_topk_workspace_size);
