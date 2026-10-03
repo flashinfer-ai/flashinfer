@@ -422,7 +422,7 @@ def _reference_moe(
     assert topk_ids is not None and topk_weights is not None
     intermediate_size = w2.shape[2]
     result = torch.zeros_like(hidden_states, dtype=torch.float32)
-    x = (
+    gemm1_input = (
         _reference_deepseek_activations(hidden_states)
         if activation_fp8
         else hidden_states.float()
@@ -431,7 +431,7 @@ def _reference_moe(
         token_ids, slots = torch.where(topk_ids == expert)
         if token_ids.numel() == 0:
             continue
-        gemm1 = (x[token_ids] @ w1[expert].float().T).to(torch.bfloat16)
+        gemm1 = (gemm1_input[token_ids] @ w1[expert].float().T).to(torch.bfloat16)
         intermediate = _reference_activation(gemm1, activation, intermediate_size)
         if activation_fp8:
             intermediate = _reference_deepseek_activations(intermediate)
