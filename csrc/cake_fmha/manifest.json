@@ -140,8 +140,8 @@
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a",
-                  "sm_103a": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a"
+                  "sm_100a": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf",
+                  "sm_103a": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
@@ -156,8 +156,8 @@
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a",
-                  "sm_103a": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a"
+                  "sm_100a": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf",
+                  "sm_103a": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
@@ -1251,7 +1251,7 @@
           }
         },
         "source_package_file_count": 44,
-        "source_package_sha256": "24c9c97974eb0ac8d898b75a788e85edae07e4bd4ca6f20337fb93bad14eb7e3",
+        "source_package_sha256": "98698c57ace9e942a4f6caac3368132bc99c44228a8d517484717c010fc37673",
         "balanced_routes": {
           "dcp_spec_bf16_balanced": {
             "arguments": {
@@ -2041,8 +2041,8 @@
       "sha256": "03cfc35e253a91a9675d2e3da75d60b15be3f04ca97465c9c656183c3a943ba7"
     },
     "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu": {
-      "bytes": 228143,
-      "sha256": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a"
+      "bytes": 235190,
+      "sha256": "4e858b80c0deca5e606190da5fe818969d0b898ab467f1979f4bb2159c18ccdf"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l20.cu": {
       "bytes": 116857,
@@ -2189,20 +2189,20 @@
       "sha256": "0e5951bb89fa8b4990843bef3b181ea06e99875e5e324aa0dc2f79582a73ebab"
     },
     "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu": {
-      "bytes": 144117,
-      "sha256": "bc086537a5380526fd0e73e243a12f35d24e124fa668ea5678e283913e8bf5b5"
+      "bytes": 149704,
+      "sha256": "25d1b340a8d12fa112cb6a3043616b430e77f08086125df4206a9d25d126e852"
     },
     "cuda/decode_balanced_bf16_hd64/sm_103a/default.cu": {
-      "bytes": 144020,
-      "sha256": "16b164686c4a1ca56289e75664bf6b4817a1406fcfc99ff6892be16dc094c96a"
+      "bytes": 149607,
+      "sha256": "dd0d8a23e07e4d36d9d1c32ce7ca0eb132208590fc5695a956d7f6d20d63479f"
     },
     "cuda/decode_balanced_bf16_hd64_g16/sm_100a/default.cu": {
-      "bytes": 145973,
-      "sha256": "0aa5af85e4d9ef9c69222b9a4e090f28b5d757a1f6b3487812046339e7c8dccf"
+      "bytes": 151560,
+      "sha256": "c3959dbfc6450a4f05503c28464453082670c1141eac27841f2187b45695ff26"
     },
     "cuda/decode_balanced_bf16_hd64_g16/sm_103a/default.cu": {
-      "bytes": 145876,
-      "sha256": "d9328399825e115ff9dfbe541042ac12130da79dfab0fb9aaf38b7add02c6783"
+      "bytes": 151463,
+      "sha256": "25cb0d20e6c28556a2219862edb9811497ccc8461997683467e0dd75dfe9728f"
     },
     "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu": {
       "bytes": 213603,
@@ -4514,8 +4514,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "bc086537a5380526fd0e73e243a12f35d24e124fa668ea5678e283913e8bf5b5",
-            "sm_103a": "16b164686c4a1ca56289e75664bf6b4817a1406fcfc99ff6892be16dc094c96a"
+            "sm_100a": "25d1b340a8d12fa112cb6a3043616b430e77f08086125df4206a9d25d126e852",
+            "sm_103a": "dd0d8a23e07e4d36d9d1c32ce7ca0eb132208590fc5695a956d7f6d20d63479f"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu",
@@ -4628,8 +4628,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "0aa5af85e4d9ef9c69222b9a4e090f28b5d757a1f6b3487812046339e7c8dccf",
-            "sm_103a": "d9328399825e115ff9dfbe541042ac12130da79dfab0fb9aaf38b7add02c6783"
+            "sm_100a": "c3959dbfc6450a4f05503c28464453082670c1141eac27841f2187b45695ff26",
+            "sm_103a": "25cb0d20e6c28556a2219862edb9811497ccc8461997683467e0dd75dfe9728f"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd64_g16/sm_100a/default.cu",
