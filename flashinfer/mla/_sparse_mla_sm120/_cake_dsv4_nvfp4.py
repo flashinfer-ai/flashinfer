@@ -150,14 +150,19 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
       least 8 chunks; H >= 96 pairs only with at least 16 chunks at
       ``ctas >= SMs / 3``.
 
-    GB10 (SM121, 48 SMs; ``num_sms < 64``) differs only at a full wave with two
+    GB10 (SM121, 48 SMs; ``num_sms < 64``) differs at a full wave with two
     chunks: a two-chunk CTA gathers too little to pay for the doubled serial MMA
     of two tiles once the one-tile grid is more than two waves (H = 64 and
     H = 128 at 32 tokens: one tile 2-3 % faster), while up to two waves the
     pair still folds the partial second wave into one resident wave (H = 128 at
     8 tokens: 1.04-1.07x) and H = 32 always pairs because one CTA then covers
-    the token's whole head set (1.05-1.07x).  Rows with >= 4 chunks pair at a
-    full wave on both; the sub-wave rules are the same on both.
+    the token's whole head set (1.05-1.07x); beyond eight one-tile waves the
+    pair wins again (H = 64 at 128 tokens 1.04-1.05x, H = 128 flat), so the
+    one-tile band is ``2 waves < ctas <= 8 waves``.  Rows with >= 4 chunks
+    pair at a full wave on both.  Sub-wave, the H = 64 band is inclusive at
+    ``ctas == 2/3 SMs`` on GB10 (32 CTAs of 8 chunks: two tiles 1.03-1.04x;
+    GB202 never lands exactly on 2/3 of its SM count); every other sub-wave
+    rule is the same on both.
 
     Head counts not divisible by 32 have no two-tile instance.
 
@@ -189,12 +194,13 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
         return 1
     ctas = int(num_tokens) * (num_heads // hpb)
     chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    small_die = num_sms < _SMALL_DIE_SMS
     if ctas >= num_sms:
         if (
-            num_sms < _SMALL_DIE_SMS
+            small_die
             and chunks <= 2
             and num_heads > 2 * hpb
-            and ctas > 2 * num_sms
+            and 2 * num_sms < ctas <= 8 * num_sms
         ):
             return 1
         return 2
@@ -203,7 +209,8 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
     if num_heads == 2 * hpb:
         return 2 if ctas >= two_thirds or (chunks >= 8 and ctas >= third) else 1
     if num_heads == 4 * hpb:
-        return 2 if chunks >= 8 and third <= ctas < two_thirds else 1
+        upper = ctas < two_thirds or (small_die and ctas == two_thirds)
+        return 2 if chunks >= 8 and third <= ctas and upper else 1
     return 2 if chunks >= 16 and ctas >= third else 1
 
 
