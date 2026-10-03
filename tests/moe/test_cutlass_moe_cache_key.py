@@ -60,7 +60,10 @@ def _runner(runner_cls, **parallel):
     return runner_cls(**kwargs)
 
 
-@pytest.mark.parametrize("size,rank", [("tp_size", "tp_rank"), ("ep_size", "ep_rank")])
+@pytest.mark.parametrize(
+    "size,rank",
+    [("tp_size", "tp_rank"), ("ep_size", "ep_rank"), ("cluster_size", "cluster_rank")],
+)
 def test_cutlass_moe_cache_key_is_rank_invariant(moe_runner_cls, size, rank):
     """Ranks tuned together must share persisted tactics: a cache hit skips the
     set_autotune_process_group reduce, so a rank-specific key made only the rank
