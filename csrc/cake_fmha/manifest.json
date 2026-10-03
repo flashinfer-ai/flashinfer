@@ -1820,6 +1820,10 @@
       "bytes": 3018,
       "sha256": "0f65e26dc0d9d3279704edcc40be70a5b34a735e724473de9d2c3aec1704566d"
     },
+    "bindings/cake_fmha_decode_balanced_bf16_hd64_g16_binding.cu": {
+      "bytes": 3034,
+      "sha256": "57296a766027e90d8147d57bd0fd91b4f7f17bfeb83a1957e56f50201df19ff2"
+    },
     "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu": {
       "bytes": 2917,
       "sha256": "ded98975f79549a3f102998c2c019f8e1aeb00ecfaf55231e8bc3444700310c0"
@@ -2185,12 +2189,20 @@
       "sha256": "0e5951bb89fa8b4990843bef3b181ea06e99875e5e324aa0dc2f79582a73ebab"
     },
     "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu": {
-      "bytes": 143420,
-      "sha256": "da971cd589af26fb18c070a6e30a6421cd6946cd6cccc0684498a9a32dae11de"
+      "bytes": 141569,
+      "sha256": "4587cde79db5bbfd5884d2ff2c65d6a4f5db3ceb257fd49224c1676262cd320e"
     },
     "cuda/decode_balanced_bf16_hd64/sm_103a/default.cu": {
-      "bytes": 143323,
-      "sha256": "fac8adefa8594693ef2de7b1430cb5f2ece91e5e89b78fc9feeacde05b65207e"
+      "bytes": 141472,
+      "sha256": "26ee0222366e17269e5c22217bb419e589fca2bfd379dfbd4b25dd62501fa073"
+    },
+    "cuda/decode_balanced_bf16_hd64_g16/sm_100a/default.cu": {
+      "bytes": 143424,
+      "sha256": "576f7f813d0dc5b5cd41a8668ffad78a3871bbc733c5a8a95ef93e072e4c1ec2"
+    },
+    "cuda/decode_balanced_bf16_hd64_g16/sm_103a/default.cu": {
+      "bytes": 143327,
+      "sha256": "8e4e33cd2326da4efc72615c07375ce88ace006fa894a37381cedf42b99bbfb1"
     },
     "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu": {
       "bytes": 213603,
@@ -2565,8 +2577,8 @@
       "sha256": "14388bf51cabd8e32ba47fe6f1d767b55f716795a80246fa33e95f1148059f72"
     },
     "include/cake_fmha.h": {
-      "bytes": 23389,
-      "sha256": "43e3a3c82819e21d304f97e57a9dec35c61a2d4bd37798ee42a9e271cd5b99c6"
+      "bytes": 24016,
+      "sha256": "d23ca8569b1471d19719bb79f125e634adb0cc6f2300474d4df43407f6bf3645"
     },
     "include/cake_fmha_hd256_support.h": {
       "bytes": 1964,
@@ -4502,12 +4514,126 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "da971cd589af26fb18c070a6e30a6421cd6946cd6cccc0684498a9a32dae11de",
-            "sm_103a": "fac8adefa8594693ef2de7b1430cb5f2ece91e5e89b78fc9feeacde05b65207e"
+            "sm_100a": "4587cde79db5bbfd5884d2ff2c65d6a4f5db3ceb257fd49224c1676262cd320e",
+            "sm_103a": "26ee0222366e17269e5c22217bb419e589fca2bfd379dfbd4b25dd62501fa073"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu",
             "sm_103a": "cuda/decode_balanced_bf16_hd64/sm_103a/default.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_balanced_bf16_hd64_g16": {
+      "binding_sha256": "57296a766027e90d8147d57bd0fd91b4f7f17bfeb83a1957e56f50201df19ff2",
+      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_g16_binding.cu",
+      "dynamic_shared_memory_bytes": 159232,
+      "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64_g16",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "group_ratio"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16_hd64_g16",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "576f7f813d0dc5b5cd41a8668ffad78a3871bbc733c5a8a95ef93e072e4c1ec2",
+            "sm_103a": "8e4e33cd2326da4efc72615c07375ce88ace006fa894a37381cedf42b99bbfb1"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_bf16_hd64_g16/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_hd64_g16/sm_103a/default.cu"
           }
         }
       ],
@@ -8488,7 +8614,11 @@
       "components": [
         {
           "component": "decode_balanced_bf16_hd64",
-          "condition": "always"
+          "condition": "num_qo_heads // num_kv_heads <= 8"
+        },
+        {
+          "component": "decode_balanced_bf16_hd64_g16",
+          "condition": "9 <= num_qo_heads // num_kv_heads <= 16"
         }
       ],
       "standalone_ready": true,
