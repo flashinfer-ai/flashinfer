@@ -427,12 +427,11 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
 
         ``target`` selects the route relative to the calling section:
         ``"head"`` is this instance's HEAD route, ``"first_loop"`` the route of
-        LOOP iteration 0 (called from HEAD), ``"current_loop"`` the route of
-        the calling LOOP iteration (no pipelining), and ``"next_loop"`` the
-        route of the following LOOP iteration. Only the lane-distributed load is issued
+        LOOP iteration 0 (called from HEAD), and ``"next_loop"`` the route of
+        the following LOOP iteration. Only the lane-distributed load is issued
         here; the warp broadcasts happen in ``resolve_route`` so the global
-        memory latency overlaps the TMA issue of the current route instead of
-        stalling the load warp. Layouts without one-warp transport keep their
+        memory latency overlaps the load warp's TMA issue in between instead of
+        stalling it. Layouts without one-warp transport keep their
         loads in ``resolve_route`` and get placeholder values here.
         """
 
@@ -442,10 +441,6 @@ class SmemBlockSparseKvMetadataResource(DecodeGenResourceBase):
             route_idx = Int32(self.inst_id)
         elif cutlass.const_expr(target == "first_loop"):
             route_idx = num_insts + Int32(self.inst_id)
-        elif cutlass.const_expr(target == "current_loop"):
-            route_idx = (stage_info.loop_offset + Int32(1)) * num_insts + Int32(
-                self.inst_id
-            )
         else:
             route_idx = (stage_info.loop_offset + Int32(2)) * num_insts + Int32(
                 self.inst_id

@@ -1083,36 +1083,36 @@ class DecodeGenTask(Task):
 # Dense paged-KV consumes page offsets produced by PageTableTask. Sparse
 # paged-KV instead consumes physical page IDs retained with its prepared route.
 # ======================================================================
-def _resolve_and_store_sparse_route(
+def _prefetch_sparse_route(
     sparse_kv_metadata: MemoryResource | None,
-    section: FmhaStage,
-    prefetch: tuple[Any, Any] | None = None,
-    *,
-    pipeline: bool = True,
-) -> tuple[tuple[Any, Any, Any, Any] | None, tuple[Any, Any] | None]:
-    """Resolve one prepared route and retain it for the matching K/V pair.
+    target: str,
+) -> tuple[Any, Any] | None:
+    """Issue one prepared route-record load; dense profiles get ``None``.
 
-    Returns ``(route, prefetch)``. With ``pipeline`` the record load is issued
-    one resolution ahead: HEAD loads its own record immediately, and every
-    resolution issues the load for the next one (LOOP iteration 0 from HEAD,
-    iteration i + 1 from iteration i) before the caller's K TMA burst, so the
-    global-memory latency overlaps that issue instead of stalling the load
-    warp. Callers pass the returned ``prefetch`` back into the next resolution
-    of the same instance, the way ``_staged_kv_load`` threads its cached page
-    IDs. Without ``pipeline`` the record is loaded where it is resolved and no
-    state is returned; the split-ring load variants use this because the
-    pipelined form measured slower for them. Dense profiles pass ``None`` and
-    get ``(None, None)``.
+    Route records are loaded one resolution ahead so their global-memory
+    latency overlaps other load-warp work instead of stalling it. Callers
+    pass the result to the instance's next ``_resolve_and_store_sparse_route``,
+    the way ``_staged_kv_load`` threads its cached page IDs.
     """
 
     if sparse_kv_metadata is None:
-        return None, None
-    if not pipeline:
-        prefetch = sparse_kv_metadata.prefetch_route(
-            target="head" if section == FmhaStage.Head else "current_loop"
-        )
-    elif section == FmhaStage.Head:
-        prefetch = sparse_kv_metadata.prefetch_route(target="head")
+        return None
+    return sparse_kv_metadata.prefetch_route(target=target)
+
+
+def _resolve_and_store_sparse_route(
+    sparse_kv_metadata: MemoryResource | None,
+    section: FmhaStage,
+    prefetch: tuple[Any, Any] | None,
+) -> tuple[Any, Any, Any, Any] | None:
+    """Resolve one prepared route and retain it for the matching K/V pair.
+
+    ``prefetch`` is the record load issued earlier by
+    ``_prefetch_sparse_route``. Dense profiles pass ``None`` and get ``None``.
+    """
+
+    if sparse_kv_metadata is None:
+        return None
     assert prefetch is not None
     prefetched_record_word, prefetched_record_offset = prefetch
     (
@@ -1131,18 +1131,12 @@ def _resolve_and_store_sparse_route(
         resolved_atom_validity=resolved_atom_validity,
         route_record_word_offset=route_record_word_offset,
     )
-    next_prefetch = None
-    if pipeline:
-        next_prefetch = sparse_kv_metadata.prefetch_route(
-            target="first_loop" if section == FmhaStage.Head else "next_loop"
-        )
-    route = (
+    return (
         resolved_record_word,
         resolved_origin1,
         resolved_atom_validity,
         route_record_word_offset,
     )
-    return route, next_prefetch
 
 
 def _publish_sparse_softmax_route(
@@ -1240,7 +1234,15 @@ def create_load_task(
             "load_k1": (sparse_kv_metadata1, sparse_softmax_metadata1),
         }
 
-        # HEAD: load Q once, then prefetch K for each active instance.
+        # HEAD: issue every instance's route-record load before Q, so their
+        # global-memory latency overlaps the wait for the previous work tile
+        # to release Q and the Q load itself. Dense profiles have no route
+        # metadata: the prefetch, resolve and publish helpers are no-ops for
+        # ``None`` resources, so one cadence serves dense and block-sparse loads.
+        prefetch_by_label = {
+            label: _prefetch_sparse_route(route_metadata_by_label[label][0], "head")
+            for label in head_labels
+        }
         smem_q.acquire()
         smem_q.tma_load()
         smem_q.commit()
@@ -1253,19 +1255,17 @@ def create_load_task(
                 smem_page_offsets.wait()
             else:
                 _page_offsets_consume(smem_page_offsets)
-        # Dense profiles have no route metadata: the resolve and publish
-        # helpers are no-ops for ``None`` resources, so one cadence serves
-        # both dense and block-sparse loads.
-        prefetch_by_label = {}
         head_routes = []
         for label in head_labels:
             kv_metadata, softmax_metadata = route_metadata_by_label[label]
-            route, prefetch_by_label[label] = _resolve_and_store_sparse_route(
-                kv_metadata, FmhaStage.Head
+            route = _resolve_and_store_sparse_route(
+                kv_metadata, FmhaStage.Head, prefetch_by_label[label]
             )
+            # Each resolution issues its successor's record load ahead of its
+            # K copies, which gives the load the longest lead time.
+            prefetch_by_label[label] = _prefetch_sparse_route(kv_metadata, "first_loop")
             _kv_load(label, FmhaStage.Head)
-            if route is not None:
-                head_routes.append((softmax_metadata, route))
+            head_routes.append((softmax_metadata, route))
         # Issue all K tiles before a metadata FIFO can backpressure the load warp.
         for softmax_metadata, route in head_routes:
             _publish_sparse_softmax_route(softmax_metadata, route)
@@ -1282,20 +1282,21 @@ def create_load_task(
             loop_labels = ("load_k0", "load_v0", "load_k1", "load_v1")
         with domain_loop(0, domain, 1, unroll=1):
             # Generic V-first profiles consume their retained route before the
-            # matching K label replaces it.
-            loop_routes = []
+            # matching K label replaces it. Each route goes to its Softmax
+            # consumer right after its own K issue instead of waiting for the
+            # other instance's loads.
             for label in loop_labels:
                 kv_metadata, softmax_metadata = route_metadata_by_label.get(
                     label, (None, None)
                 )
-                route, prefetch_by_label[label] = _resolve_and_store_sparse_route(
+                route = _resolve_and_store_sparse_route(
                     kv_metadata, FmhaStage.Loop, prefetch_by_label.get(label)
                 )
+                prefetch_by_label[label] = _prefetch_sparse_route(
+                    kv_metadata, "next_loop"
+                )
                 _kv_load(label, FmhaStage.Loop)
-                if route is not None:
-                    loop_routes.append((softmax_metadata, route))
-            for sparse_softmax_metadata, route in loop_routes:
-                _publish_sparse_softmax_route(sparse_softmax_metadata, route)
+                _publish_sparse_softmax_route(softmax_metadata, route)
 
         # TAIL: load the final V tile for each active instance's last BMM2.
         for label in tail_labels:
@@ -1765,6 +1766,14 @@ def create_load_task_split_kv(
             if not hold_page_window:
                 _page_offsets_release(offsets)
 
+        # Issue every instance's HEAD route-record load before Q, so their
+        # global-memory latency overlaps the wait for the previous work tile
+        # to release Q and the Q load itself.
+        prefetch_by_label = {
+            load_k: _prefetch_sparse_route(sparse_kv_metadata, "head")
+            for smem_k, _, sparse_kv_metadata, _, load_k, _ in active_instances
+            if smem_k is not None
+        }
         if smem_q is not None:
             smem_q.acquire()
             smem_q.tma_load()
@@ -1786,8 +1795,8 @@ def create_load_task_split_kv(
         ) in active_instances:
             if smem_k is None:
                 continue
-            route, _ = _resolve_and_store_sparse_route(
-                sparse_kv_metadata, FmhaStage.Head, pipeline=False
+            route = _resolve_and_store_sparse_route(
+                sparse_kv_metadata, FmhaStage.Head, prefetch_by_label[load_k]
             )
             load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Head)
             head_routes.append((sparse_softmax_metadata, route))
@@ -1795,10 +1804,21 @@ def create_load_task_split_kv(
         # backpressure. A per-instance task naturally stages its sole route.
         for sparse_softmax_metadata, route in head_routes:
             _publish_sparse_softmax_route(sparse_softmax_metadata, route)
+        # Successor record loads go out after the K copies and the route
+        # publish, here and in the loop. Queued ahead of the copies, a record
+        # load delays the shared-memory reads of the route origins that feed
+        # their coordinates, and with them the work tile's first K tiles and
+        # Softmax routes.
+        prefetch_by_label = {
+            load_k: _prefetch_sparse_route(sparse_kv_metadata, "first_loop")
+            for smem_k, _, sparse_kv_metadata, _, load_k, _ in active_instances
+            if smem_k is not None
+        }
 
         with domain_loop(0, domain, 1, unroll=1):
             # V consumes the retained route before the next K overwrites it.
-            loop_routes = []
+            # Each route goes to its Softmax consumer right after its own K
+            # issue instead of waiting for the other instance's loads.
             for (
                 smem_k,
                 smem_v,
@@ -1816,13 +1836,14 @@ def create_load_task_split_kv(
                     smem_page_offsets_v_local,
                     FmhaStage.Loop,
                 )
-                route, _ = _resolve_and_store_sparse_route(
-                    sparse_kv_metadata, FmhaStage.Loop, pipeline=False
+                route = _resolve_and_store_sparse_route(
+                    sparse_kv_metadata, FmhaStage.Loop, prefetch_by_label[load_k]
                 )
                 load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Loop)
-                loop_routes.append((sparse_softmax_metadata, route))
-            for sparse_softmax_metadata, route in loop_routes:
                 _publish_sparse_softmax_route(sparse_softmax_metadata, route)
+                prefetch_by_label[load_k] = _prefetch_sparse_route(
+                    sparse_kv_metadata, "next_loop"
+                )
 
         for _, smem_v, _, _, _, load_v in active_instances:
             if smem_v is not None:
