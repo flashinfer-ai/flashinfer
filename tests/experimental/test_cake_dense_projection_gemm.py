@@ -2195,11 +2195,12 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
 def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
     if not _device_supported():
         pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
-    # a 24-tile swapped weight gradient (N = 32, K = 3072, T = 1001): stream-K "auto" two-part split with the
-    # deterministic in-kernel fixup.  The round-9 rules route the GLM small-N weight gradients to whole tiles on
-    # sm_100a (64-row family: 48 tiles, which 74 pairs cannot split), so the split is pinned on a half-width
-    # synthetic row with whichever of the 64-row / 128-row instances this device's export registered (both plan
-    # 24 pair tiles)
+    # a swapped weight gradient on a half-width synthetic row (N = 32, K = 3072, T = 1001): stream-K "auto"
+    # two-part split of a single partial wave with the deterministic in-kernel fixup.  The round-9 rules route
+    # the GLM small-N weight gradients to whole tiles on sm_100a (64-row family: 48 tiles, which 74 pairs cannot
+    # split), so the split is pinned on this row with whichever of the 64-row / 128-row instances this device's
+    # export registered: the 64-row instance plans 24 pair tiles of 128 rows (sm_100a), the 128-row instance 12
+    # pair tiles of 256 rows (sm_107a); the expectation follows the registered instance's tile height.
     device = torch.device("cuda")
     g = torch.Generator(device=device).manual_seed(SEED + 3)
     T, K, N = 1001, 3072, 32
@@ -2209,9 +2210,18 @@ def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
     v = dict(A=X.t(), B=G, out=out, transposed=True)
     knobs = _registered_knobs(v, dict(cta_rows=64), dict(cta_rows=128))
     prepared = prepare_projection_wgrad(G, X, out, **knobs)
-    assert prepared.plan.transposed_out and prepared.plan.pair_tiles == 24
-    if prepared.plan.sm_pairs >= 48:
-        assert (prepared.plan.tail_tiles, prepared.plan.sk_units) == (24, 48)
+    pair_tiles = prepared.plan.M // (
+        2 * prepared.plan.cta_rows
+    )  # 24 (64-row instance) or 12 (128-row instance)
+    assert prepared.plan.transposed_out and pair_tiles in (12, 24)
+    assert prepared.plan.pair_tiles == pair_tiles
+    if (
+        prepared.plan.sm_pairs >= 2 * pair_tiles
+    ):  # one partial wave whose halves fit the pairs: every tile in two parts
+        assert (prepared.plan.tail_tiles, prepared.plan.sk_units) == (
+            pair_tiles,
+            2 * pair_tiles,
+        )
     first = prepared.launch().clone()
     torch.cuda.synchronize()
     _check(out.t(), torch.matmul(X.t().double(), G.double()))
