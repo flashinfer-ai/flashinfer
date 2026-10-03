@@ -1,5 +1,6 @@
 """Trace tests for TRT-LLM Gen MXFP8 block-scale MoE."""
 
+import pytest
 import torch
 
 
@@ -195,3 +196,62 @@ def test_mxfp8_moe_trace_reference_applies_swiglu_oa_params():
     torch.testing.assert_close(routed_oa_out, oa_out, atol=1e-2, rtol=1e-2)
     assert not torch.allclose(default_out, clamp_only_out, atol=1e-2, rtol=1e-2)
     assert not torch.allclose(default_out, oa_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("limit", [0.25, 7.0, 16.0])
+def test_mxfp8_step_trace_serialized_reference(limit):
+    from flashinfer import ActivationType
+    from flashinfer.fused_moe.core import Fp8QuantizationType
+    from flashinfer.fused_moe import (
+        trtllm_fp8_block_scale_moe,
+        trtllm_fp8_block_scale_routed_moe,
+    )
+
+    kwargs = _make_identity_mxfp8_inputs()
+    hidden = kwargs.pop("hidden_states_bf16")
+    hidden[:, 0] = torch.tensor([-32.0, -8.0, 8.0, 32.0])
+    hidden[:, 1] = torch.tensor([32.0, 7.0, 1.0, -1.0])
+    kwargs.update(
+        hidden_states=hidden.to(torch.float8_e4m3fn),
+        hidden_states_scale=torch.full((4, 4), 127, dtype=torch.uint8),
+        gemm1_weights_scale=torch.full((1, 256, 4), 127, dtype=torch.uint8),
+        gemm2_weights_scale=torch.full((1, 128, 4), 127, dtype=torch.uint8),
+        intermediate_size=128,
+        local_num_experts=1,
+        routing_method_type=0,
+        routed_scaling_factor=None,
+        fp8_quantization_type=Fp8QuantizationType.MxFp8.value,
+        activation_type=ActivationType.SwigluStep.value,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=torch.tensor([limit]),
+    )
+    expected = torch.zeros_like(hidden)
+    expected[:, 0] = (
+        torch.nn.functional.silu(hidden[:, 1].float()).clamp(max=limit)
+        * hidden[:, 0].float().clamp(-limit, limit)
+    ).to(hidden.dtype)
+    for api, name in (
+        (
+            trtllm_fp8_block_scale_moe,
+            "_trtllm_fp8_block_scale_moe_default_routing_reference",
+        ),
+        (
+            trtllm_fp8_block_scale_routed_moe,
+            "_trtllm_fp8_block_scale_routed_moe_reference",
+        ),
+    ):
+        case = dict(kwargs)
+        if api is trtllm_fp8_block_scale_routed_moe:
+            case.pop("routing_logits")
+            case["topk_ids"] = torch.full((4, 1), 0x3F80, dtype=torch.int32)
+        definition = api.fi_trace(**case)
+        assert "swiglu_step" in definition["name"]
+        assert definition["inputs"]["hidden_states_scale"]["shape"] == [
+            "seq_len",
+            "num_hidden_blocks",
+        ]
+        namespace = {}
+        exec(definition["reference"], namespace)  # noqa: S102
+        actual = namespace[name](**case)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

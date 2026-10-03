@@ -956,6 +956,10 @@ class TestTypedActivationConfig:
         from flashinfer.fused_moe.prepare import _activation_param_view
 
         assert _activation_param_view(SwiGLU(), 3, torch.device("cpu")) == {}
+        assert _activation_param_view(SwiGLUStep(), 3, torch.device("cpu")) == {}
+        step = _activation_param_view(SwiGLUStep(limit=16.0), 3, torch.device("cpu"))
+        assert set(step) == {"gemm1_clamp_limit"}
+        torch.testing.assert_close(step["gemm1_clamp_limit"], torch.full((3,), 16.0))
         view = _activation_param_view(
             SwiGLU(alpha=1.7, beta=0.25, limit=6.0),
             3,
@@ -1178,7 +1182,9 @@ class TestTypedActivationConfig:
         assert SwiGLUStep().limit == 7.0
 
 
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize(
+    "activation", (SwiGLU(), SwiGLUStep(), SwiGLUStep(limit=16.0), ReLU2())
+)
 def test_trtllm_bf16_preparation_shapes_for_declared_activations(activation):
     experts, hidden, intermediate = 2, 128, 128
     rows = intermediate * (2 if activation.is_gated else 1)
@@ -1196,7 +1202,9 @@ def test_trtllm_bf16_preparation_shapes_for_declared_activations(activation):
     assert view["gemm2_weights"].numel() == experts * hidden * intermediate
 
 
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize(
+    "activation", (SwiGLU(), SwiGLUStep(), SwiGLUStep(limit=16.0), ReLU2())
+)
 def test_trtllm_fp8_per_tensor_preparation_shapes_for_declared_activations(
     activation,
 ):
@@ -1418,21 +1426,34 @@ class TestMoERunnerSupport:
             SiTU,
         )
         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
-            (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+            (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+                SwiGLU,
+                SwiGLUStep,
+                GeGLU,
+                SiTU,
+                ReLU2,
+            ),
             (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
             (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
         }
         assert TrtllmBf16RoutedRunner.supported_activation_classes == (
             SwiGLU,
+            SwiGLUStep,
             ReLU2,
         )
         assert TrtllmFp8PerTensorRunner.supported_activation_classes == (
             SwiGLU,
+            SwiGLUStep,
             ReLU2,
         )
         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
             (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
-            (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): (
+                SwiGLU,
+                SwiGLUStep,
+                GeGLU,
+                ReLU2,
+            ),
         }
         assert TrtllmMxInt4RoutedRunner.supported_activation_classes == (SwiGLU,)
 
@@ -1445,6 +1466,23 @@ class TestMoERunnerSupport:
         )
         base.update(overrides)
         return MoEConfig(**base)
+
+    def test_trtllm_fp4_step_supports_per_token_scaling(self, monkeypatch):
+        """The Step export includes BF16 FC1 outputs for per-token NVFP4."""
+        import flashinfer.utils as utils
+
+        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+        runner.config = self._nvfp4_swiglu(
+            activation=SwiGLUStep(7),
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                per_token_scale=True,
+            ),
+        )
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
+        runner.check_support()
 
     @pytest.mark.parametrize(
         ("compute_capability", "supported"),
@@ -3723,6 +3761,9 @@ class TestTrtllmFp4UnpackedContract:
         "activation",
         [
             pytest.param(SwiGLU(), id="swiglu"),
+            pytest.param(SwiGLUStep(), id="swiglu-step"),
+            pytest.param(SwiGLUStep(limit=16.0), id="swiglu-step-16"),
+            pytest.param(SwiGLUStep(limit=0.25), id="swiglu-step-025"),
             pytest.param(ReLU2(), id="relu2"),
         ],
     )
@@ -3742,6 +3783,10 @@ class TestTrtllmFp4UnpackedContract:
             use_per_token_activation=True,
             use_nontrivial_alphas=False,
         )
+        if isinstance(activation, SwiGLUStep):
+            # Exercise clipping while keeping identical quantized payloads.
+            tensors["x_per_token_scale"] *= 64.0
+            tensors["x_ref"] *= 64.0
         config = MoEConfig(
             routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
             quant=QuantConfig(
@@ -3774,6 +3819,13 @@ class TestTrtllmFp4UnpackedContract:
             activation=activation,
             device=device,
         )
+        if isinstance(activation, SwiGLUStep):
+            # Cover physical limits with both global and per-token dequantization.
+            # Preparation can share the default scale tensor with FC2.
+            for key in ("output1_scale_scalar", "output1_scale_gate_scalar"):
+                prepared_weights[key] = torch.full_like(prepared_weights[key], 2.0)
+            if "gemm1_clamp_limit" in prepared_weights:
+                prepared_weights["gemm1_clamp_limit"] /= 2.0
         fc1_size = intermediate_size * (2 if activation.is_gated else 1)
         assert prepared_weights["gemm1_weights"].shape == (
             num_experts,
@@ -3806,7 +3858,7 @@ class TestTrtllmFp4UnpackedContract:
             hidden_states=tensors["x_ref"],
             gemm1_weights=tensors["w1_weight_bf16"],
             gemm2_weights=tensors["w2_weight_bf16"],
-            gemm1_alpha=ones,
+            gemm1_alpha=ones * 2.0 if isinstance(activation, SwiGLUStep) else ones,
             gemm2_alpha=ones,
             token_selected_experts=act_pack.topk_ids,
             token_final_scales=act_pack.topk_weights,
@@ -3818,6 +3870,9 @@ class TestTrtllmFp4UnpackedContract:
             fc2_input_scale=tensors["fc2_input_scale"],
             use_per_token_activation=True,
             activation_type=activation.type,
+            swiglu_limit=activation.limit
+            if isinstance(activation, SwiGLUStep)
+            else None,
         )
         passed, pct, atol = check_accuracy(eager, reference)
         assert passed, (

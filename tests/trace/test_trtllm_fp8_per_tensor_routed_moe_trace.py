@@ -1,6 +1,7 @@
 """Trace tests for routed TRT-LLM FP8 per-tensor-scale MoE."""
 
 import torch
+import pytest
 
 
 def _trace_kwargs():
@@ -77,3 +78,45 @@ def test_fp8_per_tensor_routed_moe_trace_reference_unpacks_routing():
         [[0.25 * sigmoid_1], [1.5 * sigmoid_2]], dtype=torch.bfloat16
     )
     torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.parametrize(
+    "custom_limits", [False, True], ids=["default-7", "mixed-7-16"]
+)
+def test_fp8_step_serialized_trace_keeps_nonunit_raw_limits(custom_limits):
+    from flashinfer import ActivationType
+    from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_routed_moe
+
+    kwargs = _trace_kwargs()
+    kwargs.update(
+        activation_type=ActivationType.SwigluStep.value,
+        gemm1_weights=torch.tensor(
+            [[[32.0], [16.0]], [[-8.0], [8.0]]], dtype=torch.float8_e4m3fn
+        ),
+        output1_scales_gate_scalar=torch.tensor([0.5, 2.0]),
+        output1_scales_scalar=torch.tensor([0.25, 3.0]),
+        output2_scales_scalar=torch.tensor([2.0, 0.5]),
+    )
+    physical_limits = torch.tensor([7.0, 16.0] if custom_limits else [7.0, 7.0])
+    gate_scale = kwargs["output1_scales_gate_scalar"]
+    raw_limits = physical_limits / gate_scale
+    kwargs["gemm1_clamp_limit"] = raw_limits if custom_limits else None
+    definition = trtllm_fp8_per_tensor_scale_routed_moe.fi_trace(**kwargs)
+    assert definition["inputs"]["gemm1_clamp_limit"]["optional"] is True
+    namespace = {}
+    exec(definition["reference"], namespace)  # noqa: S102
+    actual = namespace["_trtllm_fp8_per_tensor_scale_routed_moe_reference"](**kwargs)
+    up = torch.tensor([32.0, -8.0]).clamp(min=-raw_limits, max=raw_limits)
+    gate = torch.nn.functional.silu(torch.tensor([16.0, 8.0]) * gate_scale).clamp(
+        max=physical_limits
+    )
+    expected = (
+        up
+        * gate
+        * kwargs["output1_scales_scalar"]
+        * kwargs["output2_scales_scalar"]
+        * torch.tensor([0.25, 0.75])
+    )
+    torch.testing.assert_close(
+        actual[:, 0], expected.to(torch.bfloat16), rtol=0, atol=0
+    )
