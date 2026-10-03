@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from pathlib import Path
 
 import pytest
@@ -59,21 +60,30 @@ def _decode(**overrides):
     return cake_gdn.select_cake_gdn_decode_variant(**params)
 
 
-def test_manifest_is_consistent_and_source_only() -> None:
-    # Check the manifest's own bookkeeping instead of pinning row counts:
-    # every promoted row lands here, so literal counts break on each export.
+def test_manifest_lists_loadable_source_only_variants() -> None:
+    # The manifest is the only registry: every variant names one kernel source
+    # (shared with the other specializations of the same body), the -D defines
+    # that specialize it, and one host shim.  Nothing is pinned by checksum.
     manifest = cake_gdn._manifest()
-    assert manifest["contract_row_count"] == len(manifest["contract_rows"]) > 0
-    assert manifest["architecture_row_count"] == manifest["contract_row_count"] * len(
-        manifest["architectures"]
-    )
-    assert manifest["architecture_row_count"] == (
-        manifest["admitted_architecture_rows"]
-        + manifest["fail_closed_architecture_rows"]
-    )
-    assert manifest["variant_count"] == len(manifest["variants"]) > 0
+    root = cake_gdn._source_dir()
+    variants = manifest["variants"]
+    assert len(variants) > 0
+    assert len({record["name"] for record in variants}) == len(variants)
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
+    assert "sha256" not in json.dumps(manifest)
+    architectures = set(manifest["architectures"])
+    for header in manifest["cuda_headers"]:
+        assert (root / header["path"]).is_file()
+    for record in variants:
+        (output,) = record["outputs"]
+        assert set(output["architectures"]) <= architectures
+        assert (root / output["path"]).is_file()
+        assert (root / record["host_binding"]["path"]).is_file()
+        for key, value in record["defines"].items():
+            assert key.isidentifier()
+            assert isinstance(value, str) and value
+        assert set(record["defines"]) <= set(record["specializations"])
 
 
 def test_prefill_resolver_selects_dvsplit_full_and_single_chunk() -> None:
