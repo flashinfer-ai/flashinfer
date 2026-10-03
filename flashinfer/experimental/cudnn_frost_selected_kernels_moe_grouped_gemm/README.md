@@ -811,12 +811,15 @@ cluster or TMA-store variant. Its families sit next to the SM107 ones as
 `sm120_cudnn_frost_*_bf16_normal_stg.py`, and its artifact ids start with
 `sm120_cudnn_frost_`; manifest and shortlist records carry `arch: sm_120a`.
 
-The sources are exported from cuDNN Frontend `c132d859`. Its SM120 host zeroes
+The sources are exported from cuDNN Frontend `a74b1b21`. Its SM120 host zeroes
 the scheduler counter with a one-thread kernel before the PDL main launch, as
 the SM100 MoE hosts do; earlier SM120 producers relied on the in-process cuDNN
 Frost launcher for that reset, which the FlashInfer adapter does not run. Like
 the SM107 sources, its scheduler takes `G+1` explicit group boundaries (launch
-ABI `v2`).
+ABI `v2`). The producer warpgroup (the TMA, scheduler and donor warps after the
+eight compute warps) releases its registers with one warpgroup-uniform
+`setmaxnreg` before the per-warp roles diverge, as the `.aligned` PTX
+instruction requires; the kernel body is otherwise that of `c132d859`.
 
 Admission, token-count shortlists, the native routing/finalize adapter and the
 MoELayer integration are shared with SM107a; the adapter is compiled with the

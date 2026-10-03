@@ -277,11 +277,11 @@ NUM_WARPS = threads_per_cta // 32
 NUM_SCHED_CONSUMER_WARPS = NUM_COMPUTE_WARPS + 1
 
 EPI_REG_COUNT = 232
+# One budget for the whole producer warpgroup (TMA, scheduler and donor warps).
+# PTX setmaxnreg is .sync.aligned over the warpgroup: it is issued once, before
+# the per-warp roles diverge, so the count cannot differ per warp.
 PROD_REG_COUNT = 24
-# The scheduler warp runs the group prefix scan (a few more live values than
-# the dense kernel's CLC loop); still well inside the budget the 8 compute
-# warps' increase leaves over.
-SCHED_REG_COUNT = 40
+assert NUM_COMPUTE_WARPS % 4 == 0, "the producer warps must form whole warpgroups"
 
 # ---------------------------------------------------------------------------
 # Geometry derived from the injected tile constants (all plain Python ints —
@@ -519,13 +519,19 @@ def frost_template_kernel(
     tiles_along_n = cute.ceil_div(cutlass.Int32(N), cgrp_tile_mnk[1])
     first_token_arr = cutlass.make_array_view(first_token_offset)
 
+    # -- Producer warpgroup ---------------------------------------------------
+    # Warps NUM_COMPUTE_WARPS.. (TMA, scheduler, donors) are whole warpgroups:
+    # release their registers once, warpgroup-uniformly, before the roles below
+    # diverge per warp. Donor warps have no further role and simply exit.
+    if warp_idx >= NUM_COMPUTE_WARPS:
+        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
+
     # -- Grouped scheduler warp ------------------------------------------------
     # Claim the next GLOBAL linear tile index off the counter, locate the group
     # it falls in (a warp-parallel prefix scan over the group sizes, resumed
     # from the last hit -- claims only ever grow), split the group-local index
     # into (tile_m, tile_n) under the group's own L2 raster, and publish.
     if warp_idx == SCHEDULER_WARP_ID:
-        nvvm.setmaxregister(SCHED_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
         full_warp_mask = 0xFFFFFFFF
@@ -647,7 +653,6 @@ def frost_template_kernel(
 
     # -- TMA producer warp ----------------------------------------------------
     if warp_idx == TMA_WARP_ID:
-        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
@@ -1055,10 +1060,6 @@ def frost_template_kernel(
             if warp_idx == 0:
                 if elect_one:
                     nvvm.griddepcontrol("launch_dependents")
-
-    # -- Unused donor warps ---------------------------------------------------
-    if warp_idx > SCHEDULER_WARP_ID:
-        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
 
 
 frost_template_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

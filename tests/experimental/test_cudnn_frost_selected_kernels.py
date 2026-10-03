@@ -848,6 +848,15 @@ def test_bf16_sm120_sources_roundtrip_without_cudnn(monkeypatch):
             for node in ast.walk(ast.parse(template))
         )
         assert "# @@FROST_TMA_STORE@@" not in template
+        # PTX setmaxnreg is .sync.aligned over the warpgroup: the producer
+        # warpgroup (TMA, scheduler and donor warps) releases registers once,
+        # before its per-warp roles diverge, and the compute warpgroups grow once.
+        assert template.count("nvvm.setmaxregister(") == 2
+        assert (
+            "    if warp_idx >= NUM_COMPUTE_WARPS:\n"
+            "        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)\n"
+        ) in template
+        assert "SCHED_REG_COUNT" not in template
         tactic = record["tactic"]
         assert tactic["template"] == "sm120_moe_grouped_matmul_fwd.py"
         assert (tactic["swap_ab"], tactic["store_mode"], tactic["cta_group"]) == (
