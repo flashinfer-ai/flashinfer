@@ -73,6 +73,18 @@ repos:
         exclude: |
           (?x)^(3rdparty/.*|csrc/cake_bf16_bmm/.*|csrc/fused_moe/warp_decode/.*|flashinfer/jit/aot_config.py|csrc/concat_mla/.*|csrc/cake_vsa/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/cake_fused_qk_rope_append/.*|csrc/cake_sage_block_sparse_attention/(?:sm_100a|sm_103a)/.*|csrc/dcp/.*|csrc/generated/.*|csrc/kda/(?:tf32|bf16)/.*|csrc/alphamoe_nvfp4_(?:sm100|c[0-9]+_[a-z_]+)\.cu)$
 
+  # Clang-tidy linter for C++ code
+  - repo: local
+    hooks:
+      - id: clang-tidy
+        name: clang-tidy
+        entry: bash -c 'clang-tidy "$@" -- -I./include -I./csrc -std=c++17' --
+        language: system
+        types_or: [c++, c, cuda]
+        files: ^(include|csrc)/
+        exclude: ^3rdparty/
+        require_serial: true
+
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at
       hooks:
