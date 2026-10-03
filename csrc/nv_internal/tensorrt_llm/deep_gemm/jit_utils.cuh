@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 #include <nvrtc.h>
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <iostream>
@@ -228,5 +229,53 @@ inline GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint3
 
   return std::make_tuple(best_block_m, best_block_n, best_num_stages, best_num_tma_multicast,
                          best_smem_size);
+}
+
+// Split-K for the normal SwapAB GEMM (small M): when the output blocks leave most SMs idle, split K
+// across the CTAs of a cluster so that more SMs stream the weight. `max_active_clusters(s)` is the
+// number of s-CTA clusters the device can keep resident at one CTA per SM; a split is only used
+// when every cluster is resident in a single wave. The returned config keeps the block sizes of
+// `config` and adjusts the stage count and shared memory for the split.
+struct SplitKConfig {
+  int num_split_k;
+  int num_stages;
+  int smem_size;
+};
+
+template <typename MaxActiveClustersFn>
+inline SplitKConfig get_swapab_split_k_config(uint32_t shape_n, uint32_t shape_m, uint32_t shape_k,
+                                              GemmConfig const& config, int num_device_sms,
+                                              MaxActiveClustersFn&& max_active_clusters,
+                                              int block_k = 128) {
+  auto const [block_m, block_n, num_stages, num_tma_multicast, smem_size] = config;
+  int const num_weight_blocks = div_up(shape_n, block_m);
+  int const num_blocks = num_weight_blocks * div_up(shape_m, block_n);
+  int const num_k_blocks = div_up(shape_k, block_k);
+  int num_split_k = 1;
+  // The gain comes from streaming more distinct weight blocks at once. On GH200 a 2-way split of
+  // more than 32 weight blocks with one N block was up to 5% slower, while the same block count
+  // with two N blocks (two CTAs reading each weight block) was still faster.
+  if (num_tma_multicast == 1 && static_cast<int>(shape_k) % block_k == 0 && num_blocks <= 48 &&
+      num_weight_blocks <= 32) {
+    // Each split adds a fixed cost (cluster launch, pipeline fill and the DSMEM reduction), so
+    // shapes whose blocks already occupy a fair share of the SMs only split long K ranges.
+    int const min_k_blocks_per_split = num_blocks <= 24 ? 4 : 16;
+    for (int split = 2; split <= 8; ++split) {
+      if (num_blocks * split > num_device_sms) break;
+      if (num_k_blocks % split != 0 || num_k_blocks / split < min_k_blocks_per_split) continue;
+      if (num_blocks > max_active_clusters(split)) continue;
+      num_split_k = split;
+    }
+  }
+  if (num_split_k == 1) return {1, num_stages, smem_size};
+
+  // Rank 0 keeps the partial accumulators of the other ranks in shared memory
+  int const split_stages = std::min(num_stages, num_k_blocks / num_split_k);
+  int const reduce_smem = 8 + 16 + (num_split_k - 1) * block_m * block_n * 4;
+  int const split_smem =
+      get_smem_size(split_stages, shape_k, block_m, block_n, block_k, true) + reduce_smem;
+  constexpr int sm90_capacity = 232448;
+  if (split_smem > sm90_capacity) return {1, num_stages, smem_size};
+  return {num_split_k, split_stages, split_smem};
 }
 }  // namespace deep_gemm::jit

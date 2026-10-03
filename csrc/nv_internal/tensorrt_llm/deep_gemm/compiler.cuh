@@ -138,7 +138,8 @@ inline std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k
                                   uint32_t const block_m, uint32_t const block_n,
                                   uint32_t const block_k, uint32_t const num_groups,
                                   uint32_t const num_stages, uint32_t const num_tma_multicast,
-                                  deep_gemm::GemmType const gemm_type, bool swapAB = false) {
+                                  deep_gemm::GemmType const gemm_type, bool swapAB = false,
+                                  uint32_t const num_split_k = 1) {
   constexpr uint32_t kNumTMAThreads = 128;
   constexpr uint32_t kNumMathThreadsPerGroup = 128;
 
@@ -223,6 +224,18 @@ __global__ void dummy_kernel() {
 }
 )";
 
+  if (num_split_k > 1) {
+    // Split-K is only instantiated for the normal SwapAB kernel: pass the split count after the
+    // scheduler's defaulted block-count parameters and after the kernel's input type.
+    if (!swapAB || gemm_type != deep_gemm::GemmType::Normal) {
+      throw std::runtime_error("Split-K is only supported for the normal SwapAB GEMM");
+    }
+    std::string const split = std::to_string(num_split_k);
+    code.insert(code.find(">::type;"),
+                ", " + std::to_string((shape_n + block_m - 1) / block_m) + ", 16, " + split);
+    code.insert(code.find(input_type + ">;") + input_type.size(), ", " + split);
+  }
+
   return code;
 }
 
@@ -249,7 +262,8 @@ class Compiler {
   Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
                  uint32_t const block_n, uint32_t const block_k, uint32_t const num_groups,
                  uint32_t const num_stages, uint32_t const num_tma_multicast,
-                 deep_gemm::GemmType const gemm_type, bool swapAB = false) {
+                 deep_gemm::GemmType const gemm_type, bool swapAB = false,
+                 uint32_t const num_split_k = 1) {
     int sm_version = tensorrt_llm::common::getSMVersion();
     if (sm_version != 90) {
       TLLM_THROW(
@@ -265,6 +279,10 @@ class Compiler {
                        std::to_string(num_groups) + "_" + std::to_string(num_stages) +
                        std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" +
                        std::to_string(num_tma_multicast) + "_" + gemm_type_to_string(gemm_type);
+    if (num_split_k > 1) {
+      // Prefix, so that the GEMM type stays the last field of the cached kernel name
+      name = "splitk" + std::to_string(num_split_k) + "_" + name;
+    }
     std::filesystem::path path = getCacheDir() / name;
 
     // Check runtime cache or file system hit
@@ -329,8 +347,9 @@ class Compiler {
       TLLM_LOG_INFO("\n");
     }
 
-    std::string code = generateKernel(shape_n, shape_k, block_m, block_n, block_k, num_groups,
-                                      num_stages, num_tma_multicast, gemm_type, swapAB);
+    std::string code =
+        generateKernel(shape_n, shape_k, block_m, block_n, block_k, num_groups, num_stages,
+                       num_tma_multicast, gemm_type, swapAB, num_split_k);
 
     if (kJitDebugging) {
       TLLM_LOG_INFO("Generated kernel code:\n%s", code.c_str());
