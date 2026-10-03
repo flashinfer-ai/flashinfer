@@ -313,8 +313,7 @@ __device__ __forceinline__ uint8_t nvfp4_append_quantize_e2m1(float value) {
 template <typename DType, bool precise_rounding = false>
 __device__ __forceinline__ void nvfp4_append_quantize_block(
     const DType* __restrict__ input, const float global_scale, const size_t input_base,
-    const uint32_t dim_base, uint8_t* __restrict__ packed_out, uint8_t* __restrict__ sf_out,
-    const bool nvfp4_4over6 = false) {
+    const uint32_t dim_base, uint8_t* __restrict__ packed_out, uint8_t* __restrict__ sf_out) {
   float values[16];
   float amax = 0.0f;
 #pragma unroll
@@ -330,27 +329,26 @@ __device__ __forceinline__ void nvfp4_append_quantize_block(
         precise_rounding ? amax * __frcp_rn(6.0f * global_scale) : amax / (6.0f * global_scale);
   }
   __nv_fp8_e4m3 sf_fp8 = __nv_fp8_e4m3(sf_value);
-  // 4over6 also tries the block scale that maps amax to 4 and keeps it on a strictly lower MSE.
-  if (nvfp4_4over6) {
-    auto error = [&](float sf) {
-      const float scale =
-          precise_rounding ? __frcp_rn(sf * global_scale) : 1.0f / (sf * global_scale);
-      float sum = 0.0f;
+#ifdef FLASHINFER_NVFP4_APPEND_4OVER6
+  // page_nvfp4_4over6 also tries the block scale mapping amax to 4, kept on a strictly lower MSE.
+  auto error = [&](float sf) {
+    const float scale =
+        precise_rounding ? __frcp_rn(sf * global_scale) : 1.0f / (sf * global_scale);
+    float sum = 0.0f;
 #pragma unroll
-      for (uint32_t i = 0; i < 16; ++i) {
-        const uint32_t level = nvfp4_append_quantize_e2m1(values[i] * scale) & 0x7;
-        const float mag =
-            level < 4 ? 0.5f * level : (level < 6 ? level - 2.0f : 2.0f * level - 8.0f);
-        const float diff = mag * sf * global_scale - fabsf(values[i]);
-        sum += diff * diff;
-      }
-      return sum;
-    };
-    const __nv_fp8_e4m3 sf4_fp8 = __nv_fp8_e4m3(sf_value * 1.5f);
-    if (error(static_cast<float>(sf4_fp8)) < error(static_cast<float>(sf_fp8))) {
-      sf_fp8 = sf4_fp8;
+    for (uint32_t i = 0; i < 16; ++i) {
+      const uint32_t level = nvfp4_append_quantize_e2m1(values[i] * scale) & 0x7;
+      const float mag = level < 4 ? 0.5f * level : (level < 6 ? level - 2.0f : 2.0f * level - 8.0f);
+      const float diff = mag * sf * global_scale - fabsf(values[i]);
+      sum += diff * diff;
     }
+    return sum;
+  };
+  const __nv_fp8_e4m3 sf4_fp8 = __nv_fp8_e4m3(sf_value * 1.5f);
+  if (error(static_cast<float>(sf4_fp8)) < error(static_cast<float>(sf_fp8))) {
+    sf_fp8 = sf4_fp8;
   }
+#endif
   *sf_out = sf_fp8.__x;
 
   const float sf_rounded = static_cast<float>(sf_fp8);
@@ -574,7 +572,7 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheKernel(
   }
 }
 
-template <uint32_t HEAD_DIM, typename DType, typename IdType, bool NVFP4_4OVER6 = false>
+template <uint32_t HEAD_DIM, typename DType, typename IdType>
 __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
     const DType* __restrict__ append_key, const DType* __restrict__ append_value,
     const IdType* __restrict__ slot_mapping, uint32_t nnz, uint32_t num_heads, uint32_t page_size,
@@ -631,10 +629,10 @@ __global__ void NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel(
     const uint32_t packed_base = block_idx * PACKED_PER_SF;
     if (is_v) {
       nvfp4_append_quantize_block(append_value, v_scale, append_v_base, dim_base,
-                                  v_out + packed_base, v_sf_out + block_idx, NVFP4_4OVER6);
+                                  v_out + packed_base, v_sf_out + block_idx);
     } else {
       nvfp4_append_quantize_block(append_key, k_scale, append_k_base, dim_base, k_out + packed_base,
-                                  k_sf_out + block_idx, NVFP4_4OVER6);
+                                  k_sf_out + block_idx);
     }
   }
 }
@@ -683,7 +681,7 @@ cudaError_t NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
     size_t k_stride_page, size_t k_stride_n, size_t k_stride_h, size_t v_stride_page,
     size_t v_stride_n, size_t v_stride_h, size_t k_sf_stride_page, size_t k_sf_stride_n,
     size_t k_sf_stride_h, size_t v_sf_stride_page, size_t v_sf_stride_n, size_t v_sf_stride_h,
-    float* k_scale, float* v_scale, cudaStream_t stream = nullptr, bool nvfp4_4over6 = false) {
+    float* k_scale, float* v_scale, cudaStream_t stream = nullptr) {
   if (nnz == 0 || num_heads == 0) {
     return cudaSuccess;
   }
@@ -695,9 +693,6 @@ cudaError_t NVFP4QuantizeAppendPagedKVCacheWithSlotMapping(
     dim3 nblks(nnz, num_heads);
     dim3 nthrs(num_threads);
     auto kernel = NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel<HEAD_DIM, DType, IdType>;
-    if (nvfp4_4over6) {
-      kernel = NVFP4QuantizeAppendPagedKVCacheWithSlotMappingKernel<HEAD_DIM, DType, IdType, true>;
-    }
     void* args[] = {(void*)&append_key,
                     (void*)&append_value,
                     (void*)&slot_mapping,

@@ -44,8 +44,8 @@ from .utils import (
 
 
 @functools.cache
-def get_page_module():
-    return gen_page_module().build_and_load()
+def get_page_module(nvfp4_4over6: bool = False):
+    return gen_page_module(nvfp4_4over6).build_and_load()
 
 
 @register_custom_op(
@@ -280,7 +280,8 @@ def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
     nvfp4_4over6: bool,
 ) -> None:
     slot_mapping = slot_mapping.contiguous()
-    get_page_module().nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+    module = get_page_module(True) if nvfp4_4over6 else get_page_module()
+    module.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
         append_key,
         append_value,
         slot_mapping,
@@ -291,7 +292,6 @@ def _nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_kernel(
         k_scale,
         v_scale,
         layout,
-        nvfp4_4over6,
     )
 
 
