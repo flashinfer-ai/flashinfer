@@ -356,6 +356,19 @@ def _issue_score_seed(
         tmem_s.seed_scores_loop()
 
 
+def _qk_wave_waits_k_first(cfg: FmhaDecodeConfig) -> bool:
+    """Whether a QK wave observes its K stage before it acquires the S slot.
+
+    A loop QK's K stage lands long before the softmax frees its S slot, so
+    the K wait is already satisfied when the wave starts. Taking it before
+    the S acquire keeps the path from the S-empty wake-up to the first MMA
+    down to the MMA instructions themselves. INT32-score waves keep the K
+    wait after the S acquire so the seed MMA issue overlaps it, and waves
+    with several head-dim stages wait per stage.
+    """
+    return not cfg.uses_int32_scores and cfg.num_head_dim_stages_kv == 1
+
+
 def _consume_staged_qk_mma(
     smem_kv: MemoryResource,
     tmem_s: MemoryResource,
@@ -364,6 +377,7 @@ def _consume_staged_qk_mma(
     qk_mma_label: str,
     section: FmhaStage,
     cfg: FmhaDecodeConfig,
+    tmem_stats_done: MemoryResource | None = None,
 ) -> None:
     """Consume all K head-dim stages for one QK MMA wave.
 
@@ -371,11 +385,19 @@ def _consume_staged_qk_mma(
     preceding same-instance PV reads P as its TMEM A operand from the same
     issuing thread, and the tensor core interlocks that read against a later
     MMA's accumulator write, so no completion wait is needed before QK.
+    Profiles with a stats handoff (``tmem_stats_done``) hold it from before
+    the S acquire through the S commit.
     """
+    k_first = _qk_wave_waits_k_first(cfg)
+    if k_first:
+        smem_kv.wait()
+    if tmem_stats_done is not None:
+        tmem_stats_done.acquire()
     tmem_s.acquire()
     _issue_score_seed(tmem_s, section, cfg)
     for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
-        smem_kv.wait()
+        if not k_first:
+            smem_kv.wait()
         kv_desc = getattr(smem_kv, k_desc_label)()
         if cfg.uses_q_desc_ref:
             getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
@@ -390,6 +412,8 @@ def _consume_staged_qk_mma(
             )
         smem_kv.release()
     tmem_s.commit()
+    if tmem_stats_done is not None:
+        tmem_stats_done.commit()
 
 
 def _consume_streamed_pv_fragments(
@@ -2242,28 +2266,16 @@ def create_mma_task_split_kv(
             section: FmhaStage,
         ) -> None:
             """Issue one scheduled QK wave using the selected phase work."""
-            if tmem_stats_done is not None:
-                tmem_stats_done.acquire()
-            tmem_s.acquire()
-            _issue_score_seed(tmem_s, section, cfg)
-            for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
-                smem_kv.wait()
-                kv_desc = smem_kv.kv_desc()
-                if cfg.uses_q_desc_ref:
-                    getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
-                        kv_desc=kv_desc,
-                        head_dim_stage_idx=head_dim_stage_idx,
-                    )
-                else:
-                    getattr(tmem_s, qk_mma_label)(
-                        q_desc=q_desc,
-                        kv_desc=kv_desc,
-                        head_dim_stage_idx=head_dim_stage_idx,
-                    )
-                smem_kv.release()
-            tmem_s.commit()
-            if tmem_stats_done is not None:
-                tmem_stats_done.commit()
+            _consume_staged_qk_mma(
+                smem_kv,
+                tmem_s,
+                q_desc,
+                "kv_desc",
+                qk_mma_label,
+                section,
+                cfg,
+                tmem_stats_done,
+            )
 
         def pv_mma(
             smem_kv: MemoryResource,
@@ -2563,26 +2575,16 @@ def create_mma_task_one_inst_qkv(
 
         def qk_mma(q_desc, qk_mma_label: str, section: FmhaStage) -> None:
             """Issue one scheduled single-instance QK wave."""
-            tmem_stats_done.acquire()
-            tmem_s.acquire()
-            _issue_score_seed(tmem_s, section, cfg)
-            for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
-                smem_k.wait()
-                kv_desc = smem_k.kv_desc()
-                if cfg.uses_q_desc_ref:
-                    getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
-                        kv_desc=kv_desc,
-                        head_dim_stage_idx=head_dim_stage_idx,
-                    )
-                else:
-                    getattr(tmem_s, qk_mma_label)(
-                        q_desc=q_desc,
-                        kv_desc=kv_desc,
-                        head_dim_stage_idx=head_dim_stage_idx,
-                    )
-                smem_k.release()
-            tmem_s.commit()
-            tmem_stats_done.commit()
+            _consume_staged_qk_mma(
+                smem_k,
+                tmem_s,
+                q_desc,
+                "kv_desc",
+                qk_mma_label,
+                section,
+                cfg,
+                tmem_stats_done,
+            )
 
         def pv_mma(vp_mma_label: str, section: FmhaStage) -> None:
             """Issue one scheduled single-instance PV wave."""
@@ -3182,6 +3184,11 @@ def _softmax_schedule_body(
                 scales.wait()
             sage_scale_arr = sage_k_scales.take_tile()
             sage_summary_scale_arr = sage_scale_arr
+        # ProdAcquire: take the stats slot while the scores are still in
+        # flight. Correction frees the slot soon after it reads the previous
+        # stats, so the acquire is satisfied by now, and taking it here keeps
+        # its barrier check out of the path between the tile max and P.
+        tmem_softmax_local.acquire()
         # ConsWait/ConsWork: load S from TMEM and compute the tile max.
         tmem_s.wait()
         softmax_loop_kwargs = dict(
@@ -3214,7 +3221,6 @@ def _softmax_schedule_body(
         # Publish old/new max before the P path so correction can observe
         # the same stats order as the decode pipeline.
         # ProdWork: store old/new max for correction's in-loop O update.
-        tmem_softmax_local.acquire()
         tmem_softmax_local.store_loop_old_new_stats(
             old_max_arr=old_max_arr,
             new_max_arr=new_max_arr,
