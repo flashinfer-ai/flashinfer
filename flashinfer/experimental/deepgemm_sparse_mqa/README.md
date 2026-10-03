@@ -5,14 +5,24 @@ prepares the compressed sparse MQA indexer (metadata generation followed by the
 block-scaled logits kernel) on SM100a and SM103a. Each prepared call returns a
 plan; `plan.run()` submits on the current PyTorch stream.
 
-Six generated programs serve both architectures (the loader compiles the shared
-source with the exact flag set of the attached device):
+Ten generated programs serve both architectures (the loader compiles each
+program's source with the exact flag set of the attached device):
 
-- two metadata programs, one per KV layout (contiguous, paged). The SM count,
-  the sparse index capacity (a multiple of 4 up to `LIMITS["max_sparse_blocks"]`),
-  the split width (640 MXFP4 / 512 MXFP8 KV tokens over the block size), the
-  sparse block size (8 or 16) and the page size (any multiple of the block size)
-  are runtime arguments;
+- two runtime-geometry metadata programs, one per KV layout (contiguous,
+  paged). The SM count, the sparse index capacity (a multiple of 4 up to
+  `LIMITS["max_sparse_blocks"]`), the split width (640 MXFP4 / 512 MXFP8 KV
+  tokens over the block size), the sparse block size (8 or 16) and the page
+  size (any multiple of the block size) are runtime arguments;
+- four exact-geometry metadata programs: the production geometry (capacity
+  `LIMITS["exact_capacity"]`, 8-token blocks, 64-token pages) per layout,
+  compiled with the device SM count folded into the schedule layout, one per
+  (architecture, SM count) pair of the measured devices (`ROUTES` keys
+  `metadata:<layout>:exact:<sms>`; `exported_exact_sms(arch, paged=...)` lists
+  the SM counts exported for an architecture, `LIMITS["exact_num_sms"]` their
+  union). `metadata_route_key()` selects an exact program only for an
+  (architecture, SM count) pair it was exported for and the runtime program
+  otherwise (e.g. 152 SMs on SM100a), never a program compiled for another SM
+  count;
 - four logits programs, one per format x layout (MXFP4 runs five math
   warpgroups over 640-token splits, MXFP8 four over 512-token splits), with
   32 heads, D=128, 8-token blocks, 64-token pages and aligned windows.

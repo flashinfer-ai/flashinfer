@@ -496,17 +496,40 @@ def metadata_workspace_words(queries, capacity, *, fmt, sparse_block_kv, paged):
     return words
 
 
+def exported_exact_sms(arch: str, *, paged: bool) -> tuple[int, ...]:
+    """SM counts whose exact-geometry metadata program of the layout is exported for ``arch`` (the device's
+    architecture); ``LIMITS["exact_num_sms"]`` is the union over all architectures."""
+    layout = "paged" if paged else "contiguous"
+    prefix = f"metadata:{layout}:exact:"
+    return tuple(
+        sorted(
+            int(key[len(prefix) :])
+            for key, name in ROUTES.items()
+            if key.startswith(prefix) and arch in MODULES[name]["arches"]
+        )
+    )
+
+
 def metadata_route_key(
-    *, paged, capacity, sparse_block_kv, page_kv, num_sms, use_unaligned_ks=False
+    *,
+    paged,
+    capacity,
+    sparse_block_kv,
+    page_kv,
+    num_sms,
+    arch,
+    use_unaligned_ks=False,
 ):
     """``ROUTES`` key of the metadata program for one geometry: the exact-geometry program at the exported
     production geometry (capacity ``LIMITS["exact_capacity"]``, ``LIMITS["sparse_block_kv"]``-token blocks and,
-    for paged rows, ``LIMITS["page_kv"]``-token pages) compiled for this device's SM count
-    (``LIMITS["exact_num_sms"]``), the runtime program otherwise."""
+    for paged rows, ``LIMITS["page_kv"]``-token pages) when a program compiled for this device's SM count is
+    exported for its architecture (``exported_exact_sms``), the runtime-geometry program otherwise. The SM
+    count is folded into the exact program's schedule layout, so a program compiled for another SM count is
+    never substituted: a device whose (architecture, SM count) pair is not exported runs the runtime program."""
     layout = "paged" if paged else "contiguous"
     exact = (
         not use_unaligned_ks
-        and num_sms in LIMITS["exact_num_sms"]
+        and num_sms in exported_exact_sms(arch, paged=paged)
         and capacity == LIMITS["exact_capacity"]
         and sparse_block_kv == LIMITS["sparse_block_kv"]
         and (not paged or page_kv == LIMITS["page_kv"])
@@ -631,6 +654,7 @@ class SparseMetadataPlan:
                 sparse_block_kv=sparse_block_kv,
                 page_kv=page_kv,
                 num_sms=self.num_sms,
+                arch=self.arch,
                 use_unaligned_ks=use_unaligned_ks,
             )
         ]

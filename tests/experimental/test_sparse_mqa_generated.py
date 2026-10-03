@@ -160,11 +160,17 @@ def test_sparse_logits_analytical(fmt, paged, capacity):
         sparse_block_kv=8,
         page_kv=64,
         num_sms=metadata.num_sms,
+        arch=metadata.arch,
     )
-    # The production geometry (capacity 2048, 8-token blocks, 64-token pages) on an exported SM count runs the
-    # exact-geometry program, every other capacity the runtime program of the layout.
-    assert metadata.num_sms in _runtime.LIMITS["exact_num_sms"]
-    assert (":exact:" in key) == (capacity == _runtime.LIMITS["exact_capacity"])
+    # The production geometry (capacity 2048, 8-token blocks, 64-token pages) runs the exact-geometry program
+    # when one is exported for this device's (architecture, SM count); every other capacity, and a device
+    # without an exported pair (e.g. 152 SMs on sm_100a), runs the runtime program of the layout.
+    exported = metadata.num_sms in _runtime.exported_exact_sms(
+        metadata.arch, paged=paged
+    )
+    assert (":exact:" in key) == (
+        exported and capacity == _runtime.LIMITS["exact_capacity"]
+    )
     assert plan.programs["metadata"] == _runtime.ROUTES[key]
 
 
@@ -357,9 +363,12 @@ def test_sparse_metadata_runtime_geometry(fmt, paged, capacity, block, page):
         sparse_block_kv=block,
         page_kv=page,
         num_sms=plan.num_sms,
+        arch=plan.arch,
     )
-    exact = (capacity, block) == (_runtime.LIMITS["exact_capacity"], 8) and (
-        not paged or page == 64
+    exact = (
+        (capacity, block) == (_runtime.LIMITS["exact_capacity"], 8)
+        and (not paged or page == 64)
+        and plan.num_sms in _runtime.exported_exact_sms(plan.arch, paged=paged)
     )
     assert (":exact:" in key) == exact
     # A device SM count the exact program was not compiled for falls back to the runtime program.
@@ -370,6 +379,7 @@ def test_sparse_metadata_runtime_geometry(fmt, paged, capacity, block, page):
         sparse_block_kv=block,
         page_kv=page,
         num_sms=foreign_sms,
+        arch=plan.arch,
     ).count(":exact:")
     assert plan.program == _runtime.ROUTES[key]
     plan.run()
@@ -384,6 +394,52 @@ def test_sparse_metadata_runtime_geometry(fmt, paged, capacity, block, page):
         block_table=case["block_table"],
     )
     assert not bool(torch.count_nonzero(plan.workspace[[0, 32, 64]]))
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_sparse_metadata_route_key_is_arch_aware(paged):
+    """The exact-geometry program is selected only for an (architecture, SM count) pair it was exported for:
+    the SM count is folded into its schedule layout, so e.g. 152 SMs on sm_100a (GB200) must run the runtime
+    program even though a 152-SM program exists for sm_103a. Pure host logic, no device needed."""
+    geometry = dict(
+        paged=paged,
+        capacity=_runtime.LIMITS["exact_capacity"],
+        sparse_block_kv=_runtime.LIMITS["sparse_block_kv"],
+        page_kv=_runtime.LIMITS["page_kv"],
+    )
+    layout = "paged" if paged else "contiguous"
+    arches = sorted(
+        {a for record in _runtime.MODULES.values() for a in record["arches"]}
+    )
+    assert arches, "registry exports no architecture"
+    seen_exact = seen_runtime = False
+    for arch in arches:
+        exported = _runtime.exported_exact_sms(arch, paged=paged)
+        assert exported, f"no exact-geometry {layout} program exported for {arch}"
+        for sms in _runtime.LIMITS["exact_num_sms"]:
+            key = _runtime.metadata_route_key(num_sms=sms, arch=arch, **geometry)
+            if sms in exported:
+                assert key == f"metadata:{layout}:exact:{sms}"
+                assert arch in _runtime.MODULES[_runtime.ROUTES[key]]["arches"]
+                seen_exact = True
+            else:
+                assert key == f"metadata:{layout}"
+                seen_runtime = True
+        assert not _runtime.metadata_route_key(
+            num_sms=max(_runtime.LIMITS["exact_num_sms"]) + 1, arch=arch, **geometry
+        ).count(":exact:")
+    assert seen_exact
+    if sorted(_runtime.LIMITS["exact_num_sms"]) != sorted(
+        set().union(*(set(_runtime.exported_exact_sms(a, paged=paged)) for a in arches))
+    ):
+        pytest.fail(
+            "LIMITS['exact_num_sms'] is not the union of the exported SM counts"
+        )
+    assert seen_runtime or all(
+        len(_runtime.exported_exact_sms(a, paged=paged))
+        == len(_runtime.LIMITS["exact_num_sms"])
+        for a in arches
+    )
 
 
 def test_sparse_metadata_rejects_non_power_of_two_page():
