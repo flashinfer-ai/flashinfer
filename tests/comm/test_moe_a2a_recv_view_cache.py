@@ -76,6 +76,41 @@ def test_cache_none_rebuilds_every_call(monkeypatch):
     assert len(calls) == 4, "two payloads x two calls should rebuild every view"
 
 
+def test_invalid_expert_id_reaches_selected_backend(monkeypatch):
+    """The padding marker must survive backend selection and FFI forwarding."""
+    captured = {}
+    wrap_calls = []
+    _patch(monkeypatch, wrap_calls)
+
+    class _RecordingModule:
+        @staticmethod
+        def moe_a2a_dispatch(*args):
+            captured["args"] = args
+            return _RECV_OFFSETS, _RECV_SIZES, 1024, -1, 0
+
+    def get_module(backend):
+        captured["backend"] = backend
+        return _RecordingModule
+
+    monkeypatch.setattr(a2a, "get_moe_alltoall_module", get_module)
+    a2a.moe_a2a_dispatch(
+        torch.zeros(2, 1, dtype=torch.int32),
+        [torch.zeros(2, 4), torch.zeros(2, 2)],
+        torch.zeros(4),
+        torch.zeros(8, dtype=torch.int32),
+        runtime_max_tokens_per_rank=2,
+        ep_rank=0,
+        ep_size=2,
+        top_k=1,
+        num_experts=4,
+        enable_pdl=False,
+        invalid_expert_id=-1,
+        backend="cake",
+    )
+    assert captured["backend"] == "cake"
+    assert captured["args"][-1] == -1
+
+
 def test_cache_hits_on_second_dispatch(monkeypatch):
     """A populated cache must serve identical keys without rebuilding.
 

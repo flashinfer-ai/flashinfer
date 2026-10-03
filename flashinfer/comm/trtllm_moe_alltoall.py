@@ -129,6 +129,7 @@ def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
         eplb_local_stats: Optional[torch.Tensor] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        invalid_expert_id: Optional[int] = None,
     ):
         """
         Dispatch tokens and payloads to expert ranks.
@@ -154,6 +155,8 @@ def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
                 (see :func:`moe_a2a_active_rank_mask`). Bit i set means rank i is alive and
                 participates in this collective; tokens routed to a masked-off rank are
                 dropped. Requires enable_rank_mask=True.
+            invalid_expert_id: If set, entries whose expert id equals
+                this value are treated as padding and skipped during dispatch.
 
         Returns:
             recv_offsets: List of offsets for each payload in the workspace
@@ -178,6 +181,7 @@ def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
             eplb_local_stats,
             enable_rank_mask,
             active_rank_mask,
+            invalid_expert_id,
         )
 
     @register_custom_op(
@@ -516,6 +520,7 @@ def moe_a2a_dispatch(
     enable_rank_mask: bool = False,
     active_rank_mask: Optional[torch.Tensor] = None,
     *,
+    invalid_expert_id: Optional[int] = None,
     backend: MoeAlltoAllBackend = "trtllm",
     recv_view_cache: Optional[dict] = None,
 ):
@@ -564,6 +569,9 @@ def moe_a2a_dispatch(
         Masking a peer does not advance that peer's transport epoch. Before a
         skipped peer rejoins, all ranks must quiesce and coordinate workspace
         reinitialization; merely restoring its mask bit is insufficient.
+    invalid_expert_id : int, optional
+        If set, entries whose expert id equals this value are treated as padding
+        and skipped during dispatch.
     backend : {"trtllm", "cake"}
         Defaults to ``"trtllm"``. Pass ``"cake"`` to opt in on CC 10.0/10.3;
         must match workspace initialization, combine, and all peer ranks.
@@ -609,6 +617,7 @@ def moe_a2a_dispatch(
         eplb_local_stats,
         enable_rank_mask,
         active_rank_mask,
+        invalid_expert_id,
     )
 
     # Bind once per dispatch without pointer/device queries in the hot path.
@@ -1393,6 +1402,13 @@ class MoeAlltoAll:
                 "with enable_rank_mask=True"
             )
 
+        if invalid_token_expert_id is not None:
+            assert expert_id_payload_index is not None, (
+                "expert_id_payload_index required when invalid_token_expert_id is set"
+            )
+            if not 0 <= expert_id_payload_index < len(input_payloads):
+                raise ValueError("expert_id_payload_index must index input_payloads")
+
         recv_tensors, combine_payload_offset, eplb_gathered_stats = moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
@@ -1406,6 +1422,7 @@ class MoeAlltoAll:
             eplb_local_stats=eplb_local_stats,
             enable_rank_mask=self.enable_rank_mask,
             active_rank_mask=active_rank_mask,
+            invalid_expert_id=invalid_token_expert_id,
             backend=self._backend,
             recv_view_cache=self._recv_view_cache,
         )
@@ -1418,9 +1435,6 @@ class MoeAlltoAll:
 
         # Sanitize invalid tokens if requested
         if invalid_token_expert_id is not None:
-            assert expert_id_payload_index is not None, (
-                "expert_id_payload_index required when invalid_token_expert_id is set"
-            )
             recv_expert_ids = recv_tensors[expert_id_payload_index]
             moe_a2a_sanitize_expert_ids(
                 recv_expert_ids,
