@@ -981,6 +981,44 @@ def test_export_compile_commands_output_option(monkeypatch, tmp_path):
     assert not ignored_file.exists()
 
 
+@pytest.mark.parametrize("use_output_option", [False, True])
+@pytest.mark.parametrize("target_kind", ["missing_parent", "directory"])
+def test_export_compile_commands_write_failure(
+    monkeypatch, tmp_path, use_output_option, target_kind
+):
+    from click.testing import CliRunner
+
+    from flashinfer.__main__ import cli
+
+    mock_specs = {
+        "module_a": MockJitSpec(
+            "module_a",
+            [{"directory": "/build", "command": "nvcc -c a.cu", "file": "a.cu"}],
+        ),
+    }
+    monkeypatch.setattr("flashinfer.__main__._ensure_modules_registered", lambda: [])
+    monkeypatch.setattr(
+        "flashinfer.__main__.jit_spec_registry.get_all_specs", lambda: mock_specs
+    )
+
+    output_path = (
+        tmp_path / "missing" / "compile_commands.json"
+        if target_kind == "missing_parent"
+        else tmp_path
+    )
+    args = ["export-compile-commands"]
+    if use_output_option:
+        args.append("--output")
+    args.append(str(output_path))
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == 1, result.output
+    assert "Failed to write compile commands:" in result.output
+    assert "Successfully exported" not in result.output
+    assert not output_path.is_file()
+
+
 def test_export_compile_commands_no_modules(monkeypatch, tmp_path):
     """
     Test that export-compile-commands handles empty module registry.
