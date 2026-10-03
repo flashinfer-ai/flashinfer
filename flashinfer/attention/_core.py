@@ -424,6 +424,7 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
         if backend == "auto":
             # dispatch backend before init jit module
             if packed_fp4_kv:
+                # Keep native FP4 local; the shared chooser only excludes uint8.
                 backend = "fa2"
             else:
                 backend = determine_attention_backend(

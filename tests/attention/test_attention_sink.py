@@ -1131,19 +1131,32 @@ _NVFP4_KV_DTYPES = [torch.uint8] + (
 )
 
 
-@pytest.mark.parametrize("kv_data_type", _NVFP4_KV_DTYPES)
-def test_attention_sink_nvfp4_auto_selects_fa2(monkeypatch, kv_data_type):
+@pytest.mark.parametrize(
+    ("kv_data_type", "expected_backend"),
+    [(torch.bfloat16, "fa3")] + [(dtype, "fa2") for dtype in _NVFP4_KV_DTYPES],
+)
+def test_attention_sink_auto_selects_backend(
+    monkeypatch, kv_data_type, expected_backend
+):
+    from flashinfer.attention import _core
+
     monkeypatch.setattr(
-        "flashinfer.attention._core.determine_attention_backend",
-        lambda *args, **kwargs: "fa3",
+        _core, "determine_attention_backend", lambda *args, **kwargs: "fa3"
+    )
+
+    def init_wrapper(self, **kwargs):
+        self._backend = kwargs["backend"]
+
+    monkeypatch.setattr(
+        _core.BatchPrefillWithPagedKVCacheWrapper, "__init__", init_wrapper
     )
     wrapper = flashinfer.BatchAttentionWithAttentionSinkWrapper(
-        torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        torch.empty(8 * 1024 * 1024, dtype=torch.uint8),
         kv_layout="HND",
         backend="auto",
         kv_data_type=kv_data_type,
     )
-    assert wrapper._backend == "fa2"
+    assert wrapper._backend == expected_backend
 
 
 @pytest.mark.parametrize("kv_data_type", _NVFP4_KV_DTYPES)

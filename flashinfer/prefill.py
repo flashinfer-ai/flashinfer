@@ -3595,9 +3595,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
-        # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
+        # For NVFP4 KV (packed FP4), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
-        # For NVFP4 KV (uint8 packed), v_cache last dim is packed bytes
+        # For NVFP4 KV (packed FP4), v_cache last dim is packed bytes
         # (2 values per byte): the unpacked VO width is v_cache.shape[-1]*2,
         # which equals head_dim_vo even for asymmetric (QK, VO) plans.
         # Using q.shape[-1] here assumed head_dim_vo == head_dim_qk and made
