@@ -172,15 +172,31 @@ offset 0; `completion_base` is rejected. The CPU tests check that every
 registered name is bindable, so a regenerated registration with a new name
 fails fast on the host side.
 
-## SM120 / SM121: DeepSeek-V4 NVFP4 sparse-MLA decode
+## SM120 / SM121: DeepSeek-V4 NVFP4 sparse-MLA decode and prefill
 
 `sm_120a/` holds the Cake-generated SM120 (GB202: RTX 5090, RTX PRO 6000
-Blackwell) DeepSeek-V4 NVFP4 sparse-MLA decode family: one translation unit per
-query head count (8, 16, 32, 48, 64, 80, 96, 112, 128) with the single-cache
-decode, dual-cache decode and split-merge kernels (head counts divisible by 32
-also carry two-tile variants that process 32 heads per CTA over one shared
-candidate gather), the TVM-FFI binding
-`cake_sparse_mla_dsv4_nvfp4_binding.cu`, and
+Blackwell) DeepSeek-V4 NVFP4 sparse-MLA families (DeepSeek-V4 sparse MLA SM120
+tracker: flashinfer#4254):
+
+* **decode** -- one translation unit per query head count (8, 16, 32, 48, 64,
+  80, 96, 112, 128), `cake_sparse_mla_dsv4_nvfp4_h<N>.cu`, with the
+  single-cache decode, dual-cache decode and split-merge kernels (head counts
+  divisible by 32 also carry two-tile variants that process 32 heads per CTA
+  over one shared candidate gather);
+* **prefill** -- one translation unit per head count 16 .. 128,
+  `cake_sparse_mla_dsv4_nvfp4_prefill_h<N>.cu`, with one kernel per (head tiles
+  x single / dual cache x one-item / persistent CTAs): a prefill CTA holds
+  `16 * head_tiles` heads of one token (1 tile always, 2 for head counts
+  divisible by 32, 4 for head counts divisible by 64) and runs *all* of the
+  token's 64-candidate chunks (at most 16, so `topk + extra_topk <= 1024`)
+  with a direct epilogue -- no split scratch, no merge launch. The persistent
+  form launches `min(items, SMs)` CTAs that walk the (token, head block) items
+  with a grid stride while the IO warps prefetch and quantize the next item's
+  Q.
+
+Both share the TVM-FFI binding `cake_sparse_mla_dsv4_nvfp4_binding.cu`
+(entries `cake_sparse_mla_sm120_dsv4_nvfp4_decode` and
+`cake_sparse_mla_sm120_dsv4_nvfp4_prefill`), the kernel ABI header and
 `cake_sparse_mla_dsv4_nvfp4_manifest.json` (provenance, geometry constants
 and the source list the JIT spec compiles). Regenerate the whole directory
 from the Cake kernel schedules with one command; do not edit the generated
@@ -213,3 +229,37 @@ chunks per CTA, at most 16 chunks of 64 candidates per CTA, so more than 1024
 candidates always split) mirror the generating kernel module's launcher;
 `head_tiles` / `num_splits` on the low-level decode entry override them.
 `backend="auto"` keeps the hand-written SM120 kernels.
+
+For several query tokens the same entry points pick between the decode and
+the prefill kernel through
+`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel` (one token,
+head counts without a prefill instance, more than 16 chunks and candidate
+counts that are not multiples of 64 always decode; wide head counts (>= 64)
+decode up to 16 tokens, or up to 32 tokens with at most 128 candidates;
+narrower head counts decode up to 64 tokens with at least 512 candidates). The
+prefill planner `cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` returns
+`(head_tiles, persistent)`: two tiles below 128 tokens for head counts >= 64
+that are divisible by 32, otherwise the largest instance (one tile for 16 / 32
+/ 48 heads), persistent CTAs once the one-item grid covers two waves of SMs.
+These thresholds are provisional until the paired decode / prefill sweeps on
+RTX PRO 6000 Blackwell and RTX 5090 land. The low-level entry
+`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_prefill` runs the prefill
+directly (caller-owned `output` / `out_lse`, `head_tiles` / `persistent`
+overrides, no scratch):
+
+```python
+from flashinfer.mla import cake_sparse_mla_sm120_dsv4_nvfp4_prefill
+
+plan = cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+    q, nvfp4_cache, indices, output, out_lse, sm_scale,
+    topk_length=lengths, attn_sink=sink,
+    extra_kv_cache=compressed_cache, extra_indices=extra_indices,
+)
+# plan == {"head_tiles": 4, "persistent": 1, "num_ctas": <SMs>} for 128 heads x 2048 tokens
+```
+
+```bash
+pytest tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4.py -q          # decode (needs SM120/SM121)
+pytest tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py -q  # prefill + CPU planner tests
+python benchmarks/bench_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py         # paired sparse / cake prefill rows
+```

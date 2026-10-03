@@ -658,3 +658,99 @@ class TestBgmvMoeEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestBgmvMoeStreams:
+    """The kernels must launch on the caller's current stream: a side stream
+    must order correctly and CUDA Graph capture must record both kernels."""
+
+    def setup_method(self):
+        _skip_if_unsupported_sm()
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("num_tokens", [4, 64])
+    def test_graph_capture_and_side_stream_match_eager(self, dtype, num_tokens):
+        from flashinfer.fused_moe.bgmv_moe import (
+            bgmv_moe,
+            bgmv_moe_expand,
+            bgmv_moe_shrink,
+            fill_w_ptr,
+        )
+
+        hidden_size, rank, num_experts, top_k, num_loras = 768, 16, 8, 2, 4
+        data = generate_test_data(
+            num_tokens, hidden_size, rank, num_experts, top_k, num_loras, 1, dtype
+        )
+        data["lora_indices"].fill_(0)
+        args = (
+            data["x"],
+            data["lora_a_weights"],
+            data["lora_b_weights"],
+            data["sorted_token_ids"],
+            data["expert_ids"],
+            data["lora_indices"],
+            data["topk_weights"],
+            num_experts,
+        )
+        eager = bgmv_moe(*args).float()
+        torch.cuda.synchronize()
+        assert bool((eager.abs().amax(dim=1) > 0).all()), "every token has a LoRA"
+
+        # Eager on a side stream must observe the same ordering guarantees.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            on_side = bgmv_moe(*args).float()
+        side.synchronize()
+        torch.testing.assert_close(on_side, eager, atol=1e-3, rtol=1e-2)
+
+        # Pointer tables are host-side work and live outside the capture; the
+        # zero-fills and the two kernels are what a prepared pipeline records.
+        device = data["x"].device
+        w_ptr_a = torch.zeros(1, num_experts, dtype=torch.int64, device=device)
+        w_ptr_b = torch.zeros(1, num_experts, dtype=torch.int64, device=device)
+        stride_a = fill_w_ptr(w_ptr_a, data["lora_a_weights"][0], num_experts, 0)
+        stride_b = fill_w_ptr(w_ptr_b, data["lora_b_weights"][0], num_experts, 0)
+        slice_start_loc = torch.zeros(1, dtype=torch.int64, device=device)
+        shrink_out = torch.empty(1, data["num_pairs"], rank, dtype=dtype, device=device)
+        y_accum = torch.empty(
+            num_tokens, hidden_size, dtype=torch.float32, device=device
+        )
+
+        def pipeline():
+            shrink_out.zero_()
+            y_accum.zero_()
+            bgmv_moe_shrink(
+                shrink_out,
+                data["x"],
+                w_ptr_a,
+                data["sorted_token_ids"],
+                data["expert_ids"],
+                data["lora_indices"],
+                stride_a,
+            )
+            bgmv_moe_expand(
+                y_accum,
+                shrink_out,
+                w_ptr_b,
+                data["sorted_token_ids"],
+                data["expert_ids"],
+                data["topk_weights"],
+                data["lora_indices"],
+                slice_start_loc,
+                [hidden_size],
+                stride_b,
+            )
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(side):
+            pipeline()  # warm the JIT module outside capture
+            side.synchronize()
+            with torch.cuda.graph(graph, stream=side):
+                pipeline()
+        y_accum.fill_(float("nan"))
+        shrink_out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y_accum, eager, atol=1e-3, rtol=1e-2)

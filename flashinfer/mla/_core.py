@@ -1234,7 +1234,10 @@ def _resolve_dsv4_sparse_mla_backend(
     ] = "auto",
 ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
-    is_sm100_family = cc in ((10, 0), (10, 3))
+    is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
+    # CuTe DSL HCA and the SM100 CAKE kernels require SM100/SM103;
+    # only the prebuilt cubin backend additionally covers SM107.
+    is_sm100_or_sm103 = cc in ((10, 0), (10, 3))
     is_sm120_family = cc in ((12, 0), (12, 1))
     if requested_backend == "auto":
         if is_sm120_family:
@@ -1242,7 +1245,7 @@ def _resolve_dsv4_sparse_mla_backend(
         if is_sm100_family:
             return "trtllm-gen"
         raise ValueError(
-            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103 via "
+            "trtllm_batch_decode_sparse_mla_dsv4 supports SM100/SM103/SM107 via "
             f"TRTLLM-GEN or SM120/SM121 via sparse backend, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend not in ("trtllm-gen", "cute-dsl", "sparse", "cake"):
@@ -1250,13 +1253,17 @@ def _resolve_dsv4_sparse_mla_backend(
             "backend must be one of 'auto', 'trtllm-gen', 'cute-dsl', "
             f"'sparse', or 'cake', got {requested_backend!r}"
         )
-    if requested_backend in ("trtllm-gen", "cute-dsl") and not is_sm100_family:
+    if requested_backend == "trtllm-gen" and not is_sm100_family:
         raise ValueError(
-            f"backend={requested_backend!r} requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+            f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
+        )
+    if requested_backend == "cute-dsl" and not is_sm100_or_sm103:
+        raise ValueError(
+            f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
-    if requested_backend == "cake" and not (is_sm100_family or is_sm120_family):
+    if requested_backend == "cake" and not (is_sm100_or_sm103 or is_sm120_family):
         raise ValueError(
             f"backend='cake' requires SM100/SM103 or SM120/SM121, got SM{cc[0]}{cc[1]}"
         )
@@ -1829,7 +1836,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
 
     The implementation is selected from the query device architecture.
 
-    On SM100/SM103, this calls the TRTLLM-GEN DeepSeek V4 sparse MLA kernels.
+    On SM100/SM103/SM107, this calls the prebuilt DeepSeek V4 sparse MLA cubins.
     The query and both KV pools use head dim 512. The query may be BF16 or
     per-tensor FP8 E4M3 and the default output is BF16. When
     ``dsv4_inv_rope_cos_sin_cache`` is provided, the fixed TRTLLM-GEN
@@ -1860,7 +1867,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     query/KV tensors and produces BF16 output.
 
     With ``backend="cake"`` on SM120/SM121 and ``kv_cache_format="nvfp4"``,
-    this calls the Cake SM120 NVFP4 sparse-MLA decode kernels through the
+    this calls the Cake SM120 NVFP4 sparse-MLA kernels through the
     SM120 ``"sparse"`` call surface (``swa_topk_lens``, optional
     ``compressed_kv_cache`` + ``extra_sparse_indices`` /
     ``extra_sparse_topk_lens``, ``sinks``, HND / NHD / 3-D packed caches).
@@ -1869,6 +1876,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     96, 112 and 128 query heads; ``workspace_buffer`` holds the split-K
     partials and the LSE (size it with
     :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes`).
+    Every call runs either the split decode kernel or the single-launch
+    prefill kernel (one CTA per token and head block over all of its
+    candidates, no split scratch) as chosen by
+    :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`
+    from the measured crossover of the two sm_120a SKUs.
 
     With ``backend="cake"`` on SM100/SM103, this calls the source-level CAKE
     kernels (``flashinfer.mla.cake_dsv4``). The metadata may describe fewer
@@ -1900,8 +1912,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     query : torch.Tensor
         Dense query input ``[batch_size, q_len_per_request, num_heads, 512]``
         or varlen query input ``[sum_q, num_heads, 512]`` when
-        ``cum_seq_lens_q`` is provided. SM100/SM103 accepts BF16 or FP8 E4M3;
-        SM120/SM121 accepts BF16.
+        ``cum_seq_lens_q`` is provided. SM100/SM103/SM107 accept BF16 or FP8
+        E4M3; SM120/SM121 accepts BF16.
     swa_kv_cache : torch.Tensor
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses an opaque
         packed uint8 record with last dimension 584 (FP8), 528 (DSV4.1 FP8) or
@@ -1993,7 +2005,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``sparse_topk_lens_offset``).
     backend : {"auto", "trtllm-gen", "cute-dsl", "sparse", "cake"}
         Backend selection. ``"auto"`` preserves the architecture-based default:
-        TRTLLM-GEN on SM100/SM103 and sparse on SM120/SM121. HCA is selected
+        the prebuilt cubins on SM100/SM103/SM107 and sparse on SM120/SM121. HCA is selected
         only when ``"cute-dsl"`` is requested explicitly. Source-level CAKE
         kernels are selected only when ``"cake"`` is requested explicitly: on
         SM100/SM103 the FP8/BF16 DSv4 family, on SM120/SM121 the NVFP4 DSv4

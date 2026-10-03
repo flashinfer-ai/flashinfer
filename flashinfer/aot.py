@@ -121,7 +121,9 @@ from .jit.bgmv_moe import (
 )
 from .jit.cake_bgmv_moe import (
     CAKE_BGMV_MOE_DTYPES,
+    CAKE_BGMV_MOE_GENERIC_RANKS,
     CAKE_BGMV_MOE_HIDDEN_SIZES,
+    gen_cake_bgmv_moe_generic_module,
     gen_cake_bgmv_moe_module,
 )
 from .jit.monomoe import gen_monomoe_module
@@ -820,6 +822,11 @@ def gen_all_modules(
                     for hidden_size in CAKE_BGMV_MOE_HIDDEN_SIZES
                     for dtype in CAKE_BGMV_MOE_DTYPES
                 )
+                jit_specs.extend(
+                    gen_cake_bgmv_moe_generic_module(rank, dtype, cake_bgmv_arch)
+                    for rank in CAKE_BGMV_MOE_GENERIC_RANKS
+                    for dtype in CAKE_BGMV_MOE_DTYPES
+                )
         if sm_capabilities.get("sm100a_exact", False):
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
@@ -1128,7 +1135,7 @@ def gen_all_modules(
     # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
     if has_sm120 or has_sm121:
         jit_specs.append(gen_sparse_mla_sm120_module())
-        # Cake DSv4 NVFP4 sparse-MLA decode (backend="cake" on SM120/SM121).
+        # Cake DSv4 NVFP4 sparse-MLA decode + prefill (backend="cake" on SM120/SM121).
         jit_specs.append(gen_cake_sparse_mla_sm120_dsv4_nvfp4_module())
 
     # Add cuDNN FMHA module
