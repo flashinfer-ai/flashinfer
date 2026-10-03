@@ -13,6 +13,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.usefixtures("isolated_pytest_addopts")
 def test_pytest_timeout_plugin_enforces_marked_deadline(tmp_path: Path) -> None:
     test_file = tmp_path / "test_timeout.py"
     test_file.write_text(
