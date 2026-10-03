@@ -11293,6 +11293,40 @@ def get_fp8_blockscale_gemm_runner_sm90():
     return module.init()
 
 
+def _fp8_blockscale_sm90_input_scale(
+    input_scale: torch.Tensor, m: int, k_blocks: int
+) -> torch.Tensor:
+    """Return the (M, K // 128) input scales with strides (1, ceil(M / 4) * 4),
+    the M-major TMA-aligned layout the SM90 kernel reads through a raw pointer.
+    """
+    if input_scale.shape != (m, k_blocks):
+        hint = ""
+        if input_scale.shape == (k_blocks, m):
+            hint = (
+                ". For a (K // 128, M) M-major buffer, pass input_scale.T, "
+                "which is used without a copy"
+            )
+        raise ValueError(
+            f"input_scale shape mismatch. Expected ({m}, {k_blocks}) "
+            f"(per-token, 1x128 blocks), got {tuple(input_scale.shape)}{hint}"
+        )
+    # The kernel's TMA descriptor spans aligned_m rows in every K block, so the
+    # padded rows must be inside the tensor's storage as well.
+    aligned_m = (m + 3) // 4 * 4
+    storage_numel = input_scale.untyped_storage().nbytes() // input_scale.element_size()
+    if (
+        (m == 1 or input_scale.stride(0) == 1)
+        and (k_blocks == 1 or input_scale.stride(1) == aligned_m)
+        and input_scale.storage_offset() + k_blocks * aligned_m <= storage_numel
+    ):
+        return input_scale
+    aligned = torch.empty(
+        k_blocks * aligned_m, dtype=input_scale.dtype, device=input_scale.device
+    ).as_strided((m, k_blocks), (1, aligned_m))
+    aligned.copy_(input_scale)
+    return aligned
+
+
 @flashinfer_api(trace=fp8_blockscale_gemm_sm90_trace)
 def fp8_blockscale_gemm_sm90(
     input: torch.Tensor,
@@ -11317,15 +11351,24 @@ def fp8_blockscale_gemm_sm90(
     Parameters
     ----------
     input : torch.Tensor
-        Input activation tensor of shape (M, K).
-        - BF16 (torch.bfloat16) with internal quantization
+        Input activation tensor of shape (M, K). Can be:
+        - BF16 (torch.bfloat16), quantized internally with 1x128 block scales
+        - FP8 (torch.float8_e4m3fn) with input_scale required
     weight : torch.Tensor
         Weight tensor of shape (N, K). Can be:
         - FP8 (torch.float8_e4m3fn) with weight_scale required
-        - BF16 (torch.bfloat16) for internal quantization
+        - BF16 (torch.bfloat16), quantized internally with 128x128 block scales
     input_scale : torch.Tensor, optional
+        Per-token (1x128 block) float32 dequantization scales of shape (M, K // 128).
+        Required if input is FP8, must be None if input is BF16. The kernel reads
+        them M-major with the M stride rounded up to a multiple of 4, i.e. strides
+        (1, ceil(M / 4) * 4). A tensor already in that layout is used without a
+        copy; any other layout (for example the row-major output of
+        ``per_token_cast_to_fp8``) is copied into it first.
     weight_scale : torch.Tensor, optional
-        Scaling factors for weight. Required if weight is FP8.
+        Per-block (128x128) float32 dequantization scales of shape
+        (ceil(N / 128), K // 128). Required if weight is FP8, must be None if weight
+        is BF16. Per-token (N, K // 128) weight scales are not supported.
     out : torch.Tensor, optional
         Output tensor of shape (M, N). If None, will be allocated.
     out_dtype : torch.dtype, optional
@@ -11348,21 +11391,18 @@ def fp8_blockscale_gemm_sm90(
     >>> output = fp8_blockscale_gemm_sm90(input_bf16, weight_bf16)
     >>> print(output.shape)  # torch.Size([16, 4096])
     >>>
-    >>> # Mixed: BF16 input + FP8 weight
-    >>> from flashinfer.testing.utils import per_token_cast_to_fp8
-    >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
-    >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
-    >>> weight_fp8, weight_scale = per_token_cast_to_fp8(weight_bf16)
+    >>> # Mixed: BF16 input + FP8 weight with 128x128 block scales
+    >>> from flashinfer.testing.utils import per_block_cast_to_fp8
+    >>> weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
+    >>> # weight_scale has shape (N // 128, K // 128)
     >>> output = fp8_blockscale_gemm_sm90(input_bf16, weight_fp8, None, weight_scale)
     >>> print(output.shape)  # torch.Size([16, 4096])
     >>>
-    >>> # FP8 weight with 128x128 block scales
-    >>> from flashinfer.testing.utils import per_block_cast_to_fp8
-    >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
-    >>> weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
-    >>> # weight_scale has shape (N // 128, K // 128)
-    >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
-    >>> output = fp8_blockscale_gemm_sm90(input_bf16, weight_fp8, None, weight_scale)
+    >>> # W8A8: FP8 input with 1x128 scales + FP8 weight with 128x128 block scales
+    >>> from flashinfer.testing.utils import per_token_cast_to_fp8
+    >>> input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
+    >>> # input_scale has shape (M, K // 128)
+    >>> output = fp8_blockscale_gemm_sm90(input_fp8, weight_fp8, input_scale, weight_scale)
     >>> print(output.shape)  # torch.Size([16, 4096])
     Notes
     -----
@@ -11370,10 +11410,8 @@ def fp8_blockscale_gemm_sm90(
     - SwapAB kernel is automatically used when M < 32 (threshold)
     - For FP8 inputs, scaling factors must be provided
     - For BF16 inputs, quantization and scaling happen internally
-    - Weight scales support two granularities:
-      * Per-token (1x128 blocks): (N, K//128)
-      * Per-block (128x128 blocks): (N//128, K//128)
-    - Input scales only support per-token format: (M, K//128)
+    - Scale granularity is fixed by the kernel: 1x128 for the input and 128x128
+      for the weight
     - The function uses DeepGEMM backend with JIT compilation
     """
     # Validate architecture support
@@ -11429,6 +11467,7 @@ def fp8_blockscale_gemm_sm90(
                 f"input_scale device mismatch. Expected {input.device}, "
                 f"got {input_scale.device}"
             )
+        input_scale = _fp8_blockscale_sm90_input_scale(input_scale, M, K // BLOCK_SIZE)
     else:
         if not input_is_bf16:
             raise ValueError(
@@ -11444,19 +11483,25 @@ def fp8_blockscale_gemm_sm90(
     if weight_is_fp8:
         if weight_scale is None:
             raise ValueError("weight_scale is required when weight is FP8. ")
-        expected_per_token_shape = (N, K // BLOCK_SIZE)
-        expected_per_block_shape = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE, K // BLOCK_SIZE)
-        is_per_token = weight_scale.shape == expected_per_token_shape
-        is_per_block = weight_scale.shape == expected_per_block_shape
-
-        if not (is_per_token or is_per_block):
+        expected_shape = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE, K // BLOCK_SIZE)
+        if weight_scale.shape != expected_shape:
+            if weight_scale.shape == (N, K // BLOCK_SIZE):
+                raise ValueError(
+                    f"Per-token (1x128) weight_scale of shape "
+                    f"{tuple(weight_scale.shape)} is not supported: the kernel applies "
+                    "one scale per 128x128 weight block. Quantize the weight with "
+                    "128x128 blocks (for example "
+                    "flashinfer.testing.utils.per_block_cast_to_fp8) to get a "
+                    f"weight_scale of shape {expected_shape}."
+                )
             raise ValueError(
-                f"weight_scale shape mismatch. Expected either {expected_per_token_shape} "
-                f"(per-token, 1x128 blocks) or {expected_per_block_shape} "
-                f"(per-block, 128x128 blocks), got {weight_scale.shape}"
+                f"weight_scale shape mismatch. Expected {expected_shape} "
+                f"(per-block, 128x128 blocks), got {tuple(weight_scale.shape)}"
             )
         if weight_scale.dtype != torch.float32:
             raise ValueError(f"weight_scale must be float32, got {weight_scale.dtype}")
+        # The kernel indexes weight_scale as a dense row-major array.
+        weight_scale = weight_scale.contiguous()
     else:
         if not weight_is_bf16:
             raise ValueError(

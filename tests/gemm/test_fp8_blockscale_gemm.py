@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 import flashinfer
 from flashinfer.gemm import fp8_blockscale_gemm_sm90
-from flashinfer.testing.utils import per_token_cast_to_fp8
+from flashinfer.testing.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
 from flashinfer.utils import (
     get_compute_capability,
     has_flashinfer_jit_cache,
@@ -39,6 +39,22 @@ def warmup_jit():
         jit_specs = [gen_fp8_blockscale_gemm_sm90_module()]
         flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
     yield
+
+
+def _dequant_1x128(x_fp8, scale):
+    """Dequantize with per-token (M, K // 128) scales."""
+    return x_fp8.float() * scale.float().repeat_interleave(128, dim=1)
+
+
+def _dequant_128x128(x_fp8, scale):
+    """Dequantize with per-block (ceil(N / 128), K // 128) scales."""
+    n, k = x_fp8.shape
+    scale = scale.float().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    return x_fp8.float() * scale[:n, :k]
+
+
+def _rel_err(out, ref):
+    return ((out.float() - ref).norm() / ref.norm()).item()
 
 
 @pytest.mark.parametrize("m", [1, 16, 32, 64, 128])
@@ -104,14 +120,9 @@ def test_fp8_blockscale_gemm_dtypes(m, n, k, input_dtype, weight_dtype):
     """Test the 2 recommended dtype combinations with proper FP8 quantization.
 
     Uses quantization from flashinfer.testing.utils:
-    - per_token_cast_to_fp8: 1x128 block quantization (for both input and weight)
-
-    Note: Both input and weight use per_token (1x128 blocks).
-    The API expects scale shape (N, K//128), which per_token provides.
-
-    These utilities return scales in the correct format (reciprocals) that
-    match TRT-LLM's kernel expectations. For kernel reference,
-    see csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
+    - per_token_cast_to_fp8: 1x128 block quantization for the input
+    - per_block_cast_to_fp8: 128x128 block quantization for the weight,
+      giving the (N // 128, K // 128) weight scales the kernel expects
     """
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability[0] < 9:
@@ -144,7 +155,7 @@ def test_fp8_blockscale_gemm_dtypes(m, n, k, input_dtype, weight_dtype):
 
     # Quantize weight
     if weight_dtype == torch.float8_e4m3fn:
-        weight_tensor, weight_scale = per_token_cast_to_fp8(weight_bf16)
+        weight_tensor, weight_scale = per_block_cast_to_fp8(weight_bf16)
     else:
         weight_tensor, weight_scale = weight_bf16, None
 
@@ -178,7 +189,7 @@ def test_fp8_blockscale_gemm_dtypes(m, n, k, input_dtype, weight_dtype):
 @pytest.mark.parametrize("k", [512, 4096])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_fp8_blockscale_gemm_w8a8(m, n, k, input_dtype):
-    """Test W8A8 (FP8+FP8) GEMM with per-token scales for both input and weight.
+    """Test W8A8 (FP8+FP8) GEMM with 1x128 input and 128x128 weight scales.
 
     This test demonstrates full FP8 quantization for both activations and weights.
     """
@@ -204,54 +215,31 @@ def test_fp8_blockscale_gemm_w8a8(m, n, k, input_dtype):
         (torch.rand(n, k, dtype=torch.bfloat16, device=device) - 0.5) * 2 * fp8_max
     )
 
-    # Quantize both input and weight to FP8 with per-token (1x128) scales
+    # Quantize the input with 1x128 scales and the weight with 128x128 scales
     input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
-    weight_fp8, weight_scale = per_token_cast_to_fp8(weight_bf16)
+    weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
 
     # Verify scale shapes
     assert input_scale.shape == (m, k // 128), (
         f"Expected input scale shape ({m}, {k // 128}), got {input_scale.shape}"
     )
-    assert weight_scale.shape == (n, k // 128), (
-        f"Expected weight scale shape ({n}, {k // 128}), got {weight_scale.shape}"
+    assert weight_scale.shape == (n // 128, k // 128), (
+        f"Expected weight scale shape ({n // 128}, {k // 128}), got {weight_scale.shape}"
     )
     assert input_scale.min() > 0, "Input scale should be positive"
     assert weight_scale.min() > 0, "Weight scale should be positive"
 
-    M_padded = ((m + 4 - 1) // 4) * 4  # Round M up to multiple of 4
-    K_blocks = k // 128
-
     if input_dtype == torch.float8_e4m3fn:
-        # Create padded tensor with the stride TRT-LLM expects
-        input_scale_padded = torch.zeros(
-            K_blocks, M_padded, dtype=torch.float32, device=device
-        )
-        input_scale_padded[:, :m] = input_scale.T
-        input_scale_padded = input_scale_padded[:, :m]
-
         output = fp8_blockscale_gemm_sm90(
-            input_fp8, weight_fp8, input_scale_padded, weight_scale
+            input_fp8, weight_fp8, input_scale, weight_scale
         )
         # Dequantize FP8 tensors to create reference (tests kernel correctness, not quantization)
-        # Dequant: bf16 = fp8.to(bf16) * scale (applied per 128-element block)
-        input_dequant = torch.zeros_like(input_bf16)
-        for i in range(m):
-            for k_tile in range(k // 128):
-                start, end = k_tile * 128, (k_tile + 1) * 128
-                input_dequant[i, start:end] = (
-                    input_fp8[i, start:end].to(torch.bfloat16) * input_scale[i, k_tile]
-                )
+        input_dequant = _dequant_1x128(input_fp8, input_scale)
     else:
         output = fp8_blockscale_gemm_sm90(input_bf16, weight_fp8, None, weight_scale)
-        input_dequant = input_bf16
+        input_dequant = input_bf16.float()
 
-    weight_dequant = torch.zeros_like(weight_bf16)
-    for j in range(n):
-        for k_tile in range(k // 128):
-            start, end = k_tile * 128, (k_tile + 1) * 128
-            weight_dequant[j, start:end] = (
-                weight_fp8[j, start:end].to(torch.bfloat16) * weight_scale[j, k_tile]
-            )
+    weight_dequant = _dequant_128x128(weight_fp8, weight_scale)
 
     reference = torch.matmul(input_dequant, weight_dequant.T)
 
@@ -354,6 +342,169 @@ def test_fp8_blockscale_gemm_error_handling():
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="FP8 input.*BF16 weight.*not supported"):
         fp8_blockscale_gemm_sm90(input_fp8, weight, input_scale, None)
+
+
+def _input_scale_in_layout(scale, layout):
+    """Return per-token (M, K // 128) scales with the same values in another layout."""
+    m, k_blocks = scale.shape
+    if layout == "row_major":  # per_token_cast_to_fp8 output
+        return scale.contiguous()
+    if layout == "m_major_tma_aligned":  # strides (1, ceil(M / 4) * 4), read as is
+        aligned_m = (m + 3) // 4 * 4
+        buf = torch.zeros(k_blocks, aligned_m, dtype=scale.dtype, device=scale.device)
+        buf[:, :m] = scale.T
+        return buf.T[:m]
+    if layout == "m_major_unaligned":  # strides (1, M)
+        return scale.T.contiguous().T
+    if layout == "strided":
+        buf = torch.zeros(m, 2 * k_blocks, dtype=scale.dtype, device=scale.device)
+        buf[:, ::2] = scale
+        return buf[:, ::2]
+    raise ValueError(layout)
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 256, 512),
+        (4, 256, 512),  # M == K // 128
+        (7, 192, 1024),  # M % 4 != 0, N % 128 != 0
+        (32, 256, 4096),  # M == K // 128
+        (130, 1024, 1024),
+        (7, 256, 128),  # K // 128 == 1, M % 4 != 0
+    ],
+)
+@pytest.mark.parametrize(
+    "input_layout",
+    ["bf16", "row_major", "m_major_tma_aligned", "m_major_unaligned", "strided"],
+)
+@pytest.mark.parametrize("weight_scale_contiguous", [True, False])
+def test_fp8_blockscale_gemm_scale_layouts(
+    m, n, k, input_layout, weight_scale_contiguous
+):
+    """Every supported input/weight scale layout must match an fp32 reference.
+
+    Magnitudes vary per 1x128 block so that a scale read from the wrong
+    position changes the result.
+    """
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] < 9:
+        pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
+
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
+
+    device = "cuda"
+    torch.manual_seed(0)
+
+    def randn_varied(rows, cols):
+        mag = torch.exp2(
+            torch.randint(-3, 4, (rows, cols // 128), device=device).float()
+        )
+        x = torch.randn(rows, cols, device=device) * mag.repeat_interleave(128, dim=1)
+        return x.to(torch.bfloat16)
+
+    input_bf16 = randn_varied(m, k)
+    weight_fp8, weight_scale = per_block_cast_to_fp8(randn_varied(n, k))
+    weight_dequant = _dequant_128x128(weight_fp8, weight_scale)
+    if not weight_scale_contiguous:
+        weight_scale = weight_scale.T.contiguous().T
+
+    if input_layout == "bf16":
+        output = fp8_blockscale_gemm_sm90(input_bf16, weight_fp8, None, weight_scale)
+        reference = input_bf16.float() @ weight_dequant.T
+        # Includes the error of the kernel's internal FP8 input quantization.
+        tol = 5e-2
+    else:
+        input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
+        output = fp8_blockscale_gemm_sm90(
+            input_fp8,
+            weight_fp8,
+            _input_scale_in_layout(input_scale, input_layout),
+            weight_scale,
+        )
+        reference = _dequant_1x128(input_fp8, input_scale) @ weight_dequant.T
+        tol = 1e-2
+
+    err = _rel_err(output, reference)
+    assert err < tol, f"relative error {err:.4f} (tolerance {tol})"
+
+
+@pytest.mark.parametrize("m,n,k", [(7, 256, 512), (64, 1024, 1024)])
+def test_fp8_blockscale_gemm_unsupported_scale_layouts(m, n, k):
+    """Scale layouts the kernel cannot read must raise instead of being misread."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] < 9:
+        pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
+
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
+
+    device = "cuda"
+    torch.manual_seed(0)
+    input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    weight_bf16 = torch.randn(n, k, device=device, dtype=torch.bfloat16)
+    input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
+    weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
+
+    # Per-token (1x128) weight scales: the kernel only applies 128x128 scales.
+    weight_fp8_tok, weight_scale_tok = per_token_cast_to_fp8(weight_bf16)
+    with pytest.raises(ValueError, match="Per-token .*weight_scale.*not supported"):
+        fp8_blockscale_gemm_sm90(input_bf16, weight_fp8_tok, None, weight_scale_tok)
+    with pytest.raises(ValueError, match="Per-token .*weight_scale.*not supported"):
+        fp8_blockscale_gemm_sm90(
+            input_fp8, weight_fp8_tok, input_scale, weight_scale_tok
+        )
+
+    # Other weight scale shapes and dtypes.
+    with pytest.raises(ValueError, match="weight_scale shape mismatch"):
+        fp8_blockscale_gemm_sm90(
+            input_bf16, weight_fp8, None, weight_scale.repeat_interleave(2, dim=1)
+        )
+    with pytest.raises(ValueError, match="weight_scale must be float32"):
+        fp8_blockscale_gemm_sm90(
+            input_bf16, weight_fp8, None, weight_scale.to(torch.bfloat16)
+        )
+
+    # Input scales must be (M, K // 128), including not the transposed shape.
+    with pytest.raises(ValueError, match="pass input_scale.T"):
+        fp8_blockscale_gemm_sm90(input_fp8, weight_fp8, input_scale.T, weight_scale)
+    with pytest.raises(ValueError, match="input_scale shape mismatch"):
+        fp8_blockscale_gemm_sm90(
+            input_fp8,
+            weight_fp8,
+            input_scale.repeat_interleave(2, dim=1),
+            weight_scale,
+        )
+    with pytest.raises(ValueError, match="input_scale must be float32"):
+        fp8_blockscale_gemm_sm90(
+            input_fp8, weight_fp8, input_scale.to(torch.bfloat16), weight_scale
+        )
+
+
+@pytest.mark.parametrize("m,k_blocks", [(7, 1), (1, 4), (7, 3), (8, 2)])
+def test_fp8_blockscale_gemm_input_scale_padded_storage(m, k_blocks):
+    """Input scales used without a copy must have storage for the padded rows.
+
+    The kernel's TMA load reads ceil(M / 4) * 4 rows in every K block.
+    """
+    from flashinfer.gemm.gemm_base import _fp8_blockscale_sm90_input_scale
+
+    aligned_m = (m + 3) // 4 * 4
+    scale = torch.rand(m, k_blocks, device="cuda") + 0.5
+    padded = torch.zeros(k_blocks, aligned_m, device="cuda")
+    padded[:, :m] = scale.T
+    for layout in [scale.contiguous(), scale.T.contiguous().T, padded.T[:m]]:
+        out = _fp8_blockscale_sm90_input_scale(layout, m, k_blocks)
+        assert torch.equal(out, scale)
+        assert out.stride(0) == 1 or m == 1
+        assert out.stride(1) == aligned_m or k_blocks == 1
+        storage_numel = out.untyped_storage().nbytes() // out.element_size()
+        assert out.storage_offset() + k_blocks * aligned_m <= storage_numel
+    # Already padded: used as is.
+    assert _fp8_blockscale_sm90_input_scale(padded.T[:m], m, k_blocks).data_ptr() == (
+        padded.data_ptr()
+    )
 
 
 def test_fp8_blockscale_gemm_output_buffer():

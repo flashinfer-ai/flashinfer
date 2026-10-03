@@ -127,18 +127,15 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
     if (weight_is_fp8) {
       TVM_FFI_ICHECK(scales_b.has_value() && scales_b.value().data_ptr() != nullptr)
           << "scales_b is required for FP8 weight";
-      // Validate scale shape: should be (N, K/128) for per-token or (N/128, K/128) for per-block
+      // The kernel applies one scale per 128x128 weight block: (N/128, K/128), rounded up.
+      int64_t expected_scale_n = (shape_n + 127) / 128;
       int64_t expected_scale_k = (shape_k + 127) / 128;
       int64_t scale_dim0 = scales_b.value().size(0);
       int64_t scale_dim1 = scales_b.value().size(1);
 
-      bool is_per_token = (scale_dim0 == shape_n && scale_dim1 == expected_scale_k);
-      bool is_per_block = (scale_dim0 == (shape_n + 127) / 128 && scale_dim1 == expected_scale_k);
-
-      TVM_FFI_ICHECK(is_per_token || is_per_block)
-          << "scales_b shape mismatch: expected (" << shape_n << ", " << expected_scale_k
-          << ") for per-token or (" << ((shape_n + 127) / 128) << ", " << expected_scale_k
-          << ") for per-block, got (" << scale_dim0 << ", " << scale_dim1 << ")";
+      TVM_FFI_ICHECK(scale_dim0 == expected_scale_n && scale_dim1 == expected_scale_k)
+          << "scales_b shape mismatch: expected (" << expected_scale_n << ", " << expected_scale_k
+          << ") per-block (128x128) scales, got (" << scale_dim0 << ", " << scale_dim1 << ")";
     }
 
     // Extract scale pointers
