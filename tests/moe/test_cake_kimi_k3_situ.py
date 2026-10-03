@@ -80,6 +80,34 @@ def test_cake_situ_workspace_size_holds_every_smaller_shape():
     assert _workspace_size(max_num_tokens=100) >= _workspace_size(max_num_tokens=64)
 
 
+def test_cake_situ_n32_route_uses_the_cluster_router():
+    # GPU-free: the 512/1024-token sequence of each architecture lists exactly one
+    # routing kernel source, and it declares the eight-CTA cluster the runtime launches.
+    from flashinfer.fused_moe.cake_kimi_k3_situ import _ROUTE_MC_CLUSTER
+    from flashinfer.jit.cake_kimi_k3_situ import (
+        PROGRAMS,
+        ROUTES,
+        _source_path,
+        cake_situ_sequence,
+    )
+
+    for arch in ("sm_100a", "sm_103a"):
+        key = cake_situ_sequence(arch, 32, False, False, n32_claim8=True)
+        assert key == ROUTES[(arch, "n32_claim8")]
+        kernels = [
+            source
+            for source in PROGRAMS[key]["sources"]
+            if source.endswith("_kernel.cu")
+        ]
+        clustered = [
+            source
+            for source in kernels
+            if f"__cluster_dims__({_ROUTE_MC_CLUSTER},1,1)"
+            in _source_path(source).read_text()
+        ]
+        assert len(clustered) == 1, (arch, kernels)
+
+
 @pytest.fixture(scope="module")
 def cake_situ_device():
     if not torch.cuda.is_available():
@@ -216,12 +244,20 @@ def _trtllm_reference(x, ids, route_weights, prepared):
 
 
 @pytest.mark.parametrize(
-    "num_tokens",
-    [64, 256, 512, 2048],
-    ids=["n8", "n16", "n32", "n128"],
+    "num_tokens, routing",
+    [
+        (64, "uniform"),
+        (256, "uniform"),
+        (512, "uniform"),
+        (2048, "uniform"),
+        (512, "skew"),
+        (1024, "skew"),
+    ],
+    ids=["n8", "n16", "n32", "n128", "n32_skew", "n64_skew"],
 )
 def test_cake_situ_output_workspace_and_external_graph(
     num_tokens,
+    routing,
     cake_situ_device,
     cake_situ_weights,
     cake_situ_workspace,
@@ -241,7 +277,14 @@ def test_cake_situ_output_workspace_and_external_graph(
     )
     slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
     tokens = torch.arange(num_tokens, dtype=torch.int32, device=device)
-    ids = ((tokens[:, None] * TOP_K + slots[None, :]) % EXPERTS).contiguous()
+    if routing == "uniform":
+        ids = ((tokens[:, None] * TOP_K + slots[None, :]) % EXPERTS).contiguous()
+    else:
+        # Heavy expert skew for the clustered 512- and 1024-token routes: every
+        # token picks one of four disjoint 16-expert groups, so 64 experts each
+        # receive num_tokens / 4 rows (several 32-row tiles per expert span) and
+        # the other 832 experts receive none.
+        ids = ((tokens[:, None] % 4) * TOP_K + slots[None, :]).contiguous()
     route_weights = (
         torch.randn(
             num_tokens,
@@ -288,9 +331,15 @@ def test_cake_situ_output_workspace_and_external_graph(
             **activation_kwargs,
         )
 
-    with pytest.raises(ValueError, match="prepar"):
-        submit()
-    assert torch.isnan(output).all()
+    # The module-scoped workspace keeps every prepared shape; a token count that an
+    # earlier case already prepared (the skewed 512-token case follows the round-robin
+    # one) is served without a fresh prepare, so the unprepared-shape rejection is
+    # asserted on the first case of each token count only.
+    state = getattr(workspace, "_flashinfer_cake_situ_workspace", None)
+    if state is None or num_tokens not in state["shapes"]:
+        with pytest.raises(ValueError, match="prepar"):
+            submit()
+        assert torch.isnan(output).all()
     assert (
         cake_fused_moe_prepare_workspace(
             workspace,
@@ -300,6 +349,13 @@ def test_cake_situ_output_workspace_and_external_graph(
         )
         is workspace
     )
+    # The 512- and 1024-token routes run the routing kernel as one eight-CTA
+    # cluster over a seven-row FC2 pool; every other row keeps its route.
+    prepared_shape = workspace._flashinfer_cake_situ_workspace["shapes"][num_tokens]
+    assert prepared_shape["n32_claim8"] is (num_tokens in (512, 1024))
+    if prepared_shape["n32_claim8"]:
+        assert prepared_shape["fc2_grid_n"] == 7
+        assert prepared_shape["fc2_pool_ctas"] == 196
 
     expected = _trtllm_reference(x, ids, route_weights, prepared)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.
