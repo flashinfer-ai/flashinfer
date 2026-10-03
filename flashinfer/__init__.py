@@ -303,6 +303,7 @@ from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
 from .prefill import (
     trtllm_sage_attention_quantize as trtllm_sage_attention_quantize,
 )
+from .vdn import VDNWindowAttentionWrapper as VDNWindowAttentionWrapper
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
 from .rope import apply_llama31_rope as apply_llama31_rope
