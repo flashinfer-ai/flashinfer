@@ -174,6 +174,10 @@ SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 # names; a kernel's argument plan selects from them).  A record with another
 # ``abi`` (a plumbing placeholder program) is not served by this backend.
 ABI_CONTRACT = "lm_head_loss_v1"
+# The hidden valid-row count serves calls of this many chunks or more (``ceil(T / chunk)``): its fixed host cost per call (the
+# plan on the count after the readback, the launches it orders) is hidden behind chunk 0's logits GEMM only from there; one- and
+# two-chunk calls measured 5-16 % slower with it than on the host-count path (same kernels, bitwise the same outputs).
+HIDDEN_COUNT_MIN_CHUNKS = 3
 SUPPORTED_ABIS = (ABI_CONTRACT,)
 
 # Geometry the kernels of a record were built for (record field ``geometry``;
@@ -1259,15 +1263,18 @@ def hidden_count_eligible(
     stats: bool,
 ) -> bool:
     """Whether a compacted call runs the hidden valid-row count: a registered program with the gather kernel and the
-    device-count form of chunk 0's logits GEMM (the raster rule at the buffer extent ``min(chunk, T)``), ``T > 0``,
-    an ``X`` the GEMM reads in place -- a 16-byte row pitch (no contiguous copy) and a 16-byte-aligned base -- and a
-    toolchain whose code for the record's architecture runs the hidden count's schedule
-    (:func:`cake_jit.toolchain_runs_hidden_count`: not nvcc 13.0.x for sm_103a).  Every other call takes the shipped
-    :func:`valid_rows` path."""
+    device-count form of chunk 0's logits GEMM (the raster rule at the buffer extent ``min(chunk, T)``), a call of
+    :data:`HIDDEN_COUNT_MIN_CHUNKS` chunks or more (``ceil(T / chunk) >= 3``: one- and two-chunk calls cannot hide the
+    path's fixed host cost behind chunk 0's logits GEMM and run 5-16 % slower with it), an ``X`` the GEMM reads in
+    place -- a 16-byte row pitch (no contiguous copy) and a 16-byte-aligned base -- and a toolchain whose code for the
+    record's architecture runs the hidden count's schedule (:func:`cake_jit.toolchain_runs_hidden_count`: not nvcc
+    13.0.x for sm_103a).  Every other call takes the shipped :func:`valid_rows` path."""
+    rows, chunk = int(problem.num_rows), int(problem.chunk)
     if (
         record is None
         or module_name is None
-        or int(problem.num_rows) == 0
+        or rows <= 0
+        or (rows + chunk - 1) // chunk < HIDDEN_COUNT_MIN_CHUNKS
         or problem.x_copy
         or X.data_ptr() % 16
     ):

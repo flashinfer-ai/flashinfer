@@ -146,9 +146,14 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   chunk 0's gather and GEMM skipped.  The same kernels per row, so `loss` /
   `logp` / `dX` / `dW` are bitwise the previous path's.  Calls the
   device-count GEMM cannot serve -- an `X` that needs a contiguous copy or
-  whose base is not 16-byte aligned, a program without the kernels -- and
-  every `sm_103a` call on CUDA 13.0 (the toolchain note below) take the
-  previous path; the prepared runner (`prepare_lm_head_loss`) is
+  whose base is not 16-byte aligned, a program without the kernels --, calls
+  of fewer than three chunks (`ceil(T / chunk_size) < 3`,
+  `cake_backend.HIDDEN_COUNT_MIN_CHUNKS`: the path's fixed host cost per call
+  is hidden behind chunk 0's logits GEMM only from three chunks on; one- and
+  two-chunk calls measured 5-16 % slower with it, so, like the dW side
+  stream's `auto` rule, it serves calls of three or more chunks) and every
+  `sm_103a` call on CUDA 13.0 (the toolchain note below) take the previous
+  path; the prepared runner (`prepare_lm_head_loss`) is
   unchanged.  The chunk buffers and the gather buffer exist at the buffer
   extent before the count is known (`memory_report(..., hidden_count=True)`;
   `cake_backend.hidden_count_eligible` / `_hidden_count_begin`).

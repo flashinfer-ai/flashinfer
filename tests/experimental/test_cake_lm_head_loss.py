@@ -3286,12 +3286,14 @@ def test_hidden_count_plan_keys():
 
 def test_hidden_count_eligibility_rules(monkeypatch):
     """A compacted call runs the hidden valid-row count only with a registered program that carries the gather kernel
-    and the device-count form of chunk 0's logits GEMM at the buffer extent's raster, ``T > 0``, an ``X`` the GEMM
-    reads in place (no contiguous copy, a 16-byte-aligned base) and a toolchain whose sm_103a code runs it (not nvcc
-    13.0.x)."""
+    and the device-count form of chunk 0's logits GEMM at the buffer extent's raster, a call of three or more chunks
+    (``HIDDEN_COUNT_MIN_CHUNKS``: one- and two-chunk calls cannot hide the path's fixed host cost behind chunk 0's GEMM
+    and take the previous path), ``T > 0``, an ``X`` the GEMM reads in place (no contiguous copy, a 16-byte-aligned
+    base) and a toolchain whose sm_103a code runs it (not nvcc 13.0.x)."""
     from packaging.version import Version
 
     monkeypatch.setattr(cake_jit, "get_cuda_version", lambda: Version("13.4"))
+    assert cake_backend.HIDDEN_COUNT_MIN_CHUNKS == 3
     name = "cake_lm_head_loss_fake"
 
     def record(*stages):
@@ -3311,29 +3313,44 @@ def test_hidden_count_eligibility_rules(monkeypatch):
     )
     monkeypatch.setitem(cake_jit.MODULES, name, full)
     X = torch.empty(
-        4097, 6144, dtype=torch.bfloat16
-    )  # host tensor: the rule reads the pointer and the stride only
-    p = _problem(4097, 6144, 154880, 4096)
-    assert elig(
-        p, X, full, name, stats=True
-    )  # buffer extent 4096 rows: the g16 device-count form is registered
+        16, 6144, dtype=torch.bfloat16
+    )  # host tensor: the rule reads the pointer only
+    p = _problem(12289, 6144, 154880, 4096)  # four chunks, buffer extent 4096 rows
+    assert elig(p, X, full, name, stats=True)  # the g16 device-count form is registered
     assert not elig(
         p, X, full, name, stats=False
     )  # the long-raster recompute form is missing
-    short = _problem(1500, 6144, 154880, 4096)
+    short = _problem(
+        3100, 6144, 154880, 1024
+    )  # four chunks, buffer extent 1024 rows: the default raster
+    assert elig(short, X, full, name, stats=False)
+    # the chunk rule: a call of fewer than three chunks takes the previous path whatever the program carries
+    assert not elig(
+        _problem(1500, 6144, 154880, 4096), X, full, name, stats=True
+    )  # one chunk
+    assert not elig(
+        _problem(4097, 6144, 154880, 4096), X, full, name, stats=True
+    )  # two chunks
+    assert not elig(
+        _problem(8192, 6144, 154880, 4096), X, full, name, stats=True
+    )  # exactly two
     assert elig(
-        short, X[:1500], full, name, stats=False
-    )  # 1500 rows: the default raster
+        _problem(8193, 6144, 154880, 4096), X, full, name, stats=True
+    )  # three: the first served
+    assert not elig(
+        _problem(2048, 6144, 154880, 1024), X, full, name, stats=True
+    )  # two chunks at C = 1024
+    assert elig(_problem(2049, 6144, 154880, 1024), X, full, name, stats=True)
     assert not elig(p, X, None, None, stats=True)  # no registered program
     assert not elig(_problem(0, 6144, 154880, 4096), X[:0], full, name, stats=True)
     assert not elig(
         replace(p, x_copy=True), X, full, name, stats=True
     )  # X needs a contiguous copy
-    n = 4097 * 6144
-    misaligned = torch.empty(n + 8, dtype=torch.bfloat16)[4 : 4 + n].view(4097, 6144)
+    n = 16 * 6144
+    misaligned = torch.empty(n + 8, dtype=torch.bfloat16)[4 : 4 + n].view(16, 6144)
     assert misaligned.data_ptr() % 16 == 8
     assert not elig(p, misaligned, full, name, stats=True)
-    aligned = torch.empty(n + 8, dtype=torch.bfloat16)[8 : 8 + n].view(4097, 6144)
+    aligned = torch.empty(n + 8, dtype=torch.bfloat16)[8 : 8 + n].view(16, 6144)
     assert aligned.data_ptr() % 16 == 0 and elig(p, aligned, full, name, stats=True)
     without_gather = record("row_grad", "gemm_logits_mcnt", "gemm_logits_mcnt_g16")
     monkeypatch.setitem(cake_jit.MODULES, name, without_gather)
@@ -3341,16 +3358,16 @@ def test_hidden_count_eligibility_rules(monkeypatch):
     without_long = record("row_grad", "gather_rows_bf16", "gemm_logits_mcnt")
     monkeypatch.setitem(cake_jit.MODULES, name, without_long)
     assert not elig(p, X, without_long, name, stats=True)
-    assert elig(short, X[:1500], without_long, name, stats=True)
+    assert elig(short, X, without_long, name, stats=True)
     sm_103a = dict(full, arch="sm_103a")
     monkeypatch.setitem(cake_jit.MODULES, name, sm_103a)
-    assert elig(short, X[:1500], sm_103a, name, stats=True)  # the same rules on sm_103a
+    assert elig(short, X, sm_103a, name, stats=True)  # the same rules on sm_103a
     monkeypatch.setattr(cake_jit, "get_cuda_version", lambda: Version("13.0"))
     assert not elig(
-        short, X[:1500], sm_103a, name, stats=True
+        short, X, sm_103a, name, stats=True
     )  # nvcc 13.0.x: the sm_103a calls take the host-count path
     monkeypatch.setitem(cake_jit.MODULES, name, full)
-    assert elig(short, X[:1500], full, name, stats=True)  # sm_100a is not affected
+    assert elig(short, X, full, name, stats=True)  # sm_100a is not affected
 
 
 _HIDDEN_COUNT_HOST_CASES = [  # (T, C, objective, entry, ignored fraction): three chunks + tail, T < C, T = C + 1, T = C
@@ -4735,7 +4752,8 @@ def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
     hidden = (
         cake_backend.hidden_count_default()
         and cake_jit.toolchain_runs_hidden_count(cake_backend.arch_for(inp.X.device))
-    )  # the effective switch of this eligible call (sm_103a on nvcc 13.0.x takes the host-count path)
+        and cake_backend.HIDDEN_COUNT_MIN_CHUNKS <= (4097 + 4095) // 4096
+    )  # the effective switch of this call: two chunks take the host-count path (the chunk rule), as does sm_103a on nvcc 13.0.x
     kw = dict(objective="ce", loss_div=inp.loss_div, chunk_size=4096)
     with _cache(True) as cache:
         cache.clear()
@@ -5392,12 +5410,21 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
     _require_program(entry="logprob")
     _require_hidden_count()
     name, record = cake_backend.record_for(CUDA, DEFAULT_H, DEFAULT_V)
-    for T, ignore in ((1500, 0.05), (1500, 0.0), (4097, 0.5), (300, 1.0)):
+    # calls of three chunks and more (the chunk rule): some rows ignored, none, most (a count below the buffer
+    # extent), five chunks at half, all ignored
+    cases = (
+        (3100, 1024, 0.05),
+        (3100, 1024, 0.0),
+        (3100, 1024, 0.9),
+        (4097, 1024, 0.5),
+        (2200, 1024, 1.0),
+    )
+    for T, C, ignore in cases:
         inp = make_inputs(
             T, seed=SEED + 62 + T, device=CUDA, W=glm_weight, ignore_frac=ignore
         )
         problem = validate_lm_head_inputs(
-            inp.X, inp.W, inp.labels, chunk_size=4096, entry="logprob"
+            inp.X, inp.W, inp.labels, chunk_size=C, entry="logprob"
         )
         assert cake_backend.hidden_count_eligible(
             problem, inp.X, record, name, stats=True
@@ -5413,7 +5440,7 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
         )
         count = hc.finish()
         n_valid = int(inp.valid.sum())
-        assert count == n_valid and hc.rows0 == min(4096, T) and hc.count == count
+        assert count == n_valid and hc.rows0 == min(C, T) and hc.count == count
         idx = inp.valid.nonzero().reshape(-1)
         assert torch.equal(hc.valid, inp.valid)
         assert torch.equal(hc.idx_full[:count], idx)
@@ -5428,17 +5455,18 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
         assert torch.all(hc.x_c[n0:] == 0)
         if n0 == 0:
             continue
-        # the shipped host-bound GEMM over the same rows (the log-probability forward keeps the logits intact)
+        # the shipped host-bound GEMM over chunk 0's rows (the log-probability forward keeps the logits intact); an
+        # explicit index also when every row is valid: the call has several chunks and only chunk 0 is compared
         runner = prepare_lm_head_loss(
             inp.X,
             inp.W,
             inp.labels,
-            chunk_size=4096,
+            chunk_size=C,
             need_dx=False,
             need_dw=False,
             entry="logprob",
             backend="cake",
-            compact_rows=False if count == T else idx[:n0],
+            compact_rows=idx[:n0],
         )
         assert runner.plan.num_chunks == 1 and runner.plan.chunks[0][1] == n0
         runner.forward()
@@ -5460,9 +5488,10 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
     """The hidden valid-row count on the generated program: switch ``0`` (the count and the index on the host before
     the first launch) and ``1`` (device compaction, chunk 0's gather kernel and device-count logits GEMM queued before
     the count is read) give bitwise the same ``loss`` / ``logp`` / ``dX`` / ``dW`` on both entries over the three
-    outcomes (some rows ignored, none, all) and over one-, two- and three-chunk calls; with the switch on the count is
-    read only after both launches are queued and the host count is never taken; the remembered binding serves the
-    switch."""
+    outcomes (some rows ignored, none, all) and over one-, two-, three- and four-chunk calls -- the count serves three
+    chunks and more (``HIDDEN_COUNT_MIN_CHUNKS``), the shorter calls take the host-count path on either value; with the
+    switch on and a served call the count is read only after both launches are queued and the host count is never
+    taken; the remembered binding serves the switch."""
     _require_program(entry="loss")
     _require_program(entry="logprob")
     _require_hidden_count()
@@ -5500,8 +5529,14 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
         (4097, "ce", 0.05),
         (4097, "ce", 0.5),
         (8700, "ce", 0.05),
+        (8700, "policy", 0.5),
+        (8700, "ce", 1.0),
+        (12289, "ce", 0.05),
     ]
     for T, objective, ignore in cases:
+        hidden = (
+            T + 4095
+        ) // 4096 >= cake_backend.HIDDEN_COUNT_MIN_CHUNKS  # the chunk rule
         inp = make_inputs(
             T,
             objective=objective,
@@ -5517,7 +5552,7 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
             monkeypatch.setattr(
                 cake_backend,
                 "valid_rows",
-                refuse_valid_rows if env == "1" else real_valid_rows,
+                refuse_valid_rows if env == "1" and hidden else real_valid_rows,
             )
             with _cache(False):
                 log.clear()
@@ -5548,7 +5583,7 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
                 and cake_backend.parse_stage(s)[1]["count"]
             ]
             assert (fr.row_index is None) == (n_valid == T)
-            if env == "0":
+            if env == "0" or not hidden:
                 assert gather not in binds and not counted
                 assert not any(kind == "finish" for kind, _ in log)
                 assert fr.memory["hidden_count"] is False
@@ -5586,7 +5621,7 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
     monkeypatch.setattr(cake_backend, "valid_rows", real_valid_rows)
     # the remembered binding of the hidden-count path: a hit is bitwise the validating call
     monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, "1")
-    inp = make_inputs(4097, seed=SEED + 63, device=CUDA, W=glm_weight, ignore_frac=0.05)
+    inp = make_inputs(8193, seed=SEED + 63, device=CUDA, W=glm_weight, ignore_frac=0.05)
     with _cache(True) as cache:
         cache.clear()
         first = _run(inp, 4096, backend="cake", compact_rows=True)
