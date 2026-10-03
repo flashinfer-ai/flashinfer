@@ -14,8 +14,11 @@ includes precomputed routing, fused FC1 activation, FC2 and finalization.
 Alternating measurement order reduces drift. CUPTI reports the elapsed span
 from the first GPU activity to the last activity in one CUDA graph replay,
 including overlapping kernels and gaps. If CUPTI is unavailable, the recorded
-method is CUDA graph timing with events. Cache is not flushed. The report
-contains all samples and paired bootstrap intervals across round medians.
+method is CUDA graph timing with events. The cache policy applies to both
+tactic tuning and timing: the default warm policy does not flush L2, while
+the cold policy flushes before each sample. Tuning uses multiple graph replays
+to select tactics for the same execution regime as timing. The report contains
+all samples and paired bootstrap intervals across round medians.
 """
 
 from __future__ import annotations
@@ -90,6 +93,14 @@ def parse_args():
     parser.add_argument("--rounds", type=int, default=7)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmups", type=int, default=10)
+    parser.add_argument(
+        "--cache-policy",
+        choices=("warm", "cold"),
+        default="warm",
+        help="Use the same L2 policy for tactic selection and measured samples.",
+    )
+    parser.add_argument("--tuning-graph-replays", type=int, default=20)
+    parser.add_argument("--tuning-repeat", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1091)
     parser.add_argument("--pdl", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cupti", action=argparse.BooleanOptionalAction, default=True)
@@ -110,6 +121,8 @@ def parse_args():
             args.rounds,
             args.iterations,
             args.warmups,
+            args.tuning_graph_replays,
+            args.tuning_repeat,
         )
         <= 0
     ):
@@ -122,6 +135,8 @@ def parse_args():
         parser.error("Step limits must be positive and finite")
     if args.rounds < 3 or args.regression_threshold < 0:
         parser.error("require rounds >= 3 and regression-threshold >= 0")
+    if args.cache_policy == "cold" and not args.cupti:
+        parser.error("cold graph timing requires CUPTI to flush L2 before each sample")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error("output-dir must be empty or absent")
     return args
@@ -209,12 +224,23 @@ def make_candidate(
     packed = runner.pack_inputs(act, native)
     launch_kwargs = runner.launch_kwargs_for(packed)
     tuner = AutoTuner.get()
+    # The production runner profiles cold L2 by default. This benchmark's
+    # sustained graph timing needs tactics selected under the same cache
+    # policy; change only the copied config, preserving its input/routing rules.
+    tuning_config = dataclasses.replace(
+        runner.tuning_config_for(packed),
+        use_cuda_graph=True,
+        use_cold_l2_cache=args.cache_policy == "cold",
+        use_cold_l2_graph_replay=False,
+        cuda_graph_profile_replays=args.tuning_graph_replays,
+        profiling_repeat=args.tuning_repeat,
+    )
     with autotune(tuning_buckets=(tokens,)):
         _, tactic = tuner.choose_one(
             custom_op=f"moe_swiglu_stepfun_{runner.backend_key}",
             runners=[runner],
             inputs=packed,
-            tuning_config=runner.tuning_config_for(packed),
+            tuning_config=tuning_config,
             **launch_kwargs,
         )
     # Initialize tactic workspaces before CUDA graph capture.
@@ -239,10 +265,15 @@ def measure(args, candidate):
             repeat_iters=args.iterations,
             enable_cupti=args.cupti,
             use_cuda_graph=True,
-            cold_l2_cache=False,
+            cold_l2_cache=args.cache_policy == "cold",
         )
     messages = [str(w.message) for w in caught]
     fallback = any("Falling back" in message for message in messages)
+    if args.cache_policy == "cold" and fallback:
+        raise RuntimeError(
+            "CUPTI fell back to graph events without an L2 flush; "
+            "cannot measure the requested cold cache policy"
+        )
     method = (
         "cupti_activity_span_cuda_graph"
         if args.cupti and not fallback
@@ -322,8 +353,23 @@ def main():
         "nvcc": command_output("nvcc", "--version"),
         "timing_scope": "native unified runner forward: routing, fused FC1 activation, FC2, finalize; preparation and input quantization excluded",
         "routing": "uniform round-robin expert ids; normalized FP32 weights; UnpackedPrecomputed",
-        "cold_l2_cache": False,
+        "cold_l2_cache": args.cache_policy == "cold",
         "autotune": "independent per activation, precision, token count",
+        "tuning_policy": {
+            "timer": "AutoTuner-selected v1 CUDA graph timer",
+            "requested_timer_environment": os.environ.get("FLASHINFER_AUTOTUNE_TIMER"),
+            "cold_l2_cache": args.cache_policy == "cold",
+            "use_cold_l2_graph_replay": False,
+            "cuda_graph_profile_replays": args.tuning_graph_replays,
+            "profiling_repeat": args.tuning_repeat,
+        },
+        "measurement_policy": {
+            "requested_timer": "cupti" if args.cupti else "cuda_events",
+            "use_cuda_graph": True,
+            "cold_l2_cache": args.cache_policy == "cold",
+            "samples_per_round": args.iterations,
+            "actual_methods": [],
+        },
         "trtllm_gen_bmm_artifact_path": ArtifactPath.TRTLLM_GEN_BMM,
         "trtllm_gen_bmm_expected_checksum_sha256": CheckSumHash.TRTLLM_GEN_BMM,
         "flashinfer_cubin_dir": str(FLASHINFER_CUBIN_DIR),
@@ -382,6 +428,7 @@ def main():
         {f"step_limit_{limit:g}": SwiGLUStep(limit=limit) for limit in args.step_limits}
     )
     rows = []
+    actual_methods = set()
     with (args.output_dir / "samples.jsonl").open("w") as raw:
         for precision in args.precisions:
             backend, runner_cls, fmt = MODES[precision]
@@ -425,6 +472,7 @@ def main():
                         med = statistics.median(samples)
                         round_medians[name].append(med)
                         methods[name].add(method)
+                        actual_methods.add(method)
                         record = dict(
                             precision=precision,
                             tokens=tokens,
@@ -438,6 +486,9 @@ def main():
                             warnings=messages,
                             hashes=hashes,
                             tactic=candidates[name][2],
+                            cache_policy=args.cache_policy,
+                            tuning_graph_replays=args.tuning_graph_replays,
+                            tuning_repeat=args.tuning_repeat,
                         )
                         raw.write(json.dumps(record, default=json_default) + "\n")
                         raw.flush()
@@ -467,6 +518,9 @@ def main():
                         top_k=args.top_k,
                         step_limit=variants[name].limit,
                         pdl=args.pdl,
+                        cache_policy=args.cache_policy,
+                        tuning_graph_replays=args.tuning_graph_replays,
+                        tuning_repeat=args.tuning_repeat,
                         oai_median_us=statistics.median(oai),
                         step_median_us=statistics.median(step),
                         median_latency_ratio=statistics.median(step)
@@ -502,6 +556,12 @@ def main():
         else None
     )
     metadata["nvidia_smi_after"] = command_output("nvidia-smi")
+    metadata["measurement_policy"]["actual_methods"] = sorted(actual_methods)
+    metadata["tuning_policy"]["actual_timer"] = (
+        "globaltimer_cuda_graph"
+        if AutoTuner.get()._use_global_timer
+        else "cuda_events_cuda_graph"
+    )
     (args.output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, default=json_default) + "\n"
     )
