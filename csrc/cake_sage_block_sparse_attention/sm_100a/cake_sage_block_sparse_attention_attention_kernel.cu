@@ -45,27 +45,8 @@ static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap ali
 #include <cuda_fp8.h>
 
 #define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_SCORES_OFFSET 0
-#define TMEM_PROBS_0_OFFSET 64
-#define TMEM_PROBS_1_OFFSET 192
 #define TMEM_OUTPUT_0_OFFSET 256
 #define TMEM_OUTPUT_1_OFFSET 384
-#define NUM_KV_PIPE_STAGES 4
-#define SMEM_Q_SMEM_OFF 1024
-#define SMEM_Q_SMEM_STAGE_BYTES 8192
-#define SMEM_Q_SMEM_STRIDE 8192
-#define SMEM_KV_SMEM_OFF 9216
-#define SMEM_KV_SMEM_STAGE_BYTES 16384
-#define SMEM_KV_SMEM_STRIDE 16384
-#define SMEM_V_SMEM_OFF 9216
-#define SMEM_V_SMEM_STAGE_BYTES 16384
-#define SMEM_V_SMEM_STRIDE 16384
-#define SMEM_SCALE_SMEM_OFF 74752
-#define SMEM_SCALE_SMEM_STAGE_BYTES 3072
-#define SMEM_SCALE_SMEM_STRIDE 3072
-#define SMEM_TOTAL 77824
-#define THREADS 512
 
 #include <math_constants.h>
 
@@ -1026,7 +1007,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_sage_block_sparse_attention_62c3142a797348e374c0(CakeTensorMap const* q, CakeTensorMap const* k, CakeTensorMap const* v, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale, int* __restrict__ block_index, int* __restrict__ block_nums, int* __restrict__ block_sizes, int seqlen_q, int seqlen_k, int num_heads, int num_kv_heads, int q_blocks, int k_blocks, int k_scale_groups, int capacity, int block_sparse_num, int has_block_nums, int block_sizes_mode, int v_scale_batch_stride, int total_tiles, float softmax_scale_log2, int return_lse)
+kernel_cake_sage_block_sparse_attention_f63b7fc8674de9925f7e(CakeTensorMap const* q, CakeTensorMap const* k, CakeTensorMap const* v, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale, int* __restrict__ block_index, int* __restrict__ block_nums, int* __restrict__ block_sizes, int seqlen_q, int seqlen_k, int num_heads, int num_kv_heads, int q_blocks, int k_blocks, int k_scale_groups, int capacity, int block_sparse_num, int has_block_nums, int block_sizes_mode, int v_scale_batch_stride, int total_tiles, float softmax_scale_log2, int return_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1034,7 +1015,12 @@ kernel_cake_sage_block_sparse_attention_62c3142a797348e374c0(CakeTensorMap const
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define q_full_addr (mbar_base + 0)
@@ -1453,13 +1439,25 @@ kernel_cake_sage_block_sparse_attention_62c3142a797348e374c0(CakeTensorMap const
                     for (int _la = 0; _la < 32; _la++)
                         add_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_la], _add2_4);
                     #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                    for (int _le = 0; _le < 32; _le++) {
+                        if (1 && _le >= 24) {
+                            float2 _exp2_pair_5 = ex2_emulation_f32x2_value(make_float2(_tmem_load_0[_le*2], _tmem_load_0[_le*2 + 1]));
+                            _tmem_load_0[_le*2] = _exp2_pair_5.x;
+                            _tmem_load_0[_le*2 + 1] = _exp2_pair_5.y;
+                        } else {
+                            _tmem_load_0[_le*2] = approx_exp2(_tmem_load_0[_le*2]);
+                            _tmem_load_0[_le*2 + 1] = approx_exp2(_tmem_load_0[_le*2 + 1]);
+                        }
+#else
                     for (int _le = 0; _le < 64; _le++) {
                         _tmem_load_0[_le] = approx_exp2(_tmem_load_0[_le]);
+#endif
                     }
-                    float2 _reg_reduce_sum2_5 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_0[0], &_reg_reduce_sum2_5);
-                    softmax_block_sum(&_tmem_load_0[32], &_reg_reduce_sum2_5);
-                    float _tmem_load_0_sum = _reg_reduce_sum2_5.x + _reg_reduce_sum2_5.y;
+                    float2 _reg_reduce_sum2_6 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_0[0], &_reg_reduce_sum2_6);
+                    softmax_block_sum(&_tmem_load_0[32], &_reg_reduce_sum2_6);
+                    float _tmem_load_0_sum = _reg_reduce_sum2_6.x + _reg_reduce_sum2_6.y;
                     float block_half = _tmem_load_0_sum;
                     float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_half, 16);
                     float block_sum = block_half + _shfl_xor_1;

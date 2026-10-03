@@ -18,22 +18,17 @@
 // tvm-ffi direct-source launcher for Cake kernel 'kernel_cake_sage_block_sparse_attention_f63b7fc8674de9925f7e'.
 #include <cuda.h>
 #include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "tvm_ffi_utils.h"
 
-#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
-#include <string>
 #include <unordered_map>
-#include <vector>
 
 struct CakeTensorMap;
 extern "C" __global__ void kernel_cake_sage_block_sparse_attention_f63b7fc8674de9925f7e(CakeTensorMap const* q, CakeTensorMap const* k, CakeTensorMap const* v, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale, int* __restrict__ block_index, int* __restrict__ block_nums, int* __restrict__ block_sizes, int seqlen_q, int seqlen_k, int num_heads, int num_kv_heads, int q_blocks, int k_blocks, int k_scale_groups, int capacity, int block_sparse_num, int has_block_nums, int block_sizes_mode, int v_scale_batch_stride, int total_tiles, float softmax_scale_log2, int return_lse);
-
 
 namespace cake_host_shim_c802b60dd9d50557 {
 
@@ -69,26 +64,6 @@ class ScopedCudaDevice {
   int previous_device_ = -1;
   bool restore_ = false;
 };
-
-inline int64_t CakeDeviceMultiprocessorCount(int device_id) {
-  constexpr int kMaxCachedCudaDevices = 64;
-  TVM_FFI_CHECK(device_id >= 0 && device_id < kMaxCachedCudaDevices, RuntimeError)
-      << "physical-SM-count cache does not cover cuda:" << device_id;
-  static std::atomic<int> count_by_device[kMaxCachedCudaDevices]{};
-  int cached = count_by_device[device_id].load(std::memory_order_acquire);
-  if (cached > 0) return cached;
-
-  int count = 0;
-  cudaError_t error = cudaDeviceGetAttribute(
-      &count, cudaDevAttrMultiProcessorCount, device_id);
-  TVM_FFI_CHECK(error == cudaSuccess && count > 0, RuntimeError)
-      << "querying multiProcessorCount failed for cuda:" << device_id
-      << ": cudaError=" << static_cast<int>(error) << ", count=" << count;
-  // Concurrent first launches may repeat the immutable device query, but all
-  // publication is atomic and every later hot-path lookup is one acquire load.
-  count_by_device[device_id].store(count, std::memory_order_release);
-  return count;
-}
 
 inline void CheckCudaTensor(const TensorView& t, const char* name) {
   TVM_FFI_CHECK(t.device().device_type == kDLCUDA, ValueError)
@@ -130,34 +105,6 @@ inline void CheckDtype(const TensorView& t, const char* name, int code, int bits
       << name << " dtype mismatch: expected DLDataType(code=" << code << ", bits=" << bits
       << ", lanes=" << lanes << "), got (code=" << (int)d.code << ", bits=" << (int)d.bits
       << ", lanes=" << (int)d.lanes << ")";
-}
-
-// A logical axis.outer(trailing) folds every source dim above the trailing
-// dimensions. Shape products are independent of physical strides, so verify
-// the leading dimensions form one dense row-major chain instead of inventing
-// a "folded stride". The descriptor reads its exact adjacent physical step
-// separately through stride[-(trailing + 1)].
-inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char* name) {
-  TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
-      << name << " cannot fold leading dimensions above " << trailing
-      << " trailing dims from ndim=" << t.ndim();
-  int outer_last = t.ndim() - trailing - 1;
-  if (outer_last <= 0) {
-    return;
-  }
-  int64_t step = t.stride(outer_last);
-  TVM_FFI_CHECK(step > 0, ValueError)
-      << name << " physical strides must be positive";
-  int64_t expected = step;
-  for (int axis = outer_last - 1; axis >= 0; --axis) {
-    expected *= t.size(axis + 1);
-    if (t.size(axis) > 1) {
-      TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
-          << name << " leading dims are not physically foldable above " << trailing
-          << " trailing dims: stride(" << axis << ")=" << t.stride(axis)
-          << ", expected " << expected;
-    }
-  }
 }
 
 // Caller-owned storage is mutable scratch, including when its address and
