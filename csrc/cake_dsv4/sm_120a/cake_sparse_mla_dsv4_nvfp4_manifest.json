@@ -40,13 +40,11 @@
     "cake_sparse_mla_dsv4_nvfp4_h80.cu",
     "cake_sparse_mla_dsv4_nvfp4_h96.cu"
   ],
-  "decode_sources_kept": true,
-  "decode_sources_kept_from_identity": "55adcc0298172a23b0ba2e1d1ee9c85c34b863cfcc95e33bc1fe0efe4164dd87",
-  "decode_sources_kept_from_tree_commit": "64ae3c0d3cda1b6d624f4209b3dde5f3c368c6c4",
+  "decode_sources_kept": false,
   "decode_threads": 320,
   "entry": "cake_sparse_mla_sm120_dsv4_nvfp4_decode",
   "family": "cake_sparse_mla_sm120_dsv4_nvfp4",
-  "generated_at": "2026-10-03T09:06:02Z",
+  "generated_at": "2026-10-03T21:16:37Z",
   "generator": "sm120-dsv4-nvfp4-sparse-mla-flashinfer-export",
   "head_counts": [
     8,
@@ -62,9 +60,9 @@
   "head_dim": 512,
   "header": "cake_sparse_mla_dsv4_nvfp4_kernels.h",
   "heads_per_block": 16,
-  "identity": "fa97f844dad0ed541427c1f5276322c77b1270ce680cc8b5ff6baf6cb34c7ab0",
+  "identity": "9137a41af15f6411febb18aecc9d08948133df1b6988e90e09bddc2d781bcc22",
   "identity_scope": "sha256 over sorted (file name, file text without the provenance header)",
-  "kernel_commit": "fb6fd4d22dc56615497044e850b165ef9173bc7d",
+  "kernel_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
   "kernel_tree_modified": false,
   "max_chunks_per_block": 16,
   "merge_params": [
@@ -132,7 +130,7 @@
       2
     ]
   },
-  "prefill_kernel_commit": "0dcb6e5f0182053fd0a0da6419bceda1e42d11fc",
+  "prefill_kernel_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
   "prefill_max_chunks": 16,
   "prefill_min_blocks_per_sm": 1,
   "prefill_params": [
@@ -209,7 +207,7 @@
     "cake_sparse_mla_dsv4_nvfp4_prefill_h80.cu",
     "cake_sparse_mla_dsv4_nvfp4_prefill_h96.cu"
   ],
-  "tree_commit": "0dcb6e5f0182053fd0a0da6419bceda1e42d11fc",
+  "tree_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
   "two_tile_head_counts": [
     32,
     64,
