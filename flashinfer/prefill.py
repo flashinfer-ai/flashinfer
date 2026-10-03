@@ -3543,7 +3543,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
 
         if (
-            k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
+            _is_nvfp4_kv_dtype(k_cache.dtype) or _is_nvfp4_kv_dtype(v_cache.dtype)
         ) and kv_cache_sf is None:
             raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
         key_block_scales, value_block_scales = (
@@ -3605,7 +3605,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # output buffer whenever VO < QK.
         out_head_dim = (
             v_cache.shape[-1] * 2
-            if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+            if kv_cache_sf is not None and _is_nvfp4_kv_dtype(v_cache.dtype)
             else v_cache.shape[-1]
         )
         if out is None:
