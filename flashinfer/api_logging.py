@@ -2509,6 +2509,7 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
                     if "Wrapper" in class_name or class_name in [
                         "BatchMLAPagedAttentionWrapper",
                         "MoELayer",
+                        "PreparedTopKRaggedTransform",
                     ]:
                         func_name = f"{class_name}.{func_name}"
                         self_id = id(args[0])
