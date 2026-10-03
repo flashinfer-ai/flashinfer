@@ -13,6 +13,7 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
     pack_f32_to_fp4,
     preprocess_block_scaled_weights,
     preprocess_prequantized_block_scaled_weights,
+    quantize_mxfp4_block32,
     quantize_mxfp8_block32,
     quantize_nvfp4_block16,
     to_blocked,
@@ -20,10 +21,12 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
 )
 
 
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
 def test_chunked_preprocess_matches_full_transform(kind):
     # NVFP4 has a partial final 128-row SF atom; MXFP8 pads SF columns.
     hidden, intermediate = (192, 64) if kind == "nvfp4" else (384, 192)
+    if kind == "mxfp4_mxfp8":
+        intermediate = 256
     generator = torch.Generator().manual_seed(41)
     w13 = torch.randn(3, 2 * intermediate, hidden, generator=generator).bfloat16()
     w2 = torch.randn(3, hidden, intermediate, generator=generator).bfloat16()
@@ -39,6 +42,8 @@ def test_chunked_preprocess_matches_full_transform(kind):
         q, sf = (
             quantize_nvfp4_block16(source)
             if kind == "nvfp4"
+            else quantize_mxfp4_block32(source)
+            if kind == "mxfp4_mxfp8"
             else quantize_mxfp8_block32(source, dtype)
         )
         expected_scale = torch.stack([to_blocked(s.view(torch.uint8)) for s in sf])
@@ -139,6 +144,25 @@ def test_fp4_rounding_at_every_midpoint():
         torch.testing.assert_close(actual, expected * sign, rtol=0, atol=0)
 
 
+def test_mxfp4_block_scales_and_packed_values():
+    values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    block = torch.cat((values, -values)).repeat(2)
+    source = torch.stack((block, block * 2, block * 0.5, torch.zeros_like(block)))
+    packed, scales = quantize_mxfp4_block32(source)
+    assert packed.shape == (4, 16)
+    assert scales.dtype == torch.float8_e8m0fnu
+    assert scales.view(torch.uint8).flatten().tolist() == [127, 128, 126, 1]
+    expected = block.expand(3, -1)
+    torch.testing.assert_close(unpack_fp4_to_f32(packed[:3]), expected, rtol=0, atol=0)
+    assert not packed[3].view(torch.uint8).any()
+
+    # Crossing the largest E2M1 value raises the block scale to the next power.
+    source = torch.full((1, 32), 6.0)
+    source[0, 0] = torch.nextafter(source[0, 0], torch.tensor(float("inf")))
+    _, scales = quantize_mxfp4_block32(source)
+    assert scales.view(torch.uint8).item() == 128
+
+
 @pytest.mark.parametrize("rows, cols", [(64, 6), (128, 8), (192, 6), (256, 12)])
 def test_scale_unswizzle_recovers_logical_plane(rows, cols):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
@@ -150,7 +174,7 @@ def test_scale_unswizzle_recovers_logical_plane(rows, cols):
     torch.testing.assert_close(from_blocked(to_blocked(raw), rows, cols), raw)
 
 
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
 @pytest.mark.parametrize("storage", ["contiguous", "strided", "unaligned"])
 def test_prequantized_ingestion_preserves_bytes(kind, storage):
     from importlib import import_module
@@ -159,10 +183,13 @@ def test_prequantized_ingestion_preserves_bytes(kind, storage):
 
     hidden, intermediate, experts = 384, 192, 3
     nvfp4 = kind == "nvfp4"
-    packing, vec = (2, 16) if nvfp4 else (1, 32)
+    fp4 = kind in ("nvfp4", "mxfp4_mxfp8")
+    if kind == "mxfp4_mxfp8":
+        intermediate = 256
+    packing, vec = (2 if fp4 else 1), (16 if nvfp4 else 32)
     dtype = (
         torch.uint8
-        if nvfp4
+        if fp4
         else torch.float8_e4m3fn
         if kind == "mxfp8_e4m3"
         else torch.float8_e5m2
@@ -196,6 +223,8 @@ def test_prequantized_ingestion_preserves_bytes(kind, storage):
     sf1 = payload((experts, 2 * intermediate, hidden // vec), sf_dtype)
     sf2 = payload((experts, hidden, intermediate // vec), sf_dtype)
     backend = "nvfp4_nvfp4_bf16_cutedsl" if nvfp4 else "mxfp8_mxfp8_bf16_cutedsl"
+    if kind == "mxfp4_mxfp8":
+        backend = "mxfp8_mxfp4_bf16_cutedsl"
     mod = import_module(
         f"flashinfer.moe_ep.backends.mega.kernel.sm107.{backend}.weights"
     )
@@ -203,7 +232,7 @@ def test_prequantized_ingestion_preserves_bytes(kind, storage):
         PrequantizedMoEWeights(w13, w2, sf1, sf2),
         intermediate_size=intermediate,
         hidden_size=hidden,
-        **({} if nvfp4 else {"kind": kind}),
+        **({} if fp4 else {"kind": kind}),
     )
     for leg, (weight, scale) in enumerate(result):
         source, raw_sf = (w13, sf1) if leg == 0 else (w2, sf2)

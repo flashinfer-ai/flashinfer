@@ -511,17 +511,15 @@ def _dsl_supports_ldtm_stat() -> bool:
 
 
 def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
-    """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100.
+    """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100 with 16-bit V.
 
     Measured on B200. The paired D128 dense path is MUFU bound and takes 4.
-    Single-QKV dense takes 2. Causal is issue bound and takes 0. The fp8
-    P-in-SMEM path takes 3 and other fp8 paths take 0."""
+    Single-QKV dense takes 2. Causal is issue bound and takes 0. Callers can
+    set cfg.exp2_fma_pairs to any value on any path."""
     if torch.cuda.get_device_capability(device_index) != (10, 0):
         return 0
-    if cfg.is_causal:
+    if cfg.v_dtype.width != 16 or cfg.is_causal:
         return 0
-    if cfg.v_dtype.width == 8:
-        return 3 if cfg.p_in_smem else 0
     if cfg.pv_half_overlap:
         return 4
     return 2 if cfg.single_qkv_instance else 0
@@ -1615,12 +1613,11 @@ def _resolve_paged_plan_geometry(
 
 
 def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
-    """Dense contiguous MHA or GQA at D=128 with bf16 or E4M3 QK runs the two-CTA
-    UMMA form, which pairs adjacent Q tiles of one head through the grid.
+    """Dense contiguous MHA or GQA at D=128 with bf16 QK runs the two-CTA UMMA
+    form, which pairs adjacent Q tiles of one head through the grid.
     The two-CTA launch is non-persistent with heads on grid Y and batch on
-    grid Z. CUDA limits grid Y and Z to 65,535; oversized geometries keep the
-    persistent flattened grid so every otherwise-valid int32 plan stays
-    launchable."""
+    grid Z. CUDA limits grid Y and Z to 65,535. Oversized geometries keep the
+    persistent flattened grid so the valid int32 plans stay launchable."""
     return (
         _default_two_cta_umma(geometry.device_index)
         and geometry.head_dim == 128

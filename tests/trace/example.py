@@ -22,6 +22,10 @@ dsv41_fp4_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp4_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
 dsv41_fp4_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
+dsv41_fp8_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
+dsv41_fp8_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
+dsv41_fp8_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
+dsv41_fp8_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
@@ -134,7 +138,8 @@ top_k_top_p_sampling calls top_p_sampling internally.
 FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize available.
 GDN prefill files require SM90+ (Hopper) GPU.
 MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
-dsv41_fp4_quantize_*_sparse_mla_cache_*.json are only generated on SM120/SM121 GPUs.
+dsv41_fp4_quantize_*_sparse_mla_cache_*.json and dsv41_fp8_quantize_*_sparse_mla_cache_*.json
+are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
 """
@@ -156,39 +161,39 @@ SAVE_DIR = Path(os.environ["FLASHINFER_TRACE_DUMP_DIR"])
 import torch
 
 import flashinfer
-import flashinfer.norm
-import flashinfer.sampling
-import flashinfer.gemm
-import flashinfer.gdn_decode
-import flashinfer.kda_decode
-import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
-from flashinfer.jit.cpp_ext import is_cuda_version_at_least
-from flashinfer.utils import is_sm100a_supported
-from flashinfer.cake_minimax_h3 import (
-    MiniMaxH3Mxfp8PreAttention,
-    MiniMaxH3Nvfp4PreAttention,
-    MiniMaxH3QkvQuantizePack,
-)
+import flashinfer.fused_moe
+import flashinfer.gdn_decode
+import flashinfer.gemm
+import flashinfer.kda_decode
+import flashinfer.norm
+import flashinfer.sampling
 from flashinfer.attention.prims_ts.block_sparse import (
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
     block_sparse_attention,
     block_sparse_attention_with_paged_kv_cache,
 )
+from flashinfer.cake_minimax_h3 import (
+    MiniMaxH3Mxfp8PreAttention,
+    MiniMaxH3Nvfp4PreAttention,
+    MiniMaxH3QkvQuantizePack,
+)
+from flashinfer.comm import (
+    PcieIpcAllGatherWorkspace,
+    PcieIpcReduceScatterWorkspace,
+)
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+from flashinfer.fi_trace import fi_trace
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
     fmha_v2_prefill_sm120,
 )
-from flashinfer.mla import BatchMLAPagedAttentionWrapper
-from flashinfer.comm import (
-    PcieIpcAllGatherWorkspace,
-    PcieIpcReduceScatterWorkspace,
-)
-from flashinfer.fi_trace import fi_trace
+from flashinfer.utils import is_sm100a_supported
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
@@ -414,13 +419,35 @@ def example_dsv41_fp4_cache():
 example_dsv41_fp4_cache()
 
 
+def example_dsv41_fp8_cache():
+    from flashinfer.mla import (
+        dsv41_fp8_quantize_append_sparse_mla_cache,
+        dsv41_fp8_quantize_pack_sparse_mla_cache,
+    )
+    from flashinfer.utils import get_compute_capability
+
+    if get_compute_capability(torch.device(device)) not in ((12, 0), (12, 1)):
+        print("Skipping DSV4.1 FP8 cache examples: requires SM120/SM121")
+        return
+    latent = torch.randn(4, 8, 512, dtype=torch.bfloat16, device=device)
+    for layout in ("HND", "NHD"):
+        cache = dsv41_fp8_quantize_pack_sparse_mla_cache(latent, kv_layout=layout)
+        slots = torch.tensor([0, 9, 9, -1, 32], dtype=torch.int64, device=device)
+        dsv41_fp8_quantize_append_sparse_mla_cache(
+            latent.reshape(-1, 512)[:5], slots, cache
+        )
+
+
+example_dsv41_fp8_cache()
+
+
 # ── Quantization (FP4 / NVFP4 / MXFP4 / MXFP8, SM100+) ────────────────────────
 # Kernels are SM100+ only; trace is dumped before kernel launch so JSONs are
 # generated on any GPU — runtime failures are suppressed.
 from flashinfer.quantization.fp4_quantization import (
     fp4_quantize,
-    nvfp4_kv_dequantize_paged,
     mxfp4_quantize,
+    nvfp4_kv_dequantize_paged,
     nvfp4_quantize,
     silu_and_mul_nvfp4_quantize,
 )
@@ -2330,7 +2357,11 @@ for _pts_semantic_PS in (32, 4):
     with contextlib.suppress(Exception):
         from flashinfer.attention.prims_ts.decode import (
             BatchDecodePagedTSWrapper as _PrimTSDecodeWrapper,
+        )
+        from flashinfer.attention.prims_ts.decode import (
             batch_decode_with_paged_kv_cache as _attention_ts_decode,
+        )
+        from flashinfer.attention.prims_ts.decode import (
             get_prims_ts_batch_decode_workspace_size as _prims_ts_fmha_ws_size,
         )
 
@@ -2436,7 +2467,11 @@ for _pts_semantic_PS in (32, 4):
 with contextlib.suppress(Exception):
     from flashinfer.attention.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper as _PrimTSMLADecodeWrapper,
+    )
+    from flashinfer.attention.prims_ts.mla_decode import (
         batch_mla_decode_with_paged_kv_cache as _attention_ts_mla_decode,
+    )
+    from flashinfer.attention.prims_ts.mla_decode import (
         get_prims_ts_batch_mla_decode_workspace_size as _prims_ts_mla_ws_size,
     )
 
@@ -2566,6 +2601,7 @@ with contextlib.suppress(Exception):
 # xqa_batch_decode_with_kv_cache (SM100+ XQA decode wrapper, NHD 5-D cache).
 with contextlib.suppress(Exception):
     import math as _math2
+
     from flashinfer.decode import xqa_batch_decode_with_kv_cache as _xqa_dec
 
     _xqa_B, _xqa_Hq, _xqa_Hk, _xqa_D, _xqa_PS = 2, 8, 2, 128, 16
@@ -2596,6 +2632,7 @@ with contextlib.suppress(Exception):
 # xqa_batch_decode_with_kv_cache_mla (SM120/121 XQA MLA decode, FP8).
 with contextlib.suppress(Exception):
     import math as _math3
+
     from flashinfer.mla import (
         xqa_batch_decode_with_kv_cache_mla as _xmla_mla_dec,
     )

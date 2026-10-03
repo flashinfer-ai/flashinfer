@@ -2365,18 +2365,25 @@ def test_t1_unbounded_softplus_auto_fallback_handles_absent_and_strided_state(
     )
 
 
+@pytest.mark.parametrize("explicit_num_accepted_tokens", [False, True])
 @pytest.mark.parametrize("use_qk_l2norm_in_kernel", [True, False])
-@pytest.mark.parametrize("num_sequences", [2, 4])
+@pytest.mark.parametrize("num_sequences", [1, 2, 4])
 def test_t1_unbounded_softplus_auto_falls_back_to_cute_with_explicit_cu_seqlens(
-    flash_kda_device, monkeypatch, num_sequences, use_qk_l2norm_in_kernel
+    flash_kda_device,
+    monkeypatch,
+    num_sequences,
+    use_qk_l2norm_in_kernel,
+    explicit_num_accepted_tokens,
 ):
-    """Explicit T=1 ``cu_seqlens`` decode is unservable by Cake for any input.
+    """Explicit T=1 ``cu_seqlens`` decode routes to CuTe without probing Cake.
 
-    The selector wants one accepted-token entry per sequence and this path
-    supplies a single scalar, so ``"auto"`` has to reach CuTe here even when the
-    contract otherwise looks Cake-shaped. Parametrised over
-    ``use_qk_l2norm_in_kernel`` for exactly that reason, and over the one-warp
-    threshold at 32 heads.
+    ``backend="cake"`` refuses this contract outright, so ``"auto"`` must not
+    quietly serve it either: the candidate drops it before the selector is ever
+    consulted. Parametrised over the one-warp threshold at 32 heads and over
+    both ways the probe used to resolve -- with a per-sequence
+    ``num_accepted_tokens`` the selector accepted at every ``num_sequences``,
+    and without one it accepted only at ``num_sequences=1``, where the single
+    scalar supplied here trivially satisfies its per-sequence check.
     """
 
     num_heads = 32
@@ -2417,6 +2424,11 @@ def test_t1_unbounded_softplus_auto_falls_back_to_cute_with_explicit_cu_seqlens(
         ssm_state_indices=state_indices,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
+        num_accepted_tokens=(
+            torch.ones(num_sequences, dtype=torch.int32, device=flash_kda_device)
+            if explicit_num_accepted_tokens
+            else None
+        ),
     )
     pool = torch.randn(
         (slots, num_heads, _D, _D),
@@ -2440,7 +2452,18 @@ def test_t1_unbounded_softplus_auto_falls_back_to_cute_with_explicit_cu_seqlens(
         frozen_calls.append(variant)
         return run_frozen(variant, **kwargs)
 
+    select_calls = 0
+    select_variant = recurrent_module._select_flash_kda_decode_variant
+
+    def track_select_call(**kwargs):
+        nonlocal select_calls
+        select_calls += 1
+        return select_variant(**kwargs)
+
     monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
+    monkeypatch.setattr(
+        recurrent_module, "_select_flash_kda_decode_variant", track_select_call
+    )
     actual_pool = pool.clone()
     before = actual_pool.clone()
     actual_output, actual_state = recurrent_kda(
@@ -2451,6 +2474,7 @@ def test_t1_unbounded_softplus_auto_falls_back_to_cute_with_explicit_cu_seqlens(
     )
 
     assert frozen_calls == []
+    assert select_calls == 0
     torch.testing.assert_close(
         actual_output.float(), expected_output.float(), atol=0, rtol=0
     )

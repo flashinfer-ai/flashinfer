@@ -52,6 +52,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     key_pass_dq_mode,
     key_pass_ranges,
     offset_gather_kv_indices,
+    derive_topk_length,
     plan_key_passes,
     prepare_dsa_train,
     record_abi,
@@ -62,6 +63,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
 )
 from tests.test_helpers.cake_dsa_train_reference import (
     calibrate_beta,
+    globalize_gather_indices_loop,
     make_inputs,
     reference_fp64,
     rel_l2,
@@ -95,7 +97,7 @@ def _device_supported() -> bool:
 
 def _require_program(*, backward: bool = False):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 device")
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
     if not generated_program_available(torch.device("cuda"), backward=backward):
         pytest.skip(
             "generated DSA training program"
@@ -255,6 +257,12 @@ def test_key_pass_policy_rule():
         (4096, 45512): 2,
     }
     assert {k: policy.passes(k[0], k[1], 2048) for k in expected} == expected
+    # a packed multi-segment key row plans one pass: whole-row ranges do not match segment-confined index rows
+    assert policy.passes(4096, 65536, 2048, num_segments=1) == 2
+    assert policy.passes(4096, 65536, 2048, num_segments=2) == 1
+    assert policy.passes(4096, 268757, 2048, num_segments=9) == 1
+    with pytest.raises(ValueError, match="num_segments"):
+        policy.passes(4096, 65536, 2048, num_segments=0)
     assert key_pass_ranges(65536, 2) == ((0, 32768), (32768, 65536))
     assert key_pass_ranges(131072, 3) == ((0, 43691), (43691, 87382), (87382, 131072))
     assert key_pass_ranges(10, 1) == ((0, 10),)
@@ -277,6 +285,14 @@ def test_plan_key_passes_override_and_policy():
     # no registered policy, or no pass stages: the single-pass stage
     assert plan_key_passes({}, _ALL_STAGES, 4096, 65536, 2048) == 1
     assert plan_key_passes(record, _SINGLE_PASS_STAGES, 4096, 65536, 2048) == 1
+    # a packed multi-segment row: one pass by policy, an explicit override still counts
+    assert plan_key_passes(record, _ALL_STAGES, 4096, 65536, 2048, num_segments=2) == 1
+    assert (
+        plan_key_passes(
+            record, _ALL_STAGES, 4096, 65536, 2048, key_passes=2, num_segments=2
+        )
+        == 2
+    )
     # explicit override
     assert plan_key_passes(record, _ALL_STAGES, 4096, 65536, 2048, key_passes=1) == 1
     assert plan_key_passes(record, _ALL_STAGES, 4096, 4096, 2048, key_passes=5) == 5
@@ -334,11 +350,12 @@ def test_offset_gather_kv_indices_matches_loop():
                 if 0 <= v < seq_k[d]:
                     expected[row, j] = v + int(cu_k[d])
             row += 1
-    got = offset_gather_kv_indices(local, cu_q, cu_k)
+    # causal=False: plain offsetting (the causal term has its own tests in the packed / strided layout block)
+    got = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
     assert got.dtype == torch.int32
     assert torch.equal(got, expected)
     out = torch.empty_like(local)
-    assert offset_gather_kv_indices(local, cu_q, cu_k, out=out) is out
+    assert offset_gather_kv_indices(local, cu_q, cu_k, causal=False, out=out) is out
     assert torch.equal(out, expected)
 
 
@@ -1546,6 +1563,97 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
     assert max(rel_l2(grads[2], single[2]), rel_l2(grads[3], single[3])) < 1e-2
 
 
+def test_public_entry_derives_row_lengths_and_matches_full_rows():
+    """Without ``topk_length`` the public entry derives the per-row length (last valid slot + 1) and the kernels skip
+    the trailing invalid blocks: on documents shorter than top-k (most slots ``-1``) the forward / backward equal the
+    explicit full-length call bitwise (out, lse, dq) and within the FP32 reduction spread (dkv), and match the
+    reference."""
+    _require_program(backward=True)
+    inp = make_inputs([200, 96, 300], [200, 96, 4096], seed=SEED + 752, topk=256)
+    S = inp.kv_latent.shape[0]
+    derived = derive_topk_length(inp.idx_global, S)
+    assert torch.equal(
+        derived, inp.topk_length
+    )  # the generator's rows are valid-first: last valid + 1 == count
+    assert int(derived.max()) <= 256 and int((derived < 256).sum()) > 0
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    leaves_a = [t.detach().clone().requires_grad_() for t in args]
+    leaves_b = [t.detach().clone().requires_grad_() for t in args]
+    full = torch.full(
+        (inp.q_latent.shape[0],), 256, dtype=torch.int32, device=inp.q_latent.device
+    )
+    with _quiet_experimental():
+        out_a, lse_a = dsa_sparse_attention(*leaves_a, inp.idx_global, return_lse=True)
+        out_b, lse_b = dsa_sparse_attention(
+            *leaves_b, inp.idx_global, topk_length=full, return_lse=True
+        )
+    grads_a = torch.autograd.grad(out_a, leaves_a, inp.dout)
+    grads_b = torch.autograd.grad(out_b, leaves_b, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out_a.detach(), out_b.detach()) and torch.equal(lse_a, lse_b)
+    assert torch.equal(grads_a[0], grads_b[0]) and torch.equal(grads_a[1], grads_b[1])
+    # dkv: fp32 atomics summed in a different key-block order round to bf16 differently on a few elements
+    # (the cross-path spread used throughout this file); both paths must also meet the reference gates
+    assert max(rel_l2(grads_a[2], grads_b[2]), rel_l2(grads_a[3], grads_b[3])) < 1e-3
+    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
+    _check_forward(inp, out_a, lse_a, ref)
+    _check_backward(grads_a, ref)
+    _check_backward(grads_b, ref)
+
+
+def test_varlen_multi_segment_row_plans_single_pass():
+    """A packed two-segment key row whose total length triggers the whole-row formula (2 x 23,000 keys >
+    45,511) plans the single-pass stage through the varlen entry (``num_segments = len(cu_seqlens_k) - 1``:
+    whole-row ranges do not match segment-confined index rows), while the flat call on the same global
+    indices plans two whole-row passes; the forward is untouched, both backwards agree (dq differs in the
+    FP32 summation order only) and match the FP64 reference."""
+    record, stages = _require_key_pass_program()
+    device = torch.device("cuda")
+    assert plan_key_passes(record, stages, 256, 46000, 128) == 2
+    assert plan_key_passes(record, stages, 256, 46000, 128, num_segments=2) == 1
+    assert dsa_train_workspace_size(
+        256, 46000, 128, device, num_segments=2
+    ) == dsa_train_workspace_size(256, 46000, 128, device, key_passes=1)
+    inp = make_inputs([128, 128], [23000, 23000], seed=SEED + 751, topk=128)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    flat_leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _cache(True) as cache:
+        cache.clear()
+        with _quiet_experimental():
+            out_v, lse_v = dsa_sparse_attention_varlen(
+                *leaves,
+                inp.idx_local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                inp.max_seqlen_q,
+                inp.max_seqlen_k,
+                return_lse=True,
+            )
+        grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
+        torch.cuda.synchronize()
+        remembered = [b for b in cache._bindings.values() if b.backward_order]
+        assert [b.key_passes for b in remembered] == [1]
+        assert not any(isinstance(k, tuple) for k in remembered[0].backward_order)
+        with _quiet_experimental():
+            out_f, lse_f = dsa_sparse_attention(
+                *flat_leaves, inp.idx_global, return_lse=True
+            )
+        grads_f = torch.autograd.grad(out_f, flat_leaves, inp.dout)
+        torch.cuda.synchronize()
+        # the segment count is part of the binding key: the flat call binds anew and plans the two passes
+        assert sorted(
+            b.key_passes for b in cache._bindings.values() if b.backward_order
+        ) == [1, 2]
+    assert torch.equal(out_v.detach(), out_f.detach()) and torch.equal(lse_v, lse_f)
+    for a, b in zip(grads_v, grads_f, strict=True):
+        assert rel_l2(a, b) < 1e-3
+    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
+    _check_forward(inp, out_v, lse_v, ref)
+    _check_backward(grads_v, ref)
+    _check_backward(grads_f, ref)
+
+
 def _indices_view_inside_storage(indices: torch.Tensor, offset: int) -> torch.Tensor:
     """A contiguous copy of ``indices`` that starts ``offset`` elements inside a larger buffer."""
     n = indices.numel()
@@ -1944,3 +2052,995 @@ def test_autograd_lse_gradient_is_rejected_and_unused_out_gives_no_grad():
         t is not None and t.shape == leaf.shape
         for t, leaf in zip(g, leaves, strict=True)
     )
+
+
+# --- Packed / strided trainer layouts and causal varlen offsetting (flashinfer-ai/flashinfer#5675) ---
+# Packed / strided trainer layouts and the causal tail-of-prefix varlen rule (flashinfer-ai/flashinfer#5675).  The
+# kernels take the head / token strides of the query operands and the key row stride from the tensors (TMA descriptors
+# encoded from the view; k_rope as storage alias + element offset + row stride), so a view changes descriptor fields
+# only: out, lse, o_lo and dQ must be bitwise identical to the contiguous path; dK / dV are FP32 reductions whose order
+# is not fixed (FP32 tolerance).
+
+
+def _q_rope_as_q256_slice(q_rope):
+    """``q_rope`` as the ``192:256`` channel slice of a ``[T, 64, 256]`` pre-absorption query: head stride 256, token
+    stride 16384, storage offset 192 elements (384 B); the other channels are noise the kernels must not read."""
+    gen = torch.Generator(device=q_rope.device).manual_seed(756)
+    q256 = torch.randn(
+        q_rope.shape[0], NUM_HEADS, 256, device=q_rope.device, generator=gen
+    ).to(torch.bfloat16)
+    q256[:, :, 192:256].copy_(q_rope)
+    view = q256[:, :, 192:256]
+    assert view.stride() == (16384, 256, 1) and view.storage_offset() == 192
+    assert view.data_ptr() == q256.data_ptr() + 384 and view.data_ptr() % 16 == 0
+    return q256, view
+
+
+def _kv_as_packed_row(kv_latent, k_rope, row_stride):
+    """``kv_latent`` / ``k_rope`` as the ``0:512`` / ``512:576`` column slices of a packed ``[S, row_stride]`` row
+    (576 = latent + rope; 704 = with a frozen 128-channel indexer key stored alongside)."""
+    gen = torch.Generator(device=kv_latent.device).manual_seed(row_stride)
+    kv = torch.randn(
+        kv_latent.shape[0], row_stride, device=kv_latent.device, generator=gen
+    ).to(torch.bfloat16)
+    kv[:, :D_LATENT].copy_(kv_latent)
+    kv[:, D_LATENT:D_QK].copy_(k_rope)
+    lat, rope = kv[:, :D_LATENT], kv[:, D_LATENT:D_QK]
+    assert lat.stride() == (row_stride, 1) and rope.stride() == (row_stride, 1)
+    assert rope.storage_offset() == D_LATENT
+    return kv, lat, rope
+
+
+def _forward_backward(q_latent, q_rope, kv_latent, k_rope, indices, dout):
+    out, lse, o_lo = cake_backend.forward(q_latent, q_rope, kv_latent, k_rope, indices)
+    grads = cake_backend.backward(
+        q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout
+    )
+    torch.cuda.synchronize()
+    return (out, lse, o_lo), grads
+
+
+def _assert_same_step(got, ref):
+    """out / lse / o_lo / dq bitwise; dK / dV within the FP32 reduction spread."""
+    for a, b in zip(got[0], ref[0], strict=True):
+        assert torch.equal(a, b)
+    assert torch.equal(got[1][0], ref[1][0]) and torch.equal(got[1][1], ref[1][1])
+    assert max(rel_l2(got[1][2], ref[1][2]), rel_l2(got[1][3], ref[1][3])) < 1e-3
+
+
+def _non_causal_local_indices(inp, gen, *, masked_docs=()):
+    """Distinct uniform picks over the whole document (deliberately including keys after the query), 10 % of the
+    slots ``-1`` anywhere, and every slot ``-1`` for the documents in ``masked_docs``."""
+    local = torch.empty_like(inp.idx_local)
+    cu_q = inp.cu_seqlens_q.tolist()
+    topk = inp.topk
+    for d, (lq, lk) in enumerate(zip(inp.seq_q, inp.seq_k, strict=True)):
+        picks = torch.rand(
+            lq, max(lk, topk), device=local.device, generator=gen
+        ).argsort(dim=-1)[:, :topk]
+        rows = torch.where(picks < lk, picks, torch.full_like(picks, -1)).to(
+            torch.int32
+        )
+        if d in masked_docs:
+            rows.fill_(-1)
+        local[cu_q[d] : cu_q[d + 1]] = rows
+    drop = torch.rand(local.shape, device=local.device, generator=gen) < 0.1
+    return torch.where(drop, torch.full_like(local, -1), local)
+
+
+# Host layer
+
+
+def test_offset_gather_kv_indices_causal_tail_of_prefix():
+    """The varlen rule of the Cake facade: query ``local_q`` of document ``d`` sits at key position
+    ``(seqlen_k[d] - seqlen_q[d]) + local_q`` and, with ``causal=True``, attends selected keys ``<=`` that
+    position only; ``causal=False`` (the default, as in the first release) is the plain offsetting; a zero-query
+    document contributes no rows."""
+    # documents: tail (3 queries, 5 keys), tail (2 queries, 6 keys), keys without queries, full (4 x 4)
+    cu_q = torch.tensor([0, 3, 5, 5, 9], dtype=torch.int32)
+    cu_k = torch.tensor([0, 5, 11, 14, 18], dtype=torch.int32)
+    local = torch.tensor(
+        [
+            [0, 1, 2, -1, 4],  # doc 0, position (5 - 3) + 0 = 2: 4 beyond the bound
+            [1, 0, 3, 4, -1],  # position 3: 4 beyond
+            [2, 1, 0, 4, 5],  # position 4: 5 >= seqlen_k
+            [
+                4,
+                5,
+                3,
+                -1,
+                6,
+            ],  # doc 1, position (6 - 2) + 0 = 4: 5 beyond, 6 >= seqlen_k
+            [5, 4, 0, 6, -1],  # position 5: every key <= 5 is causal
+            [0, 1, 2, 3, -1],  # doc 3, position 0
+            [3, 2, 1, 0, 4],  # position 1: 3, 2 beyond, 4 >= seqlen_k
+            [-1, -1, -1, -1, -1],  # fully masked row
+            [
+                3,
+                0,
+                1,
+                2,
+                3,
+            ],  # position 3: all causal (a repeated key is a repeated slot)
+        ],
+        dtype=torch.int32,
+    )
+    strict_expected = [
+        [0, 1, 2, -1, -1],
+        [1, 0, 3, -1, -1],
+        [2, 1, 0, 4, -1],
+        [9, -1, 8, -1, -1],
+        [10, 9, 5, -1, -1],
+        [14, -1, -1, -1, -1],
+        [-1, -1, 15, 14, -1],
+        [-1, -1, -1, -1, -1],
+        [17, 14, 15, 16, 17],
+    ]
+    loose_expected = [
+        [0, 1, 2, -1, 4],
+        [1, 0, 3, 4, -1],
+        [2, 1, 0, 4, -1],
+        [9, 10, 8, -1, -1],
+        [10, 9, 5, -1, -1],
+        [14, 15, 16, 17, -1],
+        [17, 16, 15, 14, -1],
+        [-1, -1, -1, -1, -1],
+        [17, 14, 15, 16, 17],
+    ]
+    strict = offset_gather_kv_indices(local, cu_q, cu_k, causal=True)
+    assert strict.dtype == torch.int32 and strict.tolist() == strict_expected
+    loose = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
+    assert loose.tolist() == loose_expected
+    # the default is the plain offsetting of the first release
+    assert torch.equal(offset_gather_kv_indices(local, cu_q, cu_k), loose)
+    for causal, expected in ((True, strict), (False, loose)):
+        assert torch.equal(
+            globalize_gather_indices_loop(local, cu_q, cu_k, causal=causal), expected
+        )
+    out = torch.empty_like(local)
+    assert offset_gather_kv_indices(local, cu_q, cu_k, causal=True, out=out) is out
+    assert torch.equal(out, strict)
+    # the fused per-row lengths (varlen entry default) equal the derivation on the result, bitwise
+    strict2, lengths = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=True, return_topk_length=True
+    )
+    assert torch.equal(strict2, strict)
+    expected_lengths = [3, 3, 4, 3, 3, 1, 4, 0, 5]  # last valid slot + 1 per strict row
+    assert lengths.dtype == torch.int32 and lengths.tolist() == expected_lengths
+    assert torch.equal(lengths, derive_topk_length(strict, 18))
+    loose2, loose_len = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=False, return_topk_length=True
+    )
+    assert torch.equal(loose2, loose) and torch.equal(
+        loose_len, derive_topk_length(loose, 18)
+    )
+    # more queries than keys: own positions -1, 0, 1 -> the first row is fully masked under the causal rule
+    cu_q2 = torch.tensor([0, 3], dtype=torch.int32)
+    cu_k2 = torch.tensor([0, 2], dtype=torch.int32)
+    local2 = torch.tensor([[0, 1], [0, 1], [1, 0]], dtype=torch.int32)
+    strict3, len3 = offset_gather_kv_indices(
+        local2, cu_q2, cu_k2, causal=True, return_topk_length=True
+    )
+    assert strict3.tolist() == [[-1, -1], [0, -1], [1, 0]] and len3.tolist() == [
+        0,
+        1,
+        2,
+    ]
+    assert offset_gather_kv_indices(local2, cu_q2, cu_k2, causal=False).tolist() == [
+        [0, 1],
+        [0, 1],
+        [1, 0],
+    ]
+
+
+def _trainer_host_inputs(total_q=8, total_k=16, topk=5):
+    q256 = torch.zeros(total_q, NUM_HEADS, 256, dtype=torch.bfloat16)
+    q576 = torch.zeros(total_q, NUM_HEADS, D_QK, dtype=torch.bfloat16)
+    kv704 = torch.zeros(total_k, 704, dtype=torch.bfloat16)
+    idx = torch.zeros(total_q, topk, dtype=torch.int32)
+    return q256, q576, kv704, idx
+
+
+def test_validate_accepts_trainer_strided_layouts():
+    """The GLM-5.2 trainer layouts: q_rope as the 192:256 slice of the [T, 64, 256] pre-absorption query (head
+    stride 256, 384 B storage offset), q_latent contiguous or a view of [T, 64, 576], kv_latent / k_rope as column
+    slices of a [S, 704] (indexer key alongside) or [S, 576] row -- and in general any 16-byte-multiple head / row
+    stride with a 16-byte-aligned base."""
+    q256, q576, kv704, idx = _trainer_host_inputs()
+    q_rope = q256[:, :, 192:256]
+    assert q_rope.stride() == (16384, 256, 1) and q_rope.storage_offset() == 192
+    kv576 = kv704[:, :D_QK].contiguous()
+    for q_latent in (q576[..., :D_LATENT], q576[..., :D_LATENT].contiguous()):
+        for kv in (kv704, kv576):
+            assert validate_dsa_train_inputs(
+                q_latent, q_rope, kv[:, :D_LATENT], kv[:, D_LATENT:D_QK], idx
+            ) == (8, 16, 5)
+    # head stride 80 elements (160 B) sliced at channel 8 (16 B); key row stride 520 elements sliced at column 8
+    q80 = torch.zeros(8, NUM_HEADS, 80, dtype=torch.bfloat16)
+    kv520 = torch.zeros(16, 520, dtype=torch.bfloat16)
+    assert validate_dsa_train_inputs(
+        q576[..., :D_LATENT],
+        q80[:, :, 8:72],
+        kv520[:, 8:520],
+        kv704[:, D_LATENT:D_QK],
+        idx,
+    ) == (8, 16, 5)
+
+
+def _with(q_latent=None, q_rope=None, kv_latent=None, k_rope=None):
+    """Validator arguments of the trainer layouts with one operand replaced by ``fn(q256, q576, kv704)``."""
+
+    def mutate(q256, q576, kv704, idx):
+        return (
+            q576[..., :D_LATENT] if q_latent is None else q_latent(q256, q576, kv704),
+            q256[:, :, 192:256] if q_rope is None else q_rope(q256, q576, kv704),
+            kv704[:, :D_LATENT] if kv_latent is None else kv_latent(q256, q576, kv704),
+            kv704[:, D_LATENT:D_QK] if k_rope is None else k_rope(q256, q576, kv704),
+            idx,
+        )
+
+    return mutate
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        # head stride 68 elements = 136 B: not a 16-byte multiple
+        (
+            _with(
+                q_rope=lambda q256, q576, kv704: torch.zeros(
+                    8, NUM_HEADS, 68, dtype=torch.bfloat16
+                )[..., :D_ROPE]
+            ),
+            "head stride",
+        ),
+        # base 8 B into the row: the TMA global address must be 16-byte aligned
+        (
+            _with(
+                q_rope=lambda q256, q576, kv704: torch.zeros(
+                    8, NUM_HEADS, 80, dtype=torch.bfloat16
+                )[:, :, 4:68]
+            ),
+            "16-byte aligned",
+        ),
+        # head stride below the slice width: heads would overlap
+        (
+            _with(
+                q_rope=lambda q256, q576, kv704: torch.as_strided(
+                    q576, (8, NUM_HEADS, D_ROPE), (NUM_HEADS * D_QK, 32, 1)
+                )
+            ),
+            "head stride",
+        ),
+        # token stride 4100 elements: not a 16-byte multiple
+        (
+            _with(
+                q_latent=lambda q256, q576, kv704: torch.as_strided(
+                    torch.zeros(65536, dtype=torch.bfloat16),
+                    (8, NUM_HEADS, D_LATENT),
+                    (4100, D_LATENT, 1),
+                )
+            ),
+            "token stride",
+        ),
+        # channel stride 2: the innermost dimension is not contiguous
+        (
+            _with(
+                q_latent=lambda q256, q576, kv704: torch.zeros(
+                    8, NUM_HEADS, 2 * D_LATENT, dtype=torch.bfloat16
+                )[..., ::2]
+            ),
+            "last dimension",
+        ),
+        # key row stride 700 elements = 1400 B: not a 16-byte multiple
+        (
+            _with(
+                kv_latent=lambda q256, q576, kv704: torch.zeros(
+                    16, 700, dtype=torch.bfloat16
+                )[:, :D_LATENT]
+            ),
+            "row stride",
+        ),
+        # key base 8 B into the row
+        (_with(kv_latent=lambda q256, q576, kv704: kv704[:, 4:516]), "16-byte aligned"),
+        # key row stride below the slice width: rows would overlap
+        (
+            _with(
+                k_rope=lambda q256, q576, kv704: torch.as_strided(
+                    kv704, (16, D_ROPE), (32, 1)
+                )
+            ),
+            "row stride",
+        ),
+    ],
+)
+def test_validate_rejects_unsupported_strides(mutate, match):
+    q256, q576, kv704, idx = _trainer_host_inputs()
+    with pytest.raises(ValueError, match=match):
+        validate_dsa_train_inputs(*mutate(q256, q576, kv704, idx))
+
+
+# Device tests
+
+
+def test_forward_backward_strided_q_rope_256_bitwise():
+    """``q_rope`` as the ``192:256`` channel slice of a ``[T, 64, 256]`` query (head stride 256, token stride 16384,
+    384 B storage offset) with a contiguous ``q_latent``: forward and backward equal the contiguous path bitwise (the
+    TMA descriptor takes the view's strides; the computation order is unchanged), dK / dV within the FP32 reduction
+    spread; the view is consumed in place, the remembered binding serves it, and the autograd path puts the rope
+    gradient into channels 192:256 of the [T, 64, 256] leaf."""
+    _require_program(backward=True)
+    inp = make_inputs([160, 96], [160, 320], seed=SEED + 756, topk=96)
+    q256, q_rope = _q_rope_as_q256_slice(inp.q_rope)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    ref = _forward_backward(*args, inp.idx_global, inp.dout)
+    got = _forward_backward(
+        inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout
+    )
+    _assert_same_step(got, ref)
+    assert q_rope.data_ptr() == q256.data_ptr() + 384 and q_rope.stride() == (
+        16384,
+        256,
+        1,
+    )
+    again = cake_backend.forward(
+        inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
+    )
+    torch.cuda.synchronize()
+    for a, b in zip(again, got[0], strict=True):
+        assert torch.equal(a, b)
+    leaf = q256.detach().clone().requires_grad_()
+    with _quiet_experimental():
+        out = dsa_sparse_attention(
+            inp.q_latent, leaf[:, :, 192:256], inp.kv_latent, inp.k_rope, inp.idx_global
+        )
+    (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref[0][0]) and torch.equal(grad[:, :, 192:256], ref[1][1])
+    assert torch.all(grad[:, :, :192] == 0)
+
+
+def test_kv_row_stride_704_bitwise():
+    """``kv_latent = kv[:, :512]`` / ``k_rope = kv[:, 512:576]`` of a packed ``[S, 704]`` row (indexer key alongside)
+    and of a ``[S, 576]`` row: forward and backward equal the contiguous path and each other bitwise (gather
+    descriptor / rope pointer stride only); the ``[S, 704]`` autograd leaf gets its gradient in columns 0:576 only."""
+    _require_program(backward=True)
+    inp = make_inputs([128, 128], [128, 384], seed=SEED + 757, topk=96)
+    ref = _forward_backward(
+        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout
+    )
+    got = {}
+    for row_stride in (576, 704):
+        kv, lat, rope = _kv_as_packed_row(inp.kv_latent, inp.k_rope, row_stride)
+        got[row_stride] = _forward_backward(
+            inp.q_latent, inp.q_rope, lat, rope, inp.idx_global, inp.dout
+        )
+        _assert_same_step(got[row_stride], ref)
+    _assert_same_step(got[704], got[576])
+    leaf = kv.detach().clone().requires_grad_()  # the [S, 704] buffer
+    with _quiet_experimental():
+        out = dsa_sparse_attention(
+            inp.q_latent,
+            inp.q_rope,
+            leaf[:, :D_LATENT],
+            leaf[:, D_LATENT:D_QK],
+            inp.idx_global,
+        )
+    (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref[0][0]) and torch.all(grad[:, D_QK:] == 0)
+    assert (
+        max(
+            rel_l2(grad[:, :D_LATENT], ref[1][2]),
+            rel_l2(grad[:, D_LATENT:D_QK], ref[1][3]),
+        )
+        < 1e-3
+    )
+
+
+def test_dkv_dst_map_value_check_is_opt_in(monkeypatch):
+    """``_check_dkv_acc`` validates dtype / shape / contiguity / device of ``dkv_dst_map`` but not its values
+    (the kernel does not range-check the map); with ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1`` an out-of-range
+    destination row raises ``ValueError`` and an in-range map passes."""
+    dkv_acc = torch.zeros(4, D_QK, dtype=torch.float32)
+    good = torch.tensor([3, 0, 3], dtype=torch.int32)
+    bad = torch.tensor([0, 4, 1], dtype=torch.int32)  # 4 == S_dst is outside [0, S_dst)
+    monkeypatch.delenv("FLASHINFER_CAKE_DSA_CHECK_DST_MAP", raising=False)
+    for dst_map in (good, bad):
+        operand, row_stride = cake_backend._check_dkv_acc(dkv_acc, dst_map, num_kv=3)
+        assert operand is dkv_acc and row_stride == D_QK
+    monkeypatch.setenv("FLASHINFER_CAKE_DSA_CHECK_DST_MAP", "1")
+    assert cake_backend._check_dkv_acc(dkv_acc, good, num_kv=3)[1] == D_QK
+    with pytest.raises(ValueError, match=r"dkv_dst_map values must lie in \[0, 4\)"):
+        cake_backend._check_dkv_acc(dkv_acc, bad, num_kv=3)
+    with pytest.raises(ValueError, match="dkv_dst_map values must lie in"):
+        cake_backend._check_dkv_acc(
+            dkv_acc, torch.tensor([-1, 0, 0], dtype=torch.int32), num_kv=3
+        )
+
+
+def test_varlen_causal_tail_of_prefix_matches_reference():
+    """Query segments that are the tail of their key prefix (seqlen_q < seqlen_k) with gather indices that
+    deliberately select keys beyond the causal bound ``(seqlen_k - seqlen_q) + local_q``: the varlen entry masks
+    exactly those slots (loop reference of the rule; the FP64 reference sees the same set), a zero-query segment
+    contributes no rows, and a segment whose every slot is ``-1`` gives ``out = 0``, ``lse = -inf``, ``dq = 0`` and
+    exact zeros in dK / dV for its keys."""
+    _require_program(backward=True)
+    seq_q, seq_k = (
+        [40, 48, 0, 56, 32],
+        [40, 200, 64, 320, 96],
+    )  # full, tail, keys only, tail, tail (all -1)
+    inp = make_inputs(seq_q, seq_k, seed=SEED + 758, topk=64)
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    local = _non_causal_local_indices(inp, gen, masked_docs=(4,))
+    cu_q, cu_k = inp.cu_seqlens_q, inp.cu_seqlens_k
+    expected = globalize_gather_indices_loop(local, cu_q, cu_k, causal=True).cuda()
+    assert torch.equal(
+        offset_gather_kv_indices(local, cu_q, cu_k, causal=True), expected
+    )
+    loose = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
+    assert torch.equal(
+        loose, globalize_gather_indices_loop(local, cu_q, cu_k, causal=False).cuda()
+    )
+    assert ((expected == -1) & (loose != -1)).any(), (
+        "the case must select keys beyond the causal bound"
+    )
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    (out, lse, _), grads = _forward_backward(*args, expected, inp.dout)
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _quiet_experimental():
+        out_v, lse_v = dsa_sparse_attention_varlen(
+            *leaves,
+            local,
+            cu_q,
+            cu_k,
+            inp.max_seqlen_q,
+            inp.max_seqlen_k,
+            causal=True,
+            return_lse=True,
+        )
+    grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out_v, out) and torch.equal(lse_v, lse)
+    assert torch.equal(grads_v[0], grads[0]) and torch.equal(grads_v[1], grads[1])
+    assert max(rel_l2(grads_v[2], grads[2]), rel_l2(grads_v[3], grads[3])) < 1e-3
+    ref = reference_fp64(*args, expected, dout=inp.dout)
+    _check_forward(inp, out_v, lse_v, ref)
+    _check_backward(grads_v, ref)
+    masked = slice(int(cu_q[-2]), int(cu_q[-1]))
+    assert torch.all(lse_v[masked] == float("-inf")) and torch.all(out_v[masked] == 0)
+    assert torch.all(grads_v[0][masked] == 0) and torch.all(grads_v[1][masked] == 0)
+    assert torch.all(grads_v[2][int(cu_k[-2]) :] == 0) and torch.all(
+        grads_v[3][int(cu_k[-2]) :] == 0
+    )
+    with _quiet_experimental():
+        out_nc = dsa_sparse_attention_varlen(*args, local, cu_q, cu_k, causal=False)
+    torch.cuda.synchronize()
+    assert not torch.equal(out_nc, out_v), (
+        "without the causal term the same picks attend keys after the query"
+    )
+
+
+def test_varlen_segment_with_every_slot_masked_gives_zero_outputs():
+    """A packed segment whose gather rows are all ``-1``: ``out = 0``, ``lse = -inf``, ``dq = 0`` for its rows and
+    exact zeros in dK / dV for its keys; the other segment's row-local results are those of the flat call."""
+    _require_program(backward=True)
+    inp = make_inputs([64, 48], [64, 160], seed=SEED + 759, topk=64)
+    local = inp.idx_local.clone()
+    local[64:] = -1
+    cu_q, cu_k = inp.cu_seqlens_q, inp.cu_seqlens_k
+    glob = offset_gather_kv_indices(local, cu_q, cu_k)
+    assert torch.all(glob[64:] == -1) and torch.equal(glob[:64], inp.idx_global[:64])
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _quiet_experimental():
+        out, lse = dsa_sparse_attention_varlen(
+            *leaves, local, cu_q, cu_k, return_lse=True
+        )
+    grads = torch.autograd.grad(out, leaves, inp.dout)
+    (out_flat, lse_flat, _), grads_flat = _forward_backward(
+        *args, inp.idx_global, inp.dout
+    )
+    torch.cuda.synchronize()
+    assert torch.all(lse[64:] == float("-inf")) and torch.all(out[64:] == 0)
+    assert torch.all(grads[0][64:] == 0) and torch.all(grads[1][64:] == 0)
+    assert torch.all(grads[2][64:] == 0) and torch.all(grads[3][64:] == 0)
+    assert torch.equal(out[:64], out_flat[:64]) and torch.equal(lse[:64], lse_flat[:64])
+    assert torch.equal(grads[0][:64], grads_flat[0][:64]) and torch.equal(
+        grads[1][:64], grads_flat[1][:64]
+    )
+    ref = reference_fp64(*args, glob, dout=inp.dout)
+    _check_forward(inp, out, lse, ref)
+    _check_backward(grads, ref)
+
+
+def test_varlen_packed_glm_structure_small():
+    """Scaled-down GLM-5.2 packed batch: 8 segments alternating a full document and the tail of a ~32x longer key
+    prefix, top-k 128, through the varlen entry -- equals the flat call on the generator's global indices (bitwise
+    for out / lse / dq) and the FP64 reference; the generator's causal picks are left untouched by the rule."""
+    _require_program(backward=True)
+    seq_q = [177, 175, 212, 211, 212, 211, 212, 211]
+    seq_k = [177, 5684, 212, 6792, 212, 6792, 212, 6792]
+    inp = make_inputs(seq_q, seq_k, seed=SEED + 760, topk=128)
+    assert torch.equal(
+        offset_gather_kv_indices(inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k),
+        inp.idx_global,
+    )
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    (out, lse, _), grads = _forward_backward(*args, inp.idx_global, inp.dout)
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _quiet_experimental():
+        out_v, lse_v = dsa_sparse_attention_varlen(
+            *leaves,
+            inp.idx_local,
+            inp.cu_seqlens_q,
+            inp.cu_seqlens_k,
+            inp.max_seqlen_q,
+            inp.max_seqlen_k,
+            return_lse=True,
+        )
+    grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out_v, out) and torch.equal(lse_v, lse)
+    assert torch.equal(grads_v[0], grads[0]) and torch.equal(grads_v[1], grads[1])
+    assert max(rel_l2(grads_v[2], grads[2]), rel_l2(grads_v[3], grads[3])) < 1e-3
+    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
+    _check_forward(inp, out_v, lse_v, ref)
+    _check_backward(grads_v, ref)
+
+
+# --- end of the packed / strided layout block ---
+# --- Packed fp32 dK/dV accumulation and destination mapping (flashinfer-ai/flashinfer#5675) ---
+# Packed FP32 dK/dV accumulation into a caller-provided buffer with an optional destination-row map (issue #5675).
+# Comparisons across two backward calls use a tolerance: their FP32 reductions run in another order.
+ACC_REL_L2 = 1e-4
+
+
+def _acc_plan_record(with_accumulate: bool) -> dict:
+    """A fake record whose bwd_cast plan does (not) declare the packed-accumulate operands."""
+    plan = [
+        ["buffer", "src_latent"],
+        ["buffer", "src_rope"],
+        ["buffer", "dst_latent"],
+        ["buffer", "dst_rope"],
+        ["buffer", "dst_latent_f32"],
+        ["buffer", "dst_rope_f32"],
+        ["parameter", "latent_groups"],
+        ["parameter", "rope_groups"],
+        ["parameter", "out_f32"],
+    ]
+    if with_accumulate:
+        plan += [
+            ["buffer", "dst_packed"],
+            ["parameter", "dst_row_stride"],
+            ["buffer", "dst_map"],
+            ["parameter", "has_dst_map"],
+            ["parameter", "accumulate"],
+        ]
+    plan += [["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]]
+    return {
+        "arch": "sm_100a",
+        "abi": ABI_CONTRACT,
+        "stages": ["fwd", "bwd_delta", "bwd_main", "bwd_cast"],
+        "dkv_acc_layout": "permuted",
+        "bwd_cast": {
+            "module": "fake",
+            "sources": [],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": plan,
+            "closure_sha256": "0" * 64,
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "0" * 64,
+    }
+
+
+def _cast_operand_tensors(S: int) -> dict:
+    return dict(
+        q_latent=torch.zeros(2, NUM_HEADS, D_LATENT, dtype=torch.bfloat16),
+        q_rope=torch.zeros(2, NUM_HEADS, D_ROPE, dtype=torch.bfloat16),
+        kv_latent=torch.zeros(S, D_LATENT, dtype=torch.bfloat16),
+        k_rope=torch.zeros(S, D_ROPE, dtype=torch.bfloat16),
+        indices=torch.zeros(2, 4, dtype=torch.int32),
+        delta=torch.zeros(2, NUM_HEADS),
+        dkv_latent_acc=torch.zeros(S, D_LATENT),
+        dk_rope_acc=torch.zeros(S, D_ROPE),
+        dkv_latent=torch.empty(0, dtype=torch.bfloat16),
+        dk_rope=torch.empty(0, dtype=torch.bfloat16),
+        dkv_latent_fp32=torch.zeros(S, D_LATENT),
+        dk_rope_fp32=torch.zeros(S, D_ROPE),
+    )
+
+
+def test_record_cast_accumulates_reads_the_plan():
+    assert cake_backend.record_cast_accumulates(_acc_plan_record(True))
+    assert not cake_backend.record_cast_accumulates(_acc_plan_record(False))
+    assert not cake_backend.record_cast_accumulates(
+        {"arch": "sm_100a", "stages": ["fwd"]}
+    )
+    assert set(cake_backend.CAST_ACCUMULATE_OPERANDS) <= set(
+        cake_backend.CONTRACT_ALIASES
+    ) | set(cake_backend.CONTRACT_SCALARS)
+    for name in cake_jit.MODULES:
+        assert isinstance(
+            cake_backend.record_cast_accumulates(cake_jit.MODULES[name]), bool
+        )
+
+
+def test_check_dkv_acc_accepts_the_contract_layouts():
+    S = 16
+    acc576 = torch.zeros(S, D_QK)
+    operand, stride = cake_backend._check_dkv_acc(acc576, None, S)
+    assert operand is acc576 and stride == D_QK
+    acc704 = torch.zeros(
+        S + 4, 704
+    )  # a frozen 128-channel indexer key stored alongside the 576 channels
+    operand, stride = cake_backend._check_dkv_acc(acc704, None, S)
+    assert operand is acc704 and stride == 704
+    view = acc704[
+        :, :D_QK
+    ]  # the 576 columns as a strided view: a flat alias from its first element
+    operand, stride = cake_backend._check_dkv_acc(view, None, S)
+    assert stride == 704 and operand.is_contiguous() and operand.dim() == 1
+    assert (
+        operand.data_ptr() == view.data_ptr()
+        and operand.numel() == (S + 4 - 1) * 704 + D_QK
+    )
+    dst_map = torch.zeros(S, dtype=torch.int32)
+    operand, stride = cake_backend._check_dkv_acc(
+        torch.zeros(3, D_QK), dst_map, S
+    )  # fewer rows than S with a map
+    assert stride == D_QK
+
+
+@pytest.mark.parametrize(
+    "acc, dst_map, match",
+    [
+        (lambda: torch.zeros(16, D_QK, dtype=torch.bfloat16), None, "float32"),
+        (lambda: torch.zeros(16 * D_QK), None, "2-D"),
+        (lambda: torch.zeros(16, D_LATENT), None, ">= 576"),
+        (lambda: torch.zeros(D_QK, 16).t(), None, r"stride\(1\)"),
+        (lambda: torch.zeros(16, 578), None, "multiple of 4"),
+        (lambda: torch.zeros(16, 580)[:, 1:], None, "16-byte"),
+        (lambda: torch.zeros(8, D_QK), None, "at least S"),
+        (lambda: torch.zeros(16, D_QK), torch.zeros(16, dtype=torch.int64), "int32"),
+        (
+            lambda: torch.zeros(16, D_QK),
+            torch.zeros(15, dtype=torch.int32),
+            r"int32 \[S\]",
+        ),
+        (
+            lambda: torch.zeros(16, D_QK),
+            torch.zeros(32, dtype=torch.int32)[::2],
+            "contiguous",
+        ),
+    ],
+)
+def test_check_dkv_acc_rejects(acc, dst_map, match):
+    with pytest.raises(ValueError, match=match):
+        cake_backend._check_dkv_acc(acc(), dst_map, 16)
+
+
+def test_backward_binding_key_covers_dkv_acc_and_map():
+    T, S = 4, 8
+    q = torch.zeros(T, NUM_HEADS, D_QK, dtype=torch.bfloat16)
+    kv = torch.zeros(S, D_QK, dtype=torch.bfloat16)
+    idx = torch.zeros(T, 5, dtype=torch.int32)
+    out = torch.zeros(T, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    lse = torch.zeros(T, NUM_HEADS)
+    args = (
+        q[..., :D_LATENT],
+        q[..., D_LATENT:],
+        kv[:, :D_LATENT],
+        kv[:, D_LATENT:],
+        idx,
+        out,
+        out,
+        lse,
+        out,
+        None,
+        1.0,
+        False,
+    )
+    plain = backward_binding_key(*args)
+    acc = torch.zeros(S, 704)
+    with_acc = backward_binding_key(*args, dkv_acc=acc)
+    assert plain != with_acc and with_acc == backward_binding_key(*args, dkv_acc=acc)
+    assert with_acc != backward_binding_key(
+        *args, dkv_acc=acc[:, :D_QK]
+    )  # another row layout of the same storage
+    dst_map = torch.zeros(S, dtype=torch.int32)
+    assert with_acc != backward_binding_key(*args, dkv_acc=acc, dkv_dst_map=dst_map)
+
+
+def test_bind_stage_serves_the_accumulating_cast_plan(monkeypatch):
+    """The packed-accumulate operands bind from ``dkv_acc`` / ``dkv_dst_map`` (aliases ``dst_packed`` / ``dst_map``) and
+    the three scalars; without them the host binds inert placeholders of the right dtypes, as the production launcher does."""
+    monkeypatch.setitem(
+        cake_jit.MODULES, "cake_dsa_h64_train_fake_acc", _acc_plan_record(True)
+    )
+    monkeypatch.setattr(
+        cake_backend,
+        "load_cake_dsa_train_module",
+        lambda name, stage: SimpleNamespace(run=lambda *a: None),
+    )
+    S = 8
+    t = _cast_operand_tensors(S)
+    acc = torch.zeros(S, 704)
+    dst_map = torch.arange(S, dtype=torch.int32)
+    t["dkv_acc"], t["dkv_dst_map"] = acc, dst_map
+    scalars = dict(
+        num_queries=2,
+        num_kv=S,
+        topk=4,
+        softmax_scale=1.0,
+        has_topk_length=0,
+        out_f32=0,
+        dst_row_stride=704,
+        has_dst_map=1,
+        accumulate=1,
+    )
+    values = cake_backend._contract_values(t, scalars)
+    launch = bind_stage("cake_dsa_h64_train_fake_acc", "bwd_cast", values, (3, 1, 1))
+    assert launch.arguments[9] is acc and launch.arguments[10] == 704
+    assert launch.arguments[11] is dst_map and launch.arguments[12:14] == (1, 1)
+    assert {key for _, key in launch.slots} >= {"dkv_acc", "dkv_dst_map"}
+    t.pop("dkv_acc")
+    t.pop("dkv_dst_map")
+    inert = cake_backend._contract_values(
+        t, dict(scalars, dst_row_stride=0, has_dst_map=0, accumulate=0)
+    )
+    launch = bind_stage("cake_dsa_h64_train_fake_acc", "bwd_cast", inert, (3, 1, 1))
+    assert (
+        launch.arguments[9] is t["dkv_latent_acc"]
+        and launch.arguments[11] is t["indices"]
+    )
+    assert launch.arguments[10] == 0 and launch.arguments[12:14] == (0, 0)
+    # a remembered binding re-supplies both per call (placeholders when the call accumulates nothing)
+    rebound = launch.templated().arguments_for(
+        cake_backend._inert_cast_values(dict(t, indices_storage=t["indices"]))
+    )
+    assert rebound[9] is t["dkv_latent_acc"] and rebound[11] is t["indices"]
+    # the old plan (no accumulate operands) still binds from the same values
+    monkeypatch.setitem(
+        cake_jit.MODULES, "cake_dsa_h64_train_fake_old", _acc_plan_record(False)
+    )
+    old = bind_stage("cake_dsa_h64_train_fake_old", "bwd_cast", values, (3, 1, 1))
+    assert len(old.arguments) == 12 and old.arguments[0] is t["dkv_latent_acc"]
+
+
+def test_backward_rejects_dkv_acc_with_dkv_fp32_and_a_map_without_acc():
+    q, kv, idx = _host_inputs()
+    out = torch.zeros(8, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    lse = torch.zeros(8, NUM_HEADS)
+    args = (
+        q[..., :D_LATENT],
+        q[..., D_LATENT:],
+        kv[:, :D_LATENT],
+        kv[:, D_LATENT:],
+        idx,
+        out,
+        out,
+        lse,
+        out,
+    )
+    with pytest.raises(ValueError, match="dkv_fp32"):
+        cake_backend.backward(*args, dkv_fp32=True, dkv_acc=torch.zeros(16, D_QK))
+    with pytest.raises(ValueError, match="dkv_dst_map"):
+        cake_backend.backward(*args, dkv_dst_map=torch.zeros(16, dtype=torch.int32))
+
+
+def _require_accumulating_cast():
+    _, record = record_for(torch.device("cuda"))
+    if not cake_backend.record_cast_accumulates(record):
+        pytest.skip(
+            "the registered program's bwd_cast predates the packed-accumulate operands (re-export needed)"
+        )
+
+
+def _forward_and_natural_dkv(inp):
+    """Forward outputs, the explicit backward's dq and the natural FP32 dK/dV as one packed ``[S, 576]`` reference."""
+    out, lse, o_lo = cake_backend.forward(
+        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
+    )
+    args = (
+        inp.q_latent,
+        inp.q_rope,
+        inp.kv_latent,
+        inp.k_rope,
+        inp.idx_global,
+        out,
+        o_lo,
+        lse,
+        inp.dout,
+    )
+    dq_l, dq_r, nat_l, nat_r = cake_backend.backward(*args, dkv_fp32=True)
+    torch.cuda.synchronize()
+    return args, dq_l, dq_r, torch.cat([nat_l, nat_r], dim=1)
+
+
+def test_backward_dkv_acc_identity_accumulates_in_place():
+    """``dkv_acc`` without a map: ``+= dkv`` into a pre-filled ``[S, 704]`` buffer (twice over two calls), columns 576:
+    untouched, no dK/dV outputs, dq unchanged; the strided 576-column view of the buffer is accepted as well."""
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([256], [512], seed=SEED + 20, topk=128)
+    args, dq_l, dq_r, nat = _forward_and_natural_dkv(inp)
+    S = inp.total_k
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    pre = torch.randn(S, 704, device="cuda", generator=gen)
+    acc = pre.clone()
+    aq_l, aq_r, none_l, none_r = cake_backend.backward(*args, dkv_acc=acc)
+    torch.cuda.synchronize()
+    assert none_l is None and none_r is None
+    assert torch.equal(aq_l, dq_l) and torch.equal(aq_r, dq_r)
+    torch.testing.assert_close(acc[:, :D_QK], pre[:, :D_QK] + nat, rtol=1e-4, atol=1e-4)
+    assert torch.equal(acc[:, D_QK:], pre[:, D_QK:])
+    cake_backend.backward(
+        *args, dkv_acc=acc[:, :D_QK]
+    )  # second call, through the strided view: keeps adding
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        acc[:, :D_QK], pre[:, :D_QK] + 2 * nat, rtol=1e-4, atol=1e-4
+    )
+    assert torch.equal(acc[:, D_QK:], pre[:, D_QK:])
+
+
+def test_bwd_cast_accumulate_without_map_is_one_fp32_add_bitwise():
+    """From the SAME permuted accumulators (a prepared runner's), the accumulating cast without a map equals
+    ``previous + natural`` bitwise: one FP32 add per element on both sides."""
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([128], [256], seed=SEED + 21, topk=64)
+    runner = prepare_dsa_train(
+        inp.q_latent,
+        inp.q_rope,
+        inp.kv_latent,
+        inp.k_rope,
+        inp.idx_global,
+        dout=inp.dout,
+        backward=True,
+        dkv_fp32=True,
+    )
+    runner.forward()
+    _, _, nat_l, nat_r = runner.backward()
+    torch.cuda.synchronize()
+    S = inp.total_k
+    pre = torch.randn(
+        S, 704, device="cuda", generator=torch.Generator(device="cuda").manual_seed(2)
+    )
+    acc = pre.clone()
+    t = dict(runner.tensors, dkv_acc=acc)
+    scalars = dict(
+        num_queries=runner.num_queries,
+        num_kv=S,
+        topk=runner.topk,
+        softmax_scale=runner.softmax_scale,
+        has_topk_length=int(runner.has_topk_length),
+        out_f32=0,
+        dst_row_stride=704,
+        has_dst_map=0,
+        accumulate=1,
+    )
+    values = cake_backend._contract_values(t, scalars, key_passes=runner.key_passes)
+    physical = record_for(torch.device("cuda"))[1]["bwd_cast"]
+    grid = grid_dims(
+        physical["grid"],
+        scalars,
+        torch.cuda.get_device_properties(0).multi_processor_count,
+    )
+    launch = bind_stage(runner.module_name, "bwd_cast", values, grid)
+    with cake_backend._ffi_stream_context(runner.device_index):
+        launch()
+    torch.cuda.synchronize()
+    assert torch.equal(acc[:, :D_LATENT], pre[:, :D_LATENT] + nat_l)
+    assert torch.equal(acc[:, D_LATENT:D_QK], pre[:, D_LATENT:D_QK] + nat_r)
+    assert torch.equal(acc[:, D_QK:], pre[:, D_QK:])
+
+
+def test_backward_dkv_acc_destination_map_with_duplicates_matches_index_add():
+    """A many-to-few map (512 source rows into 300 destination rows) sums like ``index_add_`` of the natural dK/dV;
+    unmapped destination rows stay zero; a permutation lands every source row on its own destination row."""
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([256], [512], seed=SEED + 22, topk=128)
+    args, _, _, nat = _forward_and_natural_dkv(inp)
+    S, S_dst = inp.total_k, 300
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    dst_map = torch.randint(0, S_dst, (S,), device="cuda", generator=gen).to(
+        torch.int32
+    )
+    acc = torch.zeros(S_dst, 704, device="cuda")
+    _, _, none_l, none_r = cake_backend.backward(
+        *args, dkv_acc=acc, dkv_dst_map=dst_map
+    )
+    torch.cuda.synchronize()
+    assert none_l is None and none_r is None
+    expect = torch.zeros(S_dst, D_QK, device="cuda").index_add_(
+        0, dst_map.to(torch.int64), nat
+    )
+    assert rel_l2(acc[:, :D_QK], expect) < ACC_REL_L2
+    assert torch.all(acc[:, D_QK:] == 0)
+    untouched = torch.ones(S_dst, dtype=torch.bool, device="cuda")
+    untouched[dst_map.long()] = False
+    assert untouched.any() and torch.all(acc[untouched] == 0)
+    perm = torch.randperm(S, device="cuda", generator=gen).to(torch.int32)
+    acc_p = torch.zeros(S, D_QK, device="cuda")
+    cake_backend.backward(*args, dkv_acc=acc_p, dkv_dst_map=perm)
+    torch.cuda.synchronize()
+    assert rel_l2(acc_p[perm.long()], nat) < ACC_REL_L2
+
+
+def test_binding_cache_serves_dkv_acc_bindings_per_buffer():
+    """A remembered dkv_acc binding re-supplies the caller's buffer and map per call; another buffer layout binds anew."""
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([128], [256], seed=SEED + 24, topk=64)
+    args, _, _, nat = _forward_and_natural_dkv(inp)
+    S = inp.total_k
+    cache = cake_backend.BINDING_CACHE
+    if not cache.enabled:
+        pytest.skip("binding cache disabled")
+    acc = torch.zeros(S, D_QK, device="cuda")
+    dst_map = torch.arange(S, device="cuda", dtype=torch.int32)
+    key = backward_binding_key(
+        *args, None, default_softmax_scale(), False, None, acc, dst_map
+    )
+    cake_backend.backward(*args, dkv_acc=acc, dkv_dst_map=dst_map)
+    binding = cache.peek(key)
+    assert binding is not None and binding.accumulate_dkv and binding.holds_no_tensor()
+    hits = cache.hits
+    cake_backend.backward(
+        *args, dkv_acc=acc, dkv_dst_map=dst_map
+    )  # same binding: a hit, adds again
+    torch.cuda.synchronize()
+    assert cache.hits == hits + 1
+    assert rel_l2(acc, 2 * nat) < ACC_REL_L2
+    acc2 = torch.zeros(
+        S + 2, 704, device="cuda"
+    )  # another layout: another binding (miss), row stride 704 baked
+    cake_backend.backward(*args, dkv_acc=acc2)
+    torch.cuda.synchronize()
+    assert cache.hits == hits + 1
+    assert (
+        rel_l2(acc2[:S, :D_QK], nat) < ACC_REL_L2
+        and torch.all(acc2[S:] == 0)
+        and torch.all(acc2[:, D_QK:] == 0)
+    )
+
+
+def test_autograd_function_with_dkv_acc_returns_no_kv_grads_and_accumulates():
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([128], [256], seed=SEED + 23, topk=64)
+    args, dq_l, dq_r, nat = _forward_and_natural_dkv(inp)
+    leaves = [
+        t.detach().clone().requires_grad_()
+        for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    ]
+    S = inp.total_k
+    acc = torch.zeros(S, D_QK, device="cuda")
+    out, lse = cake_backend.DSASparseAttentionFunction.apply(
+        *leaves, inp.idx_global, None, default_softmax_scale(), None, acc, None
+    )
+    out.backward(inp.dout)
+    torch.cuda.synchronize()
+    assert leaves[0].grad is not None and leaves[1].grad is not None
+    assert leaves[2].grad is None and leaves[3].grad is None
+    assert torch.equal(leaves[0].grad, dq_l) and torch.equal(leaves[1].grad, dq_r)
+    assert rel_l2(acc, nat) < ACC_REL_L2
+    perm = torch.randperm(
+        S, device="cuda", generator=torch.Generator(device="cuda").manual_seed(5)
+    ).to(torch.int32)
+    acc_p = torch.zeros(S, D_QK, device="cuda")
+    out2, _ = cake_backend.DSASparseAttentionFunction.apply(
+        *leaves, inp.idx_global, None, default_softmax_scale(), None, acc_p, perm
+    )
+    out2.backward(inp.dout)
+    torch.cuda.synchronize()
+    assert leaves[2].grad is None and leaves[3].grad is None
+    assert rel_l2(acc_p[perm.long()], nat) < ACC_REL_L2
+
+
+# --- end of the packed fp32 dK/dV block ---

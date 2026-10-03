@@ -1850,7 +1850,7 @@ def _kv_ring_smem_budget_bytes(
 
     # The TS allocator bump-allocates each data block at its own alignment
     # (largest first), so a buffer-aligned block costs its size rounded up to
-    # cfg.buffer_align_bytes; the 4-32 byte records follow, then barriers.
+    # cfg.buffer_align_bytes. The 4-32 byte records follow, then barriers.
     align = cfg.buffer_align_bytes
     smem_p_bytes = 0
     if cfg.p_in_smem:

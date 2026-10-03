@@ -2,7 +2,7 @@
 
 ``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The
 ``sm90_fp8_*`` dtypes select the Hopper tuner. BF16 and mixed BF16/MXFP8
-are supported by the SM100 tuner only.
+are supported by the SM100 tuner only. MXFP4/MXFP8 is wired for SM107.
 
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
@@ -34,6 +34,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "nvfp4",
             "mxfp8_e4m3",
             "mxfp8_e5m2",
+            "mxfp4_mxfp8",
             "sm90_fp8_e4m3",
             "sm90_fp8_e5m2",
             "bf16",
@@ -191,7 +192,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if family == "sm90" or (family == "sm107" and args.dtype.startswith("bf16")):
             print(f"--dtype {args.dtype} is unsupported on {family}", file=sys.stderr)
             return 2
-        if args.dtype == "nvfp4":
+        if args.dtype == "mxfp4_mxfp8":
+            if family != "sm107":
+                print("--dtype mxfp4_mxfp8 requires --arch sm107", file=sys.stderr)
+                return 2
+            backend = "mxfp8_mxfp4_bf16_cutedsl"
+        elif args.dtype == "nvfp4":
             backend = "nvfp4_nvfp4_bf16_cutedsl"
         elif args.dtype == "bf16":
             backend = "bf16_bf16_bf16_cutedsl"

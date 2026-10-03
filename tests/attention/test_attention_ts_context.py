@@ -2733,6 +2733,7 @@ def test_attention_ts_context_d256_live_paged_clc_uses_distinct_auxiliary_warps(
                 is_clc_dynamic=True,
                 exhaustive_deadlock_race_check=True,
             )
+        )
 
     tasks = {task.name: task for task in task_manager.tasks}
     scheduler_task = tasks["SchedulerTask"]

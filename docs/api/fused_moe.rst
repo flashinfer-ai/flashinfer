@@ -104,12 +104,27 @@ Multi-LoRA MoE (BGMV)
 Batched Gather-Matrix-Vector kernels for serving multiple LoRA adapters on
 top of a Mixture-of-Experts layer (shrink + expand).
 
+:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100 and
+SM103 devices the generated Cake programs serve one LoRA slice with rank 8, 16,
+32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688 and
+3072 at rank 32 use the specialized measured bodies at up to 2048 tokens, ``plan.variant ==
+"specialized"``; everything else the runtime-hidden generic bundles,
+``plan.variant == "generic"``); the output has one owner per token, so replays
+are bitwise reproducible. Arbitrary pair order (for example expert-sorted
+dispatch) is served through a token->pair route index that the shrink kernels
+publish and the expand kernels read in O(1) per CTA; the generic shrink splits the hidden
+dimension over extra CTAs at small pair counts and reduces the partials in a fixed order.
+Other inputs fall back to the portable
+``bgmv_moe_shrink`` / ``bgmv_moe_expand`` kernels (``plan.backend_used ==
+"portable"``) unless ``fallback=False`` is passed.
+
 .. autosummary::
     :toctree: ../generated
 
     bgmv_moe
     prepare_bgmv_moe
     BGMVMoECakePlan
+    BGMVMoEPortablePlan
     bgmv_moe_shrink
     bgmv_moe_expand
     bgmv_moe_gemm1_lora_delta

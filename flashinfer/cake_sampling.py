@@ -365,15 +365,19 @@ def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
 # (the eager span of the two-launch chain includes the host gap between its launches and is not the measure) the in-CTA
 # tail loses to the chain on every resident (B200 1.20-1.54, GB300 1.40-1.84) and on every stream at k <= 750; the
 # cluster-8 streams at k = 1000 win on both (B200 0.89-0.94, GB300 0.89-0.97), so ``_fuse_block_tail`` takes the twin
-# only for a cluster-8 stream with top_k_max > _BLOCK_TAIL_MIN_K on a one-wave grid.  H100 / R200 keep the chain (no
-# graph-replay A/B recorded for them in round 7).
-_BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
+# only for a cluster-8 stream with top_k_max > _BLOCK_TAIL_MIN_K on a one-wave grid.  Round 8 adds H100: under graph
+# replay the twin runs 0.93-0.97 of the chain at V = 151936 and 0.96-0.99 at V = 262144 (B = 1-8, k = 800 / 1000, bitwise
+# identical; eager 0.93-0.98).  R200 keeps the chain (no graph-replay A/B recorded for it).
+_BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
+    {(9, 0), (10, 0), (10, 3)}
+)
 _BLOCK_TAIL_MIN_CLUSTER = 8
 _BLOCK_TAIL_MIN_K = 768
 # Largest row the whole-CTA tail serves per capability (None: any).  GB300 round-7 matrices: the cluster-8 streams at
 # V = 151936 run 3-11 % faster fused, at V = 262144 3-7 % slower eager (a cold-L2 stage 1 is hidden by the chain's
 # host-bound launch gap there) and even under graph replay, so GB300 keeps the chain above this vocabulary.
 _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY: dict[tuple[int, int], Optional[int]] = {
+    (9, 0): None,
     (10, 0): None,
     (10, 3): 196608,
 }
@@ -459,6 +463,31 @@ _FLAG_ROW_SPAN_DIET = 32
 _ROW_SPAN_DIET_MIN_CLUSTER = 8
 _ROW_SPAN_DIET_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
 _FLAG_SPEC_SAMPLE = 64
+# Launch flag bit 7 (round 8, lever L-B): the slab-tail form of the speculative-sample build.  The selected pairs of a
+# fused launch are pushed into rank 0's shared-memory slab (DSM stores) and the two-warp tail reads them there instead
+# of re-reading the global slab row; every output is bit-identical.  The coarse-sample build carries the slab tail
+# without a bit (it only serves fused launches); the default build never does (the k > 64 chains keep binaries without
+# the slab code, which moved them by 1-14 % when compiled in).  Taken on the capabilities where the paired
+# perturbed-process A/Bs won on every served fused cell (B200 0.948-0.993, GB300 0.959-0.992, 4/4 processes); Hopper
+# measured 1.003-1.047 with it and keeps the plain speculative build.  Only rows of at most `_SLAB_TAIL_MAX_CHUNKS`
+# register chunks per CTA take it: the round-8 matrices and same-node in-process A/Bs on B200 / GB300 put the 8-chunk
+# `_cs` rows at 1.000-1.015, the 10-chunk rows at 1.012-1.020 and the 16-chunk `_sp` row at 0.997-1.014 (the slab's
+# fixed saving does not grow with the row while its per-chunk bookkeeping does), and every served 1-5-chunk row at
+# 0.93-0.99.
+_FLAG_SLAB_TAIL = 128
+_SLAB_TAIL_SPEC_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
+_SLAB_TAIL_MAX_CHUNKS = 5
+# Stage-1 launch_flags bit 8: the pushed-coarse-sums form of the default build (`_lg` twin; round 8 lever L-G(d)): each
+# CTA stores its coarse histogram sums into every CTA's shared memory so the two-level cluster select reads them locally.
+# A two-launch chain on a streaming variant with the two-level select takes it on these capabilities (GB300 cluster-8
+# chains 0.985-0.987, H100 0.992-0.994, medians over four perturbed processes); B200 keeps the plain build (+0.9..+1.7 %).
+# Only the ept-32 build (`_COARSE_PUSH_MIN_EPT`) takes it: those gates ran the two-chunk ept-32 cluster-8 chains, and the
+# GB300 round-8 matrix put the served four-chunk ept-16 chains (V = 262144, B = 1-8, k = 1000) at 1.014-1.052 in both
+# tree orders with same-node in-process A/Bs of 1.022-1.056 (the pushed stores grow with the chunk count, the two
+# dependent select round trips they replace do not).
+_FLAG_COARSE_PUSH = 256
+_COARSE_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(9, 0), (10, 3)})
+_COARSE_PUSH_MIN_EPT = 32
 _SPEC_SAMPLE_WIDE_EPT = 32
 _SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER = 8
 _SPEC_SAMPLE_WIDE_MIN_CHUNKS = 16
@@ -611,6 +640,99 @@ def _spec_sample_flag(
     elif chunks != 1 and chunks < _SPEC_SAMPLE_WIDE_MIN_CHUNKS:
         return 0
     return _FLAG_SPEC_SAMPLE if _stage1_has_spec_sample(cluster, ept, True) else 0
+
+
+@functools.cache
+def _stage1_has_slab_tail(cluster: int, ept: int, stream: bool, coarse: bool) -> bool:
+    """Whether the frozen variant ships the slab-tail form of its coarse-sample (``coarse``) or speculative-sample build
+    (a manifest entry with ``slab_tail`` and the matching sample flag): the kernel taken by launch_flags bit 7 together
+    with bit 0 and bit 4 / 6.  Every output is bit-identical to the plain sample build."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if v["slab_tail"] and (v["coarse_sample"] if coarse else v["spec_sample"]):
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _slab_tail_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    sample_flag: int,
+    vocab: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> int:
+    """Stage-1 ``launch_flags`` bit 7 for a fused launch that takes a sample build (bit 4 or bit 6 in ``sample_flag``):
+    the slab-tail twin of that build on the capabilities in ``_SLAB_TAIL_SPEC_CAPABILITIES`` when the variant ships it
+    and the row is at most ``_SLAB_TAIL_MAX_CHUNKS`` register chunks per CTA.  Default-build and non-fused launches
+    never take it; Hopper / Rubin and the long cluster-1 / cluster-2 rows keep the plain sample builds."""
+    flag = int(sample_flag) & (_FLAG_SPEC_SAMPLE | _FLAG_COARSE_SAMPLE)
+    if not stream or not flag:
+        return 0
+    if (
+        capability is None
+        or (int(capability[0]), int(capability[1])) not in _SLAB_TAIL_SPEC_CAPABILITIES
+    ):
+        return 0
+    if (
+        math.ceil(int(vocab) / (_THREADS * int(ept) * int(cluster)))
+        > _SLAB_TAIL_MAX_CHUNKS
+    ):
+        return 0
+    coarse = bool(flag & _FLAG_COARSE_SAMPLE)
+    return _FLAG_SLAB_TAIL if _stage1_has_slab_tail(cluster, ept, True, coarse) else 0
+
+
+@functools.cache
+def _stage1_has_coarse_push(cluster: int, ept: int, stream: bool) -> bool:
+    """Whether the frozen variant ships the pushed-coarse-sums form of its default build (a manifest entry with
+    ``coarse_push``): the kernel taken by launch_flags bit 8 on a two-launch chain.  Every output is bit-identical to the
+    default build."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if v["coarse_push"]:
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _coarse_push_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    chain_flags: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> int:
+    """Stage-1 ``launch_flags`` bit 8 for a two-launch chain (``chain_flags``: the chain's flags so far; a sample build in
+    them, bit 4 / 6, keeps the plain build): the pushed-coarse-sums twin of the default build on the capabilities in
+    ``_COARSE_PUSH_CAPABILITIES`` when the variant ships it and the build is at least ``_COARSE_PUSH_MIN_EPT`` elements
+    per thread.  Fused launches never take it; B200 / Rubin and the ept-16 chains keep the plain default build."""
+    if (
+        not stream
+        or int(ept) < _COARSE_PUSH_MIN_EPT
+        or int(chain_flags)
+        & (
+            _FLAG_FUSE_TAIL
+            | _FLAG_FUSE_BLOCK_TAIL
+            | _FLAG_COARSE_SAMPLE
+            | _FLAG_SPEC_SAMPLE
+            | _FLAG_SLAB_TAIL
+        )
+    ):
+        return 0
+    if (
+        capability is None
+        or (int(capability[0]), int(capability[1])) not in _COARSE_PUSH_CAPABILITIES
+    ):
+        return 0
+    return _FLAG_COARSE_PUSH if _stage1_has_coarse_push(cluster, ept, True) else 0
 
 
 def _sample_build_flag(
@@ -1128,14 +1250,22 @@ def top_k_top_p_sampling_from_probs(
     # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
     # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
     if fused:
-        launch_flags = _FLAG_FUSE_TAIL | _sample_build_flag(
+        capability = _device_capability(probs.device.index or 0)
+        sample_flag = _sample_build_flag(
             cluster,
             ept,
             bool(stream_variant),
             kmax,
             vocab,
             batch,
-            _device_capability(probs.device.index or 0),
+            capability,
+        )
+        launch_flags = (
+            _FLAG_FUSE_TAIL
+            | sample_flag
+            | _slab_tail_flag(
+                cluster, ept, bool(stream_variant), sample_flag, vocab, capability
+            )
         )
     elif fused_block:
         launch_flags = _FLAG_FUSE_BLOCK_TAIL
@@ -1157,7 +1287,14 @@ def top_k_top_p_sampling_from_probs(
                 batch,
                 _device_capability(probs.device.index or 0),
             )
-    module.radix_topk(
+            launch_flags |= _coarse_push_flag(
+                cluster,
+                ept,
+                True,
+                launch_flags,
+                _device_capability(probs.device.index or 0),
+            )
+    stage1_args = (
         probs,
         k_arr,
         k_scalar,
@@ -1177,8 +1314,8 @@ def top_k_top_p_sampling_from_probs(
         int(philox_offset) & 0xFFFFFFFFFFFFFFFF,
         1 if renorm_out is not None else 0,
         launch_flags,
-        stream,
     )
+    module.radix_topk(*stage1_args, stream)
     if fused or fused_block:
         return out
     module.sparse_topp_sample(
