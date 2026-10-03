@@ -237,6 +237,70 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, backend, 
     assert torch.equal(pool[untouched], torch.zeros_like(pool[untouched]))
 
 
+def test_state_stride_divisibility():
+    """The wrapper only assumes stride divisibility the pool satisfies."""
+    from flashinfer.gdn_kernels.blackwell.gdn_prefill import (
+        _state_stride_divisibility,
+    )
+
+    H, D = 4, 128
+    hvk = H * D * D
+    compact = torch.empty(6, H, D, D)
+    assert _state_stride_divisibility((compact, compact), D) == D
+    # Several layers coalesced into each slot
+    coalesced = torch.empty(6, 3, H, D, D)[:, 1]
+    assert coalesced.stride(0) == 3 * hvk
+    assert _state_stride_divisibility((coalesced, None), D) == D
+    # Slot padded by 96 elements
+    padded = torch.empty(6, hvk + 96)[:, :hvk].unflatten(1, (H, D, D))
+    assert _state_stride_divisibility((padded, padded), D) == 32
+    # The most constrained state wins
+    assert _state_stride_divisibility((compact, padded), D) == 32
+    # Non-unit K stride: no assumption
+    strided_k = torch.empty(6, H, D, 2 * D)[..., ::2]
+    assert _state_stride_divisibility((strided_k,), D) == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_prefill_state_indices_compact_and_padded_pools_in_one_process(dtype):
+    """Alternating compact and padded pools must not reuse a mismatched kernel."""
+    _skip_if_not_supported("flashinfer", False)
+    device = torch.device("cuda")
+    D, H = 128, 16
+    seq_lens = [64, 32, 96, 16, 48, 80, 8, 128]
+    num_seqs = len(seq_lens)
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, dtype, device, seed=7
+    )
+    packed_state = torch.empty_like(init_state)
+    ref_output, ref_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        init_state.clone(),
+        packed_state,
+        None,
+        False,
+        "flashinfer",
+    )
+
+    n_pool = num_seqs + 3
+    perm = [(i * 5 + 1) % n_pool for i in range(num_seqs)]
+    assert len(set(perm)) == num_seqs
+    idx = torch.tensor(perm, dtype=torch.int32, device=device)
+    for pad in (0, 96, 0, 96):
+        pool = _make_pool(init_state, perm, n_pool, pad, init_state.dtype, device)
+        output, _ = _run(
+            q, k, v, g, beta, cu_seqlens, pool, pool, idx, False, "flashinfer"
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(output, ref_output), f"output differs (pad={pad})"
+        assert torch.equal(pool[perm], ref_final), f"final state differs (pad={pad})"
+
+
 @pytest.mark.parametrize("index_dtype", INTEGER_DTYPES)
 @pytest.mark.parametrize("backend,use_cp,H", BACKEND_CP_HEAD_CASES)
 def test_prefill_integer_index_dtypes(index_dtype, backend, use_cp, H):
