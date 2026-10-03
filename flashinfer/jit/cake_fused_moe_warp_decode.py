@@ -15,9 +15,7 @@ limitations under the License.
 """
 
 import functools
-import hashlib
-import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Literal
 
 from . import env as jit_env
@@ -35,20 +33,82 @@ _TARGET_FLAGS: dict[CakeWarpDecodeTarget, list[str]] = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
 }
-_TARGET_ARCH: dict[CakeWarpDecodeTarget, str] = {
-    "sm100a": "sm_100a",
-    "sm103a": "sm_103a",
-}
 _TARGET_MINOR: dict[CakeWarpDecodeTarget, int] = {"sm100a": 0, "sm103a": 3}
 _MODULE_URI: dict[CakeWarpDecodeTarget, str] = {
     "sm100a": "cake_fused_moe_warp_decode_sm100a",
     "sm103a": "cake_fused_moe_warp_decode_sm103a",
 }
-_LEGACY_SM103A_GENERATED_SOURCE = "cake_adaptive_warp_decode_kernels.cu"
-_EXPORTED_MANIFEST = "cake_warp_decode_inventory.json"
 _BINDING_SOURCE = "cake_warp_decode_binding.cu"
 _GENERATED_MANIFEST = "cake_warp_decode_generated_manifest.cuh"
 _CONTRACT_HEADER = "cake_warp_decode_contract.cuh"
+
+# Device translation units per exact target. ``generated/common`` holds the
+# kernels whose source is the same for SM100a and SM103a; the per-target
+# directories hold the kernels that differ. The generated manifest header
+# declares every symbol listed here for the matching target.
+_COMMON_SOURCES: tuple[str, ...] = (
+    "cake_warp_decode_024bed5eb8061821a022_kernel.cu",
+    "cake_warp_decode_2943d5a4f443be1b5408_kernel.cu",
+    "cake_warp_decode_670effeafbee07071ec6_kernel.cu",
+    "cake_warp_decode_6b2146aa6e4e8f2e2161_kernel.cu",
+    "cake_warp_decode_857d1ba629d5d1813f19_kernel.cu",
+    "cake_warp_decode_87d1b6a9bbc9ece09ad6_kernel.cu",
+    "cake_warp_decode_8851303d75b4e1cec033_kernel.cu",
+    "cake_warp_decode_8d34c1c2891be9b66f15_kernel.cu",
+    "cake_warp_decode_9021eadecd3078bf13c5_kernel.cu",
+    "cake_warp_decode_ac22f4a6ae1ebaae1276_kernel.cu",
+    "cake_warp_decode_b5ee48ba618c8145d075_kernel.cu",
+    "cake_warp_decode_b8935d27ab092becf9a0_kernel.cu",
+    "cake_warp_decode_b9ce2c4ba5690e69450c_kernel.cu",
+    "cake_warp_decode_bbea84bc0aa6f631c01e_kernel.cu",
+    "cake_warp_decode_de1fffa0c9722d6f3dc2_kernel.cu",
+    "cake_warp_decode_e7c996a7418120fdc59d_kernel.cu",
+    "cake_warp_decode_fc102671dcafa54593ec_kernel.cu",
+)
+_SM100A_SOURCES: tuple[str, ...] = (
+    "cake_warp_decode_1919fdc835c6d5747044_kernel.cu",
+    "cake_warp_decode_36c3fc6de7aff6664eb4_kernel.cu",
+    "cake_warp_decode_571467f2fe1a078edd15_kernel.cu",
+    "cake_warp_decode_8aa1d75a331e184994b1_kernel.cu",
+    "cake_warp_decode_8aec1074daa9fa51c03c_kernel.cu",
+    "cake_warp_decode_913a821ce8dee11dafcf_kernel.cu",
+    "cake_warp_decode_9bba0f8393c3f5c41338_kernel.cu",
+    "cake_warp_decode_aacea66676dc5e3ed74d_kernel.cu",
+    "cake_warp_decode_ab11eefabf140deeaf0c_kernel.cu",
+    "cake_warp_decode_b1f32bc0ea0d0dbbf453_kernel.cu",
+    "cake_warp_decode_c2c3b32fdd0cd7ae0c4c_kernel.cu",
+    "cake_warp_decode_d17899c336800a8599a6_kernel.cu",
+    "cake_warp_decode_df32a9c78cd8ea22ac78_kernel.cu",
+    "cake_warp_decode_e465613750770e29988f_kernel.cu",
+    "cake_warp_decode_fc0aed4e58408740ce2a_kernel.cu",
+)
+_SM103A_SOURCES: tuple[str, ...] = (
+    "cake_warp_decode_0d07af7cfe5697b5ecdc_kernel.cu",
+    "cake_warp_decode_269d5aebbb5aa995796a_kernel.cu",
+    "cake_warp_decode_36ef13a3551d497679cd_kernel.cu",
+    "cake_warp_decode_3b1c1adc59f3837a48a4_kernel.cu",
+    "cake_warp_decode_3f5bc27d007af5687d63_kernel.cu",
+    "cake_warp_decode_49b2dacb8c21fd7ca1c6_kernel.cu",
+    "cake_warp_decode_64b75a49bc729f82a995_kernel.cu",
+    "cake_warp_decode_65d8dc9a2b51bca5f578_kernel.cu",
+    "cake_warp_decode_7173b39130de7a59f9c6_kernel.cu",
+    "cake_warp_decode_7e715939a26489a27fcb_kernel.cu",
+    "cake_warp_decode_7fc08d4a160ade893bda_kernel.cu",
+    "cake_warp_decode_8bce1085cbf8aaa7c7f6_kernel.cu",
+    "cake_warp_decode_9805c54bf6db2ee12595_kernel.cu",
+    "cake_warp_decode_b0f548cc0bc03def0160_kernel.cu",
+    "cake_warp_decode_b47db4977f3026b27967_kernel.cu",
+    "cake_warp_decode_b84333fbc5c6282202d1_kernel.cu",
+    "cake_warp_decode_e2796e299356440aa3e4_kernel.cu",
+)
+_TARGET_SOURCES: dict[CakeWarpDecodeTarget, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "sm100a": (("common", _COMMON_SOURCES), ("sm_100a", _SM100A_SOURCES)),
+    "sm103a": (("common", _COMMON_SOURCES), ("sm_103a", _SM103A_SOURCES)),
+}
+# Every device TU compiles with fast math except the SiTU static FC1 kernel.
+_NO_FAST_MATH_SOURCES: frozenset[str] = frozenset(
+    ["cake_warp_decode_bbea84bc0aa6f631c01e_kernel.cu"]
+)
 
 
 def _get_cake_fused_moe_warp_decode_csrc_dir() -> Path:
@@ -88,311 +148,22 @@ def _get_include_dir() -> Path:
     )
 
 
-def _require_dict(value: Any, context: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError(
-            f"Cake warp-decode export manifest {context} must be an object"
-        )
-    return value
+def _device_sources(csrc_dir: Path, target: CakeWarpDecodeTarget) -> list[Path]:
+    """Resolve the exact-target device translation units."""
 
-
-def _resolve_export_path(csrc_dir: Path, raw_path: Any, context: str) -> Path:
-    if not isinstance(raw_path, str) or not raw_path or "\\" in raw_path:
-        raise ValueError(
-            f"Cake warp-decode export manifest {context} must be a non-empty POSIX path"
-        )
-    parts = raw_path.split("/")
-    posix_path = PurePosixPath(raw_path)
-    if posix_path.is_absolute() or any(part in {"", ".", ".."} for part in parts):
-        raise ValueError(
-            f"Cake warp-decode export manifest {context} is not a safe relative path: "
-            f"{raw_path!r}"
-        )
-
-    repo_root = csrc_dir.parents[2].resolve()
-    resolved = (repo_root / Path(*posix_path.parts)).resolve()
-    try:
-        resolved.relative_to(repo_root)
-    except ValueError as error:
-        raise ValueError(
-            f"Cake warp-decode export manifest {context} escapes the package root: "
-            f"{raw_path!r}"
-        ) from error
-    if not resolved.is_file():
+    if target not in _TARGET_SOURCES:
+        raise ValueError(f"unsupported Cake warp-decode target: {target}")
+    sources = [
+        csrc_dir / "generated" / subdir / name
+        for subdir, names in _TARGET_SOURCES[target]
+        for name in names
+    ]
+    missing = [str(source) for source in sources if not source.is_file()]
+    if missing:
         raise FileNotFoundError(
-            f"Cake warp-decode export manifest {context} source not found: {resolved}"
+            f"Cake warp-decode {target} device sources not found: {missing}"
         )
-    return resolved
-
-
-def _load_exported_device_sources(
-    csrc_dir: Path, target: CakeWarpDecodeTarget
-) -> tuple[list[Path], bool, dict[Path, list[str]]]:
-    """Validate the target-owned inventory and resolve exact-architecture devices."""
-
-    generated_dir = csrc_dir / "generated"
-    manifest_path = generated_dir / _EXPORTED_MANIFEST
-    if not manifest_path.is_file():
-        if target == "sm103a":
-            legacy = generated_dir / _LEGACY_SM103A_GENERATED_SOURCE
-            if legacy.is_file():
-                return [legacy], False, {}
-        raise FileNotFoundError(
-            f"Cake warp-decode {target} generated inventory was not found at "
-            f"{manifest_path}; install the generated warp-decode kernel inventory"
-        )
-    try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(
-            f"Cake warp-decode inventory could not be read: {manifest_path}"
-        ) from error
-    manifest = _require_dict(payload, "root")
-    if manifest.get("schema") != "flashinfer.warp_decode.inventory.v1":
-        raise ValueError(
-            "Cake warp-decode inventory schema must be flashinfer.warp_decode.inventory.v1"
-        )
-    modules = manifest.get("modules")
-    sequences = manifest.get("sequences")
-    routes = manifest.get("routes")
-    files = _require_dict(manifest.get("files"), "files")
-    if not all(
-        isinstance(rows, list) and rows for rows in (modules, sequences, routes)
-    ):
-        raise ValueError(
-            "Cake warp-decode inventory modules, sequences, and routes must be non-empty arrays"
-        )
-    program = {
-        "modules": modules,
-        "sequences": sequences,
-        "routes": routes,
-        "files": files,
-    }
-    program_bytes = (
-        json.dumps(program, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        + "\n"
-    ).encode("utf-8")
-    if hashlib.sha256(program_bytes).hexdigest() != manifest.get("program_hash"):
-        raise ValueError("Cake warp-decode inventory program hash mismatch")
-
-    file_paths: dict[str, Path] = {}
-    for raw_path, digest in files.items():
-        source = _resolve_export_path(csrc_dir, raw_path, f"files[{raw_path!r}]")
-        if (
-            not isinstance(digest, str)
-            or hashlib.sha256(source.read_bytes()).hexdigest() != digest
-        ):
-            raise ValueError(
-                f"Cake warp-decode inventory file hash mismatch: {raw_path}"
-            )
-        file_paths[raw_path] = source
-    used_files: set[str] = set()
-
-    def inventory_file(raw_path: Any, context: str) -> Path:
-        if not isinstance(raw_path, str) or raw_path not in file_paths:
-            raise ValueError(f"Cake warp-decode inventory {context} is not in files")
-        used_files.add(raw_path)
-        return file_paths[raw_path]
-
-    def identity(row: dict[str, Any], context: str) -> tuple[str, str, str]:
-        arch, name, role = (row.get(key) for key in ("arch", "name", "role"))
-        if arch not in _TARGET_ARCH.values() or not all(
-            isinstance(value, str) and value for value in (name, role)
-        ):
-            raise ValueError(
-                f"Cake warp-decode inventory {context} identity is invalid"
-            )
-        return arch, name, role
-
-    module_sources: dict[tuple[str, str, str], Path] = {}
-    module_devices: dict[tuple[str, str, str], str] = {}
-    module_symbols: dict[tuple[str, str, str], str] = {}
-    device_compile_flags: dict[Path, list[str]] = {}
-    for index, raw_module in enumerate(modules):
-        context = f"modules[{index}]"
-        module = _require_dict(raw_module, context)
-        key = identity(module, context)
-        if key in module_sources:
-            raise ValueError(f"Cake warp-decode inventory duplicates module {key!r}")
-        if not all(
-            isinstance(module.get(field), str) and module[field]
-            for field in ("kernel_symbol", "ffi_entry")
-        ):
-            raise ValueError(f"Cake warp-decode inventory {context} symbol is invalid")
-        device = inventory_file(module.get("device"), f"{context}.device")
-        if device.parent.name != key[0]:
-            raise ValueError(
-                f"Cake warp-decode inventory {context} device architecture differs"
-            )
-        inventory_file(module.get("binding"), f"{context}.binding")
-        compile_flags = module.get("compile_flags")
-        if not isinstance(compile_flags, list) or not all(
-            isinstance(flag, str) and flag for flag in compile_flags
-        ):
-            raise ValueError(
-                f"Cake warp-decode inventory {context}.compile_flags is invalid"
-            )
-        if (
-            device in device_compile_flags
-            and device_compile_flags[device] != compile_flags
-        ):
-            raise ValueError(
-                f"Cake warp-decode inventory has conflicting compile flags for {device}"
-            )
-        device_compile_flags[device] = compile_flags
-        module_sources[key] = device
-        module_devices[key] = module["device"]
-        module_symbols[key] = module["kernel_symbol"]
-
-    sequence_modules: dict[tuple[str, str, str], tuple[tuple[str, str, str], ...]] = {}
-    sequence_module_union: set[tuple[str, str, str]] = set()
-    for index, raw_sequence in enumerate(sequences):
-        context = f"sequences[{index}]"
-        sequence = _require_dict(raw_sequence, context)
-        key = identity(sequence, context)
-        if key in sequence_modules:
-            raise ValueError(f"Cake warp-decode inventory duplicates sequence {key!r}")
-        members = sequence.get("modules")
-        if not isinstance(members, list) or not members:
-            raise ValueError(
-                f"Cake warp-decode inventory {context}.modules must be non-empty"
-            )
-        module_keys = []
-        for member_index, raw_member in enumerate(members):
-            member = _require_dict(raw_member, f"{context}.modules[{member_index}]")
-            member_key = (key[0], member.get("name"), member.get("role"))
-            if member_key not in module_sources:
-                raise ValueError(
-                    f"Cake warp-decode inventory {context} references missing module {member_key!r}"
-                )
-            module_keys.append(member_key)
-        expected_devices = list(
-            dict.fromkeys(module_devices[member] for member in module_keys)
-        )
-        if sequence.get("devices") != expected_devices:
-            raise ValueError(
-                f"Cake warp-decode inventory {context} device and module inventories differ"
-            )
-        if not isinstance(sequence.get("ffi_entry"), str) or not sequence["ffi_entry"]:
-            raise ValueError(
-                f"Cake warp-decode inventory {context}.ffi_entry is invalid"
-            )
-        inventory_file(sequence.get("binding"), f"{context}.binding")
-        sequence_modules[key] = tuple(module_keys)
-        sequence_module_union.update(module_keys)
-    if sequence_module_union != set(module_sources):
-        raise ValueError(
-            "Cake warp-decode inventory module and sequence closure differs"
-        )
-
-    generated_header = generated_dir / _GENERATED_MANIFEST
-    repo_root = csrc_dir.parents[2].resolve()
-    for source in (
-        generated_header,
-        csrc_dir / _BINDING_SOURCE,
-        csrc_dir / _CONTRACT_HEADER,
-    ):
-        inventory_file(source.resolve().relative_to(repo_root).as_posix(), source.name)
-    if used_files != set(files):
-        raise ValueError("Cake warp-decode inventory files exceed its source closure")
-    header_text = generated_header.read_text(encoding="utf-8")
-    for key, symbol in module_symbols.items():
-        if symbol not in header_text:
-            raise ValueError(
-                f"Cake warp-decode generated C++ manifest is missing {key[0]} symbol {symbol}"
-            )
-
-    target_arch = _TARGET_ARCH[target]
-    route_module_union: set[tuple[str, str, str]] = set()
-    route_sequences: set[tuple[str, str, str]] = set()
-    seen_routes: set[tuple[str, str]] = set()
-    silu_tokens: dict[str, set[int]] = {
-        "fc1_silu_static": set(),
-        "fc1_silu_persistent": set(),
-    }
-    for index, raw_route in enumerate(routes):
-        context = f"routes[{index}]"
-        route = _require_dict(raw_route, context)
-        arch = route.get("arch")
-        args = _require_dict(route.get("args"), f"{context}.args")
-        route_key = (
-            arch,
-            json.dumps(args, sort_keys=True, separators=(",", ":"), allow_nan=False),
-        )
-        if route_key in seen_routes:
-            raise ValueError(
-                f"Cake warp-decode inventory duplicates route {route_key!r}"
-            )
-        seen_routes.add(route_key)
-        sequence = _require_dict(route.get("sequence"), f"{context}.sequence")
-        sequence_key = (arch, sequence.get("name"), sequence.get("role"))
-        if sequence_key not in sequence_modules:
-            raise ValueError(
-                f"Cake warp-decode inventory {context} references missing sequence"
-            )
-        stages = route.get("stages")
-        if not isinstance(stages, list) or not stages:
-            raise ValueError(
-                f"Cake warp-decode inventory {context}.stages must be non-empty"
-            )
-        stage_keys = []
-        for stage_index, raw_stage in enumerate(stages):
-            stage = _require_dict(raw_stage, f"{context}.stages[{stage_index}]")
-            member = _require_dict(
-                stage.get("module"), f"{context}.stages[{stage_index}].module"
-            )
-            member_key = (arch, member.get("name"), member.get("role"))
-            stage_keys.append(member_key)
-            if (
-                arch == target_arch
-                and args.get("activation") == "silu"
-                and tuple(
-                    args.get(name)
-                    for name in (
-                        "hidden_size",
-                        "intermediate_size",
-                        "num_experts",
-                        "local_num_experts",
-                        "top_k",
-                    )
-                )
-                == (6144, 1536, 192, 192, 4)
-                and stage.get("name") == "fc1"
-                and stage.get("template") in silu_tokens
-            ):
-                tokens = args.get("num_tokens")
-                if not isinstance(tokens, int) or isinstance(tokens, bool):
-                    raise ValueError(
-                        f"Cake warp-decode inventory {context} num_tokens is invalid"
-                    )
-                silu_tokens[stage["template"]].add(tokens)
-        if tuple(stage_keys) != sequence_modules[sequence_key]:
-            raise ValueError(
-                f"Cake warp-decode inventory {context} stage and sequence order differs"
-            )
-        route_module_union.update(stage_keys)
-        route_sequences.add(sequence_key)
-    if route_module_union != set(module_sources) or route_sequences != set(
-        sequence_modules
-    ):
-        raise ValueError("Cake warp-decode inventory route closure differs")
-    device_sources = list(
-        dict.fromkeys(
-            source for key, source in module_sources.items() if key[0] == target_arch
-        )
-    )
-    if not device_sources:
-        raise ValueError(
-            f"Cake warp-decode inventory has no modules for exact target {target_arch}"
-        )
-    has_silu = silu_tokens["fc1_silu_static"] == {1} and silu_tokens[
-        "fc1_silu_persistent"
-    ] == set(range(2, 33))
-    return (
-        device_sources,
-        has_silu,
-        {source: device_compile_flags[source] for source in device_sources},
-    )
+    return sources
 
 
 def get_cake_fused_moe_warp_decode_uri(
@@ -414,35 +185,29 @@ def gen_cake_fused_moe_warp_decode_module(
     uri = get_cake_fused_moe_warp_decode_uri(target)
     csrc_dir = _get_cake_fused_moe_warp_decode_csrc_dir()
     generated_dir = csrc_dir / "generated"
-    generated_sources, has_silu, compile_flags = _load_exported_device_sources(
-        csrc_dir, target
-    )
-    required_files = (
+    device_sources = _device_sources(csrc_dir, target)
+    for source in (
         csrc_dir / _BINDING_SOURCE,
         generated_dir / _GENERATED_MANIFEST,
         csrc_dir / _CONTRACT_HEADER,
-    )
-    for source in required_files:
+    ):
         if not source.is_file():
             raise FileNotFoundError(f"Cake warp-decode source not found: {source}")
 
-    # Only exported device TUs are compiled. Their generated FFI bindings each
-    # own an entry named by the export manifest and would conflict with the
-    # production receipt/Graph-aware binding's single typed `run` alias.
     target_flags = [
         *_TARGET_FLAGS[target],
         f"-DFLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR={_TARGET_MINOR[target]}",
-        f"-DFLASHINFER_CAKE_WARP_DECODE_HAS_SILU={int(has_silu)}",
     ]
     spec = gen_jit_spec(
         name=uri,
-        sources=[
-            *generated_sources,
-            csrc_dir / _BINDING_SOURCE,
-        ],
+        sources=[*device_sources, csrc_dir / _BINDING_SOURCE],
         extra_cuda_cflags=target_flags,
         extra_cuda_cflags_by_source={
-            source: [*target_flags, *flags] for source, flags in compile_flags.items()
+            source: [
+                *target_flags,
+                *([] if source.name in _NO_FAST_MATH_SOURCES else ["--use_fast_math"]),
+            ]
+            for source in device_sources
         },
         extra_ldflags=["-lcuda"],
         extra_include_paths=[

@@ -10,15 +10,14 @@ Sm107Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
 
 @dataclass
 class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm107.next_cutedsl_megamoe.sm107_block_scaled_mega_moe``.
+    """Configure Rubin inference with MXFP8 E4M3/E5M2 activations and weights.
 
-    The Rubin inference block-scaled swap-AB fused dispatch + FC1 + SwiGLU +
-    FC2 + combine mega kernel (``BlockScaledSwapAbMegaMoeKernel``) at quant
-    kind mxfp8: mxfp8 activations x mxfp8 weights -> bf16 output, sf_vec_size
-    32, gate/up interleave 16.
+    The kernel fuses dispatch, FC1, activation, FC2, and BF16 combine. It uses
+    E8M0 scales per 32 values and 16-row gate/up stripes. SwiGLU is the default;
+    SiTU requires both positive, finite beta parameters.
     """
 
-    intermediate_size: int  # post-SwiGLU width; FC1 GEMM N is 2*intermediate_size
+    intermediate_size: int  # width after activation; FC1 N is 2*intermediate_size
     top_k: int
     kernel_name: str = "sm107_mxfp8_mxfp8_bf16_cutedsl"
     kind: Sm107Mxfp8Kind = "mxfp8_e4m3"
@@ -46,3 +45,6 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     # is unsupported because the kernel fixes its knobs at construction.
     knobs: dict | str | None = None
     max_sm_count: Optional[int] = None
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None

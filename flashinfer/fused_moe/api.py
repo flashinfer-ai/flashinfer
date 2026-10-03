@@ -1949,6 +1949,62 @@ class SM12xMxfp8Mxfp4Config:
 
 
 @dataclass(frozen=True)
+class SM12xNvfp4Bf16Config:
+    """SM120/SM121 CuTe-DSL NVFP4-weight x BF16-activation backend.
+
+    Reads the prepared cuTile NVFP4 weight view in place: packed E2M1 weights,
+    128x4-swizzled E4M3 block scales and per-expert FP32 global scales. The
+    same view serves :class:`CuTileNvfp4Config` (W4A4) and
+    :class:`CuTileNvfp4Bf16Config`, so no second weight copy is needed.
+    Supports ``SwiGLU`` with default scalars and ``ReLU2``. Expert
+    parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the shared cuTile NVFP4 view from checkpoint NVFP4 weights.
+
+        Register it with ``MoEWeightPack.prepare_for("sm12x_nvfp4_bf16", ...)``,
+        or reuse a view already registered for ``"cutile_nvfp4"``.
+        """
+        return CuTileNvfp4Config.prepare_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            source_format=source_format,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "SM12xNvfp4Bf16Config()"
+
+
+@dataclass(frozen=True)
 class B12xNvfp4Config:
     """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
 
@@ -2063,6 +2119,7 @@ BackendConfigType = Union[
     CuteDslConfig,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
+    SM12xNvfp4Bf16Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 ]
@@ -2097,6 +2154,7 @@ ALL_BACKEND_CONFIGS = (
     CuteDslConfig,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
+    SM12xNvfp4Bf16Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 )
@@ -2372,6 +2430,8 @@ class MoEActivationPack:
     # Pair-specific scales documented above; None for BF16 and per-tensor FP8.
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
+    # A negative id marks an unrouted slot (e.g. CUDA-graph padding) only on
+    # b12x for now; other backends define no behavior for negative ids.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
     # float32 for TRTLLM UnpackedPrecomputed.

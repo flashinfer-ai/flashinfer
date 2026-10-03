@@ -3561,6 +3561,7 @@ def test_wrapper_warns_once_after_successful_backend_plan(
         _wrapper._BatchMLAPagedAttentionCuteDslBackend, "_candidate_types", (Backend,)
     )
     monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", lambda device: False)
     monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", lambda args: ("fa2",))
     monkeypatch.setenv(
         "FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1" if backend == "auto" else "0"

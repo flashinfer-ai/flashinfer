@@ -54,6 +54,14 @@ def _configuration(batch, heads, page, capacity, sms, capability):
     # and correct BF16/FP16 results; larger head/key tiles retain two CTAs.
     if capability == (10, 0) and block_h == 64 and block_n == 8:
         num_ctas = 1
+    # Two CTAs produce NaNs on SM120/SM121 for these head/key tiles.
+    # Use one CTA for them while retaining two CTAs for other tiles.
+    if capability in ((12, 0), (12, 1)) and (block_h, block_n) in (
+        (64, 8),
+        (128, 8),
+        (128, 16),
+    ):
+        num_ctas = 1
     return (
         block_h,
         block_n,

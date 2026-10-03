@@ -24,7 +24,7 @@ from ..support import shortlisted_moe_geometry
 def large_bf16_moe(config, act, arch):
     x = act.hidden_states_q
     compatible = (
-        arch == 107
+        arch in (107, 120)
         and config.quant.pair == (QuantFormat.BF16, QuantFormat.BF16)
         and config.quant.output == QuantFormat.BF16
         and act.routing_input_mode == RoutingInputMode.PackedPrecomputed

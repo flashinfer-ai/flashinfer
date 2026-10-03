@@ -35,7 +35,7 @@ class LRUCache(OrderedDict):
         super().__setitem__(key, value)
         self.move_to_end(key)
         if len(self) > self.maxsize:
-            self.popitem(last=False)
+            del self[next(iter(self))]
 
 
 class TensorCache:

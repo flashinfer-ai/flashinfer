@@ -46,6 +46,53 @@ def _config(**kw):
     )
 
 
+def test_mxfp4_weights_have_independent_dtype_and_packing():
+    cfg = _config(quant_kind="mxfp4_mxfp8", intermediate=128)
+    assert cfg.torch_act_data_dtype == torch.float8_e4m3fn
+    assert cfg.torch_weight_data_dtype == getattr(
+        torch, "float4_e2m1fn_x2", torch.uint8
+    )
+    assert cfg.torch_act_sf_dtype == torch.float8_e8m0fnu
+    assert cfg.sf_vec_size == 32
+    assert cfg.instruction_k == 64
+    shapes = block_scaled._expected_weight_shapes(cfg)
+    assert shapes[:2] == ((8, 64, 256), (8, 64, 128))
+    with pytest.raises(ValueError, match="multiple of 128"):
+        _config(quant_kind="mxfp4_mxfp8", intermediate=192)
+
+
+def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
+    from flashinfer.moe_ep import (
+        PrequantizedMoEWeights,
+        preprocess_sm107_mxfp4_mega_weights,
+    )
+
+    pack = PrequantizedMoEWeights(
+        torch.zeros(1, 256, 64, dtype=torch.uint8),
+        torch.zeros(1, 128, 64, dtype=torch.uint8),
+        torch.zeros(1, 256, 4, dtype=torch.float8_e4m3fn),
+        torch.zeros(1, 128, 4, dtype=torch.float8_e4m3fn),
+    )
+    with pytest.raises(ValueError, match="block scales"):
+        preprocess_sm107_mxfp4_mega_weights(
+            pack, intermediate_size=128, hidden_size=128
+        )
+
+
+@pytest.mark.parametrize("world", [-1, 0, 3, 5, 6])
+def test_k3_geometry_rejects_invalid_world_before_device_setup(monkeypatch, world):
+    from tests.moe_ep.sm107_test_utils import run_mxfp4_k3_geometry
+
+    def unexpected_device_setup(*args, **kwargs):
+        pytest.fail("Invalid K3 geometry reached device setup")
+
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.ensure_moe_ep_cuda_device", unexpected_device_setup
+    )
+    with pytest.raises(ValueError, match="positive world size that divides 896"):
+        run_mxfp4_k3_geometry(0, world)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -75,6 +122,21 @@ def _config(**kw):
         {"gate_up_clamp": float("nan")},
         {"schedule_policy": ("grouped", True)},
         {"mma_tiler_mnk": (128.0, 128, 128)},
+        {"activation": "unknown"},
+        {"activation": "situ"},
+        {"activation": "situ", "situ_beta": 1.25},
+        {"activation": "situ", "situ_linear_beta": 0.75},
+        {"activation": "situ", "situ_beta": float("nan"), "situ_linear_beta": 0.75},
+        {"activation": "situ", "situ_beta": 1.25, "situ_linear_beta": float("inf")},
+        {"activation": "situ", "situ_beta": 0, "situ_linear_beta": 0.75},
+        {"activation": "situ", "situ_beta": 1.25, "situ_linear_beta": -1},
+        {
+            "activation": "situ",
+            "situ_beta": 1.25,
+            "situ_linear_beta": 0.75,
+            "gate_up_clamp": 1,
+        },
+        {"situ_beta": 1.25, "situ_linear_beta": 0.75},
     ],
 )
 def test_reject_unsafe_config_before_workspace_allocation(overrides):
@@ -261,6 +323,145 @@ def test_unsupported_scalars_are_never_silently_ignored(name):
     setattr(t, name, torch.ones(1))
     with pytest.raises(ValueError, match=name):
         validate_unit_scalars(t)
+
+
+def test_activation_cache_entries_are_distinct(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    key = dict(
+        dtype="nvfp4",
+        world_size=4,
+        hidden=128,
+        intermediate=64,
+        num_experts=8,
+        topk=2,
+        max_tokens=128,
+        device="test",
+    )
+    variants = [
+        {},
+        dict(gate_up_clamp=2.0),
+        dict(activation="situ", situ_beta=1.25, situ_linear_beta=0.75),
+        dict(activation="situ", situ_beta=2.0, situ_linear_beta=0.75),
+    ]
+    for i, variant in enumerate(variants):
+        record_knobs({"token_in_flag_batch": i + 1}, **key, **variant)
+    for i, variant in enumerate(variants):
+        assert lookup_knobs(**key, **variant) == {"token_in_flag_batch": i + 1}
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8"])
+def test_situ_workspace_configuration_and_pool_keys(kind, monkeypatch):
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    cls = (
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        if kind == "nvfp4"
+        else Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+    )
+    fp = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=128)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    keys = []
+    for beta in (None, 1.25, 2.0):
+        cfg = cls(
+            64,
+            2,
+            **(
+                {}
+                if beta is None
+                else dict(activation="situ", situ_beta=beta, situ_linear_beta=0.75)
+            ),
+        )
+        backend = create_mega_kernel(cfg)
+        backend.bind_ep_bootstrap(
+            BootstrapConfig(rank=0, world_size=1, auto_bootstrap=False)
+        )
+        resolved = backend._resolved_config(fp)
+        assert resolved.activation == ("swiglu" if beta is None else "situ")
+        assert resolved.situ_beta == beta
+        keys.append(backend._workspace_pool_key(fp))
+    assert len(set(keys)) == 3
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_invalid_input_normalization(value):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
+        validate_input_norm_const,
+    )
+
+    with pytest.raises(ValueError, match="positive and finite"):
+        validate_input_norm_const(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        torch.ones(3),
+        torch.ones(2, 1),
+        torch.ones(2, dtype=torch.bfloat16),
+        torch.ones(4)[::2],
+        torch.ones(2),
+    ],
+)
+def test_invalid_nvfp4_scalar_metadata(value):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
+        validate_nvfp4_scalars,
+    )
+
+    with pytest.raises(ValueError, match="fc1_alpha"):
+        validate_nvfp4_scalars(
+            {"fc1_alpha": value}, num_local_experts=2, device=torch.device("cuda", 0)
+        )
+
+
+def test_nvfp4_scalars_reset_between_pooled_layers(monkeypatch):
+    from flashinfer.moe_ep import Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.backend import (
+        Sm107Nvfp4BlockScaledMegaKernelBackend,
+    )
+
+    def backend(**kwargs):
+        return Sm107Nvfp4BlockScaledMegaKernelBackend(
+            Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(64, 2, **kwargs)
+        )
+
+    configured = backend(
+        fc1_alpha=torch.tensor([0.5, 0.75]),
+        fc2_alpha=torch.tensor([2.0, 3.0]),
+        fc1_norm_const=torch.tensor([1.5, 2.5]),
+    )
+    plain = backend()
+    ws = SimpleNamespace(
+        config=_config(quant_kind="nvfp4", num_total_experts=2),
+        x=torch.empty(1, 64, dtype=torch.uint8),
+        x_sf=torch.empty(1, 8, dtype=torch.float8_e4m3fn),
+        topk_idx=torch.empty(1, 2, dtype=torch.int32),
+        topk_weights=torch.empty(1, 2),
+        fc1_alpha=torch.ones(2),
+        fc2_alpha=torch.ones(2),
+        fc1_norm_const=torch.ones(2),
+        note_staged_tokens=lambda count: None,
+    )
+    t = MoEEpTensors(
+        torch.empty(0, 64, dtype=torch.uint8),
+        torch.empty(0, 2, dtype=torch.int32),
+        torch.empty(0, 2),
+    )
+    configured.stage_inputs(t, ws, quantize_input=False)
+    torch.testing.assert_close(ws.fc1_alpha, torch.tensor([0.5, 0.75]))
+    t.fc1_alpha = torch.tensor([0.2, 0.4])
+    configured.stage_inputs(t, ws, quantize_input=False)
+    torch.testing.assert_close(ws.fc1_alpha, t.fc1_alpha)
+    t.fc1_alpha = None
+    configured.stage_inputs(t, ws, quantize_input=False)
+    torch.testing.assert_close(ws.fc1_alpha, torch.tensor([0.5, 0.75]))
+    plain.stage_inputs(t, ws, quantize_input=False)
+    for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+        torch.testing.assert_close(getattr(ws, name), torch.ones(2))
 
 
 def test_transformed_layout_and_scale_encoding_contract():
