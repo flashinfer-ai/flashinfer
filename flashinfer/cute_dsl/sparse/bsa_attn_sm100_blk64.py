@@ -50,6 +50,21 @@ _sm100_blk64_compile_cache = get_jit_cache("bsa_fwd_blk64")
 
 
 @flashinfer_api
+
+def _bshd_out_is_tma_writable(out, head_dim_v: int) -> bool:
+    """Whether a caller-provided BSHD `out` can be written by the output TMA directly.
+
+    The store needs head_dim innermost with stride 1 and every other stride 16B
+    aligned; anything else has to go through a staging buffer.
+    """
+    if out is None:
+        return False
+    if out.stride(-1) != 1 or out.shape[-1] != head_dim_v:
+        return False
+    align = 16 // out.element_size()
+    return all(s % align == 0 for s in out.stride()[:-1])
+
+
 def bsa_attn_sm100_blk64_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -353,15 +368,26 @@ def bsa_attn_sm100_blk64_fwd(
             device=q_bhsd.device,
         )
     else:
-        # Always allocate a fresh contiguous BHSD output for the kernel (even
-        # when the caller pre-allocated a BSHD `out`); a transposed view of
-        # `out` would hand the kernel a non-contiguous destination, which the
-        # upstream kernel does not expect. Copy back into `out` at the end.
-        out_bhsd = torch.empty(
-            (batch_size, num_head, seqlen_q, head_dim_v),
-            dtype=output_dtype,
-            device=q_bhsd.device,
+        # Write BSHD straight out. The output TMA atom is built from mO's own
+        # layout (see make_tiled_tma_atom in bsa_fwd_sm100.py), so a transposed
+        # view of a BSHD buffer is a legal destination as long as head_dim stays
+        # the innermost stride-1 axis and the remaining strides are 16B-aligned
+        # -- exactly the condition maybe_contiguous() already relies on for the
+        # Q/K/V loads above.
+        #
+        # Materialising a contiguous BHSD buffer and transposing afterwards costs
+        # a full-tensor copy per call (135 MB at S=37.7k, h=14, d=128), plus a
+        # second one whenever the caller passes `out`.
+        out_bshd = (
+            requested_out
+            if _bshd_out_is_tma_writable(requested_out, head_dim_v)
+            else torch.empty(
+                (batch_size, seqlen_q, num_head, head_dim_v),
+                dtype=output_dtype,
+                device=q_bhsd.device,
+            )
         )
+        out_bhsd = out_bshd.transpose(1, 2)
         lse = (
             requested_lse
             if requested_lse is not None
@@ -496,10 +522,17 @@ def bsa_attn_sm100_blk64_fwd(
             ),
         )
 
-    result_out = out_bhsd.transpose(1, 2).contiguous()
-    if requested_out is not None and result_out is not requested_out:
-        requested_out.copy_(result_out)
-        result_out = requested_out
+    if kv_splits_i > 1:
+        # The split-KV combine produces a fresh contiguous BHSD tensor, so this
+        # path still needs the transpose.
+        result_out = out_bhsd.transpose(1, 2).contiguous()
+        if requested_out is not None and result_out is not requested_out:
+            requested_out.copy_(result_out)
+            result_out = requested_out
+    else:
+        # out_bhsd is a view of out_bshd, which the kernel has already written
+        # in the layout the caller asked for.
+        result_out = out_bshd
     if requested_lse is not None and lse is not requested_lse:
         requested_lse.copy_(lse)
         lse = requested_lse
