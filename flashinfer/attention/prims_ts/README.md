@@ -270,9 +270,12 @@ with `sage_config=SageAttentionConfig(...)`; every run supplies the scales as
 
 ```text
 S[r][c] = sfQ[blkQ(r)] * sfK[blkK(c)] * (Q8 . K8^T)[r][c]
-P       = softmax_row(S), quantized to E4M3 as 448 * p
-O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (448 * l[r])  (+ v_mean[d])
+P       = softmax_row(S), quantized to E4M3 as C * p with C = 448 * 2**-h
+O[r][d] = sfV[d] * (sum_c P8[r][c] * V8[c][d]) / (C * l[r])  (+ v_mean[d])
 ```
+
+`h` is the recipe's `p_headroom_log2` on Q64/KV256 tiles and block-sparse
+routes, and 0 elsewhere.
 
 FlashInfer does not quantize: the 8-bit tensors and scales come from the
 caller, for example TensorRT-LLM's `sageQuant`. `v_mean` adds a per-channel
@@ -288,11 +291,22 @@ scale must be finite and positive; the kernel does not check the values.
 | `k_block_size` | 1, 4, 16, 32, 64, 128 or 256; default 16 |
 | `k_summary_block_size` | K block size of proxy summary scales; default `k_block_size` |
 | `v_mean` | Whether every run supplies `v_mean`; default `False` |
+| `p_headroom_log2` | E4M3 binades of P reserved for deferred softmax anchors, 0 to 8; default 0 |
 | Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`) |
 
-The block-size fields belong to `SageAttentionConfig`; the defaults are
-TensorRT-LLM's production recipe. Masks and scheduling follow the 16-bit
-plans. The paged block-sparse APIs do not support Sage attention.
+The block-size, `v_mean` and `p_headroom_log2` fields belong to
+`SageAttentionConfig`; the defaults are TensorRT-LLM's production recipe.
+Masks and scheduling follow the 16-bit plans. The paged block-sparse APIs do
+not support Sage attention.
+
+A positive `p_headroom_log2` lets the kernel keep the softmax exponent anchor
+while the row maximum rises by at most that many binades, so it skips
+rescaling the accumulated output. The gain depends on the scores: flat rows
+rarely raise their maximum by much, while wide rows still rescale. The price
+is range: the E4M3 grid of P moves down by the same number of binades, so
+probabilities far below the anchor round to subnormals or zero. Rows whose
+largest scores arrive first, such as an attention sink in the leading blocks,
+lose the most. Evaluate it on the target model before enabling it.
 
 ### Scale tensors
 

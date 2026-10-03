@@ -570,6 +570,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
                     else key.sage.k_block_size
                 ),
                 "sage_v_mean": key.sage.v_mean,
+                "sage_p_headroom_log2": key.sage.p_headroom_log2,
             }
         )
     layout_args: dict[str, object]

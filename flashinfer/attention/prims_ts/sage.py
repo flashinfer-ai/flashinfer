@@ -47,14 +47,27 @@ class SageAttentionConfig:
     ``k_summary_block_size`` is the K block size of a proxy plan's summary
     scales; construction sets it to ``k_block_size`` when it is omitted.
     Both must be one of ``SAGE_K_BLOCK_SIZES``. ``v_mean`` says whether every
-    run supplies a per-channel V mean that is added back to the output. The
-    defaults are TensorRT-LLM's production recipe.
+    run supplies a per-channel V mean that is added back to the output.
+
+    ``p_headroom_log2`` (0 to 8) trades E4M3 range of the probabilities for
+    fewer output rescales. P is quantized at ``448 * 2**-p_headroom_log2``,
+    and launches that defer softmax anchor updates (KV256 tiles and
+    block-sparse routes) keep the exponent anchor while the row maximum rises
+    by at most that many binades, skipping the rescale of the accumulated
+    output. The grid moves down by the same amount, so probabilities far below
+    the anchor lose precision; rows whose largest scores arrive first, such
+    as attention sinks in the first blocks, are the most exposed. 0 keeps
+    exact anchors and the full range; ``log2(1.75)`` gives the power-of-two
+    scale 256. Other launches ignore it.
+
+    The defaults are TensorRT-LLM's production recipe.
     """
 
     q_block_size: int = 1
     k_block_size: int = 16
     v_mean: bool = False
     k_summary_block_size: int | None = None
+    p_headroom_log2: float = 0.0
 
     def __post_init__(self) -> None:
         if self.k_summary_block_size is None:

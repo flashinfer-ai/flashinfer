@@ -18,8 +18,6 @@ Keep non-obvious constants here with their rationale so config, resource, and
 reduction code can use named values without duplicating comments.
 """
 
-import math
-
 # B200 has 148 SMs. Use this only when the runtime SM query is unavailable,
 # so auto split-KV selection remains deterministic in offline/test flows.
 FALLBACK_SM_COUNT_B200 = 148
@@ -156,10 +154,11 @@ FP16_VALUES_PER_REG = 2
 # one-byte or 16 two-byte K elements.
 MMA_K_STEP_BYTES = 32
 
-# FP8 probabilities are quantized as 448 * p (the E4M3 maximum); row sums and
-# sink terms share the scale, and the output normalization divides it out.
-FP8_P_QUANT_SCALE = 448.0
-FP8_P_QUANT_LOG2_SCALE = math.log2(FP8_P_QUANT_SCALE)
+# FP8 probabilities are quantized as ``p * FmhaDecodeConfig.fp8_p_quant_scale``:
+# the E4M3 maximum, less the ``sage_p_headroom_log2`` binades a deferred
+# exponent anchor may lag the row maximum. Row sums and sink terms share the
+# scale, and the output normalization divides it out.
+E4M3_MAX = 448.0
 
 # tcgen05 SMEM descriptor geometry: address offsets count 16-byte units and a
 # 128-byte swizzle atom spans one 128-byte row per K or MN index.
