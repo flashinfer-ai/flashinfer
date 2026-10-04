@@ -107,8 +107,6 @@ def _load_inventory(csrc_dir: Path, target: CakeStepFunTarget) -> tuple[list[Pat
             raise ValueError(f"Cake StepFun inventory kernels[{index}] device or compile_flags are invalid")
         if kernel["arch"] != target:
             continue
-        if Path(device).parent.name != target:
-            raise ValueError(f"Cake StepFun inventory kernels[{index}] device architecture differs")
         tile = kernel.get("tile_n")
         if not isinstance(tile, int) or tile in seen_tiles:
             raise ValueError(f"Cake StepFun inventory kernels[{index}] tile is invalid or duplicated")
