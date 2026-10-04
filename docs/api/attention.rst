@@ -261,7 +261,8 @@ PageAttention for MLA
 
     The NVFP4 cache that route reads is written per layer by the fused
     SM120/SM121 writers ``cake_dsv4_nvfp4_rope_quantize_insert`` (sliding-window
-    pool: GPT-J RoPE of the query and latent KV, head-padded ``q_out``, NVFP4
+    pool: GPT-J RoPE of the query and latent KV, head-padded ``q_out`` or, with
+    ``q_inplace=True`` and no head padding, the query rotated in place, NVFP4
     quantization and paged insert in one launch) and
     ``cake_dsv4_nvfp4_kv_rope_quantize_insert`` (compressed pool with
     ``compress_ratio`` 1 or 2, speculative context with ratio 1); both produce

@@ -183,10 +183,13 @@ torch-level GPT-J RoPE of the query and latent KV, the query head padding and
 `nvfp4_quantize_append_sparse_mla_cache`: the roped KV row is rounded to BF16
 and quantized exactly like the append writer (byte-identical records: 224 B
 E2M1 NoPE, 128 B BF16 RoPE bits, 28 E4M3 scales + 4 zero bytes), `q_out` is the
-fp32 rotation of each live head rounded to BF16 with zero-filled padded heads.
-One warp per (token, head slot), 256-thread CTAs, variants per padded head
-count (8, 16, 32, 64, 128) x Q RoPE on/off x slot dtype (int32 / int64) for
-the QKV form and per compress ratio (1, 2) x slot dtype for the KV form. Both
+fp32 rotation of each live head rounded to BF16 with zero-filled padded heads;
+with `q_inplace=True` (no head padding, Q RoPE on) the entry rotates the 64
+RoPE dims of `q` itself and returns `q` (one warp per 8 heads, nothing else of
+`q` is touched or copied). One warp per (token, head slot), 256-thread CTAs,
+variants per padded head count (8, 16, 32, 64, 128) x Q RoPE on/off x slot
+dtype (int32 / int64) for the QKV form, the in-place form per head count x
+slot dtype, and per compress ratio (1, 2) x slot dtype for the KV form. Both
 entries take the 3-D / HND / NHD cache views with a runtime page size and a
 16-byte-multiple page stride, skip negative and out-of-range slots, accept a
 `slot_mapping` shorter than `positions` (data-parallel padding), allocate
@@ -206,7 +209,11 @@ from flashinfer.mla import (
 
 # Sliding-window pool (per layer): rotated, head-padded Q plus the quantized KV insert.
 q_out = cake_dsv4_nvfp4_rope_quantize_insert(
-    q, kv, swa_cache, slot_mapping, positions, cos_sin_cache, q_head_padded=8
+    q, kv, swa_cache, slot_mapping, positions, cos_sin_cache, q_head_padded=16
+)
+# No head padding (every power-of-two TP split of DeepSeek-V4): rotate q in place.
+q = cake_dsv4_nvfp4_rope_quantize_insert(
+    q, kv, swa_cache, slot_mapping, positions, cos_sin_cache, q_inplace=True
 )
 # Compressed pool (ratio 2: boundary rows only) and speculative context (ratio 1).
 cake_dsv4_nvfp4_kv_rope_quantize_insert(
