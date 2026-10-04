@@ -5262,6 +5262,17 @@ class _TrtllmRunnerBase(MoERunner):
     _pair: tuple[QuantFormat, QuantFormat]
     _num_weight_rows: int
     _intermediate_size: int
+    device: torch.device
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        """Pack the activation and weight views into the positional launch list.
+
+        Every concrete TRT-LLM runner defines its own packing; this declaration
+        is the interface a mixin layered over them can rely on.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not define pack_inputs")
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -5473,7 +5484,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
         (QuantFormat.MXFP4, QuantFormat.BF16),
@@ -5871,7 +5882,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = (
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
     )
@@ -6235,7 +6246,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
     supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
     # The per-tensor cubin manifest has SwiGLU and ReLU2 epilogues. GeGLU is
     # representable by the enum but has no matching generated kernel.
-    supported_activation_classes = (SwiGLU, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLU, ReLU2)
 
     def _check_activation_parameters(self) -> None:
         if (
@@ -6553,7 +6564,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
     # The BF16 cubin manifest currently contains SwiGLU and ReLU2. GeGLU and
     # SiTU are represented by the launcher enum but have no matching kernels.
-    supported_activation_classes = (SwiGLU, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLU, ReLU2)
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -6771,7 +6782,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
 # ---------------------------------------------------------------------------
 # Cake StepFun runners (exported Cake FC1 kernels inside the trtllm-gen pipeline)
 # ---------------------------------------------------------------------------
-class CakeStepFunRunner(MoERunner):
+class CakeStepFunRunner(_TrtllmRunnerBase):
     """StepFun adapter over the Cake-enabled trtllm-gen ``MoERunner`` (all FC1 families).
 
     Instantiating this class returns the per-precision subclass for the
@@ -6853,7 +6864,9 @@ class CakeStepFunRunner(MoERunner):
 class CakeStepFunNvfp4Runner(CakeStepFunRunner, TrtllmFp4RoutedRunner):
     """NVFP4 StepFun over the Cake FC1 kernels (E2m1 output, or bf16 output with per-token scales)."""
 
-    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+    )
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
@@ -6864,21 +6877,27 @@ class CakeStepFunNvfp4Runner(CakeStepFunRunner, TrtllmFp4RoutedRunner):
 class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
     """BF16 StepFun over the Cake FC1 kernels (BlockMajorK weights)."""
 
-    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
-    supported_activation_classes = (SwiGLUStep,)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.BF16, QuantFormat.BF16),
+    )
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLUStep,)
 
 
 class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner):
     """Per-tensor FP8 StepFun over the Cake FC1 kernels (raw-unit clamp limits)."""
 
-    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
-    supported_activation_classes = (SwiGLUStep,)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+    )
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLUStep,)
 
 
 class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
     """MXFP8 StepFun over the Cake FC1 kernels (UE8M0 block scales)."""
 
-    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+    )
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {

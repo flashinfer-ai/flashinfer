@@ -17,7 +17,7 @@ limitations under the License.
 import os
 import platform
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from . import env as jit_env
 from ..artifacts import ArtifactPath, CheckSumHash
@@ -333,7 +333,7 @@ def trtllm_gen_fused_moe_build_inputs(
     module_name: str,
     enable_rubin: bool = False,
     nvcc_flags: Optional[List[str]] = None,
-) -> tuple[List[Path], List[str], List[Path]]:
+) -> tuple[List[Path], List[str], List[Union[str, Path]]]:
     """Host sources, nvcc flags, and include paths of a trtllm-gen fused-MoE module.
 
     Resolves the BMM artifact (manifest header, export headers) into the
@@ -442,7 +442,7 @@ def trtllm_gen_fused_moe_build_inputs(
         *_manifest_host_compile_flags(),
         *nvcc_flags,
     ]
-    include_paths = [
+    include_paths: List[Union[str, Path]] = [
         # gen_root supplies both the export-header symlink and the
         # arch-filtered flashinferMetaInfo.h; the artifact's own include/
         # dir is deliberately not on the path so the unfiltered manifest
