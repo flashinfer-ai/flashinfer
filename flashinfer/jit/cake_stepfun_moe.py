@@ -36,7 +36,7 @@ _MODULE_URI: dict[CakeStepFunTarget, str] = {
     "sm_103a": "fused_moe_cake_stepfun_sm103",
 }
 _INVENTORY = "cake_stepfun_inventory.json"
-_INVENTORY_SCHEMA = "flashinfer.cake_stepfun.inventory.v1"
+_INVENTORY_SCHEMA = "flashinfer.cake_stepfun.inventory.v2"
 _MANIFEST = "cake_stepfun_generated_manifest.cuh"
 _RUNNER_SOURCE = "cake_stepfun_fc1_runner.cu"
 _RUNNER_HEADER = "cake_stepfun_fc1_runner.cuh"
@@ -78,7 +78,7 @@ def _load_inventory(csrc_dir: Path, target: CakeStepFunTarget) -> tuple[list[Pat
     if not isinstance(kernels, list) or not kernels or not isinstance(files, dict) or not files:
         raise ValueError("Cake StepFun inventory kernels and files must be non-empty")
     program = {
-        key: inventory[key] for key in ("kernels", "parameters", "files") if key in inventory
+        key: inventory[key] for key in ("kernels", "families", "files") if key in inventory
     }
     program_bytes = (
         json.dumps(program, sort_keys=True, separators=(",", ":")) + "\n"
@@ -95,9 +95,12 @@ def _load_inventory(csrc_dir: Path, target: CakeStepFunTarget) -> tuple[list[Pat
     manifest_relative = inventory.get("manifest")
     if manifest_relative not in files or Path(manifest_relative).name != _MANIFEST:
         raise ValueError("Cake StepFun inventory must list the generated manifest header")
+    families = inventory.get("families")
+    if not isinstance(families, dict) or not families:
+        raise ValueError("Cake StepFun inventory families must be a non-empty mapping")
     device_sources: list[Path] = []
     compile_flags: dict[Path, list[str]] = {}
-    seen_tiles: set[int] = set()
+    seen: set[tuple[str, int]] = set()
     for index, kernel in enumerate(kernels):
         if not isinstance(kernel, dict) or kernel.get("arch") not in _TARGET_FLAGS:
             raise ValueError(f"Cake StepFun inventory kernels[{index}] is invalid")
@@ -107,13 +110,20 @@ def _load_inventory(csrc_dir: Path, target: CakeStepFunTarget) -> tuple[list[Pat
             raise ValueError(f"Cake StepFun inventory kernels[{index}] device or compile_flags are invalid")
         if kernel["arch"] != target:
             continue
+        family = kernel.get("family")
         tile = kernel.get("tile_n")
-        if not isinstance(tile, int) or tile in seen_tiles:
-            raise ValueError(f"Cake StepFun inventory kernels[{index}] tile is invalid or duplicated")
-        seen_tiles.add(tile)
+        if family not in families or not isinstance(tile, int) or tile not in families[family].get("tiles", ()):
+            raise ValueError(f"Cake StepFun inventory kernels[{index}] family or tile is invalid")
+        if (family, tile) in seen:
+            raise ValueError(f"Cake StepFun inventory kernels[{index}] duplicates ({family}, tile {tile})")
+        seen.add((family, tile))
         source = (repo_root / device).resolve()
         device_sources.append(source)
         compile_flags[source] = list(flags)
+    for family, spec in families.items():
+        missing = sorted(set(spec.get("tiles", ())) - {tile for fam, tile in seen if fam == family})
+        if missing:
+            raise ValueError(f"Cake StepFun inventory lacks {family} tiles {missing} for target {target}")
     if not device_sources:
         raise ValueError(f"Cake StepFun inventory has no kernels for target {target}")
     return device_sources, compile_flags
@@ -135,8 +145,8 @@ def gen_cake_stepfun_fused_moe_module(target: CakeStepFunTarget) -> JitSpec:
     ``-DCAKE_STEPFUN_FC1``, which replaces the GEMM1 stage by the exported Cake
     StepFun FC1 kernels of ``csrc/fused_moe/cake_stepfun/``. It exports the same
     TVM-FFI operations as ``fused_moe_trtllm_sm100`` under its own module name plus
-    the standalone FC1 entry points ``cake_stepfun_fc1_tiles`` and
-    ``cake_stepfun_fc1_nvfp4``.
+    the standalone FC1 entry points ``cake_stepfun_fc1_families``,
+    ``cake_stepfun_fc1_tiles`` and ``cake_stepfun_fc1``.
     """
     uri = get_cake_stepfun_fused_moe_uri(target)
     csrc_dir = _get_cake_stepfun_csrc_dir()

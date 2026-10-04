@@ -55,19 +55,57 @@ generated::TensorLayout denseLayout(void const* data, std::initializer_list<int6
   return layout;
 }
 
-bool isCakeSelectable(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOutput,
-                      bool useDeepSeekFp8, MoE::ActivationType activationType,
-                      bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
-                      batchedGemm::gemm::BiasType biasType, bool usePerTokenScaling,
-                      bool usePerChannelScaling) {
-  // The exported inventory is the NVFP4 fused-activation FC1: E2m1 activations and weights, E2m1
-  // output with block scales, trtllm-shuffled MajorK weights, no bias, no per-token/channel scales.
-  return dtypeAct == btg::Dtype::E2m1 && dtypeWeights == btg::Dtype::E2m1 &&
-         dtypeOutput == btg::Dtype::E2m1 && !useDeepSeekFp8 &&
-         activationType == MoE::ActivationType::SwigluStep && useShuffledMatrix &&
-         weightLayout == batchedGemm::gemm::MatrixLayout::MajorK &&
-         biasType == batchedGemm::gemm::BiasType::None && !usePerTokenScaling &&
-         !usePerChannelScaling;
+// The generated-manifest family served by the native cubin selection arguments, or -1.
+int selectFamily(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOutput,
+                 bool useDeepSeekFp8, MoE::ActivationType activationType, bool useShuffledMatrix,
+                 batchedGemm::gemm::MatrixLayout weightLayout, batchedGemm::gemm::BiasType biasType,
+                 bool usePerTokenScaling, bool usePerChannelScaling) {
+  using batchedGemm::gemm::MatrixLayout;
+  // Every exported family is the fused SwiGLU-Step FC1 over trtllm-shuffled weights without a
+  // GEMM1 bias or per-channel scales.
+  if (activationType != MoE::ActivationType::SwigluStep || !useShuffledMatrix ||
+      biasType != batchedGemm::gemm::BiasType::None || usePerChannelScaling || useDeepSeekFp8) {
+    return -1;
+  }
+  if (dtypeAct == btg::Dtype::E2m1 && dtypeWeights == btg::Dtype::E2m1 &&
+      weightLayout == MatrixLayout::MajorK) {
+    if (dtypeOutput == btg::Dtype::E2m1 && !usePerTokenScaling) return generated::kFc1Nvfp4;
+    if (dtypeOutput == btg::Dtype::Bfloat16 && usePerTokenScaling) {
+      return generated::kFc1Nvfp4PerToken;
+    }
+    return -1;
+  }
+  if (usePerTokenScaling) return -1;
+  if (dtypeAct == btg::Dtype::Bfloat16 && dtypeWeights == btg::Dtype::Bfloat16 &&
+      dtypeOutput == btg::Dtype::Bfloat16 && weightLayout == MatrixLayout::BlockMajorK) {
+    return generated::kFc1Bf16;
+  }
+  if (dtypeAct == btg::Dtype::E4m3 && dtypeWeights == btg::Dtype::E4m3 &&
+      dtypeOutput == btg::Dtype::E4m3 && weightLayout == MatrixLayout::MajorK) {
+    return generated::kFc1Fp8PerTensor;
+  }
+  if (dtypeAct == btg::Dtype::MxE4m3 && dtypeWeights == btg::Dtype::MxE4m3 &&
+      dtypeOutput == btg::Dtype::MxE4m3 && weightLayout == MatrixLayout::MajorK) {
+    return generated::kFc1MxFp8;
+  }
+  return -1;
+}
+
+char const* familyName(int family) {
+  switch (family) {
+    case generated::kFc1Nvfp4:
+      return "nvfp4";
+    case generated::kFc1Nvfp4PerToken:
+      return "nvfp4_bf16tok";
+    case generated::kFc1Bf16:
+      return "bf16";
+    case generated::kFc1Fp8PerTensor:
+      return "fp8";
+    case generated::kFc1MxFp8:
+      return "mxfp8";
+    default:
+      return "native";
+  }
 }
 
 }  // namespace
@@ -82,18 +120,21 @@ Fc1Runner::Fc1Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dt
       mDtypeOutput(dtypeOutput),
       mTileTokensDim(tileTokensDim),
       mActType(activationType),
-      mBiasType(biasType) {
-  if (isCakeSelectable(dtypeAct, dtypeWeights, dtypeOutput, useDeepSeekFp8, activationType,
-                       useShuffledMatrix, weightLayout, biasType, usePerTokenScaling,
-                       usePerChannelScaling)) {
+      mBiasType(biasType),
+      mFamily(selectFamily(dtypeAct, dtypeWeights, dtypeOutput, useDeepSeekFp8, activationType,
+                           useShuffledMatrix, weightLayout, biasType, usePerTokenScaling,
+                           usePerChannelScaling)) {
+  if (mFamily >= 0) {
     for (size_t index = 0; index < generated::kFc1KernelCount; ++index) {
-      if (generated::kFc1Kernels[index].tile_n == tileTokensDim) {
+      auto const& spec = generated::kFc1Kernels[index];
+      if (spec.family == mFamily && spec.tile_n == tileTokensDim) {
         mKernels.push_back(static_cast<int32_t>(index));
       }
     }
   }
   mSmemConfigured.assign(generated::kFc1KernelCount, false);
   if (mKernels.empty()) {
+    mFamily = -1;
     mNative.emplace(dtypeAct, dtypeWeights, dtypeOutput, useDeepSeekFp8, tileTokensDim,
                     activationType, useShuffledMatrix, weightLayout, biasType, usePerTokenScaling,
                     usePerChannelScaling);
@@ -106,10 +147,12 @@ bool Fc1Runner::shapeSupported(int32_t configIndex, int32_t hiddenSize,
     return false;
   }
   auto const& spec = generated::kFc1Kernels[configIndex];
-  // K streams in whole BLOCK_K tiles and the weight block scales in 64-column groups; the
-  // interleaved up/gate output rows tile by output_rows_per_cta (128 physical weight rows).
+  // K streams in whole BLOCK_K tiles (the block-scale groups divide BLOCK_K); the interleaved
+  // up/gate output rows tile by output_rows_per_cta (128 physical weight rows) and a cluster of
+  // cluster[0] CTAs covers adjacent output-row tiles.
+  int64_t const gridM = intermediateSize / spec.output_rows_per_cta;
   return hiddenSize > 0 && hiddenSize % spec.block_k == 0 && intermediateSize > 0 &&
-         intermediateSize % spec.output_rows_per_cta == 0;
+         intermediateSize % spec.output_rows_per_cta == 0 && gridM % spec.cluster[0] == 0;
 }
 
 size_t Fc1Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize,
@@ -134,10 +177,11 @@ int32_t Fc1Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
       return index;
     }
   }
-  FLASHINFER_CHECK(false, "No Cake StepFun FC1 kernel for tile_N=", mTileTokensDim,
-                   " accepts hidden_size=", hiddenSize, ", intermediate_size=", intermediateSize,
+  FLASHINFER_CHECK(false, "No Cake StepFun FC1 kernel (", familyName(mFamily),
+                   ") for tile_N=", mTileTokensDim, " accepts hidden_size=", hiddenSize,
+                   ", intermediate_size=", intermediateSize,
                    " (hidden_size must be a multiple of the kernel K tile and intermediate_size a "
-                   "multiple of its output rows per CTA).");
+                   "multiple of its output rows per CTA times the cluster size).");
   return -1;
 }
 
@@ -181,24 +225,20 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
                  validHiddenSize, validIntermediateSize);
     return;
   }
+  char const* const family = familyName(mFamily);
   FLASHINFER_CHECK(shapeSupported(configIndex, hiddenSize, intermediateSize),
-                   "Invalid Cake StepFun FC1 config index ", configIndex, " for tile_N=",
-                   mTileTokensDim, ", hidden_size=", hiddenSize,
+                   "Invalid Cake StepFun FC1 config index ", configIndex, " for ", family,
+                   " tile_N=", mTileTokensDim, ", hidden_size=", hiddenSize,
                    ", intermediate_size=", intermediateSize);
-  FLASHINFER_CHECK(hiddenStateScale != nullptr && weightScale != nullptr,
-                   "Cake StepFun FC1 requires NVFP4 activation and weight block scales");
-  FLASHINFER_CHECK(outputScalesScalar != nullptr && outputScalesGateScalar != nullptr,
-                   "Cake StepFun FC1 requires per-expert output1 scales");
-  FLASHINFER_CHECK(ptrClampLimit != nullptr,
-                   "Cake StepFun FC1 requires an explicit per-expert clamp limit "
-                   "(gemm1_clamp_limit in raw units: limit / output1_scales_gate_scalar)");
+  FLASHINFER_CHECK(ptrClampLimit != nullptr, "Cake StepFun FC1 (", family,
+                   ") requires an explicit per-expert clamp limit (gemm1_clamp_limit)");
   FLASHINFER_CHECK(ptrGatedActAlpha == nullptr && ptrGatedActBeta == nullptr,
                    "SwigluStep accepts gemm1_clamp_limit only; gemm1_alpha / gemm1_beta must be "
                    "absent");
   FLASHINFER_CHECK(ptrBias == nullptr && permutedIdxToBiasRowIdx == nullptr,
                    "Cake StepFun FC1 does not consume a GEMM1 bias");
-  FLASHINFER_CHECK(perTokenScales == nullptr && perChannelScales == nullptr,
-                   "Cake StepFun FC1 does not consume per-token or per-channel scales");
+  FLASHINFER_CHECK(perChannelScales == nullptr,
+                   "Cake StepFun FC1 does not consume per-channel scales");
   FLASHINFER_CHECK(!useRoutingScalesOnInput,
                    "Cake StepFun FC1 does not apply routing scales on the input");
   FLASHINFER_CHECK((validHiddenSize < 0 || validHiddenSize == hiddenSize) &&
@@ -208,51 +248,119 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   FLASHINFER_CHECK(ptrNumNonExitingCtas != nullptr && permutedIdxToTokenIdx != nullptr &&
                        ptrCtaIdxXyToBatchIdx != nullptr && ptrCtaIdxXyToMnLimit != nullptr,
                    "Cake StepFun FC1 requires the complete trtllm-gen routing arrays");
+  bool const blockScaled =
+      mFamily == generated::kFc1Nvfp4 || mFamily == generated::kFc1Nvfp4PerToken ||
+      mFamily == generated::kFc1MxFp8;
+  bool const scalarScaled = mFamily == generated::kFc1Nvfp4 ||
+                            mFamily == generated::kFc1Nvfp4PerToken ||
+                            mFamily == generated::kFc1Fp8PerTensor;
+  FLASHINFER_CHECK(!blockScaled || (hiddenStateScale != nullptr && weightScale != nullptr),
+                   "Cake StepFun FC1 (", family,
+                   ") requires activation and weight block scales");
+  FLASHINFER_CHECK(!scalarScaled ||
+                       (outputScalesScalar != nullptr && outputScalesGateScalar != nullptr),
+                   "Cake StepFun FC1 (", family, ") requires per-expert output1 scales");
+  FLASHINFER_CHECK(mFamily != generated::kFc1Nvfp4PerToken || perTokenScales != nullptr,
+                   "Cake StepFun FC1 (nvfp4_bf16tok) requires the fp32 per-token activation scales");
+  FLASHINFER_CHECK(mFamily == generated::kFc1Nvfp4PerToken || perTokenScales == nullptr,
+                   "Cake StepFun FC1 (", family, ") does not consume per-token scales");
+  FLASHINFER_CHECK(mFamily == generated::kFc1Nvfp4PerToken || mFamily == generated::kFc1Bf16 ||
+                       mFamily == generated::kFc1Fp8PerTensor || outputScale != nullptr,
+                   "Cake StepFun FC1 (", family, ") requires the output block-scale buffer");
 
   auto const& spec = generated::kFc1Kernels[configIndex];
+  int64_t const E = numExperts;
+  int64_t const H = hiddenSize;
+  int64_t const I = intermediateSize;
+  int64_t const T = numTokens;
   int32_t const gridM = intermediateSize / spec.output_rows_per_cta;
   int32_t const gridN =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  int32_t const maxPaddedTokens =
+  int64_t const maxPaddedTokens =
       Routing::getMaxPermutedPaddedCount(numTokens, topK, numExperts, mTileTokensDim);
   int32_t const kTiles = hiddenSize / spec.block_k;
 
   generated::Fc1Args args{};
-  // Weights: [numExperts, 2 * intermediateSize, hiddenSize / 2] packed E2m1 bytes.
-  auto const weightLayout = denseLayout(
-      weight, {int64_t{numExperts}, int64_t{2} * intermediateSize, int64_t{hiddenSize} / 2});
-  FLASHINFER_CHECK(spec.encode_a(&args.A, weightLayout),
-                   "Cake StepFun FC1: failed to encode the weight tensor map");
-  // Weight block scales in the 128x4 interleaved layout, viewed per 128-row weight tile:
-  // [numExperts * gridM, hiddenSize / 64, 2, 256] bytes.
-  auto const weightScaleLayout = denseLayout(
-      weightScale, {int64_t{numExperts} * gridM, int64_t{hiddenSize} / 64, int64_t{2}, int64_t{256}});
-  FLASHINFER_CHECK(spec.encode_sfa(&args.SFA, weightScaleLayout),
-                   "Cake StepFun FC1: failed to encode the weight block-scale tensor map");
-  // Output: [maxPaddedTokens, intermediateSize / 2] packed E2m1 bytes (row stride is what the
-  // kernel's descriptor consumes; the padded row extent is published by routing on device).
-  auto const outputLayout =
-      denseLayout(output, {int64_t{maxPaddedTokens}, int64_t{intermediateSize} / 2});
-  FLASHINFER_CHECK(spec.encode_c(&args.C, outputLayout),
-                   "Cake StepFun FC1: failed to encode the output tensor map");
-  args.B = static_cast<uint8_t*>(hiddenState);
-  args.SFB = static_cast<uint8_t*>(hiddenStateScale);
-  args.SFC = static_cast<uint8_t*>(outputScale);
+  generated::TensorLayout weightLayout{}, weightScaleLayout{}, activationLayout{},
+      activationScaleLayout{}, outputLayout{};
+  switch (mFamily) {
+    case generated::kFc1Nvfp4:
+    case generated::kFc1Nvfp4PerToken:
+      // Weights [E, 2I, H/2] packed E2m1 bytes; 128x4 block scales viewed per 128-row weight
+      // tile [E * gridM, H/64, 2, 256]; activations [T, H/2] bytes with linear [T, H/16] scales.
+      weightLayout = denseLayout(weight, {E, 2 * I, H / 2});
+      weightScaleLayout = denseLayout(weightScale, {E * gridM, H / 64, int64_t{2}, int64_t{256}});
+      activationLayout = denseLayout(hiddenState, {T, H / 2});
+      activationScaleLayout = denseLayout(hiddenStateScale, {T, H / 16});
+      // E2m1 output [maxPadded, I/2] bytes; the bf16 per-token output is a plain pointer.
+      outputLayout = denseLayout(output, {maxPaddedTokens, I / 2});
+      break;
+    case generated::kFc1Bf16:
+      // BlockMajorK bf16 weights [E, H/64, 2I, 64]; bf16 activations [T, H]; bf16 output.
+      weightLayout = denseLayout(weight, {E, H / 64, 2 * I, int64_t{64}});
+      activationLayout = denseLayout(hiddenState, {T, H});
+      outputLayout = denseLayout(output, {maxPaddedTokens, I});
+      break;
+    case generated::kFc1Fp8PerTensor:
+      // Shuffled MajorK E4m3 weights [E, 2I, H]; E4m3 activations [T, H]; E4m3 output
+      // [maxPadded, I] (FlashInfer's buffer is wider; the kernel's row stride is I).
+      weightLayout = denseLayout(weight, {E, 2 * I, H});
+      activationLayout = denseLayout(hiddenState, {T, H});
+      outputLayout = denseLayout(output, {maxPaddedTokens, I});
+      break;
+    case generated::kFc1MxFp8:
+      // Shuffled MajorK MxE4m3 weights [E, 2I, H] with swizzled UE8M0 scales viewed per 128-row
+      // weight tile [E * gridM, H/128, 2, 256]; activations [T, H] with linear [T, H/32] scales.
+      weightLayout = denseLayout(weight, {E, 2 * I, H});
+      weightScaleLayout = denseLayout(weightScale, {E * gridM, H / 128, int64_t{2}, int64_t{256}});
+      activationLayout = denseLayout(hiddenState, {T, H});
+      activationScaleLayout = denseLayout(hiddenStateScale, {T, H / 32});
+      outputLayout = denseLayout(output, {maxPaddedTokens, I});
+      break;
+    default:
+      FLASHINFER_CHECK(false, "Cake StepFun FC1: unknown family ", mFamily);
+  }
+  FLASHINFER_CHECK(spec.encode_a != nullptr && spec.encode_a(&args.A, weightLayout),
+                   "Cake StepFun FC1 (", family, "): failed to encode the weight tensor map");
+  if (spec.encode_sfa != nullptr) {
+    FLASHINFER_CHECK(spec.encode_sfa(&args.SFA, weightScaleLayout), "Cake StepFun FC1 (", family,
+                     "): failed to encode the weight block-scale tensor map");
+  }
+  if (spec.encode_b != nullptr) {
+    FLASHINFER_CHECK(spec.encode_b(&args.B_map, activationLayout), "Cake StepFun FC1 (", family,
+                     "): failed to encode the activation tensor map");
+  }
+  if (spec.encode_sfb != nullptr) {
+    FLASHINFER_CHECK(spec.encode_sfb(&args.SFB_map, activationScaleLayout), "Cake StepFun FC1 (",
+                     family, "): failed to encode the activation block-scale tensor map");
+  }
+  if (spec.encode_c != nullptr) {
+    FLASHINFER_CHECK(spec.encode_c(&args.C_map, outputLayout), "Cake StepFun FC1 (", family,
+                     "): failed to encode the output tensor map");
+  }
+  args.B_ptr = hiddenState;
+  args.SFB_ptr = hiddenStateScale;
+  args.C_ptr = output;
+  // SFC is the output block-scale buffer, or the per-token activation scales the bf16 per-token
+  // kernels gather by token index.
+  args.SFC_ptr = mFamily == generated::kFc1Nvfp4PerToken ? perTokenScales : outputScale;
   args.route_map = permutedIdxToTokenIdx;
   args.tile_expert = ptrCtaIdxXyToBatchIdx;
   args.tile_mn_limit = ptrCtaIdxXyToMnLimit;
+  args.total_tiles = ptrNumNonExitingCtas;
+  args.work_counter = nullptr;
   args.scale_c = outputScalesScalar;
   args.scale_gate = outputScalesGateScalar;
   args.clamp_limit = ptrClampLimit;
-  // The SwiGLU-Step epilogue forces alpha = 1 and beta = 0; the exported kernel reads neither.
-  args.act_alpha = nullptr;
-  args.act_beta = nullptr;
+  // The SwiGLU-Step epilogue forces alpha = 1 and beta = 0 and reads neither; a valid per-expert
+  // vector keeps any kernel read in bounds.
+  args.act_alpha = outputScalesScalar != nullptr ? outputScalesScalar : ptrClampLimit;
+  args.act_beta = args.act_alpha;
   args.M_out = intermediateSize;
   args.K = hiddenSize;
   args.grid_m = gridM;
   args.grid_n = gridN;
   args.K_tiles = kTiles;
-  args.total_tiles = ptrNumNonExitingCtas;
 
   if (!mSmemConfigured[configIndex]) {
     cudaError_t const configured = spec.configure(spec.dynamic_smem_bytes);
@@ -268,7 +376,8 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   config.blockDim = dim3(spec.block[0], spec.block[1], spec.block[2]);
   config.dynamicSmemBytes = spec.dynamic_smem_bytes;
   config.stream = stream;
-  std::array<cudaLaunchAttribute, 1> attributes{};
+  std::array<cudaLaunchAttribute, 2> attributes{};
+  unsigned numAttrs = 0;
   // Diagnostic override: CAKE_STEPFUN_FC1_PDL=0 launches the FC1 kernel without the programmatic
   // stream-serialization attribute, =1 launches it with the attribute, while the rest of the
   // pipeline keeps the caller's PDL setting; unset follows enable_pdl.
@@ -279,11 +388,19 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   }();
   bool const fc1Pdl = fc1PdlOverride < 0 ? enable_pdl : fc1PdlOverride == 1;
   if (fc1Pdl) {
-    attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attributes[0].val.programmaticStreamSerializationAllowed = 1;
-    config.attrs = attributes.data();
-    config.numAttrs = 1;
+    attributes[numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[numAttrs].val.programmaticStreamSerializationAllowed = 1;
+    ++numAttrs;
   }
+  if (spec.cluster_attribute) {
+    attributes[numAttrs].id = cudaLaunchAttributeClusterDimension;
+    attributes[numAttrs].val.clusterDim.x = spec.cluster[0];
+    attributes[numAttrs].val.clusterDim.y = spec.cluster[1];
+    attributes[numAttrs].val.clusterDim.z = spec.cluster[2];
+    ++numAttrs;
+  }
+  config.attrs = attributes.data();
+  config.numAttrs = numAttrs;
   cudaError_t const launched = spec.submit(&config, args);
   FLASHINFER_CHECK(launched == cudaSuccess, "Cake StepFun FC1 launch failed for ", spec.symbol,
                    " grid=(", gridM, ",", gridN, ") : ", cudaGetErrorString(launched));

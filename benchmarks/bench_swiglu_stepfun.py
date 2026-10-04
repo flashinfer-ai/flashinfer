@@ -183,8 +183,6 @@ def parse_args():
         parser.error("require rounds >= 3 and regression-threshold >= 0")
     if args.cache_policy == "cold" and not args.cupti:
         parser.error("cold graph timing requires CUPTI to flush L2 before each sample")
-    if "cake" in args.backends and "nvfp4" not in args.precisions:
-        parser.error("the cake backend runs NVFP4 only; include nvfp4 in --precisions")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error("output-dir must be empty or absent")
     return args
@@ -273,11 +271,22 @@ def make_candidate(
         _activation_param_view(activation, args.experts, act.hidden_states_q.device)
     )
     if arm == "cake":
-        # The Cake FC1 kernels read an explicit per-expert limit in raw accumulator
-        # units (no implicit default), as CakeStepFunConfig.prepare_weights stores it.
-        view["gemm1_clamp_limit"] = (
-            activation.limit / base_view["output1_scale_gate_scalar"]
-        ).contiguous()
+        # The Cake FC1 kernels read an explicit per-expert limit (no implicit default) in
+        # the units CakeStepFunConfig.prepare_weights stores: raw accumulator units for
+        # NVFP4 and per-tensor FP8 (logical limit over the FC1 gate dequant scale),
+        # physical units for BF16 and MXFP8.
+        gate_key = {
+            QuantFormat.NVFP4: "output1_scale_gate_scalar",
+            QuantFormat.FP8PerTensor: "output1_scales_gate_scalar",
+        }.get(quant.weight)
+        if gate_key is not None:
+            view["gemm1_clamp_limit"] = (
+                activation.limit / base_view[gate_key]
+            ).contiguous()
+        else:
+            view["gemm1_clamp_limit"] = torch.full(
+                (args.experts,), activation.limit, dtype=torch.float32, device="cuda"
+            )
     elif quant.weight is QuantFormat.FP8PerTensor and isinstance(
         activation, SwiGLUStep
     ):
@@ -525,11 +534,7 @@ def main():
             elif precision != "bf16":
                 prepare_kwargs["quant"] = quant
             base_view = backend.prepare_weights(w1, w2, **prepare_kwargs)
-            arms = [
-                arm
-                for arm in args.backends
-                if arm == "trtllm" or precision == "nvfp4"
-            ]
+            arms = list(args.backends)
             for tokens in args.tokens:
                 act, hashes = make_activations(
                     args, tokens, backend, quant, hidden_states_scale_global
