@@ -270,12 +270,15 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   config.stream = stream;
   std::array<cudaLaunchAttribute, 1> attributes{};
   // Diagnostic override: CAKE_STEPFUN_FC1_PDL=0 launches the FC1 kernel without the programmatic
-  // stream-serialization attribute while the rest of the pipeline keeps the caller's PDL setting.
-  static bool const fc1PdlDisabled = [] {
+  // stream-serialization attribute, =1 launches it with the attribute, while the rest of the
+  // pipeline keeps the caller's PDL setting; unset follows enable_pdl.
+  static int const fc1PdlOverride = [] {
     char const* value = std::getenv("CAKE_STEPFUN_FC1_PDL");
-    return value != nullptr && value[0] == '0' && value[1] == '\0';
+    if (value == nullptr || value[0] == '\0' || value[1] != '\0') return -1;
+    return value[0] == '0' ? 0 : value[0] == '1' ? 1 : -1;
   }();
-  if (enable_pdl && !fc1PdlDisabled) {
+  bool const fc1Pdl = fc1PdlOverride < 0 ? enable_pdl : fc1PdlOverride == 1;
+  if (fc1Pdl) {
     attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attributes[0].val.programmaticStreamSerializationAllowed = 1;
     config.attrs = attributes.data();
