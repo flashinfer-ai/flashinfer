@@ -63,7 +63,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_80b494053f17b2b9b178(
+__global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a22e10ee14cc5c07acb7(
     float* __restrict__ state, __nv_bfloat16* __restrict__ x, unsigned long long dt_addr,
     unsigned long long a_addr, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C,
     unsigned long long d_addr, __nv_bfloat16* __restrict__ z, unsigned long long dt_bias_addr,

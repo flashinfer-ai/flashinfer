@@ -70,6 +70,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+__device__ __forceinline__ float max_noftz(float a, float b) {
+  float c;
+  asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+  return c;
+}
+
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
 
 __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c) {
@@ -83,7 +89,7 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_193ec52bcf392c460694(
+__global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a623bc5b6863d0333670(
     __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ x, float* __restrict__ dt,
     float* __restrict__ A, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C,
     float* __restrict__ D, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ output,
@@ -170,9 +176,11 @@ __global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_193
     dt_value = dt[(token_base + step_1) * nheads + head];
     dt_value += dt_bias[head];
     if (dt_softplus != 0) {
-      float _exp_0 = expf(dt_value);
+      float _min_0 = fminf(dt_value, 20.0f);
+      float _exp_0 = expf(_min_0);
       float _log1p_0 = log1pf(_exp_0);
-      dt_value = _log1p_0;
+      float _max_0 = max_noftz(_log1p_0, dt_value);
+      dt_value = _max_0;
     }
   }
   asm volatile("cp.async.wait_group 0;");
