@@ -340,6 +340,30 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
         f"#define CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE {single_tile_ring}"
         in binding
     )
+    # Lever 34: the bf16 Blackwell bundles run the mixed-precision ring grouped shrink.
+    mixed = (
+        1
+        if arch in ("sm100a", "sm103a") and cake_bgmv_moe._dtype_tag(dtype) == "bf16"
+        else 0
+    )
+    assert f"#define CAKE_BGMV_MOE_GROUP_SHRINK_MIXED {mixed}" in binding
+    assert (
+        f"#define CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED {metadata.shrink_grouped_ring_mixed_symbol}"
+        in binding
+    )
+    if cake_bgmv_moe._dtype_tag(dtype) == "bf16":
+        assert (
+            "_shrink_grouped_ring_mixed_" in metadata.shrink_grouped_ring_mixed_symbol
+        )
+    else:
+        assert (
+            metadata.shrink_grouped_ring_mixed_symbol
+            == metadata.shrink_grouped_ring_symbol
+        )
+        assert (
+            metadata.shrink_grouped_ring_mixed_single_symbol
+            == metadata.shrink_grouped_ring_single_symbol
+        )
     assert '#include "cake_bgmv_moe_generic_binding.cuh"' in binding
     cake_bgmv_moe.gen_cake_bgmv_moe_generic_module.cache_clear()
 
@@ -555,6 +579,8 @@ def test_grouped_workspace_sizing_and_selector():
             metadata.shrink_grouped_single_symbol,
             metadata.shrink_grouped_ring_symbol,
             metadata.shrink_grouped_ring_single_symbol,
+            metadata.shrink_grouped_ring_mixed_symbol,
+            metadata.shrink_grouped_ring_mixed_single_symbol,
             metadata.expand_grouped_symbol,
             metadata.combine_grouped_symbol,
             metadata.order_build_symbol,
@@ -566,6 +592,7 @@ def test_grouped_workspace_sizing_and_selector():
             "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER",
             "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED",
             "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING",
+            "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED",
             "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED",
             "CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED",
             "CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD",
@@ -575,6 +602,11 @@ def test_grouped_workspace_sizing_and_selector():
         # 512 B reduction scratch of the direct form.
         assert "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED 512\n" in body
         assert "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING 49664\n" in body
+        # Lever 34: the mixed-precision form stages the weight rows only (two 16 KiB K tiles).
+        assert (
+            "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED 33280\n"
+            in body
+        )
 
 
 def test_order_remap_selector_and_workspace():

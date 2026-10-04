@@ -147,6 +147,13 @@ inline int32_t GroupShrinkRankTilesPerCta(int32_t num_tiles) {
 inline bool GroupShrinkRing(int32_t num_tiles) {
   return CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE != 0 || num_tiles > 1;
 }
+// Lever 34: the bf16 bundles of sm_100a/sm_103a run the mixed-precision grouped shrink
+// (fma.rn.f32.bf16 on the packed BF16 halves, weights-only cp.async ring, x rows register-direct)
+// wherever the ring form is selected: the products, their order and the rounding points are those
+// of the widened chain, so the rows are bitwise identical.  The jit sets
+// CAKE_BGMV_MOE_GROUP_SHRINK_MIXED to 1 for those bundles (0 elsewhere: sm_90 lacks the
+// instruction, fp16 rows keep the widened chain).
+inline bool GroupShrinkMixed(bool ring) { return CAKE_BGMV_MOE_GROUP_SHRINK_MIXED != 0 && ring; }
 // Column blocks (kGroupExpandThreads columns each) one grouped-expand CTA walks.
 // Blackwell: 8 at hidden >= 4096, 4 below (the expand is a per-CTA latency chain; 8 blocks at
 // hidden 2048 leaves too few CTAs); sm_90 rank 64 the same, rank 8-32 2 (neutral at 2-8 on H100).
@@ -178,6 +185,19 @@ constexpr int32_t kGroupScatterSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAT
 constexpr int32_t kShrinkGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED;
 // Lever 3: the cp.async operand-ring grouped shrink stages two K tiles of x and weight rows.
 constexpr int32_t kShrinkGroupedRingSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING;
+// Lever 34: the mixed-precision form's ring holds the weight rows only (fp16 bundles render no
+// mixed form; their aliases resolve to the ring kernels and share its smem).
+#ifdef CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED
+constexpr int32_t kShrinkGroupedRingMixedSmemBytes =
+    CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED;
+#else
+constexpr int32_t kShrinkGroupedRingMixedSmemBytes = kShrinkGroupedRingSmemBytes;
+#endif
+#ifdef CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED_SINGLE
+static_assert(CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED_SINGLE ==
+                  kShrinkGroupedRingMixedSmemBytes,
+              "the mixed-precision grouped shrink forms must share smem");
+#endif
 constexpr int32_t kExpandGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED;
 constexpr int32_t kCombineGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED;
 
@@ -338,6 +358,19 @@ void Configure() {
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  kShrinkGroupedRingSmemBytes),
             "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, operand ring, single rank tile)");
+  // Lever 34: the mixed-precision ring forms (bf16 bundles; fp16 aliases resolve to the ring
+  // kernels).
+  if (CAKE_BGMV_MOE_GROUP_SHRINK_MIXED != 0) {
+    CheckCuda(cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   kShrinkGroupedRingMixedSmemBytes),
+              "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, mixed-precision ring)");
+    CheckCuda(cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED_SINGLE,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   kShrinkGroupedRingMixedSmemBytes),
+              "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, mixed-precision ring, single "
+              "rank tile)");
+  }
   // Lever 30: the rank-64 grouped expand double-buffers its weight stage (two 36 KiB column
   // blocks) and exceeds the default carveout; lower ranks keep register fragments.
   TVM_FFI_ICHECK(max_dynamic_smem >= kExpandGroupedSmemBytes)
@@ -552,12 +585,18 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
     // Lever 20k: one rank tile per CTA takes the straight-line form (sm_90a pays ~10 % per shrink
     // CTA for the loop form at its 128-register budget; the stores are bitwise identical).
     const bool shrink_ring = GroupShrinkRing(num_tiles);
+    // Lever 34: mixed-precision ring form on the bf16 Blackwell bundles (bitwise identical rows).
+    const bool shrink_mixed = GroupShrinkMixed(shrink_ring);
     const auto shrink_kernel =
-        shrink_ring ? (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_RING_SINGLE
-                                              : CAKE_BGMV_MOE_SHRINK_GROUPED_RING)
-                    : (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE
-                                              : CAKE_BGMV_MOE_SHRINK_GROUPED);
-    const int32_t shrink_smem = shrink_ring ? kShrinkGroupedRingSmemBytes : kShrinkGroupedSmemBytes;
+        shrink_mixed  ? (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED_SINGLE
+                                                : CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED)
+        : shrink_ring ? (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_RING_SINGLE
+                                                : CAKE_BGMV_MOE_SHRINK_GROUPED_RING)
+                      : (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE
+                                                : CAKE_BGMV_MOE_SHRINK_GROUPED);
+    const int32_t shrink_smem = shrink_mixed  ? kShrinkGroupedRingMixedSmemBytes
+                                : shrink_ring ? kShrinkGroupedRingSmemBytes
+                                              : kShrinkGroupedSmemBytes;
     CheckCuda(LaunchGroupedPdl(shrink_kernel, shrink_grid, dim3(kShrinkThreads, 1, 1), shrink_smem,
                                stream, shrink_ptr, x_ptr, a_ptr, token_ptr, num_pairs, num_experts,
                                hidden, num_tiles, shrink_rt_per_cta, shrink_rt_groups, ws_ptr,

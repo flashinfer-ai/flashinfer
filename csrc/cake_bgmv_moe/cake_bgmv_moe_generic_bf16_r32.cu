@@ -8242,94 +8242,167 @@ __global__ __launch_bounds__(256, 1) void kernel_flashinfer_bgmv_moe_combine_gro
       }
     }
     float pv[4];
-#pragma unroll 1
-    for (int s = 0; s < sweeps; s++) {
-      float acc[4];
-      int col0 = s * 1024 + tid * 4;
-#pragma unroll
-      for (int cc = 0; cc < 4; cc++) {
-        acc[cc] = 0.0f;
-      }
-      if (vec_ok != 0) {
-        if (col0 < hidden) {
+    int fast = 0;
+    if (vec_ok != 0) {
+      if (scan_all == 0) {
+        if (route_count == 2) {
           if (lora_id >= 0) {
+            fast = 1;
+          }
+        }
+      }
+    }
+    if (fast != 0) {
+      int fp0 = route_list[0];
+      int fp1 = route_list[1];
+      float fw0 = topk_weights[fp0];
+      float fw1 = topk_weights[fp1];
+      long long fb0 = (long long)fp0 * (long long)hidden;
+      long long fb1 = (long long)fp1 * (long long)hidden;
+      float pva0[4];
+      float pva1[4];
+      float acca[4];
 #pragma unroll 1
-            for (int step = 0; step < route_count; step++) {
-              int pair = step;
-              int route_match = 1;
-              if (scan_all != 0) {
-                if (sorted_token_ids[step] != (long long)token) {
-                  route_match = 0;
-                }
-              } else {
-                pair = route_list[step];
-              }
-              if (route_match != 0) {
-                float pair_weight = topk_weights[pair];
-                {
-                  unsigned _v4_0_0;
-                  unsigned _v4_0_1;
-                  unsigned _v4_0_2;
-                  unsigned _v4_0_3;
-                  asm volatile(
-                      "ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                      : "=r"(_v4_0_0), "=r"(_v4_0_1), "=r"(_v4_0_2), "=r"(_v4_0_3)
-                      : "l"((const void*)(reinterpret_cast<const float*>(partials_raw) +
-                                          ((long long)pair * (long long)hidden + (long long)col0)))
-                      : "memory");
-                  pv[0 + 0] = __uint_as_float(_v4_0_0);
-                  pv[0 + 1] = __uint_as_float(_v4_0_1);
-                  pv[0 + 2] = __uint_as_float(_v4_0_2);
-                  pv[0 + 3] = __uint_as_float(_v4_0_3);
-                }
-#pragma unroll
-                for (int cc_1 = 0; cc_1 < 4; cc_1++) {
-                  float _fma_0 = __fmaf_rn(pv[cc_1], pair_weight, acc[cc_1]);
-                  acc[cc_1] = _fma_0;
-                }
-              }
-            }
+      for (int st = 0; st < sweeps; st++) {
+        int colt = st * 1024 + tid * 4;
+        if (colt < hidden) {
+          {
+            unsigned _v4_0_0;
+            unsigned _v4_0_1;
+            unsigned _v4_0_2;
+            unsigned _v4_0_3;
+            asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(_v4_0_0), "=r"(_v4_0_1), "=r"(_v4_0_2), "=r"(_v4_0_3)
+                         : "l"((const void*)(reinterpret_cast<const float*>(partials_raw) +
+                                             (fb0 + (long long)colt)))
+                         : "memory");
+            pva0[0 + 0] = __uint_as_float(_v4_0_0);
+            pva0[0 + 1] = __uint_as_float(_v4_0_1);
+            pva0[0 + 2] = __uint_as_float(_v4_0_2);
+            pva0[0 + 3] = __uint_as_float(_v4_0_3);
           }
           {
-            float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
-            *reinterpret_cast<float4*>((y_accum + (token * output_stride + output_offset + col0)) +
+            unsigned _v4_1_0;
+            unsigned _v4_1_1;
+            unsigned _v4_1_2;
+            unsigned _v4_1_3;
+            asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(_v4_1_0), "=r"(_v4_1_1), "=r"(_v4_1_2), "=r"(_v4_1_3)
+                         : "l"((const void*)(reinterpret_cast<const float*>(partials_raw) +
+                                             (fb1 + (long long)colt)))
+                         : "memory");
+            pva1[0 + 0] = __uint_as_float(_v4_1_0);
+            pva1[0 + 1] = __uint_as_float(_v4_1_1);
+            pva1[0 + 2] = __uint_as_float(_v4_1_2);
+            pva1[0 + 3] = __uint_as_float(_v4_1_3);
+          }
+#pragma unroll
+          for (int cc = 0; cc < 4; cc++) {
+            acca[cc] = 0.0f;
+            float _fma_0 = __fmaf_rn(pva0[cc], fw0, acca[cc]);
+            acca[cc] = _fma_0;
+            float _fma_1 = __fmaf_rn(pva1[cc], fw1, acca[cc]);
+            acca[cc] = _fma_1;
+          }
+          {
+            float4 _v4 = make_float4(acca[0 + 0], acca[0 + 1], acca[0 + 2], acca[0 + 3]);
+            *reinterpret_cast<float4*>((y_accum + (token * output_stride + output_offset + colt)) +
                                        0) = _v4;
           }
         }
-      } else {
-        if (lora_id >= 0) {
+      }
+    }
+    if (fast == 0) {
 #pragma unroll 1
-          for (int step_1 = 0; step_1 < route_count; step_1++) {
-            int pair_s = step_1;
-            int route_match_s = 1;
-            if (scan_all != 0) {
-              if (sorted_token_ids[step_1] != (long long)token) {
-                route_match_s = 0;
-              }
-            } else {
-              pair_s = route_list[step_1];
-            }
-            if (route_match_s != 0) {
-              float pair_weight_s = topk_weights[pair_s];
+      for (int s = 0; s < sweeps; s++) {
+        float acc[4];
+        int col0 = s * 1024 + tid * 4;
 #pragma unroll
-              for (int cc_2 = 0; cc_2 < 4; cc_2++) {
-                if (col0 + cc_2 < hidden) {
-                  float _fma_1 = __fmaf_rn(reinterpret_cast<const float*>(
-                                               partials_raw)[(long long)pair_s * (long long)hidden +
-                                                             (long long)col0 + (long long)cc_2],
-                                           pair_weight_s, acc[cc_2]);
-                  acc[cc_2] = _fma_1;
+        for (int cc_1 = 0; cc_1 < 4; cc_1++) {
+          acc[cc_1] = 0.0f;
+        }
+        if (vec_ok != 0) {
+          if (col0 < hidden) {
+            if (lora_id >= 0) {
+#pragma unroll 1
+              for (int step = 0; step < route_count; step++) {
+                int pair = step;
+                int route_match = 1;
+                if (scan_all != 0) {
+                  if (sorted_token_ids[step] != (long long)token) {
+                    route_match = 0;
+                  }
+                } else {
+                  pair = route_list[step];
+                }
+                if (route_match != 0) {
+                  float pair_weight = topk_weights[pair];
+                  {
+                    unsigned _v4_2_0;
+                    unsigned _v4_2_1;
+                    unsigned _v4_2_2;
+                    unsigned _v4_2_3;
+                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                 : "=r"(_v4_2_0), "=r"(_v4_2_1), "=r"(_v4_2_2), "=r"(_v4_2_3)
+                                 : "l"((const void*)(reinterpret_cast<const float*>(partials_raw) +
+                                                     ((long long)pair * (long long)hidden +
+                                                      (long long)col0)))
+                                 : "memory");
+                    pv[0 + 0] = __uint_as_float(_v4_2_0);
+                    pv[0 + 1] = __uint_as_float(_v4_2_1);
+                    pv[0 + 2] = __uint_as_float(_v4_2_2);
+                    pv[0 + 3] = __uint_as_float(_v4_2_3);
+                  }
+#pragma unroll
+                  for (int cc_2 = 0; cc_2 < 4; cc_2++) {
+                    float _fma_2 = __fmaf_rn(pv[cc_2], pair_weight, acc[cc_2]);
+                    acc[cc_2] = _fma_2;
+                  }
+                }
+              }
+            }
+            {
+              float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
+              *reinterpret_cast<float4*>(
+                  (y_accum + (token * output_stride + output_offset + col0)) + 0) = _v4;
+            }
+          }
+        } else {
+          if (lora_id >= 0) {
+#pragma unroll 1
+            for (int step_1 = 0; step_1 < route_count; step_1++) {
+              int pair_s = step_1;
+              int route_match_s = 1;
+              if (scan_all != 0) {
+                if (sorted_token_ids[step_1] != (long long)token) {
+                  route_match_s = 0;
+                }
+              } else {
+                pair_s = route_list[step_1];
+              }
+              if (route_match_s != 0) {
+                float pair_weight_s = topk_weights[pair_s];
+#pragma unroll
+                for (int cc_3 = 0; cc_3 < 4; cc_3++) {
+                  if (col0 + cc_3 < hidden) {
+                    float _fma_3 =
+                        __fmaf_rn(reinterpret_cast<const float*>(
+                                      partials_raw)[(long long)pair_s * (long long)hidden +
+                                                    (long long)col0 + (long long)cc_3],
+                                  pair_weight_s, acc[cc_3]);
+                    acc[cc_3] = _fma_3;
+                  }
                 }
               }
             }
           }
-        }
 #pragma unroll
-        for (int cc_3 = 0; cc_3 < 4; cc_3++) {
-          if (col0 + cc_3 < hidden) {
-            *(reinterpret_cast<float*>(y_accum +
-                                       (token * output_stride + output_offset + col0 + cc_3)) +
-              (0)) = acc[cc_3];
+          for (int cc_4 = 0; cc_4 < 4; cc_4++) {
+            if (col0 + cc_4 < hidden) {
+              *(reinterpret_cast<float*>(y_accum +
+                                         (token * output_stride + output_offset + col0 + cc_4)) +
+                (0)) = acc[cc_4];
+            }
           }
         }
       }
@@ -8602,41 +8675,50 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
           acc[owner] = 0.0f;
         }
         int tid_vec = tid * 8;
-        if (tid_vec < hidden) {
-          int kw0 = tid_vec / 2;
 #pragma unroll
-          for (int j_1 = 0; j_1 < 4; j_1++) {
-            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                             x_ring_addr + (unsigned int)((j_1 * 1024 + tid_vec) * 2)),
-                         "l"(reinterpret_cast<const unsigned int*>(x_raw) +
-                             (tokens[j_1] * (long long)hidden_words + (long long)kw0)));
-          }
+        for (int d = 0; d < 1; d++) {
+          int k_p = d * 1024 + tid_vec;
+          if (k_p < hidden) {
+            int kw_p = k_p / 2;
+            {
 #pragma unroll
-          for (int r = 0; r < 8; r++) {
-            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                             w_ring_addr + (unsigned int)((r * 1024 + tid_vec) * 2)),
-                         "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
-                             (weight_words_it + (long long)(r * hidden_words) + (long long)kw0)));
+              for (int j_1 = 0; j_1 < 4; j_1++) {
+                asm volatile(
+                    "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                        x_ring_addr + (unsigned int)(((d * 4 + j_1) * 1024 + tid_vec) * 2)),
+                    "l"(reinterpret_cast<const unsigned int*>(x_raw) +
+                        (tokens[j_1] * (long long)hidden_words + (long long)kw_p)));
+              }
+            }
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+              asm volatile(
+                  "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                      w_ring_addr + (unsigned int)(((d * 8 + r) * 1024 + tid_vec) * 2)),
+                  "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
+                      (weight_words_it + (long long)(r * hidden_words) + (long long)kw_p)));
+            }
           }
+          asm volatile("cp.async.commit_group;");
         }
-        asm volatile("cp.async.commit_group;");
 #pragma unroll 1
         for (int local = 0; local < num_tiles; local++) {
           int stage = local % 2;
           int nxt = local + 1;
-          __syncthreads();
           if (nxt < num_tiles) {
             int nstage = nxt % 2;
             int k_n = nxt * 1024 + tid_vec;
             if (k_n < hidden) {
               int kw_n = k_n / 2;
+              {
 #pragma unroll
-              for (int j_2 = 0; j_2 < 4; j_2++) {
-                asm volatile(
-                    "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                        x_ring_addr + (unsigned int)(((nstage * 4 + j_2) * 1024 + tid_vec) * 2)),
-                    "l"(reinterpret_cast<const unsigned int*>(x_raw) +
-                        (tokens[j_2] * (long long)hidden_words + (long long)kw_n)));
+                for (int j_2 = 0; j_2 < 4; j_2++) {
+                  asm volatile(
+                      "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                          x_ring_addr + (unsigned int)(((nstage * 4 + j_2) * 1024 + tid_vec) * 2)),
+                      "l"(reinterpret_cast<const unsigned int*>(x_raw) +
+                          (tokens[j_2] * (long long)hidden_words + (long long)kw_n)));
+                }
               }
 #pragma unroll
               for (int r_1 = 0; r_1 < 8; r_1++) {
@@ -8647,12 +8729,9 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
                         (weight_words_it + (long long)(r_1 * hidden_words) + (long long)kw_n)));
               }
             }
-            asm volatile("cp.async.commit_group;");
-            asm volatile("cp.async.wait_group 1;");
-          } else {
-            asm volatile("cp.async.wait_group 0;");
           }
-          __syncthreads();
+          asm volatile("cp.async.commit_group;");
+          asm volatile("cp.async.wait_group 1;");
           int k_base_r = local * 1024 + tid_vec;
           if (k_base_r < hidden) {
 #pragma unroll
@@ -11220,6 +11299,1381 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
               acc[30] = __fmaf_rn(w_t[14], x_values[31], acc[30]);
               acc[31] = __fmaf_rn(w_t[15], x_values[31], acc[31]);
 #endif
+            }
+          }
+        }
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+          float _shfl_xor_0 =
+              __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) != 0) ? acc[i] : acc[i + 16]), 16);
+          red_a[i] = (((lane_0 & 16) != 0) ? acc[i + 16] : acc[i]) + _shfl_xor_0;
+        }
+#pragma unroll
+        for (int i_1 = 0; i_1 < 8; i_1++) {
+          float _shfl_xor_1 =
+              __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) != 0) ? red_a[i_1] : red_a[i_1 + 8]), 8);
+          red_b[i_1] = (((lane_0 & 8) != 0) ? red_a[i_1 + 8] : red_a[i_1]) + _shfl_xor_1;
+        }
+#pragma unroll
+        for (int i_2 = 0; i_2 < 4; i_2++) {
+          float _shfl_xor_2 =
+              __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) != 0) ? red_b[i_2] : red_b[i_2 + 4]), 4);
+          red_c[i_2] = (((lane_0 & 4) != 0) ? red_b[i_2 + 4] : red_b[i_2]) + _shfl_xor_2;
+        }
+#pragma unroll
+        for (int i_3 = 0; i_3 < 2; i_3++) {
+          float _shfl_xor_3 =
+              __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) != 0) ? red_c[i_3] : red_c[i_3 + 2]), 2);
+          red_d[i_3] = (((lane_0 & 2) != 0) ? red_c[i_3 + 2] : red_c[i_3]) + _shfl_xor_3;
+        }
+#pragma unroll
+        for (int i_4 = 0; i_4 < 1; i_4++) {
+          float _shfl_xor_4 =
+              __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 1) != 0) ? red_d[i_4] : red_d[i_4 + 1]), 1);
+          red_e[i_4] = (((lane_0 & 1) != 0) ? red_d[i_4 + 1] : red_d[i_4]) + _shfl_xor_4;
+        }
+#pragma unroll
+        for (int i_5 = 0; i_5 < 1; i_5++) {
+          warp_partials[(lane_0 + i_5) * 4 + warp] = red_e[i_5];
+        }
+        __syncthreads();
+        if (tid < 32) {
+          float owned_accum = 0.0f;
+#pragma unroll
+          for (int source_warp = 0; source_warp < 4; source_warp++) {
+            owned_accum += warp_partials[tid * 4 + source_warp];
+          }
+          int owner_j = tid / 8;
+          int owner_rr = tid % 8;
+          if (owner_j < count) {
+            int owner_route = (int)reinterpret_cast<const unsigned int*>(
+                workspace_raw)[off_sorted_routes + start + owner_j];
+            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(shrink_out_raw) +
+                                               (owner_route * 32 + rank_base_it + owner_rr)) +
+              (0)) = __float2bfloat16_rn(owned_accum);
+          }
+        }
+        __syncthreads();
+        rank_base_it = rank_base_it + 8;
+        weight_words_it = weight_words_it + weight_words_step;
+      }
+    }
+  }
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
+}  // extern "C"
+
+#undef BLACKWELL_INF
+#undef NUM_MAIN_STAGES
+#undef SMEM_TOTAL
+#undef SMEM_WARP_PARTIALS_OFF
+#undef SMEM_WARP_PARTIALS_STAGE_BYTES
+#undef SMEM_WARP_PARTIALS_STRIDE
+#undef SMEM_W_RING_OFF
+#undef SMEM_W_RING_STAGE_BYTES
+#undef SMEM_W_RING_STRIDE
+#undef SMEM_X_RING_OFF
+#undef SMEM_X_RING_STAGE_BYTES
+#undef SMEM_X_RING_STRIDE
+#undef THREADS
+
+#define BLACKWELL_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_WARP_PARTIALS_OFF 0
+#define SMEM_WARP_PARTIALS_STAGE_BYTES 512
+#define SMEM_WARP_PARTIALS_STRIDE 512
+#define SMEM_X_RING_OFF 512
+#define SMEM_X_RING_STAGE_BYTES 16
+#define SMEM_X_RING_STRIDE 16
+#define SMEM_W_RING_OFF 512
+#define SMEM_W_RING_STAGE_BYTES 32768
+#define SMEM_W_RING_STRIDE 32768
+#define SMEM_TOTAL 33280
+#define THREADS 128
+
+extern "C" {
+
+__global__
+__launch_bounds__(128, 6) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_mixed_bf16_r32(
+    uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
+    uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids, int num_pairs,
+    int num_experts, int hidden, int num_tiles, int rt_per_cta, int rt_groups,
+    unsigned int* __restrict__ workspace_raw, int off_group_offset, int off_tile_table,
+    int off_sorted_routes) {
+  const int tid = threadIdx.x;
+  const int warp = make_warp_uniform(tid / 32);
+  const int lane = tid % 32;
+
+  extern __shared__ __align__(1024) char smem_raw[];
+  int smem;
+  smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+  const int bid = blockIdx.x;
+  const int num_bids = gridDim.x;
+
+  const int cta_rank = 0;
+
+  // Kernel setup ops
+  float* warp_partials = reinterpret_cast<float*>(smem_raw + 0);
+  const int warp_partials_addr = smem + 0;
+  __nv_bfloat16* x_ring = reinterpret_cast<__nv_bfloat16*>(smem_raw + 512);
+  const int x_ring_addr = smem + 512;
+  __nv_bfloat16* w_ring = reinterpret_cast<__nv_bfloat16*>(smem_raw + 512);
+  const int w_ring_addr = smem + 512;
+
+  // === Task calls (dependency order) ===
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  int rt_group = blockIdx.x % ((0) ? 4 : rt_groups);
+  int half = blockIdx.x / ((0) ? 4 : rt_groups) % 4;
+  int tile = blockIdx.x / (((0) ? 4 : rt_groups) * 4);
+  int n_tiles = (int)reinterpret_cast<const unsigned int*>(workspace_raw)[0];
+  if (tile < n_tiles) {
+    int entry = (int)reinterpret_cast<const unsigned int*>(workspace_raw)[off_tile_table + tile];
+    int group = entry / 65536;
+    int chunk = entry % 65536;
+    int start =
+        (int)reinterpret_cast<const unsigned int*>(workspace_raw)[off_group_offset + group] +
+        chunk * 16 + half * 4;
+    int group_end =
+        (int)reinterpret_cast<const unsigned int*>(workspace_raw)[off_group_offset + group + 1];
+    int count = group_end - start;
+    if (count > 4) {
+      count = 4;
+    }
+    if (count > 0) {
+      int lora = group / num_experts;
+      int expert = group % num_experts;
+      int hidden_words = hidden / 2;
+      long long weight_row_base = (long long)(lora * num_experts + expert) * 32;
+      int routes[4];
+      long long tokens[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        routes[j] = -1;
+        tokens[j] = 0;
+        if (count > j) {
+          routes[j] = (int)reinterpret_cast<const unsigned int*>(
+              workspace_raw)[off_sorted_routes + start + j];
+          tokens[j] = sorted_token_ids[routes[j]];
+        }
+      }
+      int rank_tile0 = rt_group * rt_per_cta;
+      int rank_tile_end = rank_tile0 + rt_per_cta;
+      int rank_base_it = rank_tile0 * 8;
+      long long weight_words_it =
+          (weight_row_base + (long long)rank_base_it) * (long long)hidden_words;
+      long long weight_words_step = hidden_words * 8;
+#pragma unroll 1
+      for (int rank_tile = rank_tile0; rank_tile < rank_tile_end; rank_tile++) {
+        float acc[32];
+        unsigned int x_car[16];
+        unsigned int xr_car[4];
+        unsigned int w_car[4];
+        float x_values[32];
+        float w_values[8];
+        float w_t[16];
+        int lane_0 = lane;
+        float red_a[16];
+        float red_b[8];
+        float red_c[4];
+        float red_d[2];
+        float red_e[1];
+#pragma unroll
+        for (int owner = 0; owner < 32; owner++) {
+          acc[owner] = 0.0f;
+        }
+        int tid_vec = tid * 8;
+        if (tid_vec < hidden) {
+          int kw_x0 = tid_vec / 2;
+#pragma unroll
+          for (int j_1 = 0; j_1 < 4; j_1++) {
+            {
+              const uint4* _ivptr_0 = reinterpret_cast<const uint4*>(
+                  reinterpret_cast<const unsigned int*>(x_raw) +
+                  tokens[j_1] * (long long)hidden_words + (long long)kw_x0);
+              uint4 _ivld_0;
+              asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                           : "=r"(_ivld_0.x), "=r"(_ivld_0.y), "=r"(_ivld_0.z), "=r"(_ivld_0.w)
+                           : "l"((const void*)(_ivptr_0))
+                           : "memory");
+              (x_car + j_1 * 4)[0 + 0] = _ivld_0.x;
+              (x_car + j_1 * 4)[0 + 1] = _ivld_0.y;
+              (x_car + j_1 * 4)[0 + 2] = _ivld_0.z;
+              (x_car + j_1 * 4)[0 + 3] = _ivld_0.w;
+            }
+          }
+        }
+#pragma unroll
+        for (int d = 0; d < 1; d++) {
+          int k_p = d * 1024 + tid_vec;
+          if (k_p < hidden) {
+            int kw_p = k_p / 2;
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+              asm volatile(
+                  "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                      w_ring_addr + (unsigned int)(((d * 8 + r) * 1024 + tid_vec) * 2)),
+                  "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
+                      (weight_words_it + (long long)(r * hidden_words) + (long long)kw_p)));
+            }
+          }
+          asm volatile("cp.async.commit_group;");
+        }
+#pragma unroll 1
+        for (int local = 0; local < num_tiles; local++) {
+          int stage = local % 2;
+          int nxt = local + 1;
+          if (nxt < num_tiles) {
+            int nstage = nxt % 2;
+            int k_n = nxt * 1024 + tid_vec;
+            if (k_n < hidden) {
+              int kw_n = k_n / 2;
+#pragma unroll
+              for (int r_1 = 0; r_1 < 8; r_1++) {
+                asm volatile(
+                    "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                        w_ring_addr + (unsigned int)(((nstage * 8 + r_1) * 1024 + tid_vec) * 2)),
+                    "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
+                        (weight_words_it + (long long)(r_1 * hidden_words) + (long long)kw_n)));
+              }
+            }
+          }
+          asm volatile("cp.async.commit_group;");
+          asm volatile("cp.async.wait_group 1;");
+          int k_base_r = local * 1024 + tid_vec;
+          if (k_base_r < hidden) {
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                           "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                           "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                           "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                         : "r"(w_ring_addr + (unsigned int)((stage * 8 * 1024 + tid_vec) * 2)));
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[0])
+                  : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[0] = __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[0]);
+              acc[0] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[0]);
+              acc[0] = __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[0]);
+              acc[0] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[0]);
+              acc[0] = __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[0]);
+              acc[0] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[0]);
+              acc[0] = __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[0]);
+              acc[0] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[0]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[8])
+                  : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[8] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[8]);
+              acc[8] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[8]);
+              acc[8] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[8]);
+              acc[8] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[8]);
+              acc[8] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[8]);
+              acc[8] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[8]);
+              acc[8] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[8]);
+              acc[8] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[8]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[16])
+                  : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[16] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[16]);
+              acc[16] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[16]);
+              acc[16] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[16]);
+              acc[16] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[16]);
+              acc[16] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[16]);
+              acc[16] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[16]);
+              acc[16] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[16]);
+              acc[16] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[16]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[24])
+                  : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[24] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[24]);
+              acc[24] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[24]);
+              acc[24] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[24]);
+              acc[24] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[24]);
+              acc[24] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[24]);
+              acc[24] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[24]);
+              acc[24] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[24]);
+              acc[24] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[24]);
+#endif
+            }
+            asm volatile(
+                "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 1) * 1024 + tid_vec) * 2)));
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[1])
+                  : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[1] = __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[1]);
+              acc[1] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[1]);
+              acc[1] = __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[1]);
+              acc[1] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[1]);
+              acc[1] = __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[1]);
+              acc[1] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[1]);
+              acc[1] = __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[1]);
+              acc[1] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[1]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[9])
+                  : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[9] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[9]);
+              acc[9] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[9]);
+              acc[9] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[9]);
+              acc[9] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[9]);
+              acc[9] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[9]);
+              acc[9] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[9]);
+              acc[9] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[9]);
+              acc[9] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[9]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[17])
+                  : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[17] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[17]);
+              acc[17] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[17]);
+              acc[17] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[17]);
+              acc[17] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[17]);
+              acc[17] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[17]);
+              acc[17] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[17]);
+              acc[17] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[17]);
+              acc[17] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[17]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[25])
+                  : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[25] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[25]);
+              acc[25] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[25]);
+              acc[25] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[25]);
+              acc[25] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[25]);
+              acc[25] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[25]);
+              acc[25] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[25]);
+              acc[25] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[25]);
+              acc[25] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[25]);
+#endif
+            }
+            asm volatile(
+                "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 2) * 1024 + tid_vec) * 2)));
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[2])
+                  : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[2] = __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[2]);
+              acc[2] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[2]);
+              acc[2] = __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[2]);
+              acc[2] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[2]);
+              acc[2] = __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[2]);
+              acc[2] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[2]);
+              acc[2] = __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[2]);
+              acc[2] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[2]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[10])
+                  : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[10] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[10]);
+              acc[10] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[10]);
+              acc[10] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[10]);
+              acc[10] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[10]);
+              acc[10] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[10]);
+              acc[10] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[10]);
+              acc[10] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[10]);
+              acc[10] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[10]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[18])
+                  : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[18] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[18]);
+              acc[18] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[18]);
+              acc[18] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[18]);
+              acc[18] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[18]);
+              acc[18] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[18]);
+              acc[18] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[18]);
+              acc[18] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[18]);
+              acc[18] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[18]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[26])
+                  : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[26] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[26]);
+              acc[26] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[26]);
+              acc[26] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[26]);
+              acc[26] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[26]);
+              acc[26] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[26]);
+              acc[26] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[26]);
+              acc[26] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[26]);
+              acc[26] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[26]);
+#endif
+            }
+            asm volatile(
+                "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 3) * 1024 + tid_vec) * 2)));
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[3])
+                  : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[3] = __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[3]);
+              acc[3] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[3]);
+              acc[3] = __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[3]);
+              acc[3] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[3]);
+              acc[3] = __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[3]);
+              acc[3] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[3]);
+              acc[3] = __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[3]);
+              acc[3] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[3]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[11])
+                  : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[11] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[11]);
+              acc[11] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[11]);
+              acc[11] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[11]);
+              acc[11] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[11]);
+              acc[11] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[11]);
+              acc[11] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[11]);
+              acc[11] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[11]);
+              acc[11] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[11]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[19])
+                  : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[19] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[19]);
+              acc[19] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[19]);
+              acc[19] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[19]);
+              acc[19] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[19]);
+              acc[19] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[19]);
+              acc[19] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[19]);
+              acc[19] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[19]);
+              acc[19] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[19]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[27])
+                  : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[27] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[27]);
+              acc[27] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[27]);
+              acc[27] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[27]);
+              acc[27] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[27]);
+              acc[27] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[27]);
+              acc[27] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[27]);
+              acc[27] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[27]);
+              acc[27] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[27]);
+#endif
+            }
+            asm volatile(
+                "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 4) * 1024 + tid_vec) * 2)));
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[4])
+                  : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[4] = __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[4]);
+              acc[4] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[4]);
+              acc[4] = __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[4]);
+              acc[4] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[4]);
+              acc[4] = __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[4]);
+              acc[4] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[4]);
+              acc[4] = __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[4]);
+              acc[4] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[4]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[12])
+                  : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[12] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[12]);
+              acc[12] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[12]);
+              acc[12] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[12]);
+              acc[12] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[12]);
+              acc[12] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[12]);
+              acc[12] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[12]);
+              acc[12] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[12]);
+              acc[12] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[12]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[20])
+                  : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[20] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[20]);
+              acc[20] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[20]);
+              acc[20] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[20]);
+              acc[20] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[20]);
+              acc[20] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[20]);
+              acc[20] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[20]);
+              acc[20] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[20]);
+              acc[20] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[20]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[28])
+                  : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[28] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[28]);
+              acc[28] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[28]);
+              acc[28] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[28]);
+              acc[28] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[28]);
+              acc[28] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[28]);
+              acc[28] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[28]);
+              acc[28] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[28]);
+              acc[28] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[28]);
+#endif
+            }
+            asm volatile(
+                "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 5) * 1024 + tid_vec) * 2)));
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[5])
+                  : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[5] = __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[5]);
+              acc[5] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[5]);
+              acc[5] = __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[5]);
+              acc[5] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[5]);
+              acc[5] = __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[5]);
+              acc[5] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[5]);
+              acc[5] = __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[5]);
+              acc[5] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[5]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[13])
+                  : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[13] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[13]);
+              acc[13] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[13]);
+              acc[13] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[13]);
+              acc[13] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[13]);
+              acc[13] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[13]);
+              acc[13] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[13]);
+              acc[13] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[13]);
+              acc[13] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[13]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[21])
+                  : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[21] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[21]);
+              acc[21] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[21]);
+              acc[21] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[21]);
+              acc[21] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[21]);
+              acc[21] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[21]);
+              acc[21] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[21]);
+              acc[21] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[21]);
+              acc[21] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[21]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[29])
+                  : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[29] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[29]);
+              acc[29] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[29]);
+              acc[29] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[29]);
+              acc[29] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[29]);
+              acc[29] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[29]);
+              acc[29] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[29]);
+              acc[29] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[29]);
+              acc[29] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[29]);
+#endif
+            }
+            asm volatile(
+                "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 6) * 1024 + tid_vec) * 2)));
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[6])
+                  : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[6] = __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[6]);
+              acc[6] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[6]);
+              acc[6] = __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[6]);
+              acc[6] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[6]);
+              acc[6] = __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[6]);
+              acc[6] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[6]);
+              acc[6] = __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[6]);
+              acc[6] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[6]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[14])
+                  : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[14] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[14]);
+              acc[14] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[14]);
+              acc[14] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[14]);
+              acc[14] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[14]);
+              acc[14] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[14]);
+              acc[14] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[14]);
+              acc[14] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[14]);
+              acc[14] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[14]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[22])
+                  : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[22] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[22]);
+              acc[22] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[22]);
+              acc[22] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[22]);
+              acc[22] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[22]);
+              acc[22] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[22]);
+              acc[22] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[22]);
+              acc[22] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[22]);
+              acc[22] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[22]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[30])
+                  : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[30] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[30]);
+              acc[30] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[30]);
+              acc[30] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[30]);
+              acc[30] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[30]);
+              acc[30] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[30]);
+              acc[30] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[30]);
+              acc[30] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[30]);
+              acc[30] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[30]);
+#endif
+            }
+            asm volatile(
+                "ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                  "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 7) * 1024 + tid_vec) * 2)));
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[7])
+                  : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[7] = __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16),
+                                 acc[7]);
+              acc[7] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[0] & 0xFFFF0000u), acc[7]);
+              acc[7] = __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16),
+                                 acc[7]);
+              acc[7] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[1] & 0xFFFF0000u), acc[7]);
+              acc[7] = __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16),
+                                 acc[7]);
+              acc[7] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[2] & 0xFFFF0000u), acc[7]);
+              acc[7] = __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16),
+                                 acc[7]);
+              acc[7] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                                 __uint_as_float(w_car[3] & 0xFFFF0000u), acc[7]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[15])
+                  : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[15] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[15]);
+              acc[15] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[15]);
+              acc[15] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[15]);
+              acc[15] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[15]);
+              acc[15] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[15]);
+              acc[15] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[15]);
+              acc[15] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[15]);
+              acc[15] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[15]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[23])
+                  : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[23] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[23]);
+              acc[23] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[23]);
+              acc[23] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[23]);
+              acc[23] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[23]);
+              acc[23] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[23]);
+              acc[23] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[23]);
+              acc[23] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[23]);
+              acc[23] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[23]);
+#endif
+            }
+            {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+              asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, "
+                  "_b2l, _b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 "
+                  "{_b0l, _b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, "
+                  "%6;\n\tmov.b32 {_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, "
+                  "_a3h}, %4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                  "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                  : "+f"(acc[31])
+                  : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                    "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+              acc[31] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                  acc[31]);
+              acc[31] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[0] & 0xFFFF0000u), acc[31]);
+              acc[31] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                  acc[31]);
+              acc[31] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[1] & 0xFFFF0000u), acc[31]);
+              acc[31] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                  acc[31]);
+              acc[31] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[2] & 0xFFFF0000u), acc[31]);
+              acc[31] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                  acc[31]);
+              acc[31] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                  __uint_as_float(w_car[3] & 0xFFFF0000u), acc[31]);
+#endif
+            }
+            int k_xn = k_base_r + 1024;
+            if (k_xn < hidden) {
+              int kw_xn = k_xn / 2;
+#pragma unroll
+              for (int j_2 = 0; j_2 < 4; j_2++) {
+                {
+                  const uint4* _ivptr_1 = reinterpret_cast<const uint4*>(
+                      reinterpret_cast<const unsigned int*>(x_raw) +
+                      tokens[j_2] * (long long)hidden_words + (long long)kw_xn);
+                  uint4 _ivld_1;
+                  asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                               : "=r"(_ivld_1.x), "=r"(_ivld_1.y), "=r"(_ivld_1.z), "=r"(_ivld_1.w)
+                               : "l"((const void*)(_ivptr_1))
+                               : "memory");
+                  (x_car + j_2 * 4)[0 + 0] = _ivld_1.x;
+                  (x_car + j_2 * 4)[0 + 1] = _ivld_1.y;
+                  (x_car + j_2 * 4)[0 + 2] = _ivld_1.z;
+                  (x_car + j_2 * 4)[0 + 3] = _ivld_1.w;
+                }
+              }
             }
           }
         }
@@ -14225,41 +15679,48 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
         acc[owner] = 0.0f;
       }
       int tid_vec = tid * 8;
-      if (tid_vec < hidden) {
-        int kw0 = tid_vec / 2;
 #pragma unroll
-        for (int j_1 = 0; j_1 < 4; j_1++) {
-          asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                           x_ring_addr + (unsigned int)((j_1 * 1024 + tid_vec) * 2)),
-                       "l"(reinterpret_cast<const unsigned int*>(x_raw) +
-                           (tokens[j_1] * (long long)hidden_words + (long long)kw0)));
-        }
+      for (int d = 0; d < 1; d++) {
+        int k_p = d * 1024 + tid_vec;
+        if (k_p < hidden) {
+          int kw_p = k_p / 2;
+          {
 #pragma unroll
-        for (int r = 0; r < 8; r++) {
-          asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                           w_ring_addr + (unsigned int)((r * 1024 + tid_vec) * 2)),
-                       "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
-                           (weight_words0 + (long long)(r * hidden_words) + (long long)kw0)));
+            for (int j_1 = 0; j_1 < 4; j_1++) {
+              asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                               x_ring_addr + (unsigned int)(((d * 4 + j_1) * 1024 + tid_vec) * 2)),
+                           "l"(reinterpret_cast<const unsigned int*>(x_raw) +
+                               (tokens[j_1] * (long long)hidden_words + (long long)kw_p)));
+            }
+          }
+#pragma unroll
+          for (int r = 0; r < 8; r++) {
+            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                             w_ring_addr + (unsigned int)(((d * 8 + r) * 1024 + tid_vec) * 2)),
+                         "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
+                             (weight_words0 + (long long)(r * hidden_words) + (long long)kw_p)));
+          }
         }
+        asm volatile("cp.async.commit_group;");
       }
-      asm volatile("cp.async.commit_group;");
 #pragma unroll 1
       for (int local = 0; local < num_tiles; local++) {
         int stage = local % 2;
         int nxt = local + 1;
-        __syncthreads();
         if (nxt < num_tiles) {
           int nstage = nxt % 2;
           int k_n = nxt * 1024 + tid_vec;
           if (k_n < hidden) {
             int kw_n = k_n / 2;
+            {
 #pragma unroll
-            for (int j_2 = 0; j_2 < 4; j_2++) {
-              asm volatile(
-                  "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                      x_ring_addr + (unsigned int)(((nstage * 4 + j_2) * 1024 + tid_vec) * 2)),
-                  "l"(reinterpret_cast<const unsigned int*>(x_raw) +
-                      (tokens[j_2] * (long long)hidden_words + (long long)kw_n)));
+              for (int j_2 = 0; j_2 < 4; j_2++) {
+                asm volatile(
+                    "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                        x_ring_addr + (unsigned int)(((nstage * 4 + j_2) * 1024 + tid_vec) * 2)),
+                    "l"(reinterpret_cast<const unsigned int*>(x_raw) +
+                        (tokens[j_2] * (long long)hidden_words + (long long)kw_n)));
+              }
             }
 #pragma unroll
             for (int r_1 = 0; r_1 < 8; r_1++) {
@@ -14270,12 +15731,9 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
                       (weight_words0 + (long long)(r_1 * hidden_words) + (long long)kw_n)));
             }
           }
-          asm volatile("cp.async.commit_group;");
-          asm volatile("cp.async.wait_group 1;");
-        } else {
-          asm volatile("cp.async.wait_group 0;");
         }
-        __syncthreads();
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
         int k_base_r = local * 1024 + tid_vec;
         if (k_base_r < hidden) {
 #pragma unroll
@@ -16914,6 +18372,1363 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
 #undef SMEM_X_RING_STRIDE
 #undef THREADS
 
+#define BLACKWELL_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_WARP_PARTIALS_OFF 0
+#define SMEM_WARP_PARTIALS_STAGE_BYTES 512
+#define SMEM_WARP_PARTIALS_STRIDE 512
+#define SMEM_X_RING_OFF 512
+#define SMEM_X_RING_STAGE_BYTES 16
+#define SMEM_X_RING_STRIDE 16
+#define SMEM_W_RING_OFF 512
+#define SMEM_W_RING_STAGE_BYTES 32768
+#define SMEM_W_RING_STRIDE 32768
+#define SMEM_TOTAL 33280
+#define THREADS 128
+
+extern "C" {
+
+__global__
+__launch_bounds__(128, 6) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_mixed_single_bf16_r32(
+    uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
+    uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids, int num_pairs,
+    int num_experts, int hidden, int num_tiles, int rt_per_cta, int rt_groups,
+    unsigned int* __restrict__ workspace_raw, int off_group_offset, int off_tile_table,
+    int off_sorted_routes) {
+  const int tid = threadIdx.x;
+  const int warp = make_warp_uniform(tid / 32);
+  const int lane = tid % 32;
+
+  extern __shared__ __align__(1024) char smem_raw[];
+  int smem;
+  smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+  const int bid = blockIdx.x;
+  const int num_bids = gridDim.x;
+
+  const int cta_rank = 0;
+
+  // Kernel setup ops
+  float* warp_partials = reinterpret_cast<float*>(smem_raw + 0);
+  const int warp_partials_addr = smem + 0;
+  __nv_bfloat16* x_ring = reinterpret_cast<__nv_bfloat16*>(smem_raw + 512);
+  const int x_ring_addr = smem + 512;
+  __nv_bfloat16* w_ring = reinterpret_cast<__nv_bfloat16*>(smem_raw + 512);
+  const int w_ring_addr = smem + 512;
+
+  // === Task calls (dependency order) ===
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  int rt_group = blockIdx.x % ((1) ? 4 : rt_groups);
+  int half = blockIdx.x / ((1) ? 4 : rt_groups) % 4;
+  int tile = blockIdx.x / (((1) ? 4 : rt_groups) * 4);
+  int n_tiles = (int)reinterpret_cast<const unsigned int*>(workspace_raw)[0];
+  if (tile < n_tiles) {
+    int entry = (int)reinterpret_cast<const unsigned int*>(workspace_raw)[off_tile_table + tile];
+    int group = entry / 65536;
+    int chunk = entry % 65536;
+    int start =
+        (int)reinterpret_cast<const unsigned int*>(workspace_raw)[off_group_offset + group] +
+        chunk * 16 + half * 4;
+    int group_end =
+        (int)reinterpret_cast<const unsigned int*>(workspace_raw)[off_group_offset + group + 1];
+    int count = group_end - start;
+    if (count > 4) {
+      count = 4;
+    }
+    if (count > 0) {
+      int lora = group / num_experts;
+      int expert = group % num_experts;
+      int hidden_words = hidden / 2;
+      long long weight_row_base = (long long)(lora * num_experts + expert) * 32;
+      int routes[4];
+      long long tokens[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        routes[j] = -1;
+        tokens[j] = 0;
+        if (count > j) {
+          routes[j] = (int)reinterpret_cast<const unsigned int*>(
+              workspace_raw)[off_sorted_routes + start + j];
+          tokens[j] = sorted_token_ids[routes[j]];
+        }
+      }
+      int rank_base0 = rt_group * 8;
+      long long weight_words0 = (weight_row_base + (long long)rank_base0) * (long long)hidden_words;
+      float acc[32];
+      unsigned int x_car[16];
+      unsigned int xr_car[4];
+      unsigned int w_car[4];
+      float x_values[32];
+      float w_values[8];
+      float w_t[16];
+      int lane_0 = lane;
+      float red_a[16];
+      float red_b[8];
+      float red_c[4];
+      float red_d[2];
+      float red_e[1];
+#pragma unroll
+      for (int owner = 0; owner < 32; owner++) {
+        acc[owner] = 0.0f;
+      }
+      int tid_vec = tid * 8;
+      if (tid_vec < hidden) {
+        int kw_x0 = tid_vec / 2;
+#pragma unroll
+        for (int j_1 = 0; j_1 < 4; j_1++) {
+          {
+            const uint4* _ivptr_0 = reinterpret_cast<const uint4*>(
+                reinterpret_cast<const unsigned int*>(x_raw) +
+                tokens[j_1] * (long long)hidden_words + (long long)kw_x0);
+            uint4 _ivld_0;
+            asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(_ivld_0.x), "=r"(_ivld_0.y), "=r"(_ivld_0.z), "=r"(_ivld_0.w)
+                         : "l"((const void*)(_ivptr_0))
+                         : "memory");
+            (x_car + j_1 * 4)[0 + 0] = _ivld_0.x;
+            (x_car + j_1 * 4)[0 + 1] = _ivld_0.y;
+            (x_car + j_1 * 4)[0 + 2] = _ivld_0.z;
+            (x_car + j_1 * 4)[0 + 3] = _ivld_0.w;
+          }
+        }
+      }
+#pragma unroll
+      for (int d = 0; d < 1; d++) {
+        int k_p = d * 1024 + tid_vec;
+        if (k_p < hidden) {
+          int kw_p = k_p / 2;
+#pragma unroll
+          for (int r = 0; r < 8; r++) {
+            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                             w_ring_addr + (unsigned int)(((d * 8 + r) * 1024 + tid_vec) * 2)),
+                         "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
+                             (weight_words0 + (long long)(r * hidden_words) + (long long)kw_p)));
+          }
+        }
+        asm volatile("cp.async.commit_group;");
+      }
+#pragma unroll 1
+      for (int local = 0; local < num_tiles; local++) {
+        int stage = local % 2;
+        int nxt = local + 1;
+        if (nxt < num_tiles) {
+          int nstage = nxt % 2;
+          int k_n = nxt * 1024 + tid_vec;
+          if (k_n < hidden) {
+            int kw_n = k_n / 2;
+#pragma unroll
+            for (int r_1 = 0; r_1 < 8; r_1++) {
+              asm volatile(
+                  "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                      w_ring_addr + (unsigned int)(((nstage * 8 + r_1) * 1024 + tid_vec) * 2)),
+                  "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
+                      (weight_words0 + (long long)(r_1 * hidden_words) + (long long)kw_n)));
+            }
+          }
+        }
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
+        int k_base_r = local * 1024 + tid_vec;
+        if (k_base_r < hidden) {
+          asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                       : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                       : "r"(w_ring_addr + (unsigned int)((stage * 8 * 1024 + tid_vec) * 2)));
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[0])
+                : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[0] =
+                __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16), acc[0]);
+            acc[0] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[0]);
+            acc[0] =
+                __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16), acc[0]);
+            acc[0] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[0]);
+            acc[0] =
+                __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16), acc[0]);
+            acc[0] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[0]);
+            acc[0] =
+                __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16), acc[0]);
+            acc[0] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[0]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[8])
+                : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[8] =
+                __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16), acc[8]);
+            acc[8] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[8]);
+            acc[8] =
+                __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16), acc[8]);
+            acc[8] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[8]);
+            acc[8] =
+                __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16), acc[8]);
+            acc[8] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[8]);
+            acc[8] =
+                __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16), acc[8]);
+            acc[8] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[8]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[16])
+                : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[16] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[16]);
+            acc[16] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[16]);
+            acc[16] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[16]);
+            acc[16] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[16]);
+            acc[16] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[16]);
+            acc[16] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[16]);
+            acc[16] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[16]);
+            acc[16] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[16]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[24])
+                : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[24] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[24]);
+            acc[24] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[24]);
+            acc[24] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[24]);
+            acc[24] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[24]);
+            acc[24] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[24]);
+            acc[24] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[24]);
+            acc[24] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[24]);
+            acc[24] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[24]);
+#endif
+          }
+          asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                       : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                       : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 1) * 1024 + tid_vec) * 2)));
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[1])
+                : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[1] =
+                __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16), acc[1]);
+            acc[1] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[1]);
+            acc[1] =
+                __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16), acc[1]);
+            acc[1] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[1]);
+            acc[1] =
+                __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16), acc[1]);
+            acc[1] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[1]);
+            acc[1] =
+                __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16), acc[1]);
+            acc[1] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[1]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[9])
+                : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[9] =
+                __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16), acc[9]);
+            acc[9] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[9]);
+            acc[9] =
+                __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16), acc[9]);
+            acc[9] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[9]);
+            acc[9] =
+                __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16), acc[9]);
+            acc[9] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[9]);
+            acc[9] =
+                __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16), acc[9]);
+            acc[9] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[9]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[17])
+                : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[17] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[17]);
+            acc[17] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[17]);
+            acc[17] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[17]);
+            acc[17] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[17]);
+            acc[17] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[17]);
+            acc[17] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[17]);
+            acc[17] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[17]);
+            acc[17] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[17]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[25])
+                : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[25] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[25]);
+            acc[25] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[25]);
+            acc[25] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[25]);
+            acc[25] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[25]);
+            acc[25] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[25]);
+            acc[25] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[25]);
+            acc[25] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[25]);
+            acc[25] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[25]);
+#endif
+          }
+          asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                       : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                       : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 2) * 1024 + tid_vec) * 2)));
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[2])
+                : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[2] =
+                __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16), acc[2]);
+            acc[2] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[2]);
+            acc[2] =
+                __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16), acc[2]);
+            acc[2] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[2]);
+            acc[2] =
+                __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16), acc[2]);
+            acc[2] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[2]);
+            acc[2] =
+                __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16), acc[2]);
+            acc[2] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[2]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[10])
+                : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[10] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[10]);
+            acc[10] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[10]);
+            acc[10] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[10]);
+            acc[10] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[10]);
+            acc[10] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[10]);
+            acc[10] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[10]);
+            acc[10] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[10]);
+            acc[10] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[10]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[18])
+                : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[18] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[18]);
+            acc[18] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[18]);
+            acc[18] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[18]);
+            acc[18] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[18]);
+            acc[18] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[18]);
+            acc[18] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[18]);
+            acc[18] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[18]);
+            acc[18] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[18]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[26])
+                : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[26] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[26]);
+            acc[26] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[26]);
+            acc[26] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[26]);
+            acc[26] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[26]);
+            acc[26] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[26]);
+            acc[26] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[26]);
+            acc[26] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[26]);
+            acc[26] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[26]);
+#endif
+          }
+          asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                       : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                       : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 3) * 1024 + tid_vec) * 2)));
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[3])
+                : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[3] =
+                __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16), acc[3]);
+            acc[3] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[3]);
+            acc[3] =
+                __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16), acc[3]);
+            acc[3] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[3]);
+            acc[3] =
+                __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16), acc[3]);
+            acc[3] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[3]);
+            acc[3] =
+                __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16), acc[3]);
+            acc[3] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[3]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[11])
+                : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[11] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[11]);
+            acc[11] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[11]);
+            acc[11] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[11]);
+            acc[11] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[11]);
+            acc[11] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[11]);
+            acc[11] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[11]);
+            acc[11] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[11]);
+            acc[11] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[11]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[19])
+                : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[19] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[19]);
+            acc[19] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[19]);
+            acc[19] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[19]);
+            acc[19] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[19]);
+            acc[19] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[19]);
+            acc[19] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[19]);
+            acc[19] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[19]);
+            acc[19] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[19]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[27])
+                : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[27] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[27]);
+            acc[27] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[27]);
+            acc[27] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[27]);
+            acc[27] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[27]);
+            acc[27] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[27]);
+            acc[27] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[27]);
+            acc[27] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[27]);
+            acc[27] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[27]);
+#endif
+          }
+          asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                       : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                       : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 4) * 1024 + tid_vec) * 2)));
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[4])
+                : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[4] =
+                __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16), acc[4]);
+            acc[4] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[4]);
+            acc[4] =
+                __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16), acc[4]);
+            acc[4] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[4]);
+            acc[4] =
+                __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16), acc[4]);
+            acc[4] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[4]);
+            acc[4] =
+                __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16), acc[4]);
+            acc[4] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[4]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[12])
+                : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[12] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[12]);
+            acc[12] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[12]);
+            acc[12] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[12]);
+            acc[12] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[12]);
+            acc[12] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[12]);
+            acc[12] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[12]);
+            acc[12] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[12]);
+            acc[12] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[12]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[20])
+                : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[20] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[20]);
+            acc[20] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[20]);
+            acc[20] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[20]);
+            acc[20] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[20]);
+            acc[20] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[20]);
+            acc[20] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[20]);
+            acc[20] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[20]);
+            acc[20] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[20]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[28])
+                : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[28] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[28]);
+            acc[28] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[28]);
+            acc[28] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[28]);
+            acc[28] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[28]);
+            acc[28] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[28]);
+            acc[28] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[28]);
+            acc[28] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[28]);
+            acc[28] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[28]);
+#endif
+          }
+          asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                       : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                       : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 5) * 1024 + tid_vec) * 2)));
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[5])
+                : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[5] =
+                __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16), acc[5]);
+            acc[5] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[5]);
+            acc[5] =
+                __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16), acc[5]);
+            acc[5] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[5]);
+            acc[5] =
+                __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16), acc[5]);
+            acc[5] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[5]);
+            acc[5] =
+                __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16), acc[5]);
+            acc[5] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[5]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[13])
+                : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[13] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[13]);
+            acc[13] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[13]);
+            acc[13] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[13]);
+            acc[13] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[13]);
+            acc[13] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[13]);
+            acc[13] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[13]);
+            acc[13] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[13]);
+            acc[13] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[13]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[21])
+                : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[21] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[21]);
+            acc[21] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[21]);
+            acc[21] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[21]);
+            acc[21] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[21]);
+            acc[21] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[21]);
+            acc[21] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[21]);
+            acc[21] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[21]);
+            acc[21] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[21]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[29])
+                : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[29] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[29]);
+            acc[29] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[29]);
+            acc[29] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[29]);
+            acc[29] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[29]);
+            acc[29] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[29]);
+            acc[29] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[29]);
+            acc[29] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[29]);
+            acc[29] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[29]);
+#endif
+          }
+          asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                       : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                       : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 6) * 1024 + tid_vec) * 2)));
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[6])
+                : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[6] =
+                __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16), acc[6]);
+            acc[6] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[6]);
+            acc[6] =
+                __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16), acc[6]);
+            acc[6] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[6]);
+            acc[6] =
+                __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16), acc[6]);
+            acc[6] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[6]);
+            acc[6] =
+                __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16), acc[6]);
+            acc[6] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[6]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[14])
+                : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[14] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[14]);
+            acc[14] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[14]);
+            acc[14] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[14]);
+            acc[14] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[14]);
+            acc[14] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[14]);
+            acc[14] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[14]);
+            acc[14] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[14]);
+            acc[14] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[14]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[22])
+                : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[22] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[22]);
+            acc[22] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[22]);
+            acc[22] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[22]);
+            acc[22] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[22]);
+            acc[22] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[22]);
+            acc[22] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[22]);
+            acc[22] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[22]);
+            acc[22] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[22]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[30])
+                : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[30] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[30]);
+            acc[30] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[30]);
+            acc[30] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[30]);
+            acc[30] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[30]);
+            acc[30] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[30]);
+            acc[30] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[30]);
+            acc[30] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[30]);
+            acc[30] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[30]);
+#endif
+          }
+          asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                       : "=r"(*reinterpret_cast<uint32_t*>(&w_car[0])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 1])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 2])),
+                         "=r"(*reinterpret_cast<uint32_t*>(&w_car[(0) + 3]))
+                       : "r"(w_ring_addr + (unsigned int)(((stage * 8 + 7) * 1024 + tid_vec) * 2)));
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[7])
+                : "r"(x_car[0]), "r"(x_car[1]), "r"(x_car[2]), "r"(x_car[3]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[7] =
+                __fmaf_rn(__uint_as_float(x_car[0] << 16), __uint_as_float(w_car[0] << 16), acc[7]);
+            acc[7] = __fmaf_rn(__uint_as_float(x_car[0] & 0xFFFF0000u),
+                               __uint_as_float(w_car[0] & 0xFFFF0000u), acc[7]);
+            acc[7] =
+                __fmaf_rn(__uint_as_float(x_car[1] << 16), __uint_as_float(w_car[1] << 16), acc[7]);
+            acc[7] = __fmaf_rn(__uint_as_float(x_car[1] & 0xFFFF0000u),
+                               __uint_as_float(w_car[1] & 0xFFFF0000u), acc[7]);
+            acc[7] =
+                __fmaf_rn(__uint_as_float(x_car[2] << 16), __uint_as_float(w_car[2] << 16), acc[7]);
+            acc[7] = __fmaf_rn(__uint_as_float(x_car[2] & 0xFFFF0000u),
+                               __uint_as_float(w_car[2] & 0xFFFF0000u), acc[7]);
+            acc[7] =
+                __fmaf_rn(__uint_as_float(x_car[3] << 16), __uint_as_float(w_car[3] << 16), acc[7]);
+            acc[7] = __fmaf_rn(__uint_as_float(x_car[3] & 0xFFFF0000u),
+                               __uint_as_float(w_car[3] & 0xFFFF0000u), acc[7]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[15])
+                : "r"(x_car[4]), "r"(x_car[5]), "r"(x_car[6]), "r"(x_car[7]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[15] = __fmaf_rn(__uint_as_float(x_car[4] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[15]);
+            acc[15] = __fmaf_rn(__uint_as_float(x_car[4] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[15]);
+            acc[15] = __fmaf_rn(__uint_as_float(x_car[5] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[15]);
+            acc[15] = __fmaf_rn(__uint_as_float(x_car[5] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[15]);
+            acc[15] = __fmaf_rn(__uint_as_float(x_car[6] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[15]);
+            acc[15] = __fmaf_rn(__uint_as_float(x_car[6] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[15]);
+            acc[15] = __fmaf_rn(__uint_as_float(x_car[7] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[15]);
+            acc[15] = __fmaf_rn(__uint_as_float(x_car[7] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[15]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[23])
+                : "r"(x_car[8]), "r"(x_car[9]), "r"(x_car[10]), "r"(x_car[11]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[23] = __fmaf_rn(__uint_as_float(x_car[8] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[23]);
+            acc[23] = __fmaf_rn(__uint_as_float(x_car[8] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[23]);
+            acc[23] = __fmaf_rn(__uint_as_float(x_car[9] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[23]);
+            acc[23] = __fmaf_rn(__uint_as_float(x_car[9] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[23]);
+            acc[23] = __fmaf_rn(__uint_as_float(x_car[10] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[23]);
+            acc[23] = __fmaf_rn(__uint_as_float(x_car[10] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[23]);
+            acc[23] = __fmaf_rn(__uint_as_float(x_car[11] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[23]);
+            acc[23] = __fmaf_rn(__uint_as_float(x_car[11] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[23]);
+#endif
+          }
+          {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+            asm("{\n\t.reg .b16 _a0l, _a0h, _b0l, _b0h, _a1l, _a1h, _b1l, _b1h, _a2l, _a2h, _b2l, "
+                "_b2h, _a3l, _a3h, _b3l, _b3h;\n\tmov.b32 {_a0l, _a0h}, %1;\n\tmov.b32 {_b0l, "
+                "_b0h}, %5;\n\tmov.b32 {_a1l, _a1h}, %2;\n\tmov.b32 {_b1l, _b1h}, %6;\n\tmov.b32 "
+                "{_a2l, _a2h}, %3;\n\tmov.b32 {_b2l, _b2h}, %7;\n\tmov.b32 {_a3l, _a3h}, "
+                "%4;\n\tmov.b32 {_b3l, _b3h}, %8;\n\tfma.rn.f32.bf16 %0, _a0l, _b0l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a0h, _b0h, %0;\n\tfma.rn.f32.bf16 %0, _a1l, _b1l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a1h, _b1h, %0;\n\tfma.rn.f32.bf16 %0, _a2l, _b2l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a2h, _b2h, %0;\n\tfma.rn.f32.bf16 %0, _a3l, _b3l, "
+                "%0;\n\tfma.rn.f32.bf16 %0, _a3h, _b3h, %0;\n\t}"
+                : "+f"(acc[31])
+                : "r"(x_car[12]), "r"(x_car[13]), "r"(x_car[14]), "r"(x_car[15]), "r"(w_car[0]),
+                  "r"(w_car[1]), "r"(w_car[2]), "r"(w_car[3]));
+#else
+            acc[31] = __fmaf_rn(__uint_as_float(x_car[12] << 16), __uint_as_float(w_car[0] << 16),
+                                acc[31]);
+            acc[31] = __fmaf_rn(__uint_as_float(x_car[12] & 0xFFFF0000u),
+                                __uint_as_float(w_car[0] & 0xFFFF0000u), acc[31]);
+            acc[31] = __fmaf_rn(__uint_as_float(x_car[13] << 16), __uint_as_float(w_car[1] << 16),
+                                acc[31]);
+            acc[31] = __fmaf_rn(__uint_as_float(x_car[13] & 0xFFFF0000u),
+                                __uint_as_float(w_car[1] & 0xFFFF0000u), acc[31]);
+            acc[31] = __fmaf_rn(__uint_as_float(x_car[14] << 16), __uint_as_float(w_car[2] << 16),
+                                acc[31]);
+            acc[31] = __fmaf_rn(__uint_as_float(x_car[14] & 0xFFFF0000u),
+                                __uint_as_float(w_car[2] & 0xFFFF0000u), acc[31]);
+            acc[31] = __fmaf_rn(__uint_as_float(x_car[15] << 16), __uint_as_float(w_car[3] << 16),
+                                acc[31]);
+            acc[31] = __fmaf_rn(__uint_as_float(x_car[15] & 0xFFFF0000u),
+                                __uint_as_float(w_car[3] & 0xFFFF0000u), acc[31]);
+#endif
+          }
+          int k_xn = k_base_r + 1024;
+          if (k_xn < hidden) {
+            int kw_xn = k_xn / 2;
+#pragma unroll
+            for (int j_2 = 0; j_2 < 4; j_2++) {
+              {
+                const uint4* _ivptr_1 = reinterpret_cast<const uint4*>(
+                    reinterpret_cast<const unsigned int*>(x_raw) +
+                    tokens[j_2] * (long long)hidden_words + (long long)kw_xn);
+                uint4 _ivld_1;
+                asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                             : "=r"(_ivld_1.x), "=r"(_ivld_1.y), "=r"(_ivld_1.z), "=r"(_ivld_1.w)
+                             : "l"((const void*)(_ivptr_1))
+                             : "memory");
+                (x_car + j_2 * 4)[0 + 0] = _ivld_1.x;
+                (x_car + j_2 * 4)[0 + 1] = _ivld_1.y;
+                (x_car + j_2 * 4)[0 + 2] = _ivld_1.z;
+                (x_car + j_2 * 4)[0 + 3] = _ivld_1.w;
+              }
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < 16; i++) {
+        float _shfl_xor_0 =
+            __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) != 0) ? acc[i] : acc[i + 16]), 16);
+        red_a[i] = (((lane_0 & 16) != 0) ? acc[i + 16] : acc[i]) + _shfl_xor_0;
+      }
+#pragma unroll
+      for (int i_1 = 0; i_1 < 8; i_1++) {
+        float _shfl_xor_1 =
+            __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) != 0) ? red_a[i_1] : red_a[i_1 + 8]), 8);
+        red_b[i_1] = (((lane_0 & 8) != 0) ? red_a[i_1 + 8] : red_a[i_1]) + _shfl_xor_1;
+      }
+#pragma unroll
+      for (int i_2 = 0; i_2 < 4; i_2++) {
+        float _shfl_xor_2 =
+            __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) != 0) ? red_b[i_2] : red_b[i_2 + 4]), 4);
+        red_c[i_2] = (((lane_0 & 4) != 0) ? red_b[i_2 + 4] : red_b[i_2]) + _shfl_xor_2;
+      }
+#pragma unroll
+      for (int i_3 = 0; i_3 < 2; i_3++) {
+        float _shfl_xor_3 =
+            __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) != 0) ? red_c[i_3] : red_c[i_3 + 2]), 2);
+        red_d[i_3] = (((lane_0 & 2) != 0) ? red_c[i_3 + 2] : red_c[i_3]) + _shfl_xor_3;
+      }
+#pragma unroll
+      for (int i_4 = 0; i_4 < 1; i_4++) {
+        float _shfl_xor_4 =
+            __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 1) != 0) ? red_d[i_4] : red_d[i_4 + 1]), 1);
+        red_e[i_4] = (((lane_0 & 1) != 0) ? red_d[i_4 + 1] : red_d[i_4]) + _shfl_xor_4;
+      }
+#pragma unroll
+      for (int i_5 = 0; i_5 < 1; i_5++) {
+        warp_partials[(lane_0 + i_5) * 4 + warp] = red_e[i_5];
+      }
+      __syncthreads();
+      if (tid < 32) {
+        float owned_accum = 0.0f;
+#pragma unroll
+        for (int source_warp = 0; source_warp < 4; source_warp++) {
+          owned_accum += warp_partials[tid * 4 + source_warp];
+        }
+        int owner_j = tid / 8;
+        int owner_rr = tid % 8;
+        if (owner_j < count) {
+          int owner_route = (int)reinterpret_cast<const unsigned int*>(
+              workspace_raw)[off_sorted_routes + start + owner_j];
+          *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(shrink_out_raw) +
+                                             (owner_route * 32 + rank_base0 + owner_rr)) +
+            (0)) = __float2bfloat16_rn(owned_accum);
+        }
+      }
+    }
+  }
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
+}  // extern "C"
+
+#undef BLACKWELL_INF
+#undef NUM_MAIN_STAGES
+#undef SMEM_TOTAL
+#undef SMEM_WARP_PARTIALS_OFF
+#undef SMEM_WARP_PARTIALS_STAGE_BYTES
+#undef SMEM_WARP_PARTIALS_STRIDE
+#undef SMEM_W_RING_OFF
+#undef SMEM_W_RING_STAGE_BYTES
+#undef SMEM_W_RING_STRIDE
+#undef SMEM_X_RING_OFF
+#undef SMEM_X_RING_STAGE_BYTES
+#undef SMEM_X_RING_STRIDE
+#undef THREADS
+
 // Dynamic shared memory per launch, in bytes.
 #define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE 221824
 #define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL 37120
@@ -16935,5 +19750,7 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
 #define CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED 128
 #define CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD 16640
 #define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING 49664
+#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED 33280
 #define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_SINGLE 512
 #define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_SINGLE 49664
+#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING_MIXED_SINGLE 33280

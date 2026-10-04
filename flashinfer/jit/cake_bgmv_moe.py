@@ -403,6 +403,8 @@ class CakeBGMVMoEGenericMetadata(NamedTuple):
     shrink_grouped_single_symbol: str
     shrink_grouped_ring_symbol: str
     shrink_grouped_ring_single_symbol: str
+    shrink_grouped_ring_mixed_symbol: str
+    shrink_grouped_ring_mixed_single_symbol: str
     expand_grouped_symbol: str
     combine_grouped_symbol: str
     order_build_symbol: str
@@ -640,6 +642,23 @@ def _generic_metadata(rank: int, dtype: CakeBGMVMoEDType) -> CakeBGMVMoEGenericM
             if rank > 8
             else f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_{tag}_r{rank}"
         ),
+        # Lever 34: mixed-precision (fma.rn.f32.bf16 on the packed halves, weights-only ring) forms,
+        # rendered for bf16 only; the binding launches them on sm_100a/sm_103a wherever the ring form
+        # is selected (CAKE_BGMV_MOE_GROUP_SHRINK_MIXED).  fp16 bundles alias them to the ring forms.
+        shrink_grouped_ring_mixed_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_mixed_{tag}_r{rank}"
+            if tag == "bf16"
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_{tag}_r{rank}"
+        ),
+        shrink_grouped_ring_mixed_single_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_mixed_single_{tag}_r{rank}"
+            if tag == "bf16" and rank > 8
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_mixed_{tag}_r{rank}"
+            if tag == "bf16"
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_single_{tag}_r{rank}"
+            if rank > 8
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_{tag}_r{rank}"
+        ),
         expand_grouped_symbol=f"kernel_flashinfer_bgmv_moe_expand_grouped_{tag}_r{rank}",
         combine_grouped_symbol=f"kernel_flashinfer_bgmv_moe_combine_grouped_{tag}_r{rank}",
         # Lever 27: single-CTA route-order prologue of the SM90 per-route shrink.
@@ -788,6 +807,12 @@ def _generic_binding_source(
     # (768x16 0.983 / 768x64 0.976 vs the direct form on H100); Blackwell keeps the direct form
     # there (the ring's two barriers cost 1.2-2.2 % with nothing to overlap).
     group_shrink_ring_single_tile = 1 if target.arch == "sm90a" else 0
+    # Lever 34: the bf16 bundles of sm_100a/sm_103a run the mixed-precision (fma.rn.f32.bf16)
+    # weights-only-ring grouped shrink wherever the ring form is selected (bitwise identical rows;
+    # the instruction exists from sm_100 on, fp16 rows keep the widened chain).
+    group_shrink_mixed = (
+        1 if target.arch in ("sm100a", "sm103a") and input_dtype == "dl_bfloat16" else 0
+    )
     return f"""\
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
@@ -819,6 +844,9 @@ def _generic_binding_source(
 #define CAKE_BGMV_MOE_SHRINK_GROUPED_RING {metadata.shrink_grouped_ring_symbol}
 #define CAKE_BGMV_MOE_SHRINK_GROUPED_RING_SINGLE {metadata.shrink_grouped_ring_single_symbol}
 #define CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE {group_shrink_ring_single_tile}
+#define CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED {metadata.shrink_grouped_ring_mixed_symbol}
+#define CAKE_BGMV_MOE_SHRINK_GROUPED_RING_MIXED_SINGLE {metadata.shrink_grouped_ring_mixed_single_symbol}
+#define CAKE_BGMV_MOE_GROUP_SHRINK_MIXED {group_shrink_mixed}
 #define CAKE_BGMV_MOE_EXPAND_GROUPED {metadata.expand_grouped_symbol}
 #define CAKE_BGMV_MOE_COMBINE_GROUPED {metadata.combine_grouped_symbol}
 #define CAKE_BGMV_MOE_ORDER_BUILD {metadata.order_build_symbol}

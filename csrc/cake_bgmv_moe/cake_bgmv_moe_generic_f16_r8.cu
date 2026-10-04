@@ -8437,94 +8437,167 @@ __global__ __launch_bounds__(256, 1) void kernel_flashinfer_bgmv_moe_combine_gro
       }
     }
     float pv[4];
-#pragma unroll 1
-    for (int s = 0; s < sweeps; s++) {
-      float acc[4];
-      int col0 = s * 1024 + tid * 4;
-#pragma unroll
-      for (int cc = 0; cc < 4; cc++) {
-        acc[cc] = 0.0f;
-      }
-      if (vec_ok != 0) {
-        if (col0 < hidden) {
+    int fast = 0;
+    if (vec_ok != 0) {
+      if (scan_all == 0) {
+        if (route_count == 2) {
           if (lora_id >= 0) {
+            fast = 1;
+          }
+        }
+      }
+    }
+    if (fast != 0) {
+      int fp0 = route_list[0];
+      int fp1 = route_list[1];
+      float fw0 = topk_weights[fp0];
+      float fw1 = topk_weights[fp1];
+      long long fb0 = (long long)fp0 * (long long)hidden;
+      long long fb1 = (long long)fp1 * (long long)hidden;
+      float pva0[4];
+      float pva1[4];
+      float acca[4];
 #pragma unroll 1
-            for (int step = 0; step < route_count; step++) {
-              int pair = step;
-              int route_match = 1;
-              if (scan_all != 0) {
-                if (sorted_token_ids[step] != (long long)token) {
-                  route_match = 0;
-                }
-              } else {
-                pair = route_list[step];
-              }
-              if (route_match != 0) {
-                float pair_weight = topk_weights[pair];
-                {
-                  unsigned _v4_0_0;
-                  unsigned _v4_0_1;
-                  unsigned _v4_0_2;
-                  unsigned _v4_0_3;
-                  asm volatile(
-                      "ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-                      : "=r"(_v4_0_0), "=r"(_v4_0_1), "=r"(_v4_0_2), "=r"(_v4_0_3)
-                      : "l"((const void*)(reinterpret_cast<const float*>(partials_raw) +
-                                          ((long long)pair * (long long)hidden + (long long)col0)))
-                      : "memory");
-                  pv[0 + 0] = __uint_as_float(_v4_0_0);
-                  pv[0 + 1] = __uint_as_float(_v4_0_1);
-                  pv[0 + 2] = __uint_as_float(_v4_0_2);
-                  pv[0 + 3] = __uint_as_float(_v4_0_3);
-                }
-#pragma unroll
-                for (int cc_1 = 0; cc_1 < 4; cc_1++) {
-                  float _fma_0 = __fmaf_rn(pv[cc_1], pair_weight, acc[cc_1]);
-                  acc[cc_1] = _fma_0;
-                }
-              }
-            }
+      for (int st = 0; st < sweeps; st++) {
+        int colt = st * 1024 + tid * 4;
+        if (colt < hidden) {
+          {
+            unsigned _v4_0_0;
+            unsigned _v4_0_1;
+            unsigned _v4_0_2;
+            unsigned _v4_0_3;
+            asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(_v4_0_0), "=r"(_v4_0_1), "=r"(_v4_0_2), "=r"(_v4_0_3)
+                         : "l"((const void*)(reinterpret_cast<const float*>(partials_raw) +
+                                             (fb0 + (long long)colt)))
+                         : "memory");
+            pva0[0 + 0] = __uint_as_float(_v4_0_0);
+            pva0[0 + 1] = __uint_as_float(_v4_0_1);
+            pva0[0 + 2] = __uint_as_float(_v4_0_2);
+            pva0[0 + 3] = __uint_as_float(_v4_0_3);
           }
           {
-            float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
-            *reinterpret_cast<float4*>((y_accum + (token * output_stride + output_offset + col0)) +
+            unsigned _v4_1_0;
+            unsigned _v4_1_1;
+            unsigned _v4_1_2;
+            unsigned _v4_1_3;
+            asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(_v4_1_0), "=r"(_v4_1_1), "=r"(_v4_1_2), "=r"(_v4_1_3)
+                         : "l"((const void*)(reinterpret_cast<const float*>(partials_raw) +
+                                             (fb1 + (long long)colt)))
+                         : "memory");
+            pva1[0 + 0] = __uint_as_float(_v4_1_0);
+            pva1[0 + 1] = __uint_as_float(_v4_1_1);
+            pva1[0 + 2] = __uint_as_float(_v4_1_2);
+            pva1[0 + 3] = __uint_as_float(_v4_1_3);
+          }
+#pragma unroll
+          for (int cc = 0; cc < 4; cc++) {
+            acca[cc] = 0.0f;
+            float _fma_0 = __fmaf_rn(pva0[cc], fw0, acca[cc]);
+            acca[cc] = _fma_0;
+            float _fma_1 = __fmaf_rn(pva1[cc], fw1, acca[cc]);
+            acca[cc] = _fma_1;
+          }
+          {
+            float4 _v4 = make_float4(acca[0 + 0], acca[0 + 1], acca[0 + 2], acca[0 + 3]);
+            *reinterpret_cast<float4*>((y_accum + (token * output_stride + output_offset + colt)) +
                                        0) = _v4;
           }
         }
-      } else {
-        if (lora_id >= 0) {
+      }
+    }
+    if (fast == 0) {
 #pragma unroll 1
-          for (int step_1 = 0; step_1 < route_count; step_1++) {
-            int pair_s = step_1;
-            int route_match_s = 1;
-            if (scan_all != 0) {
-              if (sorted_token_ids[step_1] != (long long)token) {
-                route_match_s = 0;
-              }
-            } else {
-              pair_s = route_list[step_1];
-            }
-            if (route_match_s != 0) {
-              float pair_weight_s = topk_weights[pair_s];
+      for (int s = 0; s < sweeps; s++) {
+        float acc[4];
+        int col0 = s * 1024 + tid * 4;
 #pragma unroll
-              for (int cc_2 = 0; cc_2 < 4; cc_2++) {
-                if (col0 + cc_2 < hidden) {
-                  float _fma_1 = __fmaf_rn(reinterpret_cast<const float*>(
-                                               partials_raw)[(long long)pair_s * (long long)hidden +
-                                                             (long long)col0 + (long long)cc_2],
-                                           pair_weight_s, acc[cc_2]);
-                  acc[cc_2] = _fma_1;
+        for (int cc_1 = 0; cc_1 < 4; cc_1++) {
+          acc[cc_1] = 0.0f;
+        }
+        if (vec_ok != 0) {
+          if (col0 < hidden) {
+            if (lora_id >= 0) {
+#pragma unroll 1
+              for (int step = 0; step < route_count; step++) {
+                int pair = step;
+                int route_match = 1;
+                if (scan_all != 0) {
+                  if (sorted_token_ids[step] != (long long)token) {
+                    route_match = 0;
+                  }
+                } else {
+                  pair = route_list[step];
+                }
+                if (route_match != 0) {
+                  float pair_weight = topk_weights[pair];
+                  {
+                    unsigned _v4_2_0;
+                    unsigned _v4_2_1;
+                    unsigned _v4_2_2;
+                    unsigned _v4_2_3;
+                    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                 : "=r"(_v4_2_0), "=r"(_v4_2_1), "=r"(_v4_2_2), "=r"(_v4_2_3)
+                                 : "l"((const void*)(reinterpret_cast<const float*>(partials_raw) +
+                                                     ((long long)pair * (long long)hidden +
+                                                      (long long)col0)))
+                                 : "memory");
+                    pv[0 + 0] = __uint_as_float(_v4_2_0);
+                    pv[0 + 1] = __uint_as_float(_v4_2_1);
+                    pv[0 + 2] = __uint_as_float(_v4_2_2);
+                    pv[0 + 3] = __uint_as_float(_v4_2_3);
+                  }
+#pragma unroll
+                  for (int cc_2 = 0; cc_2 < 4; cc_2++) {
+                    float _fma_2 = __fmaf_rn(pv[cc_2], pair_weight, acc[cc_2]);
+                    acc[cc_2] = _fma_2;
+                  }
+                }
+              }
+            }
+            {
+              float4 _v4 = make_float4(acc[0 + 0], acc[0 + 1], acc[0 + 2], acc[0 + 3]);
+              *reinterpret_cast<float4*>(
+                  (y_accum + (token * output_stride + output_offset + col0)) + 0) = _v4;
+            }
+          }
+        } else {
+          if (lora_id >= 0) {
+#pragma unroll 1
+            for (int step_1 = 0; step_1 < route_count; step_1++) {
+              int pair_s = step_1;
+              int route_match_s = 1;
+              if (scan_all != 0) {
+                if (sorted_token_ids[step_1] != (long long)token) {
+                  route_match_s = 0;
+                }
+              } else {
+                pair_s = route_list[step_1];
+              }
+              if (route_match_s != 0) {
+                float pair_weight_s = topk_weights[pair_s];
+#pragma unroll
+                for (int cc_3 = 0; cc_3 < 4; cc_3++) {
+                  if (col0 + cc_3 < hidden) {
+                    float _fma_3 =
+                        __fmaf_rn(reinterpret_cast<const float*>(
+                                      partials_raw)[(long long)pair_s * (long long)hidden +
+                                                    (long long)col0 + (long long)cc_3],
+                                  pair_weight_s, acc[cc_3]);
+                    acc[cc_3] = _fma_3;
+                  }
                 }
               }
             }
           }
-        }
 #pragma unroll
-        for (int cc_3 = 0; cc_3 < 4; cc_3++) {
-          if (col0 + cc_3 < hidden) {
-            *(reinterpret_cast<float*>(y_accum +
-                                       (token * output_stride + output_offset + col0 + cc_3)) +
-              (0)) = acc[cc_3];
+          for (int cc_4 = 0; cc_4 < 4; cc_4++) {
+            if (col0 + cc_4 < hidden) {
+              *(reinterpret_cast<float*>(y_accum +
+                                         (token * output_stride + output_offset + col0 + cc_4)) +
+                (0)) = acc[cc_4];
+            }
           }
         }
       }
@@ -8791,41 +8864,48 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
         acc[owner] = 0.0f;
       }
       int tid_vec = tid * 8;
-      if (tid_vec < hidden) {
-        int kw0 = tid_vec / 2;
 #pragma unroll
-        for (int j_1 = 0; j_1 < 4; j_1++) {
-          asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                           x_ring_addr + (unsigned int)((j_1 * 1024 + tid_vec) * 2)),
-                       "l"(reinterpret_cast<const unsigned int*>(x_raw) +
-                           (tokens[j_1] * (long long)hidden_words + (long long)kw0)));
-        }
+      for (int d = 0; d < 1; d++) {
+        int k_p = d * 1024 + tid_vec;
+        if (k_p < hidden) {
+          int kw_p = k_p / 2;
+          {
 #pragma unroll
-        for (int r = 0; r < 8; r++) {
-          asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                           w_ring_addr + (unsigned int)((r * 1024 + tid_vec) * 2)),
-                       "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
-                           (weight_words0 + (long long)(r * hidden_words) + (long long)kw0)));
+            for (int j_1 = 0; j_1 < 4; j_1++) {
+              asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                               x_ring_addr + (unsigned int)(((d * 4 + j_1) * 1024 + tid_vec) * 2)),
+                           "l"(reinterpret_cast<const unsigned int*>(x_raw) +
+                               (tokens[j_1] * (long long)hidden_words + (long long)kw_p)));
+            }
+          }
+#pragma unroll
+          for (int r = 0; r < 8; r++) {
+            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                             w_ring_addr + (unsigned int)(((d * 8 + r) * 1024 + tid_vec) * 2)),
+                         "l"(reinterpret_cast<const unsigned int*>(lora_a_raw) +
+                             (weight_words0 + (long long)(r * hidden_words) + (long long)kw_p)));
+          }
         }
+        asm volatile("cp.async.commit_group;");
       }
-      asm volatile("cp.async.commit_group;");
 #pragma unroll 1
       for (int local = 0; local < num_tiles; local++) {
         int stage = local % 2;
         int nxt = local + 1;
-        __syncthreads();
         if (nxt < num_tiles) {
           int nstage = nxt % 2;
           int k_n = nxt * 1024 + tid_vec;
           if (k_n < hidden) {
             int kw_n = k_n / 2;
+            {
 #pragma unroll
-            for (int j_2 = 0; j_2 < 4; j_2++) {
-              asm volatile(
-                  "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                      x_ring_addr + (unsigned int)(((nstage * 4 + j_2) * 1024 + tid_vec) * 2)),
-                  "l"(reinterpret_cast<const unsigned int*>(x_raw) +
-                      (tokens[j_2] * (long long)hidden_words + (long long)kw_n)));
+              for (int j_2 = 0; j_2 < 4; j_2++) {
+                asm volatile(
+                    "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
+                        x_ring_addr + (unsigned int)(((nstage * 4 + j_2) * 1024 + tid_vec) * 2)),
+                    "l"(reinterpret_cast<const unsigned int*>(x_raw) +
+                        (tokens[j_2] * (long long)hidden_words + (long long)kw_n)));
+              }
             }
 #pragma unroll
             for (int r_1 = 0; r_1 < 8; r_1++) {
@@ -8836,12 +8916,9 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
                       (weight_words0 + (long long)(r_1 * hidden_words) + (long long)kw_n)));
             }
           }
-          asm volatile("cp.async.commit_group;");
-          asm volatile("cp.async.wait_group 1;");
-        } else {
-          asm volatile("cp.async.wait_group 0;");
         }
-        __syncthreads();
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
         int k_base_r = local * 1024 + tid_vec;
         if (k_base_r < hidden) {
 #pragma unroll
