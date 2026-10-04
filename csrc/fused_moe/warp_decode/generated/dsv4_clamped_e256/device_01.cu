@@ -624,6 +624,8 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
             unsigned int _phase_work_full = 0;
             #pragma unroll 1
             for (unsigned int _work_iter = 0; _work_iter < 64 / 2 * grid_n + 1; _work_iter++) {
+                unsigned int saved_next_valid = 0;
+                unsigned int saved_next_linear = 0;
                 if (cluster_work < (unsigned int)(64 / 2 * num_non_exiting_ctas[0])) {
                     unsigned int m_tile = cluster_work % (unsigned int)(64 / 2) * 2 + (unsigned int)cta_rank;
                     unsigned int n_tile = cluster_work / (unsigned int)(64 / 2);
@@ -653,6 +655,19 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                     float _tmem_load_0[8];
                     tmem_ld_x8(&_tmem_load_0[0], taddr + (unsigned int)(cta_rank * 64 + warp_0 * 32 << 16) + acc_stage * 8);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    asm volatile("barrier.sync 7, 64;" ::: "memory");
+                    if (elect_sync()) {
+                        asm volatile(
+                            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                            :: "r"((mma_free_addr + (acc_stage) * 8) & 0xFEFFFFFF) : "memory");
+                    }
+                    mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
+                    unsigned int valid = work_response[0];
+                    unsigned int next_linear = work_response[1];
+                    mbarrier_arrive(work_empty_addr + (work_stage) * 8);
+                    _phase_work_full ^= 1;
+                    saved_next_valid = valid;
+                    saved_next_linear = next_linear;
                     for (int token_pair = 0; token_pair < 4; token_pair++) {
                         if (valid_rows > token_pair * 2) {
                             float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, _tmem_load_0[token_pair * 2], 8);
@@ -739,23 +754,21 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                         }
                     }
                     asm volatile("barrier.sync 7, 64;" ::: "memory");
-                    if (elect_sync()) {
-                        asm volatile(
-                            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                            :: "r"((mma_free_addr + (acc_stage) * 8) & 0xFEFFFFFF) : "memory");
-                    }
                     acc_stage += 1;
                     if (acc_stage == 2) { acc_stage = 0; _phase_mma_full ^= 1; }
+                } else {
+                    mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
+                    unsigned int valid_1 = work_response[0];
+                    unsigned int next_linear_1 = work_response[1];
+                    mbarrier_arrive(work_empty_addr + (work_stage) * 8);
+                    _phase_work_full ^= 1;
+                    saved_next_valid = valid_1;
+                    saved_next_linear = next_linear_1;
                 }
-                mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
-                unsigned int valid = work_response[0];
-                unsigned int next_linear = work_response[1];
-                mbarrier_arrive(work_empty_addr + (work_stage) * 8);
-                _phase_work_full ^= 1;
-                if (valid == 0) {
+                if (saved_next_valid == 0) {
                     break;
                 }
-                cluster_work = next_linear;
+                cluster_work = saved_next_linear;
             }
         }
     }
@@ -828,14 +841,14 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                         }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
-                    unsigned int valid_1 = work_response[0];
-                    unsigned int next_linear_1 = work_response[1];
+                    unsigned int valid_2 = work_response[0];
+                    unsigned int next_linear_2 = work_response[1];
                     mbarrier_arrive(work_empty_addr + (work_stage_1) * 8);
                     _phase_work_full_1 ^= 1;
-                    if (valid_1 == 0) {
+                    if (valid_2 == 0) {
                         break;
                     }
-                    cluster_work_1 = next_linear_1;
+                    cluster_work_1 = next_linear_2;
                 }
             }
         }
@@ -910,14 +923,14 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                         }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
-                    unsigned int valid_2 = work_response[0];
-                    unsigned int next_linear_2 = work_response[1];
+                    unsigned int valid_3 = work_response[0];
+                    unsigned int next_linear_3 = work_response[1];
                     mbarrier_arrive(work_empty_addr + (work_stage_2) * 8);
                     _phase_work_full_2 ^= 1;
-                    if (valid_2 == 0) {
+                    if (valid_3 == 0) {
                         break;
                     }
-                    cluster_work_2 = next_linear_2;
+                    cluster_work_2 = next_linear_3;
                 }
             }
         }
@@ -1039,14 +1052,14 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                         if (acc_stage_1 == 2) { acc_stage_1 = 0; _phase_mma_free ^= 1; }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_3) * 8, _phase_work_full_3);
-                    unsigned int valid_3 = work_response[0];
-                    unsigned int next_linear_3 = work_response[1];
+                    unsigned int valid_4 = work_response[0];
+                    unsigned int next_linear_4 = work_response[1];
                     mbarrier_arrive(work_empty_addr + (work_stage_3) * 8);
                     _phase_work_full_3 ^= 1;
-                    if (valid_3 == 0) {
+                    if (valid_4 == 0) {
                         break;
                     }
-                    cluster_work_3 = next_linear_3;
+                    cluster_work_3 = next_linear_4;
                 }
             }
         }
@@ -1229,14 +1242,14 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_4) * 8, _phase_work_full_4);
-                unsigned int valid_4 = work_response[0];
-                unsigned int next_linear_4 = work_response[1];
+                unsigned int valid_5 = work_response[0];
+                unsigned int next_linear_5 = work_response[1];
                 mbarrier_arrive(work_empty_addr + (work_stage_4) * 8);
                 _phase_work_full_4 ^= 1;
-                if (valid_4 == 0) {
+                if (valid_5 == 0) {
                     break;
                 }
-                cluster_work_4 = next_linear_4;
+                cluster_work_4 = next_linear_5;
             }
         }
     }
@@ -1272,14 +1285,14 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_5) * 8, _phase_work_full_5);
-                unsigned int valid_5 = work_response[0];
-                unsigned int next_linear_5 = work_response[1];
+                unsigned int valid_6 = work_response[0];
+                unsigned int next_linear_6 = work_response[1];
                 mbarrier_arrive(work_empty_addr + (work_stage_5) * 8);
                 _phase_work_full_5 ^= 1;
-                if (valid_5 == 0) {
+                if (valid_6 == 0) {
                     break;
                 }
-                cluster_work_5 = next_linear_5;
+                cluster_work_5 = next_linear_6;
             }
         }
     }
@@ -1346,14 +1359,14 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_6) * 8, _phase_work_full_6);
-                unsigned int valid_6 = work_response[0];
-                unsigned int next_linear_6 = work_response[1];
+                unsigned int valid_7 = work_response[0];
+                unsigned int next_linear_7 = work_response[1];
                 mbarrier_arrive(work_empty_addr + (work_stage_6) * 8);
                 _phase_work_full_6 ^= 1;
-                if (valid_6 == 0) {
+                if (valid_7 == 0) {
                     break;
                 }
-                cluster_work_6 = next_linear_6;
+                cluster_work_6 = next_linear_7;
             }
             if (pending != 0) {
                 asm volatile("cp.async.wait_group 0;");
@@ -1415,19 +1428,19 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                     __syncwarp();
                     _phase_private_full ^= 1;
                     unsigned int publish = 1;
-                    unsigned int next_linear_7 = 0;
+                    unsigned int next_linear_8 = 0;
                     if (_clc_valid_0 != 0) {
                         if (_clc_ctaid_y_0 >= (unsigned int)num_non_exiting_ctas[0]) {
                             publish = 0;
                         } else {
-                            next_linear_7 = _clc_ctaid_y_0 * (unsigned int)(64 / 2) + _clc_ctaid_x_0 / 2;
+                            next_linear_8 = _clc_ctaid_y_0 * (unsigned int)(64 / 2) + _clc_ctaid_x_0 / 2;
                         }
                     }
                     if (publish != 0) {
                         mbarrier_wait_cluster_hint(relay_empty_addr + (relay_stage) * 8, _phase_relay_empty, 10000000);
                         if (elect_sync()) {
                             work_response[0] = _clc_valid_0;
-                            work_response[1] = next_linear_7;
+                            work_response[1] = next_linear_8;
                             work_response[2] = 0;
                             work_response[3] = 0;
                             mbarrier_arrive(work_full_addr + (work_stage_7) * 8);
@@ -1448,16 +1461,16 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                                 : "=r"(_mapa_1) : "r"(relay_full_addr + relay_stage * 8), "r"(1));
                             asm volatile(
                                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                                :: "r"(_mapa_0), "r"(_clc_valid_0), "r"(next_linear_7), "r"(0), "r"(0), "r"(_mapa_1) : "memory");
+                                :: "r"(_mapa_0), "r"(_clc_valid_0), "r"(next_linear_8), "r"(0), "r"(0), "r"(_mapa_1) : "memory");
                         }
                         _phase_relay_empty ^= 1;
                         mbarrier_wait(work_full_addr + (work_stage_7) * 8, _phase_work_full_7);
-                        unsigned int valid_7 = work_response[0];
+                        unsigned int valid_8 = work_response[0];
                         unsigned int next_linear_0 = work_response[1];
                         mbarrier_arrive(work_empty_addr + (work_stage_7) * 8);
                         _phase_work_empty ^= 1;
                         _phase_work_full_7 ^= 1;
-                        if (valid_7 == 0) {
+                        if (valid_8 == 0) {
                             break;
                         }
                     }

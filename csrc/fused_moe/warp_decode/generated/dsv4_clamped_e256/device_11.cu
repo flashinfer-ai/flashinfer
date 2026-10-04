@@ -973,8 +973,8 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                         mbarrier_wait_token(tmem_sfb_full_addr + (stage_2) * 8, readiness_phase, sfb_ready);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         if (elect_sync()) {
-                            int _mma_a_lo_0 = (((smem_a_mma0_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
-                            int _mma_b_lo_0 = (((smem_b_mma0_addr) >> 4) & 0x3FFF) + (stage_2) * 128;
+                            int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
+                            int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_2) * 128;
                             {
                                 uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_0) | ((uint64_t)0x40004040 << 32);
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x40004040 << 32);
@@ -982,8 +982,8 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                                 tcgen05_mma_mxf4nvf4_bs((tmem_accum + (acc_stage_1 * 16)), a_desc + 0, b_desc + 0,
                                     0x8020480U, (unsigned int)tmem_sfa + stage_2 * 32 + 0, (unsigned int)tmem_sfb + stage_2 * 32 + 0, ((((1) ? ((iter_k_2 == 0) ? 1 : 0) : 0)) ? 0 : 1));
                             }
-                            int _mma_a_lo_1 = (((smem_a_mma1_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
-                            int _mma_b_lo_1 = (((smem_b_mma1_addr) >> 4) & 0x3FFF) + (stage_2) * 128;
+                            int _mma_a_lo_1 = (((smem_a_addr + 32) >> 4) & 0x3FFF) + (stage_2) * 2048;
+                            int _mma_b_lo_1 = (((smem_b_addr + 32) >> 4) & 0x3FFF) + (stage_2) * 128;
                             {
                                 uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_1) | ((uint64_t)0x40004040 << 32);
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_1) | ((uint64_t)0x40004040 << 32);
@@ -991,8 +991,8 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                                 tcgen05_mma_mxf4nvf4_bs((tmem_accum + (acc_stage_1 * 16)), a_desc + 0, b_desc + 0,
                                     0x8020480U, (unsigned int)tmem_sfa + (stage_2 * 32 + 4) + 0, (unsigned int)tmem_sfb + (stage_2 * 32 + 4) + 0, ((((0) ? ((iter_k_2 == 0) ? 1 : 0) : 0)) ? 0 : 1));
                             }
-                            int _mma_a_lo_2 = (((smem_a_mma2_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
-                            int _mma_b_lo_2 = (((smem_b_mma2_addr) >> 4) & 0x3FFF) + (stage_2) * 128;
+                            int _mma_a_lo_2 = (((smem_a_addr + 64) >> 4) & 0x3FFF) + (stage_2) * 2048;
+                            int _mma_b_lo_2 = (((smem_b_addr + 64) >> 4) & 0x3FFF) + (stage_2) * 128;
                             {
                                 uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_2) | ((uint64_t)0x40004040 << 32);
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_2) | ((uint64_t)0x40004040 << 32);
@@ -1000,8 +1000,8 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                                 tcgen05_mma_mxf4nvf4_bs((tmem_accum + (acc_stage_1 * 16)), a_desc + 0, b_desc + 0,
                                     0x8020480U, (unsigned int)tmem_sfa + (stage_2 * 32 + 8) + 0, (unsigned int)tmem_sfb + (stage_2 * 32 + 8) + 0, ((((0) ? ((iter_k_2 == 0) ? 1 : 0) : 0)) ? 0 : 1));
                             }
-                            int _mma_a_lo_3 = (((smem_a_mma3_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
-                            int _mma_b_lo_3 = (((smem_b_mma3_addr) >> 4) & 0x3FFF) + (stage_2) * 128;
+                            int _mma_a_lo_3 = (((smem_a_addr + 96) >> 4) & 0x3FFF) + (stage_2) * 2048;
+                            int _mma_b_lo_3 = (((smem_b_addr + 96) >> 4) & 0x3FFF) + (stage_2) * 128;
                             {
                                 uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_3) | ((uint64_t)0x40004040 << 32);
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_3) | ((uint64_t)0x40004040 << 32);
@@ -1009,8 +1009,8 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                                 tcgen05_mma_mxf4nvf4_bs((tmem_accum + (acc_stage_1 * 16)), a_desc + 0, b_desc + 0,
                                     0x8020480U, (unsigned int)tmem_sfa + (stage_2 * 32 + 12) + 0, (unsigned int)tmem_sfb + (stage_2 * 32 + 12) + 0, ((((0) ? ((iter_k_2 == 0) ? 1 : 0) : 0)) ? 0 : 1));
                             }
-                            int _mma_a_lo_4 = (((smem_a_mma4_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
-                            int _mma_b_lo_4 = (((smem_b_mma4_addr) >> 4) & 0x3FFF) + (stage_2) * 128;
+                            int _mma_a_lo_4 = (((smem_a_addr + 16384) >> 4) & 0x3FFF) + (stage_2) * 2048;
+                            int _mma_b_lo_4 = (((smem_b_addr + 1024) >> 4) & 0x3FFF) + (stage_2) * 128;
                             {
                                 uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_4) | ((uint64_t)0x40004040 << 32);
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_4) | ((uint64_t)0x40004040 << 32);
@@ -1018,8 +1018,8 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                                 tcgen05_mma_mxf4nvf4_bs((tmem_accum + (acc_stage_1 * 16)), a_desc + 0, b_desc + 0,
                                     0x8020480U, (unsigned int)tmem_sfa + (stage_2 * 32 + 16) + 0, (unsigned int)tmem_sfb + (stage_2 * 32 + 16) + 0, ((((0) ? ((iter_k_2 == 0) ? 1 : 0) : 0)) ? 0 : 1));
                             }
-                            int _mma_a_lo_5 = (((smem_a_mma5_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
-                            int _mma_b_lo_5 = (((smem_b_mma5_addr) >> 4) & 0x3FFF) + (stage_2) * 128;
+                            int _mma_a_lo_5 = (((smem_a_addr + 16416) >> 4) & 0x3FFF) + (stage_2) * 2048;
+                            int _mma_b_lo_5 = (((smem_b_addr + 1056) >> 4) & 0x3FFF) + (stage_2) * 128;
                             {
                                 uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_5) | ((uint64_t)0x40004040 << 32);
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_5) | ((uint64_t)0x40004040 << 32);
@@ -1027,8 +1027,8 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                                 tcgen05_mma_mxf4nvf4_bs((tmem_accum + (acc_stage_1 * 16)), a_desc + 0, b_desc + 0,
                                     0x8020480U, (unsigned int)tmem_sfa + (stage_2 * 32 + 20) + 0, (unsigned int)tmem_sfb + (stage_2 * 32 + 20) + 0, ((((0) ? ((iter_k_2 == 0) ? 1 : 0) : 0)) ? 0 : 1));
                             }
-                            int _mma_a_lo_6 = (((smem_a_mma6_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
-                            int _mma_b_lo_6 = (((smem_b_mma6_addr) >> 4) & 0x3FFF) + (stage_2) * 128;
+                            int _mma_a_lo_6 = (((smem_a_addr + 16448) >> 4) & 0x3FFF) + (stage_2) * 2048;
+                            int _mma_b_lo_6 = (((smem_b_addr + 1088) >> 4) & 0x3FFF) + (stage_2) * 128;
                             {
                                 uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_6) | ((uint64_t)0x40004040 << 32);
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_6) | ((uint64_t)0x40004040 << 32);
@@ -1036,8 +1036,8 @@ kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100(const __grid_constant__ CUtensorM
                                 tcgen05_mma_mxf4nvf4_bs((tmem_accum + (acc_stage_1 * 16)), a_desc + 0, b_desc + 0,
                                     0x8020480U, (unsigned int)tmem_sfa + (stage_2 * 32 + 24) + 0, (unsigned int)tmem_sfb + (stage_2 * 32 + 24) + 0, ((((0) ? ((iter_k_2 == 0) ? 1 : 0) : 0)) ? 0 : 1));
                             }
-                            int _mma_a_lo_7 = (((smem_a_mma7_addr) >> 4) & 0x3FFF) + (stage_2) * 2048;
-                            int _mma_b_lo_7 = (((smem_b_mma7_addr) >> 4) & 0x3FFF) + (stage_2) * 128;
+                            int _mma_a_lo_7 = (((smem_a_addr + 16480) >> 4) & 0x3FFF) + (stage_2) * 2048;
+                            int _mma_b_lo_7 = (((smem_b_addr + 1120) >> 4) & 0x3FFF) + (stage_2) * 128;
                             {
                                 uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_7) | ((uint64_t)0x40004040 << 32);
                                 uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_7) | ((uint64_t)0x40004040 << 32);

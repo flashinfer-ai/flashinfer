@@ -534,3 +534,101 @@ Capture IDs 0–5 identify the six balanced capture triplets per shape. Latencie
 |32|3|286.560000000|286.368000000|290.304000000|1.013065326633|1.013744552464|1.000670465974|
 |32|4|286.496000000|286.463000000|290.335000000|1.013399838043|1.013516579803|1.000115198123|
 |32|5|286.592000000|286.400000000|290.623500000|1.014067036065|1.014746857542|1.000670391061|
+
+
+## Packed-FC1 epilogue and FC2 operand-staging cohort (2026-10-04)
+
+This separate current public cohort qualifies the updated packed-FC1 epilogue
+and FC2 operand staging. All historical sections above remain independent
+evidence; their uses of “current” refer to those earlier cohorts. The new
+public implementation beats `flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe`
+at **32/32 shapes and 192/192 capture comparisons**, with no ties or regressions
+against that named baseline. Public geometric-mean speedup is
+**1.024821927359×**; the minimum is **T14,
+161.502948222µs versus 162.606988718µs,
+1.006836039267×**. The equivalent source implementation measures
+1.024913981537× against the same baseline.
+
+The geometry remains B200 sm_100a, H=4096, I=2048, E=256, top-k=6, every integer
+T=1..32 and clamped SwiGLU limit 10.0. This is the routed expert kernel; the
+shared expert remains outside it. All three arms consume the same physical
+synthetic NVFP4 weights, activations, routes and scales, with equivalent clamp
+parameters and BF16 output. The normal public JIT library was built and
+qualified independently; a source implementation's binary is not substituted
+for the public library.
+
+Timing uses `loom.bench.bench_gpu_time`, CUPTI and cold L2 around the complete
+call, including planning, projections, activation/quantization and weighted
+finalization. Each row is the equal-weight geometric mean of six balanced
+capture medians per arm:192 captures per arm,576 arm-capture observations.
+No best-capture selection or historical timing reuse is used. The six fixed
+captures describe variation, not independent randomized trials or a confidence
+interval. All times below are microseconds; speedup is FlashInfer/implementation.
+Source/public below1 means that the public implementation is slower than its
+equivalent source control; that comparison is reported, not the baseline gate.
+
+| T | Captures per arm | Source µs | Public µs | FlashInfer µs | Source speedup | Public speedup | Source/public |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 6 | 24.975504270 | 25.097973262 | 29.390014399 | 1.176753593482× | 1.171011463457× | 0.995120363297× |
+| 2 | 6 | 41.306282206 | 41.194393657 | 44.687346548 | 1.081853513842× | 1.084791948136× | 1.002716111060× |
+| 3 | 6 | 55.999754338 | 55.860900600 | 60.079534165 | 1.072853530795× | 1.075520328515× | 1.002485705312× |
+| 4 | 6 | 68.058127881 | 67.914132468 | 72.697992025 | 1.068175018740× | 1.070439824285× | 1.002120256985× |
+| 5 | 6 | 79.940631763 | 79.967282618 | 83.188698665 | 1.040630988646× | 1.040284175498× | 0.999666728022× |
+| 6 | 6 | 91.706132468 | 91.871605624 | 93.780500232 | 1.022619727909× | 1.020777851819× | 0.998198865091× |
+| 7 | 6 | 100.815145060 | 100.996295439 | 103.715839503 | 1.028772407573× | 1.026927166503× | 0.998206366095× |
+| 8 | 6 | 110.014811760 | 109.977577560 | 111.561274343 | 1.014056857964× | 1.014400178819× | 1.000338561741× |
+| 9 | 6 | 122.025595810 | 121.817580934 | 123.284571718 | 1.010317310070× | 1.012042521064× | 1.001707593225× |
+| 10 | 6 | 128.265780539 | 128.265763020 | 129.465865723 | 1.009356238109× | 1.009356375972× | 1.000000136585× |
+| 11 | 6 | 135.721788573 | 135.588281223 | 136.964234250 | 1.009154356795× | 1.010148023232× | 1.000984652576× |
+| 12 | 6 | 145.694769097 | 145.444251906 | 146.745470214 | 1.007211659857× | 1.008946508999× | 1.001722427580× |
+| 13 | 6 | 155.044303155 | 154.734980423 | 156.772120549 | 1.011144023733× | 1.013165349688× | 1.001999048511× |
+| 14 | 6 | 161.513607854 | 161.502948222 | 162.606988718 | 1.006769589749× | 1.006836039267× | 1.000066002707× |
+| 15 | 6 | 169.102780142 | 169.113447213 | 170.499759003 | 1.008261122966× | 1.008197525468× | 0.999936923584× |
+| 16 | 6 | 179.070136295 | 178.958307645 | 180.552736570 | 1.008279439023× | 1.008909499343× | 1.000624886609× |
+| 17 | 6 | 184.782309514 | 184.664982242 | 188.600895862 | 1.020665324279× | 1.021313806070× | 1.000635352035× |
+| 18 | 6 | 188.627990366 | 188.787961534 | 191.779769952 | 1.016708970821× | 1.015847453377× | 0.999152641053× |
+| 19 | 6 | 194.686988602 | 194.409460044 | 197.641621202 | 1.015176322883× | 1.016625534361× | 1.001427546571× |
+| 20 | 6 | 202.558578291 | 202.345306738 | 205.630812529 | 1.015167139623× | 1.016237123777× | 1.001053998019× |
+| 21 | 6 | 209.721428779 | 210.009478510 | 212.361012477 | 1.012586142069× | 1.011197275396× | 0.998628396523× |
+| 22 | 6 | 221.252140882 | 221.454812662 | 225.108050848 | 1.017427673020× | 1.016496540049× | 0.999084816547× |
+| 23 | 6 | 224.873474533 | 224.547800544 | 228.504758061 | 1.016148118561× | 1.017621893902× | 1.001450354839× |
+| 24 | 6 | 237.027151895 | 237.283320805 | 240.680600934 | 1.015413630925× | 1.014317399624× | 0.998920409115× |
+| 25 | 6 | 244.851466891 | 244.862247245 | 248.157915448 | 1.013503895234× | 1.013459274512× | 0.999955973803× |
+| 26 | 6 | 250.214241872 | 250.851318079 | 253.352818811 | 1.012543558335× | 1.009972045395× | 0.997460343391× |
+| 27 | 6 | 255.544978473 | 256.211956916 | 259.699756041 | 1.016258498183× | 1.013612944406× | 0.997396770820× |
+| 28 | 6 | 263.128766316 | 263.779491283 | 266.414179197 | 1.012485950994× | 1.009988221227× | 0.997533072173× |
+| 29 | 6 | 271.816821541 | 271.752795733 | 275.326076692 | 1.012910367839× | 1.013149012689× | 1.000235603127× |
+| 30 | 6 | 281.112951863 | 281.235661963 | 284.216907302 | 1.011041666414× | 1.010600523840× | 0.999563675179× |
+| 31 | 6 | 284.504975861 | 284.957945421 | 287.896688079 | 1.011921451313× | 1.010312899517× | 0.998410398560× |
+| 32 | 6 | 289.453439999 | 289.346977832 | 294.344052286 | 1.016896024064× | 1.017270180225× | 1.000367939447× |
+
+Public/source differences remain mixed: public is slower at 15
+aggregate shapes (T1, T5, T6, T7, T15, T18, T21, T22, T24, T25, T26, T27, T28, T30, T31). At capture level, public is faster in
+89 comparisons, 5 tie, and source is faster in
+98. Both source and public beat FlashInfer in all 192 captures.
+This cohort does not establish a controlled causal improvement over historical
+cohorts or attribute a gain to either changed device unit alone.
+
+All 32 strict BF16 correctness shapes pass at atol=rtol=0.01 with stricter checks
+preserved, together with 576 timing postchecks, 7 API/graph cases and 8 dynamic
+route cases. Eight non-overlapping shape shards were reduced into the full
+domain; individual shard coverage flags are not whole-domain performance gates.
+The full-domain result requires FlashInfer/public>1 at every T. Public JIT
+library SHA-256: `c59667990a9254947a272cc28f93798cdd927948c2f15de675b25ada5bf5c750`. Observed loaded FlashInfer baseline library
+SHA-256: `74d38e3ec9ddae49151300a3bb106f09ac58c874884eb11d3a6b6f5c6dc9d7c5`. These identify this cohort, not earlier captures.
+
+Successful physical turnaround was 2372.639219s.
+Successful wrapper-worker durations sum to 5553.121231s;
+validation-worker durations sum to 5504.204544s.
+Parallel worker sums are not elapsed time. Prior failed orchestration attempts
+are separate from these successful cohort durations.
+
+The stock baseline remains its observed default-tactic fallback, not a claim
+of an explicitly tuned optimum. This synthetic cohort is not actual checkpoint,
+full-model, router or shared-expert execution. Earlier checkpoint qualification
+and its T1–4 per-capture baseline-binary association gap remain unchanged.
+Separate synccheck and racecheck timeouts remain **SKIPPED: sanitizer timeout
+after 20 seconds**, not passes; no unchanged timed-out check was retried here.
+Hardware-limit evidence and broader promotion remain incomplete. Keep the
+review draft; serialized profiler evidence does not establish a normal-PDL
+whole-call hardware ceiling.
