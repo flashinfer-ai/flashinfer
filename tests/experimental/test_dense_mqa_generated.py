@@ -438,3 +438,44 @@ def test_fp8_mqa_logits_one_shot(queries, keys, heads):
     native = deep_gemm.fp8_mqa_logits(q, (kv, scales), weights, ks, ke, clean_logits=False)
     torch.cuda.synchronize()
     torch.testing.assert_close(out[finite], native[finite], atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("queries,keys,heads", [(16, 4096, 32), (37, 4100, 64)])
+def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
+    """The one-shot entry captured in a CUDA graph launches on the capture
+    stream: a replay after the captured output is poisoned reproduces the eager
+    bits (an empty capture leaves the poison and fails), and the logits are
+    non-trivial."""
+    _skip_unless_exported()
+    if not _runtime.dense_route_available(heads, queries, keys):
+        pytest.skip(f"catalog has no route for H={heads}, Q={queries}, K={keys}")
+    from flashinfer.dense_mqa import fp8_mqa_logits
+
+    torch.manual_seed(5)
+    q = torch.randn(queries, heads, 128, device="cuda").to(torch.float8_e4m3fn)
+    kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.rand(keys, device="cuda") + 0.5
+    weights = torch.randn(queries, heads, device="cuda")
+    ks = torch.zeros(queries, device="cuda", dtype=torch.int32)
+    ke = torch.full_like(ks, keys)
+    eager = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)  # eager warm-up builds the module
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)
+    with torch.cuda.stream(stream):
+        captured.fill_(float("nan"))
+        graph.replay()
+    stream.synchronize()
+    assert torch.equal(captured, eager), "graph replay does not reproduce the eager logits"
+    assert torch.isfinite(captured).all() and bool((captured != 0).any())
+    with torch.cuda.stream(stream):
+        weights.neg_()
+        captured.fill_(float("nan"))
+        graph.replay()
+        changed = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)
+    stream.synchronize()
+    assert torch.equal(captured, changed) and not torch.equal(captured, eager)

@@ -251,3 +251,41 @@ def test_paged_host_helpers_and_rejections():
         meta = get_paged_mqa_logits_metadata(ctx_2d, 64, 148)
         with pytest.raises(ValueError):
             fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, meta, max_len, clean_logits=True)
+
+
+@pytest.mark.parametrize("heads,page,next_n,batch,avg_ctx", CASES[:1])
+def test_paged_one_shot_graph_replay(heads, page, next_n, batch, avg_ctx):
+    """``get_paged_mqa_logits_metadata`` + ``fp8_paged_mqa_logits`` captured in
+    a CUDA graph (the engine's decode path) launch on the capture stream: a
+    replay after poisoning the captured buffers reproduces the eager bits on
+    every cell inside the rows' lengths and the logits are non-trivial; an
+    empty capture leaves the poison and fails."""
+    _skip_unless_route(heads, page, next_n)
+    q, kv_cache, _kv_fp8, _scale, weights, ctx_2d, block_table, max_len = _inputs(heads, page, next_n, batch, avg_ctx)
+    num_sms = _runtime._resolve_device(q, None)[1]
+    meta = get_paged_mqa_logits_metadata(ctx_2d, page, num_sms)
+    eager = fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, meta, max_len)
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured_meta = get_paged_mqa_logits_metadata(ctx_2d, page, num_sms)
+            captured = fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, captured_meta, max_len)
+    with torch.cuda.stream(stream):
+        captured_meta.fill_(0x55555555)
+        captured.fill_(float("nan"))
+        graph.replay()
+    stream.synchronize()
+    assert torch.equal(captured_meta, meta)
+    inside = torch.arange(max_len, device="cuda")[None, :] < ctx_2d.reshape(-1)[:, None]
+    assert torch.equal(captured[inside], eager[inside]), "graph replay does not reproduce the eager logits"
+    assert torch.isfinite(captured[inside]).all() and bool((captured[inside] != 0).any())
+    with torch.cuda.stream(stream):
+        weights.neg_()
+        captured.fill_(float("nan"))
+        graph.replay()
+        changed = fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, meta, max_len)
+    stream.synchronize()
+    assert torch.equal(captured[inside], changed[inside]) and not torch.equal(captured[inside], eager[inside])
