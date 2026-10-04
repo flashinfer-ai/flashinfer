@@ -549,8 +549,17 @@ def test_config_is_explicit_exact_sm100_sm103_and_stepfun_only():
 def test_fused_shared_experts_follow_the_native_family(precision):
     """bf16 / per-tensor fp8 reject S > 0 like their trtllm-gen runners; nvfp4 / mxfp8 accept it."""
     spec = PRECISIONS[precision]
+    # MoEConfig only admits fused shared experts under DeepSeekV3 routing.
     runner = CakeStepFunRunner(
-        _config(num_tokens=8, quant=spec.quant, num_fused_shared_experts=1),
+        _config(
+            num_tokens=8,
+            quant=spec.quant,
+            num_fused_shared_experts=1,
+            routing_method=RoutingMethodType.DeepSeekV3,
+            n_groups=8,
+            top_k_groups=4,
+            routed_scaling=2.5,
+        ),
         torch.device("cpu"),
     )
     assert type(runner) is spec.runner_cls
