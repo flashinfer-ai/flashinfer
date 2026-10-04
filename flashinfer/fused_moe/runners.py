@@ -6243,7 +6243,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
     # The per-tensor cubin manifest has SwiGLU and ReLU2 epilogues. GeGLU is
     # representable by the enum but has no matching generated kernel.
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLU, ReLU2)
@@ -6561,7 +6561,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = ((QuantFormat.BF16, QuantFormat.BF16),)
     # The BF16 cubin manifest currently contains SwiGLU and ReLU2. GeGLU and
     # SiTU are represented by the launcher enum but have no matching kernels.
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLU, ReLU2)
@@ -6801,7 +6801,7 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
     """
 
     backend_key = "cake"
-    supported_activation_classes = (SwiGLUStep,)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLUStep,)
 
     def __new__(cls, config: MoEConfig | None = None, device: Any = None, *args: Any, **kwargs: Any):
         if cls is CakeStepFunRunner:
