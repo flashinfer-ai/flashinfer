@@ -4348,6 +4348,7 @@ class TestFusedSharedExpertsBackendGating:
             if r.supports_fused_shared_experts
         }
         assert supporting == {
+            "CakeStepFunRunner",
             "TrtllmFp4RoutedRunner",
             "TrtllmFp8BlockRunner",
         }, (

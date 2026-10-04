@@ -15,7 +15,7 @@ limitations under the License.
 
 Cake StepFun fused MoE through the unified MoE API.
 
-``CakeStepFunConfig(backend="cake")`` runs trtllm-gen routing, GEMM2 and
+``CakeStepFunConfig(backend="cake_stepfun")`` runs trtllm-gen routing, GEMM2 and
 finalize with the exported Cake StepFun FC1 kernels in the GEMM1 slot, for
 NVFP4 (E2m1 output and the per-token bf16-output variant), BF16, per-tensor
 FP8 and MXFP8. These tests compare that backend with the trtllm-gen fused-MoE
@@ -100,7 +100,7 @@ NVFP4_PER_TOKEN = QuantConfig(
 BF16 = QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)
 FP8 = QuantConfig(weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor)
 MXFP8 = QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
-CAKE = BackendOptions(candidates=(CakeStepFunConfig(backend="cake"),))
+CAKE = BackendOptions(candidates=(CakeStepFunConfig(backend="cake_stepfun"),))
 
 # One entry per FC1 family the backend serves: the quantization, the trtllm-gen
 # test harness that produces the data and the reference, the weight layout the
@@ -411,7 +411,7 @@ def _build_case(
     )
     view = _kernel_view(precision, static, limits)
     weights = MoEWeightPack()
-    weights.prepare_for("cake", view)
+    weights.prepare_for("cake_stepfun", view)
     weights.prepare_for(spec.native_runner.backend_key, view)
     hidden_states_q, hidden_states_scale = _kernel_activations(
         precision, moe_impl, hidden_states, hidden_states_scale_global, inputs_data
@@ -510,20 +510,20 @@ def _capture_and_replay(runner, packed, kwargs, tactic):
 
 
 def test_config_is_explicit_exact_sm100_sm103_and_stepfun_only():
-    config = CakeStepFunConfig(backend="cake")
-    assert repr(config) == "CakeStepFunConfig(backend='cake')"
+    config = CakeStepFunConfig(backend="cake_stepfun")
+    assert repr(config) == "CakeStepFunConfig(backend='cake_stepfun')"
     assert config == CakeStepFunConfig()
-    with pytest.raises(ValueError, match="must be 'cake'"):
+    with pytest.raises(ValueError, match="must be 'cake_stepfun'"):
         CakeStepFunConfig(backend="trtllm")
     assert CakeStepFunConfig.supported(100)
     assert CakeStepFunConfig.supported(103)
     assert not CakeStepFunConfig.supported(107)
     assert not CakeStepFunConfig.supported(120)
-    assert CakeStepFunRunner.backend_key == "cake"
+    assert CakeStepFunRunner.backend_key == "cake_stepfun"
     for spec in PRECISIONS.values():
         assert CakeStepFunRunner.supports_quant(spec.quant)
         assert CakeStepFunRunner.runner_class_for(spec.quant) is spec.runner_cls
-        assert spec.runner_cls.backend_key == "cake"
+        assert spec.runner_cls.backend_key == "cake_stepfun"
         assert spec.runner_cls.supported_activation_classes_by_quant[
             spec.quant.pair
         ] == (SwiGLUStep,)
@@ -686,11 +686,11 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
         routing_input_mode=RoutingInputMode.FromLogits,
     )
     weights = MoEWeightPack()
-    weights.prepare_for("cake", view)
+    weights.prepare_for("cake_stepfun", view)
     weights.prepare_for(spec.native_runner.backend_key, view)
     outputs = {}
     for backend, runner_cls in (
-        (CakeStepFunConfig(backend="cake"), spec.runner_cls),
+        (CakeStepFunConfig(backend="cake_stepfun"), spec.runner_cls),
         (spec.native_config(), spec.native_runner),
     ):
         config = MoEConfig(
@@ -918,7 +918,7 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
         device=device,
     )
     weights = MoEWeightPack()
-    weights.prepare_for("cake", view)
+    weights.prepare_for("cake_stepfun", view)
     weights.prepare_for(TrtllmFp4RoutedRunner.backend_key, view)
     act = MoEActivationPack(
         hidden_states_q=quantized,
@@ -931,7 +931,7 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
     )
     runners = {}
     for backend, runner_cls in (
-        (CakeStepFunConfig(backend="cake"), CakeStepFunNvfp4Runner),
+        (CakeStepFunConfig(backend="cake_stepfun"), CakeStepFunNvfp4Runner),
         (TrtllmFp4Config(), TrtllmFp4RoutedRunner),
     ):
         config = _config(

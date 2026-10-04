@@ -6810,7 +6810,7 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
     implicit default limit.
     """
 
-    backend_key = "cake"
+    backend_key = "cake_stepfun"
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
         SwiGLUStep,
     )
@@ -6822,9 +6822,10 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
         *args: Any,
         **kwargs: Any,
     ):
-        if cls is CakeStepFunRunner:
-            if config is None:
-                raise TypeError("CakeStepFunRunner requires a MoEConfig")
+        # Dispatch to the FC1 family of the configured quantization. Without a
+        # config (the registry lifecycle tests build bare instances) the base
+        # class's build() guard reports the missing lifecycle step.
+        if cls is CakeStepFunRunner and config is not None:
             cls = cls.runner_class_for(config.quant)
         return super().__new__(cls)
 
@@ -6862,20 +6863,31 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
         major, minor = get_compute_capability(self.device)
         self._module = get_cake_stepfun_moe_module(f"sm_{major}{minor}a")
 
+    # The dispatcher is concrete: a bare instance (no config, as the registry
+    # lifecycle tests build) stops at the build() guard, and the FC1 families
+    # inherit the trtllm-gen implementations that follow in their MRO.
+    def get_valid_tactics(self, *args: Any, **kwargs: Any) -> List[Any]:
+        self._require_built()
+        return super().get_valid_tactics(*args, **kwargs)
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_built()
+        return super().forward(*args, **kwargs)
+
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
+        self._require_built()
         view = weights.get_view(self.backend_key)
         if view.get("gemm1_clamp_limit") is None:
             raise ValueError(
                 f"{type(self).__name__} requires the per-expert gemm1_clamp_limit "
-                "produced by CakeStepFunConfig.prepare_weights in the 'cake' view."
+                "produced by CakeStepFunConfig.prepare_weights in the 'cake_stepfun' view."
             )
         return super().pack_inputs(act, weights)
 
     def _cache_key_extras(self) -> tuple:
-        # The 'cake' backend key is shared with the warp-decode runner; the
-        # runner name keeps their tactic spaces apart.
+        # The runner name keeps the per-family tactic spaces apart.
         return (type(self).__name__,) + super()._cache_key_extras()
 
 

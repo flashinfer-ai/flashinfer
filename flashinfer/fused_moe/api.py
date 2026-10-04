@@ -773,7 +773,7 @@ class CakeStepFunConfig:
     limit ``L``. It accepts four weight families, each with :class:`SwiGLUStep`
     on exact SM100 and SM103 only: NVFP4×NVFP4 (E2m1 or bf16 output),
     BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. It is never part of the
-    default backend list; users opt in with ``CakeStepFunConfig(backend="cake")``.
+    default backend list; users opt in with ``CakeStepFunConfig(backend="cake_stepfun")``.
 
     The physical weight and activation layouts are exactly those produced by
     the matching trtllm-gen config for the family (:class:`TrtllmFp4Config` for
@@ -783,12 +783,12 @@ class CakeStepFunConfig:
     read.
     """
 
-    backend: Literal["cake"] = "cake"
+    backend: Literal["cake_stepfun"] = "cake_stepfun"
 
     def __post_init__(self) -> None:
-        if self.backend != "cake":
+        if self.backend != "cake_stepfun":
             raise ValueError(
-                f"CakeStepFunConfig backend must be 'cake', got {self.backend!r}."
+                f"CakeStepFunConfig backend must be 'cake_stepfun', got {self.backend!r}."
             )
 
     @classmethod
@@ -813,7 +813,7 @@ class CakeStepFunConfig:
     ):
         """Build the TRTLLM weight view of ``quant`` plus the per-expert StepFun limits.
 
-        Register the returned dictionary with ``MoEWeightPack.prepare_for("cake", view)``.
+        Register the returned dictionary with ``MoEWeightPack.prepare_for("cake_stepfun", view)``.
         ``quant`` selects the FC1 family: NVFP4x NVFP4 (:class:`TrtllmFp4Config`), BF16xBF16
         (:class:`TrtllmBf16Config`), FP8PerTensorxFP8PerTensor (:class:`TrtllmFp8PerTensorConfig`,
         which needs ``hidden_states_scale_global`` and ``intermediate_scale_global``) or
@@ -937,7 +937,7 @@ class CakeStepFunConfig:
         )
 
     def __repr__(self) -> str:
-        return "CakeStepFunConfig(backend='cake')"
+        return "CakeStepFunConfig(backend='cake_stepfun')"
 
 
 @dataclass(frozen=True)
