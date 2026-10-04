@@ -7840,12 +7840,12 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
 #define SMEM_S_SMEM_STAGE_BYTES 2048
 #define SMEM_S_SMEM_STRIDE 2048
 #define SMEM_W_SMEM_OFF 2112
-#define SMEM_W_SMEM_STAGE_BYTES 36864
-#define SMEM_W_SMEM_STRIDE 36864
+#define SMEM_W_SMEM_STAGE_BYTES 73728
+#define SMEM_W_SMEM_STRIDE 73728
 #define SMEM_W_U32_OFF 2112
-#define SMEM_W_U32_STAGE_BYTES 36864
-#define SMEM_W_U32_STRIDE 36864
-#define SMEM_TOTAL 39040
+#define SMEM_W_U32_STAGE_BYTES 73728
+#define SMEM_W_U32_STRIDE 73728
+#define SMEM_TOTAL 75904
 #define THREADS 256
 
 extern "C" {
@@ -7953,29 +7953,38 @@ __global__ __launch_bounds__(256, 3) void kernel_flashinfer_bgmv_moe_expand_grou
       int col_block = cb_first + cb;
       if (col_block < col_blocks) {
         int col_base = col_block * 256;
+        int w_stage = 0;
         if (cb > 0) {
           __syncthreads();
-#pragma unroll
-          for (int c_1 = 0; c_1 < 8; c_1++) {
-            int n_chunk = c_1 * 256 + tid;
-            int n_col = n_chunk / 8;
-            int n_part = n_chunk % 8;
-            int n_gcol = col_base + n_col;
-            int n_scol = n_gcol;
-            if (n_gcol >= hidden) {
-              n_scol = 0;
-            }
-            asm volatile(
-                "cp.async.cg.shared::cta.global [%0], [%1], 16, %2;" ::"r"(
-                    w_smem_addr + (unsigned int)(n_col * 144) + (unsigned int)(n_part * 16)),
-                "l"(reinterpret_cast<const unsigned int*>(lora_b_raw) +
-                    ((weight_row_base + (long long)n_scol) * 32 + (long long)(n_part * 4))),
-                "r"((n_gcol < hidden) ? 16 : 0));
-          }
-          asm volatile("cp.async.commit_group;");
-          asm volatile("cp.async.wait_group 0;");
-          __syncthreads();
         }
+        w_stage = cb % 2 * 36864;
+        int w_next_stage = (cb + 1) % 2 * 36864;
+        int next_base = (col_block + 1) * 256;
+        if (cb + 1 < col_blocks_per_cta) {
+          if (col_blocks > col_block + 1) {
+#pragma unroll
+            for (int c_1 = 0; c_1 < 8; c_1++) {
+              int n_chunk = c_1 * 256 + tid;
+              int n_col = n_chunk / 8;
+              int n_part = n_chunk % 8;
+              int n_gcol = next_base + n_col;
+              int n_scol = n_gcol;
+              if (n_gcol >= hidden) {
+                n_scol = 0;
+              }
+              asm volatile(
+                  "cp.async.cg.shared::cta.global [%0], [%1], 16, %2;" ::"r"(
+                      w_smem_addr + (unsigned int)w_next_stage + (unsigned int)(n_col * 144) +
+                      (unsigned int)(n_part * 16)),
+                  "l"(reinterpret_cast<const unsigned int*>(lora_b_raw) +
+                      ((weight_row_base + (long long)n_scol) * 32 + (long long)(n_part * 4))),
+                  "r"((n_gcol < hidden) ? 16 : 0));
+            }
+          }
+        }
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
+        __syncthreads();
 #pragma unroll
         for (int i = 0; i < 16; i++) {
           acc[i] = 0.0f;
@@ -7986,16 +7995,18 @@ __global__ __launch_bounds__(256, 3) void kernel_flashinfer_bgmv_moe_expand_grou
           unsigned int a1[4];
           int w_lane_row = warp * 32 + lane % 16;
           int w_hi = lane / 16 * 16;
-          asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                       : "=r"(a0[0]), "=r"(a0[1]), "=r"(a0[2]), "=r"(a0[3])
-                       : "r"(w_smem_addr + (unsigned int)(w_lane_row * 144) +
-                             (unsigned int)(ks * 32) + (unsigned int)w_hi)
-                       : "memory");
-          asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                       : "=r"(a1[0]), "=r"(a1[1]), "=r"(a1[2]), "=r"(a1[3])
-                       : "r"(w_smem_addr + (unsigned int)((w_lane_row + 16) * 144) +
-                             (unsigned int)(ks * 32) + (unsigned int)w_hi)
-                       : "memory");
+          asm volatile(
+              "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+              : "=r"(a0[0]), "=r"(a0[1]), "=r"(a0[2]), "=r"(a0[3])
+              : "r"(w_smem_addr + (unsigned int)w_stage + (unsigned int)(w_lane_row * 144) +
+                    (unsigned int)(ks * 32) + (unsigned int)w_hi)
+              : "memory");
+          asm volatile(
+              "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+              : "=r"(a1[0]), "=r"(a1[1]), "=r"(a1[2]), "=r"(a1[3])
+              : "r"(w_smem_addr + (unsigned int)w_stage + (unsigned int)((w_lane_row + 16) * 144) +
+                    (unsigned int)(ks * 32) + (unsigned int)w_hi)
+              : "memory");
 #pragma unroll
           for (int nt = 0; nt < 2; nt++) {
             int slot = nt * 8 + group_id;
@@ -16916,7 +16927,7 @@ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grouped_ring_si
 #define CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN 384
 #define CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER 16384
 #define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED 512
-#define CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED 39040
+#define CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED 75904
 #define CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED 128
 #define CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD 16640
 #define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING 49664

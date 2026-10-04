@@ -7916,6 +7916,7 @@ __global__ __launch_bounds__(256, 1) void kernel_flashinfer_bgmv_moe_expand_grou
       int col_block = cb_first + cb;
       if (col_block < col_blocks) {
         int col_base = col_block * 256;
+        int w_stage = 0;
         int next_block = col_block + 1;
         int next_base = next_block * 256;
 #pragma unroll

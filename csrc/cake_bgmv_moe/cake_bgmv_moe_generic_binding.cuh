@@ -338,6 +338,16 @@ void Configure() {
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  kShrinkGroupedRingSmemBytes),
             "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, operand ring, single rank tile)");
+  // Lever 30: the rank-64 grouped expand double-buffers its weight stage (two 36 KiB column
+  // blocks) and exceeds the default carveout; lower ranks keep register fragments.
+  TVM_FFI_ICHECK(max_dynamic_smem >= kExpandGroupedSmemBytes)
+      << "Cake BGMV MoE grouped expand requires " << kExpandGroupedSmemBytes
+      << " bytes of dynamic shared memory, but device " << device_id << " supports "
+      << max_dynamic_smem;
+  CheckCuda(
+      cudaFuncSetAttribute(CAKE_BGMV_MOE_EXPAND_GROUPED,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, kExpandGroupedSmemBytes),
+      "cudaFuncSetAttribute(Cake BGMV MoE grouped expand)");
 }
 
 inline void CheckCompact(const TensorView& tensor, const char* name) {
