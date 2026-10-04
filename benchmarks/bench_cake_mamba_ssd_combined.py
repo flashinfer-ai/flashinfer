@@ -84,7 +84,9 @@ def _fp64_reference(
     batch, seqlen, nheads, headdim = x.shape
     ngroups, dstate = B.shape[2], B.shape[3]
     rep = nheads // ngroups
-    lengths = list(sequence_lengths) if sequence_lengths is not None else [seqlen] * batch
+    lengths = (
+        list(sequence_lengths) if sequence_lengths is not None else [seqlen] * batch
+    )
     assert sum(lengths) == batch * seqlen, (lengths, batch, seqlen)
     starts = [sum(lengths[:index]) for index in range(len(lengths))]
     xf = x.reshape(-1, nheads, headdim).to(f64)
@@ -109,7 +111,9 @@ def _fp64_reference(
         tokens = start_index[active] + position
         step = dtp[tokens]  # [n, H]
         decay = torch.exp(step * Af)
-        update = step[:, :, None, None] * (xf[tokens][:, :, :, None] * Bf[tokens][:, :, None, :])
+        update = step[:, :, None, None] * (
+            xf[tokens][:, :, :, None] * Bf[tokens][:, :, None, :]
+        )
         state[active] = decay[:, :, None, None] * state[active] + update
         y = torch.einsum("nhpd,nhd->nhp", state[active], Cf[tokens]) + Df * xf[tokens]
         if zf is not None:
@@ -174,7 +178,10 @@ def _validate_report(report: dict, *, require_qualified_row: bool) -> None:
                 f"Cake {name} has more entries outside 1e-2 of the fp64 recurrence than CuTe: "
                 f"{accuracy['cake_outside']} vs {accuracy['cute_outside']}"
             )
-        if accuracy["cake_max_abs"] > accuracy["cute_max_abs"] + accuracy["bf16_ulp_at_cake_worst"]:
+        if (
+            accuracy["cake_max_abs"]
+            > accuracy["cute_max_abs"] + accuracy["bf16_ulp_at_cake_worst"]
+        ):
             raise AssertionError(
                 f"Cake {name} max abs error {accuracy['cake_max_abs']:.4g} exceeds CuTe's "
                 f"{accuracy['cute_max_abs']:.4g} by more than one bf16 ulp"

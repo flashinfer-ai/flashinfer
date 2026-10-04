@@ -421,7 +421,15 @@ def test_cake_benchmark_validation_policy():
 
     module = _load_cake_benchmark_module()
 
-    def accuracy(*, cake_outside=20, cute_outside=60, cake_max=0.12, cute_max=0.12, finite=True, numel=131072):
+    def accuracy(
+        *,
+        cake_outside=20,
+        cute_outside=60,
+        cake_max=0.12,
+        cute_max=0.12,
+        finite=True,
+        numel=131072,
+    ):
         return {
             "numel": numel,
             "cake_outside": cake_outside,
@@ -439,7 +447,9 @@ def test_cake_benchmark_validation_policy():
         return {
             "accuracy": {
                 "out": out if out is not None else accuracy(),
-                "final_states": final_states if final_states is not None else accuracy(cake_outside=0, cute_outside=0),
+                "final_states": final_states
+                if final_states is not None
+                else accuracy(cake_outside=0, cute_outside=0),
             },
             "speedup": speedup,
         }
@@ -447,19 +457,36 @@ def test_cake_benchmark_validation_policy():
     module._validate_report(report(), require_qualified_row=False)
     module._validate_report(report(speedup=0.99), require_qualified_row=False)
     # Poisson slack: CuTe 60 outliers admit up to 60 + 2*sqrt(60) = 75 Cake outliers.
-    module._validate_report(report(out=accuracy(cake_outside=75)), require_qualified_row=False)
+    module._validate_report(
+        report(out=accuracy(cake_outside=75)), require_qualified_row=False
+    )
     with pytest.raises(AssertionError, match="more entries outside"):
-        module._validate_report(report(out=accuracy(cake_outside=76)), require_qualified_row=False)
+        module._validate_report(
+            report(out=accuracy(cake_outside=76)), require_qualified_row=False
+        )
     with pytest.raises(AssertionError, match="limit 1 %"):
-        module._validate_report(report(out=accuracy(cake_outside=1400, cute_outside=5000)), require_qualified_row=False)
+        module._validate_report(
+            report(out=accuracy(cake_outside=1400, cute_outside=5000)),
+            require_qualified_row=False,
+        )
     with pytest.raises(AssertionError, match="is not finite"):
-        module._validate_report(report(out=accuracy(finite=False)), require_qualified_row=False)
+        module._validate_report(
+            report(out=accuracy(finite=False)), require_qualified_row=False
+        )
     # one bf16 ulp of headroom on the maximum error, no more
-    module._validate_report(report(out=accuracy(cake_max=0.15, cute_max=0.12)), require_qualified_row=False)
+    module._validate_report(
+        report(out=accuracy(cake_max=0.15, cute_max=0.12)), require_qualified_row=False
+    )
     with pytest.raises(AssertionError, match="by more than one bf16 ulp"):
-        module._validate_report(report(out=accuracy(cake_max=0.16, cute_max=0.12)), require_qualified_row=False)
+        module._validate_report(
+            report(out=accuracy(cake_max=0.16, cute_max=0.12)),
+            require_qualified_row=False,
+        )
     with pytest.raises(AssertionError, match="final_states has more entries outside"):
-        module._validate_report(report(final_states=accuracy(cake_outside=1, cute_outside=0)), require_qualified_row=False)
+        module._validate_report(
+            report(final_states=accuracy(cake_outside=1, cute_outside=0)),
+            require_qualified_row=False,
+        )
     with pytest.raises(AssertionError, match="must be faster than CuTe"):
         module._validate_report(report(speedup=0.99), require_qualified_row=True)
 

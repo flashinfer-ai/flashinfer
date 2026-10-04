@@ -25,10 +25,10 @@ import functools
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
-import cuda.bindings.driver as cuda_drv
 import torch
 from cutlass import Int32
 from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
