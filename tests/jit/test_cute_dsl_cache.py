@@ -56,6 +56,7 @@ from flashinfer.quantization.kernels.nvfp4_quantize import (  # noqa: E402
 )
 from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: E402
     NVFP44Over6Config,
+    nvfp4_4over6_cache_key,
 )
 
 NVFP4_KERNEL_GETTERS = [
@@ -81,6 +82,7 @@ NVFP4_NAME_BASELINE = {
     "nvfp4_4over6_config": None,
     "global_scale_is_tensor": True,
     "smooth_quant": False,
+    "fold_out_scale": False,
 }
 
 SVDQUANT_NAME_BASELINE = {
@@ -134,6 +136,7 @@ def test_nvfp4_kernel_name_signature_covers_codegen_params(getter):
         ),
         pytest.param("global_scale_is_tensor", False, id="global_scale_is_tensor"),
         pytest.param("smooth_quant", True, id="smooth_quant"),
+        pytest.param("fold_out_scale", True, id="fold_out_scale"),
     ],
 )
 def test_nvfp4_kernel_name_varies_with_every_argument(param, alternate):
@@ -240,6 +243,94 @@ def test_nvfp4_kernel_name_distinguishes_4over6_configs(config):
     assert len(names) == len(others)
 
 
+# Kernel names as they were produced *before* the public ``nvfp4_4over6``
+# parameter existed. The name is the artifact's directory/symbol component in
+# ``cached_ops/nvfp4_quantize_<arch>_cute_dsl/``, so changing any of these
+# strings silently invalidates every existing user's on-disk CuTe-DSL cache and
+# forces a full recompile on upgrade. The tests above only assert
+# *distinctness*, which a wholesale renaming would satisfy.
+NVFP4_LEGACY_KERNEL_NAMES = [
+    ({}, "swizzled_bfloat16_k4096_sf0_pdl1"),
+    ({"enable_pdl": False}, "swizzled_bfloat16_k4096_sf0_pdl0"),
+    ({"variant": "linear"}, "linear_bfloat16_k4096_sf0_pdl1"),
+    ({"dtype_key": "float16"}, "swizzled_float16_k4096_sf0_pdl1"),
+    ({"K": 2048}, "swizzled_bfloat16_k2048_sf0_pdl1"),
+    ({"sf_layout": SF_LAYOUT_8x4}, "swizzled_bfloat16_k4096_sf1_pdl1"),
+    ({"global_scale_is_tensor": False}, "swizzled_bfloat16_k4096_sf0_pdl1_host_sf"),
+    ({"silu_and_mul": True}, "swizzled_bfloat16_k4096_sf0_pdl1_silu"),
+    (
+        {"disable_fp4_quant_fast_math": True},
+        "swizzled_bfloat16_k4096_sf0_pdl1_nofastmath",
+    ),
+    # Suffix order is part of the string: host_sf, silu, nofastmath, 4over6.
+    (
+        {
+            "global_scale_is_tensor": False,
+            "silu_and_mul": True,
+            "disable_fp4_quant_fast_math": True,
+        },
+        "swizzled_bfloat16_k4096_sf0_pdl1_host_sf_silu_nofastmath",
+    ),
+    (
+        {"nvfp4_4over6_config": NVFP44Over6Config()},
+        "swizzled_bfloat16_k4096_sf0_pdl1_4over6_448_MAE_0",
+    ),
+    (
+        {
+            "nvfp4_4over6_config": NVFP44Over6Config(
+                e4m3_max=256, err_mode="MSE", err_use_fast_math=True
+            )
+        },
+        "swizzled_bfloat16_k4096_sf0_pdl1_4over6_256_MSE_1",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    NVFP4_LEGACY_KERNEL_NAMES,
+    ids=[name for _, name in NVFP4_LEGACY_KERNEL_NAMES],
+)
+def test_nvfp4_kernel_name_is_unchanged_from_pre_4over6_api(overrides, expected):
+    """Pin the exact legacy strings, not just their distinctness.
+
+    ``nvfp4_4over6_config=None`` in particular must produce byte-for-byte the
+    name it always has: that is the cache entry every existing user already
+    has on disk for plain NVFP4.
+    """
+    assert _nvfp4_kernel_name(**{**NVFP4_NAME_BASELINE, **overrides}) == expected
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        None,
+        NVFP44Over6Config(),
+        NVFP44Over6Config(e4m3_max=256),
+        NVFP44Over6Config(err_mode="MSE"),
+        NVFP44Over6Config(err_use_fast_math=True),
+        NVFP44Over6Config(e4m3_max=256, err_mode="MSE", err_use_fast_math=True),
+    ],
+    ids=repr,
+)
+def test_nvfp4_kernel_name_suffix_is_the_shared_cache_key(config):
+    """The kernel-name suffix and ``nvfp4_4over6_cache_key`` must not drift.
+
+    Two formatters for one recipe is how a rename slips through: the MoE
+    autotuner's cache-key extras use ``nvfp4_4over6_cache_key``, so if the
+    kernel name stopped agreeing with it, the tactic cache and the kernel
+    artifact would disagree about which recipe they hold.
+    """
+    base = _nvfp4_kernel_name(**{**NVFP4_NAME_BASELINE, "nvfp4_4over6_config": None})
+    name = _nvfp4_kernel_name(**{**NVFP4_NAME_BASELINE, "nvfp4_4over6_config": config})
+    if config is None:
+        # "off" is spelled as the *absence* of a suffix in the kernel name.
+        assert name == base
+        assert nvfp4_4over6_cache_key(config) == "off"
+    else:
+        assert name == f"{base}_{nvfp4_4over6_cache_key(config)}"
+
+
 def test_nvfp4_kernel_name_is_symbol_safe():
     """Names must already be valid symbol/filename components.
 
@@ -274,6 +365,8 @@ MM_FP4_NAME_BASELINE = {
     "use_tma_store": None,
     "enable_pdl": False,
     "out_dtype": torch.bfloat16,
+    "per_token_alpha": None,
+    "l2_policy": None,
     "batch_size": 1,
     "max_active_clusters": 74,
 }
@@ -287,6 +380,8 @@ MM_FP4_NAME_PERTURBED = {
     "use_tma_store": True,
     "enable_pdl": True,
     "out_dtype": torch.float16,
+    "per_token_alpha": "m",
+    "l2_policy": "a_ef",
     "batch_size": 2,
     "max_active_clusters": 148,
 }
@@ -302,7 +397,12 @@ def _mm_fp4_name(**kwargs):
         kwargs["use_tma_store"],
     )
     cache_key = _mm_fp4_cache_key(
-        kwargs["sf_vec_size"], tactic, kwargs["enable_pdl"], kwargs["out_dtype"]
+        kwargs["sf_vec_size"],
+        tactic,
+        kwargs["enable_pdl"],
+        kwargs["out_dtype"],
+        kwargs["per_token_alpha"],
+        kwargs["l2_policy"],
     )
     return _blockscaled_kernel_disk_name(
         cache_key, kwargs["batch_size"], kwargs["max_active_clusters"]
@@ -323,3 +423,75 @@ def test_mm_fp4_kernel_name_varies_with_every_argument(param):
     )
     for name in (baseline_name, perturbed_name):
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+@pytest.mark.parametrize("change", ["policy", "layout", "tactic"])
+def test_sm12x_disk_cache_tracks_codegen_changes(monkeypatch, tmp_path, change):
+    """Policy selection may change without rebuilding an unchanged specialization."""
+    from pathlib import Path
+
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+    from flashinfer.gemm import gemm_mm_fp4_cute_dsl as helpers
+    from flashinfer.gemm.kernels.sm12x_cute import policy, runner
+    from flashinfer.jit import cute_dsl_core
+
+    policy_file = tmp_path / "policy.py"
+    layout_file = tmp_path / "layout.py"
+    policy_file.write_text("PREFERRED_TILE_K = 256\n")
+    layout_file.write_text("SF_LAYOUT_REVISION = 1\n")
+    monkeypatch.setattr(policy, "__file__", str(policy_file))
+    monkeypatch.setattr(cute_dsl_utils, "__file__", str(layout_file))
+    monkeypatch.setattr(cute_dsl_utils, "get_max_active_clusters", lambda _: 48)
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setattr(cute_dsl_core, "get_tmpdir", lambda: tmp_path)
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_121a")
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    builds = []
+
+    class ExportedKernel:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def export_to_c(self, path, function_name):
+            Path(path).write_bytes(self.payload)
+
+    def make_compile_fn(kernel, *args):
+        def compile_kernel():
+            builds.append(kernel)
+            return ExportedKernel(str(len(builds)).encode())
+
+        return compile_kernel
+
+    monkeypatch.setattr(helpers, "_make_blockscaled_gemm_compile_fn", make_compile_fn)
+    monkeypatch.setattr(
+        cute_dsl_core.JitSpecCuteDsl,
+        "_load_from_disk",
+        lambda spec: spec.object_path.read_bytes(),
+    )
+    tactic = policy.RAW_TACTICS[0]
+
+    def load(choice):
+        # Bypass the in-process cache so every call checks the persisted artifact.
+        return runner._compile(128, 34816, 5120, choice, compute_capability=(12, 1))
+
+    first = load(tactic)
+    assert load(tactic) == first
+    assert len(builds) == 1
+    choice = tactic
+    if change == "policy":
+        policy_file.write_text("PREFERRED_TILE_K = 512\n")
+    elif change == "layout":
+        layout_file.write_text("SF_LAYOUT_REVISION = 2\n")
+    else:
+        choice = policy.RAW_TACTICS[1]
+
+    updated = load(choice)
+    if change == "policy":
+        assert updated == first
+        assert len(builds) == 1
+    else:
+        assert updated != first
+        assert len(builds) == 2
+    assert load(tactic) == (updated if change == "layout" else first)
+    assert len(builds) == (1 if change == "policy" else 2)

@@ -42,7 +42,6 @@ config = MoEConfig(
     ),
     quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    # NVFP4 activation packs are backend-native; choose one candidate set.
     backends=[TrtllmFp4Config(extra_backend_params...)],
 )
 # --- Find possible backends ---
@@ -93,7 +92,7 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | Config | Owns |
 | --- | --- |
 | RoutingConfig | num_experts, top_k, routing method, grouping params, scaling factor |
-| QuantConfig | weight / activation / output QuantFormat axes |
+| QuantConfig | weight / activation / output QuantFormat axes; swizzled_scale_factors, per_token_scale, nvfp4_4over6 (NVFP4 4over6 recipe, §3.4) |
 | ExpertConfig | intermediate_size, local sharding params |
 | ActivationConfig | common base for typed activation values and their scalar parameters |
 | BackendOptions | ordered candidate set via \| operator |
@@ -122,11 +121,9 @@ Individual backend configs provided in an ordered list. The autotuner or heurist
 ```
 # Single backend
 backends = [TrtllmFp4Config()]
-# Multiple candidates are valid only when they consume the same activation
-# pack contract. NVFP4 TRT-LLM and CUTLASS require different packs, so select
-# either singleton candidate set explicitly.
-backends = [TrtllmFp4Config()]
-# or: backends = [CutlassNvfp4Config()]
+# Multiple candidates share one MoEActivationPack: for each MMA pair every
+# backend consumes the TRT-LLM canonical pack (see MoEActivationPack).
+backends = [TrtllmFp4Config(), CuteDslConfig(), CutlassNvfp4Config()]
 # | is associative, returns BackendOptions
 ```
 
@@ -165,6 +162,22 @@ fp8_config = dataclasses.replace(
     ),
 )
 ```
+
+### 3.4 QuantConfig.nvfp4_4over6 — the 4over6 recipe
+
+NVFP4 "4over6" is a two-candidate block-scale search inside the quantizer: next to the standard `amax / 6` E4M3 block scale it also tries `amax / 4`, quantizes the block both ways and keeps the one with less reconstruction error. It is a recipe for picking block scales, not a numeric format (the MMA operands stay NVFP4), so it is a knob on `QuantConfig`, not a `QuantFormat`. Before this field it was configured only by the process-wide `FLASHINFER_NVFP4_4OVER6*` variables, which cannot vary per layer or per model.
+
+| `nvfp4_4over6=` | Meaning |
+| --- | --- |
+| unset (the default) | Read `FLASHINFER_NVFP4_4OVER6*` on every call, byte-for-byte the pre-existing behaviour. A `FutureWarning` is emitted when the environment turns 4over6 on. |
+| `None` | 4over6 off. The environment is ignored. |
+| `NVFP44Over6Config(...)` | On with exactly this recipe. The environment is ignored, with no per-field merge. |
+
+- **One public type.** The field is `Optional[NVFP44Over6Config]`; "defer to the environment" is the default value (a private `_UNSET` sentinel that callers never spell), not a third public type. Retiring the shim later means flipping the default to `None` with no signature change.
+- **One resolution boundary.** `resolve_nvfp4_4over6()` is the only Python code that reads the variables. Below it every kernel driver takes the resolved value under the name `nvfp4_4over6_config`, so an unresolved value cannot reach a `@functools.cache`-d kernel getter unnoticed. The FFI receives a packed `int64`, decoded by `resolveNVFP4Recipe()` in `csrc/nv_internal/tensorrt_llm/kernels/nvfp4Recipe.h`.
+- **An explicit setting is never silently ignored.** Support is opt-in per runner via `MoERunner.supports_nvfp4_4over6`; `MoERunner._check_support()` rejects any explicit value (including `None`, which a runner that still reads the environment could not honour) on a runner that has not opted in. `CuteDslRunner` honours a pinned recipe only with `per_token_scale=True`, the one path where it quantizes the GEMM2 input itself. `MoELayer` names the runners that do support it in its "no usable backend" error.
+- **Activations only.** The field governs the runtime activation quantization; weights are quantized by the caller ahead of the call. `QuantConfig.__post_init__` rejects an explicit setting when `activation` is not `QuantFormat.NVFP4`, so the mistake is named where the config is written rather than swallowed by the candidate filter.
+- **Flat and unified APIs take the same value.** `nvfp4_quantize(..., nvfp4_4over6=...)`, `make_nvfp4_global_scale(..., nvfp4_4over6_config=...)`, `CuteDslConfig.prepare_weights(..., nvfp4_4over6=...)` and `QuantConfig.nvfp4_4over6` all accept one `NVFP44Over6Config` object.
 
 ## 4. Public API
 
@@ -725,9 +738,11 @@ out = layer(act, weights)            # subsequent calls: cached winner dispatch
 Key mechanisms (and where they live):
 
 - **Two packs, two lifetimes.** `MoEWeightPack` holds long-lived, backend-native weight materializations keyed by `backend_key` (`prepare_for` / `get_view`); `MoEActivationPack` carries per-call pre-routed activations. This is the concrete answer to reviewers' "backends need different weight preprocessing" concern (C29–C32): each backend stores its own view, none is hidden from the caller.
-- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` / `CutlassNvfp4Config.prepare_weights(...)` (and the other quant-specific `Cutlass*Config.prepare_weights` helpers, backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7). CUTLASS NVFP4 uses swizzled `fp4_quantize` scales, not the TRTLLM shuffle / BlockMajorK path. CUTLASS FP8 / MXFP8 / W4A8 / Humming likewise keep unshuffled or mixed-input layouts distinct from TRTLLM. Each quant mode uses its matching `Cutlass*Config` / `Cutlass*Runner`; there is no quant-neutral CUTLASS fallback.
+- **One activation pack per MMA pair.** For NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8 and per-tensor FP8 every backend consumes the TRT-LLM canonical `hidden_states_q` / `hidden_states_scale` (formats per pair: `MoEActivationPack` docstring), so a mixed candidate set such as `(TrtllmFp4Config(), CuteDslConfig(), CutlassNvfp4Config())` runs on one pack and the `prepare_activations` helpers of different backends for one pair are interchangeable. Per-tensor FP8 carries no pack scale: the static `hidden_states_scale_global` / `intermediate_scale_global` are `prepare_weights` inputs of both `TrtllmFp8PerTensorConfig` and `CutlassFp8PerTensorConfig`, and CUTLASS folds its flat `quant_scales` from them at load time. Exceptions: b12x / cuTile NVFP4 take BF16 and quantize in-kernel, so they do not share candidate sets with the pre-quantized NVFP4 backends; the opt-in `QuantConfig(swizzled_scale_factors=True)` selects the flat swizzled MXFP8 `input_sf` that only the CUTLASS MXFP8 runners consume (every other runner rejects the flag in `check_support`); CUTLASS runners reject `QuantConfig(per_token_scale=True)`. Routing is matched separately: `routing_input_mode` support is per runner (`supported_routing_modes`) and `MoELayer.__call__` filters on it.
+- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` / `CutlassNvfp4Config.prepare_weights(...)` (and the other quant-specific `Cutlass*Config.prepare_weights` helpers, backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7). Weight views are backend-native: CUTLASS NVFP4 uses swizzled `fp4_quantize` scales, not the TRTLLM shuffle / BlockMajorK path, and CUTLASS FP8 / MXFP8 / W4A8 / Humming likewise keep unshuffled or mixed-input layouts distinct from TRTLLM. The quantized activation payload is shared: for NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8 and per-tensor FP8 every backend consumes the TRT-LLM canonical `hidden_states_q` / `hidden_states_scale`, so the `prepare_activations` helpers of different backends for one pair are interchangeable (see "One activation pack per MMA pair" below). Each quant mode uses its matching `Cutlass*Config` / `Cutlass*Runner`; there is no quant-neutral CUTLASS fallback.
+- **One canonical source order.** Every `prepare_weights` takes gated `w1` as `[E, 2I, H]` with rows `[up, gate]` (first `I` rows are the linear half, last `I` the gate); backends that need `[gate, up]` swap halves in their prepare helper, never in `MoEConfig`. A caller holding `[gate, up]` checkpoints does one `chunk`/`cat` at load. The fuzz references read this order for every backend; `tests/moe/test_unified_moe.py::test_bf16_gate_up_row_order_is_up_then_gate` additionally runs asymmetric halves through the TRT-LLM and CUTLASS BF16 runners so a kernel and reference that share a swap cannot both pass.
 - **Breaking change — `CutlassConfig` removed.** The deprecated, unregistered `CutlassConfig` placeholder is gone. It was never a runnable `MoELayer` backend (`supported()` always returned false; it was not in `_BACKEND_RUNNERS`). Import, annotate, serialize, or feature-detect a quant-specific type instead (`CutlassBf16Config`, `CutlassNvfp4Config`, `CutlassFp8PerTensorConfig`, `CutlassFp8BlockConfig`, `CutlassMxfp8Config`, `CutlassMxfp8Mxfp4Config`, `CutlassW4A16Config`, `CutlassW4A8Config`, `CutlassHummingConfig`). Historical **Anchor:** / CR1 quotes earlier in this document still mention `CutlassConfig` as review history, not current API.
-- **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
+- **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. This comparison captures `pack_inputs` plus `forward`, including per-call GPU conversions and routing-ID packing. One-time preparation runs before capture; Python overhead is excluded from graph replay timing. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
 - **Fail-fast scope:** each runner declares MMA ``(weight, activation)`` pairs
   plus ``supported_output_formats``; ``QuantConfig`` only checks that each axis
@@ -795,13 +810,18 @@ python scripts/generate_moe_activation_matrix.py --write
 | --- | --- | --- | --- |
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
-| `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU` |
+| `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cutile_bf16` | `CuTileBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutile_fp8_per_tensor` | `CuTileFp8PerTensorBf16Config` | `FP8PerTensor×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutile_fp8_per_tensor` | `CuTileFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutile_mxfp4` | `CuTileMxfp4Bf16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutile_mxfp4` | `CuTileMxfp4Config` | `MXFP4×MXFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutile_mxfp4` | `CuTileMxfp4Mxfp8Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutile_mxfp8` | `CuTileMxfp8Bf16Config` | `MXFP8×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutile_mxfp8` | `CuTileMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutile_nvfp4` | `CuTileNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutile_nvfp4` | `CuTileNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_bf16` | `CutlassBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
@@ -813,6 +833,11 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
+| `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
+| `sm12x_nvfp4_bf16` | `SM12xNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
@@ -1041,7 +1066,10 @@ exercised end-to-end):
   global-scale field, so calibrated-checkpoint scales are silently dropped
   (~2400× output inflation). This is roadmap item #5 below (a standardized
   intermediate-scale **QuantSpec** policy), not a quick fix; quick mitigation is
-  to make `prepare_*` fail **loud** on a non-default scale.
+  to make `prepare_*` fail **loud** on a non-default scale. Partially resolved
+  for per-tensor FP8: `trtllm_fp8_per_tensor` and `cutlass_fp8_per_tensor`
+  take the calibrated `hidden_states_scale_global` / `intermediate_scale_global`
+  as `prepare_weights` inputs (see "First-class prep" above).
 
 **Roadmap (ranked, from the 2026-06-09 audit of 51 past MoE issues):** (1) a
 Blackwell/SM120 **PR-CI runner** — highest leverage, since PR-gating CI tops out

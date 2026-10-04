@@ -589,16 +589,11 @@ def test_auto_declines_cutlass_under_cuda_graph(monkeypatch):
     assert wrapper._backend == "fa2"
 
 
-@requires_cutlass_arch
-def test_explicit_cutlass_refuses_cuda_graph():
-    """An explicit `backend="cutlass"` says so plainly instead of going stale."""
-    dev = torch.device("cuda")
-    batch, s_q, s_kv = 2, 512, 512
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
-    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_q
-    kv_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_kv
-
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+def _graph_cutlass_wrapper(qo_indptr, kv_indptr):
+    workspace = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device=qo_indptr.device
+    )
+    return flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace,
         "NHD",
         use_cuda_graph=True,
@@ -606,18 +601,102 @@ def test_explicit_cutlass_refuses_cuda_graph():
         kv_indptr_buf=kv_indptr.clone(),
         backend="cutlass",
     )
-    with pytest.raises(ValueError, match="not CUDA-graph safe"):
-        wrapper.plan(
-            qo_indptr,
-            kv_indptr,
-            32,
-            32,
-            128,
-            head_dim_vo=128,
-            causal=True,
-            q_data_type=DTYPE,
-            kv_data_type=DTYPE,
-        )
+
+
+@requires_cutlass_arch
+def test_explicit_cutlass_plan_once_then_capture_under_cuda_graph():
+    """Plan once, capture, replay: legal with `use_cuda_graph=True` (as in v0.7.0).
+
+    Nothing has been captured when the first plan() runs, so the buffers it
+    allocates are the ones the graph records. Replays over fresh input values
+    must match an eager CUTLASS run and FA2.
+    """
+    dev = torch.device("cuda")
+    h_qo, h_kv, d = 32, 8, 128
+    # Ragged, uneven lengths so the work list is not trivially uniform.
+    qo_indptr = torch.tensor([0, 300, 812], dtype=torch.int32, device=dev)
+    kv_indptr = torch.tensor([0, 400, 1024], dtype=torch.int32, device=dev)
+    nnz_qo, nnz_kv = int(qo_indptr[-1]), int(kv_indptr[-1])
+    plan_args = (qo_indptr, kv_indptr, h_qo, h_kv, d)
+    plan_kwargs = dict(
+        head_dim_vo=d, causal=True, q_data_type=DTYPE, kv_data_type=DTYPE
+    )
+
+    wrapper = _graph_cutlass_wrapper(qo_indptr, kv_indptr)
+    wrapper.plan(*plan_args, **plan_kwargs)
+    assert wrapper._backend == "cutlass"
+
+    q = torch.empty(nnz_qo, h_qo, d, dtype=DTYPE, device=dev)
+    k = torch.empty(nnz_kv, h_kv, d, dtype=DTYPE, device=dev)
+    v = torch.empty(nnz_kv, h_kv, d, dtype=DTYPE, device=dev)
+
+    def fill(seed):
+        g = torch.Generator(device=dev).manual_seed(seed)
+        for t in (q, k, v):
+            t.copy_(torch.randn(t.shape, generator=g, device=dev, dtype=DTYPE))
+
+    # Warm up (JIT load, first launch) on a side stream before capture.
+    fill(0)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        wrapper.run(q, k, v)
+    torch.cuda.current_stream().wait_stream(s)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_static = wrapper.run(q, k, v)
+
+    eager = _new_wrapper("cutlass")
+    eager.plan(*plan_args, **plan_kwargs)
+    ref_fa2 = _new_wrapper("fa2")
+    ref_fa2.plan(*plan_args, **plan_kwargs)
+    for seed in (1, 2):
+        fill(seed)
+        graph.replay()
+        torch.cuda.synchronize()
+        out_eager = eager.run(q, k, v)
+        out_ref = ref_fa2.run(q, k, v)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out_static, out_eager, rtol=0, atol=0)
+        diff = (out_static.float() - out_ref.float()).abs()
+        rel_max = (diff.max() / out_ref.float().abs().max().clamp_min(1e-6)).item()
+        assert rel_max < 2e-2, f"graph replay diverges from fa2: {rel_max:.3e}"
+
+
+@requires_cutlass_arch
+@pytest.mark.parametrize("new_qo_offsets", [(0, 256, 1024), (0, 256, 768)])
+def test_explicit_cutlass_refuses_replan_under_cuda_graph(new_qo_offsets):
+    """Re-planning would strand a captured graph on the previous plan buffers.
+
+    The refusal preserves the original plan's cached state and registered
+    indptr buffers, including when the rejected query total differs.
+    """
+    dev = torch.device("cuda")
+    batch, s_q, s_kv = 2, 512, 512
+    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_q
+    kv_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_kv
+    plan_kwargs = dict(
+        head_dim_vo=128, causal=True, q_data_type=DTYPE, kv_data_type=DTYPE
+    )
+
+    wrapper = _graph_cutlass_wrapper(qo_indptr, kv_indptr)
+    wrapper.plan(qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
+    plan_info = wrapper._plan_info
+
+    q = torch.randn(batch * s_q, 32, 128, dtype=DTYPE, device=dev)
+    k = torch.randn(batch * s_kv, 32, 128, dtype=DTYPE, device=dev)
+    v = torch.randn_like(k)
+    out_before = wrapper.run(q, k, v)
+
+    new_qo_indptr = torch.tensor(new_qo_offsets, dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match="re-planning in CUDA-graph mode"):
+        wrapper.plan(new_qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
+    assert torch.equal(wrapper._qo_indptr_buf, qo_indptr)
+    assert torch.equal(wrapper._kv_indptr_buf, kv_indptr)
+    assert wrapper._plan_info is plan_info
+    assert wrapper._qo_indptr_last == batch * s_q
+    torch.testing.assert_close(wrapper.run(q, k, v), out_before, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -784,3 +863,113 @@ def test_cudnn_ragged_handles_packed_t3hd_views():
     assert resolved == "cudnn"
     _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "cudnn on packed T3HD views")
     _assert_close_to_fa2(out_c, lse_c, out_fa2, lse_fa2, "cudnn on contiguous copies")
+
+
+def _single_token_rows(h_qo, h_kv, d, batch=8, seed=99):
+    """Every request contributes one query token (a chunked-prefill remainder
+    step) against a longer kv range: qo_indptr = arange, kv_indptr ragged."""
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(seed)
+    kv_lens = torch.randint(1, 1024, (batch,), generator=g)
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32)
+    kv_indptr[1:] = torch.cumsum(kv_lens, 0)
+    qo_indptr = torch.arange(batch + 1, dtype=torch.int32)
+    torch.manual_seed(seed)
+    q = torch.randn(batch, h_qo, d, dtype=DTYPE, device=dev)
+    k = torch.randn(int(kv_indptr[-1]), h_kv, d, dtype=DTYPE, device=dev)
+    v = torch.randn(int(kv_indptr[-1]), h_kv, d, dtype=DTYPE, device=dev)
+    return q, k, v, qo_indptr.to(dev), kv_indptr.to(dev)
+
+
+def _plan_single_token(backend, qo_indptr, kv_indptr, h_qo, h_kv, d):
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend=backend
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        h_qo,
+        h_kv,
+        d,
+        head_dim_vo=d,
+        causal=False,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    return wrapper
+
+
+@requires_cudnn_upgrade
+def test_auto_declines_single_token_gqa_rows():
+    """cuDNN's s_q == 1 kernel packs a kv group's q heads and writes the LSE only
+    for the first of them (cuDNN 9.26/9.27), so `auto` keeps single-token GQA
+    steps off cuDNN; the results, LSE included, match fa2. MHA single-token rows
+    are unaffected and may still take cuDNN."""
+    h_qo, h_kv, d = 32, 8, 128
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
+    w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    assert w._backend != "cudnn"
+    out, lse = w.run(q, k, v, return_lse=True)
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "auto on single-token GQA rows")
+    # MHA: the kernel is correct, cuDNN stays eligible
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_qo, d)
+    w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_qo, d)
+    assert w._backend == "cudnn"
+    out, lse = w.run(q, k, v, return_lse=True)
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_qo, d)
+    out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "cudnn on single-token MHA rows")
+
+
+@requires_cudnn_upgrade
+def test_explicit_cudnn_refuses_single_token_gqa_lse():
+    h_qo, h_kv, d = 32, 8, 128
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
+    w = _plan_single_token("cudnn", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    with pytest.raises(NotImplementedError, match="single-token"):
+        w.run(q, k, v, return_lse=True)
+    # the output itself is correct, so the no-LSE call is allowed
+    out = w.run(q, k, v)
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    out_fa2 = wf.run(q, k, v)
+    torch.testing.assert_close(out.float(), out_fa2.float(), atol=2e-2, rtol=2e-2)
+
+
+@requires_cudnn_upgrade
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,  # a build/execute failure is not the known LSE bug
+    reason="cuDNN s_q==1 GQA kernel writes the ragged Stats only for the first head "
+    "of each kv group (cuDNN 9.26/9.27, NVBug 6783545); drop the guards above when this passes",
+)
+def test_cudnn_single_token_gqa_lse_is_correct():
+    from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
+
+    h_qo, h_kv, d = 32, 8, 128
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    _, lse = cudnn_batch_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        float(1.0 / d**0.5),
+        workspace,
+        max_token_per_sequence=1,
+        max_sequence_kv=int((kv_indptr[1:] - kv_indptr[:-1]).max()),
+        causal=False,
+        return_lse=True,
+        batch_offsets_q=qo_indptr,
+        batch_offsets_o=qo_indptr,
+        batch_offsets_k=kv_indptr,
+        batch_offsets_v=kv_indptr,
+        batch_offsets_stats=qo_indptr,
+        batch_offsets_units="tokens",
+        lse=torch.empty(q.shape[0], h_qo, dtype=torch.float32, device="cuda"),
+    )
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    _, lse_fa2 = wf.run(q, k, v, return_lse=True)
+    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_fa2, atol=1e-2, rtol=1e-2)

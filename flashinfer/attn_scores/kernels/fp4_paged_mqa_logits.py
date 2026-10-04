@@ -83,6 +83,25 @@ _RND_RN = "rn"
 
 
 @dsl_user_op
+def relu_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """relu(x) = max(x, 0) as one FMNMX (PTX `max.NaN.f32`): exact and range-safe for
+    every finite x (no intermediate can overflow), NaN-propagating like the
+    cutlass.max it stands in for, one instruction per head where cutlass.max
+    lowers to a compare + select pair."""
+    f32_ty = cutlass.Float32.mlir_type
+    return cutlass.Float32(
+        llvm.inline_asm(
+            f32_ty,
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            "max.NaN.f32 $0, $1, 0f00000000;",
+            "=f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def pack_f16x2(
     a: Float16,
     b: Float16,
@@ -2513,18 +2532,15 @@ class FP4MQALogitsKernel:
                                             ps0 = fma_bf16x2(pa01, pw01, ps0)
                                             ps1 = fma_bf16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
-                                        )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                        )
+                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
+                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
+                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
+                                        # propagating like the scalar max, one instruction per head. Weights are
+                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
+                                        a0 = relu_f32(acc_vec[n0])
+                                        a1 = relu_f32(acc_vec[n0 + 1])
+                                        a2 = relu_f32(acc_vec[n0 + 2])
+                                        a3 = relu_f32(acc_vec[n0 + 3])
                                         r0 = t * NUM_W_IN_REG + h_g
                                         w0 = w_cache[r0]
                                         w1 = w_cache[r0 + 1]
@@ -2626,18 +2642,12 @@ class FP4MQALogitsKernel:
                                             ps0 = fma_bf16x2(pa01, pw01, ps0)
                                             ps1 = fma_bf16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
-                                        )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                        )
+                                        # smem-path heads (beyond the register weight budget; fp32
+                                        # next_n >= 3 only): the same relu on weights read from smem.
+                                        a0 = relu_f32(acc_vec[n0])
+                                        a1 = relu_f32(acc_vec[n0 + 1])
+                                        a2 = relu_f32(acc_vec[n0 + 2])
+                                        a3 = relu_f32(acc_vec[n0 + 3])
                                         w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                         w1 = sW[
                                             (t * num_heads + h_g + 1, q_stage_local)
@@ -2977,18 +2987,15 @@ class FP4MQALogitsKernel:
                                             ps0 = fma_bf16x2(pa01, pw01, ps0)
                                             ps1 = fma_bf16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
-                                        )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                        )
+                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
+                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
+                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
+                                        # propagating like the scalar max, one instruction per head. Weights are
+                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
+                                        a0 = relu_f32(acc_vec[n0])
+                                        a1 = relu_f32(acc_vec[n0 + 1])
+                                        a2 = relu_f32(acc_vec[n0 + 2])
+                                        a3 = relu_f32(acc_vec[n0 + 3])
                                         r0 = t * NUM_W_IN_REG + h_g
                                         w0 = w_cache[r0]
                                         w1 = w_cache[r0 + 1]
@@ -3090,18 +3097,12 @@ class FP4MQALogitsKernel:
                                             ps0 = fma_bf16x2(pa01, pw01, ps0)
                                             ps1 = fma_bf16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
-                                        )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                        )
+                                        # smem-path heads (beyond the register weight budget; fp32
+                                        # next_n >= 3 only): the same relu on weights read from smem.
+                                        a0 = relu_f32(acc_vec[n0])
+                                        a1 = relu_f32(acc_vec[n0 + 1])
+                                        a2 = relu_f32(acc_vec[n0 + 2])
+                                        a3 = relu_f32(acc_vec[n0 + 3])
                                         w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                         w1 = sW[
                                             (t * num_heads + h_g + 1, q_stage_local)
@@ -3208,7 +3209,11 @@ class FP4MQALogitsKernel:
 
             # TMEM dealloc: math warps are allocator + last consumer
             tmem.relinquish_alloc_permit()
-            tmem.free(tmem_ptr)
+            # Pass the static column count: dealloc must be marked exclusive for
+            # the >512-column (Rubin next_n=4) allocation, which the allocator
+            # only does when num_columns is a Python int rather than its own
+            # bookkeeping counter (DKG d9adb3cfa77).
+            tmem.free(tmem_ptr, num_tmem_alloc_cols_total)
 
         else:
             cute.arch.warpgroup_reg_dealloc(24)

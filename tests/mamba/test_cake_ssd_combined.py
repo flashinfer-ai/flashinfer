@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import hashlib
 import importlib
 import importlib.util
 import inspect
+import re
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,9 +37,13 @@ def _load_cake_benchmark_module():
     return module
 
 
-def _assert_cute_parity(actual, expected, *, nheads, ngroups):
-    torch.testing.assert_close(actual[0], expected[0], atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(actual[1], expected[1], atol=1e-2, rtol=1e-2)
+def _assert_cute_parity(actual, expected):
+    for index in (0, 1):
+        reference = expected[index]
+        # Cancellation ties the error to the head's magnitude rather than the
+        # entry's; the tensor max is a coarse bound on that.
+        atol = max(1e-2, 5e-4 * reference.abs().amax().item())
+        torch.testing.assert_close(actual[index], reference, atol=atol, rtol=1e-2)
 
 
 def _varlen_metadata(lengths, dtype):
@@ -226,7 +230,7 @@ def test_cake_ssd_combined_route_matrix(
         arguments["dt_limit"] = (0.0, float("inf"))
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cute_parity(actual, expected, nheads=nheads, ngroups=ngroups)
+    _assert_cute_parity(actual, expected)
 
 
 def test_cake_ssd_combined_accepts_framework_strided_input_views():
@@ -251,7 +255,7 @@ def test_cake_ssd_combined_accepts_framework_strided_input_views():
     }
 
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cute_parity(actual, expected, nheads=8, ngroups=8)
+    _assert_cute_parity(actual, expected)
 
 
 @pytest.mark.parametrize(
@@ -270,7 +274,7 @@ def test_cake_ssd_combined_matches_cute_d_shape_coercion(
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
 
-    _assert_cute_parity(actual, expected, nheads=8, ngroups=8)
+    _assert_cute_parity(actual, expected)
 
 
 def test_cake_ssd_combined_updates_caller_buffers():
@@ -457,7 +461,7 @@ def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
 
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cute_parity(actual, expected, nheads=8, ngroups=8)
+    _assert_cute_parity(actual, expected)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
@@ -491,7 +495,7 @@ def test_cake_ssd_combined_program_cache_is_multi_device_safe(varlen):
         tensors, arguments = cases[device_index]
         actual = runners[device_index].run(*tensors, **arguments)
         assert actual[0].device.index == device_index
-        _assert_cute_parity(actual, expected[device_index], nheads=1, ngroups=1)
+        _assert_cute_parity(actual, expected[device_index])
         assert torch.cuda.current_device() == 0
 
 
@@ -918,9 +922,14 @@ def test_source_public_cake_constructor_rejects_non_exported_arch_without_gpu(
     utils = importlib.import_module("flashinfer.utils")
     monkeypatch.setattr(utils, "get_compute_capability", lambda *_: (11, 0))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (11, 0))
-
-    with pytest.raises(ValueError, match="requires SM100 or SM103, got SM110"):
-        module.SSDCombined(128, 2, 64, 128, 1, backend="cake")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    cake_module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    cake_module._target_arch.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="requires SM100 or SM103, got SM110"):
+            module.SSDCombined(128, 2, 64, 128, 1, backend="cake")
+    finally:
+        cake_module._target_arch.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -1261,7 +1270,7 @@ def _source_cake_varlen_arguments(runner, tensors):
 def test_source_public_cake_domain_validation_without_gpu(monkeypatch, invalid, match):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
-    monkeypatch.setattr(module, "_prefix_route_selected", lambda: False)
+    monkeypatch.setattr(module, "_PREFIX_ROUTE_SELECTED", False)
     cake_runner = _source_cake_runner_without_constructor()
     tensors = list(_cpu_public_run_inputs(batch=2))
     kwargs = {}
@@ -1452,7 +1461,7 @@ def test_source_public_cute_backend_validation_without_gpu(
 def test_source_public_cake_dt_bias_validation_without_gpu(monkeypatch, invalid):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
-    monkeypatch.setattr(module, "_prefix_route_selected", lambda: False)
+    monkeypatch.setattr(module, "_PREFIX_ROUTE_SELECTED", False)
     monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
     cake_runner = _source_cake_runner_without_constructor()
@@ -1477,7 +1486,7 @@ def test_source_public_cake_dt_bias_validation_without_gpu(monkeypatch, invalid)
 def test_source_public_cake_rejects_non_cuda_inputs_without_gpu(monkeypatch):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
-    monkeypatch.setattr(module, "_prefix_route_selected", lambda: False)
+    monkeypatch.setattr(module, "_PREFIX_ROUTE_SELECTED", False)
     monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
     cake_runner = _source_cake_runner_without_constructor()
     cake_runner._get_workspace = lambda **_: {
@@ -1548,26 +1557,17 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
 
     monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
+    monkeypatch.setattr(module, "_sm_count", lambda _: 1)
     monkeypatch.setattr(
         module,
-        "_generated_program_profile",
-        lambda _name, _arch: {"stages": {"preprocess": {"block": [128, 1, 1]}}},
-    )
-    monkeypatch.setattr(
-        module,
-        "_run_generated_program",
-        lambda name, _arch, _device_index, **kwargs: calls.__setitem__(name, kwargs),
+        "_launch_program",
+        lambda name, _arch, **kwargs: calls.__setitem__(name, kwargs),
     )
     monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
     monkeypatch.setattr(
         torch.cuda,
         "current_stream",
         lambda *_: SimpleNamespace(cuda_stream=0x1234),
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda *_: SimpleNamespace(multi_processor_count=1),
     )
 
     batch, seqlen, nheads, ngroups = 2, 128, 1, 1
@@ -1618,8 +1618,9 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
         checkpoint_states=checkpoint_states,
     )
 
-    exact = calls["exact_bf16_batched"]["stage_values"]
+    exact = calls["exact_bf16_batched"]
     assert exact["preprocess"]["dt_softplus"] == 0
+    assert exact["preprocess_grid"] == (1, 1, 1)
     main = exact["main"]
     assert main["dt_softplus"] == 0
     assert main["checkpoint_state_count"] == checkpoint_states.shape[0]
@@ -1676,7 +1677,7 @@ def test_source_route_predicates_do_not_bind_program_symbols(
     assert actual == expected
 
 
-def test_source_direct_preprocess_and_prepared_sequence_binding():
+def test_source_direct_preprocess_and_sequence_argument_order():
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     sentinels = {
         name: object()
@@ -1690,7 +1691,6 @@ def test_source_direct_preprocess_and_prepared_sequence_binding():
             "chunk_offsets",
             "delta",
             "cumsum",
-            "main_x",
         )
     }
     preprocess, preprocess_grid = module._direct_preprocess_inputs(
@@ -1711,37 +1711,13 @@ def test_source_direct_preprocess_and_prepared_sequence_binding():
         dt_limit=(0.0, float("inf")),
         threads=32,
     )
-    main = {"x_map": sentinels["main_x"], "nheads": 128}
-    stage_plans = (
-        (
-            "preprocess",
-            (
-                ("buffer", "dt"),
-                ("buffer", "chunk_indices"),
-                ("buffer", "chunk_offsets"),
-                ("parameter", "direct_varlen_metadata"),
-                ("parameter", "dt_softplus"),
-                ("grid", "grid_x"),
-                ("grid", "grid_y"),
-                ("grid", "grid_z"),
-            ),
-        ),
-        (
-            "main",
-            (
-                ("tma_buffer", "x_map"),
-                ("parameter", "nheads"),
-                ("grid", "grid_x"),
-                ("grid", "grid_y"),
-                ("grid", "grid_z"),
-            ),
-        ),
-    )
+    main = {name: object() for name in module._MAIN_ARGS}
 
-    bound = module._bind_prepared_sequence_arguments(
-        stage_plans,
-        {"preprocess": preprocess, "main": main},
-        {"preprocess": preprocess_grid, "main": (148, 1, 1)},
+    bound = module._sequence_arguments(
+        preprocess,
+        preprocess_grid,
+        main,
+        (148, 1, 1),
         cuda_stream=0x1234,
     )
 
@@ -1750,46 +1726,36 @@ def test_source_direct_preprocess_and_prepared_sequence_binding():
     assert preprocess["direct_varlen_metadata"] == 1
     assert preprocess["dt_softplus"] == 0
     assert preprocess_grid == (12, 1, 1)
+    assert set(preprocess) == set(module._PREPROCESS_ARGS)
     assert bound == (
-        sentinels["dt"],
-        sentinels["chunk_indices"],
-        sentinels["chunk_offsets"],
-        1,
-        0,
+        *(preprocess[name] for name in module._PREPROCESS_ARGS),
         12,
         1,
         1,
-        sentinels["main_x"],
-        128,
+        *(main[name] for name in module._MAIN_ARGS),
         148,
         1,
         1,
         0x1234,
     )
+    assert len(bound) == 16 + 3 + 43 + 3 + 1
 
     assert module._persistent_grid_size(total_work=256, sm_count=148) == 128
     assert module._persistent_grid_size(total_work=384, sm_count=148) == 128
     assert module._persistent_grid_size(total_work=129, sm_count=148) == 129
 
 
-def test_source_generated_argument_binding_fails_closed():
+def test_source_sequence_arguments_fail_closed_on_missing_values():
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    preprocess = {name: object() for name in module._PREPROCESS_ARGS}
+    main = {name: object() for name in module._MAIN_ARGS}
+    del main["checkpoint_state_count"]
 
-    with pytest.raises(ValueError, match="buffer:missing is unresolved"):
-        module._bind_generated_arguments(
-            (("buffer", "missing"),),
-            {},
-            (1, 1, 1),
-        )
-    with pytest.raises(ValueError, match="kind is unsupported"):
-        module._bind_generated_arguments(
-            (("unknown", "value"),),
-            {"value": object()},
-            (1, 1, 1),
-        )
+    with pytest.raises(KeyError, match="checkpoint_state_count"):
+        module._sequence_arguments(preprocess, (1, 1, 1), main, (1, 1, 1), 0)
 
 
-def test_source_generated_program_runs_catalog_entry(monkeypatch):
+def test_source_program_launch_orders_stage_arguments(monkeypatch):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
 
@@ -1797,113 +1763,41 @@ def test_source_generated_program_runs_catalog_entry(monkeypatch):
         def run(self, *args):
             calls.append(args)
 
-    monkeypatch.setattr(
-        module,
-        "_generated_program_profile",
-        lambda *_: {
-            "entry": "run",
-            "launch_count": 2,
-            "stream_abi": "explicit",
-            "stage_order": ["preprocess", "main"],
-            "stages": {
-                "preprocess": {
-                    "arg_plan": [
-                        ["buffer", "dt"],
-                        ["grid", "grid_x"],
-                    ]
-                },
-                "main": {
-                    "arg_plan": [
-                        ["tma_buffer", "x_map"],
-                        ["parameter", "nheads"],
-                        ["grid", "grid_x"],
-                    ]
-                },
-            },
-        },
-    )
     monkeypatch.setattr(module, "_load_generated_program", lambda *_: Generated())
+    preprocess = {name: f"pre:{name}" for name in module._PREPROCESS_ARGS}
+    main = {name: f"main:{name}" for name in module._MAIN_ARGS}
 
-    module._run_generated_program(
+    module._launch_program(
         "prefix_bf16_varlen",
         "sm_103a",
-        0,
-        stage_values={
-            "preprocess": {"dt": "dt"},
-            "main": {"x_map": "x", "nheads": 128},
-        },
-        stage_grids={"preprocess": (32, 1, 1), "main": (148, 1, 1)},
+        preprocess=preprocess,
+        preprocess_grid=(32, 1, 1),
+        main=main,
+        main_grid=(148, 1, 1),
         cuda_stream=0x1234,
     )
 
-    assert calls == [("dt", 32, "x", 128, 148, 0x1234)]
-
-
-def test_source_generated_program_rejects_implicit_stream(monkeypatch):
-    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    monkeypatch.setattr(
-        module,
-        "_generated_program_profile",
-        lambda *_: {
-            "entry": "run",
-            "launch_count": 1,
-            "stream_abi": "implicit",
-            "stage_order": ["main"],
-            "stages": {
-                "main": {
-                    "arg_plan": [
-                        ["tma_buffer", "x_map"],
-                        ["grid", "grid_x"],
-                    ]
-                }
-            },
-        },
-    )
-    with pytest.raises(RuntimeError, match="unresolved launch ABI"):
-        module._run_generated_program(
-            "exact_bf16_batched",
-            "sm_103a",
-            0,
-            stage_values={"main": {"x_map": "x"}},
-            stage_grids={"main": (148, 1, 1)},
-            cuda_stream=0x1234,
+    assert calls == [
+        (
+            *(f"pre:{name}" for name in module._PREPROCESS_ARGS),
+            32,
+            1,
+            1,
+            *(f"main:{name}" for name in module._MAIN_ARGS),
+            148,
+            1,
+            1,
+            0x1234,
         )
+    ]
 
 
-def test_source_generated_program_rejects_unresolved_launch_abi(monkeypatch):
+def test_source_program_table_names_shipped_sources():
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    monkeypatch.setattr(
-        module,
-        "_generated_program_profile",
-        lambda *_: {
-            "entry": "run",
-            "launch_count": 1,
-            "stream_abi": "explicit",
-            "stage_order": ["preprocess", "main"],
-            "stages": {},
-        },
-    )
+    source_dir = module._source_dir()
 
-    with pytest.raises(RuntimeError, match="unresolved launch ABI"):
-        module._run_generated_program(
-            "prefix_bf16_varlen",
-            "sm_103a",
-            0,
-            stage_values={},
-            stage_grids={},
-            cuda_stream=0,
-        )
-
-
-def test_source_generated_catalog_is_terminal_and_active():
-    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    module._source_catalog.cache_clear()
-
-    catalog = module._source_catalog()
-
-    assert catalog["source_status"] == "terminal"
-    assert catalog["prefix_route_selected"] is True
-    assert set(catalog["programs"]) == {
+    assert module._PREFIX_ROUTE_SELECTED is True
+    assert set(module._PROGRAMS) == {
         "exact_bf16_batched",
         "exact_bf16_varlen",
         "exact_f16_batched",
@@ -1913,88 +1807,59 @@ def test_source_generated_catalog_is_terminal_and_active():
         "prefix_bf16_varlen",
         "prefix_f16_varlen",
     }
-    for program in catalog["programs"].values():
-        assert set(program) == {"sm_100a", "sm_103a"}
-        for profile in program.values():
-            assert profile["launch_count"] == 2
-            assert profile["stream_abi"] == "explicit"
-            assert profile["stage_order"] == ["preprocess", "main"]
-            assert len(profile["device_sources"]) == 2
-            sources = [profile["host_source"], *profile["device_sources"]]
-            for source in sources:
-                path = module._source_dir() / "generated" / source["path"]
-                assert hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"]
-
-    expected_inventory_paths = (
-        "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-        "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0.cu",
-        "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-        "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2.cu",
-        "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-        "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-        "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-        "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-        "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-        "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-        "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-        "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0.cu",
-        "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-        "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2.cu",
-        "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-        "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-        "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-        "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-        "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-        "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-        "host/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cpp",
-        "host/sm_100a/mamba_ssd_combined_exact_bf16_batched.cpp",
-        "host/sm_100a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-        "host/sm_100a/mamba_ssd_combined_exact_f16_batched.cpp",
-        "host/sm_100a/mamba_ssd_combined_exact_f16_varlen.cpp",
-        "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-        "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
-        "host/sm_100a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-        "host/sm_100a/mamba_ssd_combined_r7_f16_varlen.cpp",
-        "host/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cpp",
-        "host/sm_103a/mamba_ssd_combined_exact_bf16_batched.cpp",
-        "host/sm_103a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-        "host/sm_103a/mamba_ssd_combined_exact_f16_batched.cpp",
-        "host/sm_103a/mamba_ssd_combined_exact_f16_varlen.cpp",
-        "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-        "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
-        "host/sm_103a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-        "host/sm_103a/mamba_ssd_combined_r7_f16_varlen.cpp",
-    )
-    source_inventory = catalog["source_inventory"]
-    assert len(source_inventory) == 38
-    assert [source["path"] for source in source_inventory] == list(
-        expected_inventory_paths
-    )
-    assert all(set(source) == {"path", "sha256"} for source in source_inventory)
-    for source in source_inventory:
-        path = module._source_dir() / "generated" / source["path"]
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"]
+    template = (source_dir / module._HOST_TEMPLATE).read_text(encoding="utf-8")
+    device_sources = set()
+    for name, program in module._PROGRAMS.items():
+        state_key = name.split("_")[1]
+        assert program.state_dtype_code == module._STATE_DTYPE_CODES[state_key]
+        assert program.preprocess.threads > 0 and program.main.threads == 512
+        assert not program.preprocess.fast_math and program.main.fast_math
+        for kernel in program.kernels:
+            source = source_dir / module._DEVICE_DIR / kernel.source
+            assert source.is_file(), source
+            assert re.search(
+                rf"\b{kernel.kernel}\(", source.read_text(encoding="utf-8")
+            )
+            device_sources.add(source)
+        rendered = module._render_host_source(template, name, program)
+        placeholders = (
+            "CAKE_SSD_PROGRAM",
+            "CAKE_SSD_PREPROCESS_MODULE",
+            "CAKE_SSD_PREPROCESS_KERNEL",
+            "CAKE_SSD_PREPROCESS_THREADS",
+            "CAKE_SSD_MAIN_MODULE",
+            "CAKE_SSD_MAIN_KERNEL",
+            "CAKE_SSD_STATE_DTYPE_CODE",
+            "CAKE_SSD_MAIN_SMEM_BYTES",
+        )
+        assert all(placeholder in template for placeholder in placeholders)
+        assert not any(placeholder in rendered for placeholder in placeholders)
+        assert f"TVM_FFI_EMBED_CUBIN({program.preprocess.module});" in rendered
+        assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
+        assert f'"{program.main.kernel}"' in rendered
+        assert f"namespace cake_mamba_ssd_combined_host_{name} {{" in rendered
+        assert f"stream, {program.main_smem_bytes}u)" in rendered
+    # One shared source per physical kernel: ten device files, no architecture copies.
+    assert len(device_sources) == 10
+    assert sorted(
+        path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
+    ) == sorted(path.name for path in device_sources)
 
 
 def test_active_f16_source_package_declares_cuda_half_types_explicitly():
-    source_root = Path(__file__).parents[2] / "csrc" / "cake_mamba_ssd_combined"
+    source_root = (
+        Path(__file__).parents[2]
+        / "csrc"
+        / "cake_mamba_ssd_combined"
+        / "generated"
+        / "device"
+    )
     f16_sources = (
         source_root
-        / "generated/device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-        source_root
-        / "generated/device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-        source_root
-        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-        source_root
-        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-        source_root
-        / "generated/device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-        source_root
-        / "generated/device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-        source_root
-        / "generated/device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-        source_root
-        / "generated/device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
+        / "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
+        source_root / "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
+        source_root / "mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
+        source_root / "mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
     )
     for source_path in f16_sources:
         source = source_path.read_text(encoding="utf-8")
@@ -2002,14 +1867,10 @@ def test_active_f16_source_package_declares_cuda_half_types_explicitly():
         assert "#include <cuda_bf16.h>\n#include <cuda_fp16.h>\n" in source
 
     other_active_sources = (
-        source_root
-        / "generated/device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-        source_root
-        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-        source_root
-        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-        source_root
-        / "generated/device/sm_100a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
+        source_root / "factorized_persistent_segment_preprocess_7ae61d5f32.cu",
+        source_root / "mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
+        source_root / "mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
+        source_root / "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
     )
     assert all(
         "#include <cuda_fp16.h>" not in source_path.read_text(encoding="utf-8")
@@ -2017,33 +1878,25 @@ def test_active_f16_source_package_declares_cuda_half_types_explicitly():
     )
 
 
-def test_source_generated_multistage_loader_binds_exact_cubins(monkeypatch, tmp_path):
+def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    generated = tmp_path / "generated"
-    generated.mkdir()
-    host = generated / "host.cpp"
-    first = generated / "first.cu"
-    second = generated / "second.cu"
-    host.write_text("host source\n", encoding="utf-8")
-    first.write_text("first source\n", encoding="utf-8")
-    second.write_text("second source\n", encoding="utf-8")
-
-    def source(path, module_ident=None, compile_flags=None):
-        payload = (generated / path).read_bytes()
-        result = {"path": path, "sha256": hashlib.sha256(payload).hexdigest()}
-        if module_ident is not None:
-            result["module_ident"] = module_ident
-            result["compile_flags"] = compile_flags
-        return result
-
-    profile = {
-        "entry": "run_prepared",
-        "host_source": source("host.cpp"),
-        "device_sources": [
-            source("first.cu", "first_ident", []),
-            source("second.cu", "second_ident", ["--use_fast_math"]),
-        ],
-    }
+    program = module._PROGRAMS["prefix_bf16_varlen"]
+    device_dir = tmp_path / module._DEVICE_DIR
+    device_dir.mkdir(parents=True)
+    for kernel in program.kernels:
+        (device_dir / kernel.source).write_text(
+            f"{kernel.kernel} source\n", encoding="utf-8"
+        )
+    host = tmp_path / module._HOST_TEMPLATE
+    host.parent.mkdir(parents=True)
+    host.write_text(
+        "namespace host_CAKE_SSD_PROGRAM {}\n"
+        "TVM_FFI_EMBED_CUBIN(CAKE_SSD_PREPROCESS_MODULE);\n"
+        "TVM_FFI_EMBED_CUBIN(CAKE_SSD_MAIN_MODULE);\n"
+        "CAKE_SSD_PREPROCESS_KERNEL CAKE_SSD_PREPROCESS_THREADS CAKE_SSD_MAIN_KERNEL "
+        "CAKE_SSD_STATE_DTYPE_CODE CAKE_SSD_MAIN_SMEM_BYTES\n",
+        encoding="utf-8",
+    )
     nvcc = tmp_path / "cuda" / "bin" / "nvcc"
     nvcc.parent.mkdir(parents=True)
     nvcc.touch()
@@ -2063,7 +1916,6 @@ def test_source_generated_multistage_loader_binds_exact_cubins(monkeypatch, tmp_
         load_calls.append((args, kwargs))
         return loaded
 
-    monkeypatch.setattr(module, "_generated_program_profile", lambda *_: profile)
     monkeypatch.setattr(module, "_source_dir", lambda: tmp_path)
     monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
     monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
@@ -2071,15 +1923,23 @@ def test_source_generated_multistage_loader_binds_exact_cubins(monkeypatch, tmp_
     monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
     module._load_generated_program.cache_clear()
 
-    actual = module._load_generated_program("prefix_bf16_varlen", "sm_103a", 0)
+    actual = module._load_generated_program("prefix_bf16_varlen", "sm_103a")
+    again = module._load_generated_program("prefix_bf16_varlen", "sm_103a")
+    module._load_generated_program.cache_clear()
 
-    assert actual is loaded
+    assert actual is loaded and again is loaded
     assert len(calls) == 2
+    assert all("-arch=sm_103a" in command for command, _ in calls)
     assert "--use_fast_math" not in calls[0][0]
     assert "--use_fast_math" in calls[1][0]
     assert len(load_calls) == 1
-    assert load_calls[0][1]["cpp_sources"] == "host source\n"
+    rendered = load_calls[0][1]["cpp_sources"]
+    assert "CAKE_SSD_" not in rendered
+    assert "namespace host_prefix_bf16_varlen {}" in rendered
+    assert f"TVM_FFI_EMBED_CUBIN({program.preprocess.module});" in rendered
+    assert f"{program.preprocess.kernel} 32 {program.main.kernel} 4 149248" in rendered
     assert set(load_calls[0][1]["embed_cubin"]) == {
-        "first_ident",
-        "second_ident",
+        program.preprocess.module,
+        program.main.module,
     }
+    assert load_calls[0][0][0].startswith("cake_mamba_ssd_prefix_bf16_varlen_sm_103a_")

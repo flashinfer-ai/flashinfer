@@ -55,12 +55,19 @@ def CakeMxfp8MegaMoeEp16(
     topk_ids: torch.Tensor,
     *,
     process_group: dist.ProcessGroup | None = None,
+    backend: str = "cuda",
 ) -> Any:
-    """Create a prepared session for the specialized EP16 execution path."""
+    """Create a prepared EP16 session, optionally using ``backend="cute_dsl"``.
+
+    The default ``"cuda"`` backend is unchanged. All ranks in the process
+    group must select the same backend when constructing a session.
+    """
 
     from ..experimental.cake_mxfp8_megamoe_ep16 import create_session
 
-    return create_session(weights, topk_ids, process_group=process_group)
+    return create_session(
+        weights, topk_ids, process_group=process_group, backend=backend
+    )
 
 
 __all__ = [

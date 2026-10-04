@@ -172,6 +172,58 @@ class TestSaveLoadRoundTrip:
         finally:
             os.unlink(tmp_path)
 
+    def test_cold_policy_roundtrip_and_legacy_replacement(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            autotuner_module, "_collect_metadata", lambda: dict(_FAKE_META)
+        )
+        runner = FakeRunnerA()
+        shapes = ((64, 128),)
+        config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+        key = AutoTuner._get_cache_key("policy_op", runner, shapes, config)
+        self.tuner.profiling_cache[key] = (2, None)
+        self.tuner._profiling_cache_policies[key] = self.tuner._profiling_policy(config)
+        path = str(tmp_path / "cold.json")
+        self.tuner.save_configs(path)
+
+        # A fresh process must reuse the same measurement policy, but retune
+        # when either L2 policy or graph replay count changes.
+        fresh = AutoTuner()
+        assert fresh.load_configs(path)
+        fresh.is_tuning_mode = True
+        assert fresh.search_cache("policy_op", [runner], shapes, config)[:3] == (
+            True,
+            0,
+            2,
+        )
+        hot = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=False)
+        assert not fresh.search_cache("policy_op", [runner], shapes, hot)[0]
+        replay = TuningConfig(
+            use_cuda_graph=True, use_cold_l2_cache=True, cuda_graph_profile_replays=2
+        )
+        assert not fresh.search_cache("policy_op", [runner], shapes, replay)[0]
+
+        # Saving a loaded result must preserve its provenance as well.
+        copied = str(tmp_path / "copied.json")
+        fresh.save_configs(copied)
+        restored = AutoTuner()
+        assert restored.load_configs(copied)
+        restored.is_tuning_mode = True
+        assert restored.search_cache("policy_op", [runner], shapes, config)[0]
+
+        # Legacy replacement must remove the old record's policy. Such entries
+        # remain usable for serving, but cannot claim cold-L2 measurements.
+        legacy = tmp_path / "legacy.json"
+        legacy.write_text(json.dumps({key.file_key: ["FakeRunnerA", 1]}))
+        assert restored.load_configs(str(legacy))
+        assert not restored.search_cache("policy_op", [runner], shapes, config)[0]
+        assert restored.search_cache("policy_op", [runner], shapes, hot)[0]
+        restored.is_tuning_mode = False
+        assert restored.search_cache("policy_op", [runner], shapes, config)[:3] == (
+            True,
+            0,
+            1,
+        )
+
     def test_save_and_load_tuple_tactic(self):
         """Round-trip with a compound tuple tactic (CuteDSL-style)."""
         runner = FakeRunnerA(value=1)

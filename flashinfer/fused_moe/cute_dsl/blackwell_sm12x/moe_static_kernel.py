@@ -1400,143 +1400,150 @@ class MoEStaticKernel:
         pair_idx = Int32(bidz) * Int32(self.num_frontend_warps) + warp_idx
         while pair_idx < total_pairs:
             expert_id = topk_ids[pair_idx].to(Int32)
-            token_idx = pair_idx // num_topk
-            weight = topk_weights[pair_idx].to(cutlass.Float32)
-            local_expert_id = Int32(0)
-            row = Int32(0)
-            if lane_id == Int32(0):
-                # 32-row virtual-expert split: a monotone per-global-expert
-                # allocator yields (chunk, row-in-chunk); every chunk claims
-                # its own compact local expert id, so each scheduled tile
-                # holds <=32 valid rows — exactly the one M step the tile64
-                # MMA computes. Big experts become several tiles instead of
-                # silently losing rows past 32 (or 64 at tile128).
-                alloc_row = atomic_add_global_i32(
-                    get_ptr_as_int64(virt_route_scratch, expert_id),
-                    Int32(1),
-                )
-                chunk = alloc_row >> Int32(5)
-                row = alloc_row & Int32(31)
-                vslot = num_global_experts + expert_id * max_chunks + chunk
-                prior_local_expert_id = _atomic_cas_global_i32(
-                    get_ptr_as_int64(virt_route_scratch, vslot),
-                    Int32(-1),
-                    Int32(-2),
-                )
-                if prior_local_expert_id == Int32(-1):
-                    local_expert_id = atomic_add_global_i32(
-                        get_ptr_as_int64(active_expert_count, Int32(0)),
+            # A negative id marks an unrouted pair: it takes no row and no
+            # compact expert, and the finalizer skips its route slot.
+            if expert_id >= Int32(0):
+                token_idx = pair_idx // num_topk
+                weight = topk_weights[pair_idx].to(cutlass.Float32)
+                local_expert_id = Int32(0)
+                row = Int32(0)
+                if lane_id == Int32(0):
+                    # 32-row virtual-expert split: a monotone per-global-expert
+                    # allocator yields (chunk, row-in-chunk); every chunk claims
+                    # its own compact local expert id, so each scheduled tile
+                    # holds <=32 valid rows — exactly the one M step the tile64
+                    # MMA computes. Big experts become several tiles instead of
+                    # silently losing rows past 32 (or 64 at tile128).
+                    alloc_row = atomic_add_global_i32(
+                        get_ptr_as_int64(virt_route_scratch, expert_id),
                         Int32(1),
                     )
-                    weight_expert_ids[local_expert_id] = expert_id
-                    if chunk == Int32(0):
-                        # Keep the legacy global->local mapping for chunk 0;
-                        # the micro pre-pass and diagnostics still read it.
+                    chunk = alloc_row >> Int32(5)
+                    row = alloc_row & Int32(31)
+                    vslot = num_global_experts + expert_id * max_chunks + chunk
+                    prior_local_expert_id = _atomic_cas_global_i32(
+                        get_ptr_as_int64(virt_route_scratch, vslot),
+                        Int32(-1),
+                        Int32(-2),
+                    )
+                    if prior_local_expert_id == Int32(-1):
+                        local_expert_id = atomic_add_global_i32(
+                            get_ptr_as_int64(active_expert_count, Int32(0)),
+                            Int32(1),
+                        )
+                        weight_expert_ids[local_expert_id] = expert_id
+                        if chunk == Int32(0):
+                            # Keep the legacy global->local mapping for chunk 0;
+                            # the micro pre-pass and diagnostics still read it.
+                            _st_global_release_i32(
+                                get_ptr_as_int64(global_to_local_expert, expert_id),
+                                local_expert_id,
+                            )
                         _st_global_release_i32(
-                            get_ptr_as_int64(global_to_local_expert, expert_id),
+                            get_ptr_as_int64(virt_route_scratch, vslot),
                             local_expert_id,
                         )
-                    _st_global_release_i32(
-                        get_ptr_as_int64(virt_route_scratch, vslot),
-                        local_expert_id,
-                    )
-                else:
-                    if prior_local_expert_id == Int32(-2):
-                        _spin_wait_global_eq_i32(
-                            get_ptr_as_int64(virt_route_scratch, vslot),
-                            Int32(-2),
-                        )
-                        prior_local_expert_id = _ld_global_acquire_i32(
-                            get_ptr_as_int64(virt_route_scratch, vslot),
-                        )
-                    local_expert_id = prior_local_expert_id
-                atomic_add_global_i32(
-                    get_ptr_as_int64(row_counts, local_expert_id),
-                    Int32(1),
-                )
-                map_idx = local_expert_id * max_rows + row
-                # Preserve the unique routed-pair id.  Compute only needs its
-                # token quotient, while scatter needs a collision-free scratch
-                # row for the later token-major finalization.
-                st_global_i32(get_ptr_as_int64(token_map, map_idx), pair_idx)
-                st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
-            local_expert_id = cute.arch.shuffle_sync(local_expert_id, Int32(0))
-            row = cute.arch.shuffle_sync(row, Int32(0))
-
-            # Distribute quantization across ALL CTA threads, not just leader.
-            # Each FP4 block (16 elements) is independent — perfect parallelism.
-            gs_value = cutlass.Float32(1.0)
-            if cutlass.const_expr(self.sf_vec_size == 16):
-                gs_value = input_global_scale[expert_id].to(cutlass.Float32)
-                if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(
-                    0.0
-                ):
-                    if self.fast_math:
-                        gs_value = rcp_approx_ftz(gs_value)
                     else:
-                        gs_value = cutlass.Float32(1.0) / gs_value
-            sf_idx = lane_id
-            while sf_idx < sf_blocks_per_row:
-                block_start = sf_idx * Int32(self.sf_vec_size)
-                values = cute.make_rmem_tensor((self.sf_vec_size,), cutlass.Float32)
-                block_max = cutlass.Float32(0.0)
-                # Vectorized BF16 loads cover either one 16-value NVFP4 block
-                # or one 32-value MXFP4 block.
-                block_addr = get_ptr_as_int64(a_input, token_idx * cols + block_start)
-                for load_idx in cutlass.range_constexpr(self.sf_vec_size // 8):
-                    loaded = load_global_bf16x8_to_f32x8(
-                        block_addr + Int64(load_idx * 16)
+                        if prior_local_expert_id == Int32(-2):
+                            _spin_wait_global_eq_i32(
+                                get_ptr_as_int64(virt_route_scratch, vslot),
+                                Int32(-2),
+                            )
+                            prior_local_expert_id = _ld_global_acquire_i32(
+                                get_ptr_as_int64(virt_route_scratch, vslot),
+                            )
+                        local_expert_id = prior_local_expert_id
+                    atomic_add_global_i32(
+                        get_ptr_as_int64(row_counts, local_expert_id),
+                        Int32(1),
                     )
-                    for elem_idx in cutlass.range_constexpr(8):
-                        value = loaded[elem_idx]
-                        values[load_idx * 8 + elem_idx] = value
-                        block_max = fmax_f32(block_max, fabs_f32(value))
-                packed_lo = Uint64(0)
-                packed_hi = Uint64(0)
-                scale_byte = Uint8(0)
-                if cutlass.const_expr(self.sf_vec_size == 32):
-                    packed_lo, packed_hi, scale_byte = quantize_block_mxfp4(
-                        values, block_max
+                    map_idx = local_expert_id * max_rows + row
+                    # Preserve the unique routed-pair id.  Compute only needs its
+                    # token quotient, while scatter needs a collision-free scratch
+                    # row for the later token-major finalization.
+                    st_global_i32(get_ptr_as_int64(token_map, map_idx), pair_idx)
+                    st_global_f32(get_ptr_as_int64(token_weights, map_idx), weight)
+                local_expert_id = cute.arch.shuffle_sync(local_expert_id, Int32(0))
+                row = cute.arch.shuffle_sync(row, Int32(0))
+
+                # Distribute quantization across ALL CTA threads, not just leader.
+                # Each FP4 block (16 elements) is independent — perfect parallelism.
+                gs_value = cutlass.Float32(1.0)
+                if cutlass.const_expr(self.sf_vec_size == 16):
+                    gs_value = input_global_scale[expert_id].to(cutlass.Float32)
+                    if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(
+                        0.0
+                    ):
+                        if self.fast_math:
+                            gs_value = rcp_approx_ftz(gs_value)
+                        else:
+                            gs_value = cutlass.Float32(1.0) / gs_value
+                sf_idx = lane_id
+                while sf_idx < sf_blocks_per_row:
+                    block_start = sf_idx * Int32(self.sf_vec_size)
+                    values = cute.make_rmem_tensor((self.sf_vec_size,), cutlass.Float32)
+                    block_max = cutlass.Float32(0.0)
+                    # Vectorized BF16 loads cover either one 16-value NVFP4 block
+                    # or one 32-value MXFP4 block.
+                    block_addr = get_ptr_as_int64(
+                        a_input, token_idx * cols + block_start
                     )
-                else:
-                    if self.fast_math:
-                        packed_lo, scale_byte = quantize_block_fp4_fast(
-                            values, block_max, gs_value
+                    for load_idx in cutlass.range_constexpr(self.sf_vec_size // 8):
+                        loaded = load_global_bf16x8_to_f32x8(
+                            block_addr + Int64(load_idx * 16)
+                        )
+                        for elem_idx in cutlass.range_constexpr(8):
+                            value = loaded[elem_idx]
+                            values[load_idx * 8 + elem_idx] = value
+                            block_max = fmax_f32(block_max, fabs_f32(value))
+                    packed_lo = Uint64(0)
+                    packed_hi = Uint64(0)
+                    scale_byte = Uint8(0)
+                    if cutlass.const_expr(self.sf_vec_size == 32):
+                        packed_lo, packed_hi, scale_byte = quantize_block_mxfp4(
+                            values, block_max
                         )
                     else:
-                        packed_lo, scale_byte = quantize_block_fp4(
-                            values, block_max, gs_value
-                        )
+                        if self.fast_math:
+                            packed_lo, scale_byte = quantize_block_fp4_fast(
+                                values, block_max, gs_value
+                            )
+                        else:
+                            packed_lo, scale_byte = quantize_block_fp4(
+                                values, block_max, gs_value
+                            )
 
-                output_offset = (
-                    local_expert_id * max_rows * output_bytes_per_row
-                    + row * output_bytes_per_row
-                    + sf_idx * Int32(self.sf_vec_size // 2)
-                )
-                st_global_u64(
-                    get_ptr_as_int64(packed_a_storage, output_offset), packed_lo
-                )
-                if cutlass.const_expr(self.sf_vec_size == 32):
+                    output_offset = (
+                        local_expert_id * max_rows * output_bytes_per_row
+                        + row * output_bytes_per_row
+                        + sf_idx * Int32(self.sf_vec_size // 2)
+                    )
                     st_global_u64(
-                        get_ptr_as_int64(packed_a_storage, output_offset + Int32(8)),
-                        packed_hi,
+                        get_ptr_as_int64(packed_a_storage, output_offset), packed_lo
                     )
+                    if cutlass.const_expr(self.sf_vec_size == 32):
+                        st_global_u64(
+                            get_ptr_as_int64(
+                                packed_a_storage, output_offset + Int32(8)
+                            ),
+                            packed_hi,
+                        )
 
-                m_tile_idx = row // Int32(32 * 4)
-                k_tile_idx = sf_idx // Int32(4)
-                outer_m_idx = row % Int32(32)
-                inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
-                inner_k_idx = sf_idx % Int32(4)
-                scale_offset = (
-                    local_expert_id * expert_scale_stride
-                    + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
-                    + k_tile_idx * Int32(32 * 4 * 4)
-                    + outer_m_idx * Int32(4 * 4)
-                    + inner_m_idx * Int32(4)
-                    + inner_k_idx
-                )
-                scale_storage[scale_offset] = scale_byte
-                sf_idx += Int32(32)
+                    m_tile_idx = row // Int32(32 * 4)
+                    k_tile_idx = sf_idx // Int32(4)
+                    outer_m_idx = row % Int32(32)
+                    inner_m_idx = (row % Int32(32 * 4)) // Int32(32)
+                    inner_k_idx = sf_idx % Int32(4)
+                    scale_offset = (
+                        local_expert_id * expert_scale_stride
+                        + m_tile_idx * num_k_tiles * Int32(32 * 4 * 4)
+                        + k_tile_idx * Int32(32 * 4 * 4)
+                        + outer_m_idx * Int32(4 * 4)
+                        + inner_m_idx * Int32(4)
+                        + inner_k_idx
+                    )
+                    scale_storage[scale_offset] = scale_byte
+                    sf_idx += Int32(32)
 
             pair_idx += Int32(gdim_z) * Int32(self.num_frontend_warps)
 
@@ -2755,24 +2762,27 @@ class MoEStaticKernel:
             final_slot = Int32(0)
             while final_slot < num_topk:
                 final_route = final_token * num_topk + final_slot
-                final_partial = Int32(0)
-                while final_partial < Int32(retained_group_count):
-                    route_values = load_global_bf16x8_to_f32x8(
-                        get_ptr_as_int64(
-                            route_output_scratch,
-                            (
+                route_expert = topk_ids[final_route].to(Int32)
+                # Unrouted slots never wrote their scratch rows.
+                if route_expert >= Int32(0):
+                    final_partial = Int32(0)
+                    while final_partial < Int32(retained_group_count):
+                        route_values = load_global_bf16x8_to_f32x8(
+                            get_ptr_as_int64(
+                                route_output_scratch,
                                 (
-                                    final_route * Int32(retained_group_count)
-                                    + final_partial
-                                )
-                                * cols
-                                + final_col
-                            ),
+                                    (
+                                        final_route * Int32(retained_group_count)
+                                        + final_partial
+                                    )
+                                    * cols
+                                    + final_col
+                                ),
+                            )
                         )
-                    )
-                    for final_elem in cutlass.range_constexpr(8):
-                        final_acc[final_elem] += route_values[final_elem]
-                    final_partial += Int32(1)
+                        for final_elem in cutlass.range_constexpr(8):
+                            final_acc[final_elem] += route_values[final_elem]
+                        final_partial += Int32(1)
                 final_slot += Int32(1)
             store_global_f32x8_as_bf16(
                 get_ptr_as_int64(

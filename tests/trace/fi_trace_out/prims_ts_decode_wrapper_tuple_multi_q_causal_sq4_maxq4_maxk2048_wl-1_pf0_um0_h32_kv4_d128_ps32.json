@@ -22,6 +22,10 @@
       "value": 4,
       "description": "Fixed query length per request."
     },
+    "split_kv_allowed": {
+      "type": "const",
+      "value": 1
+    },
     "max_seq_len_q": {
       "type": "const",
       "value": 4,
@@ -88,7 +92,7 @@
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
-    "page_size in (4, 16, 32, 64, 128)",
+    "page_size in (4, 8, 16, 32, 64, 128)",
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 128",
     "max_pages_per_seq * page_size >= max(seq_lens)",

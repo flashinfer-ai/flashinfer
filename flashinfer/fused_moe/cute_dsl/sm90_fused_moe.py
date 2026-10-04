@@ -17,7 +17,7 @@ SM90 (Hopper) CuTe-DSL fused MoE, BF16/FP16.
 
 Three kernels per MoE layer:
   1. ``moe_sort``            (C++/JIT routing index maps — no data movement)
-  2. GEMM1: gather + grouped GEMM + SiLU-gating (permute fused in the A load)
+  2. GEMM1: gather + grouped GEMM + fused activation (permute fused in the A load)
   3. GEMM2: grouped GEMM + fused finalize (router-scaled scatter-reduce)
 
 Design doc: docs/design_docs/cute_dsl_moe_sm90.md.
@@ -29,9 +29,22 @@ import torch
 
 from ...api_logging import flashinfer_api
 from ...autotuner import AutoTuner
+from ...tllm_enums import (
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
+)
 from ...trace.templates.moe import cute_dsl_fused_moe_bf16_trace
 from ...utils import get_compute_capability, supported_compute_capability
-from .moe_utils import moe_output_memset_inplace, moe_sort, moe_unpermute
+from .moe_utils import (
+    moe_output_memset_inplace,
+    moe_sort,
+    moe_unpermute,
+    normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
+    validate_cute_dsl_moe_swiglu_config,
+)
 from .sm90_tuner import CuteDslFusedMoESm90Runner
 from .sm90_contiguous_gather_grouped_gemm_act_fusion import (
     sm90_contiguous_gather_grouped_gemm_act_fusion,
@@ -66,6 +79,15 @@ def _get_cuda_graph_resources() -> _CudaGraphResources:
     return _cuda_graph_resources
 
 
+def _sm90_moe_autotune_op_name(
+    activation_type: int, situ_beta: Optional[float] = None
+) -> str:
+    """Autotuner op name for one activation family (separate tuning caches)."""
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation_name = "Situ" if situ_beta is not None else activation.name
+    return f"CuteDslFusedMoE::run_moe_sm90::{activation_name}"
+
+
 def _moe_core_impl(
     x: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -87,6 +109,12 @@ def _moe_core_impl(
     gemm2_raster_along_m: bool = False,
     use_fused_finalize: bool = True,
     enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
 ) -> torch.Tensor:
     """moe_sort + GEMM1 + GEMM2 pipeline for one tactic.
 
@@ -131,7 +159,14 @@ def _moe_core_impl(
     )
     permuted_m = tile_idx_to_expert_idx.numel() * tile_size
 
-    inter = w1_weight.shape[1] // 2
+    _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    inter = w1_weight.shape[1] // (2 if gated else 1)
+    if w2_weight.shape[2] != inter:
+        raise ValueError(
+            f"w2_weight intermediate size {w2_weight.shape[2]} does not match "
+            f"w1_weight ({w1_weight.shape[1]} rows, "
+            f"{'gated' if gated else 'non-gated'} activation -> {inter})"
+        )
     if intermediate_buffer is None:
         intermediate_buffer = torch.empty(
             permuted_m, inter, dtype=x.dtype, device=x.device
@@ -172,6 +207,12 @@ def _moe_core_impl(
         cluster_shape_mn=(1, 1),
         swizzle_size=gemm1_swizzle_size,
         enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
     if use_fused_finalize:
@@ -232,30 +273,40 @@ def cute_dsl_fused_moe_bf16(
     use_fused_finalize: bool = True,
     moe_output: Optional[torch.Tensor] = None,
     enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     *,
     intermediate_buffer: Optional[torch.Tensor] = None,
     tactic: Optional[Tuple[Any, ...]] = None,
 ) -> torch.Tensor:
     """SM90 CuTe-DSL fused MoE forward (BF16/FP16, unquantized).
 
-    ``out[t] = sum_k scale[t,k] * ffn_expert(x[t]; e[t,k])`` with
+    ``out[t] = sum_k scale[t,k] * ffn_expert(x[t]; e[t,k])`` with, for the
+    default SwiGLU,
     ``ffn(x; e) = (silu(x @ w1_gate[e].T) * (x @ w1_up[e].T)) @ w2_weight[e].T``.
 
     Supported configuration:
         * Arch: SM90 (Hopper) only.
         * Dtypes: bf16 or fp16 activations and weights (must match), fp32
           accumulation; output dtype = input dtype. No quantized paths.
-        * Activation: SwiGLU (SiLU-gated) only, fused into GEMM1.
+        * Activation, fused into GEMM1: ``ActivationType.Swiglu`` (default;
+          the OAI variant via ``swiglu_alpha``/``swiglu_beta``/``swiglu_limit``,
+          SiTU via ``situ_beta``), ``ActivationType.GegluTanh``, or the
+          non-gated ``ActivationType.Relu2``.
         * Routing: pre-routed contract only — the caller runs the router and
           passes global expert ids plus **normalized** scales. ``top_k`` is a
           compile-time constant of the kernels.
         * Parallelism: TP by weight shapes; EP via ``num_local_experts`` +
           ``local_expert_offset`` (tokens routed entirely outside the local
           shard contribute zeros).
-        * Shapes: ``hidden % 64 == 0`` (GEMM1's reduction moves whole
-          64-element K tiles), ``2I % 64 == 0``, ``I % 32 == 0`` (weight
-          interleave; GEMM2's K tail is zero-filled by TMA);
-          ``num_tokens == 0`` is supported.
+        * Shapes: ``hidden % 8 == 0``; ``I % 32 == 0`` for gated activations
+          (32-column up/gate interleave), ``I % 8 == 0`` for ``Relu2``;
+          partial last K and N tiles are handled; ``num_tokens == 0`` is
+          supported.
         * Execution: CUDA-graph capturable; PDL on by default; fused
           finalize (default) is atomic and not bitwise-reproducible —
           ``use_fused_finalize=False`` selects the deterministic path.
@@ -276,9 +327,11 @@ def cute_dsl_fused_moe_bf16(
         token_selected_experts: ``[num_tokens, top_k]`` int32.
         token_final_scales: ``[num_tokens, top_k]`` float32, normalized by the
             caller.
-        w1_weight: ``[num_local_experts, 2I, hidden]`` — up/gate interleaved at 32
-            columns. Callers may cache this repack; the in-tree reference is
+        w1_weight: Gated activations: ``[num_local_experts, 2I, hidden]``,
+            up/gate interleaved at 32 columns. Callers may cache this repack;
+            the in-tree reference is
             :func:`~.sm90_contiguous_gather_grouped_gemm_act_fusion.interleave_up_gate_sm90`.
+            ``Relu2``: ``[num_local_experts, I, hidden]``, no interleave.
         w2_weight: ``[num_local_experts, hidden, I]``.
         num_experts: Total (global) expert count.
         top_k: Experts per token.
@@ -301,6 +354,16 @@ def cute_dsl_fused_moe_bf16(
             path's ``moe_unpermute``) with Programmatic Dependent Launch so
             each kernel's prologue overlaps its predecessor's tail. Numerics
             are unaffected. Part of the kernel compile cache key.
+        activation_type: GEMM1 activation, see the supported configuration
+            above. Together with the constants below it is part of the kernel
+            compile key and of the autotuner cache key.
+        swiglu_alpha: SwiGLU sigmoid multiplier (``Swiglu`` only).
+        swiglu_beta: SwiGLU up-projection bias (``Swiglu`` only).
+        swiglu_limit: SwiGLU clamp limit (``Swiglu`` only).
+        situ_beta: With ``Swiglu``, selects the SiTU gate
+            ``beta * tanh(gate / beta) * sigmoid(gate)``.
+        situ_linear_beta: Optional SiTU tanh clamp of the up branch
+            (requires ``situ_beta``).
         intermediate_buffer: Optional pre-allocated GEMM1 output buffer
             (advanced, keyword-only).
         tactic: Optional ``(tile_size, gemm1_tactic, gemm2_tactic)`` tuple
@@ -312,6 +375,9 @@ def cute_dsl_fused_moe_bf16(
     """
     if num_local_experts is None:
         num_local_experts = num_experts
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
+    validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
     num_tokens, hidden = x.shape
     if num_tokens == 0:
@@ -330,6 +396,12 @@ def cute_dsl_fused_moe_bf16(
         local_expert_offset=local_expert_offset,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
+        activation_type=int(activation),
+        swiglu_alpha=float(swiglu_alpha),
+        swiglu_beta=float(swiglu_beta),
+        swiglu_limit=float(swiglu_limit),
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     inputs = [
         x,
@@ -342,7 +414,7 @@ def cute_dsl_fused_moe_bf16(
     if tactic is not None:
         return runner(inputs, tactic=tactic, intermediate_buffer=intermediate_buffer)
     _, best_tactic = AutoTuner.get().choose_one(
-        "CuteDslFusedMoE::run_moe_sm90::Swiglu",
+        _sm90_moe_autotune_op_name(activation, situ_beta),
         [runner],
         runner.tuning_config,
         inputs,
@@ -384,6 +456,12 @@ class CuteDslBf16MoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         enable_pdl: bool = True,
         use_fused_finalize: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         """Configure the SM90 fused-MoE wrapper.
 
@@ -392,7 +470,9 @@ class CuteDslBf16MoEWrapper:
             top_k: Experts per token.
             hidden_size: Model hidden dimension.
             intermediate_size: Per-rank expert intermediate dimension
-                (``w1_weight`` is ``[E_local, 2*intermediate, hidden]`` interleaved,
+                (``w1_weight`` is ``[E_local, 2*intermediate, hidden]``
+                interleaved for gated activations or
+                ``[E_local, intermediate, hidden]`` for ``Relu2``;
                 ``w2_weight`` is ``[E_local, hidden, intermediate]``).
             num_local_experts: Experts held by this rank (EP shard);
                 defaults to ``num_experts``.
@@ -405,7 +485,24 @@ class CuteDslBf16MoEWrapper:
             use_fused_finalize: True (default) fuses the router-scaled
                 scatter-reduce into GEMM2; False selects the
                 bitwise-reproducible two-stage finalize.
+            activation_type: GEMM1 activation (``ActivationType.Swiglu``,
+                ``GegluTanh`` or ``Relu2``); see :func:`cute_dsl_fused_moe_bf16`.
+            swiglu_alpha: SwiGLU sigmoid multiplier (``Swiglu`` only).
+            swiglu_beta: SwiGLU up-projection bias (``Swiglu`` only).
+            swiglu_limit: SwiGLU clamp limit (``Swiglu`` only).
+            situ_beta: With ``Swiglu``, selects the SiTU gate with this scale.
+            situ_linear_beta: Optional SiTU tanh clamp of the up branch
+                (requires ``situ_beta``).
         """
+        activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
+        validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+        self.activation_type = int(activation)
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
+        self.swiglu_limit = float(swiglu_limit)
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -453,5 +550,11 @@ class CuteDslBf16MoEWrapper:
             intermediate_buffer=intermediate_buffer,
             use_fused_finalize=self.use_fused_finalize,
             enable_pdl=self.enable_pdl,
+            activation_type=self.activation_type,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
             tactic=tactic,
         )

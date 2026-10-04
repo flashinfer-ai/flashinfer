@@ -106,8 +106,6 @@ class QuantizationSFLayout:
     # The scale factor block rows map to data block rows in an interleaved pattern:
     # For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
     # Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-    #
-    # Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
     SWIZZLED_128x4 = 0
     SWIZZLED_8x4 = 1
     # Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
@@ -592,7 +590,6 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     workspace_tensor = torch.tensor(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
-
     if use_symm_dev_mem:
         torch.cuda.synchronize()
         comm_backend.barrier()  # must sync after create_workspace
@@ -895,6 +892,139 @@ def trtllm_allreduce_fusion(
     )
 
 
+_CakeMoeAllReduceBackend = Literal["trtllm", "cake"]
+_CAKE_MOE_ALLREDUCE_HIDDEN_DIM = 7168
+
+
+def _check_cake_moe_allreduce_backend(backend: str) -> None:
+    if backend not in ("trtllm", "cake"):
+        raise ValueError(f"unsupported MoE all-reduce backend: {backend!r}")
+
+
+def _check_cake_moe_allreduce_tensor(
+    tensor: torch.Tensor,
+    name: str,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    numel: Optional[int] = None,
+) -> None:
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}")
+    if tensor.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}")
+    if numel is not None and tensor.numel() != numel:
+        raise ValueError(f"{name} must contain {numel} elements")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _check_cake_moe_allreduce_arch(device_index: int) -> None:
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability not in ((10, 0), (10, 3)):
+        raise ValueError(
+            "Cake MoE all-reduce requires SM100 or SM103, got "
+            f"SM{capability[0]}{capability[1]}"
+        )
+
+
+def _validate_cake_moe_allreduce(
+    *,
+    world_size: int,
+    world_rank: int,
+    token_num: int,
+    hidden_dim: int,
+    workspace_ptrs: torch.Tensor,
+    residual_in: torch.Tensor,
+    rms_gamma: torch.Tensor,
+    moe_reduction_device_num_experts: int,
+    moe_reduction_scale_input: torch.Tensor,
+    moe_reduction_active_experts_token_input: torch.Tensor,
+    moe_reduction_token_input: torch.Tensor,
+    layout_code: Optional[QuantizationSFLayout],
+    moe_allreduce_out: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    norm_out: Optional[torch.Tensor],
+    quant_out: Optional[torch.Tensor],
+    scale_out: Optional[torch.Tensor],
+) -> int:
+    if moe_reduction_active_experts_token_input.device.type != "cuda":
+        raise ValueError("Cake MoE all-reduce inputs must be CUDA tensors")
+    if moe_reduction_active_experts_token_input.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise ValueError("Cake MoE all-reduce supports FP16 and BF16 only")
+    if world_size not in (2, 4, 8):
+        raise ValueError("Cake MoE all-reduce supports world_size 2, 4, or 8 only")
+    if not 0 <= world_rank < world_size:
+        raise ValueError("world_rank must be in [0, world_size)")
+    if token_num < 1:
+        raise ValueError("Cake MoE all-reduce requires at least 1 token")
+    if hidden_dim != _CAKE_MOE_ALLREDUCE_HIDDEN_DIM:
+        raise ValueError(
+            f"Cake MoE all-reduce requires hidden_dim={_CAKE_MOE_ALLREDUCE_HIDDEN_DIM}"
+        )
+
+    device = moe_reduction_active_experts_token_input.device
+    dtype = moe_reduction_active_experts_token_input.dtype
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    _check_cake_moe_allreduce_arch(device_index)
+    _check_cake_moe_allreduce_tensor(
+        workspace_ptrs,
+        "workspace_ptrs",
+        device=device,
+        dtype=torch.int64,
+    )
+    minimum_workspace_ptrs = 3 * world_size + 1
+    if workspace_ptrs.numel() < minimum_workspace_ptrs:
+        raise ValueError(
+            f"workspace_ptrs must contain at least {minimum_workspace_ptrs} pointers"
+        )
+    if moe_reduction_device_num_experts <= 0:
+        raise ValueError("moe_reduction_device_num_experts must be positive")
+    if residual_out is None or norm_out is None:
+        raise ValueError("Cake MoE all-reduce requires residual_out and norm_out")
+    if quant_out is not None or scale_out is not None or layout_code is not None:
+        raise ValueError("Cake MoE all-reduce does not support quantization")
+
+    token_elements = token_num * hidden_dim
+    expert_elements = moe_reduction_device_num_experts * token_elements
+    _check_cake_moe_allreduce_tensor(
+        moe_reduction_scale_input,
+        "moe_reduction_scale_input",
+        device=device,
+        dtype=torch.float32,
+        numel=moe_reduction_device_num_experts * token_num,
+    )
+    for tensor, name, numel in (
+        (
+            moe_reduction_active_experts_token_input,
+            "moe_reduction_active_experts_token_input",
+            expert_elements,
+        ),
+        (moe_reduction_token_input, "moe_reduction_token_input", token_elements),
+        (residual_in, "residual_in", token_elements),
+        (rms_gamma, "rms_gamma", hidden_dim),
+        (residual_out, "residual_out", token_elements),
+        (norm_out, "norm_out", token_elements),
+    ):
+        _check_cake_moe_allreduce_tensor(
+            tensor, name, device=device, dtype=dtype, numel=numel
+        )
+    if moe_allreduce_out is not None:
+        _check_cake_moe_allreduce_tensor(
+            moe_allreduce_out,
+            "moe_allreduce_out",
+            device=device,
+            dtype=dtype,
+            numel=token_elements,
+        )
+    return device_index
+
+
 def trtllm_moe_allreduce_fusion(
     world_size: int,
     world_rank: int,
@@ -917,6 +1047,8 @@ def trtllm_moe_allreduce_fusion(
     quant_out: Optional[torch.Tensor],
     scale_out: Optional[torch.Tensor],
     weight_bias: Optional[float] = None,
+    *,
+    backend: _CakeMoeAllReduceBackend = "trtllm",
 ) -> None:
     """
     Parameters:
@@ -943,7 +1075,21 @@ def trtllm_moe_allreduce_fusion(
     - weight_bias: bias added to rms_gamma before scaling.
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
+    - backend: ``"trtllm"`` (default) or the constrained ``"cake"`` SM100/SM103
+      backend. The optional backend supports contiguous FP16/BF16 tensors, world
+      sizes 2, 4 and 8, hidden_dim=7168, token payloads within the existing
+      Lamport ``MAX_COMM_SIZE`` byte limit, and residual plus norm outputs. It
+      does not support quantization. ``weight_bias`` remains a runtime value;
+      ``None`` is passed to the kernel as 0.0. ``"cake"`` runs the verified
+      source export of the Cake all-reduce union
+      (``flashinfer.jit.cake_trtllm_moe_allreduce_union``); the route binds the
+      workspace pointer table the way
+      ``trtllm_create_ipc_workspace_for_all_reduce_fusion`` registers it and
+      needs no device readback. ``moe_allreduce_out=None`` is served by the same
+      kernels writing into a scratch tensor the union loader owns.
     """
+
+    _check_cake_moe_allreduce_backend(backend)
 
     required_lamport_comm_size = moe_reduction_token_input.numel() * 2 * world_size
 
@@ -952,6 +1098,51 @@ def trtllm_moe_allreduce_fusion(
         raise ValueError(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
         )
+
+    if backend == "cake":
+        _validate_cake_moe_allreduce(
+            world_size=world_size,
+            world_rank=world_rank,
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            workspace_ptrs=workspace_ptrs,
+            residual_in=residual_in,
+            rms_gamma=rms_gamma,
+            moe_reduction_device_num_experts=moe_reduction_device_num_experts,
+            moe_reduction_scale_input=moe_reduction_scale_input,
+            moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+            moe_reduction_token_input=moe_reduction_token_input,
+            layout_code=layout_code,
+            moe_allreduce_out=moe_allreduce_out,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            quant_out=quant_out,
+            scale_out=scale_out,
+        )
+        from ..jit.cake_trtllm_moe_allreduce_union import run_cake_moe_allreduce_union
+
+        run_cake_moe_allreduce_union(
+            backend="cake",
+            world_size=world_size,
+            world_rank=world_rank,
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            workspace_ptrs=workspace_ptrs,
+            launch_with_pdl=launch_with_pdl,
+            residual_in=residual_in,
+            rms_gamma=rms_gamma,
+            rms_eps=rms_eps,
+            scale_factor=scale_factor,
+            moe_reduction_device_num_experts=moe_reduction_device_num_experts,
+            moe_reduction_scale_input=moe_reduction_scale_input,
+            moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+            moe_reduction_token_input=moe_reduction_token_input,
+            moe_allreduce_out=moe_allreduce_out,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            weight_bias=weight_bias,
+        )
+        return
 
     get_trtllm_comm_module().trtllm_moe_allreduce_fusion(
         world_size=world_size,
@@ -1010,8 +1201,10 @@ def trtllm_moe_finalize_allreduce_fusion(
     - expanded_idx_to_permuted_idx: the expanded index to permuted index tensor. [token_num, top_k]
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - residual_out: the residual output tensor. [token_num, hidden_dim]
-    - quant_out: the quant output tensor. [token_num // 4, hidden_dim], fp16/bf16 -> fp4
-    - scale_out: the scale output tensor. [token_num // SF_VEC_SIZE, hidden_dim], fp16/bf16 -> fp4
+    - quant_out: the packed FP4 output buffer, token_num * hidden_dim // 2 bytes
+      (any element type; the Cake backend checks the byte size).
+    - scale_out: the E4M3 scale output buffer in SWIZZLED_128x4 layout,
+      round_up(token_num, 128) * round_up(hidden_dim // 16, 4) bytes.
     - workspace_ptrs: the workspace pointers.
     - launch_with_pdl: whether to launch with pdl.
     - world_rank: the rank of the current process.
@@ -1047,7 +1240,6 @@ def trtllm_moe_finalize_allreduce_fusion(
         from ..jit.cake_moe_finalize_comm import run_cake_moe_finalize
 
         run_cake_moe_finalize(
-            backend="cake",
             allreduce_in=allreduce_in,
             residual_in=residual_in,
             norm_weight=norm_weight,
