@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import hashlib
 import math
 from collections import Counter
 from dataclasses import replace
@@ -41,6 +40,7 @@ from flashinfer.experimental.nvfp4_mla_decode.cake_backend import (
     V_HALVES,
     build_work_plan,
     check_pairs,
+    host_tables,
     kv_pages,
     kv_tiles,
     max_nvfp4_mla_decode_workspace_size,
@@ -189,10 +189,45 @@ def check_outputs(out, lse, ref_out, ref_lse):
     torch.testing.assert_close(lse, ref_lse, atol=LSE_ATOL, rtol=LSE_RTOL)
 
 
-def _plan_digest(plan):
-    return hashlib.sha256(
-        repr([tuple(int(v) for v in it) for it in plan.items]).encode()
-    ).hexdigest()[:16]
+def assert_plan_well_formed(plan, kv_lens, *, q_len, num_heads, enable_sink):
+    """Behavioural invariants every work plan must satisfy.
+
+    Every (request, row tile, pair row) covers its pipeline tiles exactly
+    once with contiguous, ordered splits; flags follow the split structure;
+    unit ranges partition the table into whole row pairs of one piece; the
+    launch grid is one cluster per unit.
+    """
+    m_tiles = math.ceil(q_len * num_heads / ROWS_PER_TILE)
+    covered = Counter()
+    pieces = {}
+    for it in plan.items:
+        b, m_tile, pair_row, start, end, split, num_splits, flags = it
+        assert 0 <= b < len(kv_lens) and 0 <= m_tile < m_tiles and pair_row in (0, 1)
+        assert 0 <= start < end <= kv_tiles(kv_lens[b]), it
+        assert 0 <= split < num_splits <= MAX_SPLITS, it
+        assert ((flags & FLAG_DIRECT_OUT) != 0) == (num_splits == 1), it
+        assert ((flags & FLAG_SEED_SINK) != 0) == (enable_sink and split == 0), it
+        for t in range(start, end):
+            covered[(b, m_tile, pair_row, t)] += 1
+        pieces.setdefault((b, m_tile, pair_row), {})[split] = (start, end, num_splits)
+    want = sum(kv_tiles(kv) for kv in kv_lens) * m_tiles * V_HALVES
+    assert len(covered) == want and max(covered.values()) == 1
+    for key, splits in pieces.items():
+        counts = {s[2] for s in splits.values()}
+        assert counts == {len(splits)} and sorted(splits) == list(range(len(splits))), (
+            key
+        )
+        ordered = [splits[s] for s in sorted(splits)]
+        assert ordered[0][0] == 0 and ordered[-1][1] == kv_tiles(kv_lens[key[0]])
+        for (_, e0, _), (s1, _, _) in zip(ordered, ordered[1:], strict=False):
+            assert e0 == s1
+    assert plan.max_splits == max(len(s) for s in pieces.values())
+    assert plan.unit_first[0] == 0 and plan.unit_first[-1] == plan.num_items
+    assert all(
+        a < b for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    )
+    check_pairs(plan)
+    assert plan.grid == (CLUSTER_PAIR * plan.num_units, 1, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +298,8 @@ def test_q_len_is_derived_from_query_rows(q_len):
         inputs["block_tables"],
         inputs["seq_lens"],
     )
-    assert (batch, num_heads, num_pages, got) == (
-        3,
-        64,
-        inputs["kv_cache"].shape[0],
-        q_len,
-    )
+    assert (batch, num_heads, got) == (3, 64, q_len)
+    assert num_pages == sum(kv_pages(kv) for kv in [64, 100, 130])
 
 
 @pytest.mark.parametrize("kv_lens,num_heads,q_len", [([512, 300], 8, 6), ([64], 64, 1)])
@@ -276,7 +307,6 @@ def test_rejects_fewer_than_128_query_rows(kv_lens, num_heads, q_len):
     inputs = make_inputs(
         kv_lens, num_heads, q_len=q_len, enable_sink=False, device="cpu"
     )
-    assert len(kv_lens) * q_len * num_heads < ROWS_PER_TILE
     with pytest.raises(ValueError, match="must be >= 128"):
         cake_backend.validate_nvfp4_mla_decode_inputs(
             inputs["query"],
@@ -288,108 +318,28 @@ def test_rejects_fewer_than_128_query_rows(kv_lens, num_heads, q_len):
         )
 
 
-# Expected values computed once from the source host plan module for the same
-# shapes (128-token pipeline tiles; cluster of two CTAs per unit; balanced
-# schedule over num_sms // 2 units; uniform schedule pairs consecutive items). Columns: schedule, kv_lens,
-# q_len, num_heads, num_sms, tiles_per_split, enable_sink -> (num_items,
-# num_units, grid_x, max_splits, tiles_per_split, item digest).
+# Plan geometry of the shapes the GPU tests run (128-token pipeline tiles;
+# cluster of two CTAs per unit; balanced schedule over num_sms // 2 units;
+# uniform schedule pairs consecutive rows). Columns: schedule, kv_lens, q_len,
+# num_heads, num_sms, tiles_per_split, enable_sink -> (num_items, num_units,
+# grid_x, max_splits, tiles_per_split). The item list itself is checked by
+# ``assert_plan_well_formed``.
 PLAN_EXPECTATIONS = [
-    (
-        "balanced",
-        [256, 300],
-        6,
-        64,
-        148,
-        None,
-        True,
-        (12, 1, 2, 1, None, "9e9b3c2f79b9c8c9"),
-    ),
-    (
-        "balanced",
-        [8192] * 4,
-        6,
-        64,
-        148,
-        None,
-        False,
-        (168, 74, 148, 7, None, "4ea8c4a75a2e39ec"),
-    ),
+    ("balanced", [256, 300], 6, 64, 148, None, True, (12, 1, 2, 1, None)),
+    ("balanced", [8192] * 4, 6, 64, 148, None, False, (168, 74, 148, 7, None)),
     # contract row partial_pages_h8
-    (
-        "balanced",
-        [1000, 8192, 5000],
-        6,
-        8,
-        148,
-        None,
-        True,
-        (28, 14, 28, 8, None, "59301522e221c0dc"),
-    ),
-    (
-        "balanced",
-        [131072, 64],
-        1,
-        64,
-        148,
-        None,
-        False,
-        (76, 37, 74, 37, None, "a3819a3ff83857a9"),
-    ),
+    ("balanced", [1000, 8192, 5000], 6, 8, 148, None, True, (28, 14, 28, 8, None)),
+    ("balanced", [131072, 64], 1, 64, 148, None, False, (76, 37, 74, 37, None)),
     # contract row bs32_q6_kv8k (auto -> balanced at the 8K threshold)
-    (
-        "auto",
-        [8192] * 32,
-        6,
-        64,
-        148,
-        None,
-        True,
-        (336, 74, 148, 2, None, "572f292c9a1a8d4e"),
-    ),
-    (
-        "uniform",
-        [64, 4096],
-        6,
-        64,
-        148,
-        16,
-        False,
-        (18, 9, 18, 2, 16, "cfc9d381b510474e"),
-    ),
+    ("auto", [8192] * 32, 6, 64, 148, None, True, (336, 74, 148, 2, None)),
+    ("uniform", [64, 4096], 6, 64, 148, 16, False, (18, 9, 18, 2, 16)),
     # contract row smoke, forced to two splits (tiles_per_split = ceil(3 / 2))
-    ("auto", [256, 300], 6, 64, 148, 2, True, (18, 9, 18, 2, 2, "0158765222990d70")),
-    (
-        "uniform",
-        [8192] * 32,
-        6,
-        64,
-        148,
-        None,
-        False,
-        (192, 96, 192, 1, 64, "d75ce1d28bf7186c"),
-    ),
-    ("uniform", [777, 65], 1, 64, 148, None, True, (4, 2, 4, 1, 7, "8c4b53efc0be2f5d")),
+    ("auto", [256, 300], 6, 64, 148, 2, True, (18, 9, 18, 2, 2)),
+    ("uniform", [8192] * 32, 6, 64, 148, None, False, (192, 96, 192, 1, 64)),
+    ("uniform", [777, 65], 1, 64, 148, None, True, (4, 2, 4, 1, 7)),
     # contract row no_sink_q1 (auto -> uniform)
-    (
-        "auto",
-        [64, 65, 4096, 777],
-        1,
-        64,
-        148,
-        None,
-        False,
-        (8, 4, 8, 1, 32, "34d565175b0aecd4"),
-    ),
-    (
-        "uniform",
-        [16384, 12000],
-        6,
-        64,
-        148,
-        None,
-        False,
-        (12, 6, 12, 1, 128, "4928f9d56ffee550"),
-    ),
+    ("auto", [64, 65, 4096, 777], 1, 64, 148, None, False, (8, 4, 8, 1, 32)),
+    ("uniform", [16384, 12000], 6, 64, 148, None, False, (12, 6, 12, 1, 128)),
 ]
 
 
@@ -397,7 +347,7 @@ PLAN_EXPECTATIONS = [
     "schedule,kv_lens,q_len,num_heads,num_sms,tiles_per_split,enable_sink,expected",
     PLAN_EXPECTATIONS,
 )
-def test_plan_matches_source_host_plan(
+def test_plan_geometry_and_invariants(
     schedule, kv_lens, q_len, num_heads, num_sms, tiles_per_split, enable_sink, expected
 ):
     plan = build_work_plan(
@@ -415,19 +365,28 @@ def test_plan_matches_source_host_plan(
         plan.grid[0],
         plan.max_splits,
         plan.tiles_per_split,
-        _plan_digest(plan),
     )
     assert got == expected
-    assert plan.grid == (CLUSTER_PAIR * plan.num_units, 1, 1)
+    assert_plan_well_formed(
+        plan, kv_lens, q_len=q_len, num_heads=num_heads, enable_sink=enable_sink
+    )
     if schedule == "auto":
         assert plan.schedule == (
             "balanced" if max(kv_lens) >= BALANCED_MIN_KV else "uniform"
         )
     if plan.schedule == "uniform":
         assert plan.unit_first == tuple(range(0, plan.num_items + 1, CLUSTER_PAIR))
+        assert all(it[4] - it[3] <= plan.tiles_per_split for it in plan.items)
+    else:
+        assert plan.num_units <= num_sms // CLUSTER_PAIR
+        tiles = [
+            sum(it[4] - it[3] for it in plan.items[a:b])
+            for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+        ]
+        assert max(tiles) - min(tiles) <= 2 * V_HALVES
 
 
-def test_balanced_unit_first_matches_source():
+def test_balanced_units_are_contiguous_in_request_major_order():
     plan = build_work_plan(
         [256, 300],
         num_heads=64,
@@ -445,10 +404,13 @@ def test_balanced_unit_first_matches_source():
         enable_sink=True,
         schedule="balanced",
     )
-    assert plan.unit_first[:4] == (0, 4, 8, 12) and plan.unit_first[-3:] == (
-        328,
-        332,
-        336,
+    # Every unit receives whole pairs of one piece; the request-major order of
+    # the pieces is preserved across unit boundaries.
+    keys = [(it[0], it[1], it[3]) for it in plan.items[::V_HALVES]]
+    assert keys == sorted(keys)
+    assert all(
+        (b - a) % V_HALVES == 0
+        for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
     )
 
 
@@ -522,15 +484,9 @@ def test_balanced_plan_covers_every_page_once(kv_lens, num_heads, num_sms):
         schedule="balanced",
     )
     assert plan.max_splits <= MAX_SPLITS and plan.num_units <= num_sms // CLUSTER_PAIR
-    assert plan.unit_first[0] == 0 and plan.unit_first[-1] == plan.num_items
-    covered = Counter()
-    for it in plan.items:
-        assert 0 <= it[3] < it[4]
-        for t in range(it[3], it[4]):
-            covered[(it[0], it[1], it[2], t)] += 1
-    m_tiles = math.ceil(6 * num_heads / ROWS_PER_TILE)
-    want = sum(kv_tiles(kv) for kv in kv_lens) * m_tiles * V_HALVES
-    assert len(covered) == want and max(covered.values()) == 1
+    assert_plan_well_formed(
+        plan, kv_lens, q_len=6, num_heads=num_heads, enable_sink=True
+    )
     pages = [
         sum(it[4] - it[3] for it in plan.items[a:b])
         for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
@@ -720,6 +676,7 @@ def test_quantize_nvfp4_roundtrip_and_saturation():
     packed, scale = quantize_nvfp4(x)
     assert packed.shape == (4, 3, ROW_BYTES) and packed.dtype == torch.uint8
     assert scale.shape == (4, 3, SF_ROW_BYTES) and scale.dtype == torch.uint8
+    assert packed.is_contiguous() and scale.is_contiguous()
     decoded = dequantize_nvfp4(packed, scale)
     # The coarsest E2M1 bin (4 -> 6) has a half-step of one normalized unit,
     # so every element is within one decoded block scale of its source.
@@ -802,8 +759,34 @@ def _gpu_skip_reason():
     if torch.cuda.get_device_capability() not in SUPPORTED_COMPUTE_CAPABILITIES:
         return "SM100 or SM103 required"
     if not cake_backend.generated_program_available(torch.device("cuda")):
-        return "generated program not registered in this checkout (flashinfer-ai/flashinfer#5403)"
+        return "generated programs not registered for this device"
     return None
+
+
+def test_host_tables_image_matches_the_workspace_regions():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required (pinned host memory)")
+    batch, q_len, heads = 4, 6, 64
+    kv_lens = [8192] * batch
+    plan = build_work_plan(kv_lens, num_heads=heads, num_sms=16, q_len=q_len)
+    layout = workspace_layout(plan, batch=batch, num_heads=heads, q_len=q_len)
+    q_indptr = _q_indptr(batch, q_len)
+    row_splits = token_splits(
+        plan, q_indptr, q_len=q_len, num_heads=heads, total_q=batch * q_len
+    )
+    image = host_tables(plan, layout, q_indptr=q_indptr, row_splits=row_splits)
+    assert image.is_pinned() and image.dtype == torch.int32
+    base = layout["work_table"][0]
+    assert image.numel() * 4 == layout["q_indptr"][0] + layout["q_indptr"][1] - base
+
+    def region(name):
+        offset, nbytes = layout[name]
+        return image[(offset - base) // 4 : (offset - base + nbytes) // 4]
+
+    assert torch.equal(region("work_table"), work_table_rows(plan).reshape(-1))
+    assert region("unit_first").tolist() == list(plan.unit_first)
+    assert region("row_splits").tolist() == row_splits
+    assert region("q_indptr").tolist() == q_indptr
 
 
 def test_rejects_unsupported_compute_capability():
@@ -854,7 +837,10 @@ def test_nvfp4_mla_decode(
         nbytes = max_nvfp4_mla_decode_workspace_size(
             len(kv_lens), num_heads, q_len=q_len
         )
-    workspace = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+    # Poisoned workspace: prepare does not initialize the partial regions, so
+    # every slot the kernels read must be written by them first (0xFF bytes are
+    # NaN as BF16 / FP32 and -1 as int32).
+    workspace = torch.full((nbytes,), 0xFF, dtype=torch.uint8, device="cuda")
     out = torch.empty(
         (len(kv_lens) * q_len, num_heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda"
     )
@@ -881,13 +867,25 @@ def test_nvfp4_mla_decode(
     )
     assert decode.main_kwargs["grid"] == (CLUSTER_PAIR * decode.plan.num_units, 1, 1)
     assert decode.main_kwargs["q_len"] == q_len
+    assert_plan_well_formed(
+        decode.plan, kv_lens, q_len=q_len, num_heads=num_heads, enable_sink=enable_sink
+    )
+    total_q = len(kv_lens) * q_len
+    q_indptr = _q_indptr(len(kv_lens), q_len)
+    torch.cuda.synchronize()  # the single table upload is asynchronous
+    assert torch.equal(
+        decode.main_kwargs["work_table"].cpu(), work_table_rows(decode.plan)
+    )
+    assert decode.main_kwargs["unit_first"].cpu().tolist() == list(
+        decode.plan.unit_first
+    )
+    assert decode.main_kwargs["q_indptr"].cpu().tolist() == q_indptr
     if tiles_per_split is not None:
         assert decode.plan.max_splits >= 2 and decode.reduce_kwargs is not None
     if decode.reduce_kwargs is not None:
-        total_q = len(kv_lens) * q_len
         expected_splits = token_splits(
             decode.plan,
-            list(range(0, total_q + 1, q_len)),
+            q_indptr,
             q_len=q_len,
             num_heads=num_heads,
             total_q=total_q,

@@ -39,45 +39,10 @@ from ...utils import get_compute_capability, get_device_sm_count
 
 # Filled by the generated-program export.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_selective_state_update_193ec52bcf392c460694": {
+    "cake_selective_state_update_08b0852b0be22a7ed2d8": {
         "sources": [
-            "cake_selective_state_update_193ec52bcf392c460694_kernel.cu",
-            "cake_selective_state_update_193ec52bcf392c460694_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "state"],
-            ["buffer", "x"],
-            ["buffer", "dt"],
-            ["buffer", "A"],
-            ["buffer", "B"],
-            ["buffer", "C"],
-            ["buffer", "D"],
-            ["buffer", "dt_bias"],
-            ["buffer", "output"],
-            ["buffer", "state_batch_indices"],
-            ["parameter", "batch_size"],
-            ["parameter", "nheads"],
-            ["parameter", "dim"],
-            ["parameter", "dstate"],
-            ["parameter", "ngroups"],
-            ["parameter", "token_steps"],
-            ["parameter", "state_stride_slot"],
-            ["parameter", "dt_softplus"],
-            ["parameter", "pad_slot_id"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "da18be482abf6e525927d0db8bada0b863c66bf2366a276f1ee478349feb2161",
-        "defines": [],
-        "instantiations": {},
-    },
-    "cake_selective_state_update_7eca5f0fb4a7e3324042": {
-        "sources": [
-            "cake_selective_state_update_7eca5f0fb4a7e3324042_kernel.cu",
-            "cake_selective_state_update_7eca5f0fb4a7e3324042_binding.cu",
+            "cake_selective_state_update_08b0852b0be22a7ed2d8_kernel.cu",
+            "cake_selective_state_update_08b0852b0be22a7ed2d8_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -104,55 +69,14 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "78bb4ee8c5ade2215a44b6b10795b50b632b99ebc057046fd6a77f73ecd3ef8b",
+        "closure_sha256": "5d4c58c266249a6d8c12f0d11915a7f8c205474b4a0255cf19b3f349d5c99adc",
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_80b494053f17b2b9b178": {
+    "cake_selective_state_update_0aac35fc16c30d81a328": {
         "sources": [
-            "cake_selective_state_update_80b494053f17b2b9b178_kernel.cu",
-            "cake_selective_state_update_80b494053f17b2b9b178_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "state"],
-            ["buffer", "x"],
-            ["parameter", "dt_addr"],
-            ["parameter", "a_addr"],
-            ["buffer", "B"],
-            ["buffer", "C"],
-            ["parameter", "d_addr"],
-            ["buffer", "z"],
-            ["parameter", "dt_bias_addr"],
-            ["buffer", "output"],
-            ["buffer", "state_batch_indices"],
-            ["buffer", "dst_state_batch_indices"],
-            ["parameter", "nheads"],
-            ["parameter", "ngroups"],
-            ["parameter", "dim_tiles"],
-            ["parameter", "state_stride_slot"],
-            ["parameter", "dt_batch_stride"],
-            ["parameter", "dt_head_stride"],
-            ["parameter", "a_head_stride"],
-            ["parameter", "d_head_stride"],
-            ["parameter", "dt_bias_head_stride"],
-            ["parameter", "dt_softplus"],
-            ["parameter", "has_z"],
-            ["parameter", "disable_state_update"],
-            ["parameter", "pad_slot_id"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "closure_sha256": "ca75e15832c7f20d81118b70870bc41fd3d009811a309b209ee46aaf1fd42b2b",
-        "defines": [],
-        "instantiations": {},
-    },
-    "cake_selective_state_update_aefe43c6cb600cfd08f3": {
-        "sources": [
-            "cake_selective_state_update_aefe43c6cb600cfd08f3_kernel.cu",
-            "cake_selective_state_update_aefe43c6cb600cfd08f3_binding.cu",
+            "cake_selective_state_update_0aac35fc16c30d81a328_kernel.cu",
+            "cake_selective_state_update_0aac35fc16c30d81a328_binding.cu",
         ],
         "compile_flags": ["--fmad=false"],
         "ffi_entry": "run",
@@ -176,14 +100,14 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "755effe3524dad4b3fcc4e31a3a16f1af2dedcda72060cd88927450a1ff4860c",
+        "closure_sha256": "77d68f4e98b735cb546711b906efa1c4ba757b1d1010b552868a7f2e3d4623a9",
         "defines": [],
         "instantiations": {},
     },
-    "cake_selective_state_update_e300725b6cb20c94fe61": {
+    "cake_selective_state_update_4ececa3a791410c1bb3a": {
         "sources": [
-            "cake_selective_state_update_e300725b6cb20c94fe61_kernel.cu",
-            "cake_selective_state_update_e300725b6cb20c94fe61_binding.cu",
+            "cake_selective_state_update_4ececa3a791410c1bb3a_kernel.cu",
+            "cake_selective_state_update_4ececa3a791410c1bb3a_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -209,7 +133,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "closure_sha256": "191e3d971af673ee90a11c42c6b67e1cb5728c5aa74126014068fde90b91ea26",
+        "closure_sha256": "5f68e76d091d95d304d2e2119b501ff33b3f3720a737ee3e438f638d9432727b",
         "defines": [
             "COEFFICIENT_BF16",
             "INDEX_I32",
@@ -269,13 +193,89 @@ MODULES: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "cake_selective_state_update_a22e10ee14cc5c07acb7": {
+        "sources": [
+            "cake_selective_state_update_a22e10ee14cc5c07acb7_kernel.cu",
+            "cake_selective_state_update_a22e10ee14cc5c07acb7_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "state"],
+            ["buffer", "x"],
+            ["parameter", "dt_addr"],
+            ["parameter", "a_addr"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["parameter", "d_addr"],
+            ["buffer", "z"],
+            ["parameter", "dt_bias_addr"],
+            ["buffer", "output"],
+            ["buffer", "state_batch_indices"],
+            ["buffer", "dst_state_batch_indices"],
+            ["parameter", "nheads"],
+            ["parameter", "ngroups"],
+            ["parameter", "dim_tiles"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "dt_batch_stride"],
+            ["parameter", "dt_head_stride"],
+            ["parameter", "a_head_stride"],
+            ["parameter", "d_head_stride"],
+            ["parameter", "dt_bias_head_stride"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "has_z"],
+            ["parameter", "disable_state_update"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "fbd3088b0ea10286305d02857d24c502031029b70a4f81275211230c05905657",
+        "defines": [],
+        "instantiations": {},
+    },
+    "cake_selective_state_update_a623bc5b6863d0333670": {
+        "sources": [
+            "cake_selective_state_update_a623bc5b6863d0333670_kernel.cu",
+            "cake_selective_state_update_a623bc5b6863d0333670_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "state"],
+            ["buffer", "x"],
+            ["buffer", "dt"],
+            ["buffer", "A"],
+            ["buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "D"],
+            ["buffer", "dt_bias"],
+            ["buffer", "output"],
+            ["buffer", "state_batch_indices"],
+            ["parameter", "batch_size"],
+            ["parameter", "nheads"],
+            ["parameter", "dim"],
+            ["parameter", "dstate"],
+            ["parameter", "ngroups"],
+            ["parameter", "token_steps"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "dt_softplus"],
+            ["parameter", "pad_slot_id"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "acaf9008565a79c955c63733dac855699aa8a5e3f88d717a131920d40e801ea3",
+        "defines": [],
+        "instantiations": {},
+    },
 }
 PROGRAMS: dict[str, str] = {
-    "dynamic": "cake_selective_state_update_aefe43c6cb600cfd08f3",
-    "mtp_cache_c4_t6": "cake_selective_state_update_e300725b6cb20c94fe61",
-    "mtp_horizontal": "cake_selective_state_update_7eca5f0fb4a7e3324042",
-    "mtp_short": "cake_selective_state_update_193ec52bcf392c460694",
-    "stp_fp32_identity": "cake_selective_state_update_80b494053f17b2b9b178",
+    "dynamic": "cake_selective_state_update_0aac35fc16c30d81a328",
+    "mtp_cache_c4_t6": "cake_selective_state_update_4ececa3a791410c1bb3a",
+    "mtp_horizontal": "cake_selective_state_update_08b0852b0be22a7ed2d8",
+    "mtp_short": "cake_selective_state_update_a623bc5b6863d0333670",
+    "stp_fp32_identity": "cake_selective_state_update_a22e10ee14cc5c07acb7",
 }
 
 _ARCH_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
@@ -335,6 +335,22 @@ def jit_spec(
         extra_include_paths=[source_dir, source_dir.parent, _include_dir()],
         use_fast_math=False,
     )
+
+
+def gen_cake_selective_state_update_modules(arch: str) -> list[JitSpec]:
+    """Build specifications of every delivered program and instantiation for ``arch`` (the AOT table).
+
+    The shipped BF16 single-token programs are built from their embedded device sources at first
+    use and have no build specification; a disabled JIT with a cache that lacks one of these
+    specifications makes the loader hand the call to FlashInfer.
+    """
+    specs: list[JitSpec] = []
+    for module, record in MODULES.items():
+        instantiations = record["instantiations"] or {"": {}}
+        for values in instantiations.values():
+            defines = tuple((name, int(values[name])) for name in record["defines"])
+            specs.append(jit_spec(module, arch, defines))
+    return specs
 
 
 class _Program:

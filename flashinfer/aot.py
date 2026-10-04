@@ -160,6 +160,9 @@ from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
 )
+from .jit.mamba.cake_selective_state_update import (
+    gen_cake_selective_state_update_modules,
+)
 from .jit.mhc import gen_mhc_module
 from .jit.cake_minimax_h3_mxfp8 import (
     MiniMaxH3Mxfp8Target,
@@ -633,6 +636,12 @@ def gen_all_modules(
     has_cake_megamoe_topk_reduce_sm103a = sm_capabilities.get(
         "cake_megamoe_topk_reduce_sm103a", False
     )
+    has_cake_selective_state_update_sm100a = sm_capabilities.get(
+        "cake_selective_state_update_sm100a", False
+    )
+    has_cake_selective_state_update_sm103a = sm_capabilities.get(
+        "cake_selective_state_update_sm103a", False
+    )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm103a_exact = sm_capabilities.get("sm103a_exact", False)
@@ -839,6 +848,11 @@ def gen_all_modules(
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
         if has_cake_megamoe_topk_reduce_sm103a:
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_103a"))
+        # Cake selective state update: every delivered program instantiation per architecture.
+        if has_cake_selective_state_update_sm100a:
+            jit_specs.extend(gen_cake_selective_state_update_modules("sm_100a"))
+        if has_cake_selective_state_update_sm103a:
+            jit_specs.extend(gen_cake_selective_state_update_modules("sm_103a"))
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
@@ -1411,6 +1425,14 @@ def detect_sm_capabilities():
             and cuda_version >= Version("12.8")
         ),
         "cake_megamoe_topk_reduce_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.9")
+        ),
+        "cake_selective_state_update_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "cake_selective_state_update_sm103a": (
             (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
             and cuda_version >= Version("12.9")
         ),
