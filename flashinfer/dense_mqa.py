@@ -84,30 +84,37 @@ def fp8_mqa_logits(
     )
 
 
-def dense_route_available(num_heads, queries, keys, precision="fp8"):
-    """Host-only admission of one ``(precision, H, Q, K)`` point: True when the shipped catalog carries its
-    route.  This is the table the engine consults before taking the Cake route; a 64-head tier that the
-    producer withheld (``dense_admission()``) has no record, so the engine keeps its stock kernel there."""
+def dense_route_available(num_heads, queries, keys, precision="fp8", *, arch=None):
+    """Host-only admission of one ``(precision, H, Q, K)`` point on ``arch``: True when the shipped catalog
+    carries its route and the route is admitted there.  This is the table the engine consults before taking
+    the Cake route; a 64-head tier the producer withheld on an architecture (``dense_admission(arch)``) is not
+    served there, so the engine keeps its stock kernel.  ``arch`` (:func:`device_arch` of the device, e.g.
+    ``"sm_100a"``) may be omitted only where the architectures agree on the route; otherwise ``ValueError``."""
     from .experimental.deepgemm_dense_mqa.dense_mqa import dense_route_available as _available
 
-    return _available(num_heads, queries, keys, precision)
+    return _available(num_heads, queries, keys, precision, arch=arch)
 
 
-def dense_admission():
-    """The 64-head dense family's per-tier admission, host-only, straight from the shipped catalog.
+def device_arch(device):
+    """Generated-program architecture of a CUDA device (``"sm_100a"`` / ``"sm_103a"``); the ``arch`` argument
+    of :func:`dense_route_available` and :func:`dense_admission`."""
+    from .experimental.deepgemm_dense_mqa.dense_mqa import device_arch as _device_arch
 
-    Returns ``{"admitted_routes": [...], "withheld_routes": [...], "reason": str | None}``: ``admitted_routes``
-    are the ``fp8:h64:*`` route names the catalog ships (every query count of those tiers is served),
-    ``withheld_routes`` the tier names the producer measured and did not admit (the engine keeps stock
-    DeepGEMM there; ``reason`` names why), and the two sets are disjoint.  Head counts other than 64 are
-    admitted by the ``routes`` table alone (``dense_route_available``).
+    return _device_arch(device)
+
+
+def dense_admission(arch=None):
+    """The 64-head dense family's per-tier, per-architecture admission, host-only, from the shipped catalog.
+
+    ``dense_admission(arch)`` returns ``{"admitted_routes": [...], "withheld_routes": [...], "reason": str | None}``
+    for one architecture: ``admitted_routes`` are the ``fp8:h64:*`` route names served there (every query count
+    of those tiers), ``withheld_routes`` the tier names the producer measured and did not admit there (the engine
+    keeps stock DeepGEMM; ``reason`` names why), disjoint lists; all empty when the catalog has no 64-head
+    family.  ``dense_admission()`` returns that record for every catalogued architecture, keyed by arch.  Head
+    counts other than 64 are admitted by the ``routes`` table alone (``dense_route_available``).
     """
-    from .experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+    from .experimental.deepgemm_dense_mqa.dense_mqa import _catalog, h64_admission
 
-    catalog = _catalog()
-    policy = catalog["policy"].get("dense_admission", {})
-    admitted = policy.get("admitted_routes")
-    if admitted is None:  # catalogs that predate the published set: the routes table is the admission
-        admitted = [route for route in catalog["routes"] if route.startswith("fp8:h64:")]
-    withheld = sorted(policy.get("withheld_routes", []))
-    return {"admitted_routes": sorted(admitted), "withheld_routes": withheld, "reason": policy.get("reason")}
+    if arch is None:
+        return {name: h64_admission(name) for name in sorted(_catalog()["arches"])}
+    return h64_admission(arch)

@@ -396,9 +396,17 @@ def test_dense_route_table_is_catalog_driven():
         assert _runtime.route_name("fp8", 1024, 5124, 64) == "fp8:h64:full:le1024"
         # W-dense contract: single-stage gridDim-strided programs, no metadata stage, no query bound.
         assert not _runtime.schedules_metadata(64) and _runtime.max_queries(64) is None
-        assert _runtime.dense_route_available(64, 37, 4137)
-        assert _runtime.dense_route_available(64, 100_000, 7)
-        record = _runtime.route_record("fp8", 37, 4137, 64)
+        # Availability of a 64-head point is decided per architecture (policy.dense_admission).
+        for arch in sorted(_runtime._catalog()["arches"]):
+            admitted = set(_runtime.h64_admission(arch)["admitted_routes"])
+            assert _runtime.dense_route_available(64, 37, 4137, arch=arch) == (
+                "fp8:h64:partial:le64" in admitted
+            )
+            assert _runtime.dense_route_available(64, 100_000, 7, arch=arch) == (
+                "fp8:h64:full:any" in admitted
+            )
+        h64_route = next(r for r in _runtime._catalog()["routes"] if r.startswith("fp8:h64:"))
+        record = _runtime._catalog()["routes"][h64_route]
         assert record["clean_logits"] == "raw" and record["kv_alignment"] == 1
         assert [stage for stage, _p in record["stages"]] == ["logits"]
         assert _runtime.program_names("fp8:h64:q1") == ["fp8_h64_logits_partial"]
@@ -431,8 +439,9 @@ def test_fp8_mqa_logits_one_shot(queries, keys, heads):
     same bits whether ``clean_logits`` is passed or not, and ``max_seqlen_k``
     rejected."""
     _skip_unless_exported()
-    if not _runtime.dense_route_available(heads, queries, keys):
-        pytest.skip(f"catalog has no route for H={heads}, Q={queries}, K={keys}")
+    arch = _runtime.device_arch(torch.device("cuda"))
+    if not _runtime.dense_route_available(heads, queries, keys, arch=arch):
+        pytest.skip(f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}")
     from flashinfer.dense_mqa import fp8_mqa_logits
 
     torch.manual_seed(3)
@@ -504,8 +513,9 @@ def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
     bits (an empty capture leaves the poison and fails), and the logits are
     non-trivial."""
     _skip_unless_exported()
-    if not _runtime.dense_route_available(heads, queries, keys):
-        pytest.skip(f"catalog has no route for H={heads}, Q={queries}, K={keys}")
+    arch = _runtime.device_arch(torch.device("cuda"))
+    if not _runtime.dense_route_available(heads, queries, keys, arch=arch):
+        pytest.skip(f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}")
     from flashinfer.dense_mqa import fp8_mqa_logits
 
     torch.manual_seed(5)
@@ -610,13 +620,15 @@ def test_catalog_programs_are_delivered_and_distinct():
 
 
 def test_h64_admission_matches_the_catalog_table():
-    """Host-only: the shipped per-tier allow-list of the 64-head family is the catalog's ``routes`` table.
-    Every route name the policy lists as withheld has no record and is unavailable for every query count
-    of its tier; every other 64-head tier is available iff its record exists."""
+    """Host-only: the shipped allow-list of the 64-head family is decided per architecture
+    (``policy.dense_admission``): on every catalogued arch the admitted and withheld tier names are disjoint
+    and together name every 64-head tier (none when the family is not exported), a reason accompanies a
+    non-empty withheld list, every admitted route has a catalog record, and ``dense_route_available`` on that
+    arch is True exactly for the query counts of admitted tiers. Without ``arch`` the architectures must
+    agree, otherwise the call raises (no silent admit)."""
     catalog = _runtime._catalog()
-    admission = catalog["policy"].get("dense_admission", {})
-    withheld = set(admission.get("withheld_routes", []))
-    assert withheld <= {
+    arches = sorted(catalog["arches"])
+    tiers = {
         "fp8:h64:q1",
         *(
             f"fp8:h64:{kind}:{tier}"
@@ -624,17 +636,32 @@ def test_h64_admission_matches_the_catalog_table():
             for tier in ("le8", "le64", "le1024", "any")
         ),
     }
-    assert not withheld & set(catalog["routes"])
-    assert bool(withheld) == (admission.get("reason") is not None)
-    if 64 not in _runtime.heads():
-        assert not withheld
-        return
-    for queries in (1, 2, 3, 8, 9, 16, 37, 64, 65, 128, 1024, 1025, 4096, 100_000):
-        route = _runtime.route_name("fp8", queries, 300, 64)
-        assert _runtime.dense_route_available(64, queries, 300) == (
-            route in catalog["routes"]
-        ), (queries, route)
-        assert (route in catalog["routes"]) == (route not in withheld), (queries, route)
+    verdicts, sample = {}, {}
+    for arch in arches:
+        admission = _runtime.h64_admission(arch)
+        admitted, withheld = set(admission["admitted_routes"]), set(admission["withheld_routes"])
+        assert admitted <= tiers and withheld <= tiers and not admitted & withheld
+        assert admitted <= set(catalog["routes"])
+        assert bool(withheld) == (admission["reason"] is not None)
+        if 64 not in _runtime.heads():
+            assert not admitted and not withheld
+            continue
+        assert admitted | withheld == tiers
+        for queries in (1, 2, 3, 8, 9, 16, 37, 64, 65, 128, 1024, 1025, 4096, 100_000):
+            route = _runtime.route_name("fp8", queries, 300, 64)
+            assert _runtime.dense_route_available(64, queries, 300, arch=arch) == (
+                route in admitted
+            ), (arch, queries, route)
+            verdicts.setdefault(route, set()).add(route in admitted)
+            sample.setdefault(route, queries)
+    for route, outcomes in verdicts.items():
+        if len(outcomes) == 1:
+            assert _runtime.dense_route_available(64, sample[route], 300, arch=None) == outcomes.pop()
+        else:
+            with pytest.raises(ValueError, match="pass arch"):
+                _runtime.dense_route_available(64, sample[route], 300, arch=None)
+    with pytest.raises(ValueError, match="arch must be one of"):
+        _runtime.h64_admission("sm_999x")
 
 
 def _route_point(route_name, record):
@@ -672,11 +699,10 @@ def test_dense_bindings_cover_every_program_argument():
         precision = route_name.split(":")[0]
         num_heads, bq = int(record["num_heads"]), int(record["block_q"])
         queries, keys = _route_point(route_name, record)
-        assert _runtime.dense_route_available(num_heads, queries, keys, precision), (
-            route_name,
-            queries,
-            keys,
-        )
+        assert any(
+            _runtime.dense_route_available(num_heads, queries, keys, precision, arch=arch)
+            for arch in catalog["arches"]
+        ), (route_name, queries, keys)
         starts = torch.zeros(queries, dtype=torch.int32)
         ends = torch.full((queries,), keys, dtype=torch.int32)
         if precision == "fp4":

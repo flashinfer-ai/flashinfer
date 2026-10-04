@@ -216,11 +216,15 @@ def _kv_scales_view(kv_scales, keys):
     return kv_scales.as_strided((1, keys), (needed, 1))
 
 
-def dense_route_available(num_heads, queries, keys, precision="fp8"):
-    """True when the shipped catalog carries a route for ``(precision, num_heads, queries, keys)``.
+def dense_route_available(num_heads, queries, keys, precision="fp8", *, arch=None):
+    """True when the shipped catalog carries a route for ``(precision, num_heads, queries, keys)`` and the
+    route is admitted on ``arch`` (``policy.dense_admission``, decided per architecture for the 64-head
+    family: a tier withheld on an architecture has its record but is not served there).
 
-    Host-only (no device query): the engine admission consults the table the
-    export delivered instead of restating its rules.
+    Host-only (no device query): the engine admission consults the table the export delivered instead of
+    restating its rules. ``arch=None`` is accepted only where the architectures agree on the route; a route
+    admitted on some architectures only raises ``ValueError`` (no silent admit) -- pass the device's
+    :func:`device_arch`.
     """
     try:
         bound = max_queries(num_heads)
@@ -231,15 +235,61 @@ def dense_route_available(num_heads, queries, keys, precision="fp8"):
         route = route_name(precision, queries, keys, num_heads)
     except (ValueError, KeyError):
         return False
-    return route in _catalog()["routes"]
+    if route not in _catalog()["routes"]:
+        return False
+    return _admitted(route, arch)
 
 
-def route_record(precision, queries, keys, num_heads=NUM_HEADS):
-    """The catalog record of a problem's route (``stages``, ``sequence``, ``num_heads``, ``block_q``,
-    ``clean_logits``, ``kv_alignment``); raises ``ValueError`` when the catalog does not ship it."""
-    if not dense_route_available(num_heads, queries, keys, precision):
+def h64_admission(arch):
+    """``policy.dense_admission`` of one architecture: ``{"admitted_routes": [...], "withheld_routes": [...],
+    "reason": str | None}`` -- the 64-head tiers served on ``arch`` (every query count of those tiers), the
+    tiers the producer measured and did not admit there (the engine keeps its stock kernel; ``reason`` says
+    why), two disjoint lists. Empty / ``None`` when the catalog has no 64-head family. Host-only."""
+    record = _catalog()["policy"].get("dense_admission")
+    arches = sorted(record["admitted_routes"]) if record is not None else sorted(_catalog()["arches"])
+    if arch not in arches:
+        raise ValueError(f"arch must be one of {arches}, got {arch!r}")
+    if record is None:
+        return {"admitted_routes": [], "withheld_routes": [], "reason": None}
+    return {
+        "admitted_routes": sorted(record["admitted_routes"][arch]),
+        "withheld_routes": sorted(record["withheld_routes"][arch]),
+        "reason": record["reason"][arch],
+    }
+
+
+def _admitted(route, arch):
+    """Per-architecture verdict of a catalogued route: routes outside the published family are admitted
+    everywhere; a published route is admitted on ``arch`` iff listed there; with ``arch=None`` the
+    architectures must agree."""
+    record = _catalog()["policy"].get("dense_admission")
+    if record is None:
+        return True
+    verdicts = {}
+    for name, admitted in record["admitted_routes"].items():
+        if route in admitted or route in record["withheld_routes"][name]:
+            verdicts[name] = route in admitted
+    if not verdicts:
+        return True
+    if arch is None:
+        if len(set(verdicts.values())) == 1:
+            return next(iter(verdicts.values()))
         raise ValueError(
-            f"no exported dense MQA route for {(precision, num_heads, queries, keys)}"
+            f"dense MQA route {route} is admitted on {sorted(a for a, v in verdicts.items() if v)} only "
+            f"(withheld on {sorted(a for a, v in verdicts.items() if not v)}); pass arch=device_arch(device)"
+        )
+    if arch not in record["admitted_routes"]:
+        raise ValueError(f"arch must be one of {sorted(record['admitted_routes'])}, got {arch!r}")
+    return verdicts.get(arch, True)
+
+
+def route_record(precision, queries, keys, num_heads=NUM_HEADS, *, arch=None):
+    """The catalog record of a problem's route (``stages``, ``sequence``, ``num_heads``, ``block_q``,
+    ``clean_logits``, ``kv_alignment``); raises ``ValueError`` when the catalog does not ship it or the
+    route is withheld on ``arch``."""
+    if not dense_route_available(num_heads, queries, keys, precision, arch=arch):
+        raise ValueError(
+            f"no exported dense MQA route for {(precision, num_heads, queries, keys)} on {arch or 'every arch'}"
         )
     return _catalog()["routes"][route_name(precision, queries, keys, num_heads)]
 
@@ -463,7 +513,16 @@ class DenseMqaPlan:
             )
         if keys < 1:
             raise ValueError("positive K is required")
-        if not dense_route_available(num_heads, queries, keys, precision):
+        if not dense_route_available(num_heads, queries, keys, precision, arch=arch):
+            try:
+                route = route_name(precision, queries, keys, num_heads)
+            except ValueError:
+                route = None
+            if route in _catalog()["routes"] and keys % kv_alignment(num_heads) == 0:
+                raise ValueError(
+                    f"dense MQA route {route} is withheld on {arch} ({h64_admission(arch)['reason']}); "
+                    "keep the stock path for this call"
+                )
             raise ValueError(
                 f"no exported dense MQA route for precision {precision!r}, {num_heads} heads, "
                 f"Q = {queries}, K = {keys} (K must be a multiple of kv_alignment({num_heads}))"
@@ -684,7 +743,8 @@ def fp8_mqa_logits(
     keys = int(kv_values.shape[0]) if kv_values.ndim == 2 else 0
     if (
         clean_logits
-        and route_record("fp8", queries, keys, num_heads).get("clean_logits") != "fused"
+        and route_record("fp8", queries, keys, num_heads, arch=device_arch(q.device)).get("clean_logits")
+        != "fused"
     ):
         raise ValueError(
             "clean_logits=True is not available on this route (the program stores raw tiles, DeepGEMM "
