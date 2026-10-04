@@ -6,7 +6,9 @@ Package layout::
       core/                 shared comm + kernel abstractions and validation
       backends/
         split/
-          comm/             NCCL-EP, NIXL-EP transport
+          comm/             MoE communication backends (NVLink one-sided with
+                            TRT-LLM or Cake kernels, NVLink two-sided, NCCL-EP)
+                            and the NCCL-EP / NIXL-EP Fleet transports
           kernel/           post-dispatch inner kernels
         mega/
           kernel/           fused comm + local MoE kernels
@@ -91,6 +93,10 @@ from .backends.mega.kernel.sm120.mxfp8_mxfp8_bf16_cutedsl import (
     Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm120_mxfp8_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm90.bf16_bf16_bf16_push_cake import (
+    Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_push_cake_bf16_mega_weights,
+)
 from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
     Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_pull_fp8_mega_weights,
@@ -98,6 +104,10 @@ from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
 from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
     Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
+)
+from .backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl import (
+    Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm107_mxfp4_mega_weights,
 )
 from .backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
@@ -143,7 +153,15 @@ from .core.bootstrap_utils import (
     bootstrap_ep_rank_world,
     bootstrap_ep_world_size,
 )
-from .core.comm.fleet import Fleet, create_fleet
+from .core.comm.communication import (
+    MoEEpCommParams,
+    MoEEpCommunication,
+    MoEEpDispatchResult,
+    available_communication_backends,
+    create_communication,
+    register_communication,
+)
+from .core.comm.fleet import Fleet, create_fleet, register_fleet
 from .core.comm.handle import Handle
 from .core.runtime import (
     bootstrap_moe_ep_runtime,
@@ -166,6 +184,7 @@ from .core.validation import (
 )
 from .layer import MoEEpLayer
 from .modes import (
+    CakeAlltoAllConfig,
     FusedMoeKernelConfig,
     IdentityConfig,
     MegaConfig,
@@ -174,6 +193,8 @@ from .modes import (
     MoEEpSplitGraphState,
     MoEEpSplitLayer,
     NCCLEPConfig,
+    NVLinkOneSidedConfig,
+    NVLinkTwoSidedConfig,
     NcclEpConfig,
     NvepConfig,
     SplitConfig,
@@ -192,6 +213,8 @@ from .weights import (
 __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
+    "CakeAlltoAll",
+    "CakeAlltoAllConfig",
     "CakeMxfp8MegaMoeEp16",
     "CakeMxfp8MegaMoeEp16Weights",
     "preprocess_cake_mxfp8_megamoe_ep16_weights",
@@ -207,6 +230,7 @@ __all__ = [
     "Nvfp4CutedslMegaMoeConfig",
     "Sm90PullFp8MegaMoeConfig",
     "Sm90PushFp8MegaMoeConfig",
+    "Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig",
     "DispatchInputParams",
     "DispatchOutput",
@@ -231,7 +255,10 @@ __all__ = [
     "IdentityConfig",
     "MegaConfig",
     "MoEEpArchError",
+    "MoEEpCommParams",
+    "MoEEpCommunication",
     "MoEEpConfigError",
+    "MoEEpDispatchResult",
     "MoEEpFaultToleranceUnsupportedError",
     "MoEEpLayer",
     "MoEEpMegaLayer",
@@ -248,10 +275,15 @@ __all__ = [
     "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "NCCLEPConfig",
+    "NVLinkOneSidedAlltoAll",
+    "NVLinkOneSidedConfig",
+    "NVLinkTwoSidedAlltoAll",
+    "NVLinkTwoSidedConfig",
     "NcclEpConfig",
     "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "NvepConfig",
     "QuantType",
+    "Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
@@ -259,10 +291,12 @@ __all__ = [
     "SplitConfig",
     "SplitKernelContext",
     "available_backends",
+    "available_communication_backends",
     "bootstrap_comm_group",
     "bootstrap_ep_rank_world",
     "bootstrap_ep_world_size",
     "bootstrap_moe_ep_runtime",
+    "create_communication",
     "create_fleet",
     "dummy_moe_weights",
     "ensure_bootstrap_dist_validated",
@@ -278,10 +312,14 @@ __all__ = [
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
     "preprocess_sm120_mxfp8_cutedsl_mega_weights",
+    "preprocess_sm107_mxfp4_mega_weights",
     "preprocess_sm107_mxfp8_mega_weights",
     "preprocess_sm107_nvfp4_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",
+    "preprocess_sm90_push_cake_bf16_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",
+    "register_communication",
+    "register_fleet",
     "run_split_kernel",
     "supports_fault_tolerance",
     "validate_arch_for_backend",
@@ -413,3 +451,12 @@ if _set_build_flags and not available_backends():
 from . import backends as _backends  # noqa: E402,F401
 from .backends.split.comm.nccl_ep import fleet as _nccl_ep_fleet  # noqa: E402,F401
 from .backends.split.comm.nixl_ep import fleet as _nixl_ep_fleet  # noqa: E402,F401
+from .backends.split.comm.nvlink_one_sided.communication import (  # noqa: E402
+    NVLinkOneSidedAlltoAll,
+)
+from .backends.split.comm.cake.communication import (  # noqa: E402
+    CakeAlltoAll,
+)
+from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402
+    NVLinkTwoSidedAlltoAll,
+)

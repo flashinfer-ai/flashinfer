@@ -7,22 +7,21 @@ Wraps the vendored ``sources.kernel_src.rubin.inference.mega`` kernel
 contract:
 
 - :func:`get_symm_buffer_for_sm107_block_scaled_mega_moe` — workspace allocator
-- :func:`sm107_block_scaled_mega_moe` — fused dispatch + FC1 + SwiGLU + FC2 +
-  combine compute entry
+- :func:`sm107_block_scaled_mega_moe` — fused dispatch + FC1 + activation +
+  FC2 + combine compute entry, with SwiGLU or SiTU
 
 The kernel is generic over the drop's ``QuantKind``; this shim wires up the
-``nvfp4`` and ``mxfp8_e4m3`` / ``mxfp8_e5m2`` kinds (``mxfp4`` /
-``mxfp4_mxfp8`` need a w4 weight-transform path and are not exposed yet).
+``nvfp4``, ``mxfp8_e4m3``, ``mxfp8_e5m2``, and ``mxfp4_mxfp8`` kinds.
+The mixed kind uses packed FP4 weights and E4M3 activations, both with
+E8M0 scales per 32 values.
 
 All ``sources`` / ``cutlass`` imports are function-local so importing this
 module stays CPU-safe (the package ``__init__`` re-exports from here).
 
-The staging/launch protocol mirrors the drop's own runner
-(``next/repo_internal_only/test_megamoe_rubin.py``): activation, activation
-SF, topk scores, the shared workspace, and (for the in-kernel-reduce path) the
-output live on the symmetric heap; routing indices are local int32 (16-byte
-aligned); workspaces are 128-byte aligned with their leading bytes zeroed
-before the first launch.
+Input activations, block scales, routing scores, and the shared workspace
+live on the symmetric heap, as does the output for in-kernel reduction.
+Routing indices are local int32 tensors aligned to 16 bytes. Workspaces are
+128-byte aligned with their leading bytes zeroed before the first launch.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ from . import comm
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 
-Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"]
+Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
 Sm107WorkIdMode = Literal["grid_stride", "atomic_counter"]
 Sm107ScheduleMode = Literal["grouped", "phase_interleave"]
@@ -49,6 +48,7 @@ _KIND_TABLE: dict = {
     "nvfp4": (None, torch.float8_e4m3fn, Nvfp4BlockSize, 128),
     "mxfp8_e4m3": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
     "mxfp8_e5m2": (torch.float8_e5m2, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
+    "mxfp4_mxfp8": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
 }
 
 TransformedBlockScaledWeights = Tuple[torch.Tensor, torch.Tensor]
@@ -124,7 +124,7 @@ class Sm107BlockScaledMoeConfig:
     max_tokens_per_rank: int
     num_topk: int
     hidden: int
-    intermediate: int  # post-SwiGLU width; the FC1 GEMM N is 2*intermediate
+    intermediate: int  # width after activation; the FC1 GEMM N is 2*intermediate
     rank: int
     world_size: int
     quant_kind: Sm107QuantKind = "mxfp8_e4m3"
@@ -148,10 +148,24 @@ class Sm107BlockScaledMoeConfig:
     token_back_mode: Sm107TokenBackMode = "epi_warps"
     apply_topk_at_fc1: bool = True
     max_sm_count: Optional[int] = None
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError("activation must be 'swiglu' or 'situ'.")
+        if self.activation == "situ":
+            for name in ("situ_beta", "situ_linear_beta"):
+                value = getattr(self, name)
+                if value is None or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"SiTU requires positive, finite {name}.")
+            if self.gate_up_clamp is not None:
+                raise ValueError("SiTU does not support gate_up_clamp.")
+        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+            raise ValueError("SiTU beta parameters require activation='situ'.")
         for name in (
             "num_total_experts",
             "max_tokens_per_rank",
@@ -193,6 +207,8 @@ class Sm107BlockScaledMoeConfig:
                 f"{max(2 * vec, 32)} (gate/up interleave + SF blocks) for "
                 f"{self.quant_kind}."
             )
+        if self.quant_kind == "mxfp4_mxfp8" and self.intermediate % 128:
+            raise ValueError("mxfp4_mxfp8 intermediate must be a multiple of 128.")
         tiler = self.resolved_mma_tiler_mnk
         instruction_k = self.instruction_k
         if len(tiler) != 3:
@@ -357,6 +373,12 @@ class Sm107BlockScaledMoeConfig:
         return _fp4_storage_dtype() if dtype is None else dtype
 
     @property
+    def torch_weight_data_dtype(self) -> torch.dtype:
+        if self.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
+            return _fp4_storage_dtype()
+        return self.torch_act_data_dtype
+
+    @property
     def torch_act_sf_dtype(self) -> torch.dtype:
         return _KIND_TABLE[self.quant_kind][1]
 
@@ -395,6 +417,18 @@ class Sm107BlockScaledSymmBuffer:
         self.topk_idx = torch.full(
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
         )
+        # Stable local-expert pointers allow per-call scaling updates in graphs.
+        # Defaults and overrides are copied on every backend staging call.
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            setattr(
+                self,
+                name,
+                torch.ones(
+                    cfg.experts_per_rank, dtype=torch.float32, device=self.device
+                )
+                if cfg.quant_kind == "nvfp4"
+                else None,
+            )
         if self.topk_idx.data_ptr() % 16 != 0:
             raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
@@ -508,6 +542,8 @@ class Sm107BlockScaledSymmBuffer:
                 "b_major_mode": OperandMajorMode.K,
                 "combine_format": CombineFormat.parse("bf16"),
                 "gate_up_clamp": cfg.gate_up_clamp,
+                "situ_beta": cfg.situ_beta,
+                "situ_linear_beta": cfg.situ_linear_beta,
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -580,10 +616,11 @@ class Sm107BlockScaledSymmBuffer:
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
             "stream": _cu_stream(stream),
-            # nvfp4 per-expert dequant scalars (fc1_alpha / fc2_alpha /
-            # fc1_norm_const) are omitted: the weight/staging transforms
-            # quantize with norm_const=1.0, so the scalars are identically 1
-            # and the epilogue's const_expr None-path is exact.
+            **{
+                name: _to_cute(getattr(self, name), assumed_align=4)
+                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+                if self.config.quant_kind == "nvfp4"
+            },
         }
 
     def launch(
@@ -654,6 +691,7 @@ class Sm107BlockScaledSymmBuffer:
         self.output_activation = None
         self.local_workspace = None
         self.topk_idx = None
+        self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
         self._destroyed = True
 
 
@@ -683,11 +721,14 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     token_back_mode: Sm107TokenBackMode = "epi_warps",
     apply_topk_at_fc1: bool = True,
     max_sm_count: Optional[int] = None,
+    activation: Literal["swiglu", "situ"] = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
 ) -> Sm107BlockScaledSymmBuffer:
     """Allocate the SM107 block-scaled mega session workspace.
 
     Problem sizes positional, tuning knobs keyword-only (the standard mega
-    allocator contract). ``intermediate`` is the post-SwiGLU width. Expert
+    allocator contract). ``intermediate`` is the width after activation. Expert
     weights are NOT owned by the workspace; they are passed per launch.
     """
     config = Sm107BlockScaledMoeConfig(
@@ -715,6 +756,9 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         token_back_mode=token_back_mode,
         apply_topk_at_fc1=apply_topk_at_fc1,
         max_sm_count=max_sm_count,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     return Sm107BlockScaledSymmBuffer(config)
 
@@ -726,7 +770,7 @@ def _expected_weight_shapes(
     experts = cfg.experts_per_rank
     fc1_out = 2 * cfg.intermediate
     vec = cfg.sf_vec_size
-    if cfg.quant_kind == "nvfp4":
+    if cfg.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
         fc1_shape = (experts, cfg.hidden // 2, fc1_out)
         fc2_shape = (experts, cfg.intermediate // 2, cfg.hidden)
     else:
@@ -763,11 +807,11 @@ def _validate_weight_leg(
             f"{expected_sf_numel * expected_weight_shape[0]}."
         )
     if (
-        weight.dtype != cfg.torch_act_data_dtype
+        weight.dtype != cfg.torch_weight_data_dtype
         or scale.dtype != cfg.torch_act_sf_dtype
     ):
         raise ValueError(
-            f"{name} requires {cfg.torch_act_data_dtype} weights and {cfg.torch_act_sf_dtype} scales."
+            f"{name} requires {cfg.torch_weight_data_dtype} weights and {cfg.torch_act_sf_dtype} scales."
         )
     if not weight.permute(0, 2, 1).is_contiguous() or not scale.is_contiguous():
         raise ValueError(
@@ -787,7 +831,7 @@ def sm107_block_scaled_mega_moe(
     fast_math: bool = True,  # accepted for mega API parity; the kernel has no toggle
     sync: bool = False,
 ) -> Optional[torch.Tensor]:
-    """Fused dispatch + FC1 + SwiGLU + FC2 + combine; writes ``y[:num_tokens]``.
+    """Fused dispatch, FC1, SwiGLU/SiTU, FC2, and combine; writes ``y[:num_tokens]``.
 
     The caller must have staged ``symm_buffer.x`` / ``.x_sf`` and the routing
     slices first. With ``y=None`` returns a workspace view (valid under stream

@@ -59,11 +59,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional
 
+import functools
+
 import torch
 import tvm_ffi
 
+from ...utils import get_compute_capability, get_device_sm_count
 from .cake_jit import (
     MODULES,
+    kernel_definitions,
     kernel_module_name,
     load_cake_nvfp4_per_token_module,
     route_available,
@@ -84,6 +88,16 @@ BASELINE_THREADS = (128, 256, 512)
 # Row counts that launch as one wave of one-row CTAs on both supported parts (148 / 152 SMs).
 SINGLE_WAVE_MAX_ROWS = 148
 MAX_REG_BLOCKS = 8  # 16-element blocks one quantizer thread holds in registers
+# Static-K quantizer tier (port of the production ``STATIC_M_LIMIT`` / ``STATIC_K``): contiguous row
+# sets of fewer than :data:`STATIC_M_LIMIT` tokens at a row width in :data:`STATIC_K` take an instance
+# with the row width compiled in (key suffix ``_k<K>``, ``-DK_STATIC``); every other row set, every
+# other width and every row-strided view takes the runtime-geometry instance of the same CTA shape.
+# The widths and the limit are the ones where the compiled-in build won or tied the runtime-geometry
+# build of the same CTA shape on both parts (5 interleaved rounds per row): +1.0..3.9 % at 2688 and
+# 4096, +0.0..2.7 % at 7168; from 8192 rows on the CTA shape changes and the compiled-in build loses
+# at 4096 and 7168, and widths of 8192 and above lose at every row count.
+STATIC_M_LIMIT = 8192
+STATIC_K: tuple[int, ...] = (2688, 4096, 7168)
 WIDE_MAX_M = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
@@ -92,6 +106,14 @@ ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
 # :func:`required_kernel_keys` enumerates the registered kernels for these
 # counts.
 ARCH_SM_COUNT = {"sm_100a": 148, "sm_103a": 152}
+# Co-resident clusters per cluster size on each part (``cuOccupancyMaxActiveClusters`` of the split-K
+# kernel at one CTA per SM), keyed by SM count.  A split-K launch is ``weight tiles x token tiles``
+# clusters and must fit in one wave; the capacity is the GPC placement limit, not ``sm_count // size``.
+CLUSTER_CAPACITY_BY_SM_COUNT = {
+    148: {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 8: 15},
+    152: {2: 76, 3: 46, 4: 36, 5: 28, 6: 23, 8: 15},
+}
+SPLITK3_CLUSTER = 3
 
 # Validated problem matrix (kernel keys enumerated by :func:`required_kernel_keys`).
 # GEMM families are ``(K, N)`` of the per-token quantize + GEMM chains the backend was
@@ -115,6 +137,21 @@ VALIDATED_QUANTIZE_K: tuple[int, ...] = (7168, 8192, 16384, 18432, 28672)
 VALIDATED_RAGGED_FAMILIES: tuple[tuple[int, int], ...] = ((7168, 2112), (8192, 8192))
 VALIDATED_F16_INPUT_ROWS: tuple[int, ...] = (8, 257, 2048)
 VALIDATED_FOLD_ROWS: tuple[int, ...] = (1, 130, 8192)
+# Coverage rows: the small token counts between the swapped-orientation tiles
+# (M in 9..16 on five families), a (K, N) pair outside the measured families
+# and quantizer K values outside the measured families (K % 16 == 0 only).
+VALIDATED_SMALL_M_ROWS: tuple[int, ...] = (9, 12, 16)
+VALIDATED_SMALL_M_FAMILIES: tuple[tuple[int, int], ...] = (
+    (7168, 2112),
+    (8192, 8192),
+    (7168, 18432),
+    (8192, 28672),
+    (16384, 7168),
+)
+VALIDATED_OFF_MATRIX_FAMILY: tuple[int, int] = (4096, 3200)
+VALIDATED_OFF_MATRIX_ROWS: tuple[int, ...] = (16, 300)
+VALIDATED_OFF_MATRIX_QUANTIZE_K: tuple[int, ...] = (2688, 4096)
+VALIDATED_OFF_MATRIX_QUANTIZE_ROWS: tuple[int, ...] = (1, 16, 130, 2048, 8192)
 
 
 # ---------------------------------------------------------------------------
@@ -219,13 +256,56 @@ def cta_config(k: int, m: int) -> tuple[int, int]:
     return threads, min_blocks_for(k, threads)
 
 
+LARGE_ROW_MIN_M = 512
+STORE_HINT_DEFAULT = "NONE"
+STORE_HINT_LARGE_ROW = "L2_EVICT_LAST"
+
+
+def blocks_per_thread_for(k: int, threads: int) -> int:
+    """Register capacity of the compiled instance: 16-element blocks per thread of a ``K``-wide row."""
+    return (k // SF_VEC + threads - 1) // threads
+
+
+def large_row_config(k: int, threads: int, min_blocks: int) -> bool:
+    """True for the CTA configurations :func:`cta_config` picks for row sets of
+    :data:`LARGE_ROW_MIN_M` tokens or more (port of ``large_row_config``)."""
+    return (threads, min_blocks) in {
+        cta_config(k, LARGE_ROW_MIN_M),
+        cta_config(k, 8192),
+    }
+
+
+def default_store_hint(k: int, threads: int, min_blocks: int) -> str:
+    """Output-store cache policy of the ``(K, threads, min_blocks)`` configuration (port of
+    ``default_store_hint``): L2 evict-last for the large-row configurations, whose 2-130 MB of
+    outputs would otherwise be written back into their own read stream."""
+    return (
+        STORE_HINT_LARGE_ROW
+        if large_row_config(k, threads, min_blocks)
+        else STORE_HINT_DEFAULT
+    )
+
+
 def quant_kernel_key(
-    k: int, threads: int, min_blocks: int, is_bf16: bool, fold: bool
+    threads: int,
+    blocks_per_thread: int,
+    min_blocks: int,
+    is_bf16: bool,
+    fold: bool,
+    store_hint: str = STORE_HINT_DEFAULT,
+    k_static: Optional[int] = None,
 ) -> str:
-    """Logical kernel key of one quantizer instance."""
+    """Logical kernel key of one quantizer instance: CTA width, register capacity (blocks per
+    thread), launch-bounds occupancy, input dtype, folded scale, the large-row store policy
+    (``_sl``) and, for the small-row tier, the compiled-in row width (``_k<K>``).  ``K`` and
+    the row stride are otherwise kernel arguments, not part of the key."""
     dtype = "bf16" if is_bf16 else "f16"
-    suffix = "_fold" if fold else ""
-    return f"quant:k{k}_t{threads}_mb{min_blocks}_{dtype}{suffix}"
+    return (
+        f"quant:t{threads}_b{blocks_per_thread}_mb{min_blocks}_{dtype}"
+        + ("_fold" if fold else "")
+        + ("_sl" if store_hint == STORE_HINT_LARGE_ROW else "")
+        + (f"_k{k_static}" if k_static is not None else "")
+    )
 
 
 @dataclass(frozen=True)
@@ -239,31 +319,61 @@ class QuantizePlan:
     is_bf16: bool
     fold: bool
     threads: int
+    blocks_per_thread: (
+        int  # register capacity of the instance (16-element blocks per thread)
+    )
     min_blocks: int  # launch-bounds occupancy (CTAs per SM)
+    store_hint: str  # output-store cache policy of the instance
+    k_static: Optional[
+        int
+    ]  # compiled-in row width of the small-row tier (None: runtime geometry)
     grid: int  # one CTA per padded row
     padded_rows: int
     padded_cols: int
     kernel_key: str
 
 
+def static_k_for(k: int, m: int, x_row_stride: Optional[int] = None) -> Optional[int]:
+    """``k`` when ``(M, K)`` takes the instance with the row width compiled in, else ``None``
+    (runtime geometry): ``K`` in :data:`STATIC_K`, contiguous rows and fewer than
+    :data:`STATIC_M_LIMIT` of them.  Port of the production ``static_k_for``."""
+    if k not in STATIC_K or m >= STATIC_M_LIMIT:
+        return None
+    # A single row has no row stride: ``M == 1`` always takes the static-K instance.
+    if m == 1 or x_row_stride is None or x_row_stride == k:
+        return int(k)
+    return None
+
+
 def quant_plan(
-    m: int, k: int, is_bf16: bool, fold: bool, arch: str, sm_count: int
+    m: int,
+    k: int,
+    is_bf16: bool,
+    fold: bool,
+    arch: str,
+    sm_count: int,
+    x_row_stride: Optional[int] = None,
 ) -> QuantizePlan:
     """Resolve the quantizer instance and grid exactly like the Cake production launcher
-    (``quantize_per_token``): CTA width and occupancy from :func:`cta_config`, one CTA
-    per padded row (the CTAs past ``M`` zero the padding rows of the scale tiles)."""
+    (``quantize_per_token``): CTA width and occupancy from :func:`cta_config`, the
+    static-K instance for contiguous row sets of fewer than :data:`STATIC_M_LIMIT` tokens
+    at a row width in :data:`STATIC_K`, one CTA per padded row (the CTAs past ``M`` zero
+    the padding rows of the scale tiles).  ``x_row_stride`` (elements; ``None`` =
+    contiguous) only decides between the static-K and the runtime-geometry instance."""
     m, k = int(m), int(k)
     if m < 1:
         raise ValueError("M must be positive")
     if k <= 0 or k % SF_VEC:
         raise ValueError(f"K must be a positive multiple of {SF_VEC}, got {k}")
     threads, min_blocks = cta_config(k, m)
-    blocks_per_thread = (k // SF_VEC + threads - 1) // threads
+    blocks_per_thread = blocks_per_thread_for(k, threads)
     if blocks_per_thread > MAX_REG_BLOCKS:
         raise ValueError(
             f"K={k} at {threads} threads needs {blocks_per_thread} register blocks "
             f"per thread (max {MAX_REG_BLOCKS})"
         )
+    store_hint = default_store_hint(k, threads, min_blocks)
+    k_static = static_k_for(k, m, x_row_stride)
     pm, cols = padded_rows(m), padded_sf_cols(k)
     return QuantizePlan(
         arch=arch,
@@ -273,11 +383,16 @@ def quant_plan(
         is_bf16=bool(is_bf16),
         fold=bool(fold),
         threads=threads,
+        blocks_per_thread=blocks_per_thread,
         min_blocks=min_blocks,
+        store_hint=store_hint,
+        k_static=k_static,
         grid=pm,
         padded_rows=pm,
         padded_cols=cols,
-        kernel_key=quant_kernel_key(k, threads, min_blocks, is_bf16, fold),
+        kernel_key=quant_kernel_key(
+            threads, blocks_per_thread, min_blocks, is_bf16, fold, store_hint, k_static
+        ),
     )
 
 
@@ -327,6 +442,38 @@ TWO_CTA_PER_SM_MIN_SMS = 152
 # weight tile it sweeps) fit the 126 MiB L2 and the group sweeps at least 24 weight tiles.
 RASTER16_MIN_W_TILES = 24
 RASTER16_L2_BYTES = 126 << 20
+# Measured cost of one wave of 2-CTA 256 x tile_n tiles relative to a wave of 256 x 256
+# tiles (paired sweeps on B200 and GB300); the tile width is re-picked on multi-wave
+# rows when ceil(units / pairs) x cost improves by at least TWO_CTA_TILE_MIN_GAIN.
+_TWO_CTA_TILE_WAVE_COST = {128: 0.575, 192: 0.787, 256: 1.0}
+TWO_CTA_TILE_MIN_GAIN = 0.015
+# Cluster split-K 2 for the unsplit swapped-orientation rows whose 128-row weight-tile
+# grid fills at most half the SMs at K >= SPLITK2_MIN_K.
+SPLITK2_MIN_K = 16384
+
+
+def _two_cta_wave_time(m: int, n: int, sm_count: int, tile_n: int) -> float:
+    """Waves of the persistent 2-CTA grid x the measured relative cost of one wave."""
+    pairs = max(1, sm_count // 2)
+    units = ((m + 255) // 256) * ((n + tile_n - 1) // tile_n)
+    return -(-units // pairs) * _TWO_CTA_TILE_WAVE_COST[tile_n]
+
+
+def _two_cta_tile_n(m: int, n: int, sm_count: int, tile_n: int) -> int:
+    """Re-pick the 2-CTA tile width from the measured wave model on multi-wave rows
+    (port of ``_two_cta_tile_n``)."""
+    if tile_n not in _TWO_CTA_TILE_WAVE_COST:
+        return tile_n
+    pairs = max(1, sm_count // 2)
+    if ((m + 255) // 256) * ((n + tile_n - 1) // tile_n) <= pairs:
+        return tile_n
+    base = _two_cta_wave_time(m, n, sm_count, tile_n)
+    best_n, best_t = tile_n, base
+    for cand in (256, 192, 128):
+        t = _two_cta_wave_time(m, n, sm_count, cand)
+        if t < best_t:
+            best_n, best_t = cand, t
+    return best_n if best_t <= base * (1.0 - TWO_CTA_TILE_MIN_GAIN) else tile_n
 
 
 def _score_m_tactic(
@@ -360,11 +507,14 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
     ``M <= 32`` (``N % 8 == 0``) takes the swapped orientation with 8 / 16 / 32
     tokens per tile and cluster split-K while the tile grid leaves most SMs idle;
     otherwise the tile the scorer picks for the ``M`` bucket (next power of two):
-    1-CTA 128 x {64, 128, 192, 256} or 2-CTA 256 x {64, 128, 192, 256}.  2-CTA tiles
-    use the grouped raster (``raster_group`` 8, or 16 when a 16-tile group's fp4
+    1-CTA 128 x {64, 128, 192, 256} or 2-CTA 256 x {64, 128, 192, 256}, the 2-CTA width
+    re-picked on multi-wave rows by the measured wave model (``_two_cta_tile_n``).  2-CTA
+    tiles use the grouped raster (``raster_group`` 8, or 16 when a 16-tile group's fp4
     operands fit L2 and the group sweeps at least 24 weight tiles) when the weight
-    dimension has at most 32 tiles and the cluster-launch-control scheduler when the persistent pairs
-    average at least :data:`CLC_MIN_TILES_PER_PAIR` tiles.  Single-token-tile
+    dimension has at most 32 tiles and the grid needs more than one wave, and the
+    cluster-launch-control scheduler when the persistent pairs average at least
+    :data:`CLC_MIN_TILES_PER_PAIR` tiles.  Unsplit deep-K swapped-orientation rows whose
+    weight tiles fill at most half the SMs take cluster split-K 2.  Single-token-tile
     rows (``M <= 128``) override the scorer three times: a 2-CTA 256x64 pair over at
     most :data:`TWO_CTA_SINGLE_TILE_MAX_W_TILES` narrow weight tiles (the pair loads
     the 128 real token rows once), the 128-wide two-wave tile on the 148-SM part when
@@ -381,7 +531,25 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
             split_k = 4
         elif n_tiles <= 20:
             tile_n, split_k = 8, 2
-        if split_k > 1 and k % (K_TILE * split_k) == 0:
+            # Three K slices when every cluster of the launch is co-resident (7168x1536 M = 17:
+            # 36 clusters, +6 % on both parts); 48 or more clusters of 3 need a second cluster
+            # wave (-27..-30 %) and keep two slices.
+            capacity = CLUSTER_CAPACITY_BY_SM_COUNT.get(sm_count, {}).get(
+                SPLITK3_CLUSTER
+            )
+            token_tiles = (m + tile_n - 1) // tile_n
+            if (
+                capacity is not None
+                and n_tiles * token_tiles <= capacity
+                and k // K_TILE >= SPLITK3_CLUSTER
+            ):
+                split_k = SPLITK3_CLUSTER
+        # Even K slices for split-K 2 / 4; the three-way split uses the kernel's owner-remainder partition.
+        if (
+            split_k > 1
+            and k % K_TILE == 0
+            and (split_k == SPLITK3_CLUSTER or k % (K_TILE * split_k) == 0)
+        ):
             return {
                 "tile_n": tile_n,
                 "deep_k": False,
@@ -409,6 +577,16 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         elif deep_k:
             # Single-wave deep-K rows run three mainloop stages.
             tactic["num_stages"] = 3
+        elif (
+            k >= SPLITK2_MIN_K
+            and k % 512 == 0
+            and 2 * n_tiles <= sm_count
+            and (k == SPLITK2_MIN_K or tile_n == 32)
+        ):
+            # Unsplit deep-K rows that leave more than half the SMs idle: two K halves per
+            # weight tile double the streaming CTAs (the 8 / 16-token tiles of the deeper
+            # rows lose with the split and stay unsplit).
+            tactic["split_k"] = 2
         return tactic
     bucket = m if m <= 0 else min(1 << (m - 1).bit_length(), _M_BUCKETS[-1])
     best = None
@@ -418,6 +596,8 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
             best = (score, tile_m, tile_n)
     assert best is not None
     _, tile_m, tile_n = best
+    if tile_m == 256:
+        tile_n = _two_cta_tile_n(m, n, sm_count, tile_n)
     tactic = {
         "tile_n": tile_n,
         "deep_k": False,
@@ -433,8 +613,15 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         and (n + 63) // 64 <= TWO_CTA_SINGLE_TILE_MAX_W_TILES
     ):
         # One 128-token tile over a few 64-wide weight tiles: the 2-CTA pair loads the
-        # real token rows once (no grouped raster, no CLC on these short rows).
-        return {**tactic, "two_cta": True, "a_hint": None, "b_hint": "evict_first"}
+        # real token rows once (no grouped raster, no CLC on these short rows), as a
+        # half-M pair (64 token rows per CTA, cta_group::2 M = 128).
+        return {
+            **tactic,
+            "two_cta": True,
+            "a_hint": None,
+            "b_hint": "evict_first",
+            "half_m": True,
+        }
     if (
         m <= BLOCK_M
         and tile_m == BLOCK_M
@@ -445,18 +632,17 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         # 128-wide persistent tile (two waves) beats the scorer's single-wave wide tile.
         if sm_count < TWO_CTA_PER_SM_MIN_SMS:
             tactic["tile_n"] = tile_n = 128
-    elif (
-        m <= BLOCK_M
-        and tile_m == BLOCK_M
-        and tile_n == 128
-        and sm_count >= TWO_CTA_PER_SM_MIN_SMS
-    ):
-        # One token tile, one wave of 128-wide tiles on the 152-SM part: no L2 promotion.
+    if m <= BLOCK_M and tile_m == BLOCK_M and tile_n == 128:
+        # One token tile over 128-wide tiles (one or two waves, both parts): no L2 promotion;
+        # one generated program serves every such row.
         tactic["l2_promo"] = None
     if tile_m == 256:
         tactic["two_cta"] = True
+        pairs = max(1, sm_count // 2)
         w_tiles = (n + tile_n - 1) // tile_n
-        if w_tiles <= 32:
+        # The grouped raster costs 1-2 % on a grid that fits one wave (every tile runs
+        # concurrently), so it applies to multi-wave grids only.
+        if w_tiles <= 32 and ((m + 255) // 256) * w_tiles > pairs:
             tactic["raster_group"] = 8
             group16_bytes = (16 * 256 + w_tiles * tile_n) * (k // 2)
             if (
@@ -465,7 +651,6 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
                 and group16_bytes <= RASTER16_L2_BYTES
             ):
                 tactic["raster_group"] = 16
-        pairs = max(1, sm_count // 2)
         if ((m + 255) // 256) * (
             (n + tile_n - 1) // tile_n
         ) >= CLC_MIN_TILES_PER_PAIR * pairs:
@@ -473,7 +658,46 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
     tok_tiles = (m + tile_m - 1) // tile_m
     if tok_tiles <= 2:
         tactic["a_hint"], tactic["b_hint"] = None, "evict_first"
+    if _half_m_pair_rows(m, n, tile_n, sm_count, tactic):
+        tactic["half_m"] = True
+    if (
+        tactic.get("two_cta")
+        and not tactic.get("half_m")
+        and tactic.get("sched", "static") == "static"
+    ):
+        # Stream-K tail of the static 2-CTA schedule: the partial last wave's tiles are cut
+        # into equal K slices over consecutive pairs (``stream_k_tail``); ``gemm_plan`` keeps
+        # the knob only where at least SK_MIN_SLICES fit (B200 16384x7168 / 18432x7168
+        # M=2048 1.089 / 1.098, 8192x28672 M=257 / 512 1.017 / 1.023 vs the plain program;
+        # the GB300 perf rows have no shareable tail and run the plain program).
+        tactic["stream_k"] = True
     return tactic
+
+
+def _half_m_pair_rows(
+    m: int, n: int, tile_n: int, sm_count: int, tactic: dict[str, Any]
+) -> bool:
+    """The 64-wide 2-CTA tiles of the narrow-N rows run as half-M pairs (64 token rows per
+    CTA) while the half-M grid fits 1.5 waves of pairs (1.3 waves measured faster alone and
+    in the quantize + GEMM chain, 1.6 waves faster alone but slower in the chain, 2.2 waves
+    slower); the half-M program has no CLC or grouped-raster variant."""
+    if (
+        tile_n != 64
+        or not tactic.get("two_cta")
+        or tactic.get("sched") == "clc"
+        or tactic.get("raster_group")
+    ):
+        return False
+    w_tiles = (n + 63) // 64
+    pairs = max(1, sm_count // 2)
+    return (
+        w_tiles <= TWO_CTA_SINGLE_TILE_MAX_W_TILES
+        and ((m + 63) // 64) * w_tiles <= pairs + pairs // 2
+    )
+
+
+def sched_is_clc(tactic: dict[str, Any]) -> bool:
+    return str(tactic.get("sched", "static")) == "clc"
 
 
 def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
@@ -483,6 +707,15 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append("k512")
     if tactic.get("two_cta"):
         parts.append("2cta")
+    if tactic.get("half_m"):
+        parts.append("hm")
+    if tactic.get("stream_k"):
+        # The slice count is baked into the program; ``gemm_plan`` resolves it into the tactic.
+        if "sk_split" not in tactic:
+            raise ValueError(
+                "stream_k tactic without a resolved sk_split: build the key from gemm_plan(...).tactic"
+            )
+        parts.append(f"skt{int(tactic['sk_split'])}")
     if int(tactic.get("split_k", 1)) > 1:
         parts.append(f"sk{int(tactic['split_k'])}")
     parts.append("f16" if out_f16 else "bf16")
@@ -527,10 +760,28 @@ class GemmPlan:
     w_tiles: int = 0
     num_tiles: int = 0
     grid: int = 0
+    # Stream-K tail of the static 2-CTA schedule (``stream_k`` tactics): the partial last
+    # wave's tiles, the equal K slices each is cut into and the pairs holding them.
+    sk_tiles: int = 0
+    sk_slices: int = 0
+    sk_pairs: int = 0
 
     @property
     def alpha_n(self) -> bool:
         return bool(self.tactic["alpha_n"])
+
+    @property
+    def stream_k(self) -> bool:
+        return bool(self.tactic.get("stream_k", False))
+
+    @property
+    def sk_workspace_floats(self) -> int:
+        """FP32 partials: tail tiles x slices x two CTAs x 128 rows x tile_n columns."""
+        return self.sk_tiles * self.sk_slices * 2 * BLOCK_M * int(self.tactic["tile_n"])
+
+    @property
+    def sk_flag_words(self) -> int:
+        return self.sk_tiles * self.sk_slices * 2
 
     @property
     def two_cta(self) -> bool:
@@ -547,6 +798,40 @@ class GemmPlan:
     @property
     def amc(self) -> int:
         return int(self.tactic.get("amc", 1))
+
+
+# Largest slice count of a stream-K tail tile (host launch rule ``sk_split``; mirrors the Cake
+# default).  The slice count actually used is bounded by the free pairs per tail tile, the
+# tile's output subtiles and its K tiles, and is baked into the program (``skt{S}``).
+SK_MAX_SPLIT = 8
+# Fewest slices worth running: two slices keep half a tile plus the exchange on the critical
+# path (1.005-1.008 where measured); three or more measured 1.017-1.098 on B200.
+SK_MIN_SLICES = 3
+EPI_TILE_N = 32
+
+
+def stream_k_tail(
+    num_tiles: int,
+    pairs: int,
+    k_tiles: int,
+    split: int = SK_MAX_SPLIT,
+    max_slices: int = 6,
+    min_slices: int = SK_MIN_SLICES,
+) -> tuple[int, int, int]:
+    """``(tail_tiles, slices, pairs_used)`` of the stream-K tail of a static 2-CTA grid (the
+    Cake ``stream_k_tail``): the partial last wave's ``R = num_tiles % pairs`` tiles are each
+    cut into ``slices = min(split, pairs // R, max_slices, k_tiles)`` equal K slices held by
+    ``R * slices`` pairs.  ``pairs_used == 0`` means the tail is not run: ``(0, 0, 0)`` without
+    a partial last wave, ``(R, 1, 0)`` when fewer than ``min_slices`` fit."""
+    if split < 1:
+        raise ValueError(f"sk_split must be positive, got {split}")
+    if num_tiles <= pairs or num_tiles % pairs == 0:
+        return 0, 0, 0
+    tail = num_tiles % pairs
+    slices = min(split, pairs // tail, max_slices, k_tiles)
+    if slices < max(2, min_slices):
+        return tail, 1, 0
+    return tail, slices, tail * slices
 
 
 def gemm_plan(
@@ -595,7 +880,22 @@ def gemm_plan(
         raise ValueError("the cluster A-multicast is a 1-CTA m-orientation tactic")
     if amc > 1 and m > BLOCK_M:
         raise ValueError("the cluster A-multicast tactic serves one 128-token tile")
-    tok_tile = tile_n if alpha_n else (2 * BLOCK_M if two_cta else BLOCK_M)
+    half_m = bool(tactic.get("half_m", False))
+    if half_m and (not two_cta or sched_is_clc(tactic) or tactic.get("raster_group")):
+        raise ValueError(
+            "half_m is a 2-CTA program knob without CLC scheduler or grouped raster"
+        )
+    stream_k = bool(tactic.get("stream_k", False))
+    if stream_k and (not two_cta or half_m or sched_is_clc(tactic)):
+        raise ValueError(
+            "stream_k is a knob of the static 2-CTA schedule (no half_m, no CLC scheduler)"
+        )
+    # 2-CTA pairs cover 256 token rows (128 per CTA), half-M pairs 128 (64 per CTA).
+    tok_tile = (
+        tile_n
+        if alpha_n
+        else ((BLOCK_M if half_m else 2 * BLOCK_M) if two_cta else BLOCK_M)
+    )
     w_tile = BLOCK_M if alpha_n else tile_n
     tok_tiles = (m + tok_tile - 1) // tok_tile
     w_tiles = (n + w_tile - 1) // w_tile
@@ -613,6 +913,23 @@ def gemm_plan(
         grid = min(int(sm_count) // amc, (num_tiles + amc - 1) // amc) * amc
     else:
         grid = min(int(sm_count) * blocks_per_sm, num_tiles)
+    sk_tiles = sk_slices = sk_pairs = 0
+    tactic = dict(tactic)
+    if stream_k:
+        sk_tiles, sk_slices, sk_pairs = stream_k_tail(
+            num_tiles,
+            int(sm_count) // 2,
+            k // k_tile,
+            int(tactic.get("sk_split", SK_MAX_SPLIT)),
+            int(tactic["tile_n"]) // EPI_TILE_N,
+        )
+        if sk_pairs == 0:
+            # No partial last wave, or one the pairs cannot share: the plain static program.
+            tactic.pop("stream_k", None)
+            tactic.pop("sk_split", None)
+            sk_tiles = sk_slices = sk_pairs = 0
+        else:
+            tactic["sk_split"] = sk_slices
     return GemmPlan(
         arch=arch,
         sm_count=int(sm_count),
@@ -629,6 +946,9 @@ def gemm_plan(
         w_tiles=w_tiles,
         num_tiles=num_tiles,
         grid=grid,
+        sk_tiles=sk_tiles,
+        sk_slices=sk_slices,
+        sk_pairs=sk_pairs,
     )
 
 
@@ -650,6 +970,16 @@ def validated_problems() -> tuple[tuple[str, int, int, int, bool, bool, bool], .
         rows.append(("gemm", k, n, m, True, False, True))
     for k in VALIDATED_QUANTIZE_K:
         for m in VALIDATED_ROWS:
+            for fold in (False, True):
+                rows.append(("quantize", k, 0, m, True, False, fold))
+    for k, n in VALIDATED_SMALL_M_FAMILIES:
+        for m in VALIDATED_SMALL_M_ROWS:
+            rows.append(("gemm", k, n, m, True, False, False))
+    k, n = VALIDATED_OFF_MATRIX_FAMILY
+    for m in VALIDATED_OFF_MATRIX_ROWS:
+        rows.append(("gemm", k, n, m, True, False, False))
+    for k in VALIDATED_OFF_MATRIX_QUANTIZE_K:
+        for m in VALIDATED_OFF_MATRIX_QUANTIZE_ROWS:
             for fold in (False, True):
                 rows.append(("quantize", k, 0, m, True, False, fold))
     return tuple(rows)
@@ -677,7 +1007,7 @@ def required_kernel_keys(arch: str, sm_count: Optional[int] = None) -> tuple[str
 
 
 def _device_arch(device: torch.device) -> str:
-    capability = torch.cuda.get_device_capability(device)
+    capability = get_compute_capability(device)
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
     if arch is None:
         raise ValueError(
@@ -688,7 +1018,7 @@ def _device_arch(device: torch.device) -> str:
 
 
 def _sm_count(device: torch.device) -> int:
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+    return int(get_device_sm_count(device))
 
 
 def _device_index(device: torch.device) -> int:
@@ -696,32 +1026,65 @@ def _device_index(device: torch.device) -> int:
 
 
 def generated_program_available(device: torch.device) -> bool:
-    """True when this checkout registers every validated program for ``device``."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    """True when this checkout registers the generated programs of ``device``'s architecture.
+
+    The tactic of a shape is resolved for the device's actual SM count; a shape
+    whose kernel is not registered raises ``NotImplementedError`` naming the key
+    at preparation (:func:`kernel_module_name`)."""
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(get_compute_capability(device))
     if arch is None:
         return False
-    return bool(MODULES) and route_available(
-        arch, required_kernel_keys(arch, _sm_count(device))
+    return bool(MODULES) and route_available(arch)
+
+
+def _bind(
+    arch: str, kernel_key: str, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple]:
+    """Order ``kwargs`` by the argument plan of the program behind ``kernel_key`` and load its ``arch`` build."""
+    entry, arg_plan = _entry(arch, kernel_key)
+    missing = [name for kind, name in arg_plan if kind != "grid" and name not in kwargs]
+    if missing:
+        raise KeyError(
+            f"generated kernel {kernel_key!r} expects arguments {missing}; "
+            f"host binding provides {sorted(kwargs)}"
+        )
+    return entry, _arguments(arg_plan, kwargs)
+
+
+def _entry(
+    arch: str, kernel_key: str
+) -> tuple[Callable[..., Any], tuple[tuple[str, str], ...]]:
+    """FFI entry and argument plan of the registered program behind ``kernel_key``: its
+    module built with the key's compile-line definitions (the module load is cached)."""
+    module_name = kernel_module_name(arch, kernel_key)
+    record = MODULES[module_name]
+    module = load_cake_nvfp4_per_token_module(
+        module_name, arch, kernel_definitions(kernel_key)
+    )
+    return getattr(module, record["ffi_entry"]), tuple(
+        tuple(item) for item in record["arg_plan"]
     )
 
 
-def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the argument plan of ``module_name`` and load its entry."""
-    record = MODULES[module_name]
-    grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
-    arguments = []
-    for kind, name in record["arg_plan"]:
-        if kind == "grid":
-            arguments.append(grid[name])
-        elif name in kwargs:
-            arguments.append(kwargs[name])
-        else:
-            raise KeyError(
-                f"generated module {module_name!r} expects argument {name!r} "
-                f"({kind}); host binding provides {sorted(kwargs)}"
-            )
-    module = load_cake_nvfp4_per_token_module(module_name)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+def _arguments(arg_plan: tuple[tuple[str, str], ...], kwargs: dict[str, Any]) -> tuple:
+    grid = kwargs["grid"]
+    grid_by_name = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
+    return tuple(
+        grid_by_name[name] if kind == "grid" else kwargs[name]
+        for kind, name in arg_plan
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _cached_scalar_f32(value: float, device_index: int) -> torch.Tensor:
+    """One device-resident float32 scalar per distinct Python value and device (the public
+    entries take ``global_scale_inv`` as a float; the kernel reads it from device memory)."""
+    return torch.full(
+        (1,),
+        float(value),
+        dtype=torch.float32,
+        device=torch.device("cuda", device_index),
+    )
 
 
 def _scalar_f32(value: torch.Tensor, name: str, device: torch.device) -> torch.Tensor:
@@ -793,17 +1156,30 @@ class NVFP4PerTokenQuantizeRunner:
         return len(self.launches)
 
 
+def row_stride_of(x: torch.Tensor) -> int:
+    """Elements between consecutive rows of ``x[M, K]`` (unit stride along the row required)."""
+    m, k = (int(v) for v in x.shape)
+    if k > 1 and x.stride(1) != 1:
+        raise ValueError("x must have unit stride along the row (K dimension)")
+    stride = int(x.stride(0)) if m > 1 else k
+    if stride < k:
+        raise ValueError(f"x rows overlap: row stride {stride} < K={k}")
+    return stride
+
+
 def validate_quantize_inputs(
     x: torch.Tensor, outputs: PerTokenQuantizeOutputs
 ) -> tuple[int, int]:
-    """Shape / dtype validation of one quantizer call; returns ``(M, K)``."""
-    if x.dim() != 2 or not x.is_contiguous() or x.device.type != "cuda":
-        raise ValueError("x must be a contiguous 2-D CUDA tensor")
+    """Shape / dtype validation of one quantizer call; returns ``(M, K)``.  ``x`` may be a
+    row-strided view (unit stride along the row)."""
+    if x.dim() != 2 or x.device.type != "cuda":
+        raise ValueError("x must be a 2-D CUDA tensor")
     if x.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"x must be bf16 or fp16, got {x.dtype}")
     m, k = (int(v) for v in x.shape)
-    if k % SF_VEC:
-        raise ValueError(f"K={k} must be a multiple of {SF_VEC}")
+    if k <= 0 or k % SF_VEC:
+        raise ValueError(f"K={k} must be a positive multiple of {SF_VEC}")
+    row_stride_of(x)
     fp4, sf, scale = outputs
     if (
         tuple(fp4.shape) != (m, k // 2)
@@ -851,20 +1227,48 @@ def prepare_nvfp4_per_token_quantize(
     gs_inv = _scalar_f32(global_scale_inv, "global_scale_inv", device)
     fold = out_scale is not None
     scale_arg = _scalar_f32(out_scale, "out_scale", device) if fold else gs_inv
-    plan = quant_plan(m, k, x.dtype == torch.bfloat16, fold, arch, _sm_count(device))
-    kwargs: dict[str, Any] = dict(
+    plan = quant_plan(
+        m, k, x.dtype == torch.bfloat16, fold, arch, _sm_count(device), row_stride_of(x)
+    )
+    kwargs = _quant_kwargs(plan, x, outputs, gs_inv, scale_arg)
+    with torch.cuda.device(_device_index(device)):
+        launch = _bind(arch, plan.kernel_key, kwargs)
+    return NVFP4PerTokenQuantizeRunner(plan, x, outputs, (launch,))
+
+
+def _quant_kwargs(
+    plan: QuantizePlan,
+    x: torch.Tensor,
+    outputs: PerTokenQuantizeOutputs,
+    gs_inv: torch.Tensor,
+    scale_arg: torch.Tensor,
+) -> dict[str, Any]:
+    return dict(
         x=x,
         out_fp4=outputs.fp4,
         out_sf=outputs.sf.view(-1),
         per_token_scale=outputs.scale,
         global_scale_inv=gs_inv,
         out_scale=scale_arg,
-        M=m,
+        M=plan.M,
+        K=plan.K,
+        x_row_stride=row_stride_of(x),
         grid=(plan.grid, 1, 1),
     )
-    with torch.cuda.device(_device_index(device)):
-        launch = _bind(kernel_module_name(arch, plan.kernel_key), kwargs)
-    return NVFP4PerTokenQuantizeRunner(plan, x, outputs, (launch,))
+
+
+@functools.lru_cache(maxsize=4096)
+def _quant_prepared(
+    m: int, k: int, is_bf16: bool, fold: bool, device_index: int, x_row_stride: int
+) -> tuple[QuantizePlan, Callable[..., Any], tuple[tuple[str, str], ...]]:
+    """Plan, loaded FFI entry and argument plan of the quantizer launch of one shape on one device
+    (``x_row_stride`` selects the static-K or the runtime-geometry instance)."""
+    device = torch.device("cuda", device_index)
+    arch = _device_arch(device)
+    plan = quant_plan(m, k, is_bf16, fold, arch, _sm_count(device), x_row_stride)
+    with torch.cuda.device(device_index):
+        entry, arg_plan = _entry(arch, plan.kernel_key)
+    return plan, entry, arg_plan
 
 
 def nvfp4_quantize_per_token(
@@ -888,21 +1292,34 @@ def nvfp4_quantize_per_token(
         )
     if x.dim() != 2 or x.device.type != "cuda":
         raise ValueError("x must be a 2-D CUDA tensor")
-    x = x.contiguous()
+    if x.shape[1] > 1 and x.stride(1) != 1:
+        # Only a non-unit stride along the row needs a copy; row-strided views are read in place.
+        x = x.contiguous()
+    device = x.device
+    device_index = _device_index(device)
     if isinstance(global_scale_inv, torch.Tensor):
-        gs_inv = global_scale_inv.float().reshape(1).contiguous().to(x.device)
+        gs_inv = global_scale_inv
+        if gs_inv.dtype != torch.float32 or gs_inv.device != device:
+            gs_inv = gs_inv.to(device=device, dtype=torch.float32)
+        gs_inv = gs_inv.reshape(1)
     else:
-        gs_inv = torch.tensor(
-            [float(global_scale_inv)], dtype=torch.float32, device=x.device
-        )
+        gs_inv = _cached_scalar_f32(float(global_scale_inv), device_index)
     if out_scale is not None:
-        out_scale = out_scale.float().reshape(1).contiguous().to(x.device)
-    outputs = allocate_nvfp4_per_token_quantize_outputs(
-        x.shape[0], x.shape[1], x.device
+        if out_scale.dtype != torch.float32 or out_scale.device != device:
+            out_scale = out_scale.to(device=device, dtype=torch.float32)
+        out_scale = out_scale.reshape(1)
+    m, k = (int(v) for v in x.shape)
+    if k <= 0 or k % SF_VEC:
+        raise ValueError(f"K={k} must be a positive multiple of {SF_VEC}")
+    outputs = allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    fold = out_scale is not None
+    plan, entry, arg_plan = _quant_prepared(
+        m, k, x.dtype == torch.bfloat16, fold, device_index, row_stride_of(x)
     )
-    runner = prepare_nvfp4_per_token_quantize(x, gs_inv, outputs, out_scale=out_scale)
-    fp4, sf, scale = runner.launch()
-    return fp4, sf, scale
+    kwargs = _quant_kwargs(plan, x, outputs, gs_inv, out_scale if fold else gs_inv)
+    with tvm_ffi.use_torch_stream():
+        entry(*_arguments(arg_plan, kwargs))
+    return outputs.fp4, outputs.sf, outputs.scale
 
 
 # ---------------------------------------------------------------------------
@@ -948,6 +1365,31 @@ def _flat_u8_scales(sf: torch.Tensor, name: str, rows: int, cols: int) -> torch.
             f"{name} must hold {rows} x {cols} swizzled scale bytes, got {sf.numel()}"
         )
     return sf.reshape(-1)
+
+
+_STREAM_K_WORKSPACE: dict[int, torch.Tensor] = {}
+_STREAM_K_FLAGS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _stream_k_workspace(
+    device: torch.device, floats: int, flags: int, slices: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-device FP32 partial workspace and per-(device, slice count) slot flags of the
+    stream-K tail, grown on demand (never shrunk) and shared by the device's stream-K
+    launches, which the stream orders.  The flags are free-running per-launch generations
+    (every word of a tail tile advances once per launch in which the tile exists, so all
+    words of a tile share one history for a fixed slice count); grown arrays restart from
+    zero.  No per-launch initialisation and nothing is reset."""
+    index = _device_index(device)
+    ws = _STREAM_K_WORKSPACE.get(index)
+    if ws is None or ws.numel() < max(floats, 1):
+        ws = torch.empty(max(floats, 1), dtype=torch.float32, device=device)
+        _STREAM_K_WORKSPACE[index] = ws
+    fl = _STREAM_K_FLAGS.get((index, slices))
+    if fl is None or fl.numel() < max(flags, 1):
+        fl = torch.zeros(max(flags, 1), dtype=torch.uint32, device=device)
+        _STREAM_K_FLAGS[(index, slices)] = fl
+    return ws, fl
 
 
 def prepare_mm_fp4_per_token(
@@ -1000,6 +1442,25 @@ def prepare_mm_fp4_per_token(
     plan = gemm_plan(
         m, n, k, out.dtype == torch.float16, arch, _sm_count(device), tactic=tactic
     )
+    kwargs = _gemm_kwargs(plan, a_fp4, a_flat, b_fp4, b_flat, alpha, out)
+    with torch.cuda.device(_device_index(device)):
+        launch = _bind(arch, plan.kernel_key, kwargs)
+    return NVFP4PerTokenGemmRunner(plan, out, (launch,))
+
+
+def _gemm_kwargs(
+    plan: GemmPlan,
+    a_fp4: torch.Tensor,
+    a_flat: torch.Tensor,
+    b_fp4: torch.Tensor,
+    b_flat: torch.Tensor,
+    alpha: torch.Tensor,
+    out: torch.Tensor,
+) -> dict[str, Any]:
+    """Kernel arguments of one GEMM launch (operand views of the resolved plan)."""
+    m, n, k = plan.M, plan.N, plan.K
+    cols = padded_sf_cols(k)
+    pm, pn = padded_rows(m), padded_rows(n)
     # Scale atoms as u32 words: (atoms, K/64 sets, 128 words) for whole-atom operands;
     # narrow token tiles of the swapped orientation address eight-row groups.
     a_view = a_flat.view(torch.uint32).view(pm // ROW_TILE, cols // 4, 128)
@@ -1024,9 +1485,37 @@ def prepare_mm_fp4_per_token(
         num_tiles=plan.num_tiles,
         grid=(plan.grid, 1, 1),
     )
-    with torch.cuda.device(_device_index(device)):
-        launch = _bind(kernel_module_name(arch, plan.kernel_key), kwargs)
-    return NVFP4PerTokenGemmRunner(plan, out, (launch,))
+    if plan.tactic.get("two_cta"):
+        # The 2-CTA programs also take the flat u8 scale tensors: the half-M pair gathers
+        # the words of its 64-row halves from them with register-path cp.async.
+        kwargs["SFA_RAW"], kwargs["SFB_RAW"] = a_flat, b_flat
+    if plan.stream_k:
+        # Stream-K tail: FP32 partial workspace, the generation flags (also bound as the plain
+        # u32 pointer the holders read their own word through) and the tail geometry.
+        red_ws, red_flags = _stream_k_workspace(
+            out.device, plan.sk_workspace_floats, plan.sk_flag_words, plan.sk_slices
+        )
+        kwargs.update(
+            red_ws=red_ws,
+            red_flags=red_flags,
+            red_gen=red_flags,
+            sk_tiles=plan.sk_tiles,
+            sk_pairs=plan.sk_pairs,
+        )
+    return kwargs
+
+
+@functools.lru_cache(maxsize=4096)
+def _gemm_prepared(
+    m: int, n: int, k: int, out_f16: bool, device_index: int
+) -> tuple[GemmPlan, Callable[..., Any], tuple[tuple[str, str], ...]]:
+    """Plan, loaded FFI entry and argument plan of the default-tactic GEMM of one shape on one device."""
+    device = torch.device("cuda", device_index)
+    arch = _device_arch(device)
+    plan = gemm_plan(m, n, k, out_f16, arch, _sm_count(device))
+    with torch.cuda.device(device_index):
+        entry, arg_plan = _entry(arch, plan.kernel_key)
+    return plan, entry, arg_plan
 
 
 def mm_fp4_per_token(
@@ -1055,10 +1544,38 @@ def mm_fp4_per_token(
         )
     a_u8 = a.view(torch.uint8) if a.dtype != torch.uint8 else a
     b_u8 = b_nk.view(torch.uint8) if b_nk.dtype != torch.uint8 else b_nk
-    runner = prepare_mm_fp4_per_token(
-        a_u8, a_descale, b_u8, b_sf, alpha.contiguous(), out
+    if a_u8.dim() != 2 or not a_u8.is_contiguous():
+        raise ValueError("a_fp4 must be a contiguous uint8 [M, K/2] tensor")
+    m, kh = (int(v) for v in a_u8.shape)
+    n, kh_b = (int(v) for v in b_u8.shape)
+    if kh != kh_b:
+        raise ValueError(
+            f"K mismatch: a_fp4 has {2 * kh} elements per row, b_fp4 {2 * kh_b}"
+        )
+    k = 2 * kh
+    device = a_u8.device
+    if device.type != "cuda":
+        raise ValueError("the operands must be CUDA tensors")
+    if any(t.device != device for t in (a_descale, b_u8, b_sf, alpha, out)):
+        raise ValueError("every operand must be on one CUDA device")
+    if out.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"out must be bf16 or fp16, got {out.dtype}")
+    if tuple(out.shape) != (m, n) or not out.is_contiguous():
+        raise ValueError(f"out must be a contiguous [{m}, {n}] tensor")
+    if alpha.dtype != torch.float32 or alpha.numel() != m:
+        raise ValueError("alpha must be a float32 tensor with one value per token")
+    if not alpha.is_contiguous():
+        alpha = alpha.contiguous()
+    cols = padded_sf_cols(k)
+    a_flat = _flat_u8_scales(a_descale, "a_sf", padded_rows(m), cols)
+    b_flat = _flat_u8_scales(b_sf, "b_sf", padded_rows(n), cols)
+    plan, entry, arg_plan = _gemm_prepared(
+        m, n, k, out.dtype == torch.float16, _device_index(device)
     )
-    return runner.launch()
+    kwargs = _gemm_kwargs(plan, a_u8, a_flat, b_u8, b_flat, alpha, out)
+    with tvm_ffi.use_torch_stream():
+        entry(*_arguments(arg_plan, kwargs))
+    return out
 
 
 # ---------------------------------------------------------------------------

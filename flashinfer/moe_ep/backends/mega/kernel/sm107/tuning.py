@@ -1,4 +1,4 @@
-"""Offline tuning shared by the SM107 NVFP4 and MXFP8 backends.
+"""Offline tuning shared by the SM107 block-scaled backends.
 
 The core runtime owns torch.distributed and NVSHMEM initialization.
 Each candidate needs a new session because kernel knobs are fixed at
@@ -21,6 +21,8 @@ def _backend_module(quant_kind: str, name: str):
     backend = (
         "nvfp4_nvfp4_bf16_cutedsl"
         if quant_kind == "nvfp4"
+        else "mxfp8_mxfp4_bf16_cutedsl"
+        if quant_kind == "mxfp4_mxfp8"
         else "mxfp8_mxfp8_bf16_cutedsl"
     )
     return importlib.import_module(f".{backend}.{name}", __package__)
@@ -39,7 +41,7 @@ def _dummy_transformed_weights(args, rank: int, world_size: int, quant_kind: str
     )
 
     weights_mod = _backend_module(quant_kind, "weights")
-    extra = {} if quant_kind == "nvfp4" else {"kind": quant_kind}
+    extra = {} if quant_kind in ("nvfp4", "mxfp4_mxfp8") else {"kind": quant_kind}
 
     experts_per_rank = args.num_experts // world_size
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 7 * rank)
@@ -89,7 +91,11 @@ def _stage_dummy_inputs(args, rank, symm_buffer, live_tokens: int, quant_kind: s
     import torch
 
     staging_mod = _backend_module(quant_kind, "staging")
-    extra = {} if quant_kind == "nvfp4" else {"kind": quant_kind}
+    extra = (
+        {"input_norm_const": args.input_norm_const}
+        if quant_kind == "nvfp4"
+        else {"kind": quant_kind}
+    )
 
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 13 * rank)
     x = torch.randn(
@@ -117,6 +123,9 @@ def _stage_dummy_inputs(args, rank, symm_buffer, live_tokens: int, quant_kind: s
         **extra,
     )
     symm_buffer.note_staged_tokens(staged)
+    if quant_kind == "nvfp4":
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            getattr(symm_buffer, name).fill_(getattr(args, name))
 
 
 def tune_one(
@@ -153,6 +162,9 @@ def tune_one(
             world_size,
             quant_kind=cast("Sm107QuantKind", quant_kind),
             gate_up_clamp=args.gate_up_clamp,
+            activation=args.activation,
+            situ_beta=args.situ_beta,
+            situ_linear_beta=args.situ_linear_beta,
         )
         _stage_dummy_inputs(args, rank, symm_buffer, live_tokens, quant_kind)
         y = torch.empty(live_tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
@@ -172,6 +184,10 @@ def tune_one(
                     num_experts=args.num_experts,
                     topk=args.topk,
                     max_tokens=max_tokens,
+                    activation=args.activation,
+                    situ_beta=args.situ_beta,
+                    situ_linear_beta=args.situ_linear_beta,
+                    gate_up_clamp=args.gate_up_clamp,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
@@ -210,6 +226,10 @@ def run_tuning(args, quant_kind: str) -> int:
 
     if args.combine_dtype != "bf16":
         raise SystemExit("the SM107 backends are wired for bf16 combine only")
+    from .validation import validate_input_norm_const
+
+    for name in ("input_norm_const", "fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+        validate_input_norm_const(getattr(args, name), name=name)
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))

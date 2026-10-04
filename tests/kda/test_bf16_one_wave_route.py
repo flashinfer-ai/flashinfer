@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from flashinfer import prepare_bf16_kda_prefill
+from flashinfer.cake_kda_tf32_runtime import select_bf16_schedule_route
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -117,3 +118,15 @@ def test_multi_wave_grid_keeps_direct_tile():
     schedule = _prepare((128,) * 8, 12, active_beta=True)
     assert "m64" not in schedule
     assert schedule.startswith("fused_")
+
+
+def test_select_bf16_schedule_route_rejects_unknown_gpu_arch():
+    """The metadata adapter takes ``gpu_arch`` directly (no device probe); an
+    unmapped architecture string fails with a clear error instead of a KeyError."""
+    kwargs = dict(
+        sm_count=148, fixed_layout=False, sequence_lengths=(1025, 33), num_heads=12
+    )
+    for gpu_arch in ("sm_100a", "sm_103a"):
+        assert isinstance(select_bf16_schedule_route(gpu_arch=gpu_arch, **kwargs), str)
+    with pytest.raises(ValueError, match="gpu_arch must be one of"):
+        select_bf16_schedule_route(gpu_arch="sm_90a", **kwargs)

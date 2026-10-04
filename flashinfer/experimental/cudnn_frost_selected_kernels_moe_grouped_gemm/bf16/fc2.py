@@ -87,7 +87,7 @@ def discover(roots: tuple[Path, ...] | None = None) -> tuple[Fc2Kernel, ...]:
                 or contract.get("activation") != "identity"
             ):
                 raise RuntimeError(
-                    "FC2 v1 requires BF16 inputs/output and identity activation"
+                    "FC2 v2 requires BF16 inputs/output and identity activation"
                 )
             result.append(
                 Fc2Kernel(
@@ -121,8 +121,8 @@ def matching_kernels(
 class PreparedFc2:
     """Bind caller-owned tensors outside capture, then launch without allocation.
 
-    Offsets are int32[E], start at zero, are nondecreasing, and end implicitly
-    at S. Empty experts are allowed. Callers may change tensor contents between
+    Offsets are int32[E+1], start at zero, are nondecreasing, and explicitly
+    end at or before S. Empty experts are allowed. Callers may change tensor contents between
     runs, but must preserve valid offsets and keep this plan alive for graphs.
     Each concurrent stream needs its own workspace/plan.
     """
@@ -145,7 +145,7 @@ class PreparedFc2:
             raise ValueError("FC2 expects x[S,I], weights[E,H,I]")
         s, k = x.shape
         e, n, wk = weights.shape
-        if wk != k or tuple(out.shape) != (s, n) or tuple(offsets.shape) != (e,):
+        if wk != k or tuple(out.shape) != (s, n) or tuple(offsets.shape) != (e + 1,):
             raise ValueError("FC2 tensor geometry mismatch")
         values = dict(s=s, n=n, k=k, experts=e, groups=e)
         if kernel.arch != _arch_for(x.device) or not all(

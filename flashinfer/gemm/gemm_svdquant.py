@@ -858,28 +858,9 @@ def mm_nvfp4_svdquant(
     alpha_scalar = alpha.reshape(-1)[:1]
 
     if backend == "cake":
-        from ..jit.cake_nvfp4_svdquant import (
-            cake_nvfp4_svdquant_workspace_size,
-            run_cake_nvfp4_svdquant,
-        )
+        from ..jit.cake_nvfp4_svdquant import run_cake_nvfp4_svdquant
 
-        workspace_bytes = cake_nvfp4_svdquant_workspace_size(
-            m=int(a.shape[0]),
-            n=int(b.shape[0]),
-            k=int(a.shape[1]) * 2,
-            rank=int(d.shape[1]),
-            has_bias=bias is not None,
-            device=a.device,
-        )
-        workspace = None
-        if workspace_bytes:
-            workspace = _get_cache_buf(
-                "cake_nvfp4_svdquant_tma_workspace", workspace_bytes, a.device
-            )[:workspace_bytes]
-            if workspace.data_ptr() % 128:
-                raise RuntimeError("Cake descriptor workspace is not 128-byte aligned")
         return run_cake_nvfp4_svdquant(
-            backend="cake",
             a=a,
             b=b,
             a_sf=a_sf,
@@ -889,7 +870,6 @@ def mm_nvfp4_svdquant(
             l1=l1,
             bias=bias,
             out=out,
-            workspace=workspace,
             enable_pdl=enable_pdl,
         )
 

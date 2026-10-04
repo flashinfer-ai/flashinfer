@@ -249,23 +249,6 @@ def test_validate_rejects_unsupported_inputs():
     rejects("lse must be a float32", lse=torch.empty((8, 24), dtype=torch.bfloat16))
 
 
-def test_route_name_format():
-    assert (
-        cake_jit.route_name("sm_100a", "bf16", 64, 4, 1) == "bf16_p64_g4_pm1__sm_100a"
-    )
-    assert (
-        cake_jit.route_name("sm_103a", "fp8", 128, 16, 0) == "fp8_p128_g16_pm0__sm_103a"
-    )
-    for module, record in cake_jit.MODULES.items():
-        assert record["arch"] in cake_jit.ARCH_NVCC_FLAGS
-        assert record["tma_workspace_bytes"] == 0, module
-    for name, record in cake_jit.ROUTES.items():
-        assert name.endswith("__" + record["arch"])
-        assert record["main"] in cake_jit.MODULES
-    for arch, module in cake_jit.MERGE_MODULES.items():
-        assert cake_jit.MODULES[module]["arch"] == arch
-
-
 # ---------------------------------------------------------------------------
 # GPU fixtures (upstream test_cute_dsl_mla_dcp semantics)
 # ---------------------------------------------------------------------------
@@ -304,11 +287,6 @@ def _skip_unless_registered(
         pytest.skip(
             f"generated program {kind}_p{page_size}_g{groups}_pm{plan['partition_mode']} "
             f"not registered in this checkout ({cake_jit.TRACKING_ISSUE})"
-        )
-    arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
-    if launches_merge(plan) and arch not in cake_jit.MERGE_MODULES:
-        pytest.skip(
-            f"merge kernel for {arch} not registered ({cake_jit.TRACKING_ISSUE})"
         )
     return plan
 
@@ -795,6 +773,81 @@ def test_page_sizes(dtype, page_size, num_heads, cp_world):
         permute=True,
         seed=74,
     )
+
+
+def test_strided_kv_cache_view_binds_without_copy():
+    """One layer of a ``[num_pages, L, page_size, 576]`` pool binds in place.
+
+    The K / V tensor maps carry the pool's physical strides, so the strided
+    layer view produces the same O / LSE as its contiguous copy without a
+    full-pool ``.contiguous()`` and without a copy at prepare time.
+    """
+    device = _device_or_skip()
+    query, cum_q, max_q_len, global_kv, global_lens = _make_batched_inputs(
+        (900, 64, 3, 1500), (2, 1, 1, 3), 24, torch.bfloat16, seed=81, max_q_len=4
+    )
+    kv_cache, page_table, seq_lens, max_local_len = _pack_cyclic_rank_pages(
+        global_kv, global_lens.tolist(), 2, 1, page_size=64, permute=True, seed=81
+    )
+    plan = _skip_unless_registered(
+        device,
+        dtype=query.dtype,
+        page_size=64,
+        batch_size=len(global_lens),
+        max_q_len=max_q_len,
+        num_heads=24,
+        max_seq_len=max_local_len,
+    )
+    del plan
+    layers = 3
+    pool = torch.zeros(
+        (int(kv_cache.shape[0]), layers, 64, HEAD_DIM_QK),
+        dtype=kv_cache.dtype,
+        device=device,
+    )
+    pool[:, 1] = kv_cache
+    strided = pool[:, 1]
+    assert not strided.is_contiguous() and strided.stride(-1) == 1
+
+    def run(cache):
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        workspace = torch.empty(
+            cake_mla_varq_dcp_decode_workspace_size(
+                batch_size=len(global_lens),
+                max_q_len=max_q_len,
+                num_heads=24,
+                max_seq_len=max_local_len,
+                num_sms=num_sms,
+            ),
+            dtype=torch.uint8,
+            device=device,
+        )
+        before = _cuda_memory_footprint()
+        runner = prepare_cake_mla_varq_dcp_decode(
+            query,
+            cache,
+            page_table,
+            seq_lens,
+            cum_q,
+            max_q_len,
+            max_seq_len=max_local_len,
+            softmax_scale=_SOFTMAX_SCALE,
+            workspace_buffer=workspace,
+            causal_seqlens_kv_global=global_lens,
+            cp_world=2,
+            cp_rank=1,
+        )
+        out, lse = runner.launch()
+        torch.cuda.synchronize()
+        # prepare allocates O / LSE and the int32 index copies only: no KV copy.
+        kv_bytes = cache.numel() * cache.element_size()
+        grown = _cuda_memory_footprint()["allocated_bytes"] - before["allocated_bytes"]
+        assert grown < kv_bytes, (grown, kv_bytes)
+        return out.clone(), lse.clone()
+
+    out_c, lse_c = run(kv_cache)
+    out_s, lse_s = run(strided)
+    _assert_replay_close(out_s, lse_s, out_c, lse_c)
 
 
 def test_world1_var_q_matches_disabled_dcp():
