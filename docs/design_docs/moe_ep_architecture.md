@@ -87,8 +87,8 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
-| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back (`flashinfer.comm.MoeAlltoAll`, TRT-LLM kernels) |
-| `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | `nvlink_one_sided` running the generated Cake kernels (`MoeAlltoAll` with `backend="cake"`); SM100/SM103 only |
+| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
+| `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | The one-sided protocol of `flashinfer.comm.MoeAlltoAll` running the generated Cake kernels (`backend="cake"`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`flashinfer.comm.MnnvlMoe`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
 | `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
@@ -352,7 +352,7 @@ classDiagram
     MoEEpSplitLayer --> Handle : per forward
 
     MoEEpCommunication <|-- NVLinkOneSidedAlltoAll
-    NVLinkOneSidedAlltoAll <|-- CakeAlltoAll
+    MoEEpCommunication <|-- CakeAlltoAll
     MoEEpCommunication <|-- NVLinkTwoSidedAlltoAll
 
     MoEEpMegaLayer --> MegaKernelBackend

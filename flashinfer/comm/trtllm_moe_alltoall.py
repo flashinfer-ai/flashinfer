@@ -909,19 +909,18 @@ def moe_a2a_get_workspace_size_per_rank(
 
 
 @deprecated(
-    "MoeAlltoAll is deprecated; use flashinfer.moe_ep.NVLinkOneSidedAlltoAll "
-    "(CakeAlltoAll for backend='cake'). Its implementation will "
-    "move into those classes."
+    "MoeAlltoAll is deprecated; use flashinfer.moe_ep.NVLinkOneSidedAlltoAll, "
+    "which runs newer one-sided kernels (CakeAlltoAll for backend='cake')."
 )
 class MoeAlltoAll:
     """
     Manages MoE All-to-All operations with proper workspace allocation and synchronization.
 
     .. deprecated:: 0.7.1
-        Use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`
-        (:class:`flashinfer.moe_ep.CakeAlltoAll` for
-        ``backend="cake"``). The implementation of this class will move into
-        them; they will no longer wrap it.
+        Use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`, which runs its
+        own, newer one-sided kernels (CFT counted writes, up to 256 ranks), or
+        :class:`flashinfer.moe_ep.CakeAlltoAll` for ``backend="cake"``, which
+        builds on this class.
 
     This class provides the throughput-optimized backend that supports multiple payloads
     per collective operation, explicit dispatch/combine phases, and workspace-backed tensors.

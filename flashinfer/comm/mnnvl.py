@@ -235,6 +235,12 @@ class MnnvlMemory:  # type: ignore[no-redef]
     def mapped(self) -> bool:
         return MnnvlMemory.allocated_map[self.ptr].mapped
 
+    @property
+    def local_mem_handle(self) -> int:
+        """This rank's ``CUmemGenericAllocationHandle`` backing the allocation."""
+        record = MnnvlMemory.allocated_map[self.ptr]
+        return int(record.mem_handles[record.comm_rank])
+
     def as_torch_strided_tensor(self, dtype):
         num_segments = MnnvlMemory.comm.Get_size()
         return pack_strided_memory(

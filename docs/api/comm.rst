@@ -558,7 +558,9 @@ These are the kernel-level primitives of the NVLink one-sided MoE all-to-all.
 :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll` (and
 :class:`flashinfer.moe_ep.CakeAlltoAll` for ``backend="cake"``),
 which expose the dispatch/combine interface shared by all expert-parallel
-communication backends; its implementation will move into those classes.
+communication backends. ``NVLinkOneSidedAlltoAll`` runs its own, newer
+one-sided kernels (CFT counted writes, up to 256 ranks); ``CakeAlltoAll``
+builds on ``MoeAlltoAll``.
 
 .. currentmodule:: flashinfer.comm
 
