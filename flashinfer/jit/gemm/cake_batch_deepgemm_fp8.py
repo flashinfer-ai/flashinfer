@@ -62,6 +62,22 @@ ARG_PLANS: dict[str, list[list[str]]] = {
     "plan2": [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
+        ["tma_buffer", "C_tma"],
+        ["buffer", "SFA_packed"],
+        ["buffer", "SFB_packed"],
+        ["buffer", "masked_m"],
+        ["parameter", "num_groups"],
+        ["parameter", "shape_m"],
+        ["parameter", "compute_m_cap"],
+        ["parameter", "N"],
+        ["parameter", "K"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "plan3": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
         ["buffer", "SFA_bits"],
         ["buffer", "SFB_bits"],
         ["buffer", "masked_m"],
@@ -72,22 +88,6 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "k_tiles"],
         ["parameter", "sf_cols"],
         ["parameter", "scheduled_pair_blocks"],
-        ["grid", "grid_x"],
-        ["grid", "grid_y"],
-        ["grid", "grid_z"],
-    ],
-    "plan3": [
-        ["tma_buffer", "A"],
-        ["tma_buffer", "B"],
-        ["tma_buffer", "C_tma"],
-        ["buffer", "SFA_packed"],
-        ["buffer", "SFB_packed"],
-        ["buffer", "masked_m"],
-        ["parameter", "num_groups"],
-        ["parameter", "shape_m"],
-        ["parameter", "compute_m_cap"],
-        ["parameter", "N"],
-        ["parameter", "K"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -152,11 +152,23 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 }
 
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_batch_deepgemm_fp8_2382d782c0bafc3a9878": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_2382d782c0bafc3a9878",
+    "cake_batch_deepgemm_fp8_02cd3d43724acdbda982": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2382d782c0bafc3a9878_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2382d782c0bafc3a9878_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_02cd3d43724acdbda982_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_02cd3d43724acdbda982_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -164,35 +176,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a"],
     },
-    "cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91",
+    "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_29a2b409934055f8cdd0": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_29a2b409934055f8cdd0",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_29a2b409934055f8cdd0_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_29a2b409934055f8cdd0_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_29a8930160c38b72cff6": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_29a8930160c38b72cff6",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_29a8930160c38b72cff6_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_29a8930160c38b72cff6_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -200,23 +188,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_2cd08ce62ec175db050b": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_2cd08ce62ec175db050b",
+    "cake_batch_deepgemm_fp8_1405732af0d574df0139": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_1405732af0d574df0139",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2cd08ce62ec175db050b_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2cd08ce62ec175db050b_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a"],
-    },
-    "cake_batch_deepgemm_fp8_2fce665a907c0d48ab4b": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_2fce665a907c0d48ab4b",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2fce665a907c0d48ab4b_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2fce665a907c0d48ab4b_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1405732af0d574df0139_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1405732af0d574df0139_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -224,11 +200,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_2ffc5a909a9e79353fa9": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_2ffc5a909a9e79353fa9",
+    "cake_batch_deepgemm_fp8_1602ca00dfa78ba89d6a": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_1602ca00dfa78ba89d6a",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2ffc5a909a9e79353fa9_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2ffc5a909a9e79353fa9_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1602ca00dfa78ba89d6a_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1602ca00dfa78ba89d6a_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -236,35 +212,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_36afbebf9dfd01967336": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_36afbebf9dfd01967336",
+    "cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_36afbebf9dfd01967336_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_36afbebf9dfd01967336_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a"],
-    },
-    "cake_batch_deepgemm_fp8_389e6c89e61b7d49a076": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_389e6c89e61b7d49a076_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_389e6c89e61b7d49a076_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_3dfe31e7f71ee9976e3e": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_3dfe31e7f71ee9976e3e",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_3dfe31e7f71ee9976e3e_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_3dfe31e7f71ee9976e3e_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -272,11 +224,35 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_508491c54eb3f469b37e": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_508491c54eb3f469b37e",
+    "cake_batch_deepgemm_fp8_1bb4c4c3d68e35871c2f": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_1bb4c4c3d68e35871c2f",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_508491c54eb3f469b37e_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_508491c54eb3f469b37e_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1bb4c4c3d68e35871c2f_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1bb4c4c3d68e35871c2f_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_100a"],
+    },
+    "cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a"],
+    },
+    "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -284,11 +260,59 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3",
+    "cake_batch_deepgemm_fp8_215f20f0a5f44903608b": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_215f20f0a5f44903608b",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_215f20f0a5f44903608b_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_215f20f0a5f44903608b_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan1",
+        "arches": ["sm_100a"],
+    },
+    "cake_batch_deepgemm_fp8_2ac9e23059edba242a92": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_2ac9e23059edba242a92",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2ac9e23059edba242a92_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2ac9e23059edba242a92_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_2c120bce2db6a19bf130": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_2c120bce2db6a19bf130",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2c120bce2db6a19bf130_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_2c120bce2db6a19bf130_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_364ce5d12a45a1d49602": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_364ce5d12a45a1d49602",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_364ce5d12a45a1d49602_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_364ce5d12a45a1d49602_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan1",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_54ec41340241b946c14e": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_54ec41340241b946c14e",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_54ec41340241b946c14e_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_54ec41340241b946c14e_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -305,26 +329,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
-        "arg_plan": "plan2",
+        "arg_plan": "plan3",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_638db43d71890e22c8fe": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_638db43d71890e22c8fe",
+    "cake_batch_deepgemm_fp8_59edc7df733ec03c53d5": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_59edc7df733ec03c53d5",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_638db43d71890e22c8fe_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_638db43d71890e22c8fe_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan1",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_59edc7df733ec03c53d5_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_59edc7df733ec03c53d5_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -332,35 +344,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_733a94c236b2ee6a8aee": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_733a94c236b2ee6a8aee",
+    "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_733a94c236b2ee6a8aee_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_733a94c236b2ee6a8aee_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan1",
-        "arches": ["sm_100a"],
-    },
-    "cake_batch_deepgemm_fp8_74557d5c854d22263fab": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_74557d5c854d22263fab",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_74557d5c854d22263fab_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_74557d5c854d22263fab_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan3",
-        "arches": ["sm_100a"],
-    },
-    "cake_batch_deepgemm_fp8_8730531b6d09e9544c01": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_8730531b6d09e9544c01",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_8730531b6d09e9544c01_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_8730531b6d09e9544c01_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -380,17 +368,113 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan4",
         "arches": ["sm_100a"],
     },
-    "cake_batch_deepgemm_fp8_b974999e103cd7640cc7": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_b974999e103cd7640cc7",
+    "cake_batch_deepgemm_fp8_8c4067fce6c805ee9300": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_8c4067fce6c805ee9300",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b974999e103cd7640cc7_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b974999e103cd7640cc7_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_8c4067fce6c805ee9300_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_8c4067fce6c805ee9300_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
-        "arg_plan": "plan3",
-        "arches": ["sm_100a"],
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan1",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_90284e378e31f0382475": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_90284e378e31f0382475",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_90284e378e31f0382475_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_90284e378e31f0382475_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan1",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_929a5561abc99caa7f4f_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_929a5561abc99caa7f4f_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan1",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_b53863e736461b0c669d": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_b53863e736461b0c669d",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b53863e736461b0c669d_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b53863e736461b0c669d_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_batch_deepgemm_fp8_ba92e96364e30012640e": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_ba92e96364e30012640e",
@@ -404,11 +488,23 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan5",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_bf96f77ec8235b35deac": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_bf96f77ec8235b35deac",
+    "cake_batch_deepgemm_fp8_c1541da977c9a379e49b": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_c1541da977c9a379e49b",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_bf96f77ec8235b35deac_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_bf96f77ec8235b35deac_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c1541da977c9a379e49b_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c1541da977c9a379e49b_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_ce9db47474bd124735cc": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_ce9db47474bd124735cc",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ce9db47474bd124735cc_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ce9db47474bd124735cc_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -416,23 +512,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_c216805f6296a1f0b0e8": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_c216805f6296a1f0b0e8",
+    "cake_batch_deepgemm_fp8_d22ea585c19c028e29ae": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_d22ea585c19c028e29ae",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c216805f6296a1f0b0e8_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c216805f6296a1f0b0e8_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan1",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_c41147f6dbdf4c321445": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_c41147f6dbdf4c321445",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c41147f6dbdf4c321445_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c41147f6dbdf4c321445_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d22ea585c19c028e29ae_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d22ea585c19c028e29ae_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -440,101 +524,29 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a",
+    "cake_batch_deepgemm_fp8_e306f272ed478b53bd16": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_e306f272ed478b53bd16",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_e306f272ed478b53bd16_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_e306f272ed478b53bd16_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a"],
     },
-    "cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f",
+    "cake_batch_deepgemm_fp8_e6e78deccdcbf45fa870": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_e6e78deccdcbf45fa870",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_ca298547e7b496acb4d3": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_ca298547e7b496acb4d3",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ca298547e7b496acb4d3_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ca298547e7b496acb4d3_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_d4262883ad8c2c6cef94": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_d4262883ad8c2c6cef94",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d4262883ad8c2c6cef94_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d4262883ad8c2c6cef94_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_e6e78deccdcbf45fa870_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_e6e78deccdcbf45fa870_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
         "arches": ["sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_d662bd14d9ad55d45263": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_d662bd14d9ad55d45263",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d662bd14d9ad55d45263_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d662bd14d9ad55d45263_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_e460881a1cdcaccf5860": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_e460881a1cdcaccf5860",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_e460881a1cdcaccf5860_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_e460881a1cdcaccf5860_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan1",
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_batch_deepgemm_fp8_eb727f8d280f83b52730": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_eb727f8d280f83b52730",
@@ -546,18 +558,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan6",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_ec43ea789e823a74035e": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_ec43ea789e823a74035e",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ec43ea789e823a74035e_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ec43ea789e823a74035e_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan3",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_batch_deepgemm_fp8_f2d3d7cdd838fe7ef523": {
@@ -584,23 +584,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan4",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_f8971314a3ef775f9c58": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_f8971314a3ef775f9c58",
+    "cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_f8971314a3ef775f9c58_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_f8971314a3ef775f9c58_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan1",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_fa4617e53e638c775af8": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_fa4617e53e638c775af8",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fa4617e53e638c775af8_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fa4617e53e638c775af8_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -608,88 +596,112 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_batch_deepgemm_fp8_fffc74e89022d23621dd": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_fffc74e89022d23621dd",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fffc74e89022d23621dd_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fffc74e89022d23621dd_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_100a"],
+    },
 }
 
 MODULES: dict[str, dict[str, str]] = {
-    "cake_batch_deepgemm_fp8_2382d782c0bafc3a9878_sm_100a": {
+    "cake_batch_deepgemm_fp8_02cd3d43724acdbda982_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_2382d782c0bafc3a9878",
+        "program": "cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
     },
-    "cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91",
-    },
-    "cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91_sm_103a": {
+    "cake_batch_deepgemm_fp8_02cd3d43724acdbda982_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91",
+        "program": "cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
     },
-    "cake_batch_deepgemm_fp8_29a2b409934055f8cdd0_sm_100a": {
+    "cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_29a2b409934055f8cdd0",
+        "program": "cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88",
     },
-    "cake_batch_deepgemm_fp8_29a2b409934055f8cdd0_sm_103a": {
+    "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b",
+    },
+    "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_29a2b409934055f8cdd0",
+        "program": "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b",
     },
-    "cake_batch_deepgemm_fp8_29a8930160c38b72cff6_sm_100a": {
+    "cake_batch_deepgemm_fp8_1405732af0d574df0139_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_29a8930160c38b72cff6",
+        "program": "cake_batch_deepgemm_fp8_1405732af0d574df0139",
     },
-    "cake_batch_deepgemm_fp8_29a8930160c38b72cff6_sm_103a": {
+    "cake_batch_deepgemm_fp8_1405732af0d574df0139_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_29a8930160c38b72cff6",
+        "program": "cake_batch_deepgemm_fp8_1405732af0d574df0139",
     },
-    "cake_batch_deepgemm_fp8_2cd08ce62ec175db050b_sm_100a": {
+    "cake_batch_deepgemm_fp8_1602ca00dfa78ba89d6a_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_2cd08ce62ec175db050b",
+        "program": "cake_batch_deepgemm_fp8_1602ca00dfa78ba89d6a",
     },
-    "cake_batch_deepgemm_fp8_2fce665a907c0d48ab4b_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_2fce665a907c0d48ab4b",
-    },
-    "cake_batch_deepgemm_fp8_2fce665a907c0d48ab4b_sm_103a": {
+    "cake_batch_deepgemm_fp8_1602ca00dfa78ba89d6a_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_2fce665a907c0d48ab4b",
+        "program": "cake_batch_deepgemm_fp8_1602ca00dfa78ba89d6a",
     },
-    "cake_batch_deepgemm_fp8_2ffc5a909a9e79353fa9_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_2ffc5a909a9e79353fa9",
-    },
-    "cake_batch_deepgemm_fp8_2ffc5a909a9e79353fa9_sm_103a": {
+    "cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_2ffc5a909a9e79353fa9",
+        "program": "cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15",
     },
-    "cake_batch_deepgemm_fp8_36afbebf9dfd01967336_sm_100a": {
+    "cake_batch_deepgemm_fp8_1bb4c4c3d68e35871c2f_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_36afbebf9dfd01967336",
+        "program": "cake_batch_deepgemm_fp8_1bb4c4c3d68e35871c2f",
     },
-    "cake_batch_deepgemm_fp8_389e6c89e61b7d49a076_sm_100a": {
+    "cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
+        "program": "cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6",
     },
-    "cake_batch_deepgemm_fp8_389e6c89e61b7d49a076_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
-    },
-    "cake_batch_deepgemm_fp8_3dfe31e7f71ee9976e3e_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_3dfe31e7f71ee9976e3e",
-    },
-    "cake_batch_deepgemm_fp8_508491c54eb3f469b37e_sm_100a": {
+    "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_508491c54eb3f469b37e",
+        "program": "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
     },
-    "cake_batch_deepgemm_fp8_508491c54eb3f469b37e_sm_103a": {
+    "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_508491c54eb3f469b37e",
+        "program": "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
     },
-    "cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3_sm_100a": {
+    "cake_batch_deepgemm_fp8_215f20f0a5f44903608b_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3",
+        "program": "cake_batch_deepgemm_fp8_215f20f0a5f44903608b",
     },
-    "cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3_sm_103a": {
+    "cake_batch_deepgemm_fp8_2ac9e23059edba242a92_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_2ac9e23059edba242a92",
+    },
+    "cake_batch_deepgemm_fp8_2ac9e23059edba242a92_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3",
+        "program": "cake_batch_deepgemm_fp8_2ac9e23059edba242a92",
+    },
+    "cake_batch_deepgemm_fp8_2c120bce2db6a19bf130_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_2c120bce2db6a19bf130",
+    },
+    "cake_batch_deepgemm_fp8_2c120bce2db6a19bf130_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_2c120bce2db6a19bf130",
+    },
+    "cake_batch_deepgemm_fp8_364ce5d12a45a1d49602_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_364ce5d12a45a1d49602",
+    },
+    "cake_batch_deepgemm_fp8_364ce5d12a45a1d49602_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_364ce5d12a45a1d49602",
+    },
+    "cake_batch_deepgemm_fp8_54ec41340241b946c14e_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_54ec41340241b946c14e",
+    },
+    "cake_batch_deepgemm_fp8_54ec41340241b946c14e_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_54ec41340241b946c14e",
     },
     "cake_batch_deepgemm_fp8_57c401152579ac3ac327_sm_100a": {
         "arch": "sm_100a",
@@ -699,45 +711,97 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_57c401152579ac3ac327",
     },
-    "cake_batch_deepgemm_fp8_638db43d71890e22c8fe_sm_100a": {
+    "cake_batch_deepgemm_fp8_59edc7df733ec03c53d5_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_638db43d71890e22c8fe",
+        "program": "cake_batch_deepgemm_fp8_59edc7df733ec03c53d5",
     },
-    "cake_batch_deepgemm_fp8_638db43d71890e22c8fe_sm_103a": {
+    "cake_batch_deepgemm_fp8_59edc7df733ec03c53d5_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_638db43d71890e22c8fe",
+        "program": "cake_batch_deepgemm_fp8_59edc7df733ec03c53d5",
     },
-    "cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163_sm_100a": {
+    "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163",
+        "program": "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
     },
-    "cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163_sm_103a": {
+    "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163",
-    },
-    "cake_batch_deepgemm_fp8_733a94c236b2ee6a8aee_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_733a94c236b2ee6a8aee",
-    },
-    "cake_batch_deepgemm_fp8_74557d5c854d22263fab_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_74557d5c854d22263fab",
-    },
-    "cake_batch_deepgemm_fp8_8730531b6d09e9544c01_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_8730531b6d09e9544c01",
-    },
-    "cake_batch_deepgemm_fp8_8730531b6d09e9544c01_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_8730531b6d09e9544c01",
+        "program": "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
     },
     "cake_batch_deepgemm_fp8_87a3c50a96af69fbae87_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_87a3c50a96af69fbae87",
     },
-    "cake_batch_deepgemm_fp8_b974999e103cd7640cc7_sm_100a": {
+    "cake_batch_deepgemm_fp8_8c4067fce6c805ee9300_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_b974999e103cd7640cc7",
+        "program": "cake_batch_deepgemm_fp8_8c4067fce6c805ee9300",
+    },
+    "cake_batch_deepgemm_fp8_8c4067fce6c805ee9300_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_8c4067fce6c805ee9300",
+    },
+    "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6",
+    },
+    "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6",
+    },
+    "cake_batch_deepgemm_fp8_90284e378e31f0382475_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
+    },
+    "cake_batch_deepgemm_fp8_90284e378e31f0382475_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
+    },
+    "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
+    },
+    "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
+    },
+    "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
+    },
+    "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
+    },
+    "cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2",
+    },
+    "cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2",
+    },
+    "cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a",
+    },
+    "cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a",
+    },
+    "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a",
+    },
+    "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a",
+    },
+    "cake_batch_deepgemm_fp8_b53863e736461b0c669d_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_b53863e736461b0c669d",
+    },
+    "cake_batch_deepgemm_fp8_b53863e736461b0c669d_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_b53863e736461b0c669d",
     },
     "cake_batch_deepgemm_fp8_ba92e96364e30012640e_sm_100a": {
         "arch": "sm_100a",
@@ -747,89 +811,37 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_ba92e96364e30012640e",
     },
-    "cake_batch_deepgemm_fp8_bf96f77ec8235b35deac_sm_100a": {
+    "cake_batch_deepgemm_fp8_c1541da977c9a379e49b_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_bf96f77ec8235b35deac",
+        "program": "cake_batch_deepgemm_fp8_c1541da977c9a379e49b",
     },
-    "cake_batch_deepgemm_fp8_bf96f77ec8235b35deac_sm_103a": {
+    "cake_batch_deepgemm_fp8_c1541da977c9a379e49b_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_bf96f77ec8235b35deac",
+        "program": "cake_batch_deepgemm_fp8_c1541da977c9a379e49b",
     },
-    "cake_batch_deepgemm_fp8_c216805f6296a1f0b0e8_sm_100a": {
+    "cake_batch_deepgemm_fp8_ce9db47474bd124735cc_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_c216805f6296a1f0b0e8",
+        "program": "cake_batch_deepgemm_fp8_ce9db47474bd124735cc",
     },
-    "cake_batch_deepgemm_fp8_c216805f6296a1f0b0e8_sm_103a": {
+    "cake_batch_deepgemm_fp8_ce9db47474bd124735cc_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_c216805f6296a1f0b0e8",
+        "program": "cake_batch_deepgemm_fp8_ce9db47474bd124735cc",
     },
-    "cake_batch_deepgemm_fp8_c41147f6dbdf4c321445_sm_100a": {
+    "cake_batch_deepgemm_fp8_d22ea585c19c028e29ae_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_c41147f6dbdf4c321445",
+        "program": "cake_batch_deepgemm_fp8_d22ea585c19c028e29ae",
     },
-    "cake_batch_deepgemm_fp8_c41147f6dbdf4c321445_sm_103a": {
+    "cake_batch_deepgemm_fp8_d22ea585c19c028e29ae_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_c41147f6dbdf4c321445",
+        "program": "cake_batch_deepgemm_fp8_d22ea585c19c028e29ae",
     },
-    "cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a_sm_100a": {
+    "cake_batch_deepgemm_fp8_e306f272ed478b53bd16_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a",
+        "program": "cake_batch_deepgemm_fp8_e306f272ed478b53bd16",
     },
-    "cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a_sm_103a": {
+    "cake_batch_deepgemm_fp8_e6e78deccdcbf45fa870_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a",
-    },
-    "cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f",
-    },
-    "cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f",
-    },
-    "cake_batch_deepgemm_fp8_ca298547e7b496acb4d3_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_ca298547e7b496acb4d3",
-    },
-    "cake_batch_deepgemm_fp8_ca298547e7b496acb4d3_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_ca298547e7b496acb4d3",
-    },
-    "cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13",
-    },
-    "cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13",
-    },
-    "cake_batch_deepgemm_fp8_d4262883ad8c2c6cef94_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_d4262883ad8c2c6cef94",
-    },
-    "cake_batch_deepgemm_fp8_d662bd14d9ad55d45263_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_d662bd14d9ad55d45263",
-    },
-    "cake_batch_deepgemm_fp8_d662bd14d9ad55d45263_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_d662bd14d9ad55d45263",
-    },
-    "cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5",
-    },
-    "cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5",
-    },
-    "cake_batch_deepgemm_fp8_e460881a1cdcaccf5860_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_e460881a1cdcaccf5860",
-    },
-    "cake_batch_deepgemm_fp8_e460881a1cdcaccf5860_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_e460881a1cdcaccf5860",
+        "program": "cake_batch_deepgemm_fp8_e6e78deccdcbf45fa870",
     },
     "cake_batch_deepgemm_fp8_eb727f8d280f83b52730_sm_100a": {
         "arch": "sm_100a",
@@ -838,14 +850,6 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_eb727f8d280f83b52730_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_eb727f8d280f83b52730",
-    },
-    "cake_batch_deepgemm_fp8_ec43ea789e823a74035e_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_ec43ea789e823a74035e",
-    },
-    "cake_batch_deepgemm_fp8_ec43ea789e823a74035e_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_ec43ea789e823a74035e",
     },
     "cake_batch_deepgemm_fp8_f2d3d7cdd838fe7ef523_sm_100a": {
         "arch": "sm_100a",
@@ -863,33 +867,29 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_f376efa5168590657e71",
     },
-    "cake_batch_deepgemm_fp8_f8971314a3ef775f9c58_sm_100a": {
+    "cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_f8971314a3ef775f9c58",
+        "program": "cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43",
     },
-    "cake_batch_deepgemm_fp8_f8971314a3ef775f9c58_sm_103a": {
+    "cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_f8971314a3ef775f9c58",
+        "program": "cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43",
     },
-    "cake_batch_deepgemm_fp8_fa4617e53e638c775af8_sm_100a": {
+    "cake_batch_deepgemm_fp8_fffc74e89022d23621dd_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_fa4617e53e638c775af8",
-    },
-    "cake_batch_deepgemm_fp8_fa4617e53e638c775af8_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_fa4617e53e638c775af8",
+        "program": "cake_batch_deepgemm_fp8_fffc74e89022d23621dd",
     },
 }
 
 SERVING_PROGRAMS: dict[str, str] = {
-    "n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_2fce665a907c0d48ab4b",
-    "n4096_k7168_g32_s6e1_evict_normal_l1": "cake_batch_deepgemm_fp8_bf96f77ec8235b35deac",
-    "n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_638db43d71890e22c8fe",
-    "n4096_k7168_g64_s6e1_evict_normal_l1": "cake_batch_deepgemm_fp8_f8971314a3ef775f9c58",
-    "n7168_k2048_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_c216805f6296a1f0b0e8",
-    "n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_e460881a1cdcaccf5860",
-    "n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_2ffc5a909a9e79353fa9",
-    "n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_29a8930160c38b72cff6",
+    "n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_1405732af0d574df0139",
+    "n4096_k7168_g32_s6e1_evict_normal_l1": "cake_batch_deepgemm_fp8_1602ca00dfa78ba89d6a",
+    "n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_ce9db47474bd124735cc",
+    "n4096_k7168_g64_s6e1_evict_normal_l1": "cake_batch_deepgemm_fp8_364ce5d12a45a1d49602",
+    "n7168_k2048_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6",
+    "n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a",
+    "n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b",
+    "n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
 }
 
 ARCH_NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
@@ -1017,7 +1017,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13",
+                    program="cake_batch_deepgemm_fp8_2ac9e23059edba242a92",
                     grid=(
                         min(
                             (
@@ -1055,7 +1055,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_29a2b409934055f8cdd0",
+                    program="cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
                     grid=(
                         min(
                             (
@@ -1093,7 +1093,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
+                    program="cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
                     grid=(
                         min(
                             (
@@ -1131,7 +1131,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f",
+                    program="cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
                     grid=(
                         min(
                             (
@@ -1169,7 +1169,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
+                    program="cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
                     grid=(
                         min(
                             (
@@ -1207,7 +1207,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_fa4617e53e638c775af8",
+                    program="cake_batch_deepgemm_fp8_8c4067fce6c805ee9300",
                     grid=(
                         min(
                             (
@@ -1245,7 +1245,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91",
+                    program="cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43",
                     grid=(
                         min(
                             (
@@ -1283,7 +1283,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f",
+                    program="cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
                     grid=(
                         min(
                             (
@@ -1321,7 +1321,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_36afbebf9dfd01967336",
+                    program="cake_batch_deepgemm_fp8_e306f272ed478b53bd16",
                     grid=(
                         min(
                             (
@@ -1359,7 +1359,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_36afbebf9dfd01967336",
+                    program="cake_batch_deepgemm_fp8_e306f272ed478b53bd16",
                     grid=(
                         min(
                             (
@@ -1397,7 +1397,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_2cd08ce62ec175db050b",
+                    program="cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6",
                     grid=(
                         min(
                             (
@@ -1435,7 +1435,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_2382d782c0bafc3a9878",
+                    program="cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88",
                     grid=(
                         min(
                             (
@@ -1473,7 +1473,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_2382d782c0bafc3a9878",
+                    program="cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88",
                     grid=(
                         min(
                             (
@@ -1515,7 +1515,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_508491c54eb3f469b37e",
+                    program="cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
                     grid=(
                         min(
                             (
@@ -1560,7 +1560,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a",
+                    program="cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2",
                     grid=(
                         min(
                             (
@@ -1605,7 +1605,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91",
+                    program="cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43",
                     grid=(
                         min(
                             (
@@ -1650,7 +1650,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
+                    program="cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
                     grid=(
                         min(
                             (
@@ -1695,7 +1695,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_ca298547e7b496acb4d3",
+                    program="cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
                     grid=(
                         min(
                             (
@@ -1746,7 +1746,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_fa4617e53e638c775af8",
+                    program="cake_batch_deepgemm_fp8_8c4067fce6c805ee9300",
                     grid=(
                         min(
                             (
@@ -1839,7 +1839,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_29a2b409934055f8cdd0",
+                    program="cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
                     grid=(
                         min(
                             (
@@ -1932,7 +1932,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c41147f6dbdf4c321445",
+                    program="cake_batch_deepgemm_fp8_59edc7df733ec03c53d5",
                     grid=(
                         min(
                             (
@@ -2237,7 +2237,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f",
+                    program="cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
                     grid=(
                         min(
                             (
@@ -2569,7 +2569,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163",
+                    program="cake_batch_deepgemm_fp8_54ec41340241b946c14e",
                     grid=(
                         min(
                             (
@@ -2607,7 +2607,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a",
+                    program="cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2",
                     grid=(
                         min(
                             (
@@ -2646,7 +2646,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
+                    program="cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
                     grid=(
                         min(
                             (
@@ -2685,7 +2685,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_ca298547e7b496acb4d3",
+                    program="cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
                     grid=(
                         min(
                             (
@@ -2754,7 +2754,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_29a2b409934055f8cdd0",
+                    program="cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
                     grid=(
                         min(
                             (
@@ -2823,7 +2823,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c41147f6dbdf4c321445",
+                    program="cake_batch_deepgemm_fp8_59edc7df733ec03c53d5",
                     grid=(
                         min(
                             (
@@ -2972,7 +2972,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f",
+                    program="cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
                     grid=(
                         min(
                             (
@@ -3082,7 +3082,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163",
+                    program="cake_batch_deepgemm_fp8_54ec41340241b946c14e",
                     grid=(
                         min(
                             (
@@ -3124,7 +3124,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3",
+                    program="cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a",
                     grid=(
                         min(
                             (
@@ -3163,7 +3163,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_8730531b6d09e9544c01",
+                    program="cake_batch_deepgemm_fp8_d22ea585c19c028e29ae",
                     grid=(
                         min(
                             (
@@ -3202,7 +3202,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5",
+                    program="cake_batch_deepgemm_fp8_2c120bce2db6a19bf130",
                     grid=(
                         min(
                             (
@@ -3240,7 +3240,7 @@ def _routes_sm_100a_148(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_d662bd14d9ad55d45263",
+                    program="cake_batch_deepgemm_fp8_c1541da977c9a379e49b",
                     grid=(
                         min(
                             (
@@ -3341,7 +3341,7 @@ def _routes_sm_100a_148(
                     ),
                 ),
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_733a94c236b2ee6a8aee",
+                    program="cake_batch_deepgemm_fp8_215f20f0a5f44903608b",
                     grid=(132, 1, 1),
                     args=(
                         "a",
@@ -3397,7 +3397,7 @@ def _routes_sm_100a_148(
                     ),
                 ),
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_b974999e103cd7640cc7",
+                    program="cake_batch_deepgemm_fp8_fffc74e89022d23621dd",
                     grid=(148, 1, 1),
                     args=(
                         "a",
@@ -3456,7 +3456,7 @@ def _routes_sm_100a_148(
                     ),
                 ),
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_74557d5c854d22263fab",
+                    program="cake_batch_deepgemm_fp8_1bb4c4c3d68e35871c2f",
                     grid=(148, 1, 1),
                     args=(
                         "a",
@@ -3515,7 +3515,7 @@ def _routes_sm_100a_148(
                     ),
                 ),
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_ec43ea789e823a74035e",
+                    program="cake_batch_deepgemm_fp8_b53863e736461b0c669d",
                     grid=(148, 1, 1),
                     args=(
                         "a",
@@ -3664,7 +3664,7 @@ def _routes_sm_100a_148(
                     ),
                 ),
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_ec43ea789e823a74035e",
+                    program="cake_batch_deepgemm_fp8_b53863e736461b0c669d",
                     grid=(148, 1, 1),
                     args=(
                         "a",
@@ -3889,7 +3889,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_cf1a5c28b0cbb9d78c13",
+                    program="cake_batch_deepgemm_fp8_2ac9e23059edba242a92",
                     grid=(
                         min(
                             (
@@ -3927,7 +3927,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
+                    program="cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
                     grid=(
                         min(
                             (
@@ -3965,7 +3965,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
+                    program="cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
                     grid=(
                         min(
                             (
@@ -4003,7 +4003,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163",
+                    program="cake_batch_deepgemm_fp8_54ec41340241b946c14e",
                     grid=(
                         min(
                             (
@@ -4041,7 +4041,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
+                    program="cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
                     grid=(
                         min(
                             (
@@ -4079,7 +4079,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_29a2b409934055f8cdd0",
+                    program="cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
                     grid=(
                         min(
                             (
@@ -4117,7 +4117,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_d4262883ad8c2c6cef94",
+                    program="cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15",
                     grid=(
                         min(
                             (
@@ -4155,7 +4155,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_508491c54eb3f469b37e",
+                    program="cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
                     grid=(
                         min(
                             (
@@ -4194,7 +4194,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c42f3895c1e079f0e36a",
+                    program="cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2",
                     grid=(
                         min(
                             (
@@ -4233,7 +4233,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91",
+                    program="cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43",
                     grid=(
                         min(
                             (
@@ -4272,7 +4272,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_389e6c89e61b7d49a076",
+                    program="cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
                     grid=(
                         min(
                             (
@@ -4311,7 +4311,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_ca298547e7b496acb4d3",
+                    program="cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
                     grid=(
                         min(
                             (
@@ -4356,7 +4356,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_fa4617e53e638c775af8",
+                    program="cake_batch_deepgemm_fp8_8c4067fce6c805ee9300",
                     grid=(
                         min(
                             (
@@ -4443,7 +4443,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_29a2b409934055f8cdd0",
+                    program="cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
                     grid=(
                         min(
                             (
@@ -4530,7 +4530,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c41147f6dbdf4c321445",
+                    program="cake_batch_deepgemm_fp8_59edc7df733ec03c53d5",
                     grid=(
                         min(
                             (
@@ -4859,7 +4859,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f",
+                    program="cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
                     grid=(
                         min(
                             (
@@ -5125,7 +5125,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163",
+                    program="cake_batch_deepgemm_fp8_54ec41340241b946c14e",
                     grid=(
                         min(
                             (
@@ -5163,7 +5163,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_3dfe31e7f71ee9976e3e",
+                    program="cake_batch_deepgemm_fp8_e6e78deccdcbf45fa870",
                     grid=(
                         min(
                             (
@@ -5202,7 +5202,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_2458ef4d346ca1b65c91",
+                    program="cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43",
                     grid=(
                         min(
                             (
@@ -5247,7 +5247,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_fa4617e53e638c775af8",
+                    program="cake_batch_deepgemm_fp8_8c4067fce6c805ee9300",
                     grid=(
                         min(
                             (
@@ -5316,7 +5316,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_29a2b409934055f8cdd0",
+                    program="cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
                     grid=(
                         min(
                             (
@@ -5373,7 +5373,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c41147f6dbdf4c321445",
+                    program="cake_batch_deepgemm_fp8_59edc7df733ec03c53d5",
                     grid=(
                         min(
                             (
@@ -5582,7 +5582,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_c4f1500b3e772eb3e02f",
+                    program="cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
                     grid=(
                         min(
                             (
@@ -5818,7 +5818,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_63a1a48b4d5f268a5163",
+                    program="cake_batch_deepgemm_fp8_54ec41340241b946c14e",
                     grid=(
                         min(
                             (
@@ -5860,7 +5860,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_573a2b54ea777a0d43c3",
+                    program="cake_batch_deepgemm_fp8_a6a50eabd6d1caa8ec6a",
                     grid=(
                         min(
                             (
@@ -5899,7 +5899,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_8730531b6d09e9544c01",
+                    program="cake_batch_deepgemm_fp8_d22ea585c19c028e29ae",
                     grid=(
                         min(
                             (
@@ -5938,7 +5938,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_d9620b70a0bd6b92d5f5",
+                    program="cake_batch_deepgemm_fp8_2c120bce2db6a19bf130",
                     grid=(
                         min(
                             (
@@ -5976,7 +5976,7 @@ def _routes_sm_103a_152(
             parent="seed_masked_bn",
             stages=(
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_d662bd14d9ad55d45263",
+                    program="cake_batch_deepgemm_fp8_c1541da977c9a379e49b",
                     grid=(
                         min(
                             (
@@ -6143,7 +6143,7 @@ def _routes_sm_103a_152(
                     ),
                 ),
                 StagePlan(
-                    program="cake_batch_deepgemm_fp8_ec43ea789e823a74035e",
+                    program="cake_batch_deepgemm_fp8_b53863e736461b0c669d",
                     grid=(152, 1, 1),
                     args=(
                         "a",
