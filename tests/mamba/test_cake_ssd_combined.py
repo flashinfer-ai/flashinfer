@@ -417,21 +417,49 @@ def _cute_padded_reference(constructor, tensors, arguments, lengths):
 
 
 def test_cake_benchmark_validation_policy():
+    """The benchmark gates a row on accuracy against the fp64 recurrence, not CuTe parity."""
+
     module = _load_cake_benchmark_module()
 
-    def report(*, out=True, final_states=True, speedup=1.01):
+    def accuracy(*, cake_outside=20, cute_outside=60, cake_max=0.12, cute_max=0.12, finite=True, numel=131072):
         return {
-            "out": {"tolerance_passed": out},
-            "final_states": {"tolerance_passed": final_states},
+            "numel": numel,
+            "cake_outside": cake_outside,
+            "cute_outside": cute_outside,
+            "cake_outside_fraction": cake_outside / numel,
+            "cute_outside_fraction": cute_outside / numel,
+            "cake_max_abs": cake_max,
+            "cute_max_abs": cute_max,
+            "cake_finite": finite,
+            "cute_finite": True,
+            "bf16_ulp_at_cake_worst": 0.03125,
+        }
+
+    def report(*, out=None, final_states=None, speedup=1.01):
+        return {
+            "accuracy": {
+                "out": out if out is not None else accuracy(),
+                "final_states": final_states if final_states is not None else accuracy(cake_outside=0, cute_outside=0),
+            },
             "speedup": speedup,
         }
 
     module._validate_report(report(), require_qualified_row=False)
     module._validate_report(report(speedup=0.99), require_qualified_row=False)
-    with pytest.raises(AssertionError, match="output failed BF16 parity"):
-        module._validate_report(report(out=False), require_qualified_row=False)
-    with pytest.raises(AssertionError, match="final state failed BF16 parity"):
-        module._validate_report(report(final_states=False), require_qualified_row=False)
+    # Poisson slack: CuTe 60 outliers admit up to 60 + 2*sqrt(60) = 75 Cake outliers.
+    module._validate_report(report(out=accuracy(cake_outside=75)), require_qualified_row=False)
+    with pytest.raises(AssertionError, match="more entries outside"):
+        module._validate_report(report(out=accuracy(cake_outside=76)), require_qualified_row=False)
+    with pytest.raises(AssertionError, match="limit 1 %"):
+        module._validate_report(report(out=accuracy(cake_outside=1400, cute_outside=5000)), require_qualified_row=False)
+    with pytest.raises(AssertionError, match="is not finite"):
+        module._validate_report(report(out=accuracy(finite=False)), require_qualified_row=False)
+    # one bf16 ulp of headroom on the maximum error, no more
+    module._validate_report(report(out=accuracy(cake_max=0.15, cute_max=0.12)), require_qualified_row=False)
+    with pytest.raises(AssertionError, match="by more than one bf16 ulp"):
+        module._validate_report(report(out=accuracy(cake_max=0.16, cute_max=0.12)), require_qualified_row=False)
+    with pytest.raises(AssertionError, match="final_states has more entries outside"):
+        module._validate_report(report(final_states=accuracy(cake_outside=1, cute_outside=0)), require_qualified_row=False)
     with pytest.raises(AssertionError, match="must be faster than CuTe"):
         module._validate_report(report(speedup=0.99), require_qualified_row=True)
 
