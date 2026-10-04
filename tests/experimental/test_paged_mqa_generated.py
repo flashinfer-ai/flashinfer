@@ -147,13 +147,103 @@ def _check(got, ref, ctx_2d, max_context_len, stride_rows):
         (err <= 1e-2 * row_max + 1e-2 * ref.abs().masked_fill(~inside, 0.0)).all()
     )
     # clean_logits=False semantics: inside the aligned range of each request the cells at or past the
-    # row's length are exact -inf; cells past the request's aligned range are untouched (the NaN poison).
-    split_kv = int(_runtime.paged_policy()["split_kv"])
+    # row's length are exact -inf (DeepGEMM stores finite don't-care there; -inf is the strictly safer
+    # value for the engine's top-k). Which cells are written at all is checked against DeepGEMM's own
+    # behaviour in _check_write_extent.
     for row in range(got.shape[0]):
-        ctx_last = int(ctx_2d[row // ctx_2d.shape[1], -1])
-        aligned = min((ctx_last + split_kv - 1) // split_kv * split_kv, max_context_len)
+        aligned = min(_aligned_extent(ctx_2d, row), max_context_len)
         assert bool(torch.isneginf(got[row, int(lengths[row]) : aligned]).all())
-        assert bool(torch.isnan(stride_rows[row, aligned:]).all())
+    assert stride_rows.shape[0] == got.shape[0]
+
+
+def _aligned_extent(ctx_2d, row):
+    """DeepGEMM's per-request store extent read from its source: the SM100 paged scheduler issues
+    ``ceil(context_len / SPLIT_KV)`` KV splits of ``SPLIT_KV`` columns per request
+    (``sm100_paged_mqa_logits.cuh``, ``num_kv_splits``) and with ``clean_logits=False`` nothing touches the
+    columns beyond (only the clean_logits cleaner fills ``[coverage_end, logits_stride)``)."""
+    split_kv = int(_runtime.paged_policy()["split_kv"])
+    ctx_last = int(ctx_2d[row // ctx_2d.shape[1], -1])
+    return (ctx_last + split_kv - 1) // split_kv * split_kv
+
+
+def _deep_gemm_measured(q, kv_cache, weights, ctx_2d, block_table, max_len, page):
+    """``(native_logits, written)`` with ``written`` the mask of cells DeepGEMM actually stores over its whole
+    output storage, measured: DeepGEMM allocates its output internally, so the block it will receive is
+    poisoned with NaN first (allocate a buffer of the identical byte size, free it, call DeepGEMM; the caching
+    allocator hands the same block back) and the never-written storage columns past ``max_len`` prove the
+    poison survived. ``None`` when DeepGEMM is unavailable or the poison is not observable (another block
+    was handed out); the caller then falls back to the extent read from DeepGEMM's source."""
+    try:
+        import deep_gemm
+    except ImportError:
+        return None
+    if not hasattr(deep_gemm, "fp8_paged_mqa_logits"):
+        return None
+
+    def run():
+        meta = deep_gemm.get_paged_mqa_logits_metadata(
+            ctx_2d, page, deep_gemm.get_num_sms()
+        )
+        return deep_gemm.fp8_paged_mqa_logits(
+            q, kv_cache, weights, ctx_2d, block_table, meta, max_len, clean_logits=False
+        )
+
+    probe = run()
+    torch.cuda.synchronize()
+    nbytes, rows, stride = (
+        probe.untyped_storage().nbytes(),
+        int(probe.shape[0]),
+        int(probe.stride(0)),
+    )
+    del probe
+    poison = torch.full(
+        (nbytes // 4,), float("nan"), dtype=torch.float32, device=q.device
+    )
+    del poison
+    native = run()
+    torch.cuda.synchronize()
+    if native.untyped_storage().nbytes() != nbytes or rows * stride * 4 > nbytes:
+        return None
+    full = torch.empty(0, dtype=torch.float32, device=q.device).set_(
+        native.untyped_storage(), 0, (rows * stride,)
+    )
+    full = full.view(rows, stride)
+    never_written = full[:, max_len:]
+    if never_written.numel() == 0 or not bool(torch.isnan(never_written).all()):
+        return None
+    return native, ~torch.isnan(full)
+
+
+def _check_write_extent(cake_output, measured, ctx_2d, max_len):
+    """Cake writes exactly the cells DeepGEMM writes (cell for cell on the measured DeepGEMM storage when
+    observable, else DeepGEMM's source-derived extent): a kernel that writes more or less than DeepGEMM is
+    wrong, the test is not loosened to it. ``cake_output`` is the plan's physical [rows, stride] buffer,
+    NaN-poisoned before the launch."""
+    cake_written = ~torch.isnan(cake_output)
+    if measured is None:
+        for row in range(cake_output.shape[0]):
+            aligned = min(_aligned_extent(ctx_2d, row), cake_output.shape[1])
+            assert bool(cake_written[row, :aligned].all()), (
+                f"row {row}: Cake left cells inside DeepGEMM's extent unwritten"
+            )
+            assert not bool(cake_written[row, aligned:].any()), (
+                f"row {row}: Cake writes {int(cake_written[row, aligned:].sum())} cells past DeepGEMM's extent {aligned}"
+            )
+        return
+    _native, dg_written = measured
+    common = min(cake_output.shape[1], dg_written.shape[1])
+    differs = cake_written[:, :common] ^ dg_written[:, :common]
+    if bool(differs.any()):
+        row = int(differs.any(dim=1).nonzero()[0])
+        cols = differs[row].nonzero().flatten()
+        raise AssertionError(
+            f"{int(differs.sum())} cells written by exactly one of Cake / DeepGEMM; row {row} columns "
+            f"{int(cols[0])}..{int(cols[-1])} (Cake wrote {int(cake_written[row, cols].sum())} of them, DeepGEMM "
+            f"{int(dg_written[row, cols].sum())}); request length {int(ctx_2d.reshape(-1)[row])}"
+        )
+    assert not bool(cake_written[:, common:].any()) and not bool(
+        dg_written[:, common:].any()
+    )
 
 
 @pytest.mark.parametrize("heads,page,next_n,batch,avg_ctx", CASES)
@@ -207,23 +297,14 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
     stream.synchronize()
     ref = _reference(q, kv_fp8, scale, weights, ctx_2d, block_table, max_len, page)
     _check(plan.logical_output, ref, ctx_2d, max_len, plan.output)
-    try:
-        import deep_gemm
-    except ImportError:
-        return
-    if not hasattr(deep_gemm, "fp8_paged_mqa_logits"):
-        return
-    native = deep_gemm.fp8_paged_mqa_logits(
-        q,
-        kv_cache,
-        weights,
-        ctx_2d,
-        block_table,
-        deep_gemm.get_paged_mqa_logits_metadata(ctx_2d, page, deep_gemm.get_num_sms()),
-        max_len,
-        clean_logits=False,
+    # Written extent vs DeepGEMM on the same operands (the replayed graph wrote the current contents).
+    measured = _deep_gemm_measured(
+        q, kv_cache, weights, ctx_2d, block_table, max_len, page
     )
-    torch.cuda.synchronize()
+    _check_write_extent(plan.output, measured, ctx_2d, max_len)
+    if measured is None:
+        return
+    native, _written = measured
     inside = (
         torch.arange(max_len, device=q.device)[None, :] < ctx_2d.reshape(-1)[:, None]
     )
