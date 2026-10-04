@@ -23,10 +23,7 @@ from ..api_logging import flashinfer_api
 from .attention import QSAAttention
 from .selection import QSASelection, selection_route_width
 from ..topk import WORKSPACE_ALIGNMENT
-
-
-def _round_up(value: int, multiple: int) -> int:
-    return -(-value // multiple) * multiple
+from ..utils import round_up
 
 
 @dataclass(frozen=True)
@@ -239,8 +236,8 @@ class QSA:
         _persistent, attention = QSA._attention_bytes(config, device)
         selection = QSA._selection_bytes(config, device)
         return (
-            _round_up(attention, WORKSPACE_ALIGNMENT),
-            _round_up(selection, WORKSPACE_ALIGNMENT),
+            round_up(attention, WORKSPACE_ALIGNMENT),
+            round_up(selection, WORKSPACE_ALIGNMENT),
         )
 
     @staticmethod
@@ -270,7 +267,7 @@ class QSA:
         persistent, _attention = QSA._attention_bytes(config, device)
         attention, selection = QSA._transient_split(config, device)
         return QSAWorkspaceRequirements(
-            persistent_bytes=_round_up(persistent, WORKSPACE_ALIGNMENT),
+            persistent_bytes=round_up(persistent, WORKSPACE_ALIGNMENT),
             transient_bytes=attention + selection,
             alignment=WORKSPACE_ALIGNMENT,
         )

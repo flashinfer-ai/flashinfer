@@ -28,6 +28,7 @@ from ..topk import (
     PreparedTopKRaggedTransform,
     TopKTieBreak,
 )
+from ..utils import round_up
 
 
 #: What each dtype a region is cut in costs per element. A constant, so the
@@ -45,10 +46,6 @@ _SCORE_DTYPES = (torch.float16, torch.bfloat16)
 #: What ``query_positions`` may arrive in. A position is bounded by the
 #: context length, so both hold one; the kernels narrow and validate.
 _POSITION_DTYPES = (torch.int32, torch.int64)
-
-
-def _round_up(value: int, multiple: int) -> int:
-    return -(-value // multiple) * multiple
 
 
 def selection_columns(max_model_len: int, compress_ratio: int, capacity: int) -> int:
@@ -197,25 +194,25 @@ class QSASelection:
         self.backend = self._topk.backend
 
         # The workspace, as offsets fixed here so run() only takes views.
-        scores_bytes = _round_up(
+        scores_bytes = round_up(
             self.rows_per_chunk * max_columns * 4, WORKSPACE_ALIGNMENT
         )
-        visible_bytes = _round_up(self.rows_per_chunk * 4, WORKSPACE_ALIGNMENT)
+        visible_bytes = round_up(self.rows_per_chunk * 4, WORKSPACE_ALIGNMENT)
         # The top-k writes a full chunk's worth of rows every pass, so the
         # block buffer is padded to whole chunks; the rows past the batch are
         # written and never read.
-        self.padded_rows = _round_up(max_rows, self.rows_per_chunk)
-        blocks_bytes = _round_up(
+        self.padded_rows = round_up(max_rows, self.rows_per_chunk)
+        blocks_bytes = round_up(
             self.padded_rows * self.block_topk * 4, WORKSPACE_ALIGNMENT
         )
-        offsets_bytes = _round_up(self.rows_per_chunk * 4, WORKSPACE_ALIGNMENT)
+        offsets_bytes = round_up(self.rows_per_chunk * 4, WORKSPACE_ALIGNMENT)
         self._scores_at = 0
         self._visible_at = scores_bytes
         self._blocks_at = self._visible_at + visible_bytes
         self._offsets_at = self._blocks_at + blocks_bytes
         self._topk_at = self._offsets_at + offsets_bytes
         self._topk_bytes = self._measure_topk_workspace()
-        self._total_bytes = self._topk_at + _round_up(
+        self._total_bytes = self._topk_at + round_up(
             self._topk_bytes, WORKSPACE_ALIGNMENT
         )
 

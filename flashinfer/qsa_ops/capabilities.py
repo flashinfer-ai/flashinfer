@@ -44,7 +44,6 @@ _NAMES = {
 }
 
 #: The gate module's own bits: 1 for float16, 2 for bfloat16.
-_GATE_FP16 = 1
 _GATE_BF16 = 2
 
 

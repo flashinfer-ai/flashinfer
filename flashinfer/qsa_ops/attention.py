@@ -26,6 +26,7 @@ from .output_gate import qsa_output_gate
 from ..sparse import BlockSparseAttentionWrapper
 from .route import qsa_route_from_logical
 from ..topk import WORKSPACE_ALIGNMENT
+from ..utils import round_up
 
 
 #: What a cache's bytes mean. A ``uint8`` tensor is a view of raw memory and
@@ -78,10 +79,6 @@ def row_buckets(max_rows: int, max_plans: int = 16) -> Tuple[int, ...]:
             ratio = max_rows ** (1.0 / steps)
             rungs.update(round(ratio**step) for step in range(steps))
     return tuple(sorted(rungs))
-
-
-def _round_up(value: int, multiple: int) -> int:
-    return -(-value // multiple) * multiple
 
 
 def _check_geometry(
@@ -193,8 +190,8 @@ def _plan_bytes_for(
             backend=backend,
         )
         float_bytes = max(float_bytes, int(rows_float))
-        sizes.append(_round_up(int(rows_int), WORKSPACE_ALIGNMENT))
-    return _round_up(float_bytes, WORKSPACE_ALIGNMENT), tuple(sizes)
+        sizes.append(round_up(int(rows_int), WORKSPACE_ALIGNMENT))
+    return round_up(float_bytes, WORKSPACE_ALIGNMENT), tuple(sizes)
 
 
 class _Persistent(NamedTuple):
@@ -236,7 +233,7 @@ def _walk():
     def take(nbytes):
         nonlocal offset
         begin = offset
-        offset += _round_up(nbytes, WORKSPACE_ALIGNMENT)
+        offset += round_up(nbytes, WORKSPACE_ALIGNMENT)
         return (begin, nbytes)
 
     def total():
@@ -420,7 +417,6 @@ class QSAAttention:
                 f"{persistent.numel()}"
             )
 
-        self._persistent = persistent
         self._arena = _cut(persistent, regions.arena, torch.uint8, None)
         self._indptr = {}
         for rows, span in zip(buckets, regions.indptr, strict=True):
@@ -437,7 +433,6 @@ class QSAAttention:
         self._route: dict = {}
         self._mask: dict = {}
         self._wrappers: dict = {}
-        self._slices: list = []
         self._staging: Optional[torch.Tensor] = None
         self._frozen = False
 
@@ -725,7 +720,6 @@ class QSAAttention:
         self.num_slots = num_slots
         self.page_size = page_size
         self.pages = num_slots // page_size
-        self._slices = ranges
         # The previous set, if there was one, is dropped here: its plans lived
         # in the same arena these just wrote over, so nothing may still be
         # holding them -- which is what the refusal above is for.
