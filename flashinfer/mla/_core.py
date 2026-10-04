@@ -1930,7 +1930,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     prefill kernel (one CTA per token and head block over all of its
     candidates, no split scratch) as chosen by
     :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`
-    from the measured crossover of the two sm_120a SKUs.
+    from the measured crossover of the two sm_120a SKUs. Write the NVFP4
+    pools with the fused SM120 writers
+    :func:`flashinfer.mla.cake_dsv4_nvfp4_rope_quantize_insert` (sliding-window
+    pool: GPT-J RoPE + head-padded ``q_out`` + quantize + insert in one launch)
+    and :func:`flashinfer.mla.cake_dsv4_nvfp4_kv_rope_quantize_insert`
+    (compressed pool / speculative context), which produce the bytes of
+    :func:`flashinfer.mla.nvfp4_quantize_append_sparse_mla_cache` applied to
+    the BF16-rounded roped rows.
 
     With ``backend="cake"`` on SM120/SM121 and
     ``kv_cache_format="fp8_dsv41_fp4_ca"``, this calls the Cake SM120

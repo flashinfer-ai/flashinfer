@@ -170,6 +170,55 @@ pytest tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py -q  # pr
 python benchmarks/bench_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py         # paired sparse / cake prefill rows
 ```
 
+### Cache writers: fused GPT-J RoPE + NVFP4 quantize + paged insert
+
+`sm_120a/` also holds the generated writers of the same 384-byte NVFP4 record,
+`cake_dsv4_nvfp4_rope_insert_kernel.cu` + `cake_dsv4_nvfp4_rope_insert_binding.cu`
+(TVM-FFI entries `cake_dsv4_nvfp4_rope_insert_qkv` and
+`cake_dsv4_nvfp4_rope_insert_kv`) with their own
+`cake_dsv4_nvfp4_rope_insert_manifest.json` and JIT module
+(`flashinfer/jit/cake_dsv4_nvfp4_rope_insert.py`; the attention module is not
+rebuilt when the writers are regenerated). One launch per layer replaces the
+torch-level GPT-J RoPE of the query and latent KV, the query head padding and
+`nvfp4_quantize_append_sparse_mla_cache`: the roped KV row is rounded to BF16
+and quantized exactly like the append writer (byte-identical records: 224 B
+E2M1 NoPE, 128 B BF16 RoPE bits, 28 E4M3 scales + 4 zero bytes), `q_out` is the
+fp32 rotation of each live head rounded to BF16 with zero-filled padded heads.
+One warp per (token, head slot), 256-thread CTAs, variants per padded head
+count (8, 16, 32, 64, 128) x Q RoPE on/off x slot dtype (int32 / int64) for
+the QKV form and per compress ratio (1, 2) x slot dtype for the KV form. Both
+entries take the 3-D / HND / NHD cache views with a runtime page size and a
+16-byte-multiple page stride, skip negative and out-of-range slots, accept a
+`slot_mapping` shorter than `positions` (data-parallel padding), allocate
+nothing but `q_out`, never synchronise and replay bitwise inside CUDA graphs.
+The KV entry inserts only boundary rows (`(pos + 1) % compress_ratio == 0`) at
+the cos/sin row `pos // compress_ratio * compress_ratio` -- the compressed-pool
+rule -- and is the speculative-context writer with `compress_ratio=1`. Until
+the family is exported the directory carries a placeholder manifest
+(`identity: "unexported"`): `cake_dsv4_nvfp4_rope_insert_format_info()["kernels_available"]`
+is `False` and every launch raises `FileNotFoundError`.
+
+```python
+from flashinfer.mla import (
+    cake_dsv4_nvfp4_kv_rope_quantize_insert,
+    cake_dsv4_nvfp4_rope_quantize_insert,
+)
+
+# Sliding-window pool (per layer): rotated, head-padded Q plus the quantized KV insert.
+q_out = cake_dsv4_nvfp4_rope_quantize_insert(
+    q, kv, swa_cache, slot_mapping, positions, cos_sin_cache, q_head_padded=8
+)
+# Compressed pool (ratio 2: boundary rows only) and speculative context (ratio 1).
+cake_dsv4_nvfp4_kv_rope_quantize_insert(
+    kv, compressed_cache, compressed_slots, positions, cos_sin_cache, compress_ratio=2
+)
+```
+
+```bash
+pytest tests/attention/test_cake_dsv4_nvfp4_rope_insert.py -q   # byte parity, graph replay, decode read-back
+python benchmarks/bench_cake_dsv4_nvfp4_rope_insert.py          # fused vs torch RoPE + append
+```
+
 ## SM120 / SM121: DeepSeek-V4.1 mixed-cache sparse-MLA decode
 
 `sm_120a/` also holds the Cake-generated DeepSeek-V4.1 mixed-cache decode
