@@ -106,6 +106,10 @@ _BF16_H128_PREFILL_MIN_TOKENS = 64
 # only up to this many query tokens; wider grids lose to trtllm-gen.
 # Mirrors the Cake seed's BF16_TOPK128X_SPLIT_MAX_TOKENS.
 _BF16_TOPK128X_SPLIT_MAX_TOKENS = 16
+# Mirrors the Cake seed's BF16_ROW_FIRST_V_HALF_SPLIT_MAX_TOKENS: row-first rows
+# with at most this many tokens run the V-half split program (two 2-CTA
+# clusters per token = 4 CTAs per token, one wave on 148+ SMs).
+_BF16_ROW_FIRST_V_HALF_SPLIT_MAX_TOKENS = 37
 # Widths the BF16/H128 four-owner split and row-first producers cover (two or
 # three live KV tiles); other widths below the prefill token bound have no
 # exported kernel.
@@ -1610,8 +1614,18 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         elif T > _BF16_TOPK128X_SPLIT_MAX_TOKENS:
             # Above the token bound one full-V owner per token whose invalid
             # (-1) sparse rows gather the tile's first index
-            # (hardening-000025/31 0.45-0.95x -> 1.13-1.65x).
-            producer = "bf16_h128_topk128x_row_first"
+            # (hardening-000025/31 0.45-0.95x -> 1.13-1.65x).  While four
+            # CTAs per token still fit one wave, each token runs two 2-CTA
+            # clusters that gather the full K tiles and only their 256-column
+            # V half (same MMA operands and order per element -> identical
+            # bits; -1.1 us / -8 % on the 32-token row on both targets): grid
+            # = 4 * tokens, total_work_items keeps meaning query tokens.
+            # Mirrors the Cake seed rule bf16_topk128x_uses_row_first_vsplit.
+            if T <= _BF16_ROW_FIRST_V_HALF_SPLIT_MAX_TOKENS:
+                producer = "bf16_h128_topk128x_row_first_vsplit"
+                grid_x = 4 * T
+            else:
+                producer = "bf16_h128_topk128x_row_first"
         else:
             # Two-stage split program on both Blackwell targets: four disjoint
             # full-V KV owners (a three-tile row runs with the fourth tile
