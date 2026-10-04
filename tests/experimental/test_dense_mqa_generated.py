@@ -607,3 +607,31 @@ def test_catalog_programs_are_delivered_and_distinct():
         if p.suffix == ".cu" and f"{generated}/{p.name}" not in referenced
     )
     assert not orphans, f"generated units not referenced by the catalog: {orphans}"
+
+
+def test_h64_admission_matches_the_catalog_table():
+    """Host-only: the shipped per-tier allow-list of the 64-head family is the catalog's ``routes`` table.
+    Every route name the policy lists as withheld has no record and is unavailable for every query count
+    of its tier; every other 64-head tier is available iff its record exists."""
+    catalog = _runtime._catalog()
+    admission = catalog["policy"].get("dense_admission", {})
+    withheld = set(admission.get("withheld_routes", []))
+    assert withheld <= {
+        "fp8:h64:q1",
+        *(
+            f"fp8:h64:{kind}:{tier}"
+            for kind in ("full", "partial")
+            for tier in ("le8", "le64", "le1024", "any")
+        ),
+    }
+    assert not withheld & set(catalog["routes"])
+    assert bool(withheld) == (admission.get("reason") is not None)
+    if 64 not in _runtime.heads():
+        assert not withheld
+        return
+    for queries in (1, 2, 3, 8, 9, 16, 37, 64, 65, 128, 1024, 1025, 4096, 100_000):
+        route = _runtime.route_name("fp8", queries, 300, 64)
+        assert _runtime.dense_route_available(64, queries, 300) == (
+            route in catalog["routes"]
+        ), (queries, route)
+        assert (route in catalog["routes"]) == (route not in withheld), (queries, route)
