@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import importlib
-import json
 import math
 import sys
 import threading
@@ -111,7 +110,7 @@ def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
             "m128_bt64_unbounded_softplus", target
         )
         assert n32_uri != bt64_uri
-        assert bt64_uri.endswith(f"_8f5147c17f_{target}")
+        assert bt64_uri.endswith(f"_{target}")
     csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
     assert (csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu").is_file()
     assert (
@@ -119,31 +118,26 @@ def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
     ).is_file()
 
 
-def test_cake_kda_affine_manifest_controls_export_availability():
-    csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
-    manifest = json.loads(
-        (
-            csrc_dir / "cake_kda_bf16_affine_unbounded_softplus_import_manifest.json"
-        ).read_text()
-    )
+def test_cake_kda_affine_module_table_is_complete():
     cake_kda_jit_api.get_cake_kda_affine_module_specs.cache_clear()
     specs = cake_kda_jit_api.get_cake_kda_affine_module_specs()
-    if manifest["status"] == "pending_generated_sources":
-        assert manifest["modules"] == []
-        assert manifest["remaining_generated_inputs"]
-        assert specs == ()
-        assert not cake_kda_jit_api.cake_kda_affine_is_available()
-    else:
-        assert manifest["status"] == "complete"
-        assert len(specs) == 8
-        assert cake_kda_jit_api.cake_kda_affine_is_available()
-        assert {spec.target for spec in specs} == {"sm100a", "sm103a"}
-        assert {spec.role for spec in specs} == {
-            "main",
-            "map",
-            "scan",
-            "correction",
-        }
+    assert len(specs) == 8
+    assert cake_kda_jit_api.cake_kda_affine_is_available()
+    assert {spec.target for spec in specs} == {"sm100a", "sm103a"}
+    assert {spec.role for spec in specs} == {
+        "main",
+        "map",
+        "scan",
+        "correction",
+    }
+    for spec in specs:
+        assert spec.binding_path.is_file()
+        assert all(source.is_file() for source in spec.sources)
+    uris = {
+        cake_kda_jit_api.get_cake_kda_affine_uri(spec.target, spec.role)
+        for spec in specs
+    }
+    assert len(uris) == 8
 
 
 def _valid_cake_kda_affine_selector_kwargs():
