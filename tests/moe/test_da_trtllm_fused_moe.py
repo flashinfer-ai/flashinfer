@@ -157,6 +157,17 @@ def _capture_kernel_node_count(invoke) -> int:
 
 @pytest.mark.parametrize("num_tokens", (2048, 2049, 8192))
 @pytest.mark.parametrize(
+    "tile_ns",
+    (
+        (256,),
+        (64, 128),
+        (8, 16, 64),
+        (64, 128, 192),
+        (8, 16, 32, 64, 128),
+        (8, 16, 32, 64, 96, 128, 192, 256),
+    ),
+)
+@pytest.mark.parametrize(
     "routing_input_mode,expert_id_dtype",
     (
         (RoutingInputMode.PackedPrecomputed, torch.int32),
@@ -168,12 +179,12 @@ def test_fused_multi_tile_routing_matches_independent_tiles_at_capacity_boundari
     num_tokens: int,
     routing_input_mode: RoutingInputMode,
     expert_id_dtype: torch.dtype,
+    tile_ns: tuple[int, ...],
 ) -> None:
     """Fused packed and unpacked routing must match independent tile launches bit-exactly."""
     require_sm100()
     num_experts = 256
     top_k = 8
-    tile_ns = (8, 16, 64)
 
     # Give every token unique experts with deterministic wraparound, plus nonuniform live weights.
     token_index = torch.arange(num_tokens, dtype=torch.int64).unsqueeze(1)
@@ -210,6 +221,8 @@ def test_fused_multi_tile_routing_matches_independent_tiles_at_capacity_boundari
         routing_input_mode=routing_input_mode,
         topk_weights=routing_weights_arg,
     )
+    for slot in fused.slots:
+        slot.permuted_idx_to_token_idx.fill_(-12345)
     populate_trtllm_moe_routing_metadata_(fused, routing_ids, routing_weights_arg)
     references = []
     for tile_n in tile_ns:
@@ -230,6 +243,17 @@ def test_fused_multi_tile_routing_matches_independent_tiles_at_capacity_boundari
     for actual, expected in zip(fused.slots, references, strict=True):
         assert actual.tile_n == expected.tile_n
         _assert_routing_metadata_slots_bit_exact(actual, expected)
+        # Independently verify live rows and padding, including unwritten-tail bugs
+        # that comparing two invocations of the same kernel cannot detect.
+        num_rows = int(actual.total_num_padded_tokens.item())
+        inverse = torch.full(
+            (num_rows,), -1, dtype=torch.int32, device=expert_ids.device
+        )
+        permutation = actual.expanded_idx_to_permuted_idx.reshape(-1).long()
+        inverse[permutation] = torch.arange(
+            num_tokens, device=expert_ids.device, dtype=torch.int32
+        ).repeat_interleave(top_k)
+        assert torch.equal(actual.permuted_idx_to_token_idx[:num_rows], inverse)
 
 
 @pytest.mark.parametrize("num_tokens", (2730, 2731, 8192))
@@ -378,7 +402,11 @@ def test_native_da_selector_replays_live_local_histograms(
         graph.reset()
 
 
-def test_long_multi_tile_routing_handles_local_and_nonlocal_experts() -> None:
+@pytest.mark.parametrize("tile_ns", ((8,), (64, 128, 256), (64, 128, 192)))
+@pytest.mark.parametrize("num_experts", (256, 512))
+def test_long_multi_tile_routing_handles_local_and_nonlocal_experts(
+    tile_ns, num_experts
+) -> None:
     """The extended-capacity permutation pass must ignore a nonlocal route."""
     require_sm100()
     num_tokens = 2049
@@ -393,30 +421,41 @@ def test_long_multi_tile_routing_handles_local_and_nonlocal_experts() -> None:
 
     metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
         expert_ids,
-        num_experts=256,
+        num_experts=num_experts,
         top_k=2,
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
-        tile_ns=(8,),
+        tile_ns=tile_ns,
         routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
         topk_weights=routing_weights,
     )
+    for slot in metadata.slots:
+        slot.permuted_idx_to_token_idx.fill_(-12345)
     populate_trtllm_moe_routing_metadata_(metadata, expert_ids, routing_weights)
     torch.cuda.synchronize()
 
-    expanded = metadata.slots[0].expanded_idx_to_permuted_idx.view(num_tokens, 2)
-    assert torch.all(expanded[:, 0] >= 0)
-    assert torch.all(expanded[:, 1] == -1)
-    assert metadata.slots[0].num_tokens_per_expert[local_expert_offset] == num_tokens
-    assert metadata.slots[0].num_tokens_per_expert[0] == 0
+    for slot in metadata.slots:
+        expanded = slot.expanded_idx_to_permuted_idx.view(num_tokens, 2)
+        assert torch.all(expanded[:, 0] >= 0)
+        assert torch.all(expanded[:, 1] == -1)
+        assert slot.num_tokens_per_expert[local_expert_offset] == num_tokens
+        assert slot.num_tokens_per_expert[0] == 0
+        num_rows = int(slot.total_num_padded_tokens.item())
+        inverse = torch.full((num_rows,), -1, device="cuda", dtype=torch.int32)
+        inverse[expanded[:, 0].long()] = torch.arange(
+            num_tokens, device="cuda", dtype=torch.int32
+        )
+        assert torch.equal(slot.permuted_idx_to_token_idx[:num_rows], inverse)
 
 
 @pytest.mark.parametrize(
     "routing_input_mode",
     (RoutingInputMode.PackedPrecomputed, RoutingInputMode.UnpackedPrecomputed),
 )
+@pytest.mark.parametrize("tile_ns", ((8, 32), (64, 128, 256)))
 def test_fused_multi_tile_routing_supports_da_capacity_bounds(
     routing_input_mode: RoutingInputMode,
+    tile_ns: tuple[int, ...],
 ) -> None:
     """The fused preamble must cover 1024 global experts and top-k 32."""
     require_sm100()
@@ -425,7 +464,6 @@ def test_fused_multi_tile_routing_supports_da_capacity_bounds(
     top_k = 32
     local_expert_offset = 480
     num_local_experts = 64
-    tile_ns = (8, 32)
     token_index = torch.arange(num_tokens, device="cuda", dtype=torch.int32).unsqueeze(
         1
     )

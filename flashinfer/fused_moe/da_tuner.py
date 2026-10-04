@@ -47,9 +47,9 @@ class BalancedEPWorkload:
 
     When ``ep_size`` and ``ep_rank`` are omitted, both values are inferred
     from the MoE operation's global and local expert geometry. Explicit values
-    are cross-checked against that geometry. The default two-times multiplier
-    was selected empirically from PrimsTS DA MoE measurements across EP sizes;
-    callers can request exact balanced occupancy with a multiplier of one.
+    are cross-checked against that geometry. Profiling defaults to the same
+    balanced occupancy as replay; callers can explicitly oversample with a
+    larger assignment multiplier.
     Remainder assignments go to the first ranks so small token batches remain
     valid when their assignment count is not divisible by the EP size.
     """
@@ -57,7 +57,7 @@ class BalancedEPWorkload:
     ep_size: int | None = None
     ep_rank: int | None = None
     require_equal: bool = False
-    assignment_multiplier: int = 2
+    assignment_multiplier: int = 1
 
     def __post_init__(self) -> None:
         if (self.ep_size is None) != (self.ep_rank is None):
@@ -169,7 +169,7 @@ def moe_workload(workload: MoeWorkload) -> Iterator[None]:
 
 
 def get_workload() -> MoeWorkload:
-    """Return the active MoE policy, defaulting to two-times balanced EP."""
+    """Return the active MoE policy, defaulting to exact balanced EP."""
     workload = _current_workload.get()
     return workload if workload is not None else BalancedEPWorkload()
 

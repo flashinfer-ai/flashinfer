@@ -217,7 +217,7 @@ struct MultiTileKernelArgs {
 };
 
 /// Run the permutation topology once per tile inside a single clustered CUDA kernel.
-template <typename KernelParams, typename ExpertId>
+template <typename KernelParams, typename ExpertId, bool CooperativePadding>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
     __launch_bounds__(KernelParams::MaxNumExperts)
@@ -242,8 +242,9 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
   // default cluster-sized capacity and generated implementation.
   routingPermutation<KernelParams, OutputT, KernelParams::MaxNumExperts,
                      KernelParams::MaxNumExperts / WarpSize, KernelParams::MaxNumTopExperts,
-                     /*LoadExpertIdxFromGlobal=*/true, ExpertId, kMaxTokensMultiTileCluster>(
-      params, nullptr, warpIdx, clusterBlockRank, args.expertIds);
+                     /*LoadExpertIdxFromGlobal=*/true, ExpertId, kMaxTokensMultiTileCluster,
+                     CooperativePadding>(params, nullptr, warpIdx, clusterBlockRank,
+                                         args.expertIds);
 }
 #else
 __global__ void routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelParams, ExpertId>) {
@@ -252,7 +253,7 @@ __global__ void routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelP
 #endif
 
 /// Pack host-side tile descriptors and issue the extended clustered-kernel launch.
-template <typename KernelParams, typename ExpertId>
+template <typename KernelParams, typename ExpertId, bool CooperativePadding>
 void launchMultiTileClusterKernel(Data* data, int32_t numTiles, int32_t numBlocks,
                                   int32_t numThreads, int32_t smemSize, void* stream) {
   MultiTileKernelArgs<KernelParams, ExpertId> args{};
@@ -276,12 +277,29 @@ void launchMultiTileClusterKernel(Data* data, int32_t numTiles, int32_t numBlock
   config.attrs = attributes;
   config.numAttrs = 2;
 
-  auto kernelTyped = routingIndicesMultiTileClusterKernel<KernelParams, ExpertId>;
+  auto kernelTyped =
+      routingIndicesMultiTileClusterKernel<KernelParams, ExpertId, CooperativePadding>;
   if (smemSize > 48 * 1024) {
     CHECK_CUDA_ERROR(
         cudaFuncSetAttribute(kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize));
   }
   CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, args));
+}
+
+template <typename KernelParams, typename ExpertId>
+void launchMultiTileClusterPadding(Data* data, int32_t numTiles, int32_t numBlocks,
+                                   int32_t numThreads, int32_t smemSize, void* stream) {
+  // The prepared plan contains only selectable tile sizes. Keep short tails on the
+  // existing path, and use coalesced warp stores when the entire selected range is large.
+  bool const largeTiles = std::all_of(data, data + numTiles,
+                                      [](Data const& tile) { return tile.mTileTokensDim >= 64; });
+  if (largeTiles) {
+    launchMultiTileClusterKernel<KernelParams, ExpertId, true>(data, numTiles, numBlocks,
+                                                               numThreads, smemSize, stream);
+  } else {
+    launchMultiTileClusterKernel<KernelParams, ExpertId, false>(data, numTiles, numBlocks,
+                                                                numThreads, smemSize, stream);
+  }
 }
 
 /// Launch one expert-count tier for either supported precomputed weight type.
@@ -290,12 +308,12 @@ void launchMultiTileClusterTier(Data* data, int32_t numTiles, int32_t numBlocks,
                                 int32_t smemSize, void* stream) {
   if (data[0].mDtypeOutput == tg::Dtype::Bfloat16) {
     using Params = KernelParams<__nv_bfloat16, MaxNumExperts, MaxNumTopExperts>;
-    launchMultiTileClusterKernel<Params, ExpertId>(data, numTiles, numBlocks, numThreads, smemSize,
-                                                   stream);
+    launchMultiTileClusterPadding<Params, ExpertId>(data, numTiles, numBlocks, numThreads, smemSize,
+                                                    stream);
   } else {
     using Params = KernelParams<float, MaxNumExperts, MaxNumTopExperts>;
-    launchMultiTileClusterKernel<Params, ExpertId>(data, numTiles, numBlocks, numThreads, smemSize,
-                                                   stream);
+    launchMultiTileClusterPadding<Params, ExpertId>(data, numTiles, numBlocks, numThreads, smemSize,
+                                                    stream);
   }
 }
 

@@ -56,19 +56,19 @@ def test_workload_hints_resolve_against_moe_geometry() -> None:
 
     assert (
         BalancedEPWorkload().local_assignments(capacity_tokens=32, top_k=8, **geometry)
-        == 64
+        == 32
     )
     assert (
         BalancedEPWorkload(ep_size=8, ep_rank=3).local_assignments(
             capacity_tokens=1024, top_k=8, **geometry
         )
-        == 2048
+        == 1024
     )
     assert (
         BalancedEPWorkload(
-            ep_size=8, ep_rank=3, assignment_multiplier=1
+            ep_size=8, ep_rank=3, assignment_multiplier=2
         ).local_assignments(capacity_tokens=1024, top_k=8, **geometry)
-        == 1024
+        == 2048
     )
     assert (
         FullWorkload().local_assignments(capacity_tokens=32, top_k=8, **geometry) == 256
@@ -137,7 +137,7 @@ def test_balanced_workload_rejects_out_of_range_shards(offset) -> None:
 
 
 def test_balanced_workload_accepts_unaligned_range_when_work_divides_evenly() -> None:
-    assert BalancedEPWorkload().local_assignments(64, 32, 1024, 64, 480) == 256
+    assert BalancedEPWorkload().local_assignments(64, 32, 1024, 64, 480) == 128
 
 
 def test_unaligned_remainder_requires_explicit_ep_rank() -> None:
@@ -164,14 +164,17 @@ def test_balanced_workload_distributes_remainder_by_default() -> None:
         ).local_assignments(3, 2, 4, 1)
 
     targets = [
-        BalancedEPWorkload(assignment_multiplier=1).local_assignments(3, 2, 4, 1, rank)
-        for rank in range(4)
+        BalancedEPWorkload().local_assignments(3, 2, 4, 1, rank) for rank in range(4)
     ]
     assert targets == [2, 2, 1, 1]
     assert sum(targets) == 6
 
 
-def test_default_profiling_workload_fits_small_expert_shards() -> None:
+@pytest.mark.parametrize(
+    "workload,expected",
+    [(None, [2, 2, 1, 1]), (BalancedEPWorkload(assignment_multiplier=2), [3, 3, 2, 2])],
+)
+def test_profiling_workload_fits_small_expert_shards(workload, expected) -> None:
     counts = []
     for rank in range(4):
         key = RoutingRealizationKey(
@@ -185,14 +188,19 @@ def test_default_profiling_workload_fits_small_expert_shards() -> None:
             top_k=2,
             routing_rule_fingerprint="test",
             routed_scaling_factor=1.0,
-            num_local_assignments_hint=get_workload().local_assignments(
+            num_local_assignments_hint=(workload or get_workload()).local_assignments(
                 3, 2, 4, 1, rank
             ),
         )
+        if workload is None:
+            assert (
+                key.num_local_assignments
+                == replace(key, num_local_assignments_hint=None).num_local_assignments
+            )
         ids = RoutingRealizationFactory().get_or_create(key).expert_ids
         counts.append(int((ids == rank).sum()))
         assert all(len(set(row)) == 2 for row in ids.tolist())
-    assert counts == [3, 3, 2, 2]
+    assert counts == expected
 
 
 @pytest.mark.parametrize("distribution", ["uniform", "ddist:4"])
@@ -294,10 +302,10 @@ def test_da_runtime_falls_back_when_topk_exceeds_local_shard() -> None:
 @pytest.mark.parametrize(
     "workload,num_tokens,top_k,expected",
     [
-        (BalancedEPWorkload(), 32, 8, 64),
-        (BalancedEPWorkload(assignment_multiplier=1), 32, 8, 32),
+        (BalancedEPWorkload(), 32, 8, 32),
+        (BalancedEPWorkload(assignment_multiplier=2), 32, 8, 64),
         (FullWorkload(), 32, 8, 256),
-        (BalancedEPWorkload(), 5, 6, 8),
+        (BalancedEPWorkload(), 5, 6, 4),
     ],
 )
 def test_da_runtime_derives_assignment_hint_from_context(

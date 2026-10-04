@@ -282,7 +282,7 @@ __device__ DataType calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, Dat
 template <typename KernelParams, typename BaseType, int NumThreads, int NumWarps,
           int MaxNumTopExperts, bool LoadExpertIdxFromGlobal = false,
           typename PrecomputedExpertId = int32_t,
-          int MaxNumTokens = NumBlocksPerCluster * NumThreads>
+          int MaxNumTokens = NumBlocksPerCluster * NumThreads, bool CooperativePadding = false>
 __device__ void routingPermutation(KernelParams params,
                                    PackedScoreIdx<BaseType>* smemPackedScoreIdx,
                                    int32_t const warpIdx, uint32_t const clusterBlockRank,
@@ -324,6 +324,9 @@ __device__ void routingPermutation(KernelParams params,
   // number of experts may exceed number of threads - size by MaxNumExperts
   __shared__ int32_t __attribute((aligned(128))) smemExpertCount[MaxNumExperts];
   __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[MaxNumExperts];
+  // Large selected routing tiles can have long padding tails. Publish their bounds for
+  // warp-coalesced initialization; ordinary routing retains its existing per-thread stores.
+  __shared__ int2 smemPaddingBounds[CooperativePadding ? MaxNumExperts : 1];
   // Extended-capacity instantiations use per-warp counts to make rank assignment deterministic.
   __shared__ int32_t __attribute((aligned(128)))
   smemWarpExpertState[MaxNumTokens > MaxNumTokensSingleCluster ? NumWarps : 1][MaxNumExperts];
@@ -549,7 +552,10 @@ __device__ void routingPermutation(KernelParams params,
           mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
-        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+        if constexpr (!CooperativePadding) {
+          initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2),
+                                 mnLimit1);
+        }
       }
 
       // get the padded offset associated with this expert (token-space, CGA granularity)
@@ -562,6 +568,12 @@ __device__ void routingPermutation(KernelParams params,
 
       // write expert offsets to shared
       smemExpertOffset[expert] = offset + blockExpertOffset[e];
+      if constexpr (CooperativePadding) {
+        int32_t const paddedCount = params.mIsPow2
+                                        ? mulLog2<int32_t>(numCta[e], params.mPaddingLog2)
+                                        : mulTileN<int32_t>(numCta[e], params.mTileTokensDim);
+        smemPaddingBounds[expert] = make_int2(offset + count[e], offset + paddedCount);
+      }
     }
   }
 
@@ -579,6 +591,20 @@ __device__ void routingPermutation(KernelParams params,
 
   // make expert offsets available to all threads
   __syncthreads();
+
+  if constexpr (CooperativePadding) {
+    if (params.mPtrPermutedIdxToTokenIdx != nullptr) {
+      // Interleave experts over cluster blocks so an EP-local window uses all blocks.
+      // Each tail has one owner warp; lanes write consecutive rows and never touch live data.
+      for (int32_t expert = warpIdx * NumBlocksPerCluster + clusterBlockRank;
+           expert < params.mNumExperts; expert += NumWarps * NumBlocksPerCluster) {
+        int2 const bounds = smemPaddingBounds[expert];
+        for (int32_t row = bounds.x + threadIdx.x % WarpSize; row < bounds.y; row += WarpSize) {
+          params.mPtrPermutedIdxToTokenIdx[row] = -1;
+        }
+      }
+    }
+  }
 
   // Wait: we cannot exit while other blocks may be accessing the current block's shared memory.
   // Note: I observed a perf benefit to doing this before the final loop so the compiler can
