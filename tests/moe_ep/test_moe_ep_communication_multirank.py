@@ -18,7 +18,15 @@ from datetime import timedelta
 import pytest
 
 _PG_TIMEOUT = timedelta(minutes=60)
-_BACKENDS = ["nvlink_one_sided", "cake", "nvlink_two_sided"]
+# One-sided variants pin the transport: "fence" never uses CFT counted writes,
+# "cft" uses them for every step and skips where the platform lacks them.
+_BACKENDS = [
+    "nvlink_one_sided:fence",
+    "nvlink_one_sided:cft",
+    "cake",
+    "nvlink_two_sided",
+]
+_ONE_SIDED_MODES = ["fence", "cft"]
 
 
 def _init_dist():
@@ -36,7 +44,7 @@ def _init_dist():
     return dist.get_rank(), dist.get_world_size()
 
 
-def _backend_config(name):
+def _backend_config(backend, **options):
     from flashinfer.moe_ep import (
         CakeAlltoAllConfig,
         NVLinkOneSidedConfig,
@@ -44,13 +52,23 @@ def _backend_config(name):
         available_communication_backends,
     )
 
+    name, _, mode = backend.partition(":")
     if name not in available_communication_backends():
         pytest.skip(f"{name} is not available on this machine")
+    if mode:
+        options["cft"] = mode == "cft"
     return {
         "nvlink_one_sided": NVLinkOneSidedConfig,
         "cake": CakeAlltoAllConfig,
         "nvlink_two_sided": NVLinkTwoSidedConfig,
-    }[name]()
+    }[name](**options)
+
+
+def _skip_without_cft(backend, comm):
+    """Skip a CFT variant on platforms without counted writes; all ranks agree."""
+    if backend.endswith(":cft") and not comm.cft_enabled:
+        comm.destroy()
+        pytest.skip("CFT counted writes are not available on this machine")
 
 
 def _random_routing(num_tokens, num_experts, top_k, generator):
@@ -75,8 +93,9 @@ def _identity_round_trip_reference(x, topk_ids, world_size, experts_per_rank):
 
 
 @pytest.mark.gpu_2
+@pytest.mark.parametrize("top_k", [4, 8])
 @pytest.mark.parametrize("backend", _BACKENDS)
-def test_dispatch_combine_matches_local_reference(backend):
+def test_dispatch_combine_matches_local_reference(backend, top_k):
     import torch
     import torch.distributed as dist
 
@@ -85,7 +104,6 @@ def test_dispatch_combine_matches_local_reference(backend):
     rank, world_size = _init_dist()
     config = _backend_config(backend)
     num_experts = 4 * world_size
-    top_k = 4
     hidden = 2048
     max_tokens_per_rank = 32
 
@@ -109,6 +127,8 @@ def test_dispatch_combine_matches_local_reference(backend):
         ),
         config,
     )
+    if backend.startswith("nvlink_one_sided"):
+        _skip_without_cft(backend, comm)
     try:
         for _ in range(2):  # the second round reuses the workspace
             received = comm.dispatch(
@@ -259,6 +279,8 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
     try:
         load_next_step()
         state = layer.create_graph_state(t)
+        if backend.endswith(":cft") and not layer._communication.cft_enabled:
+            pytest.skip("CFT counted writes are not available on this machine")
         layer.forward(t, graph_state=state)  # eager warmup
         torch.cuda.synchronize()
         dist.barrier()
@@ -279,3 +301,84 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
         torch.cuda.synchronize()
         dist.barrier()
         layer.destroy()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.parametrize("mode", _ONE_SIDED_MODES)
+def test_nvlink_one_sided_low_precision_eplb_and_rank_mask(mode):
+    """FP8 combine, EPLB statistics and an all-active rank mask in one round."""
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import BootstrapConfig, MoEEpCommParams, create_communication
+
+    rank, world_size = _init_dist()
+    backend = f"nvlink_one_sided:{mode}"
+    num_experts = 4 * world_size
+    top_k, hidden, max_tokens_per_rank = 8, 2048, 32
+    config = _backend_config(
+        backend,
+        use_low_precision_combine=True,
+        eplb_stats_num_experts=num_experts,
+        enable_rank_mask=True,
+    )
+    generator = torch.Generator().manual_seed(4321 + rank)
+    num_tokens = int(
+        torch.randint(1, max_tokens_per_rank + 1, (1,), generator=generator)
+    )
+    step_max = torch.tensor([num_tokens], device="cuda")
+    dist.all_reduce(step_max, op=dist.ReduceOp.MAX)
+    x = torch.randn(num_tokens, hidden, generator=generator).to("cuda", torch.bfloat16)
+    topk_ids, topk_weights = _random_routing(num_tokens, num_experts, top_k, generator)
+
+    comm = create_communication(
+        BootstrapConfig(world_size=world_size, rank=rank),
+        MoEEpCommParams(
+            num_experts=num_experts,
+            top_k=top_k,
+            max_tokens_per_rank=max_tokens_per_rank,
+            hidden_size=hidden,
+        ),
+        config,
+    )
+    _skip_without_cft(backend, comm)
+    try:
+        stats_base = torch.arange(num_experts, dtype=torch.int32, device="cuda")
+        mask = comm.active_rank_mask(range(world_size))
+        received = comm.dispatch(
+            x,
+            topk_ids,
+            topk_weights,
+            max_tokens_per_rank=int(step_max),
+            eplb_local_stats=stats_base + 1000 * rank,
+            active_rank_mask=mask,
+        )
+        torch.testing.assert_close(
+            received.eplb_gathered_stats,
+            torch.stack([stats_base + 1000 * r for r in range(world_size)]),
+        )
+        first_local = rank * comm.num_local_experts
+        ids = received.topk_ids.long()
+        is_local = (ids >= first_local) & (ids < first_local + comm.num_local_experts)
+        row_scale = torch.where(
+            is_local,
+            received.topk_weights.float() * (ids + 1).float(),
+            torch.zeros((), device="cuda"),
+        ).sum(-1, keepdim=True)
+        expert_output = torch.where(
+            is_local.any(-1, keepdim=True),
+            received.hidden_states.float() * row_scale,
+            torch.zeros((), device="cuda"),
+        ).to(torch.bfloat16)
+
+        out = comm.combine(expert_output, active_rank_mask=mask)
+
+        reference = x.float() * (topk_weights * (topk_ids.long() + 1).float()).sum(
+            -1, keepdim=True
+        )
+        # Each rank's partial result crosses the wire as FP8 e4m3.
+        error = (out.float() - reference).norm() / reference.norm()
+        assert error < 0.08, f"relative error {error:.4f}"
+    finally:
+        dist.barrier()
+        comm.destroy()

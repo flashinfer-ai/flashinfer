@@ -317,12 +317,10 @@ class _FakeMoeAlltoAll:
 
 
 @pytest.fixture
-def fake_one_sided(monkeypatch):
+def fake_cake(monkeypatch):
     import flashinfer.comm.trtllm_moe_alltoall as a2a
     from flashinfer.comm.mapping import Mapping
-    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
-        communication as one_sided,
-    )
+    from flashinfer.moe_ep.backends.split.comm.cake import communication as cake
 
     def workspace_size_per_rank(*args, **kwargs):
         _FakeMoeAlltoAll.workspace_args = args
@@ -334,7 +332,7 @@ def fake_one_sided(monkeypatch):
         a2a, "moe_a2a_get_workspace_size_per_rank", workspace_size_per_rank
     )
     monkeypatch.setattr(
-        one_sided,
+        cake,
         "mnnvl_mapping_and_config",
         lambda bootstrap, comm_backend: (
             Mapping(
@@ -346,24 +344,25 @@ def fake_one_sided(monkeypatch):
             None,
         ),
     )
-    for cls in (NVLinkOneSidedAlltoAll, CakeAlltoAll):
-        monkeypatch.setattr(cls, "is_platform_supported", classmethod(lambda cls: True))
+    monkeypatch.setattr(
+        CakeAlltoAll, "is_platform_supported", classmethod(lambda cls: True)
+    )
 
 
-def test_nvlink_one_sided_sizes_dispatch_by_format(fake_one_sided) -> None:
+def test_cake_sizes_dispatch_by_format(fake_cake) -> None:
     create_communication(
         BootstrapConfig(world_size=2, rank=0),
         _params(hidden_size=64, dispatch_format=QuantFormat.NVFP4),
-        "nvlink_one_sided",
+        "cake",
     )
-    assert _FakeMoeAlltoAll.instances[-1].kwargs["backend"] == "trtllm"
+    assert _FakeMoeAlltoAll.instances[-1].kwargs["backend"] == "cake"
     _, _, dispatch_bytes, combine_bytes, _ = _FakeMoeAlltoAll.workspace_args
     # NVFP4 values and scales, then int32 ids and FP32 weights for top_k=2.
     assert dispatch_bytes == 32 + 4 + 2 * 4 * 2
     assert combine_bytes == 64 * 2
 
 
-def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
+def test_cake_payload_plumbing(fake_cake) -> None:
     comm = create_communication(
         BootstrapConfig(world_size=2, rank=0),
         _params(),
@@ -415,13 +414,248 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
 
 
 def test_cake_needs_compute_capability_10_0_or_10_3(monkeypatch) -> None:
-    monkeypatch.setattr(
-        NVLinkOneSidedAlltoAll, "is_platform_supported", classmethod(lambda cls: True)
-    )
+    from flashinfer.moe_ep.backends.split.comm.cake import communication as cake
+
+    monkeypatch.setattr(cake, "nvlink_platform_supported", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
     assert not CakeAlltoAll.is_platform_supported()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (10, 3))
     assert CakeAlltoAll.is_platform_supported()
+
+
+_ONE_SIDED_LAYOUT = {
+    "NUM_METAINFO_FIELDS": 25,
+    "COMBINE_INPUT_SIZE_INDEX": 16,
+    "WORKSPACE_SIZE_INDEX": 24,
+    "MAX_RANKS": 256,
+    "MAX_PAYLOADS": 4,
+    "WORKSPACE_ALIGNMENT": 256,
+}
+
+
+class _FakeOneSidedModule:
+    """Records the NVLink one-sided ops; dispatch packs payloads from offset 0."""
+
+    def __init__(self) -> None:
+        self.calls: dict = {}
+
+    def moe_a2a_get_workspace_layout(self, *args):
+        self.calls["layout"] = args[:-1]
+        metainfo = args[-1]
+        metainfo.zero_()
+        metainfo[_ONE_SIDED_LAYOUT["COMBINE_INPUT_SIZE_INDEX"]] = 1 << 16
+
+    def moe_a2a_dispatch(self, ids, payloads, workspace, metainfo, rt, *args):
+        self.calls["dispatch"] = (ids, payloads, rt, args)
+        offsets, offset = [], 0
+        for payload in payloads:
+            offsets.append(offset)
+            nbytes = workspace.shape[0] * rt * payload.shape[1] * payload.element_size()
+            offset += -(-nbytes // 128) * 128
+        return offsets, 1 << 15, -1
+
+    def moe_a2a_sanitize_expert_ids(self, *args):
+        self.calls["sanitize"] = args
+
+    def moe_a2a_combine(self, *args):
+        self.calls["combine"] = args
+
+
+@pytest.fixture
+def fake_one_sided(monkeypatch):
+    """NVLinkOneSidedAlltoAll on a fake kernel module and a host workspace."""
+    from types import SimpleNamespace
+
+    import flashinfer.comm.mnnvl as mnnvl
+    import flashinfer.utils
+    from flashinfer.comm.mapping import Mapping
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
+        communication as one_sided,
+    )
+
+    module = _FakeOneSidedModule()
+    probe: dict = {"reason": None, "probed": 0}
+
+    def acquire(self, mapping, comm, metainfo, cft_capable):
+        return {
+            "key": None,
+            "workspace": torch.zeros(self.ep_size, 1 << 16, dtype=torch.uint8),
+            "metainfo": metainfo,
+            "views": {},
+            "refcount": 1,
+            "cft_ready": cft_capable,
+        }
+
+    def unsupported_reason(device_index):
+        probe["probed"] += 1
+        return probe["reason"]
+
+    monkeypatch.setattr(one_sided, "get_nvlink_one_sided_module", lambda: module)
+    monkeypatch.setattr(
+        one_sided, "layout_constants", lambda: SimpleNamespace(**_ONE_SIDED_LAYOUT)
+    )
+    monkeypatch.setattr(one_sided, "_cft_unsupported_reason", unsupported_reason)
+    monkeypatch.setattr(
+        one_sided,
+        "mnnvl_mapping_and_config",
+        lambda bootstrap, comm_backend: (
+            Mapping(
+                world_size=bootstrap.world_size,
+                rank=bootstrap.rank,
+                tp_size=bootstrap.world_size,
+                moe_ep_size=bootstrap.world_size,
+            ),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        NVLinkOneSidedAlltoAll, "is_platform_supported", classmethod(lambda cls: True)
+    )
+    monkeypatch.setattr(NVLinkOneSidedAlltoAll, "_acquire_workspace", acquire)
+    monkeypatch.setattr(mnnvl.MnnvlMemory, "initialize", staticmethod(lambda: None))
+    monkeypatch.setattr(
+        mnnvl.MnnvlMemory,
+        "set_comm_from_config",
+        staticmethod(lambda mapping, config=None: None),
+    )
+    monkeypatch.setattr(
+        mnnvl.MnnvlMemory, "get_comm", staticmethod(lambda mapping: None)
+    )
+    monkeypatch.setattr(mnnvl, "all_ranks_agree", lambda comm, local: local)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(flashinfer.utils, "device_support_pdl", lambda device: True)
+    return SimpleNamespace(module=module, probe=probe)
+
+
+def _one_sided(params=None, **config):
+    return create_communication(
+        BootstrapConfig(world_size=2, rank=0),
+        _params() if params is None else params,
+        NVLinkOneSidedConfig(**config),
+    )
+
+
+def test_nvlink_one_sided_sizes_workspace_by_format(fake_one_sided) -> None:
+    _one_sided(
+        _params(hidden_size=64, dispatch_format=QuantFormat.NVFP4),
+        extra_payload_bytes_per_token=16,
+        eplb_stats_num_experts=4,
+    )
+    ep, max_tokens, top_k, dispatch, combine_input, combine_recv, eplb, cft = (
+        fake_one_sided.module.calls["layout"]
+    )
+    assert (ep, max_tokens, top_k, eplb, cft) == (2, 3, 2, 4, True)
+    tokens = ep * max_tokens
+    # NVFP4 values and scales, int32 ids, FP32 weights and the extra payload,
+    # plus one alignment unit for each payload's own boundary.
+    assert dispatch == tokens * (32 + 4 + 2 * 4 * 2 + 16) + 4 * 256
+    assert combine_input == tokens * 64 * 2
+    assert combine_recv == tokens * 64 * 2
+
+
+def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
+    comm = _one_sided(cft=False)
+    assert not comm.cft_enabled
+    assert fake_one_sided.probe["probed"] == 0
+    assert fake_one_sided.module.calls["layout"][5] == 0
+
+    fake_one_sided.probe["reason"] = "the device does not support it"
+    assert not _one_sided().cft_enabled
+
+    fake_one_sided.probe["reason"] = None
+    comm = _one_sided(use_low_precision_combine=True, cft_max_tokens_for_dispatch=2)
+    assert comm.cft_enabled
+    # FP8 wire format sizes the CFT receive inbox.
+    assert fake_one_sided.module.calls["layout"][5] == 6 * 8
+    assert comm._use_cft(2, 2) and not comm._use_cft(3, 2)
+    assert _one_sided(cft=True)._use_cft(3, 2)
+
+
+def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
+    calls = fake_one_sided.module.calls
+    comm = _one_sided(
+        _params(num_experts=8, top_k=4), cft_max_tokens_for_dispatch=2, timeout_sec=60
+    )
+    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+    scale = torch.ones(2, 16, dtype=torch.uint8)
+    ids = torch.tensor([[0, 3, 5, 7], [1, 2, 4, 6]])
+    weights = torch.ones(2, 4)
+    result = comm.dispatch(
+        hidden, ids, weights, hidden_states_scale=scale, max_tokens_per_rank=2
+    )
+
+    sent_ids, payloads, rt, args = calls["dispatch"]
+    assert sent_ids.dtype == torch.int32 and rt == 2
+    assert [p.dtype for p in payloads] == [
+        torch.bfloat16,
+        torch.uint8,
+        torch.int32,
+        torch.float32,
+    ]
+    rank, ep, top_k, num_experts, eplb, use_cft, id_index, invalid = args[:8]
+    assert (rank, ep, top_k, num_experts, eplb) == (0, 2, 4, 8, None)
+    # Every payload row is a multiple of 16 bytes, so this small step uses CFT,
+    # which also fills the padding rows' expert ids.
+    assert use_cft and id_index == 2 and invalid == -1
+    assert args[-2] == 60
+    assert "sanitize" not in calls
+    assert result.tokens_per_rank == 2
+    assert result.hidden_states.shape == (4, 8)
+    assert result.hidden_states_scale.shape == (4, 16)
+    assert result.topk_ids.shape == (4, 4)
+    assert result.topk_weights.dtype == torch.float32
+
+    buffer = comm.get_combine_input_buffer(torch.bfloat16)
+    assert buffer.shape == (4, 8)
+    out = comm.combine(buffer)
+    assert out.shape == (2, 8)
+    payload, local_num_tokens = calls["combine"][:2]
+    assert payload.shape == (2, 2, 8) and local_num_tokens == 2
+    # A 16-byte BF16 row allows CFT for the combine as well.
+    assert calls["combine"][11] is True and calls["combine"][14] is out
+
+    # The full-capacity step exceeds the CFT limit: the fence path runs and
+    # the padding rows are sanitized separately.
+    comm.dispatch(hidden, ids, weights)
+    assert calls["dispatch"][3][5] is False and calls["dispatch"][3][6] == -1
+    assert calls["sanitize"][0].shape == (2, 3, 4)
+    output = torch.empty(2, 8, dtype=torch.bfloat16)
+    assert (
+        comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16), output=output) is output
+    )
+
+    # Eight-byte expert-id rows cannot use CFT counted writes.
+    narrow = _one_sided(_params(num_experts=8, top_k=2))
+    narrow.dispatch(hidden, ids[:, :2], max_tokens_per_rank=2)
+    assert calls["dispatch"][3][5] is False
+
+    with pytest.raises(ValueError, match="max_tokens_per_rank"):
+        comm.dispatch(hidden, ids, weights, max_tokens_per_rank=4)
+    with pytest.raises(RuntimeError, match="before dispatch"):
+        comm.combine(buffer)
+
+
+def test_nvlink_one_sided_rank_mask(fake_one_sided) -> None:
+    comm = _one_sided(enable_rank_mask=True)
+    mask = comm.active_rank_mask([0, 1, 255 % comm.ep_size])
+    assert mask.dtype == torch.uint64 and mask.tolist() == [3, 0, 0, 0]
+    with pytest.raises(ValueError, match="out of range"):
+        comm.active_rank_mask([2])
+    with pytest.raises(ValueError, match="enable_rank_mask"):
+        _one_sided().dispatch(
+            torch.ones(2, 8, dtype=torch.bfloat16),
+            torch.tensor([[0, 3], [1, 2]]),
+            active_rank_mask=mask,
+        )
+
+
+def test_nvlink_one_sided_validates_config(fake_one_sided) -> None:
+    with pytest.raises(ValueError, match="timeout_sec"):
+        _one_sided(timeout_sec=0)
+    with pytest.raises(ValueError, match="top_k"):
+        _one_sided(_params(num_experts=8, top_k=3))
+    with pytest.raises(ValueError, match="eplb_stats_num_experts"):
+        _one_sided(eplb_stats_num_experts=5)
 
 
 def test_nvlink_two_sided_marks_padding_rows_invalid(monkeypatch) -> None:
