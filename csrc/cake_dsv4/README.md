@@ -186,7 +186,9 @@ E2M1 NoPE, 128 B BF16 RoPE bits, 28 E4M3 scales + 4 zero bytes), `q_out` is the
 fp32 rotation of each live head rounded to BF16 with zero-filled padded heads;
 with `q_inplace=True` (no head padding, Q RoPE on) the entry rotates the 64
 RoPE dims of `q` itself and returns `q` (one warp per 8 heads, nothing else of
-`q` is touched or copied). One warp per (token, head slot), 256-thread CTAs,
+`q` is touched or copied; the first warp of each token also inserts the KV row,
+so the production TP8 shape runs one warp per token). One warp per (token,
+head slot) otherwise, 256-thread CTAs,
 variants per padded head count (8, 16, 32, 64, 128) x Q RoPE on/off x slot
 dtype (int32 / int64) for the QKV form, the in-place form per head count x
 slot dtype, and per compress ratio (1, 2) x slot dtype for the KV form. Both
