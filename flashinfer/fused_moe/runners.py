@@ -5851,141 +5851,6 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 # ---------------------------------------------------------------------------
 
 
-class CakeStepFunRunner(MoERunner):
-    """StepFun adapter over the Cake-enabled trtllm-gen ``MoERunner`` (all FC1 families).
-
-    Instantiating this class returns the per-precision subclass for the
-    configured quantization: :class:`CakeStepFunNvfp4Runner` (NVFP4, also with
-    ``per_token_scale``), :class:`CakeStepFunBf16Runner`,
-    :class:`CakeStepFunFp8PerTensorRunner` and :class:`CakeStepFunMxfp8Runner`.
-    Each mirrors the corresponding ``Trtllm*Runner`` (input packing, routing,
-    GEMM2, finalize) but loads the exact-architecture ``fused_moe_cake_stepfun_*``
-    module whose GEMM1 stage launches the exported Cake StepFun kernels for the
-    tile sizes they cover. A tactic is the FC1 tile (``tile_N``) x the GEMM
-    configuration index.
-
-    The weight view must come from :meth:`CakeStepFunConfig.prepare_weights`:
-    the Cake kernels read the per-expert ``gemm1_clamp_limit`` and have no
-    implicit default limit.
-    """
-
-    backend_key = "cake"
-    supported_activation_classes = (SwiGLUStep,)
-
-    def __new__(cls, config: MoEConfig | None = None, device: Any = None, *args: Any, **kwargs: Any):
-        if cls is CakeStepFunRunner:
-            if config is None:
-                raise TypeError("CakeStepFunRunner requires a MoEConfig")
-            cls = cls.runner_class_for(config.quant)
-        return super().__new__(cls)
-
-    @classmethod
-    def runner_class_for(cls, quant: QuantConfig) -> type["CakeStepFunRunner"]:
-        for runner_cls in _CAKE_STEPFUN_RUNNERS:
-            if runner_cls.supports_quant(quant):
-                return runner_cls
-        raise NotImplementedError(
-            f"CakeStepFunRunner has no FC1 family for {quant!r}; supported pairs: "
-            + ", ".join(f"{w.name}x{a.name}" for w, a in cls.supported_quant_variants)
-        )
-
-    @classmethod
-    def supports_quant(cls, quant: QuantConfig) -> bool:
-        if cls is CakeStepFunRunner:
-            return any(r.supports_quant(quant) for r in _CAKE_STEPFUN_RUNNERS)
-        return super().supports_quant(quant)
-
-    def _check_support(self) -> None:
-        super()._check_support()
-        from ..utils import get_compute_capability
-
-        compute_capability = get_compute_capability(self.device)
-        if compute_capability not in ((10, 0), (10, 3)):
-            raise NotImplementedError(
-                f"{type(self).__name__} supports exact SM100 and SM103 only, "
-                f"got SM{compute_capability[0]}{compute_capability[1]}."
-            )
-
-    def _build(self) -> None:
-        from ..utils import get_compute_capability
-        from .core import get_cake_stepfun_moe_module
-
-        major, minor = get_compute_capability(self.device)
-        self._module = get_cake_stepfun_moe_module(f"sm_{major}{minor}a")
-
-    def pack_inputs(
-        self, act: MoEActivationPack, weights: MoEWeightPack
-    ) -> List[torch.Tensor]:
-        view = weights.get_view(self.backend_key)
-        if view.get("gemm1_clamp_limit") is None:
-            raise ValueError(
-                f"{type(self).__name__} requires the per-expert gemm1_clamp_limit "
-                "produced by CakeStepFunConfig.prepare_weights in the 'cake' view."
-            )
-        return super().pack_inputs(act, weights)
-
-    def _cache_key_extras(self) -> tuple:
-        # The 'cake' backend key is shared with the warp-decode runner; the
-        # runner name keeps their tactic spaces apart.
-        return (type(self).__name__,) + super()._cache_key_extras()
-
-
-class CakeStepFunNvfp4Runner(CakeStepFunRunner, TrtllmFp4RoutedRunner):
-    """NVFP4 StepFun over the Cake FC1 kernels (E2m1 output, or bf16 output with per-token scales)."""
-
-    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
-    supported_activation_classes_by_quant: ClassVar[
-        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
-    ] = {
-        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLUStep,),
-    }
-
-
-class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
-    """BF16 StepFun over the Cake FC1 kernels (BlockMajorK weights)."""
-
-    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
-    supported_activation_classes = (SwiGLUStep,)
-
-
-class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner):
-    """Per-tensor FP8 StepFun over the Cake FC1 kernels (raw-unit clamp limits)."""
-
-    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
-    supported_activation_classes = (SwiGLUStep,)
-
-
-class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
-    """MXFP8 StepFun over the Cake FC1 kernels (UE8M0 block scales)."""
-
-    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
-    supported_activation_classes_by_quant: ClassVar[
-        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
-    ] = {
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLUStep,),
-    }
-
-
-_CAKE_STEPFUN_RUNNERS: tuple[type[CakeStepFunRunner], ...] = (
-    CakeStepFunNvfp4Runner,
-    CakeStepFunBf16Runner,
-    CakeStepFunFp8PerTensorRunner,
-    CakeStepFunMxfp8Runner,
-)
-CakeStepFunRunner.supported_quant_variants = tuple(
-    variant for runner in _CAKE_STEPFUN_RUNNERS for variant in runner.supported_quant_variants
-)
-CakeStepFunRunner.supported_routing_modes = tuple(
-    dict.fromkeys(mode for runner in _CAKE_STEPFUN_RUNNERS for mode in runner.supported_routing_modes)
-)
-CakeStepFunRunner.supports_fused_shared_experts = any(
-    runner.supports_fused_shared_experts for runner in _CAKE_STEPFUN_RUNNERS
-)
-CakeStepFunRunner.supported_activation_classes_by_quant = {
-    pair: (SwiGLUStep,) for runner in _CAKE_STEPFUN_RUNNERS for pair in runner.supported_quant_variants
-}
-
-
 # ---------------------------------------------------------------------------
 # TRTLLM block-FP8 runner — DeepSeek FP8 and MXFP8
 # ---------------------------------------------------------------------------
@@ -6901,6 +6766,145 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
             tuning_config=tuning_config,
             launch_state=_TrtllmLaunchState(static_kwargs),
         )
+
+
+# ---------------------------------------------------------------------------
+# Cake StepFun runners (exported Cake FC1 kernels inside the trtllm-gen pipeline)
+# ---------------------------------------------------------------------------
+class CakeStepFunRunner(MoERunner):
+    """StepFun adapter over the Cake-enabled trtllm-gen ``MoERunner`` (all FC1 families).
+
+    Instantiating this class returns the per-precision subclass for the
+    configured quantization: :class:`CakeStepFunNvfp4Runner` (NVFP4, also with
+    ``per_token_scale``), :class:`CakeStepFunBf16Runner`,
+    :class:`CakeStepFunFp8PerTensorRunner` and :class:`CakeStepFunMxfp8Runner`.
+    Each mirrors the corresponding ``Trtllm*Runner`` (input packing, routing,
+    GEMM2, finalize) but loads the exact-architecture ``fused_moe_cake_stepfun_*``
+    module whose GEMM1 stage launches the exported Cake StepFun kernels for the
+    tile sizes they cover. A tactic is the FC1 tile (``tile_N``) x the GEMM
+    configuration index.
+
+    The weight view must come from :meth:`CakeStepFunConfig.prepare_weights`:
+    the Cake kernels read the per-expert ``gemm1_clamp_limit`` and have no
+    implicit default limit.
+    """
+
+    backend_key = "cake"
+    supported_activation_classes = (SwiGLUStep,)
+
+    def __new__(cls, config: MoEConfig | None = None, device: Any = None, *args: Any, **kwargs: Any):
+        if cls is CakeStepFunRunner:
+            if config is None:
+                raise TypeError("CakeStepFunRunner requires a MoEConfig")
+            cls = cls.runner_class_for(config.quant)
+        return super().__new__(cls)
+
+    @classmethod
+    def runner_class_for(cls, quant: QuantConfig) -> type["CakeStepFunRunner"]:
+        for runner_cls in _CAKE_STEPFUN_RUNNERS:
+            if runner_cls.supports_quant(quant):
+                return runner_cls
+        raise NotImplementedError(
+            f"CakeStepFunRunner has no FC1 family for {quant!r}; supported pairs: "
+            + ", ".join(f"{w.name}x{a.name}" for w, a in cls.supported_quant_variants)
+        )
+
+    @classmethod
+    def supports_quant(cls, quant: QuantConfig) -> bool:
+        if cls is CakeStepFunRunner:
+            return any(r.supports_quant(quant) for r in _CAKE_STEPFUN_RUNNERS)
+        return super().supports_quant(quant)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..utils import get_compute_capability
+
+        compute_capability = get_compute_capability(self.device)
+        if compute_capability not in ((10, 0), (10, 3)):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports exact SM100 and SM103 only, "
+                f"got SM{compute_capability[0]}{compute_capability[1]}."
+            )
+
+    def _build(self) -> None:
+        from ..utils import get_compute_capability
+        from .core import get_cake_stepfun_moe_module
+
+        major, minor = get_compute_capability(self.device)
+        self._module = get_cake_stepfun_moe_module(f"sm_{major}{minor}a")
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        view = weights.get_view(self.backend_key)
+        if view.get("gemm1_clamp_limit") is None:
+            raise ValueError(
+                f"{type(self).__name__} requires the per-expert gemm1_clamp_limit "
+                "produced by CakeStepFunConfig.prepare_weights in the 'cake' view."
+            )
+        return super().pack_inputs(act, weights)
+
+    def _cache_key_extras(self) -> tuple:
+        # The 'cake' backend key is shared with the warp-decode runner; the
+        # runner name keeps their tactic spaces apart.
+        return (type(self).__name__,) + super()._cache_key_extras()
+
+
+class CakeStepFunNvfp4Runner(CakeStepFunRunner, TrtllmFp4RoutedRunner):
+    """NVFP4 StepFun over the Cake FC1 kernels (E2m1 output, or bf16 output with per-token scales)."""
+
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLUStep,),
+    }
+
+
+class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
+    """BF16 StepFun over the Cake FC1 kernels (BlockMajorK weights)."""
+
+    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+    supported_activation_classes = (SwiGLUStep,)
+
+
+class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner):
+    """Per-tensor FP8 StepFun over the Cake FC1 kernels (raw-unit clamp limits)."""
+
+    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+    supported_activation_classes = (SwiGLUStep,)
+
+
+class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
+    """MXFP8 StepFun over the Cake FC1 kernels (UE8M0 block scales)."""
+
+    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLUStep,),
+    }
+
+
+_CAKE_STEPFUN_RUNNERS: tuple[type[CakeStepFunRunner], ...] = (
+    CakeStepFunNvfp4Runner,
+    CakeStepFunBf16Runner,
+    CakeStepFunFp8PerTensorRunner,
+    CakeStepFunMxfp8Runner,
+)
+CakeStepFunRunner.supported_quant_variants = tuple(
+    variant for runner in _CAKE_STEPFUN_RUNNERS for variant in runner.supported_quant_variants
+)
+CakeStepFunRunner.supported_routing_modes = tuple(
+    dict.fromkeys(mode for runner in _CAKE_STEPFUN_RUNNERS for mode in runner.supported_routing_modes)
+)
+CakeStepFunRunner.supports_fused_shared_experts = any(
+    runner.supports_fused_shared_experts for runner in _CAKE_STEPFUN_RUNNERS
+)
+CakeStepFunRunner.supported_activation_classes_by_quant = {
+    pair: (SwiGLUStep,) for runner in _CAKE_STEPFUN_RUNNERS for pair in runner.supported_quant_variants
+}
+
 
 
 # ---------------------------------------------------------------------------
