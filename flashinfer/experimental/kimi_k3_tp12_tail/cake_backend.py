@@ -462,6 +462,140 @@ def _check(
         )
 
 
+def _k1_launch_kwargs(
+    k1_key: str,
+    *,
+    M: int,
+    rank: int,
+    workspace: Any,
+    routed_partial: Any,
+    shared_partial: Any,
+    y: Any,
+    norm_weight: Any,
+) -> tuple[str, dict[str, Any]]:
+    """The K1 launch arguments for ``k1_key`` (exact-key dispatch; ``name`` is the workspace buffer set).
+
+    ``k1_oneshot_ess`` (``M <= ONESHOT_MAX_TOKENS``) carries no poll-schedule suffix; the two-shot keys do.
+    """
+    if k1_key == "k1_oneshot_ess":
+        # early shared scatter: K1 also scatters shared_partial into the "k3" workspace slots
+        name = "k1_oneshot"
+        k1_kwargs: dict[str, Any] = dict(
+            routed=routed_partial,
+            shared=shared_partial,
+            y_out=y,
+            gamma=norm_weight,
+            mcast_ptr=workspace.multicast_ptr(name),
+            local_unicast_ptr=workspace.local_unicast_ptr(name),
+            buffer_flags=workspace.flags(name),
+            k3_peer_ptrs=workspace.peer_ptrs["k3"],
+            k3_mcast_ptr=workspace.multicast_ptr("k3"),
+            k3_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            epsilon=float(RMS_EPS),
+            grid=(M, 1, 1),
+        )
+    elif k1_key.startswith("k1_twoshot_ess:"):
+        name = "k1_twoshot"
+        k1_kwargs = dict(
+            routed=routed_partial,
+            shared=shared_partial,
+            y_out=y,
+            gamma=norm_weight,
+            peer_ptrs=workspace.peer_ptrs[name],
+            mcast_ptr=workspace.multicast_ptr(name),
+            buffer_flags=workspace.flags(name),
+            k3_peer_ptrs=workspace.peer_ptrs["k3"],
+            k3_mcast_ptr=workspace.multicast_ptr("k3"),
+            k3_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            epsilon=float(RMS_EPS),
+            grid=(M, 1, 1),
+        )
+    else:
+        # plain two-shot K1 (M >= K3_PERSIST_MIN_TOKENS): the persistent tail scatters shared_partial itself
+        name = "k1_twoshot"
+        k1_kwargs = dict(
+            routed=routed_partial,
+            y_out=y,
+            gamma=norm_weight,
+            peer_ptrs=workspace.peer_ptrs[name],
+            mcast_ptr=workspace.multicast_ptr(name),
+            buffer_flags=workspace.flags(name),
+            num_tokens=M,
+            rank=rank,
+            epsilon=float(RMS_EPS),
+            grid=(M, 1, 1),
+        )
+    return name, k1_kwargs
+
+
+def _k3_launch_kwargs(
+    k3_key: str,
+    *,
+    M: int,
+    rank: int,
+    workspace: Any,
+    grid: tuple[int, int, int],
+    shared_partial: Any,
+    y: Any,
+    gemm: Any,
+    up_weight_slice: Any,
+    out: Any,
+) -> dict[str, Any]:
+    """The tail launch arguments for ``k3_key`` (``k23:c<capacity>``, ``k3_ess:<schedule>`` or the persistent K3)."""
+    if k3_key.startswith("k23:"):
+        # fused up-projection + tail: the slice GEMM reads y and the weight slice itself
+        k3_kwargs: dict[str, Any] = dict(
+            y=y,
+            w_slice=up_weight_slice,
+            out=out,
+            peer_ptrs=workspace.peer_ptrs["k3"],
+            mcast_ptr=workspace.multicast_ptr("k3"),
+            buffer_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            my_col_begin=workspace.my_col_begin,
+            grid=grid,
+        )
+    elif k3_key.startswith("k3_ess:"):
+        # K3-ESS: no shared operand, the ESS K1 already scattered it
+        k3_kwargs = dict(
+            gemm_slice=gemm,
+            out=out,
+            peer_ptrs=workspace.peer_ptrs["k3"],
+            mcast_ptr=workspace.multicast_ptr("k3"),
+            buffer_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            my_col_begin=workspace.my_col_begin,
+            my_cols=workspace.my_cols,
+            gemm_plane_stride=M * workspace.my_cols,
+            num_gemm_splits=1,
+            grid=grid,
+        )
+    else:
+        # persistent K3 (plain at 256 tokens, cp.async.bulk pushes above): scatters shared_partial itself
+        k3_kwargs = dict(
+            shared=shared_partial,
+            gemm_slice=gemm,
+            out=out,
+            peer_ptrs=workspace.peer_ptrs["k3"],
+            mcast_ptr=workspace.multicast_ptr("k3"),
+            buffer_flags=workspace.flags("k3"),
+            num_tokens=M,
+            rank=rank,
+            my_col_begin=workspace.my_col_begin,
+            my_cols=workspace.my_cols,
+            gemm_plane_stride=M * workspace.my_cols,
+            num_gemm_splits=1,
+            grid=grid,
+        )
+    return k3_kwargs
+
+
 def prepare_kimi_k3_tp12_tail(
     routed_partial: torch.Tensor,
     shared_partial: torch.Tensor,
@@ -518,106 +652,29 @@ def prepare_kimi_k3_tp12_tail(
     up_weight_slice = up_weight[
         workspace.my_col_begin : workspace.my_col_begin + workspace.my_cols
     ]
-    if k1_key.startswith("k1_oneshot_ess:"):
-        # early shared scatter: K1 also scatters shared_partial into the "k3" workspace slots
-        name = "k1_oneshot"
-        k1_kwargs: dict[str, Any] = dict(
-            routed=routed_partial,
-            shared=shared_partial,
-            y_out=y,
-            gamma=norm_weight,
-            mcast_ptr=workspace.multicast_ptr(name),
-            local_unicast_ptr=workspace.local_unicast_ptr(name),
-            buffer_flags=workspace.flags(name),
-            k3_peer_ptrs=workspace.peer_ptrs["k3"],
-            k3_mcast_ptr=workspace.multicast_ptr("k3"),
-            k3_flags=workspace.flags("k3"),
-            num_tokens=M,
-            rank=rank,
-            epsilon=float(RMS_EPS),
-            grid=(M, 1, 1),
-        )
-    elif k1_key.startswith("k1_twoshot_ess:"):
-        name = "k1_twoshot"
-        k1_kwargs = dict(
-            routed=routed_partial,
-            shared=shared_partial,
-            y_out=y,
-            gamma=norm_weight,
-            peer_ptrs=workspace.peer_ptrs[name],
-            mcast_ptr=workspace.multicast_ptr(name),
-            buffer_flags=workspace.flags(name),
-            k3_peer_ptrs=workspace.peer_ptrs["k3"],
-            k3_mcast_ptr=workspace.multicast_ptr("k3"),
-            k3_flags=workspace.flags("k3"),
-            num_tokens=M,
-            rank=rank,
-            epsilon=float(RMS_EPS),
-            grid=(M, 1, 1),
-        )
-    else:
-        # plain two-shot K1 (M >= K3_PERSIST_MIN_TOKENS): the persistent tail scatters shared_partial itself
-        name = "k1_twoshot"
-        k1_kwargs = dict(
-            routed=routed_partial,
-            y_out=y,
-            gamma=norm_weight,
-            peer_ptrs=workspace.peer_ptrs[name],
-            mcast_ptr=workspace.multicast_ptr(name),
-            buffer_flags=workspace.flags(name),
-            num_tokens=M,
-            rank=rank,
-            epsilon=float(RMS_EPS),
-            grid=(M, 1, 1),
-        )
+    _, k1_kwargs = _k1_launch_kwargs(
+        k1_key,
+        M=M,
+        rank=rank,
+        workspace=workspace,
+        routed_partial=routed_partial,
+        shared_partial=shared_partial,
+        y=y,
+        norm_weight=norm_weight,
+    )
     grid = k3_grid(M, workspace.sm_count, rank)
-    if k3_key.startswith("k23:"):
-        # fused up-projection + tail: the slice GEMM reads y and the weight slice itself
-        k3_kwargs: dict[str, Any] = dict(
-            y=y,
-            w_slice=up_weight_slice,
-            out=out,
-            peer_ptrs=workspace.peer_ptrs["k3"],
-            mcast_ptr=workspace.multicast_ptr("k3"),
-            buffer_flags=workspace.flags("k3"),
-            num_tokens=M,
-            rank=rank,
-            my_col_begin=workspace.my_col_begin,
-            grid=grid,
-        )
-    elif k3_key.startswith("k3_ess:"):
-        # K3-ESS: no shared operand, the ESS K1 already scattered it
-        k3_kwargs = dict(
-            gemm_slice=gemm,
-            out=out,
-            peer_ptrs=workspace.peer_ptrs["k3"],
-            mcast_ptr=workspace.multicast_ptr("k3"),
-            buffer_flags=workspace.flags("k3"),
-            num_tokens=M,
-            rank=rank,
-            my_col_begin=workspace.my_col_begin,
-            my_cols=workspace.my_cols,
-            gemm_plane_stride=M * workspace.my_cols,
-            num_gemm_splits=1,
-            grid=grid,
-        )
-    else:
-        # persistent K3 (plain at 256 tokens, cp.async.bulk pushes above): scatters shared_partial itself
-        k3_kwargs = dict(
-            shared=shared_partial,
-            gemm_slice=gemm,
-            out=out,
-            peer_ptrs=workspace.peer_ptrs["k3"],
-            mcast_ptr=workspace.multicast_ptr("k3"),
-            buffer_flags=workspace.flags("k3"),
-            num_tokens=M,
-            rank=rank,
-            my_col_begin=workspace.my_col_begin,
-            my_cols=workspace.my_cols,
-            gemm_plane_stride=M * workspace.my_cols,
-            num_gemm_splits=1,
-            grid=grid,
-        )
+    k3_kwargs = _k3_launch_kwargs(
+        k3_key,
+        M=M,
+        rank=rank,
+        workspace=workspace,
+        grid=grid,
+        shared_partial=shared_partial,
+        y=y,
+        gemm=gemm,
+        up_weight_slice=up_weight_slice,
+        out=out,
+    )
     k1_entry, k1_args = _bind(k1_module, k1_kwargs)
     k3_entry, k3_args = _bind(k3_module, k3_kwargs)
     return KimiK3Tp12TailRunner(

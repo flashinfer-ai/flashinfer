@@ -172,6 +172,77 @@ def test_generated_module_inventory():
             assert cake_jit.kernel_module_name(arch, key) == cake_jit.KERNELS[key]
 
 
+class _LaunchKwargsWorkspace:
+    """A host-only stand-in for ``KimiK3Tp12TailWorkspace``: every buffer-set accessor the launch-argument
+    builders use, with placeholder values (the arguments are never launched)."""
+
+    sm_count = 148
+    my_col_begin = 0
+    my_cols = cb.HIDDEN // cb.WORLD_SIZE
+    peer_ptrs = {"k1_oneshot": None, "k1_twoshot": None, "k3": None}
+
+    @staticmethod
+    def multicast_ptr(name):
+        return name
+
+    @staticmethod
+    def local_unicast_ptr(name):
+        return name
+
+    @staticmethod
+    def flags(name):
+        return name
+
+
+def test_launch_kwargs_cover_every_generated_argument_plan():
+    """Every route key's host-built launch arguments satisfy the generated program's argument plan (CPU only).
+
+    Guards the key -> kwargs dispatch against the registered ``arg_plan`` (the one-shot ESS key carries no
+    poll-schedule suffix, so an exact-key test is required there)."""
+    if not cake_jit.MODULES:
+        pytest.skip(
+            "no generated Kimi-K3 TP12 tail program is registered in this checkout"
+        )
+    workspace = _LaunchKwargsWorkspace()
+    seen: set[str] = set()
+    for M in (1, 4, 5, 8, 9, 16, 17, 32, 128, 255, 256, 300, 1024):
+        for rank in (0, 5, 11):
+            k1_key, k3_key = cb.route_kernel_keys(M, rank)
+            name, k1_kwargs = cb._k1_launch_kwargs(
+                k1_key,
+                M=M,
+                rank=rank,
+                workspace=workspace,
+                routed_partial=None,
+                shared_partial=None,
+                y=None,
+                norm_weight=None,
+            )
+            assert name == (
+                "k1_oneshot" if M <= cb.ONESHOT_MAX_TOKENS else "k1_twoshot"
+            )
+            grid = cb.k3_grid(M, workspace.sm_count, rank)
+            k3_kwargs = cb._k3_launch_kwargs(
+                k3_key,
+                M=M,
+                rank=rank,
+                workspace=workspace,
+                grid=grid,
+                shared_partial=None,
+                y=None,
+                gemm=None,
+                up_weight_slice=None,
+                out=None,
+            )
+            for key, kwargs in ((k1_key, k1_kwargs), (k3_key, k3_kwargs)):
+                record = cake_jit.MODULES[cake_jit.KERNELS[key]]
+                expected = {name for kind, name in record["arg_plan"] if kind != "grid"}
+                assert expected <= set(kwargs), (key, sorted(expected - set(kwargs)))
+                assert len(kwargs["grid"]) == 3, key
+                seen.add(key)
+    assert seen == set(cake_jit.required_kernel_keys())
+
+
 def _single_gpu_platform() -> str:
     if not torch.cuda.is_available():
         return "requires CUDA"
