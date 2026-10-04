@@ -265,6 +265,26 @@ PageAttention for MLA
     remain arbitrary absolute rows. Precompute that conversion before a CUDA
     Graph or a latency-sensitive loop.
 
+.. note::
+
+    ``kv_cache_format="nvfp4"`` (the 384-byte-per-token DeepSeek-V4 NVFP4 sparse
+    cache: 448 NoPE values as E2M1 with one E4M3 scale per 16 values, 64 BF16
+    RoPE values, ``page_size * 352`` data bytes followed by ``page_size * 32``
+    scale bytes per page) is consumed by ``backend="sparse"`` on SM120 / SM121 and
+    by ``backend="cake"`` on SM100 / SM103 (B200 / GB300). The CAKE route takes a
+    BF16 query, two independent tables (``sparse_indices`` over ``swa_kv_cache``
+    and ``extra_sparse_indices`` over ``compressed_kv_cache`` with their own
+    ``*_topk_lens``; ``-1`` entries are masked), ``sinks``, a caller-owned
+    ``workspace_buffer`` sized by
+    :func:`flashinfer.mla.cake_dsv4.get_cake_dsv4_workspace_bytes` called with
+    ``kv_cache_format="nvfp4"`` and ``extra_topk`` set to the compressed table
+    width (the default FP8 layout has no final-LSE region), and is
+    CUDA-Graph safe. Build the cache with
+    :func:`nvfp4_quantize_pack_sparse_mla_cache` /
+    :func:`nvfp4_quantize_append_sparse_mla_cache` (one implementation for all
+    four architectures). ``backend="auto"`` keeps selecting TRTLLM-GEN on
+    SM100 / SM103; pass ``backend="cake"`` explicitly.
+
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:
 

@@ -1251,6 +1251,41 @@ def _check_dsv4_sparse_mla_inputs(
     )
 
 
+_DSV4_KV_CACHE_FORMATS = ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca")
+
+
+def _check_dsv4_kv_cache_format_backend(
+    kv_cache_format: str,
+    backend: Literal["trtllm-gen", "cute-dsl", "sparse", "cake"],
+) -> None:
+    """Pair a resolved DSv4 backend with the sparse-cache storage format.
+
+    ``fp8_dsv41`` is SM120/SM121 ``backend="sparse"`` only. The DeepSeek-V4.1
+    mixed cache (``fp8_dsv41_fp4_ca``) runs through ``backend="sparse"`` or the
+    SM120/SM121 Cake family; the 384-byte NVFP4 ABI runs on SM120/SM121 through
+    ``backend="sparse"`` or ``backend="cake"`` and on SM100/SM103 through the
+    Cake NVFP4 route (``backend="cake"``). The architecture itself is enforced
+    by :func:`_resolve_dsv4_sparse_mla_backend` and the SM120 entry point.
+    """
+    if kv_cache_format not in _DSV4_KV_CACHE_FORMATS:
+        raise ValueError(
+            "kv_cache_format must be 'fp8', 'fp8_dsv41', 'fp8_dsv41_fp4_ca', "
+            f"or 'nvfp4', got {kv_cache_format!r}"
+        )
+    if kv_cache_format == "fp8_dsv41" and backend != "sparse":
+        raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
+    if kv_cache_format == "fp8_dsv41_fp4_ca" and backend not in ("sparse", "cake"):
+        raise ValueError(
+            "kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse' (or "
+            "backend='cake' on SM120/SM121)"
+        )
+    if kv_cache_format == "nvfp4" and backend not in ("sparse", "cake"):
+        raise ValueError(
+            "kv_cache_format='nvfp4' requires backend='sparse' (SM120/SM121) or "
+            f"backend='cake' (SM100/SM103, SM120/SM121), got backend={backend!r}"
+        )
+
+
 def _resolve_dsv4_sparse_mla_backend(
     device: torch.device,
     requested_backend: Literal[
@@ -2188,23 +2223,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         both caches dequantized exactly on chip).
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
-    if kv_cache_format not in ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"):
-        raise ValueError(
-            "kv_cache_format must be 'fp8', 'fp8_dsv41', 'fp8_dsv41_fp4_ca', "
-            f"or 'nvfp4', got {kv_cache_format!r}"
-        )
-    if kv_cache_format == "fp8_dsv41" and backend != "sparse":
-        raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
+    _check_dsv4_kv_cache_format_backend(kv_cache_format, backend)
     if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
         if backend != "cake" or not _is_sm120_family(query.device):
             raise ValueError(
                 "kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse' (or "
-                "backend='cake' on SM120/SM121)"
-            )
-    if kv_cache_format == "nvfp4" and backend != "sparse":
-        if backend != "cake" or not _is_sm120_family(query.device):
-            raise ValueError(
-                "kv_cache_format='nvfp4' requires backend='sparse' (or "
                 "backend='cake' on SM120/SM121)"
             )
 
@@ -2432,6 +2455,65 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             kv_cache_format=kv_cache_format,
             backend="cake" if cake_sm120 else "sparse",
             enable_pdl=enable_pdl if cake_sm120 else None,
+        )
+
+    if backend == "cake" and kv_cache_format == "nvfp4":
+        # SM100/SM103 NVFP4 cache route. Two independent tables
+        # (``sparse_indices`` over ``swa_kv_cache``, ``extra_sparse_indices``
+        # over ``compressed_kv_cache``) as in the SM120 NVFP4 ABI; the main
+        # active length is ``sparse_topk_lens`` (``swa_topk_lens`` is accepted
+        # as the SM120 spelling of the same vector). No combined-table offset.
+        from .cake_dsv4 import run_cake_dsv4_nvfp4
+
+        if sparse_indices is None:
+            raise ValueError("backend='cake' requires sparse_indices")
+        if sparse_topk_lens is not None and swa_topk_lens is not None:
+            raise ValueError(
+                "kv_cache_format='nvfp4' takes either sparse_topk_lens or "
+                "swa_topk_lens for the main table, not both"
+            )
+        if sparse_topk_lens_offset != 0:
+            raise ValueError(
+                "kv_cache_format='nvfp4' uses independent tables; "
+                "sparse_topk_lens_offset must be 0"
+            )
+        if multi_ctas_kv_counter_buffer is not None:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is only used by backend='trtllm-gen'"
+            )
+        if query.ndim == 4:
+            if max_q_len is not None and max_q_len != query.shape[1]:
+                raise ValueError(
+                    f"Expected max_q_len == {query.shape[1]} for dense query input, "
+                    f"got {max_q_len}"
+                )
+            query_flat = query.flatten(0, 1)
+        elif query.ndim == 3:
+            query_flat = query
+        else:
+            raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
+        if out is None:
+            out = torch.empty(query.shape, dtype=torch.bfloat16, device=query.device)
+        return run_cake_dsv4_nvfp4(
+            query=query_flat,
+            swa_kv_cache=swa_kv_cache,
+            compressed_kv_cache=compressed_kv_cache,
+            workspace_buffer=workspace_buffer,
+            sparse_indices=sparse_indices,
+            sparse_topk_lens=(
+                sparse_topk_lens if sparse_topk_lens is not None else swa_topk_lens
+            ),
+            extra_sparse_indices=extra_sparse_indices,
+            extra_sparse_topk_lens=extra_sparse_topk_lens,
+            out=out,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cum_seq_lens_q,
+            seq_lens=seq_lens,
+            kv_layout=kv_layout,
+            backend="cake",
         )
 
     if backend != "cake":
