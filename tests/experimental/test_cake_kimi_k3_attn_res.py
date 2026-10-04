@@ -227,7 +227,7 @@ def test_small_m_table_boundary():
                 mm + 1 for mm, _nc in chunk_bands if mm < max_m
             }
             for m in sorted({1, max_m} | edges):
-                at = plan_route(arch, SM_COUNT, m, K, False)
+                at = cb._plan_route_exact(arch, SM_COUNT, m, K, False)
                 cluster = cb._small_m_cluster(arch, m, K)
                 nc = cb._small_m_sources_per_chunk(arch, m, K)
                 suffix = "" if nc is None else f"_nc{nc}"
@@ -288,6 +288,73 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch):
     for record in MODULES.values():
         assert record["tma_workspace_bytes"] == 0
         assert record["arches"] and set(record["arches"]) <= set(ARCHES)
+
+
+# Every token count a decoder step can present in the small / mid range, plus the measured
+# powers of two and a few large non-powers of two.
+DENSE_TOKEN_COUNTS = (
+    tuple(range(1, 601))
+    + TOKEN_COUNTS[10:]
+    + (
+        1000,
+        1536,
+        3000,
+        6144,
+        10000,
+        16383,
+    )
+)
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_every_common_path_route_resolves_to_a_registered_program(arch):
+    if not MODULES:
+        pytest.skip("no generated programs registered in this checkout")
+    registered = KERNELS[arch]
+    for pdl in (False, True):
+        for K in range(MAX_BLOCKS + 1):
+            for M in DENSE_TOKEN_COUNTS:
+                exact = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl)
+                plan = plan_route(arch, SM_COUNT, M, K, pdl)
+                cell = (arch, M, K, pdl, exact.kernel_key, plan.kernel_key)
+                assert plan.kernel_key in registered, cell
+                assert plan.kind in ("small_m", "native", "k0_tma", "persistent"), cell
+                if exact.kernel_key in registered:
+                    # a registered variant always runs exactly as the tables say
+                    assert plan == exact and plan.fallback_from is None, cell
+                    continue
+                assert plan.fallback_from == exact.kernel_key, cell
+                assert plan.route_id.endswith(".registered_fallback"), cell
+                assert plan.kind in ("small_m", "persistent"), cell
+                assert plan.kernel_key.split(":k", 1)[1].split("_", 1)[0] == str(K), (
+                    cell
+                )
+                assert (plan.arch, plan.use_pdl) == (arch, pdl), cell
+                if plan.kind == "small_m":
+                    cluster = cb.DIRECT_THREADS // plan.threads
+                    assert cluster in (1, 2, 4), cell
+                    assert plan.kernel_key.startswith(
+                        "small_m_direct:"
+                        if cluster == 1
+                        else f"small_m_cluster{cluster}:"
+                    ), cell
+                    assert plan.grid_x == M * cluster, cell
+                elif plan.schedule_id.endswith("_one_token_per_cta"):
+                    assert (plan.grid_x, plan.threads) == (M, cb.PERSISTENT_THREADS), (
+                        cell
+                    )
+                else:
+                    assert plan.threads == cb.PERSISTENT_THREADS and plan.grid_x >= 1, (
+                        cell
+                    )
+    # The measured cells never substitute.
+    for row_arch, M, K, pdl, _kind, _schedule_id, _grid_x in POLICY_ROWS:
+        if row_arch == arch:
+            assert plan_route(arch, SM_COUNT, M, K, pdl).fallback_from is None, (
+                M,
+                K,
+                pdl,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +452,17 @@ GPU_ROWS = [
     (256, 8),
     (512, 1),
     (1024, 4),
+    # table variants this checkout does not register (registered-variant fallback)
+    (7, 5),
+    (17, 5),
+    (64, 6),
+    (128, 7),
+    (140, 4),
+    (200, 8),
+    (300, 3),
+    (300, 5),
+    (1000, 1),
+    (1000, 2),
     (4096, 5),
     (16384, 8),
 ]
@@ -411,6 +489,9 @@ def test_matches_reference(M, K, pdl):
         enable_pdl=pdl,
     )
     assert runner.plan.kind in ("small_m", "native", "k0_tma", "persistent")
+    assert runner.plan.kernel_key in KERNELS[arch]
+    if runner.plan.fallback_from is not None:
+        assert runner.plan.fallback_from not in KERNELS[arch]
     assert runner.launch() is inputs["out"]
     torch.cuda.synchronize()
     _check(inputs, expected)

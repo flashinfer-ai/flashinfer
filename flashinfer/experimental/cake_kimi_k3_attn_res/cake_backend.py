@@ -44,6 +44,7 @@ are mutated in place on every launch, as in the model.
 """
 
 import functools
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -51,6 +52,7 @@ import torch
 import tvm_ffi
 
 from .cake_jit import (
+    KERNELS,
     MODULES,
     kernel_module_name,
     load_cake_kimi_k3_attn_res_module,
@@ -225,6 +227,9 @@ class RoutePlan(NamedTuple):
     route_id: str
     arch: Optional[str]
     use_pdl: bool
+    # Exact (table) key when this plan runs a registered variant of the same program family
+    # instead, because the checkout does not register the exact variant; None for exact plans.
+    fallback_from: Optional[str] = None
 
 
 @functools.lru_cache(maxsize=None)
@@ -327,6 +332,151 @@ def _native_route(arch: str, num_sms: int, M: int, K: int, use_pdl: bool):
     return None
 
 
+# Flag positions of the persistent key's ``f<bits>`` field (see ``_plan_route_exact``).
+_PERSISTENT_FLAG_ECR = 0
+_PERSISTENT_FLAG_PWA = 1
+_PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
+_PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
+_PERSISTENT_FLAG_ONE_TOKEN_PER_CTA = 4
+_PERSISTENT_KEY = re.compile(r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)$")
+_SMALL_M_KEY = re.compile(r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?$")
+
+
+def _persistent_schedule_id(nc: int, depth: int, bits: str) -> str:
+    schedule_id = f"trtllm_persistent_ws288_nc{nc}_d{depth}_vec128_fp32x2"
+    if bits[_PERSISTENT_FLAG_ECR] == "1":
+        schedule_id += "_early_consume"
+    if bits[_PERSISTENT_FLAG_PWA] == "0":
+        schedule_id += "_relaxed_producer_wait"
+    if bits[_PERSISTENT_FLAG_PREFIX_BF16_ADD] == "1":
+        schedule_id += "_prefix_bf16_add_packed_inputs_prefix_shared_addr"
+    if bits[_PERSISTENT_FLAG_PREFIX_ROUND_ONCE] == "1":
+        schedule_id += "_prefix_round_once"
+    if bits[_PERSISTENT_FLAG_ONE_TOKEN_PER_CTA] == "1":
+        schedule_id += "_one_token_per_cta"
+    return schedule_id
+
+
+def _small_m_plan(
+    arch: str, M: int, K: int, use_pdl: bool, cluster: int, exact_key: Optional[str]
+) -> RoutePlan:
+    threads = DIRECT_THREADS // cluster
+    if cluster == 1:
+        schedule_id = "small_m_direct_cta256_regres_fp32x2"
+        grid_policy = "one_token_per_cta"
+        kernel_key = f"small_m_direct:k{K}"
+    else:
+        schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2"
+        grid_policy = f"one_token_per_cluster{cluster}"
+        kernel_key = f"small_m_cluster{cluster}:k{K}"
+    route_id = (
+        f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write0.norm1."
+        f"pdl{int(use_pdl)}.{grid_policy}.registered_fallback"
+    )
+    return RoutePlan(
+        "small_m",
+        kernel_key,
+        M * cluster,
+        threads,
+        schedule_id,
+        route_id,
+        arch,
+        use_pdl,
+        exact_key,
+    )
+
+
+def _persistent_fallback(
+    plan: RoutePlan, table: dict[str, str], num_sms: int, M: int, K: int, exact_key: str
+) -> Optional[RoutePlan]:
+    """The registered persistent variant of block count ``K`` closest to the exact plan."""
+    exact = (
+        _PERSISTENT_KEY.match(plan.kernel_key) if plan.kind == "persistent" else None
+    )
+    want_nc, want_depth, want_bits = (
+        (int(exact.group(2)), int(exact.group(3)), exact.group(4))
+        if exact
+        else (None, None, None)
+    )
+    candidates = []
+    for key in table:
+        match = _PERSISTENT_KEY.match(key)
+        if match is None or int(match.group(1)) != K:
+            continue
+        nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
+        score = (
+            nc != want_nc,
+            depth != want_depth,
+            want_bits is None
+            or bits[_PERSISTENT_FLAG_ECR] != want_bits[_PERSISTENT_FLAG_ECR],
+            want_bits is None
+            or bits[_PERSISTENT_FLAG_PWA] != want_bits[_PERSISTENT_FLAG_PWA],
+            want_bits is None
+            or sum(a != b for a, b in zip(bits, want_bits, strict=False)),
+            key,
+        )
+        candidates.append((score, key, nc, depth, bits))
+    if not candidates:
+        return None
+    _score, key, nc, depth, bits = min(candidates)
+    if bits[_PERSISTENT_FLAG_ONE_TOKEN_PER_CTA] == "1":
+        grid_x, grid_policy = M, "one_token_per_cta"
+    else:
+        grid_x, grid_policy = _grid(M, num_sms, nc)
+    schedule_id = _persistent_schedule_id(nc, depth, bits)
+    wait_policy = "deferred_wait_st" if _wait_policy(plan.arch) else "control_wait_st"
+    route_id = (
+        f"{schedule_id}.{plan.arch}.{wait_policy}.k{K}.delta1.write0.norm1."
+        f"pdl{int(plan.use_pdl)}.{grid_policy}.registered_fallback"
+    )
+    return RoutePlan(
+        "persistent",
+        key,
+        grid_x,
+        PERSISTENT_THREADS,
+        schedule_id,
+        route_id,
+        plan.arch,
+        plan.use_pdl,
+        exact_key,
+    )
+
+
+def _resolve_registered(plan: RoutePlan, num_sms: int, M: int) -> RoutePlan:
+    """``plan`` itself when its program is registered (or no registry exists for the
+    architecture); otherwise the closest registered variant of the same family and block
+    count.  Bootstrap ``direct`` variants encode semantics in their key and never substitute."""
+    if plan.arch is None or plan.kind == "direct":
+        return plan
+    table = KERNELS.get(plan.arch)
+    if not table or plan.kernel_key in table:
+        return plan
+    exact_key = plan.kernel_key
+    if plan.kind == "small_m":
+        match = _SMALL_M_KEY.match(exact_key)
+        if match is None:
+            return plan
+        K = int(match.group(3))
+        same_cluster = int(match.group(2)) if match.group(2) else 1
+        for cluster in (same_cluster, 2, 4, 1):
+            if (
+                f"small_m_{'direct' if cluster == 1 else f'cluster{cluster}'}:k{K}"
+                in table
+            ):
+                return _small_m_plan(plan.arch, M, K, plan.use_pdl, cluster, exact_key)
+        fallback = _persistent_fallback(plan, table, num_sms, M, K, exact_key)
+        return fallback if fallback is not None else plan
+    if plan.kind == "persistent":
+        match = _PERSISTENT_KEY.match(exact_key)
+        if match is None:
+            return plan
+        fallback = _persistent_fallback(
+            plan, table, num_sms, M, int(match.group(1)), exact_key
+        )
+        return fallback if fallback is not None else plan
+    return plan
+
+
 def plan_route(
     arch: Optional[str],
     num_sms: int,
@@ -339,7 +489,42 @@ def plan_route(
     apply_output_norm: bool = True,
     common_path: bool = True,
 ) -> RoutePlan:
-    """Select the generated program for one call from host-known facts only."""
+    """Select the generated program for one call from host-known facts only.
+
+    The route tables name the schedule variant measured for every cell of the evaluation
+    grid.  Cells outside that grid (token counts that are not powers of two, block counts
+    5-7 at mid token counts, ...) may name a variant this checkout does not register; such a
+    plan is resolved to a registered variant of the same program family and block count
+    (``fallback_from`` records the exact key), so every dense call has a program.  Measured
+    cells always run their exact program.
+    """
+    plan = _plan_route_exact(
+        arch,
+        num_sms,
+        M,
+        num_blocks,
+        use_pdl,
+        has_delta=has_delta,
+        block_write_idx=block_write_idx,
+        apply_output_norm=apply_output_norm,
+        common_path=common_path,
+    )
+    return _resolve_registered(plan, num_sms, M)
+
+
+def _plan_route_exact(
+    arch: Optional[str],
+    num_sms: int,
+    M: int,
+    num_blocks: int,
+    use_pdl: bool,
+    *,
+    has_delta: bool = True,
+    block_write_idx: int = -1,
+    apply_output_norm: bool = True,
+    common_path: bool = True,
+) -> RoutePlan:
+    """The table-exact plan (the schedule variant named by the route tables)."""
     M = int(M)
     K = int(num_blocks)
     use_pdl = bool(use_pdl)
@@ -517,17 +702,7 @@ def plan_route(
     )
     bits = "".join("1" if flag else "0" for flag in flags)
     key = f"persistent:k{K}_nc{nc}_d{depth}_f{bits}"
-    schedule_id = f"trtllm_persistent_ws288_nc{nc}_d{depth}_vec128_fp32x2"
-    if ecr:
-        schedule_id += "_early_consume"
-    if not pwa:
-        schedule_id += "_relaxed_producer_wait"
-    if prefix_bf16_add:
-        schedule_id += "_prefix_bf16_add_packed_inputs_prefix_shared_addr"
-    if prefix_round_once:
-        schedule_id += "_prefix_round_once"
-    if one_token_per_cta:
-        schedule_id += "_one_token_per_cta"
+    schedule_id = _persistent_schedule_id(nc, depth, bits)
     wait_policy = "deferred_wait_st" if defer else "control_wait_st"
     route_id = f"{schedule_id}.{arch}.{wait_policy}.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
     return RoutePlan(

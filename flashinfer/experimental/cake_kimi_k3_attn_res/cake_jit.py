@@ -1641,7 +1641,7 @@ def kernel_module_name(arch: str, key: str) -> str:
     if name is None:
         raise NotImplementedError(
             f"The generated Kimi-K3 AttnRes kernel {key!r} for {arch} is not registered in this "
-            "checkout (the export covers the contract's token counts / block counts; see the package README)"
+            "checkout (plan_route substitutes a registered variant of the same family; see the package README)"
         )
     record = MODULES[name]
     if arch not in record["arches"]:

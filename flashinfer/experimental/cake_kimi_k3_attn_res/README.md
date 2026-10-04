@@ -29,12 +29,21 @@ ported and checked row by row by the export):
 | `direct` | one 256-thread CTA per token | no `delta`, snapshot write, no output norm, or row-padded layouts |
 
 `KERNELS[arch][kernel_key]` in `cake_jit.py` names the registered module of a
-plan; a call whose program is not registered raises `NotImplementedError`
-(`generated_program_available` answers without raising).  The checkout registers
-the programs of the Kimi-K3 evaluation: `M` in {1, 2, 4, ..., 16384} x `K` in
-{0, 1, 4, 8}, every `K` at `M` = 1 / 4096, and the semantic variants at `M` =
-1 / 3 / 7 / 17, with and without programmatic dependent launch, on `sm_100a`
-and `sm_103a` (148 SMs).
+plan.  The checkout registers the programs measured on the Kimi-K3 evaluation
+grid: `M` in {1, 2, 4, ..., 16384} x `K` in {0, 1, 4, 8}, every `K` at `M` = 1 /
+4096, and the semantic variants at `M` = 1 / 3 / 7 / 17, with and without
+programmatic dependent launch, on `sm_100a` and `sm_103a` (148 SMs).  The route
+tables above describe every dense call; when they name a schedule variant the
+checkout does not register (a token count off the grid, `K` 5-7 at mid `M`, ...),
+`plan_route` substitutes the closest registered variant of the same program
+family and block count (`small_m`: the same cluster size without the chunk
+suffix, then cluster 2, cluster 4, direct; `persistent`: the same-`K` variant
+with the same `nc` / depth, then the same `nc`, then any, in a fixed order) and
+records the table key in `RoutePlan.fallback_from`; the substituted plan's
+`route_id` ends in `.registered_fallback`.  Measured cells always run their
+exact program.  `generated_program_available` answers whether the resolved
+program is registered without raising; a call whose resolved program is not
+registered raises `NotImplementedError`.
 
 ## Correctness contract
 
