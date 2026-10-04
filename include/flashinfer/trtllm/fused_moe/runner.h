@@ -267,9 +267,17 @@ class Runner {
 }  // namespace PermuteGemm1
 
 #ifdef CAKE_STEPFUN_FC1
+}  // namespace trtllmgen_moe
+}  // namespace kernels
+}  // namespace tensorrt_llm
 // Cake StepFun FC1 kernels take the GEMM1 slot of the fused-MoE runner (module
 // fused_moe_cake_stepfun_*); the public trtllm module never defines this macro.
+// The header declares tensorrt_llm::kernels::trtllmgen_moe::cake_stepfun::Fc1Runner
+// over PermuteGemm1::Runner, so it is included at global scope right after it.
 #include "fused_moe/cake_stepfun/cake_stepfun_fc1_runner.cuh"
+namespace tensorrt_llm {
+namespace kernels {
+namespace trtllmgen_moe {
 #endif
 
 namespace Gemm2 {
