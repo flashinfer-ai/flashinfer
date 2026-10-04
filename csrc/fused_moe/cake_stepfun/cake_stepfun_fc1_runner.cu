@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
@@ -268,7 +269,13 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   config.dynamicSmemBytes = spec.dynamic_smem_bytes;
   config.stream = stream;
   std::array<cudaLaunchAttribute, 1> attributes{};
-  if (enable_pdl) {
+  // Diagnostic override: CAKE_STEPFUN_FC1_PDL=0 launches the FC1 kernel without the programmatic
+  // stream-serialization attribute while the rest of the pipeline keeps the caller's PDL setting.
+  static bool const fc1PdlDisabled = [] {
+    char const* value = std::getenv("CAKE_STEPFUN_FC1_PDL");
+    return value != nullptr && value[0] == '0' && value[1] == '\0';
+  }();
+  if (enable_pdl && !fc1PdlDisabled) {
     attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attributes[0].val.programmaticStreamSerializationAllowed = 1;
     config.attrs = attributes.data();
