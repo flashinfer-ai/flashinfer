@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Direct Cake-versus-CuTe SSDCombined parity and CUPTI benchmark."""
+"""Cake-versus-CuTe SSDCombined accuracy and CUPTI benchmark.
+
+Both backends are measured against an fp64 token-by-token recurrence: the Cake
+programs carry the per-token delta in FP16 and CuTe in BF16, so their sparse
+outside-tolerance outliers no longer coincide and elementwise Cake-vs-CuTe
+parity is not a correctness oracle (CuTe itself is outside atol=rtol=1e-2 of
+the recurrence on 0.04-1.4 % of its outputs).  A row is valid when Cake's
+output is finite, at most 1 % of its entries are outside 1e-2 of the
+recurrence, and Cake has no more outliers and no larger maximum error than
+CuTe on the same inputs.  The Cake-vs-CuTe statistics are still reported.
+"""
 
 import argparse
 import json
@@ -46,11 +56,129 @@ def _diagnostic(actual: torch.Tensor, expected: torch.Tensor) -> dict:
     }
 
 
+def _fp64_reference(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    z: torch.Tensor | None,
+    dt_bias: torch.Tensor,
+    initial_states: torch.Tensor | None,
+    sequence_lengths: list[int] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fp64 token-by-token SSM recurrence on the unpadded token-major inputs.
+
+    ``dt' = clamp(softplus(dt + dt_bias), 0, inf)``;
+    ``state = exp(dt' * A) * state + dt' * (x (x) B)``; ``y = C . state + D * x``;
+    ``y *= z * sigmoid(z)`` when ``z`` is given.  Sequences advance in lockstep
+    (one iteration per token position, masked by each sequence's length), so a
+    batched call or a packed varlen stream costs ``max(length)`` iterations.
+    Returns the fp64 output with ``x``'s shape and the ``[num_seqs, nheads,
+    headdim, dstate]`` final states (zero initial state when ``initial_states``
+    is ``None``).
+    """
+
+    f64 = torch.float64
+    batch, seqlen, nheads, headdim = x.shape
+    ngroups, dstate = B.shape[2], B.shape[3]
+    rep = nheads // ngroups
+    lengths = list(sequence_lengths) if sequence_lengths is not None else [seqlen] * batch
+    assert sum(lengths) == batch * seqlen, (lengths, batch, seqlen)
+    starts = [sum(lengths[:index]) for index in range(len(lengths))]
+    xf = x.reshape(-1, nheads, headdim).to(f64)
+    dtp = dt.reshape(-1, nheads).to(f64) + dt_bias.to(f64)
+    dtp = torch.nn.functional.softplus(dtp).clamp_min(0.0)
+    Bf = B.reshape(-1, ngroups, dstate).to(f64).repeat_interleave(rep, dim=1)
+    Cf = C.reshape(-1, ngroups, dstate).to(f64).repeat_interleave(rep, dim=1)
+    Af = A.to(f64)
+    Df = D.to(f64).reshape(nheads, 1) if D.dim() == 1 else D.to(f64)
+    zf = z.reshape(-1, nheads, headdim).to(f64) if z is not None else None
+    num_seqs = len(lengths)
+    state = (
+        initial_states[:num_seqs].to(f64).clone()
+        if initial_states is not None
+        else torch.zeros(num_seqs, nheads, headdim, dstate, dtype=f64, device=x.device)
+    )
+    out = torch.empty_like(xf)
+    start_index = torch.tensor(starts, device=x.device)
+    length_index = torch.tensor(lengths, device=x.device)
+    for position in range(max(lengths)):
+        active = (length_index > position).nonzero(as_tuple=True)[0]
+        tokens = start_index[active] + position
+        step = dtp[tokens]  # [n, H]
+        decay = torch.exp(step * Af)
+        update = step[:, :, None, None] * (xf[tokens][:, :, :, None] * Bf[tokens][:, :, None, :])
+        state[active] = decay[:, :, None, None] * state[active] + update
+        y = torch.einsum("nhpd,nhd->nhp", state[active], Cf[tokens]) + Df * xf[tokens]
+        if zf is not None:
+            zt = zf[tokens]
+            y = y * (zt * torch.sigmoid(zt))
+        out[tokens] = y
+    return out.reshape(x.shape), state
+
+
+def _accuracy(cake: torch.Tensor, cute: torch.Tensor, reference: torch.Tensor) -> dict:
+    """Outside-tolerance counts and maximum errors of both backends vs the fp64 oracle."""
+
+    atol = rtol = 1e-2
+    ref = reference.float()
+    tolerance = atol + rtol * ref.abs()
+
+    def stats(value: torch.Tensor) -> tuple[int, float, float, bool]:
+        value_f32 = value.float()
+        error = (value_f32 - ref).abs()
+        worst = int(error.argmax().item())
+        return (
+            int((error > tolerance).sum().item()),
+            float(error.max().item()),
+            float(ref.flatten()[worst].abs().item()),
+            bool(torch.isfinite(value_f32).all().item()),
+        )
+
+    cake_outside, cake_max, cake_worst_ref, cake_finite = stats(cake)
+    cute_outside, cute_max, _cute_worst_ref, cute_finite = stats(cute)
+    # one bf16 ulp at the magnitude of Cake's worst entry (bf16 keeps 8 significand bits)
+    exponent = int(np.floor(np.log2(cake_worst_ref))) if cake_worst_ref > 0 else -126
+    return {
+        "atol": atol,
+        "rtol": rtol,
+        "numel": int(ref.numel()),
+        "cake_outside": cake_outside,
+        "cute_outside": cute_outside,
+        "cake_outside_fraction": cake_outside / max(1, ref.numel()),
+        "cute_outside_fraction": cute_outside / max(1, ref.numel()),
+        "cake_max_abs": cake_max,
+        "cute_max_abs": cute_max,
+        "cake_finite": cake_finite,
+        "cute_finite": cute_finite,
+        "bf16_ulp_at_cake_worst": float(2.0 ** (exponent - 7)),
+    }
+
+
 def _validate_report(report: dict, *, require_qualified_row: bool) -> None:
-    if not report["out"]["tolerance_passed"]:
-        raise AssertionError("Cake output failed BF16 parity")
-    if not report["final_states"]["tolerance_passed"]:
-        raise AssertionError("Cake final state failed BF16 parity")
+    for name in ("out", "final_states"):
+        accuracy = report["accuracy"][name]
+        if not accuracy["cake_finite"]:
+            raise AssertionError(f"Cake {name} is not finite")
+        if accuracy["cake_outside_fraction"] > 0.01:
+            raise AssertionError(
+                f"Cake {name}: {accuracy['cake_outside']} of {accuracy['numel']} entries "
+                "outside atol=rtol=1e-2 of the fp64 recurrence (limit 1 %)"
+            )
+        # Poisson slack on CuTe's count: the two outlier sets are independent samples.
+        allowed = accuracy["cute_outside"] + 2.0 * np.sqrt(accuracy["cute_outside"])
+        if accuracy["cake_outside"] > allowed:
+            raise AssertionError(
+                f"Cake {name} has more entries outside 1e-2 of the fp64 recurrence than CuTe: "
+                f"{accuracy['cake_outside']} vs {accuracy['cute_outside']}"
+            )
+        if accuracy["cake_max_abs"] > accuracy["cute_max_abs"] + accuracy["bf16_ulp_at_cake_worst"]:
+            raise AssertionError(
+                f"Cake {name} max abs error {accuracy['cake_max_abs']:.4g} exceeds CuTe's "
+                f"{accuracy['cute_max_abs']:.4g} by more than one bf16 ulp"
+            )
     if require_qualified_row and report["speedup"] <= 1.0:
         raise AssertionError("Cake must be faster than CuTe for a reported row")
 
@@ -276,6 +404,19 @@ def main() -> None:
         )
         timings[backend] = float(np.median(samples))
 
+    reference_out, reference_states = _fp64_reference(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        z,
+        dt_bias,
+        None if args.no_initial_states else initial_states,
+        sequence_lengths,
+    )
+
     report = {
         "shape": {
             "mode": args.mode,
@@ -305,6 +446,12 @@ def main() -> None:
         },
         "out": _diagnostic(outputs["cake"][0], outputs["cute"][0]),
         "final_states": _diagnostic(outputs["cake"][1], outputs["cute"][1]),
+        "accuracy": {
+            "out": _accuracy(outputs["cake"][0], outputs["cute"][0], reference_out),
+            "final_states": _accuracy(
+                outputs["cake"][1], outputs["cute"][1], reference_states
+            ),
+        },
         "flashinfer_ms": timings["cute"],
         "cake_ms": timings["cake"],
         "speedup": timings["cute"] / timings["cake"],
