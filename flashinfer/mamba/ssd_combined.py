@@ -294,11 +294,9 @@ class SSDCombined:
         # available on datacenter Blackwell (SM100/SM103/SM110). Consumer/workstation
         # Blackwell (SM120/SM121) lacks tcgen05, so reject it here with a clear message
         # instead of a cryptic cute-dsl "expects ... sm_100a ... got sm_120a" OpError.
-        # SM107 (Rubin) shares major=10 but is not yet supported by this kernel, so
-        # reject it explicitly rather than letting it slip through the major check.
-        if major not in (10, 11) or (major, minor) == (10, 7):
+        if major not in (10, 11):
             raise ValueError(
-                f"SSDCombined requires datacenter Blackwell (SM100/SM103/SM110) "
+                f"SSDCombined requires datacenter Blackwell (SM100/SM103/SM107/SM110) "
                 f"for tcgen05 MMA. Got SM{major}{minor}."
             )
 
@@ -853,7 +851,7 @@ class _SSDCombinedRunnerConfig:
     backend: str
 
 
-@functools.cache
+@functools.lru_cache(maxsize=64)
 def _get_ssd_combined_runner(
     device_index: int,
     cuda_stream: int,
@@ -863,7 +861,9 @@ def _get_ssd_combined_runner(
 
     # ``cuda_stream`` participates in the cache key even though construction
     # itself only needs the device. Runner workspaces are mutable, so sharing
-    # one across concurrently active streams would make reuse unsafe.
+    # one across concurrently active streams would make reuse unsafe. Streams
+    # are created and destroyed over a process lifetime, so the cache is
+    # bounded; an evicted runner is rebuilt on its next call.
     with torch.cuda.device(device_index):
         return SSDCombined(
             config.chunk_size,

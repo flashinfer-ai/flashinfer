@@ -1,16 +1,22 @@
 # moe_ep Design
 
+`flashinfer.moe_ep` implements expert-parallel MoE layers, communication
+backends, and fused kernels.
+
 > For build/test/how-to-extend instructions, see the
 > [moe_ep runbook](./moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and
 > benchmark methodology, see
-> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
+> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md)
+> (SM100) and
+> [kernel_src/sm107/next_cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md)
+> (SM107).
 
 Expert-Parallel MoE with two execution modes:
 
 | Mode | Flow | When to use |
 |------|------|-------------|
-| **Split** | dispatch → inner kernel → combine | Pluggable comm + compute; NCCL-EP / NIXL-EP transport |
+| **Split** | dispatch → inner kernel → combine | Pluggable comm + compute; NVLink one-/two-sided, NCCL-EP, NIXL-EP |
 | **Mega** | fused comm + MoE kernel | Single symmetric-memory kernel; no separate Fleet/Handle |
 
 Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` → `MoEEpSplitLayer` or `MoEEpMegaLayer`.
@@ -18,8 +24,9 @@ Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backe
 ## Available backends
 
 Backends resolve by name from the config object's `kernel_name` /
-`backend_name` field (three registries: mega kernels, split kernels, split
-comm fleets; deprecated aliases still resolve but warn).
+`backend_name` field (four registries: mega kernels, split kernels,
+`MoEEpCommunication` backends, and Fleet transports; deprecated aliases still
+resolve but warn).
 
 ### Mega (fused comm + MoE kernel)
 
@@ -29,11 +36,13 @@ owns dispatch, expert compute, and combine; output is always BF16
 
 | Backend (alias) | Activation | Weight | Output | Arch | Tuning |
 |---|---|---|---|---|---|
+| `sm100_bf16_nvfp4_bf16_cutedsl` | BF16 | NVFP4 (block-16) | BF16 | SM100/SM103 | same `knobs` surface as the NVFP4 backend |
 | `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
 | `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
 | `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | explicit geometry knobs on the config (`swap_ab`, `mma_tiler_mnk`); no tuner/knob-cache yet |
 | `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3) | BF16 | SM90 | — (static dimensions/protocol choices only) |
+| `sm90_bf16_bf16_bf16_push_cake` | BF16 | BF16 | BF16 | SM90 | — (`capacity_factor`, `dedup_dispatch`, optional `clamp_limit`; native BF16 end to end: bf16 dispatch payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine wire) |
 
 The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
 tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
@@ -47,6 +56,44 @@ any kernel backend. The comm layer moves tokens (BF16 unless the kernel
 backend packs them); the kernel backend computes on this rank's expert shard.
 
 #### Comm backends (dispatch/combine transports)
+
+Comm backends come in two peer kinds, and `MoEEpSplitLayer` accepts either
+through `SplitConfig(comm=...)`. They differ in object model, not in role.
+Inside the split layer each kind runs on its own path (the Fleet/Handle path
+and the MoEEpCommunication path); a backend must be registered as exactly one
+kind, and both paths hand the inner kernel the same `SplitKernelContext`:
+
+- **`MoEEpCommunication`** (`core/comm/communication.py`) is a self-contained
+  dispatch/combine object: one long-lived instance per EP group owns its
+  workspace, and per-step routing state lives in that workspace. The NVLink
+  backends implement it. `dispatch(hidden_states, topk_ids,
+  topk_weights, ...)` returns `ep_size * tokens_per_rank` receive rows with
+  their GLOBAL top-k routing (rows without a token carry
+  `MoEEpCommParams.invalid_expert_id`); the expert computation weights and
+  reduces over its local experts; `combine` sums each token's per-rank results
+  on its source rank. Create one with `create_communication(bootstrap,
+  MoEEpCommParams(...), backend=<config>)`, or let `MoEEpSplitLayer` create it
+  (requires `FleetParams(algorithm=LOW_LATENCY, layout=RANK_MAJOR)`).
+  `MoEEpCommParams.dispatch_format` names the `QuantFormat` the activations
+  are dispatched in (unquantized `dtype` rows when unset); backends that
+  reserve buffers per dispatched byte, such as `nvlink_one_sided`, size them
+  from it.
+- **`Fleet` / `Handle`** (`core/comm/fleet.py`, `handle.py`) is the native API
+  of the NCCL-EP and NIXL-EP backends. It mirrors those libraries' group /
+  per-step-handle model and exposes their full surface (EXPERT_MAJOR and HT
+  layouts, split send/receive staging, persistent handles for CUDA graphs,
+  fault-tolerance masks). `MoEEpSplitLayer` drives `nccl_ep` / `nixl_ep`
+  through it, and engines integrate them through it directly.
+
+| Backend | Config | Interface | Transport |
+|---|---|---|---|
+| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back (`flashinfer.comm.MoeAlltoAll`, TRT-LLM kernels) |
+| `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | `nvlink_one_sided` running the generated Cake kernels (`MoeAlltoAll` with `backend="cake"`); SM100/SM103 only |
+| `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`flashinfer.comm.MnnvlMoe`); `num_experts % 4 == 0` |
+| `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
+| `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
+
+Fleet transports:
 
 | Backend | Config | Transport | Modes | Constraints |
 |---|---|---|---|---|
@@ -190,8 +237,9 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
+  backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,bf16_mxfp8_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
+  backends/mega/kernel/sm107/{mxfp8_mxfp8_bf16_cutedsl, mxfp8_mxfp4_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl}
   kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by the sm100 cutedsl backends
@@ -205,6 +253,10 @@ moe_ep/
   kernel_src/sm90/push_style_megamoe/  ← Hopper push-style FP8 (raw CUDA, JIT-compiled)
     src/{a2a,fp8_gemm}/        ← VERBATIM drop from flashinfer PR #4069 (.cu/.cuh)
     shim/, __init__.py, VENDOR.md  ← shim is part of the upstream PR here (vendored with it)
+  kernel_src/sm107/next_cutedsl_megamoe/  ← Rubin block-scaled inference
+    src/sources/               ← verbatim upstream exporter output; see VENDOR.md
+    shim/, __init__.py          ← FlashInfer adapters and public package API
+    VENDOR.md, SKILL.md, TUNING.md  ← provenance, update procedure, and measurements
   modes/{split_layer,mega_layer,config}.py
 ```
 
@@ -221,7 +273,7 @@ Layout rule — taxonomy vs provenance:
   separate snapshot of a fork and keeps its current path for now; fold it into
   `cutedsl_megamoe/` if upstream merges the SM90 kernel.)
 
-Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `backends` is imported; comm fleets register when their `fleet.py` is imported from `__init__.py`.
+Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `backends` is imported; communication backends and comm fleets register when their `communication.py` / `fleet.py` is imported from `__init__.py`.
 
 ## Core types
 
@@ -236,7 +288,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
 | `FleetAlgoKnobFaultTolerance` | Opt-in rank masking (`enabled`, `timeout_ms`, reconcile budgets) — see **Fault tolerance** |
 
-**Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune transport. Fleet is lazy-created on first `forward()`; a new Handle per forward. `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms in `last_timings_ms`.
+**Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune Fleet transports. The Fleet (or `MoEEpCommunication`) is lazy-created on first `forward()`; Fleet transports get a new Handle per forward. CUDA-graph capture goes through `create_graph_state()` for both kinds of comm backend; a `MoEEpCommunication` is already long-lived, so its graph state only pins the bound buffers, and `create_graph_state()` rejects backends with `supports_cuda_graph=False`. `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms in `last_timings_ms`.
 
 **Split compute:** the `fused_moe` kernel bridges the 3D EP dispatch buffer to `flashinfer.fused_moe` (a token-major `MoEActivationPack`) via `backends/split/kernel/fused_moe/bridge.py`:
 
@@ -294,9 +346,14 @@ classDiagram
     MoEEpLayer --> MoEEpSplitLayer : SplitConfig
     MoEEpLayer --> MoEEpMegaLayer : MegaConfig
 
-    MoEEpSplitLayer --> Fleet
+    MoEEpSplitLayer --> MoEEpCommunication : nvlink_* / cake
+    MoEEpSplitLayer --> Fleet : nccl_ep / nixl_ep
     MoEEpSplitLayer --> SplitKernelBackend
     MoEEpSplitLayer --> Handle : per forward
+
+    MoEEpCommunication <|-- NVLinkOneSidedAlltoAll
+    NVLinkOneSidedAlltoAll <|-- CakeAlltoAll
+    MoEEpCommunication <|-- NVLinkTwoSidedAlltoAll
 
     MoEEpMegaLayer --> MegaKernelBackend
 
@@ -316,17 +373,26 @@ classDiagram
 
 | Kind | Name | Config |
 |------|------|--------|
+| Comm | `nvlink_one_sided` | `NVLinkOneSidedConfig` |
+| Comm | `cake` | `CakeAlltoAllConfig` |
+| Comm | `nvlink_two_sided` | `NVLinkTwoSidedConfig` |
 | Comm | `nccl_ep` | `NcclEpConfig` (`NCCLEPConfig` alias) |
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |
 | Split kernel | `identity` | `IdentityConfig` — comm-only; `dummy_moe_weights` OK |
 | Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe`; BF16 + W4A4/W4A8/W4A16; LL EXPERT_MAJOR / RANK_MAJOR / HT FLAT |
 | Mega kernel | `sm100_fp8_fp4_bf16_deepgemm` | `Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig` — FP8/FP4, sm_100+ |
+| Mega kernel | `sm100_bf16_nvfp4_bf16_cutedsl` | `Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — BF16/NVFP4, SM100/SM103 |
 | Mega kernel | `sm100_nvfp4_nvfp4_bf16_cutedsl` | `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `sm100_mxfp8_mxfp8_bf16_cutedsl` | `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
 
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
+BF16×NVFP4 stages BF16 inputs and defaults to ordered FP32 combine inside MegaMoE.
+Routing weights apply after FC2 by default; `apply_topk_in_fc1=True` applies them
+before the BF16 FC1 handoff, with a different rounding contract.
+
 **Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into symm workspace at forward. Non-bf16 with `quantize_input=True` raises `MoEEpConfigError`; use `quantize_input=False` and pre-quantized activations plus `MoEEpTensors.scales`.
+BF16-activation backends ignore `quantize_input` and copy BF16 inputs.
 
 ## Runtime
 
@@ -335,7 +401,7 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 | Requirement | Used by |
 |-------------|---------|
 | `torch_dist` | split comm, all mega kernels |
-| `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
+| `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl`, `sm100_bf16_nvfp4_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
 
 **Host framework bootstrap (e.g. vLLM):** when the host already initialized `torch.distributed` and EP uses a subgroup, pass `BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank, auto_bootstrap=False)` and call `bootstrap_moe_ep_runtime(bootstrap, reqs)` once per worker after dist init. Mega kernels resolve comm via `bootstrap_comm_group` / `bootstrap_ep_rank_world` (`MegaKernelBackend.bind_ep_bootstrap`).
 
@@ -393,25 +459,30 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 1. **Split kernel** — `backends/split/kernel/<name>/`: subclass `SplitKernelBackend`, `@register_split_kernel`, import in `backends/split/kernel/__init__.py`.
 2. **Mega kernel** — `backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`: subclass `MegaKernelBackend`, implement `compute` / `_allocate_workspace` / `stage_inputs`, override `runtime_requirements()` if needed, `@register_mega_kernel`, import in `backends/mega/kernel/__init__.py`.
-3. **Comm backend** (split only) — `backends/split/comm/<name>/` with `config.py`, `fleet.py`, `handle.py`; import fleet from `moe_ep.__init__.py`.
+3. **Comm backend** (split only) — `backends/split/comm/<name>/`, implementing one of the two peer interfaces: a self-contained dispatch/combine object subclasses `MoEEpCommunication` and registers with `@register_communication` (`config.py`, `communication.py`); a transport built on a group / per-step-handle library implements `Fleet` / `Handle` and registers with `@register_fleet` (`fleet.py`, `handle.py`). Import it from `moe_ep.__init__.py` and add the backend's runtime needs to `split_comm_runtime_requirements`.
 
 ## Tests
 
 See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
 
-`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|multirank|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|smoke|ft|all]`:
+`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|oracle_sm107|qualify_sm107|multirank|sm90_push|sm90_bf16_push_cake|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|mega_sm107|smoke|ft|all]`:
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
 - **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
 - **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_fp8_fp8_bf16_pull_cutedsl mega kernel
+- **oracle_sm107** — single-GPU (Rubin) torch oracle and boundary tests for NVFP4, MXFP8 E4M3, and MXFP8 E5M2
+- **qualify_sm107** — strict Rubin host, single-GPU, and multirank qualification, rejecting skipped/empty tests and OOMs; see the [qualification runbook](moe_ep_sm107_qualification.md)
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
 - **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
 - **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl mega parity + multi-rank torch oracle; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
+- **mega_sm107** — Rubin MoEEpLayer vs multirank torch oracle for all three formats, with idle ranks and pooled-layer graph replay; `NPROC_MULTIRANK=2`, `4`, or `8` (default 4), own torchrun process
+- **sm90_push** — 2-GPU (Hopper) sm90_fp8_fp8_bf16_push_cuda kernel + backend; own torchrun process
+- **sm90_bf16_push_cake** — 2-GPU (Hopper) sm90_bf16_bf16_bf16_push_cake backend vs an independent bf16 torch reference (single-process `-k ep1` cases, then torchrun EP≥2 routing patterns, uneven tokens, graph replay); own torchrun process
 - **smoke** — NCCL-EP smoke script (and NIXL-EP when built)
 - **ft** — 4-GPU fault-tolerance (stalled-rank pytest half + dead-rank smoke half)
 
-`all` runs the eight Blackwell-relevant sections (everything above except the two `*_sm90` targets, which need Hopper).
+`all` runs the eight Blackwell-relevant sections (everything above except the Hopper-only targets — `oracle_sm90`, `mega_sm90`, `sm90_push`, `sm90_bf16_push_cake` — and the Rubin-only `*_sm107` targets).
 
 Multirank/smoke/correctness need the NCCL-EP build (see **Build / availability** — `docker/install/build_flashinfer_ep_pytorch.sh`); mega additionally needs Blackwell, deep_gemm, triton.
 

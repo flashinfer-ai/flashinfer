@@ -2319,6 +2319,24 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, FlashKDATens
                                 for (int value_idx_3 = 0; value_idx_3 < 8; value_idx_3++) {
                                     n_values[value_idx_3] = n_values[value_idx_3] + product[value_idx_3];
                                 }
+                                unsigned int repack_low_word[1];
+                                unsigned int repack_high_word[1];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(n_values[_lp*2 + 0], n_values[_lp*2+1 + 0]));
+                                    repack_low_word[_lp] = *(uint32_t*)&_h2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(n_values[_lp*2 + 6], n_values[_lp*2+1 + 6]));
+                                    repack_high_word[_lp] = *(uint32_t*)&_h2;
+                                }
+                                n_frag[0] = 0;
+                                n_frag[1] = 0;
+                                n_frag[2] = 0;
+                                n_frag[3] = 0;
+                                n_frag[0] = repack_low_word[0];
+                                n_frag[3] = repack_high_word[0];
                                 unsigned int binv_frag[4];
                                 binv_frag[0] = 0;
                                 binv_frag[1] = 0;
