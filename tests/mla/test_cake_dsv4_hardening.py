@@ -641,6 +641,10 @@ def test_trtllm_gen_caller_owned_counter_buffer(h_q, dtype, s_q):
 SWA_WINDOW = 128
 PAGE_SWA = 256
 POISON = 400.0
+# Value of the beacon rows behind the boundary columns (the last visible SWA
+# slot and the last active compressed column of a row); flipping its sign
+# must change every row that attends them.
+BEACON = 2.0
 WORKSPACE_128MIB = 128 * 1024 * 1024
 _REL_TOL = {torch.bfloat16: 2e-2, torch.float8_e4m3fn: 1e-1}
 _case_seed = [SEED_BASE + 50_000]
@@ -676,6 +680,9 @@ class _Case:
     sm_scale: float
     # (pool, first flat row, rows): the poison page behind every masked column.
     poison_rows: list
+    # (pool, first flat row, rows): the beacon rows behind the boundary columns
+    # (SWA first, compressed second; empty unless built with beacon=True).
+    beacon_rows: list = dataclasses.field(default_factory=list)
 
     @property
     def rows(self) -> int:
@@ -817,6 +824,7 @@ def _build_case(
     minus_one_inside: bool = False,
     alias_compressed: bool = False,
     tile_padded: bool = False,
+    beacon: bool = False,
     seed: Optional[int] = None,
 ) -> _Case:
     """Build one causal DSv4 case.
@@ -833,7 +841,9 @@ def _build_case(
     every seventh active compressed slot into ``-1``. ``alias_compressed``
     passes the SWA pool as the compressed cache (sglang SWA-only layers);
     ``tile_padded`` makes the tables ``[:T]`` views of 64-row-aligned,
-    ``-1``-filled parents (sglang prefill).
+    ``-1``-filled parents (sglang prefill). ``beacon`` points the last visible
+    SWA slot and the last active compressed column of every row at a beacon
+    row (value ``BEACON``, one reserved page per pool).
     """
     gen = torch.Generator(device="cuda:0")
     gen.manual_seed(seed if seed is not None else _next_seed())
@@ -876,11 +886,20 @@ def _build_case(
     for b, n in enumerate(pages_per_request):
         page_table[b, :n] = perm[start : start + n]
         start += n
+    extra_pages = 2 if beacon else 1
     swa_pool = _random_rows(
-        (num_pages + 1, 1, PAGE_SWA, 512), offset=-0.2, dtype=dtype, generator=gen
+        (num_pages + extra_pages, 1, PAGE_SWA, 512),
+        offset=-0.2,
+        dtype=dtype,
+        generator=gen,
     )
     swa_poison_first = num_pages * PAGE_SWA
     poison_rows = [(swa_pool, swa_poison_first, PAGE_SWA)]
+    beacon_rows = []
+    row_ids = torch.arange(rows, device="cuda:0")
+    if beacon:
+        swa_beacon_first = swa_poison_first + PAGE_SWA
+        beacon_rows.append((swa_pool, swa_beacon_first, PAGE_SWA))
     token_idx = seq_lens_t.long()[batch] - length + q_off
     visible = (token_idx + 1).clamp(0, SWA_WINDOW)
     j = torch.arange(SWA_WINDOW, device="cuda:0")
@@ -894,17 +913,28 @@ def _build_case(
         tail = torch.full_like(flat, -1)
     else:
         raise ValueError(swa_tail)
-    swa_table = torch.where(in_window, flat, tail).to(torch.int32)
+    swa_table = torch.where(in_window, flat, tail)
+    if beacon:
+        # The last visible slot of every row reads a beacon row.
+        swa_table = torch.where(
+            j[None, :] == visible[:, None] - 1,
+            (swa_beacon_first + row_ids % PAGE_SWA)[:, None].expand_as(flat),
+            swa_table,
+        )
+    swa_table = swa_table.to(torch.int32)
     if compressed_width:
         comp_pages = 64
         comp_pool = _random_rows(
-            (comp_pages + 1, 1, compressed_page, 512),
+            (comp_pages + extra_pages, 1, compressed_page, 512),
             offset=0.25,
             dtype=dtype,
             generator=gen,
         )
         comp_rows = comp_pages * compressed_page
         poison_rows.append((comp_pool, comp_rows, compressed_page))
+        if beacon:
+            comp_beacon_first = comp_rows + compressed_page
+            beacon_rows.append((comp_pool, comp_beacon_first, compressed_page))
         active = torch.tensor(
             compressed_lens
             if compressed_lens is not None
@@ -923,6 +953,15 @@ def _build_case(
             inside = (c[None, :] % 7 == 3) & (c[None, :] < active[:, None])
             comp_table = torch.where(
                 inside, torch.full_like(comp_table, -1), comp_table
+            )
+        if beacon:
+            # The last active compressed column of every row reads a beacon row.
+            comp_table = torch.where(
+                c[None, :] == active[:, None] - 1,
+                (comp_beacon_first + row_ids % compressed_page)[:, None].expand_as(
+                    picks
+                ),
+                comp_table,
             )
         table = torch.cat((swa_table, comp_table.to(torch.int32)), dim=1)
         lens = (SWA_WINDOW + active).to(torch.int32)
@@ -958,6 +997,8 @@ def _build_case(
         torch.randn((num_heads,), dtype=torch.float32, device="cuda:0", generator=gen)
         * 0.05
     )
+    for pool, first, count in beacon_rows:
+        pool.reshape(-1, 512)[first : first + count].fill_(BEACON)
     return _Case(
         dtype=dtype,
         num_heads=num_heads,
@@ -972,6 +1013,7 @@ def _build_case(
         sinks=sinks,
         sm_scale=512**-0.55,
         poison_rows=poison_rows,
+        beacon_rows=beacon_rows,
     )
 
 
@@ -994,16 +1036,70 @@ def _workspace_128mib() -> torch.Tensor:
     return torch.zeros(WORKSPACE_128MIB, dtype=torch.uint8, device="cuda:0")
 
 
-def _assert_valid(
-    got: torch.Tensor, case: _Case, expected: Optional[torch.Tensor] = None
-):
-    """Absolute tolerance of the stock test plus a relative metric (normalised L2 per row/head)."""
-    expected = case.reference() if expected is None else expected
-    ref._assert_close(got, expected, case.dtype)
+def _relative_rows(got: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+    """Normalised L2 error per (row, head)."""
     err = (got.float() - expected.float()).norm(dim=-1)
-    rel = (err / expected.float().norm(dim=-1).clamp_min(1e-3)).max().item()
+    return err / expected.float().norm(dim=-1).clamp_min(1e-3)
+
+
+def _row_detail(case: _Case, row: int) -> str:
+    return (
+        f"row {row}: active={int(case.sparse_topk_lens[row])} "
+        f"visible={int(case.visible()[row])}"
+    )
+
+
+def _stock_relative_error(
+    case: _Case, expected: torch.Tensor, **run_kwargs
+) -> Optional[float]:
+    """The stock backend's relative error on the same inputs (None without its cubins).
+
+    Attribution only: a Cake error far above it is a Cake defect, one in the
+    same class is the precision level of the shape. The tolerances do not move.
+    """
+    try:
+        stock = case.run(
+            workspace=_workspace_128mib(),
+            out=case.nan_out(),
+            backend="trtllm-gen",
+            **run_kwargs,
+        )
+        torch.cuda.synchronize()
+    except (
+        Exception
+    ):  # diagnostics only: the stock backend must never block the assertion
+        torch.cuda.synchronize()
+        return None
+    return _relative_rows(stock, expected).max().item()
+
+
+def _assert_valid(
+    got: torch.Tensor,
+    case: _Case,
+    expected: Optional[torch.Tensor] = None,
+    *,
+    stock_rel: Optional[float] = None,
+):
+    """Absolute tolerance of the stock test plus a relative metric (normalised L2
+    per row / head); the message names the worst row's active / visible counts
+    and, when known, the stock backend's own relative error."""
+    expected = case.reference() if expected is None else expected
+    rel_rows = _relative_rows(got, expected)
+    rel = rel_rows.max().item()
+    row, head = divmod(int(rel_rows.argmax().item()), case.num_heads)
+    detail = (
+        f"route={case.requirement().route} "
+        f"max_abs={(got.float() - expected.float()).abs().max().item():.4g} "
+        f"rows_over_rel_tol={int((rel_rows.amax(dim=1) > _REL_TOL[case.dtype]).sum())}"
+        f"/{case.rows} worst head {head} {_row_detail(case, row)}"
+        + (f" stock_rel={stock_rel:.4g}" if stock_rel is not None else "")
+    )
+    try:
+        ref._assert_close(got, expected, case.dtype)
+    except AssertionError as exc:
+        raise AssertionError(f"{exc}\n{detail}") from None
     assert rel <= _REL_TOL[case.dtype], (
-        f"relative error {rel:.4g} exceeds {_REL_TOL[case.dtype]} ({case.requirement().route})"
+        f"relative error {rel:.4g} exceeds {_REL_TOL[case.dtype]}; {detail}"
     )
     return expected
 
@@ -1018,13 +1114,55 @@ def _assert_poison_inert(
     case.fill_poison(POISON)
     poisoned = case.run(workspace=workspace, out=case.nan_out(), **run_kwargs)
     torch.cuda.synchronize()
-    leak = (poisoned.float() - clean.float()).abs().max().item() / POISON
+    expected = case.reference()
+    stock_rel = _stock_relative_error(case, expected, **run_kwargs)
+    delta = (poisoned.float() - clean.float()).abs().amax(dim=(1, 2))
+    leaking = delta > 0
     assert torch.equal(clean, poisoned), (
-        f"masked columns leak into the output: estimated weight {leak:.3g} "
-        f"({case.requirement().route})"
+        f"masked columns leak into the output: estimated weight "
+        f"{delta.max().item() / POISON:.3g}, {int(leaking.sum())}/{case.rows} rows, "
+        f"worst {_row_detail(case, int(delta.argmax().item()))} "
+        f"(route {case.requirement().route}"
+        + (f", stock_rel={stock_rel:.4g})" if stock_rel is not None else ")")
     )
-    _assert_valid(poisoned, case)
+    _assert_valid(poisoned, case, expected, stock_rel=stock_rel)
     return poisoned
+
+
+def _assert_boundary_columns_attended(case: _Case, workspace: torch.Tensor) -> None:
+    """Flip the sign of the beacon rows behind the boundary columns: a row whose
+    output does not move dropped its last visible SWA slot / last active
+    compressed column (window or active length applied too short, at any
+    granularity). Tolerance-free; every flipped state also matches the reference."""
+    base = _assert_poison_inert(case, workspace)
+    swa_beacon, *comp_beacon = case.beacon_rows
+    pool, first, count = swa_beacon
+    pool.reshape(-1, 512)[first : first + count].fill_(-BEACON)
+    flipped_swa = case.run(workspace=workspace, out=case.nan_out())
+    torch.cuda.synchronize()
+    moved = (flipped_swa.float() - base.float()).abs().amax(dim=(1, 2)) > 0
+    assert bool(moved.all()), (
+        "the last visible SWA slot is not attended in rows "
+        f"{(~moved).nonzero().flatten().tolist()} ({case.requirement().route}); "
+        + "; ".join(
+            _row_detail(case, r) for r in (~moved).nonzero().flatten().tolist()[:4]
+        )
+    )
+    _assert_valid(flipped_swa, case)
+    if comp_beacon:
+        pool, first, count = comp_beacon[0]
+        pool.reshape(-1, 512)[first : first + count].fill_(-BEACON)
+        flipped_comp = case.run(workspace=workspace, out=case.nan_out())
+        torch.cuda.synchronize()
+        moved = (flipped_comp.float() - flipped_swa.float()).abs().amax(dim=(1, 2)) > 0
+        has_compressed = case.sparse_topk_lens > SWA_WINDOW
+        missing = (~moved & has_compressed).nonzero().flatten().tolist()
+        assert not missing, (
+            "the last active compressed column is not attended in rows "
+            f"{missing} ({case.requirement().route}); "
+            + "; ".join(_row_detail(case, r) for r in missing[:4])
+        )
+        _assert_valid(flipped_comp, case)
 
 
 def _compressed_width(h_q: int) -> int:
@@ -1153,17 +1291,10 @@ _WINDOW_FORMS = [
 ]
 
 
-@pytest.mark.parametrize("h_q,dtype", _VALIDITY_CASES)
-@pytest.mark.parametrize("layout,compressed", _WINDOW_FORMS)
-@pytest.mark.parametrize("tail", ["stale", "minus_one"])
-def test_short_seq_lens_apply_the_causal_swa_window(
-    h_q, dtype, layout, compressed, tail
-):
-    """``seq_lens < 128``: only the first ``visible(t)`` SWA columns are attended, per
-    token (causal offset inside MTP / prefill requests); stale valid slots beyond
-    the window are masked exactly like the ``-1`` padding (reference applies the
-    window; needs the CAKE-957 exports)."""
-    _skip_unless_cake_gpu()
+def _short_window_case(
+    h_q, dtype, layout, compressed, *, swa_tail: str, beacon: bool = False
+) -> _Case:
+    """Requests below the 128 window (q_len 1 / 4 / ragged), mixed active lengths."""
     seq, q = _layout_lens(layout, short=True)
     width = _compressed_width(h_q) if compressed else 0
     rows = sum(q) if layout == "ragged" else len(seq) * q[0]
@@ -1175,12 +1306,55 @@ def test_short_seq_lens_apply_the_causal_swa_window(
         layout=_layout_kind(layout),
         compressed_width=width,
         compressed_lens=_mixed_compressed_lens(rows, width) if width else None,
-        swa_tail=tail,
+        swa_tail=swa_tail,
+        beacon=beacon,
     )
     visible = case.visible()
     assert int(visible.min()) >= 1 and int(visible.max()) == SWA_WINDOW
     assert int((visible < SWA_WINDOW).sum()) > 0
+    return case
+
+
+@pytest.mark.parametrize("h_q,dtype", _VALIDITY_CASES)
+@pytest.mark.parametrize("layout,compressed", _WINDOW_FORMS)
+def test_short_seq_lens_apply_the_causal_swa_window(h_q, dtype, layout, compressed):
+    """``seq_lens < 128`` with stale valid SWA slots beyond the window: only the first
+    ``visible(t)`` SWA columns are attended, per token (causal offset inside MTP /
+    prefill requests). The test of the window itself: the slots beyond
+    ``visible`` are valid rows of the poison page, so a missing window leaks
+    (needs the CAKE-957 exports)."""
+    _skip_unless_cake_gpu()
+    case = _short_window_case(h_q, dtype, layout, compressed, swa_tail="stale")
     _assert_poison_inert(case, _workspace_128mib())
+
+
+@pytest.mark.parametrize("h_q,dtype", _VALIDITY_CASES)
+@pytest.mark.parametrize("layout,compressed", _WINDOW_FORMS)
+def test_minus_one_padding_beyond_the_window_is_masked(h_q, dtype, layout, compressed):
+    """sglang's table convention for short requests: ``-1`` in every SWA slot beyond
+    the window. The ``-1`` slots are masked and never dereferenced. This does not
+    observe the window (the padding already implies it); the window test is the
+    stale-slot one above."""
+    _skip_unless_cake_gpu()
+    case = _short_window_case(h_q, dtype, layout, compressed, swa_tail="minus_one")
+    _assert_poison_inert(case, _workspace_128mib())
+
+
+@pytest.mark.parametrize("h_q,dtype", _VALIDITY_CASES)
+@pytest.mark.parametrize("layout,compressed", _WINDOW_FORMS)
+def test_boundary_columns_are_attended(h_q, dtype, layout, compressed):
+    """The last visible SWA slot and the last active compressed column of every row
+    must be attended: flipping the beacon rows behind them must move every row.
+    Catches a window or an active length applied too short at any granularity
+    (a tile-rounded length drops the boundary column and the output stays put),
+    independently of the tolerances. Slots beyond the window are ``-1``, columns
+    beyond the active length point at the poison page."""
+    _skip_unless_cake_gpu()
+    case = _short_window_case(
+        h_q, dtype, layout, compressed, swa_tail="minus_one", beacon=True
+    )
+    assert len(case.beacon_rows) == (2 if compressed else 1)
+    _assert_boundary_columns_attended(case, _workspace_128mib())
 
 
 _SGLANG_HEADS = [pytest.param(h, id=f"h{h}") for h in (16, 32, 64, 128)]

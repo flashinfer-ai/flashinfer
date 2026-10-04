@@ -1644,7 +1644,10 @@ def _int32_vector(
         raise ValueError(f"{name} must be int32, got {tensor.dtype}")
     if tensor.device != device:
         raise ValueError(f"{name} must be on {device}, got {tensor.device}")
-    flat = tensor.reshape(-1)
+    # A 1-D vector is bound as the caller's own object (reshape would wrap it
+    # in a new view object even when nothing changes); higher-rank inputs
+    # flatten without a copy or are rejected.
+    flat = tensor if tensor.dim() == 1 else tensor.reshape(-1)
     if flat.data_ptr() != tensor.data_ptr() or not flat.is_contiguous():
         raise ValueError(
             f"{name} must be contiguous; backend='cake' makes no host copy"
