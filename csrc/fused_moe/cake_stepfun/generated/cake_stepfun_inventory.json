@@ -1,12 +1,12 @@
 {
   "files": {
-    "csrc/fused_moe/cake_stepfun/generated/cake_stepfun_generated_manifest.cuh": "f00a1f89cc8f21fbbb3d87e05557f19d8c7777a3dd7ab3fad6bdc2208e294784",
-    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_fc1_nvfp4_n16_kernel.cu": "3a204843b71f23016c8db37bcd445a326c2008e2674f1ccf346704c573dd0ff7",
-    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_fc1_nvfp4_n32_kernel.cu": "159c7c42ce784b756b4f2a3ebddce2c3ee5b9e0bb559ca24c4ae3ec61ff34df5",
-    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_fc1_nvfp4_n8_kernel.cu": "96b4282b79164233f3beb232050c28f66af38b123669eff08d8c0b0ea55fd835",
-    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_fc1_nvfp4_n16_kernel.cu": "3a204843b71f23016c8db37bcd445a326c2008e2674f1ccf346704c573dd0ff7",
-    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_fc1_nvfp4_n32_kernel.cu": "159c7c42ce784b756b4f2a3ebddce2c3ee5b9e0bb559ca24c4ae3ec61ff34df5",
-    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_fc1_nvfp4_n8_kernel.cu": "96b4282b79164233f3beb232050c28f66af38b123669eff08d8c0b0ea55fd835"
+    "csrc/fused_moe/cake_stepfun/generated/cake_stepfun_generated_manifest.cuh": "28510f6c1aaed604ac8361ce1560c2056b0e32dc8c88a3f3a855f2e0eae6709c",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_bf62888ad7d404d37ead_kernel.cu": "0702e4bfa63615517b61a3c48344169a80a1069e82af4dff7a897cdf7f48ff41",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_c8922eb12574367ea8bd_kernel.cu": "e54a11dd03cb26367ef92f691042c4362c423ae715aaaabe983bc5d9f0d8e233",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_cdc9e85272be5bd4607d_kernel.cu": "ea41901bc51243c0ecad8e9c995b7d919926578f87aa2012ea7a173b79810947",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_3b07f796c6b5d83986b3_kernel.cu": "76c4725aab8c60439beece88580f08baf8ed0d3d9ef5c389c2973bb37b3bdf76",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_422960eb8e44c7832931_kernel.cu": "c862ebf3bc4b74b04adca7269cd53e87a73e4d66b1086cef9fc6d31d27d61407",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_b68d0d3662d1a885f85d_kernel.cu": "4095a8afe47abc7e2905cfe0c773cae583e4a34d3639de4df54d2bbe62728247"
   },
   "kernels": [
     {
@@ -20,10 +20,10 @@
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_fc1_nvfp4_n8_kernel.cu",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_c8922eb12574367ea8bd_kernel.cu",
       "dynamic_smem_bytes": 198912,
-      "kernel_symbol": "kernel_cake_stepfun_fc1_nvfp4_n8",
-      "name": "cake_stepfun_fc1_nvfp4_n8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_c8922eb12574367ea8bd",
+      "name": "cake_stepfun_moe_c8922eb12574367ea8bd",
       "output_rows_per_cta": 64,
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_static_nvfp4",
       "template": "fc1_swiglu_step_static",
@@ -40,10 +40,10 @@
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_fc1_nvfp4_n16_kernel.cu",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_bf62888ad7d404d37ead_kernel.cu",
       "dynamic_smem_bytes": 210432,
-      "kernel_symbol": "kernel_cake_stepfun_fc1_nvfp4_n16",
-      "name": "cake_stepfun_fc1_nvfp4_n16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_bf62888ad7d404d37ead",
+      "name": "cake_stepfun_moe_bf62888ad7d404d37ead",
       "output_rows_per_cta": 64,
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_static_nvfp4",
       "template": "fc1_swiglu_step_static",
@@ -60,10 +60,10 @@
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_fc1_nvfp4_n32_kernel.cu",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_cdc9e85272be5bd4607d_kernel.cu",
       "dynamic_smem_bytes": 188416,
-      "kernel_symbol": "kernel_cake_stepfun_fc1_nvfp4_n32",
-      "name": "cake_stepfun_fc1_nvfp4_n32",
+      "kernel_symbol": "kernel_cake_stepfun_moe_cdc9e85272be5bd4607d",
+      "name": "cake_stepfun_moe_cdc9e85272be5bd4607d",
       "output_rows_per_cta": 64,
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_static_nvfp4",
       "template": "fc1_swiglu_step_static",
@@ -80,10 +80,10 @@
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_fc1_nvfp4_n8_kernel.cu",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_3b07f796c6b5d83986b3_kernel.cu",
       "dynamic_smem_bytes": 198912,
-      "kernel_symbol": "kernel_cake_stepfun_fc1_nvfp4_n8",
-      "name": "cake_stepfun_fc1_nvfp4_n8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_3b07f796c6b5d83986b3",
+      "name": "cake_stepfun_moe_3b07f796c6b5d83986b3",
       "output_rows_per_cta": 64,
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_static_nvfp4",
       "template": "fc1_swiglu_step_static",
@@ -100,10 +100,10 @@
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_fc1_nvfp4_n16_kernel.cu",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_422960eb8e44c7832931_kernel.cu",
       "dynamic_smem_bytes": 210432,
-      "kernel_symbol": "kernel_cake_stepfun_fc1_nvfp4_n16",
-      "name": "cake_stepfun_fc1_nvfp4_n16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_422960eb8e44c7832931",
+      "name": "cake_stepfun_moe_422960eb8e44c7832931",
       "output_rows_per_cta": 64,
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_static_nvfp4",
       "template": "fc1_swiglu_step_static",
@@ -120,10 +120,10 @@
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_fc1_nvfp4_n32_kernel.cu",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_b68d0d3662d1a885f85d_kernel.cu",
       "dynamic_smem_bytes": 188416,
-      "kernel_symbol": "kernel_cake_stepfun_fc1_nvfp4_n32",
-      "name": "cake_stepfun_fc1_nvfp4_n32",
+      "kernel_symbol": "kernel_cake_stepfun_moe_b68d0d3662d1a885f85d",
+      "name": "cake_stepfun_moe_b68d0d3662d1a885f85d",
       "output_rows_per_cta": 64,
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_static_nvfp4",
       "template": "fc1_swiglu_step_static",
@@ -154,7 +154,7 @@
     "total_tiles"
   ],
   "precision": "nvfp4",
-  "program_hash": "ba4094aaac65ddb1bef9204549e128cfbac1ecdee73aa6789c2c2ab32fbb8a93",
+  "program_hash": "dfd1d2250b255b90ab9b43766e3ec2a38f1ef7c12f5e74f8a03c88d2d74d25d1",
   "schema": "flashinfer.cake_stepfun.inventory.v1",
   "tiles": [
     8,
