@@ -18,7 +18,8 @@ Accuracy probe: Cake SSDCombined vs CuTe vs an fp64 sequential reference.
 Runs ``SSDCombined(backend="cake")`` and ``SSDCombined(backend="cute")`` on
 identical inputs for the configurations whose CuTe-parity tests failed after
 the FP16-delta change (CAKE-956 D1) and measures each backend against an
-independent fp64 token-by-token recurrence (``fp64_reference`` below).  Per
+independent fp64 token-by-token recurrence
+(``test_cake_ssd_combined._fp64_reference``).  Per
 case it reports the number of outputs / final-state entries outside
 ``atol = rtol = 1e-2`` of the reference for Cake, for CuTe and between the two
 backends, the maxima, and where the Cake outliers sit (token / head
@@ -54,77 +55,6 @@ def _load_test_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def fp64_reference(tensors, arguments, lengths, *, delta_dtype=None):
-    """fp64 token-by-token SSM recurrence.
-
-    ``dt' = clamp(softplus(dt + dt_bias), dt_limit)`` (softplus only when
-    requested); ``state = exp(dt' * A) * state + delta * (x (x) B)``;
-    ``y = C . state + D * x``; ``y *= z * sigmoid(z)`` when ``z`` is given.
-    ``delta`` is ``dt'`` rounded to ``delta_dtype`` (``None`` = exact) so the
-    kernels' FP16 (Cake) / BF16 (CuTe) ``delta`` rounding can be emulated; the
-    decay always uses the exact ``dt'`` (both kernels scan the fp32 ``dt * A``).
-    Batched ``[B, S]`` inputs are treated as ``B`` sequences of ``S`` tokens;
-    packed varlen ``[1, T]`` inputs follow ``lengths``.  Returns the token-major
-    fp64 output with ``x``'s shape and the ``[num_seqs, H, 64, 128]`` final
-    states.
-    """
-
-    x, dt, A, B, C = tensors
-    batch, seqlen, nheads, headdim = x.shape
-    total = batch * seqlen
-    assert sum(lengths) == total, (lengths, total)
-    ngroups, dstate = B.shape[2], B.shape[3]
-    rep = nheads // ngroups
-    f64 = torch.float64
-    xf = x.reshape(total, nheads, headdim).to(f64)
-    dtf = dt.reshape(total, nheads).to(f64)
-    dt_bias = arguments.get("dt_bias")
-    if dt_bias is not None:
-        dtf = dtf + dt_bias.to(f64)
-    if arguments.get("dt_softplus", False):
-        dtf = torch.nn.functional.softplus(dtf)
-    dt_min, dt_max = arguments.get("dt_limit", (0.0, float("inf")))
-    dtf = dtf.clamp(min=float(dt_min), max=float(dt_max))
-    delta = dtf if delta_dtype is None else dtf.to(delta_dtype).to(f64)
-    decay = torch.exp(A.to(f64)[None, :] * dtf)
-    Bf = B.reshape(total, ngroups, dstate).to(f64).repeat_interleave(rep, dim=1)
-    Cf = C.reshape(total, ngroups, dstate).to(f64).repeat_interleave(rep, dim=1)
-    D = arguments.get("D")
-    if D is None:
-        Df = torch.zeros((nheads, 1), dtype=f64, device=x.device)
-    else:
-        Df = D.to(f64)
-        Df = Df[:, None] if Df.ndim == 1 else Df
-        if Df.shape[1] != headdim:
-            # A 2D D on a per-head constructor consumes its first column.
-            Df = Df[:, :1]
-    initial = arguments.get("initial_states")
-    y = torch.empty((total, nheads, headdim), dtype=f64, device=x.device)
-    states = torch.empty(
-        (len(lengths), nheads, headdim, dstate), dtype=f64, device=x.device
-    )
-    start = 0
-    for sequence, length in enumerate(lengths):
-        if initial is None:
-            state = torch.zeros((nheads, headdim, dstate), dtype=f64, device=x.device)
-        else:
-            state = initial[sequence].to(f64).clone()
-        for token in range(start, start + length):
-            state = state * decay[token][:, None, None] + (
-                (delta[token][:, None] * xf[token])[:, :, None] * Bf[token][:, None, :]
-            )
-            y[token] = (
-                torch.einsum("hdn,hn->hd", state, Cf[token]) + Df * xf[token]
-            )
-        states[sequence] = state
-        start += length
-    z = arguments.get("z")
-    if z is not None:
-        zf = z.reshape(total, nheads, headdim).to(f64)
-        y = y * (zf * torch.sigmoid(zf))
-    return y.reshape(x.shape), states
 
 
 def tol_stats(reference, value, *, atol=1e-2, rtol=1e-2):
@@ -175,7 +105,9 @@ def structure(mask, names=OUT_AXES):
         out[name] = {
             "hit": hit,
             "total": int(per.numel()),
-            "top": [(int(i), int(c)) for i, c in zip(top.indices, top.values)],
+            "top": [
+                (int(i), int(c)) for i, c in zip(top.indices, top.values, strict=True)
+            ],
         }
     # The largest cluster in one (batch, token, head) row (max 64 = whole row).
     row = mask.sum(dim=-1)
@@ -308,12 +240,12 @@ def probe_case(tests, name, constructor, tensors, arguments, lengths, cute_mode)
     cake = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
     cute = run_cute(tests, constructor, tensors, arguments, lengths, cute_mode)
     torch.cuda.synchronize()
-    ref_out, ref_state = fp64_reference(tensors, arguments, lengths)
-    ref16_out, ref16_state = fp64_reference(
-        tensors, arguments, lengths, delta_dtype=torch.float16
+    ref_out, ref_state = tests._fp64_reference(constructor, tensors, arguments)
+    ref16_out, ref16_state = tests._fp64_reference(
+        constructor, tensors, arguments, delta_dtype=torch.float16
     )
-    refb_out, refb_state = fp64_reference(
-        tensors, arguments, lengths, delta_dtype=torch.bfloat16
+    refb_out, refb_state = tests._fp64_reference(
+        constructor, tensors, arguments, delta_dtype=torch.bfloat16
     )
     torch.cuda.synchronize()
     row = {"case": name, "shape": list(tensors[0].shape), "lengths": list(lengths)}
@@ -321,17 +253,22 @@ def probe_case(tests, name, constructor, tensors, arguments, lengths, cute_mode)
     row["ref_out_absmean"] = float(ref_out.abs().mean())
     cake_out, cake_state = cake
     cute_out, cute_state = cute
-    assert tuple(cake_out.shape) == tuple(cute_out.shape), (cake_out.shape, cute_out.shape)
+    assert tuple(cake_out.shape) == tuple(cute_out.shape), (
+        cake_out.shape,
+        cute_out.shape,
+    )
     for label, (actual, ref) in {
         "out": (cake_out, ref_out),
         "state": (cake_state, ref_state),
     }.items():
         cake_stats, cake_mask = tol_stats(ref, actual)
-        cute_stats, cute_mask = tol_stats(ref, cute_out if label == "out" else cute_state)
-        both_stats, _ = tol_stats(
-            cute_out if label == "out" else cute_state, actual
+        cute_stats, cute_mask = tol_stats(
+            ref, cute_out if label == "out" else cute_state
         )
-        cake16_stats, _ = tol_stats(ref16_out if label == "out" else ref16_state, actual)
+        both_stats, _ = tol_stats(cute_out if label == "out" else cute_state, actual)
+        cake16_stats, _ = tol_stats(
+            ref16_out if label == "out" else ref16_state, actual
+        )
         cuteb_stats, _ = tol_stats(
             refb_out if label == "out" else refb_state,
             cute_out if label == "out" else cute_state,
@@ -358,9 +295,10 @@ def probe_case(tests, name, constructor, tensors, arguments, lengths, cute_mode)
                 cute_mask, OUT_AXES if label == "out" else STATE_AXES
             ),
         }
-        if actual.dtype == torch.bfloat16 and (
-            cute_out if label == "out" else cute_state
-        ).dtype == torch.bfloat16:
+        if (
+            actual.dtype == torch.bfloat16
+            and (cute_out if label == "out" else cute_state).dtype == torch.bfloat16
+        ):
             row[label]["cake_vs_cute_ulps"] = bf16_ulp_stats(
                 actual, cute_out if label == "out" else cute_state
             )
@@ -386,7 +324,9 @@ def summarize(row):
             f"overlap={block['outlier_overlap_cake_cute']}"
         )
         if "cake_vs_cute_ulps" in block:
-            lines.append(f"RESULT {row['case']} {label} ulps(cake,cute): {block['cake_vs_cute_ulps']}")
+            lines.append(
+                f"RESULT {row['case']} {label} ulps(cake,cute): {block['cake_vs_cute_ulps']}"
+            )
         lines.append(
             f"RESULT {row['case']} {label} cake outliers: {json.dumps(block['cake_outlier_structure'])}"
         )
@@ -420,7 +360,9 @@ def main(argv=None):
         print(summarize(row), flush=True)
         if args.out is not None:
             args.out.write_text(json.dumps(rows, indent=1))
-    print(f"SUMMARY cases={len(selected)} errors={len(failures)} {failures}", flush=True)
+    print(
+        f"SUMMARY cases={len(selected)} errors={len(failures)} {failures}", flush=True
+    )
     return 1 if failures else 0
 
 

@@ -17,6 +17,7 @@ limitations under the License.
 import importlib
 import importlib.util
 import inspect
+import math
 import re
 from contextlib import nullcontext
 from pathlib import Path
@@ -37,13 +38,188 @@ def _load_cake_benchmark_module():
     return module
 
 
-def _assert_cute_parity(actual, expected):
-    for index in (0, 1):
-        reference = expected[index]
-        # Cancellation ties the error to the head's magnitude rather than the
-        # entry's; the tensor max is a coarse bound on that.
-        atol = max(1e-2, 5e-4 * reference.abs().amax().item())
-        torch.testing.assert_close(actual[index], reference, atol=atol, rtol=1e-2)
+_ATOL = _RTOL = 1e-2
+# Upper bound on the fraction of Cake outputs / final-state entries outside
+# ``atol = rtol = 1e-2`` of the fp64 recurrence.  Measured on GB300 with
+# ``cake_ssd_accuracy_probe.py`` (FP16 delta): <= 0.03 % of the outputs on the
+# ``_case`` distribution, 0.53-0.57 % on the CAKE-950 realistic-decay
+# distribution (CuTe, bf16 delta: 0.04-0.10 % and 1.34-1.40 %); 0 final-state
+# entries in every case.
+_MAX_OUTSIDE_FRACTION = 0.01
+
+
+def _sequence_lengths(constructor, tensors, arguments):
+    """Per-sequence token counts: from ``seq_idx`` in packed-varlen mode,
+    ``seqlen`` per batch element otherwise."""
+
+    x = tensors[0]
+    if not constructor["has_varlen"]:
+        return [x.shape[1]] * x.shape[0]
+    seq_idx = arguments["seq_idx"].reshape(-1).to(torch.int64)
+    return torch.bincount(seq_idx).tolist()
+
+
+def _fp64_reference(constructor, tensors, arguments, *, delta_dtype=None):
+    """fp64 token-by-token SSM recurrence, the oracle both backends are
+    measured against.
+
+    ``dt' = clamp(softplus(dt + dt_bias), dt_limit)`` (softplus only when
+    requested); ``state = exp(dt' * A) * state + delta * (x (x) B)``;
+    ``y = C . state + D * x``; ``y *= z * sigmoid(z)`` when ``z`` is given.
+    ``delta`` is ``dt'`` rounded to ``delta_dtype`` (``None`` = exact); the
+    accuracy probe uses fp16 / bf16 here to emulate the kernels' ``delta``
+    storage, the decay always uses the exact ``dt'`` (both kernels scan the
+    fp32 ``dt * A``).  A 2D ``D`` on a per-head constructor consumes its first
+    column and a 1D ``D`` broadcasts over ``headdim``, like both backends.
+    Returns the token-major fp64 output with ``x``'s shape and the
+    ``[num_seqs, nheads, 64, 128]`` final states (zero initial state when
+    ``initial_states`` is ``None``).
+    """
+
+    x, dt, A, B, C = tensors
+    lengths = _sequence_lengths(constructor, tensors, arguments)
+    batch, seqlen, nheads, headdim = x.shape
+    total = batch * seqlen
+    assert sum(lengths) == total, (lengths, total)
+    ngroups, dstate = B.shape[2], B.shape[3]
+    rep = nheads // ngroups
+    f64 = torch.float64
+    xf = x.reshape(total, nheads, headdim).to(f64)
+    dtf = dt.reshape(total, nheads).to(f64)
+    dt_bias = arguments.get("dt_bias")
+    if dt_bias is not None:
+        dtf = dtf + dt_bias.to(f64)
+    if arguments.get("dt_softplus", False):
+        dtf = torch.nn.functional.softplus(dtf)
+    dt_min, dt_max = arguments.get("dt_limit", (0.0, float("inf")))
+    dtf = dtf.clamp(min=float(dt_min), max=float(dt_max))
+    delta = dtf if delta_dtype is None else dtf.to(delta_dtype).to(f64)
+    decay = torch.exp(A.to(f64)[None, :] * dtf)
+    Bf = B.reshape(total, ngroups, dstate).to(f64).repeat_interleave(rep, dim=1)
+    Cf = C.reshape(total, ngroups, dstate).to(f64).repeat_interleave(rep, dim=1)
+    D = arguments.get("D")
+    if D is None:
+        Df = torch.zeros((nheads, 1), dtype=f64, device=x.device)
+    else:
+        Df = D.to(f64)
+        Df = Df[:, None] if Df.ndim == 1 else Df
+        if Df.shape[1] != headdim:
+            Df = Df[:, :1]
+    initial = arguments.get("initial_states")
+    y = torch.empty((total, nheads, headdim), dtype=f64, device=x.device)
+    states = torch.empty(
+        (len(lengths), nheads, headdim, dstate), dtype=f64, device=x.device
+    )
+    start = 0
+    for sequence, length in enumerate(lengths):
+        if initial is None:
+            state = torch.zeros((nheads, headdim, dstate), dtype=f64, device=x.device)
+        else:
+            state = initial[sequence].to(f64).clone()
+        for token in range(start, start + length):
+            state = state * decay[token][:, None, None] + (
+                (delta[token][:, None] * xf[token])[:, :, None] * Bf[token][:, None, :]
+            )
+            y[token] = torch.einsum("hdn,hn->hd", state, Cf[token]) + Df * xf[token]
+        states[sequence] = state
+        start += length
+    z = arguments.get("z")
+    if z is not None:
+        zf = z.reshape(total, nheads, headdim).to(f64)
+        y = y * (zf * torch.sigmoid(zf))
+    return y.reshape(x.shape), states
+
+
+def _outside_tolerance(actual, reference):
+    """``|actual - reference| > atol + rtol * |reference|`` elementwise."""
+
+    difference = (actual.to(torch.float64) - reference).abs()
+    return difference > _ATOL + _RTOL * reference.abs()
+
+
+def _bf16_ulp(value):
+    """Spacing of bf16 values at magnitude ``value`` (smallest normal below)."""
+
+    magnitude = max(abs(value), torch.finfo(torch.bfloat16).tiny)
+    return 2.0 ** math.floor(math.log2(magnitude)) * torch.finfo(torch.bfloat16).eps
+
+
+def _assert_cake_accuracy(cake, cute, constructor, tensors, arguments):
+    """Cake must be at least as accurate as CuTe against the fp64 recurrence.
+
+    Both backends evaluate the same chunked algorithm with bf16 operands, so
+    each is outside ``atol = rtol = 1e-2`` of the exact recurrence on a sparse
+    set of outputs where the cancellation in ``C . state`` amplifies one
+    operand rounding.  The Cake kernels store the per-token ``delta`` in fp16
+    (CAKE-942); CuTe stores it in bf16, so the two kernels round *differently*
+    and their outlier sets no longer coincide: elementwise Cake-vs-CuTe parity
+    at 1e-2 (the previous oracle) fails on 0.0-0.2 % of the outputs although
+    Cake is the more accurate kernel.  Measured on GB300
+    (``cake_ssd_accuracy_probe.py``; outputs outside 1e-2 of the fp64
+    recurrence, Cake vs CuTe): H8/G8 batched 23 vs 79 of 131072, H128/G8
+    batched S=1024 5352 vs 16813 of 16.8 M, realistic decay varlen 8x128
+    0.573 % vs 1.403 %.  CuTe measured against a reference with a bf16-rounded
+    ``delta`` drops to Cake's count (5163 of 16.8 M): the whole difference
+    between the kernels is the ``delta`` rounding.  Final states: 0 entries
+    outside tolerance in every case for Cake.
+
+    Asserted for ``out`` and for ``final_states``:
+
+    1. every Cake value is finite;
+    2. Cake is within ``atol = rtol = 1e-2`` of the fp64 recurrence on all but
+       at most ``_MAX_OUTSIDE_FRACTION`` of the entries (the elementwise
+       tolerance is unchanged; the bound is 30x above the measured fraction
+       on the ``_case`` distribution and ~2x on the realistic one);
+    3. Cake has no more entries outside that tolerance than CuTe on the same
+       inputs (measured 0.28-0.42x of CuTe's count);
+    4. Cake's largest absolute error does not exceed CuTe's by more than one
+       bf16 ulp at the magnitude of Cake's worst entry (kernels of equal
+       internal accuracy differ by up to one output rounding there; the
+       measured excess is <= 0.8 % of CuTe's maximum, far below one ulp).
+
+    This is not a loosened CuTe parity: CuTe itself is outside 1e-2 of the
+    recurrence on 0.04-1.4 % of its outputs, so even an exact kernel would
+    fail the old oracle, while this one requires Cake to beat CuTe against
+    the truth.
+    """
+
+    reference = _fp64_reference(constructor, tensors, arguments)
+    for name, actual, baseline, expected in (
+        ("out", cake[0], cute[0], reference[0]),
+        ("final_states", cake[1], cute[1], reference[1]),
+    ):
+        assert tuple(actual.shape) == tuple(expected.shape), (
+            name,
+            tuple(actual.shape),
+            tuple(expected.shape),
+        )
+        actual64 = actual.to(torch.float64)
+        assert torch.isfinite(actual64).all(), (
+            f"{name}: Cake produced non-finite values"
+        )
+        cake_outside = int(_outside_tolerance(actual, expected).sum())
+        cute_outside = int(_outside_tolerance(baseline, expected).sum())
+        cake_error = (actual64 - expected).abs()
+        cake_max = float(cake_error.max())
+        cute_max = float((baseline.to(torch.float64) - expected).abs().max())
+        budget = _MAX_OUTSIDE_FRACTION * expected.numel()
+        assert cake_outside <= budget, (
+            f"{name}: {cake_outside} of {expected.numel()} Cake entries outside "
+            f"atol=rtol={_ATOL} of the fp64 recurrence (budget {budget:.0f}; "
+            f"CuTe {cute_outside})"
+        )
+        assert cake_outside <= cute_outside, (
+            f"{name}: Cake has {cake_outside} entries outside atol=rtol={_ATOL} "
+            f"of the fp64 recurrence, CuTe {cute_outside} on the same inputs"
+        )
+        worst = int(cake_error.argmax())
+        slack = _bf16_ulp(float(expected.reshape(-1)[worst]))
+        assert cake_max <= cute_max + slack, (
+            f"{name}: Cake max abs error {cake_max:.4g} exceeds CuTe's "
+            f"{cute_max:.4g} by more than one bf16 ulp ({slack:.4g}) at the "
+            f"worst entry (flat index {worst}, reference "
+            f"{float(expected.reshape(-1)[worst]):.4g})"
+        )
 
 
 def _varlen_metadata(lengths, dtype):
@@ -313,7 +489,7 @@ def test_cake_ssd_combined_route_matrix(
         arguments["dt_limit"] = (0.0, float("inf"))
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cute_parity(actual, expected)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 def test_cake_ssd_combined_accepts_framework_strided_input_views():
@@ -323,6 +499,8 @@ def test_cake_ssd_combined_accepts_framework_strided_input_views():
 
     constructor, tensors, arguments = _case(varlen=True)
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
+    runner = SSDCombined(**constructor, backend="cake")
+    contiguous = runner.run(*tensors, **arguments)
     x, dt, A, B, C = tensors
     tensors = (
         _sglang_projection_view(x),
@@ -337,8 +515,12 @@ def test_cake_ssd_combined_accepts_framework_strided_input_views():
         "initial_states": _strided_last_dim(arguments["initial_states"]),
     }
 
-    actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cute_parity(actual, expected)
+    actual = runner.run(*tensors, **arguments)
+    # The views carry the same values, so the kernels must reproduce the
+    # contiguous run bit for bit.
+    torch.testing.assert_close(actual[0], contiguous[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], contiguous[1], rtol=0, atol=0)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 @pytest.mark.parametrize(
@@ -357,7 +539,7 @@ def test_cake_ssd_combined_matches_cute_d_shape_coercion(
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
 
-    _assert_cute_parity(actual, expected)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 def test_cake_ssd_combined_updates_caller_buffers():
@@ -373,6 +555,7 @@ def test_cake_ssd_combined_updates_caller_buffers():
     # the kernels and returned as-is.
     out = torch.empty((1, 256, 8, 64), dtype=torch.bfloat16, device="cuda")
     runner = SSDCombined(**constructor, backend="cake")
+    allocated = runner.run(*tensors, **arguments)
     actual = runner.run(
         *tensors,
         **{
@@ -385,7 +568,11 @@ def test_cake_ssd_combined_updates_caller_buffers():
 
     torch.testing.assert_close(actual_cumsum, expected_cumsum, rtol=0, atol=0)
     assert actual[0] is out
-    _assert_cute_parity(actual, expected)
+    # Caller-owned output storage and a kernel-written cumsum must not change
+    # the arithmetic: bit-identical to the allocating run.
+    torch.testing.assert_close(actual[0], allocated[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], allocated[1], rtol=0, atol=0)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
     preserved_cumsum = actual_cumsum.clone()
     runner.run(
@@ -542,7 +729,8 @@ def test_cake_ssd_combined_f32_state_matches_cute_on_bf16_representable_states(
 ):
     """FP32 state programs: CuTe has no FP32 state, so feed both backends the
     same bf16-representable initial states (exactly the same values in either
-    dtype) and compare the outputs plus the final states rounded to bf16."""
+    dtype); the fp32 final states are measured unrounded against the fp64
+    recurrence and must be at least as accurate as CuTe's bf16 states."""
 
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
@@ -560,7 +748,7 @@ def test_cake_ssd_combined_f32_state_matches_cute_on_bf16_representable_states(
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
 
     assert actual[1].dtype == torch.float32
-    _assert_cute_parity((actual[0], actual[1].to(torch.bfloat16)), expected)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 @pytest.mark.parametrize(
@@ -575,7 +763,7 @@ def test_cake_ssd_combined_f32_state_matches_cute_on_bf16_representable_states(
 )
 def test_cake_ssd_combined_accepts_unaligned_seqlen(varlen, lengths):
     """``seqlen % 128 != 0``: the partial trailing physical chunk is handled
-    in-kernel; the reference is CuTe on a zero-padded packed stream."""
+    in-kernel; the CuTe baseline runs on a zero-padded packed stream."""
 
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
@@ -591,7 +779,7 @@ def test_cake_ssd_combined_accepts_unaligned_seqlen(varlen, lengths):
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
 
     assert tuple(actual[0].shape) == tuple(tensors[0].shape)
-    _assert_cute_parity(actual, expected)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 @pytest.mark.parametrize("count_source", ("num_seqs", "seq_chunk_cumsum"))
@@ -619,7 +807,7 @@ def test_cake_ssd_combined_varlen_without_initial_states(lengths, count_source):
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
 
     assert tuple(actual[1].shape) == (len(lengths), 8, 64, 128)
-    _assert_cute_parity(actual, expected)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 def test_cake_ssd_combined_varlen_without_initial_states_needs_a_count():
@@ -709,7 +897,7 @@ def test_cake_ssd_combined_single_chunk_realistic_decay_has_no_nan(
     Nemotron-H head geometry with realistic decay (heads whose per-chunk
     ``A * dt`` cumsum passes ``-126 / log2(e)``).  The retired prefix route
     produced ``0 * inf`` NaNs here; the output and states must be finite and
-    match CuTe."""
+    at least as accurate as CuTe's."""
 
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
@@ -732,47 +920,12 @@ def test_cake_ssd_combined_single_chunk_realistic_decay_has_no_nan(
 
     assert torch.isfinite(actual[0].float()).all()
     assert torch.isfinite(actual[1].float()).all()
-    _assert_cute_parity(actual, expected)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
-def _fp32_recurrent_reference(tensors, arguments, lengths):
-    """Per-token fp32 SSM recurrence for a packed ``[1, T]`` stream; returns
-    the token-major output and the per-sequence final states."""
-
-    x, dt, A, B, C = tensors
-    nheads = x.shape[2]
-    rep = nheads // B.shape[2]
-    x = x[0].float()
-    dt_processed = torch.nn.functional.softplus(
-        dt[0].float() + arguments["dt_bias"].float()
-    )
-    B = B[0].float().repeat_interleave(rep, dim=1)
-    C = C[0].float().repeat_interleave(rep, dim=1)
-    D = arguments["D"].float()
-    y = torch.empty(x.shape, device="cuda", dtype=torch.float32)
-    states = torch.empty(
-        (len(lengths), nheads, 64, 128), device="cuda", dtype=torch.float32
-    )
-    start = 0
-    for sequence, length in enumerate(lengths):
-        state = arguments["initial_states"][sequence].float().clone()
-        for token in range(start, start + length):
-            decay = torch.exp(A * dt_processed[token])
-            state = state * decay[:, None, None] + (
-                (dt_processed[token][:, None] * x[token])[:, :, None]
-                * B[token][:, None, :]
-            )
-            y[token] = (
-                torch.einsum("hdn,hn->hd", state, C[token]) + D[:, None] * x[token]
-            )
-        states[sequence] = state
-        start += length
-    return y.unsqueeze(0), states
-
-
-def test_cake_ssd_combined_nemotron_accuracy_vs_fp32_recurrent_reference():
+def test_cake_ssd_combined_nemotron_accuracy_vs_recurrent_reference():
     """CAKE-942: with FP16 ``delta`` the fraction of outputs outside
-    atol = rtol = 1e-2 of an fp32 recurrent reference on the Nemotron-H
+    atol = rtol = 1e-2 of the fp64 recurrent reference on the Nemotron-H
     geometry (T = 1024, realistic decay, zero initial state) is about 0.66 %
     (bf16 delta: 1.56 %, stock Triton: 0.62 %)."""
 
@@ -780,11 +933,8 @@ def test_cake_ssd_combined_nemotron_accuracy_vs_fp32_recurrent_reference():
     if capability not in ((10, 0), (10, 3)):
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
 
-    lengths = (1024,)
-    constructor, tensors, arguments = _realistic_decay_inputs(lengths, 11)
-    reference_out, reference_states = _fp32_recurrent_reference(
-        tensors, arguments, lengths
-    )
+    constructor, tensors, arguments = _realistic_decay_inputs((1024,), 11)
+    reference_out, reference_states = _fp64_reference(constructor, tensors, arguments)
 
     out, final_states = SSDCombined(**constructor, backend="cake").run(
         *tensors, **arguments
@@ -810,7 +960,7 @@ def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
 
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cute_parity(actual, expected)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
@@ -836,15 +986,17 @@ def test_cake_ssd_combined_program_cache_is_multi_device_safe(varlen):
                 SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
             )
             runners.append(SSDCombined(**constructor, backend="cake"))
-            cases.append((tensors, arguments))
+            cases.append((constructor, tensors, arguments))
 
     torch.cuda.set_device(0)
     for device_index in (0, 1, 0, 1):
         assert torch.cuda.current_device() == 0
-        tensors, arguments = cases[device_index]
+        constructor, tensors, arguments = cases[device_index]
         actual = runners[device_index].run(*tensors, **arguments)
         assert actual[0].device.index == device_index
-        _assert_cute_parity(actual, expected[device_index])
+        _assert_cake_accuracy(
+            actual, expected[device_index], constructor, tensors, arguments
+        )
         assert torch.cuda.current_device() == 0
 
 
