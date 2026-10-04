@@ -5847,6 +5847,73 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
 
 # ---------------------------------------------------------------------------
+# Cake StepFun FC1 inside the trtllm-gen fused-MoE pipeline (exact SM100/SM103)
+# ---------------------------------------------------------------------------
+
+
+class CakeStepFunRunner(TrtllmFp4RoutedRunner):
+    """StepFun adapter over the Cake-enabled trtllm-gen ``MoERunner``.
+
+    Input packing, routing, GEMM2 and finalize are those of
+    :class:`TrtllmFp4RoutedRunner`; the loaded module is the exact-architecture
+    ``fused_moe_cake_stepfun_*`` build whose GEMM1 stage launches the exported
+    Cake StepFun NVFP4 kernels for the tile sizes they cover. A tactic is the
+    FC1 tile (``tile_N``) × the native GEMM2 configuration index.
+
+    The weight view must come from :meth:`CakeStepFunConfig.prepare_weights`:
+    the Cake kernels read the per-expert ``gemm1_clamp_limit`` and have no
+    implicit default limit.
+    """
+
+    backend_key = "cake"
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLUStep,),
+    }
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support per-token scale."
+            )
+        from ..utils import get_compute_capability
+
+        compute_capability = get_compute_capability(self.device)
+        if compute_capability not in ((10, 0), (10, 3)):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports exact SM100 and SM103 only, "
+                f"got SM{compute_capability[0]}{compute_capability[1]}."
+            )
+
+    def _build(self) -> None:
+        from ..utils import get_compute_capability
+        from .core import get_cake_stepfun_moe_module
+
+        major, minor = get_compute_capability(self.device)
+        self._module = get_cake_stepfun_moe_module(f"sm_{major}{minor}a")
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        view = weights.get_view(self.backend_key)
+        if view.get("gemm1_clamp_limit") is None:
+            raise ValueError(
+                f"{type(self).__name__} requires the per-expert gemm1_clamp_limit "
+                "produced by CakeStepFunConfig.prepare_weights in the 'cake' view."
+            )
+        return super().pack_inputs(act, weights)
+
+    def _cache_key_extras(self) -> tuple:
+        # The 'cake' backend key is shared with the warp-decode runner; the
+        # runner name keeps their tactic spaces apart.
+        return (type(self).__name__,) + super()._cache_key_extras()
+
+
+
+# ---------------------------------------------------------------------------
 # TRTLLM block-FP8 runner — DeepSeek FP8 and MXFP8
 # ---------------------------------------------------------------------------
 

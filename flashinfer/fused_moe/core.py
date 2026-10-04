@@ -1735,7 +1735,26 @@ def get_trtllm_moe_sm100_module():
 
 @functools.cache
 def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
-    module = gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
+    return _build_trtllm_moe_namespace(
+        gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
+    )
+
+
+@functools.cache
+def get_cake_stepfun_moe_module(target: str):
+    """Load the Cake StepFun fused-MoE module for an exact ``sm_100a``/``sm_103a`` target.
+
+    The module exports the trtllm-gen fused-MoE operations with the GEMM1 stage
+    served by the exported Cake StepFun FC1 kernels; the returned namespace is
+    the one :func:`get_trtllm_moe_sm100_module` returns for the public module.
+    """
+    from ..jit.cake_stepfun_moe import gen_cake_stepfun_fused_moe_module
+
+    return _build_trtllm_moe_namespace(gen_cake_stepfun_fused_moe_module(target))
+
+
+def _build_trtllm_moe_namespace(module):
+    """Build and load a trtllm-gen fused-MoE JIT module and wrap its operations."""
     moe_op = module.build_and_load()
     for library_path in module.get_library_paths():
         setup_cubin_loader(str(library_path))

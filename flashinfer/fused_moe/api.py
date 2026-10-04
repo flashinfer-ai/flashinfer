@@ -764,6 +764,117 @@ class CakeWarpDecodeConfig:
 
 
 @dataclass(frozen=True)
+class CakeStepFunConfig:
+    """Cake StepFun FC1 kernels inside the trtllm-gen fused-MoE pipeline.
+
+    The backend runs the trtllm-gen routing, GEMM2 and finalize stages unchanged
+    and serves the GEMM1 stage with exported Cake NVFP4 kernels that evaluate the
+    StepFun activation ``clamp(up, -L, L) * min(silu(gate), L)`` with a per-expert
+    limit ``L``. It accepts NVFP4×NVFP4 with :class:`SwiGLUStep` on exact SM100
+    and SM103 only and is never part of the default backend list; users opt in
+    with ``CakeStepFunConfig(backend="cake")``.
+
+    The physical weight and activation layouts are exactly those produced by
+    :class:`TrtllmFp4Config` for NVFP4×NVFP4; the view additionally carries the
+    per-expert ``gemm1_clamp_limit`` the Cake kernels read.
+    """
+
+    backend: Literal["cake"] = "cake"
+
+    def __post_init__(self) -> None:
+        if self.backend != "cake":
+            raise ValueError(
+                f"CakeStepFunConfig backend must be 'cake', got {self.backend!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+        step_limits: Optional[Tensor] = None,
+    ):
+        """Build the TRTLLM NVFP4 weight view plus the per-expert StepFun limits.
+
+        Register the returned dictionary with ``MoEWeightPack.prepare_for("cake", view)``.
+        ``activation`` defaults to ``SwiGLUStep()``; ``step_limits`` optionally
+        gives one logical limit per physical expert row (routed experts followed
+        by fused shared experts) and overrides ``activation.limit`` row by row.
+        The view stores ``gemm1_clamp_limit`` in raw accumulator units, i.e. the
+        logical limit divided by ``output1_scale_gate_scalar``.
+        """
+        if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            raise ValueError(
+                "Cake StepFun weight preparation requires NVFP4×NVFP4, "
+                f"got {quant!r}."
+            )
+        activation = SwiGLUStep() if activation is None else activation
+        if not isinstance(activation, SwiGLUStep):
+            raise ValueError(
+                "Cake StepFun weight preparation requires a SwiGLUStep activation, "
+                f"got {activation!r}."
+            )
+        view = TrtllmFp4Config.prepare_weights(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            permute_cache=permute_cache,
+        )
+        gate_scale = view["output1_scale_gate_scalar"]
+        if step_limits is None:
+            limits = torch.full_like(gate_scale, activation.limit)
+        else:
+            limits = torch.as_tensor(
+                step_limits, dtype=torch.float32, device=gate_scale.device
+            )
+            if limits.shape != gate_scale.shape:
+                raise ValueError(
+                    "step_limits must hold one limit per physical expert row "
+                    f"{tuple(gate_scale.shape)}, got {tuple(limits.shape)}."
+                )
+            if not bool(torch.isfinite(limits).all()) or not bool((limits > 0).all()):
+                raise ValueError("step_limits must be finite and positive.")
+        view["gemm1_clamp_limit"] = (limits / gate_scale).contiguous()
+        return view
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+    ):
+        """Build the shared TRTLLM NVFP4 packed activation view."""
+        if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            raise ValueError(
+                "Cake StepFun activation preparation requires NVFP4×NVFP4, "
+                f"got {quant!r}."
+            )
+        return TrtllmFp4Config.prepare_activations(
+            hidden_states_bf16,
+            quant=quant,
+        )
+
+    def __repr__(self) -> str:
+        return "CakeStepFunConfig(backend='cake')"
+
+
+@dataclass(frozen=True)
 class PrimsTsConfig:
     """Explicit Prims-TS backend for SM100 and SM103.
 

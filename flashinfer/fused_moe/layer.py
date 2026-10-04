@@ -35,6 +35,7 @@ from .api import (
     BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
+    CakeStepFunConfig,
     CakeWarpDecodeConfig,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
@@ -72,6 +73,7 @@ from .api import (
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeStepFunRunner,
     CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
@@ -108,6 +110,7 @@ from .utils import map_to_hybrid_bucket
 # Concrete configured runners; automatic implementations are loaded lazily
 # through the registration contract, without naming them in this module.
 _RunnerT = Union[
+    CakeStepFunRunner,
     CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
@@ -144,6 +147,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CakeStepFunConfig: CakeStepFunRunner,
     CakeWarpDecodeConfig: CakeWarpDecodeRunner,
     CutlassBf16Config: CutlassBf16Runner,
     CutlassFp8BlockConfig: CutlassFp8BlockRunner,
