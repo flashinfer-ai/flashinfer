@@ -58,20 +58,26 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SHARED_COEFFICIENTS_STRIDE 0
 #define SMEM_TOTAL 0
 #define THREADS 128
+#define COEFFICIENT_BF16 0
+#define INDEX_I32 0
+#define LAUNCH_MIN_BLOCKS 8
 
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a22e10ee14cc5c07acb7(
+__global__
+__launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_selective_state_update_4570410fcf7e2771ab30(
     float* __restrict__ state, __nv_bfloat16* __restrict__ x, unsigned long long dt_addr,
     unsigned long long a_addr, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C,
     unsigned long long d_addr, __nv_bfloat16* __restrict__ z, unsigned long long dt_bias_addr,
-    __nv_bfloat16* __restrict__ output, long long* __restrict__ state_batch_indices,
-    long long* __restrict__ dst_state_batch_indices, int nheads, int ngroups, int dim_tiles,
-    unsigned long long state_stride_slot, long long dt_batch_stride, long long dt_head_stride,
-    long long a_head_stride, long long d_head_stride, long long dt_bias_head_stride,
-    int dt_softplus, int has_z, int disable_state_update, long long pad_slot_id) {
+    __nv_bfloat16* __restrict__ output, unsigned long long state_batch_indices_addr,
+    unsigned long long dst_state_batch_indices_addr, int nheads, int ngroups, int dim_tiles,
+    unsigned long long state_stride_slot, long long x_batch_stride, long long b_batch_stride,
+    long long c_batch_stride, long long out_batch_stride, long long dt_batch_stride,
+    long long dt_head_stride, long long a_head_stride, long long d_head_stride,
+    long long dt_bias_head_stride, int dt_softplus, int has_z, int disable_state_update,
+    long long pad_slot_id) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -106,39 +112,52 @@ __global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a22
   int rows_per_tile = 128;
   int dim_base = 0;
   int dim_end = 128;
-  long long source_slot = state_batch_indices[batch];
-  long long destination_slot = ((1) ? source_slot : dst_state_batch_indices[batch]);
+  int index_i32 = INDEX_I32;
+  int coefficient_bf16 = COEFFICIENT_BF16;
+  long long batch_i64 = (long long)batch;
+  long long source_slot = 0;
+  long long destination_slot = 0;
+  if (index_i32 != 0) {
+    int _vec_load_0[1];
+    {
+      uint32_t _scalar_bits_0;
+      asm volatile(
+          "ld.global.nc.b32 %0, [%1];"
+          : "=r"(_scalar_bits_0)
+          : "l"((const void*)(reinterpret_cast<const int*>(state_batch_indices_addr) + (batch_i64)))
+          : "memory");
+      _vec_load_0[0] = (int32_t)_scalar_bits_0;
+    }
+    source_slot = (long long)_vec_load_0[0];
+    {
+      destination_slot = source_slot;
+    }
+  } else {
+    long long _vec_load_2[1];
+    {
+      asm("ld.global.nc.s64 %0, [%1];"
+          : "=l"(_vec_load_2[0])
+          : "l"((const void*)(reinterpret_cast<const long long*>(state_batch_indices_addr) +
+                              (batch_i64))));
+    }
+    source_slot = _vec_load_2[0];
+    {
+      destination_slot = source_slot;
+    }
+  }
   int row_subgroup = lane / 16;
   int row_member = lane % 16;
   int state_col = row_member * 8;
-  int bc_base = (batch * ngroups + group) * 128;
+  long long group_i64 = (long long)group;
+  long long b_base = batch_i64 * b_batch_stride + group_i64 * 128;
+  long long c_base = batch_i64 * c_batch_stride + group_i64 * 128;
   unsigned int b_carriers[4];
   unsigned int c_carriers[4];
   float b_direct_values[8];
   float c_direct_values[8];
   {
     {
-      const uint4* _vptr_0 = reinterpret_cast<const uint4*>(B + bc_base + state_col);
-      uint4 _vld_0[1];
-#pragma unroll
-      for (int _blk = 0; _blk < 1; _blk++) {
-        _vld_0[_blk] = _vptr_0[_blk];
-        uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
-#pragma unroll
-        for (int _pair = 0; _pair < 4; _pair++) {
-          asm volatile(
-              "{\n\t"
-              "shl.b32 %0, %2, 16;\n\t"
-              "and.b32 %1, %2, 0xffff0000;\n\t"
-              "}\n"
-              : "=f"((&b_direct_values[0 + _blk * 8 + _pair * 2])[0]),
-                "=f"((&b_direct_values[0 + _blk * 8 + _pair * 2])[1])
-              : "r"(_vpairs_0[_pair]));
-        }
-      }
-    }
-    {
-      const uint4* _vptr_1 = reinterpret_cast<const uint4*>(C + bc_base + state_col);
+      const uint4* _vptr_1 = reinterpret_cast<const uint4*>(B + b_base + (long long)state_col);
       uint4 _vld_1[1];
 #pragma unroll
       for (int _blk = 0; _blk < 1; _blk++) {
@@ -151,9 +170,29 @@ __global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a22
               "shl.b32 %0, %2, 16;\n\t"
               "and.b32 %1, %2, 0xffff0000;\n\t"
               "}\n"
+              : "=f"((&b_direct_values[0 + _blk * 8 + _pair * 2])[0]),
+                "=f"((&b_direct_values[0 + _blk * 8 + _pair * 2])[1])
+              : "r"(_vpairs_1[_pair]));
+        }
+      }
+    }
+    {
+      const uint4* _vptr_2 = reinterpret_cast<const uint4*>(C + c_base + (long long)state_col);
+      uint4 _vld_2[1];
+#pragma unroll
+      for (int _blk = 0; _blk < 1; _blk++) {
+        _vld_2[_blk] = _vptr_2[_blk];
+        uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
+#pragma unroll
+        for (int _pair = 0; _pair < 4; _pair++) {
+          asm volatile(
+              "{\n\t"
+              "shl.b32 %0, %2, 16;\n\t"
+              "and.b32 %1, %2, 0xffff0000;\n\t"
+              "}\n"
               : "=f"((&c_direct_values[0 + _blk * 8 + _pair * 2])[0]),
                 "=f"((&c_direct_values[0 + _blk * 8 + _pair * 2])[1])
-              : "r"(_vpairs_1[_pair]));
+              : "r"(_vpairs_2[_pair]));
         }
       }
     }
@@ -162,16 +201,25 @@ __global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a22
   float decay_lane = 0.0f;
   float d_lane = 0.0f;
   if (lane == 0) {
-    float dt_value = reinterpret_cast<float*>(
-        dt_addr)[(long long)batch * dt_batch_stride + (long long)head * dt_head_stride];
-    dt_value += reinterpret_cast<float*>(dt_bias_addr)[(long long)head * dt_bias_head_stride];
+    float dt_value = 0.0f;
+    if (coefficient_bf16 != 0) {
+      dt_value = (float)reinterpret_cast<__nv_bfloat16*>(
+          dt_addr)[(long long)batch * dt_batch_stride + (long long)head * dt_head_stride];
+      dt_value += (float)reinterpret_cast<__nv_bfloat16*>(
+          dt_bias_addr)[(long long)head * dt_bias_head_stride];
+      d_lane = (float)reinterpret_cast<__nv_bfloat16*>(d_addr)[(long long)head * d_head_stride];
+    } else {
+      dt_value = reinterpret_cast<float*>(
+          dt_addr)[(long long)batch * dt_batch_stride + (long long)head * dt_head_stride];
+      dt_value += reinterpret_cast<float*>(dt_bias_addr)[(long long)head * dt_bias_head_stride];
+      d_lane = reinterpret_cast<float*>(d_addr)[(long long)head * d_head_stride];
+    }
     float a_value = reinterpret_cast<float*>(a_addr)[(long long)head * a_head_stride];
     dt_lane = dt_value;
     {
       float _exp_2 = expf(a_value * dt_value);
       decay_lane = _exp_2;
     }
-    d_lane = reinterpret_cast<float*>(d_addr)[(long long)head * d_head_stride];
   }
   float _shfl_0 = __shfl_sync(0xFFFFFFFF, dt_lane, 0);
   float dt_value_1 = _shfl_0;
@@ -181,10 +229,9 @@ __global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a22
   float d_value = _shfl_2;
   for (int dim_group_base = dim_base + warp * 2; dim_group_base < dim_end; dim_group_base += 8) {
     int dim_index = dim_group_base + row_subgroup;
-    int x_index = 0;
-    {
-      x_index = (batch * nheads + head) * 128 + dim_index;
-    }
+    long long row_index = (long long)(head * 128 + dim_index);
+    long long x_index = batch_i64 * x_batch_stride + row_index;
+    long long out_index = batch_i64 * out_batch_stride + row_index;
     float x_lane = 0.0f;
     float z_lane = 0.0f;
     if (row_member == 0) {
@@ -205,27 +252,27 @@ __global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a22
           (unsigned long long)source_slot * state_stride_slot + row_offset;
       if (source_slot != pad_slot_id) {
         {
-          unsigned _ldv8_2_0;
-          unsigned _ldv8_2_1;
-          unsigned _ldv8_2_2;
-          unsigned _ldv8_2_3;
-          unsigned _ldv8_2_4;
-          unsigned _ldv8_2_5;
-          unsigned _ldv8_2_6;
-          unsigned _ldv8_2_7;
+          unsigned _ldv8_3_0;
+          unsigned _ldv8_3_1;
+          unsigned _ldv8_3_2;
+          unsigned _ldv8_3_3;
+          unsigned _ldv8_3_4;
+          unsigned _ldv8_3_5;
+          unsigned _ldv8_3_6;
+          unsigned _ldv8_3_7;
           asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                       : "=r"(_ldv8_2_0), "=r"(_ldv8_2_1), "=r"(_ldv8_2_2), "=r"(_ldv8_2_3),
-                         "=r"(_ldv8_2_4), "=r"(_ldv8_2_5), "=r"(_ldv8_2_6), "=r"(_ldv8_2_7)
+                       : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3),
+                         "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7)
                        : "l"((const void*)(state + (source_index)))
                        : "memory");
-          direct_state_values[0 + 0] = __uint_as_float(_ldv8_2_0);
-          direct_state_values[0 + 1] = __uint_as_float(_ldv8_2_1);
-          direct_state_values[0 + 2] = __uint_as_float(_ldv8_2_2);
-          direct_state_values[0 + 3] = __uint_as_float(_ldv8_2_3);
-          direct_state_values[0 + 4] = __uint_as_float(_ldv8_2_4);
-          direct_state_values[0 + 5] = __uint_as_float(_ldv8_2_5);
-          direct_state_values[0 + 6] = __uint_as_float(_ldv8_2_6);
-          direct_state_values[0 + 7] = __uint_as_float(_ldv8_2_7);
+          direct_state_values[0 + 0] = __uint_as_float(_ldv8_3_0);
+          direct_state_values[0 + 1] = __uint_as_float(_ldv8_3_1);
+          direct_state_values[0 + 2] = __uint_as_float(_ldv8_3_2);
+          direct_state_values[0 + 3] = __uint_as_float(_ldv8_3_3);
+          direct_state_values[0 + 4] = __uint_as_float(_ldv8_3_4);
+          direct_state_values[0 + 5] = __uint_as_float(_ldv8_3_5);
+          direct_state_values[0 + 6] = __uint_as_float(_ldv8_3_6);
+          direct_state_values[0 + 7] = __uint_as_float(_ldv8_3_7);
         }
       }
 #pragma unroll
@@ -240,18 +287,18 @@ __global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a22
         unsigned long long destination_index =
             (unsigned long long)source_slot * state_stride_slot + row_offset;
         {
-          unsigned _stv8_3_0 = __float_as_uint(direct_state_values[0 + 0]);
-          unsigned _stv8_3_1 = __float_as_uint(direct_state_values[0 + 1]);
-          unsigned _stv8_3_2 = __float_as_uint(direct_state_values[0 + 2]);
-          unsigned _stv8_3_3 = __float_as_uint(direct_state_values[0 + 3]);
-          unsigned _stv8_3_4 = __float_as_uint(direct_state_values[0 + 4]);
-          unsigned _stv8_3_5 = __float_as_uint(direct_state_values[0 + 5]);
-          unsigned _stv8_3_6 = __float_as_uint(direct_state_values[0 + 6]);
-          unsigned _stv8_3_7 = __float_as_uint(direct_state_values[0 + 7]);
+          unsigned _stv8_4_0 = __float_as_uint(direct_state_values[0 + 0]);
+          unsigned _stv8_4_1 = __float_as_uint(direct_state_values[0 + 1]);
+          unsigned _stv8_4_2 = __float_as_uint(direct_state_values[0 + 2]);
+          unsigned _stv8_4_3 = __float_as_uint(direct_state_values[0 + 3]);
+          unsigned _stv8_4_4 = __float_as_uint(direct_state_values[0 + 4]);
+          unsigned _stv8_4_5 = __float_as_uint(direct_state_values[0 + 5]);
+          unsigned _stv8_4_6 = __float_as_uint(direct_state_values[0 + 6]);
+          unsigned _stv8_4_7 = __float_as_uint(direct_state_values[0 + 7]);
           asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" ::"l"(
                            (void*)(state + (destination_index))),
-                       "r"(_stv8_3_0), "r"(_stv8_3_1), "r"(_stv8_3_2), "r"(_stv8_3_3),
-                       "r"(_stv8_3_4), "r"(_stv8_3_5), "r"(_stv8_3_6), "r"(_stv8_3_7)
+                       "r"(_stv8_4_0), "r"(_stv8_4_1), "r"(_stv8_4_2), "r"(_stv8_4_3),
+                       "r"(_stv8_4_4), "r"(_stv8_4_5), "r"(_stv8_4_6), "r"(_stv8_4_7)
                        : "memory");
         }
       }
@@ -269,7 +316,7 @@ __global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_a22
     row_sum += _shfl_xor_4;
     if (row_member == 0) {
       float result = row_sum + d_value * x_lane;
-      output[x_index] = result;
+      output[out_index] = result;
     }
   }
 }
