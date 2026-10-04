@@ -6822,11 +6822,17 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
         *args: Any,
         **kwargs: Any,
     ):
-        # Dispatch to the FC1 family of the configured quantization. Without a
-        # config (the registry lifecycle tests build bare instances) the base
-        # class's build() guard reports the missing lifecycle step.
-        if cls is CakeStepFunRunner and config is not None:
-            cls = cls.runner_class_for(config.quant)
+        if cls is CakeStepFunRunner:
+            # The dispatcher is abstract (forward / get_valid_tactics come from
+            # the FC1 family's trtllm-gen parent). Without a config, as the
+            # registry lifecycle tests build bare instances, use the first
+            # family: before build() only the lifecycle guard is reachable, so
+            # the choice is immaterial.
+            cls = (
+                cls.runner_class_for(config.quant)
+                if config is not None
+                else _CAKE_STEPFUN_RUNNERS[0]
+            )
         return super().__new__(cls)
 
     @classmethod
@@ -6862,17 +6868,6 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
 
         major, minor = get_compute_capability(self.device)
         self._module = get_cake_stepfun_moe_module(f"sm_{major}{minor}a")
-
-    # The dispatcher is concrete: a bare instance (no config, as the registry
-    # lifecycle tests build) stops at the build() guard, and the FC1 families
-    # inherit the trtllm-gen implementations that follow in their MRO.
-    def get_valid_tactics(self, *args: Any, **kwargs: Any) -> List[Any]:
-        self._require_built()
-        return super().get_valid_tactics(*args, **kwargs)
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        self._require_built()
-        return super().forward(*args, **kwargs)
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
