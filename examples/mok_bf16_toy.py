@@ -36,7 +36,7 @@ def expert(x, gate, up, down):
     return hidden @ down.T
 
 
-def reference(global_data, weights, *, fp32=False):
+def reference(global_data, weights, *, fp32=False, source_counts=None):
     rank, ep = dist.get_rank(), dist.get_world_size()
     device = weights[0].device
     dtype = torch.float32 if fp32 else torch.bfloat16
@@ -46,7 +46,12 @@ def reference(global_data, weights, *, fp32=False):
     scores = global_data["scores"].to(device)
     t, h = x.shape
     local = t // ep
-    own_rows = slice(rank * local, (rank + 1) * local)
+    if source_counts is None:
+        source_counts = [local] * ep
+    if len(source_counts) != ep or sum(source_counts) != t:
+        raise ValueError("Source counts must cover the global input exactly")
+    start = sum(source_counts[:rank])
+    own_rows = slice(start, start + source_counts[rank])
     local_experts = weights[3].shape[0]
     y_sum = torch.zeros((t, h), dtype=torch.float32, device=device)
     dx_sum = torch.zeros_like(y_sum)
@@ -89,6 +94,8 @@ def error_report(actual, expected, gate):
         for aa, bb in zip(
             a.flatten().split(1048576), b.flatten().split(1048576), strict=True
         ):
+            if aa.numel() == 0:
+                continue
             af, bf = aa.float(), bb.float()
             diff = (af - bf).abs()
             stats[0] = torch.maximum(stats[0], diff.max().double())
@@ -214,9 +221,11 @@ def main():
     local = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local)
     device = torch.device("cuda", local)
-    dist.init_process_group(
-        "nccl", device_id=device, timeout=datetime.timedelta(seconds=180)
-    )
+    owns_group = not dist.is_initialized()
+    if owns_group:
+        dist.init_process_group(
+            "nccl", device_id=device, timeout=datetime.timedelta(seconds=180)
+        )
     rank, ep = dist.get_rank(), dist.get_world_size()
     assert ep in (1, 4), "The example supports one or four local ranks"
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -344,7 +353,7 @@ def main():
                 global_experts=total_experts,
                 macro=config.macrobatch_size,
                 mini=config.minibatch_size,
-                schedule_capacity=workspace.schedule_capacity,
+                schedule_capacity=workspace.storage.schedule_capacity,
                 routed_loads=loads,
                 reports=reports,
                 three_graph_replays_bitwise_equal=True,
@@ -352,7 +361,8 @@ def main():
         )
     if rank == 0:
         print(json.dumps(dict(status="PASS", ep=ep, cases=cases), indent=2))
-    dist.destroy_process_group()
+    if owns_group:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

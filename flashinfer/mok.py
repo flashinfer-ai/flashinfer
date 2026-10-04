@@ -33,6 +33,7 @@ def create_mok_bf16_workspace(
     num_local_tokens,
     hidden_size,
     topk,
+    source_capacity=None,
     fwd_num_comm_sms=40,
     bwd_num_comm_sms=40,
     minibatch_size=4096,
@@ -42,11 +43,15 @@ def create_mok_bf16_workspace(
     """Collectively create a caller-owned ``(config, workspace)`` pair.
 
     The process group must be initialized and its CUDA device current.
-    Defaults describe the EP16 toy ring configuration. Local token counts,
-    widths and routing buffers must satisfy the backend README's contract.
+    Source input counts may differ across ranks, including zero. Common
+    physical capacity is negotiated once; optional ``source_capacity``
+    reserves future growth and must agree across ranks. Returned workspace
+    exposes ``source_capacity`` and physical ``storage``. Defaults describe
+    a small toy ring; see the backend README for capacity and reuse rules.
     Call outside CUDA Graph capture; retain the workspace for every replay.
     """
-    from .experimental.cake_mok_bf16.workspace import MoKConfig, create_workspace
+    from .experimental.cake_mok_bf16.workspace import MoKConfig
+    from .experimental.cake_mok_bf16.backend import create_source_workspace
 
     config = MoKConfig(
         fwd_num_comm_sms=fwd_num_comm_sms,
@@ -55,11 +60,12 @@ def create_mok_bf16_workspace(
         macrobatch_size=macrobatch_size,
         schedule_capacity_multiplier=schedule_capacity_multiplier,
     )
-    return config, create_workspace(
+    return config, create_source_workspace(
         config,
         group,
         device=device,
         num_local_tokens=num_local_tokens,
         hidden_size=hidden_size,
         topk=topk,
+        source_capacity=source_capacity,
     )

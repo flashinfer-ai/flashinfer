@@ -44,6 +44,27 @@ Use a separate workspace and adapter for concurrent executions.
 Calling the experimental API is the opt-in; it emits an experimental warning.
 There is no automatic dispatch or AOT registration.
 
+## Unequal source inputs
+
+`create_mok_bf16_workspace` collectively negotiates capacity from each rank's
+actual `num_local_tokens`. Supply optional `source_capacity` with the same
+value on every rank to reserve room for future inputs. The returned workspace
+contains common physical `storage`; schedules and outputs use logical source
+lengths. Invalid expert IDs mask padding, which contributes no routed work.
+Empty source ranks still participate in every collective; their local shared
+expert weight gradients are zero.
+
+To change counts within capacity, create a new schedule and forward context.
+Recapture CUDA Graphs when tensor shapes or addresses change. Same-shape value
+updates can replay directly. Earlier graphs can still replay while their
+inputs and workspace remain alive. Run graphs sharing a workspace serially
+and in the same order across ranks. Growth beyond capacity requires all ranks
+to recreate the workspace. Padding increases storage and work according to
+the maximum reserved capacity, not only the sum of real input lengths.
+
+Run `torchrun --standalone --nproc-per-node=4 examples/mok_bf16_unequal.py`
+for unequal lengths, empty ranks, count changes and graph reuse.
+
 ## Toy contract
 
 - Scheduler layouts `(EP, local experts, top-k)`: `(1, 4, 2)`, `(4, 4, 2)`,
@@ -51,14 +72,16 @@ There is no automatic dispatch or AOT registration.
 - BF16 inputs, expert weights, outputs and weight gradients; FP32 positive
   router scores; contiguous int64 expert IDs. Each token selects distinct,
   valid expert IDs. Scores are already normalized/scaled by the caller.
-- Token rows, hidden width, and intermediate width are positive multiples of
-  256; the workspace requires at least 512 local tokens. Communication-SM
+- Logical source token counts may differ across ranks and may be zero. Hidden
+  and intermediate widths are positive multiples of 256. Common physical
+  source capacity is aligned for tiles/metadata and is at least 512 rows. Communication-SM
   counts are positive and even, leaving compute SMs available.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
-- The EP16 toy workload has 16,384 global tokens (1,024 per rank), hidden width
+- An EP16 workload can use 16,384 source tokens per rank (262,144 global), hidden width
   6,144, intermediate width 2,048, 256 routed experts, and one shared expert.
-  Its mini/macro sizes are 4,096/32,768. Sequence length here is only a way to
+  For this workload, explicitly choose mini/macro sizes 4,096/393,216 and
+  sufficient schedule capacity; the smaller default ring is a diagnostic setting. Sequence length here is only a way to
   specify token count: no attention or sequence-dependent operation is tested.
 - A larger macro ring uses more memory and can avoid forward-context
   recomputation inside backward. A comparison that changes this setting must
@@ -73,14 +96,17 @@ backpropagation, and shared-gradient all-reduce are outside this adapter.
 Run `pytest tests/experimental/test_mok_bf16.py` for the independent
 BF16-rounding reference, empty experts, multiple ring lengths, variable
 widths, repeated eager execution, and changed-input CUDA Graph replay.
-The runnable distributed example is `examples/mok_bf16_toy.py`.
+The runnable distributed examples are `examples/mok_bf16_toy.py` and
+`examples/mok_bf16_unequal.py`. The focused validation passes six single-GPU
+tests and three tests on each of four ranks. Unequal inputs include empty
+ranks, all-empty inputs, changed counts, three bitwise-identical graph
+replays, earlier-graph reuse, and same-shape input updates.
 
 Owner: Haozheng Fan. This draft needs a public tracking issue and a maintainer-
 agreed release target before experimental admission. Graduation requires
-full distributed qualification of the exported runtime and resolution of
-positive-window sanitizer deadlock-detector failures; numerical checks alone
-do not clear that gate. No whole-model or public performance claim is made.
+full EP16 qualification of the exported runtime and sanitizer acceptance;
+numerical checks alone do not clear those gates. No whole-model or public performance claim is made.
 
 The CUDA schedules derive from Cursor Research's Apache-2.0 Mixture of Kittens
-implementation at the revision above. Copyright and modification notices are
+implementation at revision `caeb2963f855c7ad53bb50c8bbf211086405cb98`. Copyright and modification notices are
 retained in the generated source files.
