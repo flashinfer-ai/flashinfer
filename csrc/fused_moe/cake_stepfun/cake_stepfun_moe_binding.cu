@@ -200,7 +200,10 @@ void cake_stepfun_fc1(String const& family, TensorView const& hidden_states,
   int64_t const num_tokens = hidden_states.size(0);
   int64_t const hidden_size = hidden_states.size(1) * spec.actPerByte;
   int64_t const num_experts = gemm1_weights.size(0);
-  int64_t const intermediate_size = gemm1_output.size(1) * spec.actPerByte;
+  // The GEMM2 input has the family's activation storage ([max_padded, I / actPerByte] bytes), except for
+  // the per-token family whose FC1 output is bf16 [max_padded, I].
+  int64_t const intermediate_size =
+      spec.perToken ? gemm1_output.size(1) : gemm1_output.size(1) * spec.actPerByte;
   TVM_FFI_ICHECK_EQ(gemm1_clamp_limit.size(0), num_experts)
       << "cake_stepfun_fc1: gemm1_clamp_limit must hold one value per expert.";
   float* scale_c = optionalFloatPtr(output1_scale_scalar, "output1_scale_scalar", num_experts, device);
