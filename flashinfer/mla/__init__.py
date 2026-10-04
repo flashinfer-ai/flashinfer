@@ -83,6 +83,7 @@ _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS = frozenset(
 _CAKE_DSV4_LAZY_EXPORTS = frozenset(
     {
         "cake_dsv4_workspace_layout",
+        "cake_dsv4_workspace_requirement",
         "cake_dsv4_workspace_reset",
         "get_cake_dsv4_workspace_bytes",
         "resolve_cake_dsv4_sparse_metadata",
