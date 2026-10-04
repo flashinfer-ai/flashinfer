@@ -772,6 +772,129 @@ def test_caller_owned_outputs_and_workspace():
     )
 
 
+@pytest.mark.parametrize(
+    "group_counts,n2,k",
+    [
+        pytest.param([128, 128, 100], 256, 1024, id="small_m_cake_gemm"),
+        pytest.param([128, 256], 256, 512, id="small_m_cute_gemm"),
+        pytest.param([256] * 8, 256, 512, id="fused"),
+        pytest.param([128] * 16, 2048, 4096, id="wide_all_one_block"),
+    ],
+)
+def test_launch_rebinds_per_call_operands(group_counts, n2, k):
+    """One prepared object per layer: the token operands and outputs are swapped per call without copies."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n2, k, seed=672, device=device
+    )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, group_counts=group_counts
+    )
+    a2, _, a_scale2, _, _ = _make_inputs(group_counts, n2, k, seed=673, device=device)
+    m_indices2 = m_indices.clone()
+    out_q2 = torch.empty_like(prepared.out_q)
+    out_s2 = torch.empty_like(prepared.out_s)
+    rebound = dict(
+        a=a2, a_scale=a_scale2, m_indices=m_indices2, out_q=out_q2, out_s=out_s2
+    )
+    q, s = prepared.launch(**rebound)
+    assert q is out_q2 and s is out_s2
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a2, b, a_scale2, b_scale, m_indices2))
+    _assert_quantizes_reference(out_q2, out_s2, g, u)
+    # The prepared operands are untouched and still bound.
+    q, s = prepared.launch()
+    assert q is prepared.out_q and s is prepared.out_s
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(q, s, g, u)
+    # A captured rebound launch replays onto the rebound tensors.
+    expected_q, expected_s = out_q2.clone(), out_s2.clone()
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        prepared.launch(**rebound)
+    out_q2.view(torch.uint8).fill_(0xFF)
+    out_s2.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_q2.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(out_s2, expected_s)
+    with pytest.raises(ValueError, match="a must have shape"):
+        prepared.launch(a=a2[:128].contiguous())
+    with pytest.raises(ValueError, match="out_s must have shape"):
+        prepared.launch(out_s=out_s2[:, :0].contiguous())
+
+
+@pytest.mark.parametrize(
+    "real_counts,n2,k",
+    [
+        pytest.param([100, 128, 5, 0, 250], 256, 512, id="small_m"),
+        pytest.param(
+            [200, 0, 37, 256, 129, 300, 1, 255, 128, 64, 99, 180],
+            256,
+            512,
+            id="large_m",
+        ),
+    ],
+)
+def test_fill_padding_accepts_compact_layout(real_counts, n2, k):
+    """-1 padding rows (compact MoE layout) are forward-filled onto the preceding expert."""
+    device = torch.device("cuda")
+    padded = [-(-c // 128) * 128 for c in real_counts]
+    a, b, a_scale, b_scale, _ = _make_inputs(padded, n2, k, seed=674, device=device)
+    rows = []
+    for g, (c, p) in enumerate(zip(real_counts, padded, strict=True)):
+        rows += [g] * c + [-1] * (p - c)
+    m_indices = torch.tensor(rows, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="fill_padding"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, validate_indices=True
+        )
+    unsorted = m_indices.clone()
+    unsorted[: real_counts[0]] = len(real_counts) - 1
+    with pytest.raises(ValueError, match="m_indices must be sorted"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            unsorted,
+            validate_indices=True,
+            fill_padding=True,
+        )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True, fill_padding=True
+    )
+    # group_counts count the padding rows that follow each expert
+    from_counts = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, group_counts=padded, fill_padding=True
+    )
+    assert from_counts.route == prepared.route
+    filled = torch.clamp(torch.cummax(m_indices, 0).values, min=0)
+    valid = m_indices >= 0
+    out_q, out_s = prepared.launch()
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, filled))
+    _assert_quantizes_reference(out_q[valid], out_s[valid], g[valid], u[valid])
+    # Graph capture includes the two forward-fill kernels.
+    expected_q, expected_s = out_q.clone(), out_s.clone()
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        prepared.launch()
+    out_q.view(torch.uint8).fill_(0xFF)
+    out_s.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out_q[valid].view(torch.uint8), expected_q[valid].view(torch.uint8)
+    )
+    assert torch.equal(out_s[valid], expected_s[valid])
+
+
 def test_re_preparing_per_step_retains_no_device_memory():
     """A new routing per step re-prepares the launch on the fused routes; nothing accumulates."""
     device = torch.device("cuda")
