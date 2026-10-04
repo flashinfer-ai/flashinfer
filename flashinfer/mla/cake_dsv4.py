@@ -44,6 +44,19 @@ Host contract (flashinfer#4671 hardening)
   ``ragged_query = 1``. The producers in :data:`_RAGGED_ONLY_ROUTES` read the
   request boundaries from ``cum_seq_lens_q`` unconditionally and receive the
   cached dense offsets instead. No host value is ever ``None``.
+* **Preconditions on the metadata.** Every metadata row must keep at least
+  one column inside the three validity predicates' domain: the active length
+  ``sparse_topk_lens[t] + sparse_topk_lens_offset`` must be ``>= 1`` and the
+  owning request must satisfy ``seq_lens[b] >= q_len_b`` (so the SWA window
+  holds at least the row's own token). sglang satisfies both by construction
+  (constant 128 on SWA-only layers, the window always contains the current
+  token). A row whose columns are all ``-1`` or all beyond the window is a
+  defined input and returns the all-invalid zero result. An active length of
+  0 is outside the trtllm-gen contract (the stock FP8 kernels read past the
+  active length or return NaN there); the Cake programs regenerated for
+  CAKE-957 all return the zero result for it (tile-count guards in the FP8
+  persistent, BF16 H64 guard/prefill and FP8 H64 source-exact bodies). The
+  host does not synchronise to check these values.
 * **Workspace.** One caller-owned ``workspace_buffer`` is carved
   deterministically (:func:`cake_dsv4_workspace_layout`)::
 
