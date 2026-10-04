@@ -11,14 +11,14 @@
     "qkv": "cake_dsv4_nvfp4_rope_insert_qkv"
   },
   "family": "cake_dsv4_nvfp4_rope_insert",
-  "generated_at": "2026-10-04T03:42:03Z",
+  "generated_at": "2026-10-04T04:37:03Z",
   "generator": "sm120-dsv4-nvfp4-rope-insert-flashinfer-export",
-  "grid": "ceil(num_tokens * (q_head_padded + 1) / warps_per_cta) CTAs; q_head_padded = 0 for the kv entry",
+  "grid": "ceil(num_tokens * slots_per_token / warps_per_cta) CTAs; slots_per_token = q_head_padded + 1 (copy form), q_head_padded / 8 (in-place form, slot 0 also inserts the KV row), 1 (kv entry)",
   "head_dim": 512,
   "header": "cake_dsv4_nvfp4_rope_insert_kernels.h",
-  "identity": "39e028c71bfebe564a75ea22f5c11a6240973e964acdfea41c1c7ce6841d40ba",
+  "identity": "1da663e2b21836efc19d4b11d5a68d413fdb7e8b698f6db59e8f48048c0613b9",
   "identity_scope": "sha256 over sorted (file name, file text without the provenance header)",
-  "kernel_commit": "3f3311e816369c1e61898df4b360c141d1f7fa2f",
+  "kernel_commit": "67117e3900a111237b3198980a1e98f16013ba8d",
   "kernel_params": [
     "q",
     "kv",
@@ -57,7 +57,7 @@
     "cake_dsv4_nvfp4_rope_insert_binding.cu"
   ],
   "threads": 256,
-  "tree_commit": "b86f8d89e26c86690429010ab307212993667edf",
+  "tree_commit": "b8f7de96b91ed70690f6e9584c8dfcbafd7a230e",
   "variants": [
     {
       "apply_q_rope": true,
