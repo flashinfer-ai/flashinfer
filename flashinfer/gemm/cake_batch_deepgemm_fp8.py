@@ -353,6 +353,11 @@ def is_batch_deepgemm_fp8_nt_groupwise_cake_available(device: torch.device) -> b
     return device.type == "cuda" and generated_program_available(device)
 
 
+def _grid3(grid: tuple[int, ...]) -> tuple[int, int, int]:
+    x, y, z = (int(v) for v in grid)
+    return (x, y, z)
+
+
 def bind_arguments(
     arg_plan: list[list[str]],
     positional: tuple[Any, ...],
@@ -643,7 +648,7 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
         arch=problem.arch,
         sm_count=problem.sm_count,
         programs=tuple(stage.program for stage in plan.stages),
-        grids=tuple(tuple(int(v) for v in stage.grid) for stage in plan.stages),
+        grids=tuple(_grid3(stage.grid) for stage in plan.stages),
         out=out,
         workspace=workspace,
         _launches=tuple(launches),
