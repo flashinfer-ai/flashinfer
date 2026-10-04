@@ -36,7 +36,7 @@ namespace {
 
 using tvm::ffi::Array;
 using tvm::ffi::TensorView;
-namespace moe = tensorrt_llm::kernels::trtllmgen_moe;
+namespace tgm = tensorrt_llm::kernels::trtllmgen_moe;
 namespace btg = batchedGemm::trtllm::gen;
 namespace generated = flashinfer::cake_stepfun::generated;
 
@@ -133,7 +133,7 @@ void cake_stepfun_fc1_nvfp4(TensorView const& hidden_states, TensorView const& h
       << "cake_stepfun_fc1_nvfp4: total_num_padded_tokens must hold one value.";
   TVM_FFI_ICHECK_EQ(gemm1_output.size(1) * 2, intermediate_size)
       << "cake_stepfun_fc1_nvfp4: gemm1_output columns must be intermediate_size / 2.";
-  int64_t const max_padded_tokens = moe::Routing::getMaxPermutedPaddedCount(
+  int64_t const max_padded_tokens = tgm::Routing::getMaxPermutedPaddedCount(
       static_cast<int32_t>(num_tokens), static_cast<int32_t>(top_k),
       static_cast<int32_t>(num_experts), static_cast<int32_t>(tile_tokens_dim));
   TVM_FFI_ICHECK_EQ(gemm1_output.size(0), max_padded_tokens)
@@ -142,7 +142,7 @@ void cake_stepfun_fc1_nvfp4(TensorView const& hidden_states, TensorView const& h
   TVM_FFI_ICHECK_EQ(gemm1_output_scale.size(0), max_padded_tokens * intermediate_size / 16)
       << "cake_stepfun_fc1_nvfp4: gemm1_output_scale must hold max_padded_tokens * "
          "intermediate_size / 16 bytes.";
-  int64_t const max_ctas = moe::Routing::getMaxNumCtasInBatchDim(
+  int64_t const max_ctas = tgm::Routing::getMaxNumCtasInBatchDim(
       static_cast<int32_t>(num_tokens), static_cast<int32_t>(top_k),
       static_cast<int32_t>(num_experts), static_cast<int32_t>(tile_tokens_dim));
   TVM_FFI_ICHECK_GE(cta_idx_xy_to_batch_idx.size(0), max_ctas)
@@ -152,9 +152,9 @@ void cake_stepfun_fc1_nvfp4(TensorView const& hidden_states, TensorView const& h
   TVM_FFI_ICHECK_GE(permuted_idx_to_token_idx.size(0), max_padded_tokens)
       << "cake_stepfun_fc1_nvfp4: permuted_idx_to_token_idx is shorter than the padded count.";
 
-  moe::cake_stepfun::Fc1Runner runner(
+  tgm::cake_stepfun::Fc1Runner runner(
       btg::Dtype::E2m1, btg::Dtype::E2m1, btg::Dtype::E2m1, /*useDeepSeekFp8=*/false,
-      static_cast<int>(tile_tokens_dim), moe::MoE::ActivationType::SwigluStep,
+      static_cast<int>(tile_tokens_dim), tgm::MoE::ActivationType::SwigluStep,
       /*useShuffledMatrix=*/true, batchedGemm::gemm::MatrixLayout::MajorK,
       batchedGemm::gemm::BiasType::None, /*usePerTokenScaling=*/false,
       /*usePerChannelScaling=*/false);
