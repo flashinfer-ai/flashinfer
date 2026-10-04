@@ -134,7 +134,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             260,
             2,
-            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="w14-h64-w260-128tok",
         ),
         pytest.param(
@@ -1036,7 +1036,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             640,
             64,
-            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="h64-w640-192tok",
         ),
         pytest.param(
@@ -1047,7 +1047,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             388,
             2,
-            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="h64-w388-192tok",
         ),
         # Off-contract low-head width beyond the three sparse tiles one
@@ -2190,11 +2190,15 @@ class _RecordingLauncher:
         (16, 260, "bf16_h128_topk128x_split4_sm100", 4),
         (12, 388, "bf16_h128_topk128x_split4_sm100", 4),
         (16, 388, "bf16_h128_topk128x_split4_sm100", 4),
-        # Above the token bound one row-first owner per token.
-        (17, 260, "bf16_h128_topk128x_row_first", 1),
-        (32, 260, "bf16_h128_topk128x_row_first", 1),  # hardening-000025
+        # Above the token bound one row-first owner per token; up to 37
+        # tokens the owner runs in the V-half split form (two 2-CTA clusters
+        # per token = grid 4 * tokens, identical bits).
+        (17, 260, "bf16_h128_topk128x_row_first_vsplit", 1),
+        (32, 260, "bf16_h128_topk128x_row_first_vsplit", 1),  # hardening-000025
+        (37, 260, "bf16_h128_topk128x_row_first_vsplit", 1),
+        (38, 260, "bf16_h128_topk128x_row_first", 1),
         (64, 260, "bf16_h128_topk128x_row_first", 1),  # hardening-000031
-        (32, 388, "bf16_h128_topk128x_row_first", 1),
+        (32, 388, "bf16_h128_topk128x_row_first_vsplit", 1),
         (64, 388, "bf16_h128_topk128x_row_first", 1),
     ],
 )
@@ -2210,11 +2214,14 @@ def test_bf16_h128_topk128x_launches_split4_or_row_first_owners(
     cake._dispatch_route("bf16_h128_topk128x", L)
     parts = L.partials(expected_splits)
     if expected_splits == 1:
+        # The V-half split program runs two 2-CTA clusters per token; the
+        # plain row-first owner one.  total_work_items stays the token count.
+        ctas_per_token = 4 if expected_producer.endswith("_vsplit") else 2
         assert L.calls == [
             (
                 expected_producer,
                 {
-                    "grid": (2 * num_query_tokens, 1, 1),
+                    "grid": (ctas_per_token * num_query_tokens, 1, 1),
                     "total_work_items": num_query_tokens,
                     **parts,
                 },
@@ -2411,14 +2418,14 @@ def test_bf16_h128_prefill_launches_the_snake_body_for_tail_majority_rows(
             128,
             2,
             260,
-            "fp8_h64_prefill_source_persistent_m64",
-        ),  # hardening-000022 (W14)
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        ),  # hardening-000022 (W14; multi-tile program)
         (
             512,
             2,
             260,
-            "fp8_h64_prefill_source_persistent_m64",
-        ),  # hardening-000034 (W14)
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        ),  # hardening-000034 (W14; multi-tile program)
         (
             64,
             None,
@@ -2456,3 +2463,56 @@ def test_fp8_h64_rows_follow_the_persistent_body_rule(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize("num_query_tokens", [128, 256, 512])
+@pytest.mark.parametrize(
+    "sparse_topk,page_size,expected",
+    [
+        # The M64 body is two exported programs selected by the item width:
+        # the box-K-gather program for single-tile items (the SWA tile is the
+        # whole item: hardening-000026 / 000032), the program without the box
+        # block for every wider item (hardening-000022 / 000028 / 000034 /
+        # 000038).  Same ABI, same bits.
+        (128, None, "fp8_h64_prefill_source_persistent_m64"),
+        (260, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (388, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (640, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (1152, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+    ],
+)
+def test_fp8_h64_m64_program_is_selected_by_the_item_width(
+    num_query_tokens, sparse_topk, page_size, expected
+):
+    assert (
+        _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=64,
+            batch_size=8,
+            max_q_len=8,
+            ragged=True,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=num_query_tokens,
+        )
+        == expected
+    )
+    # Both M64 programs are ragged-only persistent routes with one CTA per token.
+    assert expected in cake._RAGGED_ONLY_ROUTES
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize(
+    "route",
+    [
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
+    ],
+)
+def test_fp8_h64_m64_programs_launch_one_cta_per_token(arch, route):
+    tokens = 192
+    L = _RecordingLauncher(arch, num_query_tokens=tokens, num_heads=64, sparse_topk=388)
+    cake._dispatch_route(route, L)
+    assert L.calls == [
+        (route, {"grid": (tokens, 1, 1), "total_work_items": tokens, **L.partials(1)})
+    ]
