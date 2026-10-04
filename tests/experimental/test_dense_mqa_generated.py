@@ -540,3 +540,70 @@ def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
         changed = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)
     stream.synchronize()
     assert torch.equal(captured, changed) and not torch.equal(captured, eager)
+
+
+def test_catalog_programs_are_delivered_and_distinct():
+    """Host-only: every program a dense or paged route names is catalogued, its generated units exist
+    under FlashInfer's ``csrc`` (a module: its own ``<name>_kernel.cu`` + ``<name>_binding.cu``; a
+    sequence: >= 2 module kernels + its own binding), no two generated kernel units are byte-identical
+    and no generated unit is unreferenced -- a route table pointing at a program hash whose units were
+    regenerated under a new hash fails here, not at JIT build time."""
+    import hashlib
+
+    from flashinfer.jit import env
+
+    csrc = env.FLASHINFER_CSRC_DIR
+    catalog = _runtime._catalog()
+    programs = catalog["programs"]
+    generated = "csrc/experimental/deepgemm_dense_mqa/generated"
+    for table in ("routes", "paged_routes"):
+        for route, record in catalog.get(table, {}).items():
+            for _stage, program in record["stages"]:
+                assert program in programs, (table, route, program)
+            assert not record.get("sequence") or record["sequence"] in programs, (
+                table,
+                route,
+            )
+    referenced, kernels = set(), {}
+    for name, record in programs.items():
+        for source in record["sources"]:
+            assert source.startswith("csrc/"), (name, source)
+            assert (csrc / source.removeprefix("csrc/")).is_file(), (name, source)
+            referenced.add(source)
+        if record.get(
+            "standalone", True
+        ):  # an omitted-binding module carries no closure digest
+            for arch in record["arches"]:
+                assert arch in (record.get("closure_sha256") or {}), (name, arch)
+        if record["kind"] == "module":
+            expected = {f"{generated}/{name}_kernel.cu"}
+            if record["standalone"]:
+                expected.add(f"{generated}/{name}_binding.cu")
+            assert set(record["sources"]) == expected, (name, record["sources"])
+            kernels[f"{generated}/{name}_kernel.cu"] = name
+        else:
+            assert record["kind"] == "sequence", name
+            devices = [s for s in record["sources"] if s.endswith("_kernel.cu")]
+            assert (
+                len(devices) >= 2
+                and f"{generated}/{name}_binding.cu" in record["sources"]
+            ), name
+            for device in devices:
+                owner = device.rsplit("/", 1)[1].removesuffix("_kernel.cu")
+                assert programs.get(owner, {}).get("kind") == "module", (name, device)
+    digests = {}
+    for source, name in sorted(kernels.items()):
+        digest = hashlib.sha256(
+            (csrc / source.removeprefix("csrc/")).read_bytes()
+        ).hexdigest()
+        assert digest not in digests, (
+            f"{name} kernel unit is byte-identical to {digests[digest]}'s"
+        )
+        digests[digest] = name
+    generated_dir = csrc / generated.removeprefix("csrc/")
+    orphans = sorted(
+        p.name
+        for p in generated_dir.iterdir()
+        if p.suffix == ".cu" and f"{generated}/{p.name}" not in referenced
+    )
+    assert not orphans, f"generated units not referenced by the catalog: {orphans}"
