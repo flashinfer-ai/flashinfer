@@ -768,15 +768,19 @@ class CakeStepFunConfig:
     """Cake StepFun FC1 kernels inside the trtllm-gen fused-MoE pipeline.
 
     The backend runs the trtllm-gen routing, GEMM2 and finalize stages unchanged
-    and serves the GEMM1 stage with exported Cake NVFP4 kernels that evaluate the
+    and serves the GEMM1 stage with exported Cake kernels that evaluate the
     StepFun activation ``clamp(up, -L, L) * min(silu(gate), L)`` with a per-expert
-    limit ``L``. It accepts NVFP4×NVFP4 with :class:`SwiGLUStep` on exact SM100
-    and SM103 only and is never part of the default backend list; users opt in
-    with ``CakeStepFunConfig(backend="cake")``.
+    limit ``L``. It accepts four weight families, each with :class:`SwiGLUStep`
+    on exact SM100 and SM103 only: NVFP4×NVFP4 (E2m1 or bf16 output),
+    BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. It is never part of the
+    default backend list; users opt in with ``CakeStepFunConfig(backend="cake")``.
 
     The physical weight and activation layouts are exactly those produced by
-    :class:`TrtllmFp4Config` for NVFP4×NVFP4; the view additionally carries the
-    per-expert ``gemm1_clamp_limit`` the Cake kernels read.
+    the matching trtllm-gen config for the family (:class:`TrtllmFp4Config` for
+    NVFP4, :class:`TrtllmBf16Config` for BF16, :class:`TrtllmFp8PerTensorConfig`
+    for per-tensor FP8 and :class:`TrtllmFp8BlockConfig` for MXFP8); the view
+    additionally carries the per-expert ``gemm1_clamp_limit`` the Cake kernels
+    read.
     """
 
     backend: Literal["cake"] = "cake"
