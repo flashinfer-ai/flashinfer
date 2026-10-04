@@ -34,7 +34,7 @@ the semantic flags), exactly as the Cake production dispatcher does; the export
 verifies key, grid and schedule parity for every row of its denominator.  Dense
 token-major inputs with the residual add and the fused output norm take the
 persistent TMEM path (or one of the installed native ports / the exact K = 0
-path); the block-boundary snapshot write (``block_write_idx`` >= K) runs the small-M
+path); the block-boundary snapshot write (``block_write_idx`` == K) runs the write variants of the dense
 write programs; the other semantic variants (no delta, a snapshot write below K, no
 output norm, row-padded layouts) take the one-CTA-per-token bootstrap program.
 
@@ -339,7 +339,7 @@ _PERSISTENT_FLAG_PWA = 1
 _PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
 _PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
 _PERSISTENT_FLAG_ONE_TOKEN_PER_CTA = 4
-_PERSISTENT_KEY = re.compile(r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)$")
+_PERSISTENT_KEY = re.compile(r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)(_write)?$")
 _SMALL_M_KEY = re.compile(
     r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_write)?$"
 )
@@ -416,10 +416,14 @@ def _persistent_fallback(
         if exact
         else (None, None, None)
     )
+    want_write = bool(exact and exact.group(5)) or plan.kernel_key.endswith("_write")
     candidates = []
     for key in table:
         match = _PERSISTENT_KEY.match(key)
         if match is None or int(match.group(1)) != K:
+            continue
+        if bool(match.group(5)) != want_write:
+            # the snapshot store exists only in the write variants: never cross that line
             continue
         nc, depth, bits = int(match.group(2)), int(match.group(3)), match.group(4)
         score = (
@@ -442,9 +446,11 @@ def _persistent_fallback(
     else:
         grid_x, grid_policy = _grid(M, num_sms, nc)
     schedule_id = _persistent_schedule_id(nc, depth, bits)
+    if want_write:
+        schedule_id += "_write"
     wait_policy = "deferred_wait_st" if _wait_policy(plan.arch) else "control_wait_st"
     route_id = (
-        f"{schedule_id}.{plan.arch}.{wait_policy}.k{K}.delta1.write0.norm1."
+        f"{schedule_id}.{plan.arch}.{wait_policy}.k{K}.delta1.write{int(want_write)}.norm1."
         f"pdl{int(plan.use_pdl)}.{grid_policy}.registered_fallback"
     )
     return RoutePlan(
@@ -580,24 +586,45 @@ def _plan_route_exact(
         raise ValueError(f"invalid persistent launch geometry M={M}, num_sms={num_sms}")
     write_idx = int(block_write_idx)
     if write_idx >= 0:
-        # Round r4 (direction 4): the dense snapshot-write call (block K written) runs the
-        # small-M write programs at every M: the cluster / chunk bands of the dense family
-        # inside its M table, one CTA per token above it. An index below K names a block the
-        # call also reads and never reaches the dense path (``common_path_eligible``).
-        if not K <= write_idx < MAX_BLOCKS:
+        # Round r4 (direction 4 / 4b): the block-boundary snapshot write (block K written)
+        # runs the write variant of the dense cell's program: the small-M write programs
+        # inside the dense family's M table, the persistent write variant where the dense
+        # cell is persistent, one small-M CTA per token elsewhere. The written index is the
+        # program's K; any other index keeps the bootstrap (``common_path_eligible``).
+        if write_idx != K or not 0 <= K < MAX_BLOCKS:
             raise ValueError(
-                "dense snapshot-write route requires num_blocks <= block_write_idx < "
+                "dense snapshot-write route requires block_write_idx == num_blocks < "
                 f"{MAX_BLOCKS}, observed {write_idx} at K={K}"
             )
-        return _small_m_plan(
+        max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
+        dense = (
+            None
+            if max_m is not None and max_m >= M
+            else _plan_route_exact(arch, num_sms, M, K, use_pdl)
+        )
+        if dense is None or dense.kind != "persistent":
+            return _small_m_plan(
+                arch,
+                M,
+                K,
+                use_pdl,
+                _small_m_cluster(arch, M, K),
+                None,
+                sources_per_chunk=_small_m_sources_per_chunk(arch, M, K),
+                write_block=True,
+            )
+        schedule_id = f"{dense.schedule_id}_write"
+        return RoutePlan(
+            "persistent",
+            f"{dense.kernel_key}_write",
+            dense.grid_x,
+            dense.threads,
+            schedule_id,
+            dense.route_id.replace(dense.schedule_id, schedule_id, 1).replace(
+                ".write0.", ".write1.", 1
+            ),
             arch,
-            M,
-            K,
             use_pdl,
-            _small_m_cluster(arch, M, K),
-            None,
-            sources_per_chunk=_small_m_sources_per_chunk(arch, M, K),
-            write_block=True,
         )
     max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
     if max_m is not None and max_m >= M:
@@ -836,13 +863,16 @@ def common_path_eligible(
     block_write_idx: int,
 ) -> bool:
     """True when the call takes the dense path: residual add + fused output norm, no snapshot
-    write or (round r4) a snapshot write at an index >= ``num_blocks`` (the small-M write
-    programs; an index below K names a block the call also reads and takes the bootstrap),
-    token-major dense layouts with 16-byte aligned rows and a full ``[M, 8, H]`` snapshot bank."""
+    write or (round r4) the snapshot write of block ``num_blocks`` (the write variants of the
+    dense programs; an index below K names a block the call also reads, any other index keeps
+    the bootstrap), token-major dense layouts with 16-byte aligned rows and a full
+    ``[M, 8, H]`` snapshot bank."""
     if delta is None or output_norm_weight is None:
         return False
     write_idx = int(block_write_idx)
-    if 0 <= write_idx < int(num_blocks) or write_idx >= int(blocks.shape[1]):
+    if (write_idx >= 0 and write_idx != int(num_blocks)) or write_idx >= int(
+        blocks.shape[1]
+    ):
         return False
     if (
         prefix.stride(0) != HIDDEN_SIZE

@@ -182,25 +182,36 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x):
 @pytest.mark.parametrize(
     "M,K", ((1, 1), (16, 7), (64, 4), (256, 7), (1024, 1), (4096, 4))
 )
-def test_plan_route_snapshot_write_takes_the_small_m_write_programs(arch, M, K, pdl):
-    """Round r4: the block-boundary snapshot write (block K written) runs the small-M write
-    programs at every M - the cluster / chunk bands of the dense family inside its M table,
-    one CTA per token above it."""
+def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
+    """Round r4 (direction 4 / 4b): the block-boundary snapshot write (block K written) runs
+    the write variant of the dense cell's program - the small-M write programs inside the
+    dense family's M table, the persistent write variant where the dense cell is persistent."""
     plan = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=K)
-    cluster = cb._small_m_cluster(arch, M, K)
-    nc = cb._small_m_sources_per_chunk(arch, M, K)
-    nc_suffix = "" if nc is None else f"_nc{nc}"
-    family = "direct" if cluster == 1 else f"cluster{cluster}"
-    assert plan.kind == "small_m"
-    assert plan.kernel_key == f"small_m_{family}:k{K}{nc_suffix}_write"
-    assert plan.grid_x == M * cluster and plan.threads == 256 // cluster
-    assert plan.schedule_id.endswith(f"_regres_fp32x2{nc_suffix}_write")
-    assert f".k{K}.delta1.write1.norm1.pdl{int(pdl)}." in plan.route_id
+    dense = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl)
+    max_m = cb._SMALL_M_DIRECT_MAX_M[arch].get(K)
     assert plan.fallback_from is None
-    with pytest.raises(ValueError):
-        cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=K - 1)
-    with pytest.raises(ValueError):
-        cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=MAX_BLOCKS)
+    assert f".k{K}.delta1.write1.norm1.pdl{int(pdl)}." in plan.route_id
+    assert plan.schedule_id.endswith("_write") and plan.kernel_key.endswith("_write")
+    if (max_m is not None and max_m >= M) or dense.kind != "persistent":
+        cluster = cb._small_m_cluster(arch, M, K)
+        nc = cb._small_m_sources_per_chunk(arch, M, K)
+        nc_suffix = "" if nc is None else f"_nc{nc}"
+        family = "direct" if cluster == 1 else f"cluster{cluster}"
+        assert plan.kind == "small_m"
+        assert plan.kernel_key == f"small_m_{family}:k{K}{nc_suffix}_write"
+        assert plan.grid_x == M * cluster and plan.threads == 256 // cluster
+        assert plan.schedule_id.endswith(f"_regres_fp32x2{nc_suffix}_write")
+    else:
+        assert plan.kind == "persistent"
+        assert plan.kernel_key == f"{dense.kernel_key}_write"
+        assert plan.schedule_id == f"{dense.schedule_id}_write"
+        assert (plan.grid_x, plan.threads) == (dense.grid_x, dense.threads)
+        assert plan.route_id == dense.route_id.replace(
+            dense.schedule_id, plan.schedule_id, 1
+        ).replace(".write0.", ".write1.", 1)
+    for bad_idx in (K - 1, K + 1, MAX_BLOCKS):
+        with pytest.raises(ValueError):
+            cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=bad_idx)
 
 
 def test_snapshot_write_fallback_stays_in_the_write_family(monkeypatch):
@@ -595,10 +606,10 @@ def test_semantic_variants_take_the_bootstrap(
 
 @pytest.mark.parametrize("M,K", [(17, 4), (3, 7), (1, 1), (300, 4), (1024, 1)])
 @pytest.mark.parametrize("pdl", [False, True])
-def test_snapshot_write_matches_reference_on_the_small_m_write_programs(M, K, pdl):
-    """Round r4: the block-boundary snapshot write (delta + output norm, block K written) runs a
-    small-M write program; the written snapshot and the prefix are bit-exact, the output within
-    tolerance, every other block byte preserved."""
+def test_snapshot_write_matches_reference_on_the_write_variants(M, K, pdl):
+    """Round r4: the block-boundary snapshot write (delta + output norm, block K written) runs the
+    write variant of the dense program; the written snapshot and the prefix are bit-exact, the
+    output within tolerance, every other block byte preserved."""
     device, arch = _device_arch()
     if not cb.generated_program_available(
         device, M, K, enable_pdl=pdl, block_write_idx=K
@@ -622,7 +633,7 @@ def test_snapshot_write_matches_reference_on_the_small_m_write_programs(M, K, pd
         block_write_idx=K,
         enable_pdl=pdl,
     )
-    assert runner.plan.kind == "small_m"
+    assert runner.plan.kind in ("small_m", "persistent")
     assert runner.plan.kernel_key.endswith("_write")
     assert ".write1." in runner.plan.route_id
     runner.launch()
