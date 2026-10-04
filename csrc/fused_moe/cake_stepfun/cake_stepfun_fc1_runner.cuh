@@ -49,8 +49,8 @@ class Fc1Runner {
   explicit Fc1Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
                      batchedGemm::trtllm::gen::Dtype dtypeWeights,
                      batchedGemm::trtllm::gen::Dtype dtypeOutput, bool useDeepSeekFp8,
-                     int tileTokensDim, MoE::ActivationType activationType,
-                     bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
+                     int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
+                     batchedGemm::gemm::MatrixLayout weightLayout,
                      batchedGemm::gemm::BiasType biasType, bool usePerTokenScaling,
                      bool usePerChannelScaling);
 

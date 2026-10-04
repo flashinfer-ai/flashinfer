@@ -15,7 +15,8 @@
  */
 
 #ifndef CAKE_STEPFUN_FC1
-#error "cake_stepfun_fc1_runner.cu is part of the Cake StepFun fused-MoE module (-DCAKE_STEPFUN_FC1)"
+#error \
+    "cake_stepfun_fc1_runner.cu is part of the Cake StepFun fused-MoE module (-DCAKE_STEPFUN_FC1)"
 #endif
 
 #include <cuda.h>
@@ -58,10 +59,11 @@ generated::TensorLayout denseLayout(void const* data, std::initializer_list<int6
   return layout;
 }
 
-// Diagnostic operand dump (CAKE_STEPFUN_FC1_DUMP_DIR=<dir>): after the FC1 launch the runner synchronizes the
-// stream and writes every device operand the kernel received as raw bytes (<name>.bin) plus index.json with the
-// kernel symbol, launch geometry, scalar parameters and the byte size / element type / shape of each file. Debug
-// only: it serializes the stream and copies the operands to the host on every launch.
+// Diagnostic operand dump (CAKE_STEPFUN_FC1_DUMP_DIR=<dir>): after the FC1 launch the runner
+// synchronizes the stream and writes every device operand the kernel received as raw bytes
+// (<name>.bin) plus index.json with the kernel symbol, launch geometry, scalar parameters and the
+// byte size / element type / shape of each file. Debug only: it serializes the stream and copies
+// the operands to the host on every launch.
 struct DumpEntry {
   std::string name, ctype, shape;
   const void* ptr;
@@ -71,15 +73,18 @@ struct DumpEntry {
 inline void dumpBytes(std::string const& dir, DumpEntry const& e, FILE* index, bool& first) {
   std::vector<unsigned char> host(e.bytes);
   cudaError_t rc = cudaSuccess;
-  if (e.ptr != nullptr && e.bytes > 0) rc = cudaMemcpy(host.data(), e.ptr, e.bytes, cudaMemcpyDeviceToHost);
+  if (e.ptr != nullptr && e.bytes > 0)
+    rc = cudaMemcpy(host.data(), e.ptr, e.bytes, cudaMemcpyDeviceToHost);
   std::string const path = dir + "/" + e.name + ".bin";
   if (FILE* f = std::fopen(path.c_str(), "wb")) {
     if (e.ptr != nullptr && rc == cudaSuccess) std::fwrite(host.data(), 1, host.size(), f);
     std::fclose(f);
   }
-  std::fprintf(index, "%s\n  {\"param\": \"%s\", \"file\": \"%s.bin\", \"ctype\": \"%s\", \"shape\": %s, \"bytes\": %zu, \"null\": %s, \"copy_rc\": %d}",
-               first ? "" : ",", e.name.c_str(), e.name.c_str(), e.ctype.c_str(), e.shape.c_str(), e.bytes,
-               e.ptr == nullptr ? "true" : "false", static_cast<int>(rc));
+  std::fprintf(index,
+               "%s\n  {\"param\": \"%s\", \"file\": \"%s.bin\", \"ctype\": \"%s\", \"shape\": %s, "
+               "\"bytes\": %zu, \"null\": %s, \"copy_rc\": %d}",
+               first ? "" : ",", e.name.c_str(), e.name.c_str(), e.ctype.c_str(), e.shape.c_str(),
+               e.bytes, e.ptr == nullptr ? "true" : "false", static_cast<int>(rc));
   first = false;
 }
 
@@ -95,9 +100,9 @@ inline std::string shapeOf(generated::TensorLayout const& l) {
 // cta_idx_xy_to_mn_limit for the first *numNonExitingCtas CTAs and permuted_idx_to_token_idx for
 // their token slots only; a running CTA of such a kernel processes every cancelled CTA it acquires,
 // so the entries in [*numNonExitingCtas, gridN) must describe a benign tile: expert 0, zero valid
-// rows (mn_limit = tile * tileN) and padded token slots (-1). The kernel is launched in-stream between
-// routing and FC1 with the FC1's programmatic-dependent-launch attribute; it waits for routing
-// before reading the count and releases the FC1 once the tail is written.
+// rows (mn_limit = tile * tileN) and padded token slots (-1). The kernel is launched in-stream
+// between routing and FC1 with the FC1's programmatic-dependent-launch attribute; it waits for
+// routing before reading the count and releases the FC1 once the tail is written.
 constexpr unsigned kRoutingTailBlocks = 4;
 constexpr unsigned kRoutingTailThreads = 256;
 
@@ -256,8 +261,8 @@ bool Fc1Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hi
                                    int32_t intermediateSize, int32_t numExperts,
                                    int32_t numTokens) const {
   if (mNative) {
-    return mNative->isValidConfigIndex(configIndex, topK, hiddenSize, intermediateSize,
-                                       numExperts, numTokens);
+    return mNative->isValidConfigIndex(configIndex, topK, hiddenSize, intermediateSize, numExperts,
+                                       numTokens);
   }
   return shapeSupported(configIndex, hiddenSize, intermediateSize);
 }
@@ -272,15 +277,15 @@ std::vector<int64_t> Fc1Runner::getPassingConfigIndices() const {
 void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
                     void* perTokenScales, void* perChannelScales, float* outputScalesScalar,
                     float* outputScalesGateScalar, void* ptrBias, float* ptrGatedActAlpha,
-                    float* ptrGatedActBeta, float* ptrClampLimit,
-                    int32_t* permutedIdxToBiasRowIdx, void* output, void* outputScale,
-                    int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-                    int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx,
-                    int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
-                    int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit,
-                    void* bmm1Workspace, bool useRoutingScalesOnInput, int device,
-                    cudaStream_t stream, int32_t configIndex, bool enable_pdl,
-                    int32_t validHiddenSize, int32_t validIntermediateSize) {
+                    float* ptrGatedActBeta, float* ptrClampLimit, int32_t* permutedIdxToBiasRowIdx,
+                    void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
+                    int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
+                    int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
+                    int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
+                    int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace,
+                    bool useRoutingScalesOnInput, int device, cudaStream_t stream,
+                    int32_t configIndex, bool enable_pdl, int32_t validHiddenSize,
+                    int32_t validIntermediateSize) {
   if (mNative) {
     mNative->run(hiddenState, hiddenStateScale, weight, weightScale, perTokenScales,
                  perChannelScales, outputScalesScalar, outputScalesGateScalar, ptrBias,
@@ -288,8 +293,8 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
                  outputScale, topK, hiddenSize, intermediateSize, numExperts, numTokens,
                  permutedIdxToTokenIdx, ptrNumNonExitingCtas, ptrTotalNumPaddedTokens,
                  ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, bmm1Workspace,
-                 useRoutingScalesOnInput, device, stream, configIndex, enable_pdl,
-                 validHiddenSize, validIntermediateSize);
+                 useRoutingScalesOnInput, device, stream, configIndex, enable_pdl, validHiddenSize,
+                 validIntermediateSize);
     return;
   }
   char const* const family = familyName(mFamily);
@@ -315,20 +320,20 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   FLASHINFER_CHECK(ptrNumNonExitingCtas != nullptr && permutedIdxToTokenIdx != nullptr &&
                        ptrCtaIdxXyToBatchIdx != nullptr && ptrCtaIdxXyToMnLimit != nullptr,
                    "Cake StepFun FC1 requires the complete trtllm-gen routing arrays");
-  bool const blockScaled =
-      mFamily == generated::kFc1Nvfp4 || mFamily == generated::kFc1Nvfp4PerToken ||
-      mFamily == generated::kFc1MxFp8;
+  bool const blockScaled = mFamily == generated::kFc1Nvfp4 ||
+                           mFamily == generated::kFc1Nvfp4PerToken ||
+                           mFamily == generated::kFc1MxFp8;
   bool const scalarScaled = mFamily == generated::kFc1Nvfp4 ||
                             mFamily == generated::kFc1Nvfp4PerToken ||
                             mFamily == generated::kFc1Fp8PerTensor;
   FLASHINFER_CHECK(!blockScaled || (hiddenStateScale != nullptr && weightScale != nullptr),
-                   "Cake StepFun FC1 (", family,
-                   ") requires activation and weight block scales");
-  FLASHINFER_CHECK(!scalarScaled ||
-                       (outputScalesScalar != nullptr && outputScalesGateScalar != nullptr),
-                   "Cake StepFun FC1 (", family, ") requires per-expert output1 scales");
-  FLASHINFER_CHECK(mFamily != generated::kFc1Nvfp4PerToken || perTokenScales != nullptr,
-                   "Cake StepFun FC1 (nvfp4_bf16tok) requires the fp32 per-token activation scales");
+                   "Cake StepFun FC1 (", family, ") requires activation and weight block scales");
+  FLASHINFER_CHECK(
+      !scalarScaled || (outputScalesScalar != nullptr && outputScalesGateScalar != nullptr),
+      "Cake StepFun FC1 (", family, ") requires per-expert output1 scales");
+  FLASHINFER_CHECK(
+      mFamily != generated::kFc1Nvfp4PerToken || perTokenScales != nullptr,
+      "Cake StepFun FC1 (nvfp4_bf16tok) requires the fp32 per-token activation scales");
   FLASHINFER_CHECK(mFamily == generated::kFc1Nvfp4PerToken || perTokenScales == nullptr,
                    "Cake StepFun FC1 (", family, ") does not consume per-token scales");
   FLASHINFER_CHECK(mFamily == generated::kFc1Nvfp4PerToken || mFamily == generated::kFc1Bf16 ||
@@ -459,11 +464,10 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
     tailConfig.stream = stream;
     tailConfig.attrs = &pdlAttribute;
     tailConfig.numAttrs = fc1Pdl ? 1u : 0u;
-    cudaError_t const padded =
-        cudaLaunchKernelEx(&tailConfig, padRoutingTailKernel, ptrCtaIdxXyToBatchIdx,
-                           ptrCtaIdxXyToMnLimit, permutedIdxToTokenIdx,
-                           static_cast<int32_t const*>(ptrNumNonExitingCtas), gridN,
-                           mTileTokensDim);
+    cudaError_t const padded = cudaLaunchKernelEx(
+        &tailConfig, padRoutingTailKernel, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
+        permutedIdxToTokenIdx, static_cast<int32_t const*>(ptrNumNonExitingCtas), gridN,
+        mTileTokensDim);
     FLASHINFER_CHECK(padded == cudaSuccess, "Cake StepFun FC1 routing-tail launch failed for ",
                      spec.symbol, " grid_n=", gridN, " : ", cudaGetErrorString(padded));
   }
@@ -492,7 +496,8 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   FLASHINFER_CHECK(launched == cudaSuccess, "Cake StepFun FC1 launch failed for ", spec.symbol,
                    " grid=(", gridM, ",", gridN, ") : ", cudaGetErrorString(launched));
 
-  char const* const dumpDir = std::getenv("CAKE_STEPFUN_FC1_DUMP_DIR");  // re-read: drivers switch it per launch
+  char const* const dumpDir =
+      std::getenv("CAKE_STEPFUN_FC1_DUMP_DIR");  // re-read: drivers switch it per launch
   if (dumpDir != nullptr && dumpDir[0] != '\0') {
     cudaError_t const synced = cudaStreamSynchronize(stream);
     std::string const dir(dumpDir);
@@ -500,51 +505,73 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
     FLASHINFER_CHECK(index != nullptr, "Cake StepFun FC1 dump: cannot write ", dir, "/index.json");
     bool const bf16 = mFamily == generated::kFc1Bf16;
     size_t const elem = bf16 ? 2 : 1;  // every other family stores 1 byte per operand element
-    size_t const sfcBytes = mFamily == generated::kFc1Nvfp4 ? static_cast<size_t>(maxPaddedTokens) * I / 16
-                            : mFamily == generated::kFc1MxFp8 ? static_cast<size_t>(maxPaddedTokens) * I / 32
-                            : mFamily == generated::kFc1Nvfp4PerToken ? static_cast<size_t>(T) * sizeof(float)
-                                                                       : 0;
-    std::fprintf(index,
-                 "{\"kernel_symbol\": \"%s\", \"family\": %d, \"tile_n\": %d, \"grid\": [%d, %d, 1], "
-                 "\"block\": [%u, %u, %u], \"cluster\": [%u, %u, %u], \"cluster_attribute\": %s, "
-                 "\"dynamic_smem_bytes\": %zu, \"pdl\": %s, \"pad_routing_tail_launched\": %s, "
-                 "\"bounds_acquired_tiles\": %s, \"M_out\": %d, \"K\": %d, \"grid_m\": %d, \"grid_n\": %d, "
-                 "\"K_tiles\": %d, \"num_experts\": %lld, \"num_tokens\": %lld, \"top_k\": %d, "
-                 "\"max_padded_tokens\": %lld, \"sync_rc\": %d, \"operands\": [",
-                 spec.symbol, mFamily, spec.tile_n, gridM, gridN, spec.block[0], spec.block[1], spec.block[2],
-                 spec.cluster[0], spec.cluster[1], spec.cluster[2], spec.cluster_attribute ? "true" : "false",
-                 spec.dynamic_smem_bytes, fc1Pdl ? "true" : "false",
-                 (!spec.bounds_acquired_tiles && mPadRoutingTail) ? "true" : "false",
-                 spec.bounds_acquired_tiles ? "true" : "false", args.M_out, args.K, args.grid_m, args.grid_n,
-                 args.K_tiles, static_cast<long long>(E), static_cast<long long>(T), topK,
-                 static_cast<long long>(maxPaddedTokens), static_cast<int>(synced));
+    size_t const sfcBytes =
+        mFamily == generated::kFc1Nvfp4           ? static_cast<size_t>(maxPaddedTokens) * I / 16
+        : mFamily == generated::kFc1MxFp8         ? static_cast<size_t>(maxPaddedTokens) * I / 32
+        : mFamily == generated::kFc1Nvfp4PerToken ? static_cast<size_t>(T) * sizeof(float)
+                                                  : 0;
+    std::fprintf(
+        index,
+        "{\"kernel_symbol\": \"%s\", \"family\": %d, \"tile_n\": %d, \"grid\": [%d, %d, 1], "
+        "\"block\": [%u, %u, %u], \"cluster\": [%u, %u, %u], \"cluster_attribute\": %s, "
+        "\"dynamic_smem_bytes\": %zu, \"pdl\": %s, \"pad_routing_tail_launched\": %s, "
+        "\"bounds_acquired_tiles\": %s, \"M_out\": %d, \"K\": %d, \"grid_m\": %d, \"grid_n\": %d, "
+        "\"K_tiles\": %d, \"num_experts\": %lld, \"num_tokens\": %lld, \"top_k\": %d, "
+        "\"max_padded_tokens\": %lld, \"sync_rc\": %d, \"operands\": [",
+        spec.symbol, mFamily, spec.tile_n, gridM, gridN, spec.block[0], spec.block[1],
+        spec.block[2], spec.cluster[0], spec.cluster[1], spec.cluster[2],
+        spec.cluster_attribute ? "true" : "false", spec.dynamic_smem_bytes,
+        fc1Pdl ? "true" : "false",
+        (!spec.bounds_acquired_tiles && mPadRoutingTail) ? "true" : "false",
+        spec.bounds_acquired_tiles ? "true" : "false", args.M_out, args.K, args.grid_m, args.grid_n,
+        args.K_tiles, static_cast<long long>(E), static_cast<long long>(T), topK,
+        static_cast<long long>(maxPaddedTokens), static_cast<int>(synced));
     bool first = true;
     auto dense = [&](char const* name, generated::TensorLayout const& l, char const* ctype) {
-      dumpBytes(dir, DumpEntry{name, ctype, shapeOf(l), l.data, static_cast<size_t>(l.elements) * elem}, index,
-                first);
+      dumpBytes(dir,
+                DumpEntry{name, ctype, shapeOf(l), l.data, static_cast<size_t>(l.elements) * elem},
+                index, first);
     };
     dense("A", weightLayout, bf16 ? "bf16" : "uint8");
     if (weightScaleLayout.data != nullptr) dense("SFA", weightScaleLayout, "uint8");
     dense("B", activationLayout, bf16 ? "bf16" : "uint8");
     if (activationScaleLayout.data != nullptr) dense("SFB", activationScaleLayout, "uint8");
     dense("C", outputLayout, (bf16 || mFamily == generated::kFc1Nvfp4PerToken) ? "bf16" : "uint8");
-    dumpBytes(dir, DumpEntry{"SFC", mFamily == generated::kFc1Nvfp4PerToken ? "float32" : "uint8",
-                             "[" + std::to_string(sfcBytes / (mFamily == generated::kFc1Nvfp4PerToken ? 4 : 1)) + "]",
-                             args.SFC_ptr, sfcBytes}, index, first);
-    dumpBytes(dir, DumpEntry{"route_map", "int32", "[" + std::to_string(maxPaddedTokens) + "]", args.route_map,
-                             static_cast<size_t>(maxPaddedTokens) * sizeof(int32_t)}, index, first);
-    dumpBytes(dir, DumpEntry{"tile_expert", "int32", "[" + std::to_string(gridN) + "]", args.tile_expert,
-                             static_cast<size_t>(gridN) * sizeof(int32_t)}, index, first);
-    dumpBytes(dir, DumpEntry{"tile_mn_limit", "int32", "[" + std::to_string(gridN) + "]", args.tile_mn_limit,
-                             static_cast<size_t>(gridN) * sizeof(int32_t)}, index, first);
-    dumpBytes(dir, DumpEntry{"num_non_exiting_ctas", "int32", "[1]", args.total_tiles, sizeof(int32_t)}, index,
-              first);
-    dumpBytes(dir, DumpEntry{"clamp_limit", "float32", "[" + std::to_string(E) + "]", args.clamp_limit,
-                             static_cast<size_t>(E) * sizeof(float)}, index, first);
-    dumpBytes(dir, DumpEntry{"scale_c", "float32", "[" + std::to_string(E) + "]", args.scale_c,
-                             args.scale_c ? static_cast<size_t>(E) * sizeof(float) : 0}, index, first);
-    dumpBytes(dir, DumpEntry{"scale_gate", "float32", "[" + std::to_string(E) + "]", args.scale_gate,
-                             args.scale_gate ? static_cast<size_t>(E) * sizeof(float) : 0}, index, first);
+    dumpBytes(
+        dir,
+        DumpEntry{"SFC", mFamily == generated::kFc1Nvfp4PerToken ? "float32" : "uint8",
+                  "[" +
+                      std::to_string(sfcBytes / (mFamily == generated::kFc1Nvfp4PerToken ? 4 : 1)) +
+                      "]",
+                  args.SFC_ptr, sfcBytes},
+        index, first);
+    dumpBytes(dir,
+              DumpEntry{"route_map", "int32", "[" + std::to_string(maxPaddedTokens) + "]",
+                        args.route_map, static_cast<size_t>(maxPaddedTokens) * sizeof(int32_t)},
+              index, first);
+    dumpBytes(dir,
+              DumpEntry{"tile_expert", "int32", "[" + std::to_string(gridN) + "]", args.tile_expert,
+                        static_cast<size_t>(gridN) * sizeof(int32_t)},
+              index, first);
+    dumpBytes(dir,
+              DumpEntry{"tile_mn_limit", "int32", "[" + std::to_string(gridN) + "]",
+                        args.tile_mn_limit, static_cast<size_t>(gridN) * sizeof(int32_t)},
+              index, first);
+    dumpBytes(dir,
+              DumpEntry{"num_non_exiting_ctas", "int32", "[1]", args.total_tiles, sizeof(int32_t)},
+              index, first);
+    dumpBytes(dir,
+              DumpEntry{"clamp_limit", "float32", "[" + std::to_string(E) + "]", args.clamp_limit,
+                        static_cast<size_t>(E) * sizeof(float)},
+              index, first);
+    dumpBytes(dir,
+              DumpEntry{"scale_c", "float32", "[" + std::to_string(E) + "]", args.scale_c,
+                        args.scale_c ? static_cast<size_t>(E) * sizeof(float) : 0},
+              index, first);
+    dumpBytes(dir,
+              DumpEntry{"scale_gate", "float32", "[" + std::to_string(E) + "]", args.scale_gate,
+                        args.scale_gate ? static_cast<size_t>(E) * sizeof(float) : 0},
+              index, first);
     std::fprintf(index, "\n]}\n");
     std::fclose(index);
   }

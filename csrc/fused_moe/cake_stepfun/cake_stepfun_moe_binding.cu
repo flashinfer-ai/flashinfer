@@ -79,8 +79,8 @@ FamilySpec const& familySpec(String const& family) {
 }
 
 void checkTensor(TensorView const& tensor, char const* name, int64_t ndim, DLDevice device) {
-  TVM_FFI_ICHECK_EQ(tensor.ndim(), ndim) << "cake_stepfun_fc1: " << name << " must be " << ndim
-                                          << "-D.";
+  TVM_FFI_ICHECK_EQ(tensor.ndim(), ndim)
+      << "cake_stepfun_fc1: " << name << " must be " << ndim << "-D.";
   TVM_FFI_ICHECK(tensor.IsContiguous()) << "cake_stepfun_fc1: " << name << " must be contiguous.";
   TVM_FFI_ICHECK(tensor.device().device_type == kDLCUDA &&
                  tensor.device().device_id == device.device_id)
@@ -88,8 +88,8 @@ void checkTensor(TensorView const& tensor, char const* name, int64_t ndim, DLDev
 }
 
 void checkDtype(TensorView const& tensor, char const* name, DLDataType dtype) {
-  TVM_FFI_ICHECK_EQ(tensor.dtype(), dtype) << "cake_stepfun_fc1: " << name
-                                            << " has an unexpected dtype.";
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), dtype)
+      << "cake_stepfun_fc1: " << name << " has an unexpected dtype.";
 }
 
 void* optionalPtr(Optional<TensorView> const& tensor) {
@@ -148,21 +148,17 @@ Array<int64_t> cake_stepfun_fc1_tiles(String const& family) {
  * kernels that do not bound cluster-launch-control acquired tiles (false only when the caller's
  * routing arrays already carry that tail, as the Cake export parity measurement's do).
  */
-void cake_stepfun_fc1(String const& family, TensorView const& hidden_states,
-                      Optional<TensorView> const& hidden_states_scale,
-                      TensorView const& gemm1_weights,
-                      Optional<TensorView> const& gemm1_weights_scale,
-                      Optional<TensorView> const& output1_scale_scalar,
-                      Optional<TensorView> const& output1_scale_gate_scalar,
-                      TensorView const& gemm1_clamp_limit,
-                      Optional<TensorView> const& per_token_scale,
-                      TensorView const& permuted_idx_to_token_idx,
-                      TensorView const& cta_idx_xy_to_batch_idx,
-                      TensorView const& cta_idx_xy_to_mn_limit,
-                      TensorView const& num_non_exiting_ctas,
-                      TensorView const& total_num_padded_tokens, TensorView const& gemm1_output,
-                      Optional<TensorView> const& gemm1_output_scale, int64_t top_k,
-                      int64_t tile_tokens_dim, bool enable_pdl, bool pad_routing_tail) {
+void cake_stepfun_fc1(
+    String const& family, TensorView const& hidden_states,
+    Optional<TensorView> const& hidden_states_scale, TensorView const& gemm1_weights,
+    Optional<TensorView> const& gemm1_weights_scale,
+    Optional<TensorView> const& output1_scale_scalar,
+    Optional<TensorView> const& output1_scale_gate_scalar, TensorView const& gemm1_clamp_limit,
+    Optional<TensorView> const& per_token_scale, TensorView const& permuted_idx_to_token_idx,
+    TensorView const& cta_idx_xy_to_batch_idx, TensorView const& cta_idx_xy_to_mn_limit,
+    TensorView const& num_non_exiting_ctas, TensorView const& total_num_padded_tokens,
+    TensorView const& gemm1_output, Optional<TensorView> const& gemm1_output_scale, int64_t top_k,
+    int64_t tile_tokens_dim, bool enable_pdl, bool pad_routing_tail) {
   FamilySpec const& spec = familySpec(family);
   DLDevice const device = hidden_states.device();
   TVM_FFI_ICHECK(device.device_type == kDLCUDA)
@@ -177,9 +173,9 @@ void cake_stepfun_fc1(String const& family, TensorView const& hidden_states,
   checkTensor(num_non_exiting_ctas, "num_non_exiting_ctas", 1, device);
   checkTensor(total_num_padded_tokens, "total_num_padded_tokens", 1, device);
   checkTensor(gemm1_output, "gemm1_output", 2, device);
-  for (TensorView const* array : {&permuted_idx_to_token_idx, &cta_idx_xy_to_batch_idx,
-                                  &cta_idx_xy_to_mn_limit, &num_non_exiting_ctas,
-                                  &total_num_padded_tokens}) {
+  for (TensorView const* array :
+       {&permuted_idx_to_token_idx, &cta_idx_xy_to_batch_idx, &cta_idx_xy_to_mn_limit,
+        &num_non_exiting_ctas, &total_num_padded_tokens}) {
     checkDtype(*array, "routing arrays", dl_int32);
   }
   if (hidden_states_scale.has_value()) {
@@ -200,13 +196,14 @@ void cake_stepfun_fc1(String const& family, TensorView const& hidden_states,
   int64_t const num_tokens = hidden_states.size(0);
   int64_t const hidden_size = hidden_states.size(1) * spec.actPerByte;
   int64_t const num_experts = gemm1_weights.size(0);
-  // The GEMM2 input has the family's activation storage ([max_padded, I / actPerByte] bytes), except for
-  // the per-token family whose FC1 output is bf16 [max_padded, I].
+  // The GEMM2 input has the family's activation storage ([max_padded, I / actPerByte] bytes),
+  // except for the per-token family whose FC1 output is bf16 [max_padded, I].
   int64_t const intermediate_size =
       spec.perToken ? gemm1_output.size(1) : gemm1_output.size(1) * spec.actPerByte;
   TVM_FFI_ICHECK_EQ(gemm1_clamp_limit.size(0), num_experts)
       << "cake_stepfun_fc1: gemm1_clamp_limit must hold one value per expert.";
-  float* scale_c = optionalFloatPtr(output1_scale_scalar, "output1_scale_scalar", num_experts, device);
+  float* scale_c =
+      optionalFloatPtr(output1_scale_scalar, "output1_scale_scalar", num_experts, device);
   float* scale_gate =
       optionalFloatPtr(output1_scale_gate_scalar, "output1_scale_gate_scalar", num_experts, device);
   float* token_scales = nullptr;
@@ -265,8 +262,7 @@ void cake_stepfun_fc1(String const& family, TensorView const& hidden_states,
              static_cast<int32_t*>(total_num_padded_tokens.data_ptr()),
              static_cast<int32_t*>(cta_idx_xy_to_batch_idx.data_ptr()),
              static_cast<int32_t*>(cta_idx_xy_to_mn_limit.data_ptr()), /*bmm1Workspace=*/nullptr,
-             /*useRoutingScalesOnInput=*/false, device.device_id, stream, config_index,
-             enable_pdl);
+             /*useRoutingScalesOnInput=*/false, device.device_id, stream, config_index, enable_pdl);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc1_families, cake_stepfun_fc1_families);

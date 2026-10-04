@@ -46,8 +46,8 @@ extern "C" __attribute__((visibility("default"))) void FlashInferSetCubinCallbac
 thread_local std::string current_cubin;
 
 // Called by the callback to set the current cubin.
-extern "C" __attribute__((visibility("default"))) void FlashInferSetCurrentCubin(
-    const char* binary, int size) {
+extern "C" __attribute__((visibility("default"))) void FlashInferSetCurrentCubin(const char* binary,
+                                                                                 int size) {
   current_cubin = std::string(binary, size);
 }
 
