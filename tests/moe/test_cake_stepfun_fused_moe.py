@@ -257,11 +257,18 @@ def _kernel_view(precision: str, static: dict, limits: torch.Tensor) -> dict:
             "gemm1_clamp_limit": (limits / static["scale_gate_fc1"]).contiguous(),
         }
     if precision == "mxfp8":
+        # The harness keeps the swizzled UE8M0 weight scales flattened per expert; the runner
+        # validates them as [experts, rows, hidden / 32] (same bytes).
+        experts = static["gemm1_weights"].shape[0]
         return {
             "gemm1_weights": static["gemm1_weights"],
-            "gemm1_weights_scale": static["gemm1_scales"],
+            "gemm1_weights_scale": static["gemm1_scales"].reshape(
+                experts, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE // 32
+            ),
             "gemm2_weights": static["gemm2_weights"],
-            "gemm2_weights_scale": static["gemm2_scales"],
+            "gemm2_weights_scale": static["gemm2_scales"].reshape(
+                experts, HIDDEN_SIZE, INTERMEDIATE_SIZE // 32
+            ),
             "gemm1_clamp_limit": limits.contiguous(),
         }
     raise KeyError(precision)
