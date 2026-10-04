@@ -54,38 +54,6 @@ def operand(shape, precision, generator, exponent_low=-5):
     return values, scales
 
 
-def interleave_rows(tensor):
-    experts, rows = tensor.shape[:2]
-    tail = tensor.shape[2:]
-    gate = tensor[:, : rows // 2].reshape(experts, rows // 16, 8, *tail)
-    up = tensor[:, rows // 2 :].reshape(experts, rows // 16, 8, *tail)
-    return torch.stack((gate, up), dim=2).reshape(experts, rows, *tail).contiguous()
-
-
-def source_weights(inputs, shared):
-    def encode(values, sf, first_layer):
-        if first_layer:
-            values, sf = interleave_rows(values), interleave_rows(sf)
-        experts, rows, _ = values.shape
-        words = scale_words(sf)
-        # The scale row permutation is distinct from gate/up interleaving.
-        words = (
-            words.reshape(experts, rows // 128, 4, 32, -1)
-            .transpose(2, 3)
-            .contiguous()
-            .reshape(experts, rows, -1)
-        )
-        words = words.permute(0, 2, 1).contiguous().reshape(-1, rows).view(torch.uint32)
-        return values.view(torch.uint8).reshape(experts * rows, -1), words
-
-    precision = inputs["routed_weight_dtype"]
-    b1, s1 = encode(inputs[f"w1_{precision}"], inputs["w1_sf"], True)
-    b2, s2 = encode(inputs[f"w2_{precision}"], inputs["w2_sf"], False)
-    sb1, ss1 = encode(shared[0], shared[1], True)
-    sb2, ss2 = encode(shared[2], shared[3], False)
-    return dict(B1=b1, SFB1=s1, B2=b2, SFB2=s2, SB1=sb1, SSFB1=ss1, SB2=sb2, SSFB2=ss2)
-
-
 def _expert(x_rows, first, second, route_weight, width):
     """BF16 L1, clamped SwiGLU, FP32 activation quantization, BF16 L2 for one expert."""
     projected = (x_rows @ first.T).bfloat16().float()
@@ -154,19 +122,11 @@ def model_inputs(precision, num_tokens=1, seed=0, l2_scale_shift=0):
     return inputs, xs
 
 
-def shared_expert(seed=0):
-    """One FP8 shared expert at the model geometry (source family only)."""
-    generator = torch.Generator(device="cuda").manual_seed(seed + 1_000_003)
-    a, sa = operand((1, 2 * 2304, 5120), "fp8", generator)
-    b, sb = operand((1, 5120, 2304), "fp8", generator)
-    return a, sa, b, sb
-
-
-def model_reference(inputs, x_scales, shared=None):
+def model_reference(inputs, x_scales):
     """BF16 L1, clamped SwiGLU, FP32 activation quantization, BF16 L2 of the
     routed experts (only the selected ones are dequantized; all 384 at once
-    would need tens of GiB) plus the shared expert, summed in FP32 and rounded
-    to BF16 once, like the kernels."""
+    would need tens of GiB), summed in FP32 and rounded to BF16 once, like the
+    kernel."""
     precision = inputs["routed_weight_dtype"]
     x = unpack(inputs["x_fp8_packed"], x_scales, "fp8")
     width = inputs["intermediate"]
@@ -188,47 +148,19 @@ def model_reference(inputs, x_scales, shared=None):
                     inputs["topk_weights"][selected, slot],
                     width,
                 )
-    if shared is not None:
-        output += _expert(
-            x,
-            unpack(shared[0], shared[1], "fp8")[0],
-            unpack(shared[2], shared[3], "fp8")[0],
-            torch.ones(x.shape[0], device=x.device),
-            width,
-        )
     return output.bfloat16()
 
 
-def make_model(family, precision, num_tokens=16, seed=0, l2_scale_shift=0):
-    """Prepared plan of ``family`` on a catalogued model route (both routed
+def make_model(precision, num_tokens=16, seed=0, l2_scale_shift=0):
+    """Prepared pipeline plan on a catalogued model route (both routed
     precisions exist at 16 tokens; FP4 also at 1, 128, 512, 1024 and 4096
-    tokens). Returns (plan, inputs, x_scales, shared)."""
+    tokens). Returns (plan, inputs, x_scales)."""
+    from flashinfer.mega_moe_v3 import prepare_pipeline
+
     inputs, xs = model_inputs(
         precision, num_tokens=num_tokens, seed=seed, l2_scale_shift=l2_scale_shift
     )
-    shared = None
-    if family == "source":
-        from flashinfer.source_mega_moe import prepare_mega_moe
-
-        shared = shared_expert(seed)
-        plan = prepare_mega_moe(
-            inputs["x_fp8_packed"],
-            inputs["x_sf_packed"],
-            inputs["topk_idx"],
-            inputs["topk_weights"],
-            weights=source_weights(inputs, shared),
-            num_experts=inputs["num_experts"],
-            intermediate=inputs["intermediate"],
-            routed_weight_dtype=precision,
-            num_shared_experts=1,
-            activation_clamp=10.0,
-            fast_math=True,
-        )
-    else:
-        from flashinfer.mega_moe_v3 import prepare_pipeline
-
-        plan = prepare_pipeline(inputs)
-    return plan, inputs, xs, shared
+    return prepare_pipeline(inputs), inputs, xs
 
 
 def make_grouped_l2(seed=0):

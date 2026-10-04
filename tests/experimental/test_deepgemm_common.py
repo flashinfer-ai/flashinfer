@@ -14,7 +14,7 @@ from flashinfer.experimental.deepgemm_common import (
 )
 
 _EXPERIMENTAL = Path(__file__).resolve().parents[2] / "flashinfer" / "experimental"
-_FAMILIES = ("deepgemm_", "mega_moe_v3", "source_mega_moe")
+_FAMILIES = ("deepgemm_", "mega_moe_v3")
 
 
 def _per_arch_catalog():
@@ -318,18 +318,18 @@ class TestRandomInputs:
             self.h.assert_close(out.to(torch.float16), out)
 
 
-def _gpu_family(module_dir: str, catalog_file: str, label: str):
-    """Catalog, arch and SM count of the current device, or a skip naming the gap."""
+def _exported_device(describe):
+    """Architecture of the current device as the family's runtime resolves it
+    (``describe`` returns it or raises), or a skip naming the gap. The FP4 GEMM
+    and batched projection families select their programs from runtime shapes
+    and device facts; they ship no per-shape catalog file."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
-    catalog = load_catalog(_EXPERIMENTAL / module_dir / catalog_file, label=label)
     try:
-        arch = catalog.device_arch("cuda")
-        catalog.device_num_sms("cuda", arch)
+        return describe(torch)
     except (RuntimeError, UnsupportedDevice) as error:
         pytest.skip(str(error))
-    return catalog, arch
 
 
 class TestRandomInputReferenceChecks:
@@ -341,9 +341,12 @@ class TestRandomInputReferenceChecks:
     def test_fp4_gemm_matches_reference_on_random_operands(self, m, n, k, alpha):
         torch = pytest.importorskip("torch")
         from tests.experimental import deepgemm_common as helpers
+        from flashinfer.experimental.deepgemm_fp4_gemm import fp4_gemm as runtime
         from flashinfer.fp4_gemm import prepare_fp4_gemm
 
-        _gpu_family("deepgemm_fp4_gemm", "fp4_gemm_catalog.json", "Native FP4 GEMM")
+        _exported_device(
+            lambda torch: runtime.device_facts(torch.cuda.current_device())
+        )
         gen = helpers.seeded_generator(2026, "cuda")
         a, sfa, a_ref = helpers.random_fp4_operand(m, k, generator=gen, device="cuda")
         b, sfb, b_ref = helpers.random_fp4_operand(n, k, generator=gen, device="cuda")
@@ -362,13 +365,22 @@ class TestRandomInputReferenceChecks:
     ):
         torch = pytest.importorskip("torch")
         from tests.experimental import deepgemm_common as helpers
+        from flashinfer.experimental.deepgemm_batched_gemm import (
+            batched_gemm as runtime,
+        )
         from flashinfer.fp8_batched_gemm import prepare_fp8_batched_gemm
 
-        _gpu_family(
-            "deepgemm_batched_gemm",
-            "batched_gemm_catalog.json",
-            "Batched FP8 projection",
-        )
+        def describe(torch):
+            arch = runtime.device_arch("cuda")
+            sms = torch.cuda.get_device_properties(0).multi_processor_count
+            if sms not in runtime.supported_num_sms(arch):
+                raise UnsupportedDevice(
+                    f"Batched FP8 projection schedules are pinned to "
+                    f"{runtime.supported_num_sms(arch)} SMs, this device has {sms}"
+                )
+            return arch
+
+        _exported_device(describe)
         heads, inner, width = 8, 4096, 1024
         gen = helpers.seeded_generator(2026, "cuda")
         aq, asf, a_ref, bq, bsf, b_ref = [], [], [], [], [], []
