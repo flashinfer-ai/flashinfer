@@ -80,8 +80,8 @@ buffer it allocates (row stride a multiple of 8 elements). Every cell of that bu
 (`-inf` outside each row's window), so `clean_logits` changes nothing and is accepted for signature
 parity only; `max_seqlen_k` must be 0. Rows below the query block (`Q < 128 / H`) are padded by the
 entry. Which `(H, Q, K)` points have programs is a catalog property: `dense_route_available(H, Q, K)`
-answers it on the host (32 heads, `K % 256 == 0`, `Q <= max_queries()` today; the 64-head and
-KV-tail routes join as they are exported).
+answers it on the host (32 heads, `K % 256 == 0`, `Q <= max_queries()` today; the 64-head routes --
+any `K >= 1`, any `Q`, `max_queries(64)` is `None` -- join as they are exported).
 
 The paged entries read the fused DeepGEMM cache layout in place: `kv_cache` uint8
 `[pages, block_kv, 1, 132]` (`block_kv` FP8 rows of 128 then `block_kv` FP32 scales per page), E4M3
@@ -111,8 +111,9 @@ Tests: `tests/experimental/test_dense_mqa_generated.py` (dense, including the on
 `paged_routes`. Policy keys: `heads` (exported head counts), `block_q` (`{"32": 4, "64": 2}`),
 `kv_alignment` (`{"32": 256, "64": 1}`: the divisor the KV length must satisfy; 1 where the programs
 handle the KV tail in-kernel), `max_q_blocks` and `metadata_tier_blocks` (`[4, 32, 512, null]`: the
-query-block ceilings of the metadata programs, named per head count by their token ceiling, so the
-32-head tiers are `le16 / le128 / le2048 / any` and the 64-head tiers `le8 / le64 / le1024 / any`),
+query-block ceilings of the 32-head metadata programs, named per head count by their token ceiling, so the
+32-head tiers are `le16 / le128 / le2048 / any` and the 64-head tier names `le8 / le64 / le1024 / any`
+are aliases -- the 64-head routes have no metadata stage and no query bound),
 the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv` / `max_q_tokens` / `metadata_tiers`, and
 `paged` (`block_kv`, `split_kv`, `next_n_atoms`, `max_batch`, `metadata_program`). Every route record
 has `stages` (`[[stage, program], ...]`), `sequence` (a prepared sequence binding or `null`),
@@ -120,7 +121,10 @@ has `stages` (`[[stage, program], ...]`), `sequence` (a prepared sequence bindin
 the padding, the shipped 32-head programs; `"raw"`: the program stores the computed tiles only, DeepGEMM's
 `clean_logits=False` semantics, the 64-head and paged programs) and `kv_alignment`. Routes: 32 heads
 `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:<tier>`, `fp4:q1`, `fp4:<tier>`;
-64 heads `fp8:h64:q1` (shared single-query metadata + the 64-head partial logits program),
-`fp8:h64:{full,partial}:<tier>` (64-head metadata + logits programs); paged
+64 heads `fp8:h64:q1` and `fp8:h64:{full,partial}:<tier>`, each a single `logits` stage -- the
+gridDim-strided `fp8_h64_logits_full` program for `Q % 2 == 0`, `fp8_h64_logits_partial` otherwise
+(including `Q = 1`); no metadata program, launch grid = the SM count (the `SM_COUNT` compile-line
+definition, one device text per arch per program), the program's `ScheduleMeta` operand bound to `ks`
+and unused, `q [Q, 64, 128]` unpadded, output `[Q, align8(K + 256)]` with no padding rows; paged
 `paged:fp8:h<H>:p<page>:n<next_n>` (paged metadata + logits program). `fp8_mqa_logits(clean_logits=True)`
 is rejected on a `"raw"` route; the engines pass `clean_logits=False`.
