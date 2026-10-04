@@ -1371,11 +1371,22 @@ class BlockSparseAttentionWrapper:
         if self._backend == "vsa_sm100_blk128":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
-            if cc not in ((10, 0), (10, 3)):
+            if cc not in ((10, 0), (10, 3), (10, 7)):
                 raise RuntimeError(
-                    f"vsa_sm100_blk128 backend requires SM100/SM103, "
+                    f"vsa_sm100_blk128 backend requires SM100/SM103/SM107, "
                     f"current device is SM{arch}"
                 )
+            if cc == (10, 7):
+                # The blk128 kernel compiles natively for sm_107a, which only
+                # CuTe DSL >= 4.8 knows about; reject at plan time rather than
+                # failing inside the kernel constructor at run time.
+                from .cute_dsl.availability import is_rubin_cute_dsl_available
+
+                if not is_rubin_cute_dsl_available():
+                    raise RuntimeError(
+                        "vsa_sm100_blk128 backend on SM107 requires a CuTe DSL "
+                        "release with SM107 support (nvidia-cutlass-dsl >= 4.8)"
+                    )
             # BSA blk128 kernel uses 128-token compute tiles; block index granularity = R = C = 128.
             if R != 128 or C != 128:
                 raise ValueError(
@@ -1465,9 +1476,9 @@ class BlockSparseAttentionWrapper:
         if self._backend == "vsa_sm100_blk64":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
-            if cc not in ((10, 0), (10, 3)):
+            if cc not in ((10, 0), (10, 3), (10, 7)):
                 raise RuntimeError(
-                    f"vsa_sm100_blk64 backend requires SM100/SM103, "
+                    f"vsa_sm100_blk64 backend requires SM100/SM103/SM107, "
                     f"current device is SM{arch}"
                 )
             # blk64 kernel uses 64-token compute tiles; block index granularity = R = C = 64.

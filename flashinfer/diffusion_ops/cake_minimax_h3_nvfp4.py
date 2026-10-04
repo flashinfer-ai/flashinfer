@@ -69,26 +69,20 @@ def _stage_workspace(
     *,
     name: str,
     record: dict,
-    device: torch.device,
-) -> Optional[torch.Tensor]:
-    required = int(record["tma_workspace_bytes"])
-    if required == 0:
-        if value is not None:
-            raise ValueError(f"{name} must be None for a by-value descriptor route")
-        return None
-    if value is None:
-        raise ValueError(f"{name} must provide at least {required} caller-owned bytes")
-    if not isinstance(value, torch.Tensor) or value.ndim != 1:
-        raise TypeError(f"{name} must be a one-dimensional torch.Tensor")
-    if value.dtype != torch.uint8 or value.device != device:
-        raise ValueError(f"{name} must be a CUDA uint8 tensor on {device}")
-    if not value.is_cuda or not value.is_contiguous() or value.numel() < required:
-        raise ValueError(
-            f"{name} must be contiguous and contain at least {required} bytes"
+) -> None:
+    """The generated stages pass their tensor maps by value: no descriptor workspace exists.
+
+    The keyword arguments are kept for API stability and must be ``None``.
+    """
+    if any(str(kind) == "workspace" for kind, _name in record["arg_plan"]):
+        raise RuntimeError(
+            f"generated stage {record['name']!r} unexpectedly requires a descriptor workspace"
         )
-    if int(value.data_ptr()) % 128:
-        raise ValueError(f"{name} must be 128-byte aligned")
-    return value
+    if value is not None:
+        raise ValueError(
+            f"{name} must be None: the generated stages take their tensor maps by value"
+        )
+    return None
 
 
 def _gemm_row_tiles(rule: dict, *, M: int) -> int:
@@ -126,7 +120,6 @@ def _stage_call_args(
     record: dict,
     values: dict,
     *,
-    workspace: Optional[torch.Tensor],
     grid: tuple[int, ...],
 ) -> tuple:
     grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
@@ -140,10 +133,6 @@ def _stage_call_args(
                     f"generated stage requires unknown argument {name!r}"
                 )
             args.append(values[name])
-        elif kind == "workspace" and name == "tma_descriptor_workspace":
-            if workspace is None:
-                raise RuntimeError("generated stage requires descriptor workspace")
-            args.append(workspace)
         elif kind == "grid" and name in grid_values:
             args.append(grid_values[name])
         else:
@@ -177,7 +166,14 @@ def repack_minimax_h3_qkv_weight_scales_for_fused_gemm(
 
 
 class PreparedMiniMaxH3Nvfp4PreAttention:
-    """Exact-shape prepared operation with caller-owned storage."""
+    """Exact-shape prepared operation with caller-owned storage.
+
+    The generated stages take their TMA tensor maps by value, encoded once
+    at preparation; there is no descriptor workspace.  The
+    ``norm_descriptor_workspace`` / ``gemm_descriptor_workspace`` keyword
+    arguments of :func:`prepare_minimax_h3_nvfp4_pre_attention` are kept for
+    API stability and must be ``None``.
+    """
 
     def __init__(
         self,
@@ -249,6 +245,15 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     debug_adaln_bf16: Optional[torch.Tensor] = None,
     eps: float = _EPS,
 ) -> PreparedMiniMaxH3Nvfp4PreAttention:
+    """Validate the caller-owned tensors once and bind both stage launches.
+
+    ``norm_descriptor_workspace`` and ``gemm_descriptor_workspace`` must be
+    ``None``: the generated stages pass their tensor maps by value, so no
+    caller-provided descriptor workspace exists.  The keyword arguments are
+    kept for API stability; a non-``None`` value raises :class:`ValueError`.
+    The ``debug_*`` tensors are optional BF16 intermediates (AdaLN output,
+    post-norm Q / K) written only when all three are supplied.
+    """
     if not isinstance(P, int) or isinstance(P, bool) or P not in _SUPPORTED_PARTITIONS:
         raise ValueError(f"P must be one of {_SUPPORTED_PARTITIONS}")
     if float(eps) != _EPS:
@@ -347,17 +352,11 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     route = minimax_h3_nvfp4_route_record(device, P)
     norm_record = route["stages"]["norm_adaln_nvfp4_quantize"]
     gemm_record = route["stages"]["qkv_nvfp4_gemm_fused_pack"]
-    norm_descriptor_workspace = _stage_workspace(
-        norm_descriptor_workspace,
-        name="norm_descriptor_workspace",
-        record=norm_record,
-        device=device,
+    _stage_workspace(
+        norm_descriptor_workspace, name="norm_descriptor_workspace", record=norm_record
     )
-    gemm_descriptor_workspace = _stage_workspace(
-        gemm_descriptor_workspace,
-        name="gemm_descriptor_workspace",
-        record=gemm_record,
-        device=device,
+    _stage_workspace(
+        gemm_descriptor_workspace, name="gemm_descriptor_workspace", record=gemm_record
     )
     norm_module, gemm_module = load_minimax_h3_nvfp4_route(device, P)
     # Operands derived once at preparation: the GEMM output scale
@@ -420,16 +419,10 @@ def prepare_minimax_h3_nvfp4_pre_attention(
         "SCALE_STRIDE": out_sf_stride,
     }
     norm_args = _stage_call_args(
-        norm_record,
-        values,
-        workspace=norm_descriptor_workspace,
-        grid=_stage_launch_grid(norm_record, M=M, P=P),
+        norm_record, values, grid=_stage_launch_grid(norm_record, M=M, P=P)
     )
     gemm_args = _stage_call_args(
-        gemm_record,
-        values,
-        workspace=gemm_descriptor_workspace,
-        grid=_stage_launch_grid(gemm_record, M=M, P=P),
+        gemm_record, values, grid=_stage_launch_grid(gemm_record, M=M, P=P)
     )
     return PreparedMiniMaxH3Nvfp4PreAttention(
         M=M,

@@ -461,6 +461,58 @@ def test_cute_dsl_fallback_k_splits_selector():
     assert pick(512, 512, 2048, 84) == 1
 
 
+def test_cute_dsl_sm100_fallback_tactic_selector():
+    """Pin the SM100/103 no-autotune tactic pick on a 148-SM part."""
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _SM100_BF16_FP4_TACTICS,
+        _select_sm100_bf16_fp4_default_tactic,
+    )
+
+    tactics = list(_SM100_BF16_FP4_TACTICS)
+
+    def pick(m, n, sm_count=148):
+        return _select_sm100_bf16_fp4_default_tactic(tactics, m, n, sm_count)
+
+    # The row tile widens with m.
+    assert pick(1, 4096)[0][:2] == (128, 8)
+    assert pick(128, 4096)[0][:2] == (128, 32)
+    assert pick(512, 4096)[0][:2] == (128, 128)
+    assert pick(2048, 4096)[0][:2] == (128, 128)
+    # ...and is monotonically non-decreasing in m, for each projection.
+    for n in (4096, 6656, 19968):
+        widths = [pick(m, n)[0][1] for m in (1, 8, 32, 128, 512, 2048, 4096)]
+        assert widths == sorted(widths), f"n={n} row tiles not monotonic: {widths}"
+
+    # A smaller part fills with fewer tiles and affords a wider one.  Not
+    # monotonic in sm_count though: wave quantization breaks it, e.g. m=512,
+    # n=6656 picks 128 / 64 / 192 rows on 132 / 148 / 188 SMs.
+    assert pick(128, 4096, 78)[0][1] > pick(128, 4096, 264)[0][1]
+
+    # Ties resolve to raster-along-N.
+    assert all(
+        p[2] is False for p in (pick(1, 4096), pick(512, 4096), pick(2048, 6656))
+    )
+
+    # Deterministic, and only ever returns a tactic from the candidate list.
+    assert pick(512, 4096) == pick(512, 4096)
+    assert pick(512, 4096) in tactics
+
+
+def test_cute_dsl_sm100_dense_kernel_uses_opt_level_2():
+    """Pin ``--opt-level 2`` on the SM100/103 dense W4A16 compile.
+
+    The CuTe-DSL default is 3, which is slower for this kernel (nvbug 6661624).
+    Opt levels are numerically identical, so no other test catches a change.
+    """
+    import inspect
+
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import _get_sm100_bf16_fp4_kernel
+
+    src = inspect.getsource(_get_sm100_bf16_fp4_kernel)
+    assert "--opt-level 2" in src, "SM100 dense W4A16 must compile at opt-level 2"
+    assert "--opt-level 3" not in src
+
+
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_backend_preallocated_out(backend):
     """Caller-provided out tensor is written in place."""

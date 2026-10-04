@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from flashinfer.experimental.mega_moe_v3 import runtime as _v3_runtime
-from flashinfer.experimental.source_mega_moe import runtime as _source_runtime
 
 _HELPER = (
     Path(__file__).resolve().parents[2] / "examples/experimental/mega_moe_inputs.py"
@@ -16,30 +15,50 @@ _spec = importlib.util.spec_from_file_location("mega_moe_example_inputs", _HELPE
 fixtures = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fixtures)
 
+# The packed 384-expert weights, workspaces and the dequantized reference of the
+# routed experts need this much free device memory.
+MODEL_MEMORY_BYTES = 48 * 2**30
+
 
 @pytest.fixture(autouse=True)
 def supported_gpu():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     sms = torch.cuda.get_device_properties(0).multi_processor_count
-    for runtime in (_source_runtime, _v3_runtime):
-        try:
-            arch = runtime.device_arch(torch.device("cuda"))
-        except RuntimeError as error:
-            pytest.skip(str(error))
-        if sms not in runtime.supported_num_sms(arch):
-            pytest.skip(
-                f"The exported {arch} schedules cover {runtime.supported_num_sms(arch)} SMs, "
-                f"this device has {sms}"
-            )
+    try:
+        arch = _v3_runtime.device_arch(torch.device("cuda"))
+    except RuntimeError as error:
+        pytest.skip(str(error))
+    if sms not in _v3_runtime.supported_num_sms(arch):
+        pytest.skip(
+            f"The exported {arch} schedules cover {_v3_runtime.supported_num_sms(arch)} SMs, "
+            f"this device has {sms}"
+        )
     previous = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     yield
     torch.backends.cuda.matmul.allow_tf32 = previous
 
 
-def output_of(plan, family):
-    return plan.output if family == "source" else plan.outputs
+def require_model_memory():
+    if torch.cuda.mem_get_info()[0] < MODEL_MEMORY_BYTES:
+        pytest.skip(
+            "the 384-expert model inputs need about 48 GiB of free device memory"
+        )
+
+
+def make_model(precision, num_tokens=16, seed=0, l2_scale_shift=0):
+    require_model_memory()
+    return fixtures.make_model(
+        precision,
+        num_tokens=num_tokens,
+        seed=seed,
+        l2_scale_shift=l2_scale_shift,
+    )
+
+
+def model_reference(inputs, x_scales):
+    return fixtures.model_reference(inputs, x_scales)
 
 
 def graph_node_names(graph):
@@ -67,172 +86,116 @@ def graph_node_names(graph):
     return names
 
 
-def check_v3_graph_topology(plan, names):
-    """A self-cleaning route captures exactly one kernel node; every other
-    route captures its host counter resets together with the kernel."""
+def check_single_kernel_graph(names):
+    """Every exported pipeline route and the prepared grouped L2 route capture
+    exactly one kernel node: no host reset, copy or repack inside run()."""
     kernels = [name for name in names if name.startswith("kernel_")]
-    others = [name for name in names if not name.startswith("kernel_")]
     assert len(kernels) == 1, names
-    if plan.self_cleaning:
-        assert not others, names
-    else:
-        assert others, names
+    assert len(names) == 1, names
 
 
-def check_v3_workspace(plan):
-    """After a self-cleaning run every per-launch workspace word is zero again
-    and each grid gate holds only its phase bit (bits 0..30 clear)."""
-    if not plan.self_cleaning:
-        return
+def check_v3_workspace(plan, *, scratch_cleared=False):
+    """After a self-cleaning run every per-launch counter word is zero again
+    and each grid gate holds only its phase bit (bits 0..30 clear).
+
+    ``expert_scatter_offsets`` is a scratch table: every launch re-claims its
+    slots ``[0, expert_counts[e])`` before reading them, so the multi-token
+    kernels leave the previous launch's indices in place. Only the single-token
+    kernel zeroes it on exit; pass ``scratch_cleared=True`` for that route."""
+    assert plan.self_cleaning
     bindings = plan.stages[0].bindings
-    for name in ("expert_counts", "expert_scatter_offsets", "l1_arrival"):
+    counters = ["expert_counts", "l1_arrival"]
+    if scratch_cleared:
+        counters.append("expert_scatter_offsets")
+    for name in counters:
         assert bindings[name].view(torch.int32).count_nonzero().item() == 0, name
     for name in ("histogram_done", "prefix_done", "dispatch_done", "l2_done"):
         word = bindings[name].view(torch.int32) & 0x7FFFFFFF
         assert word.count_nonzero().item() == 0, name
 
 
-def check_v3_metadata(plan, inputs):
-    # The expert histogram survives a run only while the host owns the reset;
-    # a self-cleaning kernel zeroes it before exit (see check_v3_workspace).
-    assert not plan.self_cleaning
-    bindings = plan.stages[0].bindings
-    routes = inputs["topk_idx"]
-    count = torch.bincount(routes.reshape(-1), minlength=8).to(torch.int32)
-    padded = ((count + 255) // 256) * 256
-    offsets = padded.cumsum(0).to(torch.int32) - padded
-    torch.testing.assert_close(bindings["expert_counts"], count, atol=0, rtol=0)
-    torch.testing.assert_close(bindings["expert_row_offsets"], offsets, atol=0, rtol=0)
-    assert bindings["total_m_tiles_out"].item() == (padded.sum() // 128).item()
-    permuted = bindings["token_to_permuted"].reshape_as(routes).long()
-    assert torch.unique(permuted).numel() == routes.numel()
-    tokens = torch.arange(inputs["num_tokens"], device=routes.device)[
-        :, None
-    ].expand_as(routes)
-    slots = torch.arange(inputs["top_k"], device=routes.device)[None, :].expand_as(
-        routes
-    )
-    assert torch.all(permuted >= offsets[routes]).item()
-    assert torch.all(permuted < (offsets + count)[routes]).item()
-    torch.testing.assert_close(
-        bindings["meta_token"][permuted].long(), tokens, atol=0, rtol=0
-    )
-    torch.testing.assert_close(
-        bindings["meta_slot"][permuted].long(), slots, atol=0, rtol=0
-    )
-    torch.testing.assert_close(
-        bindings["routing_weight_pool"][permuted],
-        inputs["topk_weights"],
-        atol=0,
-        rtol=0,
-    )
-    expected_x = (
-        inputs["x_fp8_packed"]
-        .view(torch.int32)[:, None, :]
-        .expand(-1, inputs["top_k"], -1)
-    )
-    torch.testing.assert_close(
-        bindings["pool_fp8"][permuted], expected_x, atol=0, rtol=0
-    )
-    expected_sf = inputs["x_sf_packed"][:, None, :].expand(-1, inputs["top_k"], -1)
-    torch.testing.assert_close(
-        bindings["pool_sf"].view(torch.int32)[permuted], expected_sf, atol=0, rtol=0
-    )
-
-
-def check_source_metadata(plan, inputs):
-    views = plan.views
-    count = torch.bincount(inputs["topk_idx"].reshape(-1), minlength=8).cpu().tolist()
-    metadata = views["token_src_metadata"].reshape(-1, 3).cpu().long()
-    block = plan.config.block_m
-    offset = 0
-    seen = []
-    for expert, amount in enumerate(count):
-        actual = metadata[offset : offset + amount]
-        expected = (inputs["topk_idx"].cpu() == expert).nonzero().tolist()
-        assert torch.all(actual[:, 0] == 0).item()
-        pairs = actual[:, 1:].tolist()
-        assert sorted(pairs) == sorted(expected)
-        seen.extend(pairs)
-        offset += ((amount + block - 1) // block) * block
-    assert len(seen) == inputs["topk_idx"].numel()
-    # These arrays are explicitly cleaned by the kernel, not by plan.run().
-    for name in ("expert_send_count", "expert_recv_count", "expert_recv_count_sum"):
-        assert torch.count_nonzero(views[name][:8].view(torch.int64)).item() == 0
-    peer = views["peer_grid_idx"].view(torch.int64)[0].item()
-    ready = views["combine_ready_grid_idx"].view(torch.int64)[0].item()
-    assert peer == ready and peer > 0
-
-
-@pytest.mark.parametrize("family", ["source", "v3"])
 @pytest.mark.parametrize("precision", ["fp4", "fp8"])
 @pytest.mark.parametrize("seed", [0, 1])
-def test_pipeline_reference_and_replay(family, precision, seed):
-    plan, inputs, xs, shared = fixtures.make_smoke(family, precision, seed)
-    expected = fixtures.reference(inputs, xs, shared)
-    output = output_of(plan, family)
+def test_pipeline_reference_and_replay(precision, seed):
+    """16-token model route of both routed precisions: reference match, direct
+    and graph replay, one kernel node per run() and a clean self-cleaning
+    workspace. Row assignment inside an expert follows the atomic claim order,
+    so replays agree to the reference tolerance."""
+    plan, inputs, xs = make_model(precision, seed=seed)
+    expected = model_reference(inputs, xs)
     atol = 1.0 if precision == "fp4" else 0.1
-    check_metadata = check_source_metadata if family == "source" else check_v3_metadata
     # First launch and direct replay preserve the same workspace/counter owners.
     first = None
     for _ in range(2):
-        output.fill_(float("nan"))
+        plan.outputs.fill_(float("nan"))
         plan.run()
         torch.cuda.synchronize()
-        torch.testing.assert_close(output, expected, atol=atol, rtol=0.1)
-        check_metadata(plan, inputs)
+        torch.testing.assert_close(plan.outputs, expected, atol=atol, rtol=0.1)
+        check_v3_workspace(plan)
         if first is None:
-            first = output.clone()
+            first = plan.outputs.clone()
         else:
-            torch.testing.assert_close(
-                output,
-                first,
-                atol=0 if family == "source" else atol,
-                rtol=0 if family == "source" else 0.1,
-            )
-    # Capture contains plan.run(). A v3 route keeps its host counter resets in
-    # the graph unless it declares itself self-cleaning, in which case the graph
-    # is the kernel alone; the source plan relies on device cleanup throughout.
+            torch.testing.assert_close(plan.outputs, first, atol=atol, rtol=0.1)
+    # Capture contains plan.run(): one kernel node for every exported route.
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph):
         plan.run()
-    if family == "v3":
-        check_v3_graph_topology(plan, graph_node_names(graph))
+    check_single_kernel_graph(graph_node_names(graph))
     graph.instantiate()
     for _ in range(2):
-        output.fill_(float("nan"))
+        plan.outputs.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(
-            output,
-            first,
-            atol=0 if family == "source" else atol,
-            rtol=0 if family == "source" else 0.1,
-        )
-        check_metadata(plan, inputs)
+        torch.testing.assert_close(plan.outputs, first, atol=atol, rtol=0.1)
+        check_v3_workspace(plan)
 
 
-def test_v3_model_route_workspace_lifecycle():
-    """FP4 single-token model route: one kernel per run() when the catalog
-    declares the route self-cleaning, host counter resets inside run() otherwise."""
-    if torch.cuda.mem_get_info()[0] < 48 * 2**30:
-        pytest.skip(
-            "the 384-expert model inputs need about 48 GiB of free device memory"
-        )
-    inputs, xs = fixtures.model_inputs("fp4", num_tokens=1)
-    arch = _v3_runtime.device_arch(torch.device("cuda"))
-    try:
-        route = _v3_runtime._route(arch, "pipeline", inputs)
-    except RuntimeError as error:
-        pytest.skip(str(error))
-    from flashinfer.mega_moe_v3 import prepare_pipeline
+def test_v3_single_token_route_workspace_lifecycle():
+    """FP4 single-token model route: one kernel per run(), host reset rejected,
+    workspace words clean after every direct and replayed launch."""
+    plan, inputs, xs = make_model("fp4", num_tokens=1)
+    assert plan.self_cleaning
+    with pytest.raises(RuntimeError):
+        plan.reset()
+    expected = model_reference(inputs, xs)
+    first = None
+    for _ in range(2):
+        plan.outputs.fill_(float("nan"))
+        plan.run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(plan.outputs, expected, atol=1.0, rtol=0.1)
+        check_v3_workspace(plan, scratch_cleared=True)
+        if first is None:
+            first = plan.outputs.clone()
+        else:
+            torch.testing.assert_close(plan.outputs, first, atol=1.0, rtol=0.1)
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        plan.run()
+    check_single_kernel_graph(graph_node_names(graph))
+    graph.instantiate()
+    for _ in range(2):
+        plan.outputs.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(plan.outputs, first, atol=1.0, rtol=0.1)
+        check_v3_workspace(plan, scratch_cleared=True)
 
-    plan = prepare_pipeline(inputs)
-    assert plan.self_cleaning == bool(route["metadata"].get("self_cleaning", False))
-    if plan.self_cleaning:
-        with pytest.raises(RuntimeError):
-            plan.reset()
-    expected = fixtures.model_reference(inputs, xs)
+
+@pytest.mark.parametrize("num_tokens", [1024, 4096])
+def test_v3_long_token_routes(num_tokens):
+    """FP4 model routes at 1024 and 4096 tokens: reference match, direct and
+    graph replay, one kernel node per run() and a clean self-cleaning workspace.
+    These routes use the 32- and 128-row source tile heights. The down-projection
+    weight scales are lowered by five powers of two so that every bf16-rounded
+    weighted expert output stays below 128 in magnitude: with the fixture's
+    default scales a single accumulation-order flip in one expert output moves
+    a small element by one bf16 ulp of that output (2.0 near 256-512), outside
+    the elementwise tolerance for any implementation of this arithmetic.
+    Tolerances are unchanged."""
+    plan, inputs, xs = make_model("fp4", num_tokens=num_tokens, l2_scale_shift=5)
+    assert plan.self_cleaning
+    expected = model_reference(inputs, xs)
     first = None
     for _ in range(2):
         plan.outputs.fill_(float("nan"))
@@ -247,7 +210,7 @@ def test_v3_model_route_workspace_lifecycle():
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph):
         plan.run()
-    check_v3_graph_topology(plan, graph_node_names(graph))
+    check_single_kernel_graph(graph_node_names(graph))
     graph.instantiate()
     for _ in range(2):
         plan.outputs.fill_(float("nan"))
@@ -257,51 +220,7 @@ def test_v3_model_route_workspace_lifecycle():
         check_v3_workspace(plan)
 
 
-def test_source_update_inputs_reuses_workspace():
-    from flashinfer.source_mega_moe import prepare_mega_moe
-
-    plan, inputs, xs, shared = fixtures.make_smoke("source", "fp4")
-    plan.run()
-    original = plan.output.clone()
-    pointer = plan.workspace.data_ptr()
-    changed = dict(inputs)
-    changed["x_fp8_packed"] = (-inputs["x_fp8_packed"].float()).to(torch.float8_e4m3fn)
-    changed["topk_weights"] = inputs["topk_weights"].neg().contiguous()
-    plan.update_inputs(
-        changed["x_fp8_packed"],
-        changed["x_sf_packed"],
-        changed["topk_idx"],
-        changed["topk_weights"],
-    )
-    plan.output.fill_(float("nan"))
-    plan.run()
-    torch.cuda.synchronize()
-    assert plan.workspace.data_ptr() == pointer
-    assert not torch.equal(plan.output, original)
-    torch.testing.assert_close(
-        plan.output, fixtures.reference(changed, xs, shared), atol=1.0, rtol=0.1
-    )
-    # A fresh independent workspace must agree exactly with the reused one.
-    fresh = prepare_mega_moe(
-        changed["x_fp8_packed"],
-        changed["x_sf_packed"],
-        changed["topk_idx"],
-        changed["topk_weights"],
-        weights=fixtures.source_weights(inputs, shared),
-        num_experts=8,
-        intermediate=256,
-        routed_weight_dtype="fp4",
-        num_shared_experts=1,
-        activation_clamp=10.0,
-        fast_math=True,
-        num_sms=2,
-    )
-    fresh.run()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(plan.output, fresh.output, atol=0, rtol=0)
-
-
-def test_grouped_l2_repack_and_graph_replay():
+def test_grouped_l2_update_scales_and_graph_replay():
     plan, a, b, sa, sb, words_a, words_b = fixtures.make_grouped_l2()
     for changed in (None, "activation", "weight"):
         if changed == "activation":
@@ -310,6 +229,10 @@ def test_grouped_l2_repack_and_graph_replay():
         if changed == "weight":
             sb.mul_(0.5)
             words_b.copy_(fixtures.scale_words(sb))
+        if changed is not None:
+            # Scale words changed in place: the plan repacks them on request,
+            # never inside run().
+            plan.update_scales()
         expected = fixtures.grouped_reference(a, b, sa, sb)
         plan.outputs.fill_(float("nan"))
         plan.run()
@@ -326,7 +249,7 @@ def test_grouped_l2_repack_and_graph_replay():
         torch.cuda.synchronize()
         torch.testing.assert_close(plan.outputs, first, atol=0, rtol=0)
         # Exact natural->group-folded scale words prove both repacks occurred.
-        repack = plan.stages[0].bindings
+        repack = plan.preparation_stages[0].bindings
         permuted_a = (
             words_a.reshape(4096 // 128, 4, 32, -1)
             .transpose(1, 2)
@@ -346,12 +269,13 @@ def test_grouped_l2_repack_and_graph_replay():
         torch.testing.assert_close(
             repack["dst_b"].view(torch.int32), expected_b, atol=0, rtol=0
         )
-        graph = torch.cuda.CUDAGraph()
+        # A captured run() is the GEMM alone and replays bit-exactly.
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
         with torch.cuda.graph(graph):
             plan.run()
+        check_single_kernel_graph(graph_node_names(graph))
+        graph.instantiate()
         plan.outputs.fill_(float("nan"))
-        repack["dst_a"].zero_()
-        repack["dst_b"].zero_()
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(plan.outputs, first, atol=0, rtol=0)
