@@ -437,7 +437,7 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
         buffers.  Afterwards every ``launch`` must supply all of them.
         """
         arguments = list(self._arguments)
-        names = ("A", "A64", "A32", "C", "C_tma", "a_scale", "SFA")
+        names: tuple[str, ...] = ("A", "A64", "A32", "C", "C_tma", "a_scale", "SFA")
         if not self.fill_padding:
             names += ("m_indices",)
         for name in names:

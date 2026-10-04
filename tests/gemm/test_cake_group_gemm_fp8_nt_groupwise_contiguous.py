@@ -509,23 +509,21 @@ def test_release_prepared_operands_frees_token_buffers():
     )
     expected = _reference(a, b, a_scale, b_scale, m_indices)
     torch.cuda.synchronize()
-    torch.cuda.empty_cache()
     baseline = torch.cuda.memory_allocated(device)
+    # Token operands allocated after the baseline: they must be freed by the release.
+    a2, a_scale2, m_indices2 = a.clone(), a_scale.clone(), m_indices.clone()
     out = torch.empty((a.shape[0], 256), dtype=torch.bfloat16, device=device)
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
-        a, b, a_scale, b_scale, m_indices, out=out
+        a2, b, a_scale2, b_scale, m_indices2, out=out
     )
     prepared.release_prepared_operands()
     with pytest.raises(ValueError, match="released"):
         prepared.launch()
     with pytest.raises(ValueError, match="released"):
-        prepared.out
-    del a, a_scale, m_indices, out
+        _ = prepared.out
+    del a2, a_scale2, m_indices2, out
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated(device) == baseline
-    a, _, a_scale, _, m_indices = _make_inputs(
-        counts, 256, 1024, seed=4746, device=device
-    )
     out = torch.empty((a.shape[0], 256), dtype=torch.bfloat16, device=device)
     result = prepared.launch(a=a, a_scale=a_scale, m_indices=m_indices, out=out)
     assert result is out
