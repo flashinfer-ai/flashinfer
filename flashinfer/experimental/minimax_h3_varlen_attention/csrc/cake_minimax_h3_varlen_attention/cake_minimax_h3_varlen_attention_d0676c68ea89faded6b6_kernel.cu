@@ -93,6 +93,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define BLOCK_M 128
 #define BLOCK_N 128
 #define HEAD_DIM 128
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -384,8 +385,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, const __grid_constant__ CUtensorMap SFQ, const __grid_constant__ CUtensorMap SFK, const __grid_constant__ CUtensorMap SFVtLo, const __grid_constant__ CUtensorMap SFVtHi, __nv_bfloat16* __restrict__ O, int* __restrict__ cl_head, int* __restrict__ cl_seg_begin, int* __restrict__ cl_seg_len, int* __restrict__ cl_kv_base, int* __restrict__ cl_q_block, int* __restrict__ cl_kv_begin, int* __restrict__ cl_kv_blocks, int* __restrict__ cl_ws_slot, __half* __restrict__ partial_O, float* __restrict__ partial_ML, unsigned int num_tiles, int total_clusters, int heads, int PB, float softmax_scale_log2)
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_minimax_h3_varlen_attention_d0676c68ea89faded6b6(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, const __grid_constant__ CUtensorMap SFQ, const __grid_constant__ CUtensorMap SFK, const __grid_constant__ CUtensorMap SFVtLo, const __grid_constant__ CUtensorMap SFVtHi, __nv_bfloat16* __restrict__ O, int* __restrict__ cl_head, int* __restrict__ cl_seg_begin, int* __restrict__ cl_seg_len, int* __restrict__ cl_kv_base, int* __restrict__ cl_q_block, int total_clusters, int heads, int PB, float softmax_scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -556,7 +557,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
     if (warp <= 7) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 208;");
         { // softmax_main
-            unsigned int total_tiles = num_tiles;
+            unsigned int total_tiles = heads * total_clusters;
             unsigned int stage = make_warp_uniform(warp / 4);
             int scale_off = make_warp_uniform(stage * 128);
             int p_col = make_warp_uniform(0);
@@ -571,12 +572,11 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                 int seg_len = cl_seg_len[tile_idx];
                 int kv_base = cl_kv_base[tile_idx];
                 int m_block = cl_q_block[tile_idx] + cta_rank * 2;
-                unsigned int num_n_blocks = cl_kv_blocks[tile_idx];
-                int kv_begin = cl_kv_begin[tile_idx];
-                int ws_slot = cl_ws_slot[tile_idx];
-                int tail_base = seg_len - kv_begin * 128;
-                int kv_len = num_n_blocks * 128;
-                unsigned int n_count = (unsigned int)((kv_len + 128 - 1) / 128);
+                unsigned int num_n_blocks = (seg_len + 128 - 1) / 128;
+                int kv_begin = 0;
+                int ws_slot = -1;
+                int tail_base = seg_len;
+                unsigned int n_count = num_n_blocks;
                 float row_max = -CAKE_INF;
                 float row_max_scaled = 0.0f;
                 float row_sum = 0.0f;
@@ -1053,7 +1053,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                     float2 partial = _f2_1;
                     #pragma unroll
                     for (int pair = 2; pair < 16; pair += 2) {
-                        float2 _f2_2 = make_float2((sv + 0)[pair], (sv + 0)[pair + 1]);
+                        float2 _f2_2 = make_float2(sv[pair], sv[pair + 1]);
                         partial = add_f32x2(partial, _f2_2);
                     }
                     float2 frag_sum2 = partial;
@@ -1064,7 +1064,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                     float2 partial_0 = _f2_4;
                     #pragma unroll
                     for (int pair_1 = 2; pair_1 < 16; pair_1 += 2) {
-                        float2 _f2_5 = make_float2((sv + 16)[pair_1], (sv + 16)[pair_1 + 1]);
+                        float2 _f2_5 = make_float2(sv[16 + pair_1], sv[16 + (pair_1 + 1)]);
                         partial_0 = add_f32x2(partial_0, _f2_5);
                     }
                     frag_sum2 = partial_0;
@@ -1199,7 +1199,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                     float2 partial_1 = _f2_6;
                     #pragma unroll
                     for (int pair_2 = 2; pair_2 < 16; pair_2 += 2) {
-                        float2 _f2_7 = make_float2((sv + 32)[pair_2], (sv + 32)[pair_2 + 1]);
+                        float2 _f2_7 = make_float2(sv[32 + pair_2], sv[32 + (pair_2 + 1)]);
                         partial_1 = add_f32x2(partial_1, _f2_7);
                     }
                     float2 frag_sum2_2 = partial_1;
@@ -1210,7 +1210,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                     float2 partial_4 = _f2_9;
                     #pragma unroll
                     for (int pair_3 = 2; pair_3 < 16; pair_3 += 2) {
-                        float2 _f2_10 = make_float2((sv + 48)[pair_3], (sv + 48)[pair_3 + 1]);
+                        float2 _f2_10 = make_float2(sv[48 + pair_3], sv[48 + (pair_3 + 1)]);
                         partial_4 = add_f32x2(partial_4, _f2_10);
                     }
                     frag_sum2_2 = partial_4;
@@ -1356,7 +1356,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                     float2 partial_5 = _f2_11;
                     #pragma unroll
                     for (int pair_4 = 2; pair_4 < 16; pair_4 += 2) {
-                        float2 _f2_12 = make_float2((sv + 64)[pair_4], (sv + 64)[pair_4 + 1]);
+                        float2 _f2_12 = make_float2(sv[64 + pair_4], sv[64 + (pair_4 + 1)]);
                         partial_5 = add_f32x2(partial_5, _f2_12);
                     }
                     float2 _f2_13 = make_float2(p_scale, p_scale);
@@ -1366,7 +1366,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                     float2 partial_7 = _f2_14;
                     #pragma unroll
                     for (int pair_5 = 2; pair_5 < 16; pair_5 += 2) {
-                        float2 _f2_15 = make_float2((sv + 80)[pair_5], (sv + 80)[pair_5 + 1]);
+                        float2 _f2_15 = make_float2(sv[80 + pair_5], sv[80 + (pair_5 + 1)]);
                         partial_7 = add_f32x2(partial_7, _f2_15);
                     }
                     block_sum2 = fma_f32x2_rn_ftz(partial_7, scale2_6, block_sum2);
@@ -1500,7 +1500,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                     float2 partial_8 = _f2_16;
                     #pragma unroll
                     for (int pair_6 = 2; pair_6 < 16; pair_6 += 2) {
-                        float2 _f2_17 = make_float2((sv + 96)[pair_6], (sv + 96)[pair_6 + 1]);
+                        float2 _f2_17 = make_float2(sv[96 + pair_6], sv[96 + (pair_6 + 1)]);
                         partial_8 = add_f32x2(partial_8, _f2_17);
                     }
                     float2 _f2_18 = make_float2(p_scale, p_scale);
@@ -1510,7 +1510,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                     float2 partial_10 = _f2_19;
                     #pragma unroll
                     for (int pair_7 = 2; pair_7 < 16; pair_7 += 2) {
-                        float2 _f2_20 = make_float2((sv + 112)[pair_7], (sv + 112)[pair_7 + 1]);
+                        float2 _f2_20 = make_float2(sv[112 + pair_7], sv[112 + (pair_7 + 1)]);
                         partial_10 = add_f32x2(partial_10, _f2_20);
                     }
                     block_sum2 = fma_f32x2_rn_ftz(partial_10, scale2_9, block_sum2);
@@ -1547,89 +1547,47 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                 float final_scale = 0.0f;
                 float _rcp_0 = approx_rcp(row_sum);
                 final_scale = ((row_sum != 0.0f && row_sum == row_sum) ? _rcp_0 : 0.0f);
-                int seg_len_out = cl_seg_len[tile_idx];
-                int ws_slot_out = cl_ws_slot[tile_idx];
+                int seg_len_out = seg_len;
                 int local_row = ((unsigned int)m_block + stage) * 128 + (unsigned int)(warp % 4 * 32 + lane);
                 int token = seg_begin + local_row;
                 long long out_off = ((long long)token * (long long)heads + (long long)head) * 128;
                 int tmem_o_off = make_warp_uniform((unsigned int)TMEM_OUTPUT_0_OFFSET + stage * 128);
-                int partial_row = ws_slot_out * 512 + cta_rank * 256 + scale_off + (warp % 4 * 32 + lane);
-                if (ws_slot_out >= 0) {
-                    if (local_row < seg_len_out) {
-                        partial_ML[partial_row * 2] = row_max_scaled;
-                        partial_ML[partial_row * 2 + 1] = row_sum;
-                    }
-                }
                 #pragma unroll
                 for (int col = 0; col < 8; col++) {
                     int addr = taddr + (unsigned int)tmem_o_off + (unsigned int)(warp % 4 * 32 << 16) + (unsigned int)(col * 16);
                     float _tmem_load_0[16];
                     tmem_ld_x16(&_tmem_load_0[0], addr);
                     if (local_row < seg_len_out) {
-                        if (ws_slot_out >= 0) {
-                            {
+                        {
 #if __CUDA_ARCH__ == 1000
-                                const float2 _prescale2_82 = {final_scale, final_scale};
+                            const float2 _prescale2_82 = {final_scale, final_scale};
 #else
-                                const float2 _prescale2_81 = {final_scale, final_scale};
+                            const float2 _prescale2_81 = {final_scale, final_scale};
 #endif
-                                #if __CUDA_ARCH__ >= 1000
-                                #pragma unroll
-                                for (int _ps = 0; _ps < 8; _ps++)
+                            #if __CUDA_ARCH__ >= 1000
+                            #pragma unroll
+                            for (int _ps = 0; _ps < 8; _ps++)
 #if __CUDA_ARCH__ == 1000
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_0[0])[_ps], _prescale2_82);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_0[0])[_ps], _prescale2_82);
 #else
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_0[0])[_ps], _prescale2_81);
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_0[0])[_ps], _prescale2_81);
 #endif
-                                #else
-                                #pragma unroll
-                                for (int _ps = 0; _ps < 16; _ps++)
-                                    _tmem_load_0[0 + _ps] *= final_scale;
-                                #endif
-                                __half2 _pk[8];
-                                _pk[0] = __floats2half2_rn(_tmem_load_0[0 + 0], _tmem_load_0[0 + 1]);
-                                _pk[1] = __floats2half2_rn(_tmem_load_0[0 + 2], _tmem_load_0[0 + 3]);
-                                _pk[2] = __floats2half2_rn(_tmem_load_0[0 + 4], _tmem_load_0[0 + 5]);
-                                _pk[3] = __floats2half2_rn(_tmem_load_0[0 + 6], _tmem_load_0[0 + 7]);
-                                _pk[4] = __floats2half2_rn(_tmem_load_0[0 + 8], _tmem_load_0[0 + 9]);
-                                _pk[5] = __floats2half2_rn(_tmem_load_0[0 + 10], _tmem_load_0[0 + 11]);
-                                _pk[6] = __floats2half2_rn(_tmem_load_0[0 + 12], _tmem_load_0[0 + 13]);
-                                _pk[7] = __floats2half2_rn(_tmem_load_0[0 + 14], _tmem_load_0[0 + 15]);
-                                *reinterpret_cast<uint4*>(&((__half*)(partial_O + (partial_row * 128 + col * 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                                *reinterpret_cast<uint4*>(&((__half*)(partial_O + (partial_row * 128 + col * 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
-                            }
-                        } else {
-                            {
-#if __CUDA_ARCH__ == 1000
-                                const float2 _prescale2_83 = {final_scale, final_scale};
-#else
-                                const float2 _prescale2_82 = {final_scale, final_scale};
-#endif
-                                #if __CUDA_ARCH__ >= 1000
-                                #pragma unroll
-                                for (int _ps = 0; _ps < 8; _ps++)
-#if __CUDA_ARCH__ == 1000
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_0[0])[_ps], _prescale2_83);
-#else
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_0[0])[_ps], _prescale2_82);
-#endif
-                                #else
-                                #pragma unroll
-                                for (int _ps = 0; _ps < 16; _ps++)
-                                    _tmem_load_0[0 + _ps] *= final_scale;
-                                #endif
-                                __nv_bfloat162 _pk[8];
-                                _pk[0] = __floats2bfloat162_rn(_tmem_load_0[0 + 0], _tmem_load_0[0 + 1]);
-                                _pk[1] = __floats2bfloat162_rn(_tmem_load_0[0 + 2], _tmem_load_0[0 + 3]);
-                                _pk[2] = __floats2bfloat162_rn(_tmem_load_0[0 + 4], _tmem_load_0[0 + 5]);
-                                _pk[3] = __floats2bfloat162_rn(_tmem_load_0[0 + 6], _tmem_load_0[0 + 7]);
-                                _pk[4] = __floats2bfloat162_rn(_tmem_load_0[0 + 8], _tmem_load_0[0 + 9]);
-                                _pk[5] = __floats2bfloat162_rn(_tmem_load_0[0 + 10], _tmem_load_0[0 + 11]);
-                                _pk[6] = __floats2bfloat162_rn(_tmem_load_0[0 + 12], _tmem_load_0[0 + 13]);
-                                _pk[7] = __floats2bfloat162_rn(_tmem_load_0[0 + 14], _tmem_load_0[0 + 15]);
-                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (out_off + (long long)(col * 16))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (out_off + (long long)(col * 16))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
-                            }
+                            #else
+                            #pragma unroll
+                            for (int _ps = 0; _ps < 16; _ps++)
+                                _tmem_load_0[0 + _ps] *= final_scale;
+                            #endif
+                            __nv_bfloat162 _pk[8];
+                            _pk[0] = __floats2bfloat162_rn(_tmem_load_0[0 + 0], _tmem_load_0[0 + 1]);
+                            _pk[1] = __floats2bfloat162_rn(_tmem_load_0[0 + 2], _tmem_load_0[0 + 3]);
+                            _pk[2] = __floats2bfloat162_rn(_tmem_load_0[0 + 4], _tmem_load_0[0 + 5]);
+                            _pk[3] = __floats2bfloat162_rn(_tmem_load_0[0 + 6], _tmem_load_0[0 + 7]);
+                            _pk[4] = __floats2bfloat162_rn(_tmem_load_0[0 + 8], _tmem_load_0[0 + 9]);
+                            _pk[5] = __floats2bfloat162_rn(_tmem_load_0[0 + 10], _tmem_load_0[0 + 11]);
+                            _pk[6] = __floats2bfloat162_rn(_tmem_load_0[0 + 12], _tmem_load_0[0 + 13]);
+                            _pk[7] = __floats2bfloat162_rn(_tmem_load_0[0 + 14], _tmem_load_0[0 + 15]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (out_off + (long long)(col * 16))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (out_off + (long long)(col * 16))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
                         }
                     }
                 }
@@ -1639,7 +1597,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
     // ---- Role: correction_lo ----
     if (warp >= 8 && warp <= 9) {
         { // correction_lo_main
-            unsigned int total_tiles_1 = num_tiles;
+            unsigned int total_tiles_1 = heads * total_clusters;
             int owned_row_base = make_warp_uniform(warp % 2 * 32);
             unsigned int _phase_p_empty_0 = 1;
             unsigned int _phase_p_empty_1 = 1;
@@ -1654,9 +1612,9 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                 int seg_len_1 = cl_seg_len[tile_idx_1];
                 int kv_base_1 = cl_kv_base[tile_idx_1];
                 int m_block_1 = cl_q_block[tile_idx_1] + cta_rank * 2;
-                unsigned int num_n_blocks_1 = cl_kv_blocks[tile_idx_1];
-                int kv_begin_1 = cl_kv_begin[tile_idx_1];
-                int ws_slot_1 = cl_ws_slot[tile_idx_1];
+                unsigned int num_n_blocks_1 = (seg_len_1 + 128 - 1) / 128;
+                int kv_begin_1 = 0;
+                int ws_slot_1 = -1;
                 mbarrier_wait(p_empty_addr, _phase_p_empty_0);
                 _phase_p_empty_0 ^= 1;
                 mbarrier_wait(p_empty_addr + 8, _phase_p_empty_1);
@@ -1691,10 +1649,17 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                             int addr_1 = make_warp_uniform(taddr + (unsigned int)TMEM_OUTPUT_0_OFFSET + (unsigned int)tmem_row_base + (unsigned int)(col_1 * 16));
                             float _tmem_load_1[16];
                             tmem_ld_x16(&_tmem_load_1[0], addr_1);
+                            #if __CUDA_ARCH__ >= 1000
                             const float2 _scale2_0 = {scale, scale};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_0);
+                            #else
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 16; _ls++) {
+                                _tmem_load_1[_ls] = _tmem_load_1[_ls] * scale;
+                            }
+                            #endif
                             tmem_st_x16_f32(addr_1, _tmem_load_1);
                         }
                     }
@@ -1723,10 +1688,17 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                             int addr_2 = make_warp_uniform(taddr + (unsigned int)TMEM_OUTPUT_1_OFFSET + (unsigned int)tmem_row_base_2 + (unsigned int)(col_2 * 16));
                             float _tmem_load_2[16];
                             tmem_ld_x16(&_tmem_load_2[0], addr_2);
+                            #if __CUDA_ARCH__ >= 1000
                             const float2 _scale2_1 = {scale_3, scale_3};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_1);
+                            #else
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 16; _ls++) {
+                                _tmem_load_2[_ls] = _tmem_load_2[_ls] * scale_3;
+                            }
+                            #endif
                             tmem_st_x16_f32(addr_2, _tmem_load_2);
                         }
                     }
@@ -1754,7 +1726,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
     // ---- Role: correction_hi ----
     if (warp >= 10 && warp <= 11) {
         { // correction_hi_main
-            unsigned int total_tiles_2 = num_tiles;
+            unsigned int total_tiles_2 = heads * total_clusters;
             int owned_row_base_1 = make_warp_uniform(64 + warp % 2 * 32);
             unsigned int _phase_p_empty_0_1 = 1;
             unsigned int _phase_p_empty_1_1 = 1;
@@ -1769,9 +1741,9 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                 int seg_len_2 = cl_seg_len[tile_idx_2];
                 int kv_base_2 = cl_kv_base[tile_idx_2];
                 int m_block_2 = cl_q_block[tile_idx_2] + cta_rank * 2;
-                unsigned int num_n_blocks_2 = cl_kv_blocks[tile_idx_2];
-                int kv_begin_2 = cl_kv_begin[tile_idx_2];
-                int ws_slot_2 = cl_ws_slot[tile_idx_2];
+                unsigned int num_n_blocks_2 = (seg_len_2 + 128 - 1) / 128;
+                int kv_begin_2 = 0;
+                int ws_slot_2 = -1;
                 mbarrier_wait(p_empty_addr, _phase_p_empty_0_1);
                 _phase_p_empty_0_1 ^= 1;
                 mbarrier_wait(p_empty_addr + 8, _phase_p_empty_1_1);
@@ -1806,10 +1778,17 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                             int addr_3 = make_warp_uniform(taddr + (unsigned int)TMEM_OUTPUT_0_OFFSET + (unsigned int)tmem_row_base_1 + (unsigned int)(col_3 * 16));
                             float _tmem_load_3[16];
                             tmem_ld_x16(&_tmem_load_3[0], addr_3);
+                            #if __CUDA_ARCH__ >= 1000
                             const float2 _scale2_0 = {scale_1, scale_1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_0);
+                            #else
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 16; _ls++) {
+                                _tmem_load_3[_ls] = _tmem_load_3[_ls] * scale_1;
+                            }
+                            #endif
                             tmem_st_x16_f32(addr_3, _tmem_load_3);
                         }
                     }
@@ -1838,10 +1817,17 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                             int addr_4 = make_warp_uniform(taddr + (unsigned int)TMEM_OUTPUT_1_OFFSET + (unsigned int)tmem_row_base_2_1 + (unsigned int)(col_4 * 16));
                             float _tmem_load_4[16];
                             tmem_ld_x16(&_tmem_load_4[0], addr_4);
+                            #if __CUDA_ARCH__ >= 1000
                             const float2 _scale2_1 = {scale_3_1, scale_3_1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_4)[_ls], _scale2_1);
+                            #else
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 16; _ls++) {
+                                _tmem_load_4[_ls] = _tmem_load_4[_ls] * scale_3_1;
+                            }
+                            #endif
                             tmem_st_x16_f32(addr_4, _tmem_load_4);
                         }
                     }
@@ -1878,7 +1864,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
             unsigned int _phase_p_full_2_0 = 0;
             unsigned int _phase_p_full_2_1 = 0;
             if (cta_rank == 0) {
-                unsigned int total_tiles_3 = num_tiles;
+                unsigned int total_tiles_3 = heads * total_clusters;
                 unsigned int k_stage = 0;
                 unsigned int k_phase = 0;
                 unsigned int v_stage = 0;
@@ -1890,9 +1876,9 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                     int seg_len_3 = cl_seg_len[tile_idx_3];
                     int kv_base_3 = cl_kv_base[tile_idx_3];
                     int m_block_3 = cl_q_block[tile_idx_3] + cta_rank * 2;
-                    unsigned int num_n_blocks_3 = cl_kv_blocks[tile_idx_3];
-                    int kv_begin_3 = cl_kv_begin[tile_idx_3];
-                    int ws_slot_3 = cl_ws_slot[tile_idx_3];
+                    unsigned int num_n_blocks_3 = (seg_len_3 + 128 - 1) / 128;
+                    int kv_begin_3 = 0;
+                    int ws_slot_3 = -1;
                     mbarrier_wait(q_full_addr, _phase_q_full_0);
                     _phase_q_full_0 ^= 1;
                     mbarrier_wait(q_full_addr + 8, _phase_q_full_1);
@@ -2142,7 +2128,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
     // ---- Role: load ----
     if (warp == 13) {
         { // load_main
-            unsigned int total_tiles_4 = num_tiles;
+            unsigned int total_tiles_4 = heads * total_clusters;
             unsigned int k_load_stage = 0;
             unsigned int _phase_q_empty_0 = 1;
             unsigned int _phase_k_empty = 1;
@@ -2153,9 +2139,9 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                 int seg_len_4 = cl_seg_len[tile_idx_4];
                 int kv_base_4 = cl_kv_base[tile_idx_4];
                 int m_block_4 = cl_q_block[tile_idx_4] + cta_rank * 2;
-                unsigned int num_n_blocks_4 = cl_kv_blocks[tile_idx_4];
-                int kv_begin_4 = cl_kv_begin[tile_idx_4];
-                int ws_slot_4 = cl_ws_slot[tile_idx_4];
+                unsigned int num_n_blocks_4 = (seg_len_4 + 128 - 1) / 128;
+                int kv_begin_4 = 0;
+                int ws_slot_4 = -1;
                 int q_tile = kv_base_4 + m_block_4;
                 int q_sf_tile = head_4 * PB + q_tile;
                 int q_row = q_sf_tile * 128;
@@ -2176,7 +2162,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                 #pragma unroll 1
                 for (unsigned int ni = 0; ni < num_n_blocks_4; ni++) {
                     unsigned int n = num_n_blocks_4 - 1 - ni;
-                    int kv_sf_tile = (unsigned int)(head_4 * PB + kv_base_4 + kv_begin_4) + n;
+                    int kv_sf_tile = (unsigned int)(head_4 * PB + kv_base_4) + n;
                     int kv_row = kv_sf_tile * 128;
                     mbarrier_wait(k_empty_addr + (k_load_stage) * 8, _phase_k_empty);
                     if (elect_sync()) {
@@ -2195,7 +2181,7 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
     // ---- Role: v_load ----
     if (warp == 14) {
         { // v_load_main
-            unsigned int total_tiles_5 = num_tiles;
+            unsigned int total_tiles_5 = heads * total_clusters;
             unsigned int v_load_stage = 0;
             unsigned int _phase_v_empty = 1;
             #pragma unroll 1
@@ -2205,13 +2191,13 @@ kernel_cake_minimax_h3_varlen_attention_72d4d24d2b3d3f9d788e(const __grid_consta
                 int seg_len_5 = cl_seg_len[tile_idx_5];
                 int kv_base_5 = cl_kv_base[tile_idx_5];
                 int m_block_5 = cl_q_block[tile_idx_5] + cta_rank * 2;
-                unsigned int num_n_blocks_5 = cl_kv_blocks[tile_idx_5];
-                int kv_begin_5 = cl_kv_begin[tile_idx_5];
-                int ws_slot_5 = cl_ws_slot[tile_idx_5];
+                unsigned int num_n_blocks_5 = (seg_len_5 + 128 - 1) / 128;
+                int kv_begin_5 = 0;
+                int ws_slot_5 = -1;
                 #pragma unroll 1
                 for (unsigned int ni_1 = 0; ni_1 < num_n_blocks_5; ni_1++) {
                     unsigned int n_1 = num_n_blocks_5 - 1 - ni_1;
-                    int kv_tile = (unsigned int)(kv_base_5 + kv_begin_5) + n_1;
+                    int kv_tile = (unsigned int)kv_base_5 + n_1;
                     int kv_sf_tile_1 = head_5 * PB + kv_tile;
                     mbarrier_wait(v_empty_addr + (v_load_stage) * 8, _phase_v_empty);
                     if (elect_sync()) {

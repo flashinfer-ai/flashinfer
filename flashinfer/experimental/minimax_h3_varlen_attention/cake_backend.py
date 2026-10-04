@@ -1018,13 +1018,30 @@ def _persistent_grid(
     return (2 * pairs, 1, 1)
 
 
+# Element multiple that keeps a BF16 stride 16-byte aligned (TMA global
+# strides and the BF16 kernel's 16-byte ragged-tail copies).
+THD_STRIDE_ALIGN = 16 // 2
+
+
 def _check_thd(
     name: str,
     tensor: torch.Tensor,
     total_tokens: int,
     num_heads: int,
     device: torch.device,
+    *,
+    contiguous: bool,
 ) -> None:
+    """Validate one ``[T, H, 128]`` BF16 operand.
+
+    ``contiguous=False`` accepts any view with unit innermost stride, a head
+    stride that is a 16-byte multiple of at least 128 elements, a token
+    stride that is a 16-byte multiple of at least ``H * head_stride`` and a
+    16-byte-aligned base: contiguous tensors, the column slices of a fused
+    ``[T, 3 * H * 128]`` QKV projection (strides ``(3 * H * 128, 128, 1)``)
+    and the slices of a ``[T, H, 3, 128]`` pack (strides ``(H * 384, 384,
+    1)``).  ``contiguous=True`` additionally requires a contiguous tensor.
+    """
     if not tensor.is_cuda or tensor.device != device:
         raise ValueError(f"{name} must live on {device}")
     if tensor.dtype != torch.bfloat16:
@@ -1034,8 +1051,27 @@ def _check_thd(
             f"{name} must be [T, H, {HEAD_DIM}] = {(total_tokens, num_heads, HEAD_DIM)}, "
             f"got {tuple(tensor.shape)}"
         )
-    if not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
+    row_stride, head_stride, elem_stride = (int(s) for s in tensor.stride())
+    if elem_stride != 1:
+        raise ValueError(
+            f"{name} must have a unit innermost stride, got stride(2)={elem_stride}"
+        )
+    if head_stride < HEAD_DIM or head_stride % THD_STRIDE_ALIGN:
+        raise ValueError(
+            f"{name} head stride must be a 16-byte multiple of at least {HEAD_DIM} "
+            f"elements, got {head_stride}"
+        )
+    if row_stride < num_heads * head_stride or row_stride % THD_STRIDE_ALIGN:
+        raise ValueError(
+            f"{name} token stride must be a 16-byte multiple of at least "
+            f"H * head_stride = {num_heads * head_stride} elements, got {row_stride}"
+        )
+    if tensor.data_ptr() % 16:
+        raise ValueError(f"{name} base address must be 16-byte aligned")
+    if contiguous and not tensor.is_contiguous():
+        raise ValueError(
+            f"{name} must be contiguous, got strides {tuple(tensor.stride())}"
+        )
 
 
 def validate_minimax_h3_varlen_inputs(
@@ -1043,10 +1079,16 @@ def validate_minimax_h3_varlen_inputs(
     key: torch.Tensor,
     value: torch.Tensor,
     out: Optional[torch.Tensor],
+    *,
+    strided_qkv: bool,
 ) -> tuple[int, int, torch.device]:
     """Shape / dtype / device validation shared by both families.
 
-    Returns ``(total_tokens, num_heads, device)``.
+    ``strided_qkv=True`` (the BF16 route) accepts strided ``[T, H, 128]``
+    views for ``query`` / ``key`` / ``value`` (see ``_check_thd``; the three
+    may differ in strides); ``False`` (the NVFP4 routes, whose quantizers
+    read contiguous THD) requires contiguous tensors.  ``out`` is always
+    contiguous.  Returns ``(total_tokens, num_heads, device)``.
     """
     if query.ndim != 3:
         raise ValueError(f"query must be THD [T, H, {HEAD_DIM}]")
@@ -1055,9 +1097,11 @@ def validate_minimax_h3_varlen_inputs(
         raise ValueError("query must have at least one head")
     device = query.device
     for name, tensor in (("query", query), ("key", key), ("value", value)):
-        _check_thd(name, tensor, total_tokens, num_heads, device)
+        _check_thd(
+            name, tensor, total_tokens, num_heads, device, contiguous=not strided_qkv
+        )
     if out is not None:
-        _check_thd("out", out, total_tokens, num_heads, device)
+        _check_thd("out", out, total_tokens, num_heads, device, contiguous=True)
     return total_tokens, num_heads, device
 
 
@@ -1234,13 +1278,18 @@ def prepare_minimax_h3_varlen_attention(
 ) -> MiniMaxH3VarlenAttentionRunner:
     """Validate, plan and bind one BF16 packed-varlen attention problem.
 
-    Every allocation happens here (only the optional output and the small
-    int32 plan tables); the returned runner launches with none.
+    ``query`` / ``key`` / ``value`` may be strided ``[T, H, 128]`` views (unit
+    innermost stride, 16-byte-aligned head and token strides and base; for
+    example the column slices of a fused QKV projection or the slices of a
+    ``[T, H, 3, 128]`` pack): the kernel reads them in place, no copies are
+    made.  ``out`` is contiguous.  Every allocation happens here (only the
+    optional output and the small int32 plan tables); the returned runner
+    launches with none.
     """
     if backend != "cake":
         raise ValueError("MiniMax-H3 varlen attention supports backend='cake'")
     total_tokens, num_heads, device = validate_minimax_h3_varlen_inputs(
-        query, key, value, out
+        query, key, value, out, strided_qkv=True
     )
     if isinstance(cu_seqlens, torch.Tensor) and (
         not cu_seqlens.is_cuda or cu_seqlens.device != device
@@ -1335,7 +1384,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         raise ValueError(f"pv_mode must be one of {PV_MODES}, got {pv_mode!r}")
     variant = NVFP4_VARIANT[pv_mode]
     total_tokens, num_heads, device = validate_minimax_h3_varlen_inputs(
-        query, key, value, out
+        query, key, value, out, strided_qkv=False
     )
     if isinstance(cu_seqlens, torch.Tensor) and (
         not cu_seqlens.is_cuda or cu_seqlens.device != device

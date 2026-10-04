@@ -72,6 +72,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define BLOCK_M 128
 #define BLOCK_N 128
 #define HEAD_DIM 128
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -307,8 +308,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_varlen_attention_4e6602e44a81b36f88ed(const __grid_constant__ CUtensorMap Q, __nv_bfloat16* __restrict__ Q_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, __half* __restrict__ partial_O, float* __restrict__ partial_ML, unsigned int total_tiles, int num_heads, float softmax_scale_log2)
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_minimax_h3_varlen_attention_b98bfa76b68c7ab7c0e5(const __grid_constant__ CUtensorMap Q, __nv_bfloat16* __restrict__ Q_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, __half* __restrict__ partial_O, float* __restrict__ partial_ML, unsigned int total_tiles, int num_heads, float softmax_scale_log2, long long Q_raw_stride_m3, long long Q_raw_stride_m2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1024,10 +1025,17 @@ kernel_cake_minimax_h3_varlen_attention_4e6602e44a81b36f88ed(const __grid_consta
                             int addr0 = taddr + (unsigned int)TMEM_OUTPUT_0_OFFSET + (unsigned int)(warp % 4 * 32 << 16) + (unsigned int)(col * 16);
                             float _tmem_load_1[16];
                             tmem_ld_x16(&_tmem_load_1[0], addr0);
+                            #if __CUDA_ARCH__ >= 1000
                             const float2 _scale2_0 = {scale0, scale0};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_0);
+                            #else
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 16; _ls++) {
+                                _tmem_load_1[_ls] = _tmem_load_1[_ls] * scale0;
+                            }
+                            #endif
                             tmem_st_x16_f32(addr0, _tmem_load_1);
                         }
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -1054,10 +1062,17 @@ kernel_cake_minimax_h3_varlen_attention_4e6602e44a81b36f88ed(const __grid_consta
                             int addr1 = taddr + (unsigned int)TMEM_OUTPUT_1_OFFSET + (unsigned int)(warp % 4 * 32 << 16) + (unsigned int)(col_1 * 16);
                             float _tmem_load_3[16];
                             tmem_ld_x16(&_tmem_load_3[0], addr1);
+                            #if __CUDA_ARCH__ >= 1000
                             const float2 _scale2_1 = {scale1, scale1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_1);
+                            #else
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 16; _ls++) {
+                                _tmem_load_3[_ls] = _tmem_load_3[_ls] * scale1;
+                            }
+                            #endif
                             tmem_st_x16_f32(addr1, _tmem_load_3);
                         }
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -1834,6 +1849,8 @@ kernel_cake_minimax_h3_varlen_attention_4e6602e44a81b36f88ed(const __grid_consta
                     if (q1_valid < 0) {
                         q1_valid = 0;
                     }
+                    long long q_row_stride = Q_raw_stride_m3;
+                    long long q_head_stride = Q_raw_stride_m2;
                     int lane_group = lane / 8;
                     int lane_chunk = lane % 8;
                     #pragma unroll
@@ -1842,10 +1859,11 @@ kernel_cake_minimax_h3_varlen_attention_4e6602e44a81b36f88ed(const __grid_consta
                         int global_row = q_row + local_row_1;
                         int valid = ((local_row_1 < q0_valid) ? 1 : 0);
                         int swizzled_chunk = (lane_chunk * 16 ^ (local_row_1 & 7) << 4) / 16;
+                        long long src_row = (long long)global_row * q_row_stride + (long long)head_3 * q_head_stride + (long long)(lane_chunk * 8);
                         #pragma unroll
                         for (int d_group = 0; d_group < 2; d_group++) {
                             int dst_b128 = d_group * 128 * 8 + local_row_1 * 8 + swizzled_chunk;
-                            int src_elem = (global_row * num_heads + head_3) * 128 + d_group * 64 + lane_chunk * 8;
+                            long long src_elem = src_row + (long long)(d_group * 64);
                             asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
                                 :: "r"(smem_q0_addr + (unsigned int)(dst_b128 * 16)), "l"(Q_raw + src_elem), "r"((valid) ? 16 : 0));
                         }
@@ -1858,10 +1876,11 @@ kernel_cake_minimax_h3_varlen_attention_4e6602e44a81b36f88ed(const __grid_consta
                         int global_row_1 = q_row + BLOCK_M + local_row_3;
                         int valid_1 = ((local_row_3 < q1_valid) ? 1 : 0);
                         int swizzled_chunk_1 = (lane_chunk_1 * 16 ^ (local_row_3 & 7) << 4) / 16;
+                        long long src_row_1 = (long long)global_row_1 * q_row_stride + (long long)head_3 * q_head_stride + (long long)(lane_chunk_1 * 8);
                         #pragma unroll
                         for (int d_group_1 = 0; d_group_1 < 2; d_group_1++) {
                             int dst_b128_1 = d_group_1 * 128 * 8 + local_row_3 * 8 + swizzled_chunk_1;
-                            int src_elem_1 = (global_row_1 * num_heads + head_3) * 128 + d_group_1 * 64 + lane_chunk_1 * 8;
+                            long long src_elem_1 = src_row_1 + (long long)(d_group_1 * 64);
                             asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16, %2;"
                                 :: "r"(smem_q1_addr + (unsigned int)(dst_b128_1 * 16)), "l"(Q_raw + src_elem_1), "r"((valid_1) ? 16 : 0));
                         }
