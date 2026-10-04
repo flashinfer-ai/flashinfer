@@ -115,7 +115,9 @@ query-block ceilings of the 32-head metadata programs, named per head count by t
 32-head tiers are `le16 / le128 / le2048 / any` and the 64-head tier names `le8 / le64 / le1024 / any`
 are aliases -- the 64-head routes have no metadata stage and no query bound),
 the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv` / `max_q_tokens` / `metadata_tiers`, and
-`paged` (`block_kv`, `split_kv`, `next_n_atoms`, `max_batch`, `metadata_program`). Every route record
+`paged` (`heads` -- the paged head counts, independent of the dense `heads`; `block_kv`, `split_kv`,
+`next_n_atoms` -- 1 for every exported `next_n`, the logits programs iterate the atoms in-kernel;
+`max_batch`, `metadata_program`). Every route record
 has `stages` (`[[stage, program], ...]`), `sequence` (a prepared sequence binding or `null`),
 `num_heads`, `block_q`, `clean_logits` (`"fused"`: the program writes `-inf` outside each window and in
 the padding, the shipped 32-head programs; `"raw"`: the program stores the computed tiles only, DeepGEMM's
