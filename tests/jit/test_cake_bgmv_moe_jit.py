@@ -333,6 +333,13 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     assert f"#define CAKE_BGMV_MOE_RANK {rank}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MAJOR {cc[0]}" in binding
     assert f"#define CAKE_BGMV_MOE_CC_MINOR {cc[1]}" in binding
+    # Lever 3c: sm90a runs the operand-ring grouped shrink on single-K-tile rows too;
+    # Blackwell keeps the register-direct form there.
+    single_tile_ring = 1 if arch == "sm90a" else 0
+    assert (
+        f"#define CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE {single_tile_ring}"
+        in binding
+    )
     assert '#include "cake_bgmv_moe_generic_binding.cuh"' in binding
     cake_bgmv_moe.gen_cake_bgmv_moe_generic_module.cache_clear()
 
@@ -441,7 +448,7 @@ def test_route_index_workspace_sizing():
         # wide prefill grids never split and run the two-stage ring (form 0)
         (8192, 32, 3072, (0, 1)),
         (256, 64, 4096, (0, 1)),
-        # ring-depth break-even: 512 CTAs still three stages, 520 and 1024 two
+        # ring-depth break-even on SM90: 512 CTAs still three stages, 520 and 1024 two
         (64, 64, 7168, (2, 1)),
         (65, 64, 7168, (0, 1)),
         (128, 64, 7168, (0, 1)),
@@ -451,7 +458,43 @@ def test_route_index_workspace_sizing():
 )
 def test_generic_shrink_launch_selection(num_pairs, rank, hidden_size, expected):
     assert (
-        cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(num_pairs, rank, hidden_size)
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(
+            num_pairs, rank, hidden_size, "sm90a"
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "num_pairs,rank,hidden_size,arch,expected",
+    [
+        # lever 11d: Blackwell keeps three stages up to 1024 CTAs when hidden >= 4096
+        (65, 64, 7168, "sm100a", (2, 1)),
+        (128, 64, 7168, "sm100a", (2, 1)),
+        (128, 64, 7168, "sm103a", (2, 1)),
+        (512, 16, 4096, "sm100a", (2, 1)),
+        (1024, 8, 5888, "sm103a", (2, 1)),
+        # ... but not beyond one wave, and not for short K loops
+        (129, 64, 7168, "sm100a", (0, 1)),
+        (1025, 8, 7168, "sm103a", (0, 1)),
+        (512, 16, 3072, "sm100a", (0, 1)),
+        (1024, 8, 2048, "sm103a", (0, 1)),
+        (1024, 8, 768, "sm100a", (0, 1)),
+        # SM90 never takes the Blackwell extension
+        (128, 64, 7168, "sm90a", (0, 1)),
+        (1024, 8, 7168, "sm90a", (0, 1)),
+        # the <= 512 rule is arch-independent
+        (64, 64, 7168, "sm100a", (2, 1)),
+        (512, 8, 768, "sm90a", (2, 1)),
+    ],
+)
+def test_generic_shrink_launch_selection_blackwell_deep_ring(
+    num_pairs, rank, hidden_size, arch, expected
+):
+    assert (
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(
+            num_pairs, rank, hidden_size, arch
+        )
         == expected
     )
 
@@ -510,6 +553,8 @@ def test_grouped_workspace_sizing_and_selector():
             metadata.group_scatter_symbol,
             metadata.shrink_grouped_symbol,
             metadata.shrink_grouped_single_symbol,
+            metadata.shrink_grouped_ring_symbol,
+            metadata.shrink_grouped_ring_single_symbol,
             metadata.expand_grouped_symbol,
             metadata.combine_grouped_symbol,
             metadata.order_build_symbol,
@@ -520,11 +565,16 @@ def test_grouped_workspace_sizing_and_selector():
             "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN",
             "CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER",
             "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED",
+            "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING",
             "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED",
             "CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED",
             "CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD",
         ):
             assert f"#define {macro} " in body, macro
+        # Lever 3: the ring form stages two K tiles of x + weight rows (49664 B) behind the
+        # 512 B reduction scratch of the direct form.
+        assert "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED 512\n" in body
+        assert "#define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING 49664\n" in body
 
 
 def test_order_remap_selector_and_workspace():

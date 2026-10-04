@@ -137,6 +137,16 @@ inline int32_t GroupShrinkRankTilesPerCta(int32_t num_tiles) {
   while (per_cta * 2 <= budget) per_cta *= 2;
   return per_cta;
 }
+// Lever 3: the cp.async operand-ring grouped shrink (tile k+1's x and weight rows land in shared
+// memory while tile k computes) serves rows whose hidden spans more than one 1024-element K tile;
+// on Blackwell a single-tile CTA has nothing to overlap and pays the ring's two barriers (768-wide
+// rows lost 1.2-2.2 %), so it keeps the register-direct form there; on sm_90 the ring wins on every
+// row including the single-tile ones (768x16 0.983, 768x64 0.976), so the jit sets
+// CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE to 1 for sm90a (lever 3c).  Both forms store
+// bitwise-identical rows.
+inline bool GroupShrinkRing(int32_t num_tiles) {
+  return CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE != 0 || num_tiles > 1;
+}
 // Column blocks (kGroupExpandThreads columns each) one grouped-expand CTA walks.
 // Blackwell: 8 at hidden >= 4096, 4 below (the expand is a per-CTA latency chain; 8 blocks at
 // hidden 2048 leaves too few CTAs); sm_90 rank 64 the same, rank 8-32 2 (neutral at 2-8 on H100).
@@ -166,6 +176,8 @@ constexpr int32_t kGroupHistSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_HIST;
 constexpr int32_t kGroupScanSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAN;
 constexpr int32_t kGroupScatterSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCATTER;
 constexpr int32_t kShrinkGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED;
+// Lever 3: the cp.async operand-ring grouped shrink stages two K tiles of x and weight rows.
+constexpr int32_t kShrinkGroupedRingSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED_RING;
 constexpr int32_t kExpandGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED;
 constexpr int32_t kCombineGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED;
 
@@ -313,6 +325,19 @@ void Configure() {
       cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkGroupedSmemBytes),
       "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, single rank tile)");
+  // Lever 3: the operand-ring forms exceed the default 48 KiB carveout.
+  TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkGroupedRingSmemBytes)
+      << "Cake BGMV MoE grouped shrink (operand ring) requires " << kShrinkGroupedRingSmemBytes
+      << " bytes of dynamic shared memory, but device " << device_id << " supports "
+      << max_dynamic_smem;
+  CheckCuda(cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_RING,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 kShrinkGroupedRingSmemBytes),
+            "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, operand ring)");
+  CheckCuda(cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_GROUPED_RING_SINGLE,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 kShrinkGroupedRingSmemBytes),
+            "cudaFuncSetAttribute(Cake BGMV MoE grouped shrink, operand ring, single rank tile)");
 }
 
 inline void CheckCompact(const TensorView& tensor, const char* name) {
@@ -516,12 +541,17 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
                            1, 1);
     // Lever 20k: one rank tile per CTA takes the straight-line form (sm_90a pays ~10 % per shrink
     // CTA for the loop form at its 128-register budget; the stores are bitwise identical).
+    const bool shrink_ring = GroupShrinkRing(num_tiles);
     const auto shrink_kernel =
-        shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE : CAKE_BGMV_MOE_SHRINK_GROUPED;
-    CheckCuda(LaunchGroupedPdl(shrink_kernel, shrink_grid, dim3(kShrinkThreads, 1, 1),
-                               kShrinkGroupedSmemBytes, stream, shrink_ptr, x_ptr, a_ptr, token_ptr,
-                               num_pairs, num_experts, hidden, num_tiles, shrink_rt_per_cta,
-                               shrink_rt_groups, ws_ptr, static_cast<int32_t>(off.group_offset),
+        shrink_ring ? (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_RING_SINGLE
+                                              : CAKE_BGMV_MOE_SHRINK_GROUPED_RING)
+                    : (shrink_rt_per_cta == 1 ? CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE
+                                              : CAKE_BGMV_MOE_SHRINK_GROUPED);
+    const int32_t shrink_smem = shrink_ring ? kShrinkGroupedRingSmemBytes : kShrinkGroupedSmemBytes;
+    CheckCuda(LaunchGroupedPdl(shrink_kernel, shrink_grid, dim3(kShrinkThreads, 1, 1), shrink_smem,
+                               stream, shrink_ptr, x_ptr, a_ptr, token_ptr, num_pairs, num_experts,
+                               hidden, num_tiles, shrink_rt_per_cta, shrink_rt_groups, ws_ptr,
+                               static_cast<int32_t>(off.group_offset),
                                static_cast<int32_t>(off.tile_table),
                                static_cast<int32_t>(off.sorted_routes)),
               "Cake BGMV MoE grouped shrink launch");

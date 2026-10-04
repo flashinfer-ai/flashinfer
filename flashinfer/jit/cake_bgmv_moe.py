@@ -87,6 +87,10 @@ CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS = 128
 # the stage costs occupancy once the grid fills the machine).  Shrink forms: 0 two-stage prefill, 1 decode (4 pairs per CTA),
 # 2 three-stage prefill.
 CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS = 512
+# Lever 11d: on Blackwell the three-stage ring also wins at exactly one wave of
+# 1024 CTAs when the K loop is long (hidden >= 4096); SM90 keeps the CTA rule.
+CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MAX_CTAS = 1024
+CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MIN_HIDDEN = 4096
 CAKE_BGMV_MOE_SHRINK_FORM_PREFILL = 0
 CAKE_BGMV_MOE_SHRINK_FORM_DECODE = 1
 CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3 = 2
@@ -268,8 +272,8 @@ def select_cake_bgmv_moe_order_remap(
         return False
     # Deep-ring (three-stage) grids keep their shrink form; the remap forms are two-stage.
     if (
-        pairs * (int(rank) // CAKE_BGMV_MOE_SHRINK_RANK_TILE)
-        <= CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS
+        select_cake_bgmv_moe_generic_shrink(pairs, int(rank), int(hidden_size), arch)[0]
+        == CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3
     ):
         return False
     return (
@@ -297,7 +301,10 @@ def cake_bgmv_moe_route_index_numel(num_tokens: int) -> int:
 
 
 def select_cake_bgmv_moe_generic_shrink(
-    num_pairs: int, rank: int, hidden_size: int
+    num_pairs: int,
+    rank: int,
+    hidden_size: int,
+    arch: CakeBGMVMoEArch = "sm100a",
 ) -> Tuple[int, int]:
     """(shrink form, hidden splits) for the generic shrink launch.
 
@@ -306,8 +313,10 @@ def select_cake_bgmv_moe_generic_shrink(
     kernel on every measured small-pair row once the partials moved to
     registers, so the decode form (1) is never selected.  The prefill kernel
     runs its three-stage ring (form 2) while the pair x rank-tile grid is at
-    most ``CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS`` CTAs and the two-stage
-    ring (form 0) beyond it.  Hidden splits are added only while the grid is
+    most ``CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS`` CTAs (on SM100/SM103 also
+    up to ``CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MAX_CTAS`` CTAs when
+    ``hidden_size >= CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MIN_HIDDEN``) and
+    the two-stage ring (form 0) beyond it.  Hidden splits are added only while the grid is
     below ``CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS`` CTAs, bounded by the tile
     count and ``CAKE_BGMV_MOE_SHRINK_SPLIT_MAX``.
     """
@@ -327,9 +336,14 @@ def select_cake_bgmv_moe_generic_shrink(
     )
     target = CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS
     splits = min(max_splits, max(1, (target + ctas - 1) // ctas))
+    deep = ctas <= CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS or (
+        arch != "sm90a"
+        and ctas <= CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MAX_CTAS
+        and int(hidden_size) >= CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MIN_HIDDEN
+    )
     form = (
         CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3
-        if ctas <= CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS
+        if deep
         else CAKE_BGMV_MOE_SHRINK_FORM_PREFILL
     )
     return form, splits
@@ -387,6 +401,8 @@ class CakeBGMVMoEGenericMetadata(NamedTuple):
     group_scatter_symbol: str
     shrink_grouped_symbol: str
     shrink_grouped_single_symbol: str
+    shrink_grouped_ring_symbol: str
+    shrink_grouped_ring_single_symbol: str
     expand_grouped_symbol: str
     combine_grouped_symbol: str
     order_build_symbol: str
@@ -614,6 +630,16 @@ def _generic_metadata(rank: int, dtype: CakeBGMVMoEDType) -> CakeBGMVMoEGenericM
             if rank > 8
             else f"kernel_flashinfer_bgmv_moe_shrink_grouped_{tag}_r{rank}"
         ),
+        # Lever 3: cp.async operand-ring forms (the binding launches them when hidden spans more
+        # than one K tile; rank 8 has one rank tile, so its single form is the ring kernel itself).
+        shrink_grouped_ring_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_{tag}_r{rank}"
+        ),
+        shrink_grouped_ring_single_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_single_{tag}_r{rank}"
+            if rank > 8
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_{tag}_r{rank}"
+        ),
         expand_grouped_symbol=f"kernel_flashinfer_bgmv_moe_expand_grouped_{tag}_r{rank}",
         combine_grouped_symbol=f"kernel_flashinfer_bgmv_moe_combine_grouped_{tag}_r{rank}",
         # Lever 27: single-CTA route-order prologue of the SM90 per-route shrink.
@@ -758,6 +784,10 @@ def _generic_binding_source(
 ) -> str:
     input_dtype = "dl_bfloat16" if "_bf16_" in metadata.body else "dl_float16"
     major, minor = target.capability
+    # Lever 3c: sm_90 runs the cp.async operand-ring grouped shrink on single-K-tile rows too
+    # (768x16 0.983 / 768x64 0.976 vs the direct form on H100); Blackwell keeps the direct form
+    # there (the ring's two barriers cost 1.2-2.2 % with nothing to overlap).
+    group_shrink_ring_single_tile = 1 if target.arch == "sm90a" else 0
     return f"""\
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
@@ -786,6 +816,9 @@ def _generic_binding_source(
 #define CAKE_BGMV_MOE_GROUP_SCATTER {metadata.group_scatter_symbol}
 #define CAKE_BGMV_MOE_SHRINK_GROUPED {metadata.shrink_grouped_symbol}
 #define CAKE_BGMV_MOE_SHRINK_GROUPED_SINGLE {metadata.shrink_grouped_single_symbol}
+#define CAKE_BGMV_MOE_SHRINK_GROUPED_RING {metadata.shrink_grouped_ring_symbol}
+#define CAKE_BGMV_MOE_SHRINK_GROUPED_RING_SINGLE {metadata.shrink_grouped_ring_single_symbol}
+#define CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE {group_shrink_ring_single_tile}
 #define CAKE_BGMV_MOE_EXPAND_GROUPED {metadata.expand_grouped_symbol}
 #define CAKE_BGMV_MOE_COMBINE_GROUPED {metadata.combine_grouped_symbol}
 #define CAKE_BGMV_MOE_ORDER_BUILD {metadata.order_build_symbol}

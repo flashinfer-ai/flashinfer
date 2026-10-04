@@ -942,7 +942,7 @@ def prepare_bgmv_moe(
         )
         schedule_id = CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS[generic_schedule]
         shrink_launch = select_cake_bgmv_moe_generic_shrink(
-            int(sorted_token_ids.shape[0]), rank, hidden_size
+            int(sorted_token_ids.shape[0]), rank, hidden_size, arch
         )
         if use_order_remap:
             # The bin-ordered dispatch forms are the two-stage prefill kernel; the
