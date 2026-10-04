@@ -157,6 +157,7 @@ def prims_ts_fp8_per_tensor_scale_moe(
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
     *,
     weight_layout: int = 0,
     fc1_per_channel_weight_scale: Optional[torch.Tensor] = None,
@@ -219,6 +220,10 @@ def prims_ts_fp8_per_tensor_scale_moe(
         Optional buffer that captures selected expert IDs.
     output : Optional[torch.Tensor]
         Optional in-place output tensor.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Per-expert StepFun FC1 clamp limits. Positional mirror of the
+        trtllm-gen argument; the Prims-TS per-tensor path has no StepFun
+        epilogue and rejects a non-``None`` value.
     weight_layout : int
         Prims-TS weight layout enum value (default ``MajorK``). Keyword-only.
     fc1_per_channel_weight_scale : Optional[torch.Tensor]
@@ -296,6 +301,12 @@ def prims_ts_fp8_per_tensor_scale_moe(
     expert_weights = torch.empty(
         0, dtype=routing_logits.dtype, device=hidden_states.device
     )
+
+    if gemm1_clamp_limit is not None:
+        raise NotImplementedError(
+            "Prims-TS FP8 per-tensor path does not support gemm1_clamp_limit "
+            "(StepFun activation)"
+        )
 
     moe_op = _get_moe_op()
     moe_runner = PrimsTsFp8PerTensorMoERunner(
@@ -421,6 +432,7 @@ def _fake_prims_ts_fp8_per_tensor_scale_moe(
     norm_topk_prob: bool = True,
     routing_replay_out: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
     *,
     weight_layout: int = 0,
     fc1_per_channel_weight_scale: Optional[torch.Tensor] = None,
@@ -452,6 +464,7 @@ def _fake_prims_ts_fp8_per_tensor_scale_moe(
         fc1_per_channel_weight_scale,
         fc2_per_channel_weight_scale,
         routing_replay_out,
+        gemm1_clamp_limit,
     )
     out = (
         output
