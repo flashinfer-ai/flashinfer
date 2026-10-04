@@ -166,6 +166,64 @@ def test_merged_layout_shared_routes_are_returned_verbatim_for_every_arch():
     assert catalog.routes("sm_103a") == shared
 
 
+def _merged_catalog_shared_routes_per_arch_sm_counts():
+    return {
+        "schema": "unit.v3",
+        "programs": {
+            "k_shared": {
+                "sources": ["csrc/x/shared.cu"],
+                "compile_flags": {"sm_100a": ["-a"], "sm_103a": ["-a", "-b"]},
+                "definitions": ["NUM_CTAS"],
+                "arches": ["sm_100a", "sm_103a"],
+            },
+            "k_plain": {
+                "sources": ["csrc/x/plain.cu"],
+                "compile_flags": ["-c"],
+                "arches": ["sm_100a", "sm_103a"],
+            },
+        },
+        "routes": {
+            "a": {
+                "num_sms": {"sm_100a": 148, "sm_103a": 152},
+                "program": "k_shared",
+            },
+        },
+    }
+
+
+def test_shared_routes_carry_one_sm_count_per_arch_and_per_arch_flags():
+    catalog = Catalog(_merged_catalog_shared_routes_per_arch_sm_counts(), label="Unit")
+    assert catalog.supported_num_sms("sm_100a") == (148,)
+    assert catalog.supported_num_sms("sm_103a") == (152,)
+    route = catalog.route("sm_103a", "a")
+    assert catalog.route_num_sms("sm_103a", "a", route) == 152
+    with pytest.raises(ValueError, match="carries no SM count for sm_90a"):
+        catalog.route_num_sms("sm_90a", "a", route)
+    shared = catalog.program("sm_100a", "k_shared")
+    assert Catalog.compile_flags(shared, "sm_100a") == ["-a"]
+    assert Catalog.compile_flags(shared, "sm_103a") == ["-a", "-b"]
+    assert Catalog.compile_flags(catalog.program("sm_100a", "k_plain"), "sm_100a") == [
+        "-c"
+    ]
+
+
+def test_definitions_are_exactly_the_declared_subset_and_name_the_spec():
+    catalog = Catalog(_merged_catalog_shared_routes_per_arch_sm_counts(), label="Unit")
+    assert catalog.definitions(
+        "sm_100a", "k_shared", {"NUM_CTAS": 148, "OTHER": 1}
+    ) == {"NUM_CTAS": 148}
+    assert catalog.definitions("sm_100a", "k_plain", {"NUM_CTAS": 148}) == {}
+    with pytest.raises(ValueError, match=r"cannot supply: \['NUM_CTAS'\]"):
+        catalog.definitions("sm_100a", "k_shared", {})
+    pytest.importorskip("torch")
+    spec = catalog.jit_spec("sm_103a", "k_shared", {"NUM_CTAS": 152})
+    assert spec.name == "k_shared_sm_103a_num_ctas152"
+    flags = spec.extra_cuda_cflags
+    assert "-DNUM_CTAS=152" in flags and "-a" in flags and "-b" in flags
+    plain = catalog.jit_spec("sm_100a", "k_plain")
+    assert plain.name == "k_plain_sm_100a" and "-c" in plain.extra_cuda_cflags
+
+
 def test_missing_route_raises_unsupported_device_naming_the_options():
     catalog = Catalog(_per_arch_catalog(), label="Unit GEMM")
     options = {"M": 1, "N": 2, "num_sms": 132}

@@ -68,8 +68,12 @@ class Catalog:
     (``{"schema", "arches": {arch: {"programs", "routes"}}}``) and the
     architecture-merged layout (``{"schema", "programs": {name: {...,
     "arches": [...]}}, "routes": {arch: {...}} | {...}}``) where one source
-    compiles for every listed architecture. Nothing is hashed or re-verified at
-    import; ``closure_sha256`` is a build receipt, not a load-time gate.
+    compiles for every listed architecture. A merged program may declare
+    ``definitions`` (compile-line macro names the loader supplies, e.g. the SM
+    count) and per-architecture ``compile_flags`` (``{arch: [...]}``); a route
+    shared by every architecture may carry per-architecture SM counts
+    (``"num_sms": {arch: n}``). Nothing is hashed or re-verified at import;
+    ``closure_sha256`` is a build receipt, not a load-time gate.
     """
 
     def __init__(
@@ -162,21 +166,38 @@ class Catalog:
         """Physical SM counts with catalogued routes for ``arch``."""
         counts: set[int] = set()
         for key, route in self.routes(arch).items():
-            counts.add(self._num_sms(key, route))
+            counts.add(self.route_num_sms(arch, key, route))
         return tuple(sorted(counts))
 
-    def _num_sms(self, key: str, route: Mapping[str, Any]) -> int:
+    def route_num_sms(self, arch: str, key: str, route: Mapping[str, Any]) -> int:
+        """The SM count ``route`` was generated for on ``arch``."""
         if self._route_num_sms is not None:
             return int(self._route_num_sms(key, route))
         config = route.get("config")
         if isinstance(config, Mapping) and "num_sms" in config:
             return int(config["num_sms"])
-        if "num_sms" in route:
-            return int(route["num_sms"])
+        num_sms = route.get("num_sms")
+        if isinstance(num_sms, Mapping):
+            # A route shared by every architecture names one SM count per architecture.
+            if arch not in num_sms:
+                raise ValueError(
+                    f"{self.label} route {key!r} carries no SM count for {arch}"
+                )
+            return int(num_sms[arch])
+        if num_sms is not None:
+            return int(num_sms)
         raise ValueError(
             f"{self.label} route {key!r} carries no SM count; pass route_num_sms "
             "to read it from the route key"
         )
+
+    @staticmethod
+    def compile_flags(record: Mapping[str, Any], arch: str) -> list[str]:
+        """The program's nvcc flags for ``arch`` (a shared program may list them per architecture)."""
+        flags = record["compile_flags"]
+        if isinstance(flags, Mapping):
+            return list(flags[arch])
+        return list(flags)
 
     def arch_for_capability(self, capability: tuple[int, int]) -> str:
         """Exported architecture of ``capability`` (RuntimeError when none is catalogued)."""
@@ -213,21 +234,52 @@ class Catalog:
             )
         return sms
 
-    def jit_spec(self, arch: str, name: str):
-        """JIT build specification of program ``name`` for the exact ``arch``."""
+    def definitions(
+        self, arch: str, name: str, values: Mapping[str, int]
+    ) -> dict[str, int]:
+        """The compile-line definitions program ``name`` declares, taken from ``values``.
+
+        A program lists the macro names it leaves to the compile line in
+        ``definitions``; the caller supplies every value it can (for example
+        the SM count) and this returns exactly the declared subset. A declared
+        name the caller cannot supply is an error, never a default.
+        """
+        declared = tuple(self.program(arch, name).get("definitions", ()))
+        missing = sorted(set(declared) - set(values))
+        if missing:
+            raise ValueError(
+                f"{self.label} program {name!r} requires compile-line definitions "
+                f"this runtime cannot supply: {missing}"
+            )
+        return {key: int(values[key]) for key in declared}
+
+    def jit_spec(
+        self, arch: str, name: str, definitions: Mapping[str, int] | None = None
+    ):
+        """JIT build specification of program ``name`` for the exact ``arch``.
+
+        ``definitions`` are the program's declared compile-line macros
+        (``-DNAME=value``); their values become part of the spec name so every
+        value owns its own cached library.
+        """
         from flashinfer.jit import env
         from flashinfer.jit.core import gen_jit_spec
 
         record = self.program(arch, name)
+        definitions = self.definitions(arch, name, definitions or {})
+        suffix = "".join(
+            f"_{key.lower()}{value}" for key, value in sorted(definitions.items())
+        )
         return gen_jit_spec(
-            name=jit_spec_name(name, arch),
+            name=jit_spec_name(name, arch) + suffix,
             sources=[
                 env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/")
                 for p in record["sources"]
             ],
             extra_cuda_cflags=[
                 *nvcc_flags(arch),
-                *record["compile_flags"],
+                *self.compile_flags(record, arch),
+                *(f"-D{key}={value}" for key, value in sorted(definitions.items())),
                 "--device-entity-has-hidden-visibility=false",
             ],
             extra_ldflags=["-lcuda"],
@@ -235,9 +287,13 @@ class Catalog:
             use_fast_math=False,  # only the recorded compile flags select math modes
         )
 
-    def load_program(self, arch: str, name: str):
-        """Build and load program ``name`` for ``arch``; cached per process."""
-        return _load_program(self, arch, name)
+    def load_program(
+        self, arch: str, name: str, definitions: Mapping[str, int] | None = None
+    ):
+        """Build and load program ``name`` for ``arch`` (and ``definitions``); cached per process."""
+        return _load_program(
+            self, arch, name, tuple(sorted((definitions or {}).items()))
+        )
 
     def _require_arch(self, arch: str) -> None:
         if arch not in self.arches:
@@ -248,8 +304,10 @@ class Catalog:
 
 
 @functools.cache
-def _load_program(catalog: Catalog, arch: str, name: str):
-    spec = catalog.jit_spec(arch, name)
+def _load_program(
+    catalog: Catalog, arch: str, name: str, definitions: tuple[tuple[str, int], ...]
+):
+    spec = catalog.jit_spec(arch, name, dict(definitions))
     module = spec.build_and_load()
     return module, {
         **catalog.program(arch, name),
