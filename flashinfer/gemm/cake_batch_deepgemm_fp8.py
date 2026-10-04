@@ -5,8 +5,9 @@
 The same mathematical contract as :func:`flashinfer.gemm.batch_deepgemm_fp8_nt_groupwise`:
 ``out[g, :masked_m[g], :] = (a[g] . b[g]^T)`` with FP8 E4M3 operands, per-row
 128-wide K-block A scales, 128x128 B block scales, FP32 accumulation with the
-block scales applied in DeepGEMM's K order, BF16 output; rows at or beyond
-``masked_m[g]`` are not written.
+block scales applied in DeepGEMM's K order, BF16 output; the contents of rows
+at or beyond ``masked_m[g]`` are unspecified (whole tiles may be stored), as on
+the DeepGEMM path.
 
 The host side selects the route with the Cake dispatcher's ordered first-match
 chain rendered per ``(architecture, SM count)`` into
