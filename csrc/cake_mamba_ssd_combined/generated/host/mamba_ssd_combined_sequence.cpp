@@ -22,7 +22,69 @@
 #include <tvm/ffi/extra/cuda/cubin_launcher.h>
 #include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/function.h>
-#include "ffi_tensor_checks.h"
+// Named tensor-argument checks for TVM-FFI host bindings.
+//
+// Each check names the offending argument in its error so a caller can act on
+// the message without reading the binding. The same functions live in
+// FlashInfer's csrc/tvm_ffi_utils.h; a FlashInfer export replaces this include
+// with that header.
+
+#include <dlpack/dlpack.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/error.h>
+
+inline void check_cuda_tensor(const tvm::ffi::TensorView& t, const char* name) {
+  TVM_FFI_CHECK(t.device().device_type == kDLCUDA, ValueError)
+      << name << " must be a CUDA tensor, got device_type=" << static_cast<int>(t.device().device_type);
+}
+
+inline void check_dtype(const tvm::ffi::TensorView& t, DLDataType expected, const char* name) {
+  DLDataType d = t.dtype();
+  TVM_FFI_CHECK(d.code == expected.code && d.bits == expected.bits && d.lanes == expected.lanes, TypeError)
+      << name << " dtype mismatch: expected DLDataType(code=" << static_cast<int>(expected.code)
+      << ", bits=" << static_cast<int>(expected.bits) << ", lanes=" << static_cast<int>(expected.lanes)
+      << "), got (code=" << static_cast<int>(d.code) << ", bits=" << static_cast<int>(d.bits)
+      << ", lanes=" << static_cast<int>(d.lanes) << ")";
+}
+
+inline void check_contiguous(const tvm::ffi::TensorView& t, const char* name) {
+  TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
+}
+
+inline void check_same_device(const tvm::ffi::TensorView& t, const tvm::ffi::TensorView& reference,
+                              const char* name, const char* reference_name) {
+  TVM_FFI_CHECK(t.device().device_type == reference.device().device_type &&
+                    t.device().device_id == reference.device().device_id,
+                ValueError)
+      << name << " must be on the same device as " << reference_name << ": got device_type="
+      << static_cast<int>(t.device().device_type) << " id=" << t.device().device_id
+      << " versus device_type=" << static_cast<int>(reference.device().device_type)
+      << " id=" << reference.device().device_id;
+}
+
+// Require the dimensions above the last `trailing` dimensions to form one dense
+// row-major chain, so they can be folded into a single logical dimension whose
+// step is stride(-(trailing + 1)). Shape products are stride-independent, so
+// this verifies the physical layout instead of inventing a folded stride.
+inline void check_dense_leading_dims(const tvm::ffi::TensorView& t, int trailing, const char* name) {
+  TVM_FFI_CHECK(trailing > 0 && t.ndim() >= trailing, ValueError)
+      << name << " cannot fold leading dimensions above " << trailing << " trailing dims from ndim=" << t.ndim();
+  int outer_last = t.ndim() - trailing - 1;
+  if (outer_last <= 0) {
+    return;
+  }
+  int64_t step = t.stride(outer_last);
+  TVM_FFI_CHECK(step > 0, ValueError) << name << " physical strides must be positive";
+  int64_t expected = step;
+  for (int axis = outer_last - 1; axis >= 0; --axis) {
+    expected *= t.size(axis + 1);
+    if (t.size(axis) > 1) {
+      TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
+          << name << " leading dims are not physically foldable above " << trailing
+          << " trailing dims: stride(" << axis << ")=" << t.stride(axis) << ", expected " << expected;
+    }
+  }
+}
 
 #include <cstdint>
 #include <vector>
@@ -38,7 +100,7 @@ using tvm::ffi::TensorView;
 namespace stage_preprocess {
 
 inline auto& Kernel() {
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(CAKE_SSD_PREPROCESS_MODULE, "CAKE_SSD_PREPROCESS_KERNEL");
+  static auto kernel = EmbedCubinModule_CAKE_SSD_PREPROCESS_MODULE::Global()->mod.GetKernelWithMaxDynamicSharedMemory("CAKE_SSD_PREPROCESS_KERNEL", 99328);
   return kernel;
 }
 
@@ -215,7 +277,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_
 
 inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      prepared.kernel->Launch(prepared.kargs, prepared.grid, prepared.block, stream, 0u));
+      prepared.kernel->Launch(prepared.kargs, prepared.grid, prepared.block, stream, 99328u));
 }
 }  // namespace stage_preprocess
 
