@@ -156,13 +156,14 @@ PRECISIONS = {
         fused_shared_experts=True,
     ),
 }
-# Rows whose FC1 tile candidates all have a bitwise Cake twin: per-tensor FP8
-# ships tiles 8/16/32 only, so its larger token counts run the native tiles.
-# (precision, num_tokens) seed rows whose FC1 tile candidates have no exported Cake kernel yet and
-# therefore run the native FC1: the per-tensor fp8 kernels cover tiles 8/16/32 only (the tile-64
-# persistent fp8 kernel carries no device tile count), so T=2048 (tiles 64/128) falls back.
-KNOWN_NATIVE_FALLBACK = {("fp8", 2048)}
+# (precision, num_tokens) seed rows whose FC1 tile candidates have no exported Cake kernel and
+# therefore run the native FC1. Every family now ships a Cake kernel for every tile the FlashInfer
+# tactic list offers at the seed token counts, so the set is empty; a row that still lacks a Cake
+# tile fails instead of being excused.
+KNOWN_NATIVE_FALLBACK: set[tuple[str, int]] = set()
 
+# Rows whose FC1 tile candidates all have a bitwise Cake twin (bf16, per-tensor fp8 and mxfp8
+# reproduce the native FC1 twin bit for bit; nvfp4 does not and is checked by tolerance).
 BITWISE_ROWS = [
     ("bf16", 8),
     ("bf16", 64),
@@ -170,6 +171,8 @@ BITWISE_ROWS = [
     ("bf16", 2048),
     ("fp8", 8),
     ("fp8", 64),
+    ("fp8", 512),
+    ("fp8", 2048),
     ("mxfp8", 8),
     ("mxfp8", 512),
     ("mxfp8", 2048),
