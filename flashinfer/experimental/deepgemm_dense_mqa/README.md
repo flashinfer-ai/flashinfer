@@ -81,7 +81,11 @@ buffer it allocates (row stride a multiple of 8 elements). Every cell of that bu
 parity only; `max_seqlen_k` must be 0. Rows below the query block (`Q < 128 / H`) are padded by the
 entry. Which `(H, Q, K)` points have programs is a catalog property: `dense_route_available(H, Q, K)`
 answers it on the host (32 heads, `K % 256 == 0`, `Q <= max_queries()` today; the 64-head routes --
-any `K >= 1`, any `Q`, `max_queries(64)` is `None` -- join as they are exported).
+any `K >= 1`, any `Q`, `max_queries(64)` is `None` -- join as they are exported). The 64-head family is
+published per tier: `dense_admission()` returns the admitted `fp8:h64:*` routes, the withheld tier names and
+the producer's reason (`policy["dense_admission"]`); a withheld tier has no catalog record, so
+`dense_route_available` is `False` there and the engine keeps its stock kernel
+(`tests/experimental/test_dense_mqa_admission.py` pins this contract, host-only).
 
 The paged entries read the fused DeepGEMM cache layout in place: `kv_cache` uint8
 `[pages, block_kv, 1, 132]` (`block_kv` FP8 rows of 128 then `block_kv` FP32 scales per page), E4M3
