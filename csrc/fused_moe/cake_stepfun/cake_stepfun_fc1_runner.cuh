@@ -73,6 +73,12 @@ class Fc1Runner {
   // Generated-manifest family index of this runner (-1 on the native fallback).
   [[nodiscard]] int family() const { return mFamily; }
 
+  // Whether run() writes the benign routing tail before kernels that do not bound the tiles they
+  // acquire through cluster launch control (default on; a caller whose routing arrays already carry
+  // a benign tail, such as the Cake export parity measurement, turns it off).
+  void setRoutingTailPadding(bool enabled) { mPadRoutingTail = enabled; }
+  [[nodiscard]] bool routingTailPadding() const { return mPadRoutingTail; }
+
   // Same argument list as PermuteGemm1::Runner::run. Kernels whose manifest entry does not bound
   // the tiles acquired through cluster launch control by num_non_exiting_ctas are preceded by a
   // small in-stream kernel that writes a benign routing tail (expert 0, zero valid rows, padded
@@ -119,6 +125,7 @@ class Fc1Runner {
   std::vector<int32_t> mKernels;
   // Dynamic shared memory opt-in done once per kernel on this runner's device.
   mutable std::vector<bool> mSmemConfigured;
+  bool mPadRoutingTail{true};
   // Native FC1 for (dtype, tile) pairs without an exported Cake kernel.
   std::optional<PermuteGemm1::Runner> mNative;
 };

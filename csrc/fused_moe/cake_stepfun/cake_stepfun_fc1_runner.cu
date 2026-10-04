@@ -417,7 +417,7 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   pdlAttribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   pdlAttribute.val.programmaticStreamSerializationAllowed = 1;
 
-  if (!spec.bounds_acquired_tiles) {
+  if (!spec.bounds_acquired_tiles && mPadRoutingTail) {
     cudaLaunchConfig_t tailConfig{};
     tailConfig.gridDim = dim3(kRoutingTailBlocks, 1u, 1u);
     tailConfig.blockDim = dim3(kRoutingTailThreads, 1u, 1u);
