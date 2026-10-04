@@ -101,15 +101,28 @@ def _expert(x_rows, first, second, route_weight, width):
     return (dequantized @ second.T).bfloat16().float()
 
 
-def model_inputs(precision, num_tokens=1, seed=0):
+def model_inputs(precision, num_tokens=1, seed=0, l2_scale_shift=0):
     """Synthetic packed inputs at the catalogued model geometry: 384 experts,
     top-6, hidden 5120, intermediate 2304, clamp 10. Every token routes to six
-    distinct experts. The packed weights take about 7 GiB of device memory."""
+    distinct experts. The packed weights take about 7 GiB of device memory.
+
+    ``l2_scale_shift`` lowers the exponents of the routed down-projection
+    weight scales by that many powers of two. The long token counts use 5 so
+    that every bf16-rounded weighted expert output stays below 128 in
+    magnitude (one rounding-order flip is then at most 0.5, inside the
+    elementwise tolerance); the alternating +0.5 / -0.25 route weights, the L1
+    projection and the activation clamp are unchanged.
+    """
     generator = torch.Generator(device="cuda").manual_seed(seed)
     experts, top_k, hidden, intermediate = 384, 6, 5120, 2304
     x, xs = operand((num_tokens, hidden), "fp8", generator, exponent_low=-1)
     w1, s1 = operand((experts, 2 * intermediate, hidden), precision, generator)
-    w2, s2 = operand((experts, hidden, intermediate), precision, generator)
+    w2, s2 = operand(
+        (experts, hidden, intermediate),
+        precision,
+        generator,
+        exponent_low=-5 - l2_scale_shift,
+    )
     token = torch.arange(num_tokens, device="cuda")
     routes = torch.stack(
         [(token * top_k + slot + seed) % experts for slot in range(top_k)], dim=1
@@ -186,11 +199,13 @@ def model_reference(inputs, x_scales, shared=None):
     return output.bfloat16()
 
 
-def make_model(family, precision, num_tokens=16, seed=0):
+def make_model(family, precision, num_tokens=16, seed=0, l2_scale_shift=0):
     """Prepared plan of ``family`` on a catalogued model route (both routed
-    precisions exist at 16 tokens; FP4 also at 1, 128 and 512 tokens, and for
-    the source family at 1024 and 4096). Returns (plan, inputs, x_scales, shared)."""
-    inputs, xs = model_inputs(precision, num_tokens=num_tokens, seed=seed)
+    precisions exist at 16 tokens; FP4 also at 1, 128, 512, 1024 and 4096
+    tokens). Returns (plan, inputs, x_scales, shared)."""
+    inputs, xs = model_inputs(
+        precision, num_tokens=num_tokens, seed=seed, l2_scale_shift=l2_scale_shift
+    )
     shared = None
     if family == "source":
         from flashinfer.source_mega_moe import prepare_mega_moe

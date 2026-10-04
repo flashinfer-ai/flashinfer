@@ -18,7 +18,9 @@ into the same workspace (four copies and one scatter with a permutation index
 computed at preparation); do not reset its counters on the host.
 
 `flashinfer.mega_moe_v3.prepare_pipeline` accepts logical gate/up weight halves
-and float power-of-two scales. Preparation packs scales and interleaves the
+and float power-of-two scales. Its FP4 model routes cover 1, 16, 128, 512, 1024
+and 4096 tokens (FP8 routed weights at 16 tokens); the 1024- and 4096-token
+routes use the 32- and 128-row source tile heights. Preparation packs scales and interleaves the
 weights. Every exported pipeline route is `self_cleaning`: it launches exactly
 one kernel per `run()`, the kernel zeroes its per-launch workspace words before
 it exits and its grid gates are phase-toggling words, so the plan zeroes the
@@ -58,8 +60,8 @@ The public tests use independent PyTorch math on the exact packed inputs,
 check valid dispatch metadata and reusable counters, poison outputs between
 launches, and exercise direct and graph replay. They cover both routed
 precisions of both families on the 16-token model route, the FP4 single-token
-route's workspace lifecycle, input refresh on a reused source workspace, and
-the catalog's grouped L2 route, and they check that a captured `run()` is one
+route's workspace lifecycle, the FP4 1024- and 4096-token routes, input refresh
+on a reused source workspace, and the catalog's grouped L2 route, and they check that a captured `run()` is one
 kernel node. The 384-expert inputs need about 48 GiB of free device memory;
 the tests skip below that. They do not enumerate every model shape or claim
 model-wide performance.
