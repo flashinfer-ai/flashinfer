@@ -158,6 +158,11 @@ PRECISIONS = {
 }
 # Rows whose FC1 tile candidates all have a bitwise Cake twin: per-tensor FP8
 # ships tiles 8/16/32 only, so its larger token counts run the native tiles.
+# (precision, num_tokens) seed rows whose FC1 tile candidates have no exported Cake kernel yet and
+# therefore run the native FC1: the per-tensor fp8 kernels cover tiles 8/16/32 only (the tile-64
+# persistent fp8 kernel carries no device tile count), so T=2048 (tiles 64/128) falls back.
+KNOWN_NATIVE_FALLBACK = {("fp8", 2048)}
+
 BITWISE_ROWS = [
     ("bf16", 8),
     ("bf16", 64),
@@ -660,10 +665,14 @@ def test_stepfun_matches_trtllm_reference_for_every_tactic(
     )
     layer, runner, packed, kwargs, tactics = _cake_runner(case, device)
     cake_tiles = _cake_tiles(runner, PRECISIONS[precision].family)
-    assert any(tactic[0] in cake_tiles for tactic in tactics), (
-        f"no FC1 tile candidate of T={num_tokens} has a Cake {precision} kernel: "
-        f"tactics {tactics}, Cake tiles {sorted(cake_tiles)}"
-    )
+    if not any(tactic[0] in cake_tiles for tactic in tactics):
+        message = (
+            f"no FC1 tile candidate of T={num_tokens} has a Cake {precision} kernel: "
+            f"tactics {tactics}, Cake tiles {sorted(cake_tiles)}"
+        )
+        if (precision, num_tokens) in KNOWN_NATIVE_FALLBACK:
+            pytest.xfail(message)
+        pytest.fail(message)
     for tactic in tactics:
         output = _forward(runner, packed, kwargs, tactic)
         check_accuracy(case.reference, output.float(), **case.tolerances)
