@@ -150,10 +150,13 @@ def _check(got, ref, ctx_2d, max_context_len, stride_rows):
     # row's length are exact -inf (DeepGEMM stores finite don't-care there; -inf is the strictly safer
     # value for the engine's top-k). Which cells are written at all is checked against DeepGEMM's own
     # behaviour in _check_write_extent.
+    # The extent is align(ctx_last, SPLIT_KV), which exceeds max_context_len for the longest request(s) when
+    # max_context_len % SPLIT_KV != 0: check it on the physical rows, not on the [:, :max_context_len] view.
     for row in range(got.shape[0]):
-        aligned = min(_aligned_extent(ctx_2d, row), max_context_len)
-        assert bool(torch.isneginf(got[row, int(lengths[row]) : aligned]).all())
-    assert stride_rows.shape[0] == got.shape[0]
+        aligned = min(_aligned_extent(ctx_2d, row), stride_rows.shape[1])
+        assert bool(
+            torch.isneginf(stride_rows[row, int(lengths[row]) : aligned]).all()
+        ), row
 
 
 def _aligned_extent(ctx_2d, row):
@@ -208,8 +211,16 @@ def _deep_gemm_measured(q, kv_cache, weights, ctx_2d, block_table, max_len, page
         native.untyped_storage(), 0, (rows * stride,)
     )
     full = full.view(rows, stride)
-    never_written = full[:, max_len:]
-    if never_written.numel() == 0 or not bool(torch.isnan(never_written).all()):
+    # Witness that the poison survived: columns past each request's source-derived extent are never written
+    # by DeepGEMM (the buffer is [rows, align(max_context_len, SPLIT_KV)], so rows of shorter requests have
+    # such columns); without any witness cell the measurement is not observable.
+    witness = [
+        full[row, min(_aligned_extent(ctx_2d, row), stride) :] for row in range(rows)
+    ]
+    witness_cells = sum(int(w.numel()) for w in witness)
+    if witness_cells == 0 or not all(
+        bool(torch.isnan(w).all()) for w in witness if w.numel()
+    ):
         return None
     return native, ~torch.isnan(full)
 
@@ -220,6 +231,13 @@ def _check_write_extent(cake_output, measured, ctx_2d, max_len):
     wrong, the test is not loosened to it. ``cake_output`` is the plan's physical [rows, stride] buffer,
     NaN-poisoned before the launch."""
     cake_written = ~torch.isnan(cake_output)
+    # Beyond max_context_len the written cells of the longest request(s) are the approved deviation: -inf.
+    for row in range(cake_output.shape[0]):
+        aligned = min(_aligned_extent(ctx_2d, row), cake_output.shape[1])
+        tail = cake_output[row, max_len:aligned]
+        assert bool(torch.isneginf(tail).all()), (
+            f"row {row}: cells in [{max_len}, {aligned}) are not -inf"
+        )
     if measured is None:
         for row in range(cake_output.shape[0]):
             aligned = min(_aligned_extent(ctx_2d, row), cake_output.shape[1])
