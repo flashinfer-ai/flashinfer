@@ -1,0 +1,24 @@
+{
+  "note": "PLACEHOLDER written by hand so the JIT spec, the Python route and the tests import before the kernel family is exported. The exporter overwrites this file together with the two listed sources; identity 'unexported' means the sources are absent and every launch raises FileNotFoundError.",
+  "identity": "unexported",
+  "kernel_commit": null,
+  "generator": "sm120-dsv4-nvfp4-rope-insert-flashinfer-export",
+  "generated_at": null,
+  "sources": [
+    "cake_dsv4_nvfp4_rope_insert_kernel.cu",
+    "cake_dsv4_nvfp4_rope_insert_binding.cu"
+  ],
+  "entries": {
+    "qkv": "cake_dsv4_nvfp4_rope_insert_qkv",
+    "kv": "cake_dsv4_nvfp4_rope_insert_kv"
+  },
+  "q_head_padded_choices": [8, 16, 32, 64, 128],
+  "compress_ratios": [1, 2],
+  "slot_dtypes": ["int32", "int64"],
+  "bytes_per_token": 384,
+  "data_bytes_per_token": 352,
+  "scale_bytes_per_token": 32,
+  "head_dim": 512,
+  "rope_dim": 64,
+  "threads": 256
+}
