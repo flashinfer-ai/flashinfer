@@ -120,6 +120,7 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
             resolved_is_var_seq,
             is_var_q,
             False,
+            reducer_max_splits=implementation._get_reducer_max_splits(split_kv),
             is_workspace_size_zero=workspace_size == 0,
             enable_pdl=enable_pdl,
         )

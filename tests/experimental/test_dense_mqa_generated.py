@@ -1,58 +1,44 @@
-"""Dense prepared API: native-oracle numerics, exact metadata, non-default-stream
-dependencies and changed-input graph replay on SM100a/SM103a.
+"""Dense prepared API: PyTorch-oracle numerics, exact schedule metadata, the -inf
+mask, non-default-stream dependencies and changed-input graph replay on
+SM100a/SM103a.
 
-DeepGEMM is a test oracle only; production imports and launches do not use it.
-The private export campaign additionally reuses the original numerical fixtures.
+The reference is the DeepGEMM lightning-indexer specification evaluated in
+PyTorch (dequantized operands, weighted ReLU over heads, per-row windows) and a
+scalar specification of the DeepGEMM schedule metadata. DeepGEMM itself is an
+additional oracle when its build exposes the dense MQA logits API; production
+imports and launches never use it.
 """
+
+import bisect
 
 import pytest
 import torch
-
 from flashinfer.dense_mqa import prepare_dense_mqa_logits
 from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa as _runtime
 
+_FP4_LUT = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
 
-def _skip_unless_exported():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device required")
-    try:
-        arch = _runtime.device_arch(torch.device("cuda"))
-    except RuntimeError as error:
-        pytest.skip(str(error))
-    sms = torch.cuda.get_device_properties(0).multi_processor_count
-    if sms not in _runtime.supported_num_sms(arch):
-        pytest.skip(
-            f"The exported {arch} schedules cover {_runtime.supported_num_sms(arch)} SMs, "
-            f"this device has {sms}"
-        )
-
-
-def _inputs(precision, queries, keys):
-    torch.manual_seed(101)
-    if precision == "fp4":
-        q = torch.randint(0, 256, (queries, 32, 64), device="cuda", dtype=torch.uint8)
-        kv = torch.randint(0, 256, (keys, 64), device="cuda", dtype=torch.uint8)
-        qs = torch.full((queries, 32, 4), 127, dtype=torch.uint8, device="cuda")
-        ks = torch.full((keys, 4), 127, dtype=torch.uint8, device="cuda")
-        native_q = (q.view(torch.int8), qs.view(torch.int32).view(queries, 32))
-        native_kv = (kv.view(torch.int8), ks.view(torch.int32).view(keys))
-        rows = queries
-    else:
-        rows = max(4, queries)
-        q = torch.randn(rows, 32, 128, device="cuda").to(torch.float8_e4m3fn)
-        kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
-        qs = None
-        ks = torch.ones(keys, device="cuda")
-        native_q, native_kv = (q[:queries], None), (kv, ks)
-    weights = torch.randn(rows, 32, device="cuda")
-    starts = torch.zeros(queries, device="cuda", dtype=torch.int32)
-    ends = torch.full_like(starts, keys)
-    ends[1::3] = 17
-    ends[2::3] = 0
-    return q, kv, qs, ks, weights, starts, ends, native_q, native_kv
-
-
-# The twenty scheduled model rows; the private campaign owns source/export timing.
+# The twenty scheduled model rows plus rows outside the old route table: KV
+# lengths never catalogued (2048, 8192, 65536, 1048576 for one query) and query
+# counts that are not 1, 16 or 128 (partial four-query blocks, 33 and 132
+# queries, and 2052/2053 queries on the unbounded metadata tier).
 CASES = [
     (precision, queries, keys)
     for precision in ("fp4", "fp8")
@@ -68,77 +54,317 @@ CASES = [
         (128, 131072),
         (16, 1048576),
     )
+] + [
+    ("fp4", 7, 2048),
+    ("fp4", 33, 8192),
+    ("fp4", 130, 65536),
+    ("fp8", 3, 8192),
+    ("fp8", 16, 2048),
+    ("fp8", 128, 2048),
+    ("fp8", 1, 1048576),
+    ("fp8", 130, 8192),
+    ("fp4", 2052, 2048),
+    ("fp8", 2052, 2048),
+    ("fp8", 2053, 2048),
+    ("fp8", 132, 2048),
+    ("fp8", 33, 8192),
 ]
 
 
+def _skip_unless_exported():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    try:
+        _runtime.device_arch(torch.device("cuda"))
+    except RuntimeError as error:
+        pytest.skip(str(error))
+
+
+def _inputs(precision, queries, keys):
+    torch.manual_seed(101)
+    if precision == "fp4":
+        q = torch.randint(0, 256, (queries, 32, 64), device="cuda", dtype=torch.uint8)
+        kv = torch.randint(0, 256, (keys, 64), device="cuda", dtype=torch.uint8)
+        qs = torch.randint(124, 131, (queries, 32, 4), device="cuda", dtype=torch.uint8)
+        ks = torch.randint(124, 131, (keys, 4), device="cuda", dtype=torch.uint8)
+        rows = queries
+    else:
+        rows = max(4, queries)
+        q = torch.randn(rows, 32, 128, device="cuda").to(torch.float8_e4m3fn)
+        kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
+        qs = None
+        ks = torch.rand(keys, device="cuda") + 0.5
+    weights = torch.randn(rows, 32, device="cuda")
+    starts = torch.zeros(queries, device="cuda", dtype=torch.int32)
+    ends = torch.full_like(starts, keys)
+    ends[1::3] = 17
+    ends[2::3] = 0
+    if queries > 3:
+        starts[3::4] = 6
+    # Window contract: 0 <= start <= end <= K.
+    starts = torch.minimum(starts, ends)
+    return q, kv, qs, ks, weights, starts, ends
+
+
+def _dequantize_fp4(packed, scales):
+    """Packed E2M1 bytes [rows, 64] and UE8M0 scales [rows, 4] -> FP32 [rows, 128]."""
+    lut = torch.tensor(_FP4_LUT, dtype=torch.float32, device=packed.device)
+    values = torch.empty(
+        packed.shape[0], 128, dtype=torch.float32, device=packed.device
+    )
+    values[:, 0::2] = lut[(packed & 0xF).long()]
+    values[:, 1::2] = lut[((packed >> 4) & 0xF).long()]
+    exponent = torch.pow(2.0, scales.float() - 127.0).repeat_interleave(32, dim=1)
+    return values * exponent
+
+
+def _reference(precision, q, kv, qs, ks, weights, starts, ends, queries, keys):
+    """logits[q, k] = sum_h relu(Q[q,h] . KV[k]) * w[q,h] (* kv_scale[k] for FP8) in the window, -inf outside."""
+    if precision == "fp4":
+        q_f32 = _dequantize_fp4(q.reshape(-1, 64), qs.reshape(-1, 4)).view(
+            queries, 32, 128
+        )
+        kv_f32 = _dequantize_fp4(kv, ks)
+        kv_scale = None
+    else:
+        q_f32 = q[:queries].float()
+        kv_f32 = kv.float()
+        kv_scale = ks
+    logits = torch.zeros(queries, keys, dtype=torch.float32, device=q.device)
+    for head in range(32):
+        logits += (
+            torch.relu(q_f32[:, head] @ kv_f32.T) * weights[:queries, head : head + 1]
+        )
+    if kv_scale is not None:
+        logits *= kv_scale[None, :]
+    position = torch.arange(keys, device=q.device)[None, :]
+    inside = (position >= starts[:, None]) & (position < ends[:, None])
+    return logits.masked_fill(~inside, float("-inf"))
+
+
+def _metadata_reference(starts, ends, kv, sms):
+    """Scalar specification of the DeepGEMM cost-partition metadata."""
+    spans, work_prefix, cost_prefix = [], [], []
+    work = cost = 0
+    for q in range(0, len(starts), 4):
+        base = min(min(v, kv) for v in starts[q : q + 4]) // 4 * 4
+        end = max(min(v, kv) for v in ends[q : q + 4])
+        splits = (end - base + 255) // 256
+        spans.extend((base, splits))
+        work += splits
+        cost += splits + int(splits > 0)
+        work_prefix.append(work)
+        cost_prefix.append(cost)
+
+    def locate(sm):
+        target = sm * (cost // sms) + min(sm, cost % sms)
+        if target == cost:
+            return len(work_prefix), 0, work
+        block = bisect.bisect_right(cost_prefix, target)
+        before_work = work_prefix[block - 1] if block else 0
+        before_cost = cost_prefix[block - 1] if block else 0
+        split = min(
+            max(target - before_cost, 1) - 1, work_prefix[block] - before_work - 1
+        )
+        return block, split, before_work + split
+
+    boundaries = [locate(sm) for sm in range(sms + 1)]
+    header = [v for q, split, _ in boundaries[:-1] for v in (q, split)]
+    header += [boundaries[sm + 1][2] - boundaries[sm][2] for sm in range(sms)]
+    return header, spans
+
+
+def _check(plan, precision, expected, starts, ends, keys, sms):
+    actual = plan.logical_output
+    finite = torch.isfinite(expected)
+    assert torch.equal(torch.isfinite(actual), finite)
+    assert bool(torch.isneginf(actual[~finite]).all())
+    assert bool(torch.isneginf(plan.output[:, keys:]).all())
+    torch.testing.assert_close(
+        actual[finite],
+        expected[finite],
+        atol=1.0 if precision == "fp4" else 0.1,
+        rtol=0.1,
+    )
+    if precision == "fp4":
+        left, right = actual[finite].double(), expected[finite].double()
+        denominator = (left.square() + right.square()).sum()
+        distance = (
+            0.0
+            if denominator == 0
+            else float(1 - 2 * (left * right).sum() / denominator)
+        )
+        assert distance < 5e-6
+    header, spans = _metadata_reference(starts.tolist(), ends.tolist(), keys, sms)
+    span_offset = (3 * sms + 1) // 2 * 2
+    metadata = plan.metadata.tolist()
+    assert metadata[: 3 * sms] == header
+    assert metadata[span_offset:] == spans
+
+
+def _deep_gemm_check(
+    plan, precision, q, kv, qs, ks, weights, starts, ends, queries, keys, sms
+):
+    try:
+        import deep_gemm
+    except ImportError:
+        return
+    # DeepGEMM builds differ in the dense MQA API they expose; the oracle
+    # runs only where the dense metadata and logits entry points exist.
+    if not all(
+        hasattr(deep_gemm, name)
+        for name in (
+            "get_num_sms",
+            "set_num_sms",
+            "get_mqa_logits_metadata",
+            "fp8_fp4_mqa_logits",
+        )
+    ):
+        return
+    if precision == "fp4":
+        native_q = (q.view(torch.int8), qs.view(torch.int32).view(queries, 32))
+        native_kv = (kv.view(torch.int8), ks.view(torch.int32).view(keys))
+    else:
+        native_q, native_kv = (q[:queries], None), (kv, ks)
+    old_sms = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(sms)
+    try:
+        meta = deep_gemm.get_mqa_logits_metadata(starts, ends, keys, 32)
+        expected = deep_gemm.fp8_fp4_mqa_logits(
+            q=native_q,
+            kv=native_kv,
+            weights=weights[:queries],
+            cu_seq_len_k_start=starts,
+            cu_seq_len_k_end=ends,
+            clean_logits=True,
+            max_seqlen_k=0,
+            logits_dtype=torch.float32,
+            schedule_meta=meta,
+        )
+    finally:
+        deep_gemm.set_num_sms(old_sms)
+    torch.cuda.synchronize()
+    finite = torch.isfinite(expected)
+    actual = plan.logical_output
+    assert torch.equal(torch.isfinite(actual), finite)
+    torch.testing.assert_close(
+        actual[finite],
+        expected[finite],
+        atol=1.0 if precision == "fp4" else 0.1,
+        rtol=0.1,
+    )
+    span = (3 * sms + 1) // 2 * 2
+    assert torch.equal(plan.metadata[: 3 * sms], meta[: 3 * sms])
+    assert torch.equal(plan.metadata[span:], meta[span:])
+
+
 @pytest.mark.parametrize("precision,queries,keys", CASES)
-def test_dense_mqa_stream_and_replay(precision, queries, keys):
+def test_dense_mqa_logits(precision, queries, keys):
     _skip_unless_exported()
-    deep_gemm = pytest.importorskip("deep_gemm")
-    q, kv, qs, ks, weights, starts, ends, nq, nk = _inputs(precision, queries, keys)
+    q, kv, qs, ks, weights, starts, ends = _inputs(precision, queries, keys)
     plan = prepare_dense_mqa_logits(
         precision, q, kv, weights, starts, ends, q_scales=qs, kv_scales=ks
     )
-    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    old_sms = deep_gemm.get_num_sms()
-    deep_gemm.set_num_sms(sms)
+    assert plan.route_name == _runtime.route_name(precision, queries, keys)
+    sms = plan.num_sms
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    try:
-        with torch.cuda.stream(stream):
-            # A device-side input dependency must reach the current-stream launch.
-            weights.mul_(0.5)
+    with torch.cuda.stream(stream):
+        # A device-side input dependency must reach the current-stream launch.
+        weights.mul_(0.5)
+        plan.run()
+    stream.synchronize()
+    first = plan.output.clone()
+    expected = _reference(
+        precision, q, kv, qs, ks, weights, starts, ends, queries, keys
+    )
+    _check(plan, precision, expected, starts, ends, keys, sms)
+    _deep_gemm_check(
+        plan, precision, q, kv, qs, ks, weights, starts, ends, queries, keys, sms
+    )
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
             plan.run()
-        stream.synchronize()
-        first = plan.output.clone()
+    for changed in (False, True):
         with torch.cuda.stream(stream):
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                plan.run()
-        for changed in (False, True):
-            with torch.cuda.stream(stream):
-                if changed:
-                    weights.neg_()
-                    ends.copy_(keys - ends)
-                plan.output.fill_(float("nan"))
-                plan.metadata.fill_(0x55555555)
-                graph.replay()
-            stream.synchronize()
-            meta = deep_gemm.get_mqa_logits_metadata(starts, ends, keys, 32)
-            expected = deep_gemm.fp8_fp4_mqa_logits(
-                q=nq,
-                kv=nk,
-                weights=weights[:queries],
-                cu_seq_len_k_start=starts,
-                cu_seq_len_k_end=ends,
-                clean_logits=True,
-                max_seqlen_k=0,
-                logits_dtype=torch.float32,
-                schedule_meta=meta,
+            if changed:
+                weights.neg_()
+                ends.copy_(keys - ends)
+                starts.copy_(torch.minimum(starts, ends))
+            plan.output.fill_(float("nan"))
+            plan.metadata.fill_(0x55555555)
+            graph.replay()
+        stream.synchronize()
+        if changed:
+            expected = _reference(
+                precision, q, kv, qs, ks, weights, starts, ends, queries, keys
             )
-            torch.cuda.synchronize()
-            actual = plan.logical_output
-            finite = torch.isfinite(expected)
-            assert torch.equal(torch.isfinite(actual), finite)
-            assert bool(torch.isneginf(actual[~finite]).all())
-            assert bool(torch.isneginf(plan.output[:, keys:]).all())
-            torch.testing.assert_close(
-                actual[finite],
-                expected[finite],
-                atol=1.0 if precision == "fp4" else 0.1,
-                rtol=0.1,
-            )
-            if precision == "fp4":
-                left, right = actual[finite].double(), expected[finite].double()
-                denom = (left.square() + right.square()).sum()
-                diff = (
-                    0.0 if denom == 0 else float(1 - 2 * (left * right).sum() / denom)
-                )
-                assert diff < 5e-6
-            span = (3 * sms + 1) // 2 * 2
-            assert torch.equal(plan.metadata[: 3 * sms], meta[: 3 * sms])
-            assert torch.equal(plan.metadata[span:], meta[span:])
-            if not changed:
-                assert torch.equal(plan.output, first)
-    finally:
-        deep_gemm.set_num_sms(old_sms)
+        _check(plan, precision, expected, starts, ends, keys, sms)
+        if not changed:
+            assert torch.equal(plan.output, first)
+
+
+@pytest.mark.parametrize(
+    "precision,queries,keys,route",
+    [
+        ("fp4", 1, 4096, "fp4:q1"),
+        ("fp4", 16, 1048576, "fp4:le16"),
+        ("fp4", 7, 2048, "fp4:le16"),
+        ("fp4", 17, 2048, "fp4:le128"),
+        ("fp4", 130, 65536, "fp4:le2048"),
+        ("fp4", 2049, 4096, "fp4:any"),
+        ("fp8", 1, 4096, "fp8:q1:short"),
+        ("fp8", 1, 131072, "fp8:q1:short"),
+        ("fp8", 1, 131328, "fp8:q1"),
+        ("fp8", 128, 4096, "fp8:q128:short"),
+        ("fp8", 128, 4352, "fp8:full:le128"),
+        ("fp8", 16, 2048, "fp8:full:le16"),
+        ("fp8", 3, 8192, "fp8:partial:le16"),
+        ("fp8", 130, 8192, "fp8:partial:le2048"),
+    ],
+)
+def test_dense_mqa_route_selection(precision, queries, keys, route):
+    assert _runtime.route_name(precision, queries, keys) == route
+
+
+@pytest.mark.parametrize("sm_count", [132, 148, 152])
+def test_dense_mqa_sm_count_definition(sm_count):
+    """The FP8 indexer programs are built per launch grid: a CTA-budget override
+    compiles the fused single-query program with that SM count defined on the
+    compile line (its own JIT module) and the result is exact against the
+    reference and the metadata rule -- including a count the device does not
+    have (above its SM count the extra CTAs run as a second wave)."""
+    _skip_unless_exported()
+    arch, _device_sms = _runtime.device_facts(torch.cuda.current_device())
+    q, kv, qs, ks, weights, starts, ends = _inputs("fp8", 1, 4096)
+    plan = _runtime.DenseMqaPlan(
+        "fp8", q, kv, weights, starts, ends, kv_scales=ks, sm_count=sm_count
+    )
+    assert plan.route_name == "fp8:q1:short"
+    assert plan.num_sms == sm_count
+    program = dict(plan.route["stages"])["logits"]
+    assert plan.program_names == [program]
+    record = _runtime._catalog()["programs"][program]
+    assert record["definitions"] == ["SM_COUNT"]
+    assert _runtime.program_definitions(record, sm_count) == {"SM_COUNT": sm_count}
+    assert _runtime.program_spec(arch, program, sm_count).name.endswith(
+        f"_sm_count{sm_count}"
+    )
+    plan.run()
+    torch.cuda.synchronize()
+    expected = _reference("fp8", q, kv, qs, ks, weights, starts, ends, 1, 4096)
+    _check(plan, "fp8", expected, starts, ends, 4096, sm_count)
+
+
+def test_dense_mqa_rejects_unsupported_shapes():
+    _skip_unless_exported()
+    q, kv, qs, ks, weights, starts, ends = _inputs("fp8", 4, 4096)
+    with pytest.raises(ValueError):
+        prepare_dense_mqa_logits(
+            "fp8", q, kv[:4000], weights, starts, ends, kv_scales=ks[:4000]
+        )
+    with pytest.raises(ValueError):
+        prepare_dense_mqa_logits("fp8", q, kv, weights, starts, ends[:3], kv_scales=ks)
+    with pytest.raises(ValueError):
+        prepare_dense_mqa_logits("bf16", q, kv, weights, starts, ends, kv_scales=ks)

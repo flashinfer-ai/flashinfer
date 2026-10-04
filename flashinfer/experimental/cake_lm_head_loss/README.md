@@ -26,9 +26,11 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   multiple of 256; a row pitch that is not a multiple of 16 bytes is copied
   to a contiguous tensor first); `W [V, H]` BF16 contiguous output weight
   (`V` a multiple of 256); `labels [T]` int64 with `-100` marking an ignored
-  row (zero loss, zero gradient, `logp = 0`).  A registered program is built
-  for one `(H, V)` geometry, which its registry record pins; other geometries
-  are rejected at validation.
+  row (zero loss, zero gradient, `logp = 0`).  The generated kernels take the
+  call geometry as launch scalars, so one registered program per architecture
+  (`cake_lm_head_loss_<arch>`, `cake_jit.select_module`) serves every `(H, V)`
+  its record's geometry admits: `H` a multiple of the dX / weight-gradient work
+  items' 512 columns, `V` a multiple of the logits work item's 256 columns.
 * Per row `logp_t = z[t, y_t] - logsumexp_v z[t, v]` with `z = X @ W^T`
   computed as a BF16 GEMM (BF16 output of an FP32 accumulation) and promoted
   to FP32 for the max / log-sum-exp / loss arithmetic.
@@ -76,6 +78,85 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   row ignored: zeros without a launch.  The prepared runner
   (`prepare_lm_head_loss(..., compact_rows=True)`) fixes the valid-row set at
   preparation and returns the compact forms (`runner.scatter` restores `[T]`).
+* Fused weight-gradient cast (`fuse_dw_cast`, default on unless
+  `FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST=0`): the last chunk's
+  weight-gradient GEMM runs in the backward, where the upstream scalar
+  gradient `g` is known, with the scale and the output cast fused into its
+  epilogue (`gemm_dw_cast_bf16` / `gemm_dw_cast_f32`): the forward
+  accumulates the chunks before it into the FP32 `dW_acc` (a one-chunk call
+  has no `[V, H]` accumulator at all), the backward writes
+  `dW = cast(g * (dW_acc + dz_c^T @ X_c))` straight from the GEMM, and the
+  separate `scale_cast` pass over `dW` disappears.  The same FP32 operations
+  in the same order, so `dW` is bitwise the unfused result.  The last chunk's
+  BF16 `dlogits` rows -- a view of the `[min(T, C), V]` chunk buffer, which
+  therefore stays alive until the backward; `memory_report(...)["saved_dz_bytes"]`
+  counts that whole buffer, and the eager path allocates it on its own from the
+  first call on, so the view keeps nothing else alive -- and a view of its rows of `X` (or `X` with the
+  chunk's row index when compacted) are saved for the backward; an in-place write to `X` between the forward and the
+  backward raises PyTorch's saved-tensor version error.  `ForwardResult`
+  carries them (`dz_last`, `x_last` / `x_src` + `x_idx`) for the explicit pair
+  and `ForwardResult.backward` / `backward_loss(..., dz_last=...)` finish
+  `dW`; the prepared runner keeps that chunk's `dz` in the workspace between
+  `forward()` and `backward()`.
+* Fused dX finalize (default on unless
+  `FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE=0`): a K-sliced `dX` GEMM's FP32
+  slabs are added into `dX_acc` by one fixed-order kernel (`slab_sum`: one RN
+  add per element per slab in ascending slab order -- the evaluation order of
+  the previous chain of in-place `add_` launches, with `dX_acc` read and
+  written once), and a compacted call writes its `[T, H]` BF16 `dX` in one pass
+  (`scale_cast_scatter_bf16`: `bf16(g * dX_acc[compact row])` on the valid
+  rows, exact zeros elsewhere, addressed through the inclusive int32 scan of
+  the valid-row mask -- one `cumsum` issued in the backward -- and validated
+  against the compact index) instead of the flat cast, the zero fill and the
+  `index_copy_` of the compact rows.  The forward keeps the bool valid-row mask
+  next to the row index (`ForwardResult.row_valid`); `backward_loss(...,
+  row_valid=...)` / `finalize_dx` select the one-pass form, the log-probability
+  backward finalizes its accumulator the same way, and every row valid stays
+  the single flat cast.  The same FP32 operations in the same order: `dX` is
+  bitwise the previous path's, and `0` restores that path.  The prepared runner
+  keeps its compact `dx_out` contract (`runner.scatter` restores `[T, H]`) and
+  gains the kernel slab reduction only.
+* dW side stream (`FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM`: `auto` (default) =
+  calls of three or more chunks, `1` = every multi-chunk call, `0` = never):
+  each chunk's weight-gradient accumulate GEMM is launched on a per-device side
+  stream forked after the chunk's `row_grad` (`dz` ready) and joined before the
+  next chunk reuses the chunk buffer and before the call returns, so its CTAs
+  fill the tail wave of the chunk's `dX` GEMM instead of queueing behind it.
+  Kernels, buffers, launch order per kernel and numerics are unchanged: `loss`,
+  `logp`, `dX` and `dW` are bitwise the single-stream path's.  Two-chunk calls
+  pay the cross-stream join without an overlap gain and a one-chunk call
+  defers its only accumulate to the backward, hence the `auto` rule
+  (`cake_backend.dw_side_stream`).  The prepared runner follows the same rule
+  (a CUDA graph captured from it records the fork / join).
+* Hidden valid-row count (default on;
+  `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT=0` restores the previous path):
+  a compacted call used to count its valid rows on the host (`sum().item()`)
+  and form their index (`nonzero`) before its first launch.  It now forms the
+  index on the device (`labels >= 0` -> an inclusive int32 `cumsum` ->
+  `searchsorted`), gathers chunk 0's rows of `X` with the `gather_rows_bf16`
+  kernel and runs chunk 0's logits GEMM in its device-count form
+  (`gemm_logits_mcnt` / `gemm_logits_nostats_mcnt`: the stores bounded by the
+  count read from device memory, the buffer extent `min(chunk_size, T)` as
+  `M`), and reads the count back through a pinned cell and a CUDA event only
+  after both are queued -- the host waits for the three compaction kernels and
+  a 4-byte copy instead of the count and the index.  Every row valid: the
+  uncompacted plan with chunk 0's GEMM already done (its `X` rows for the
+  weight gradient stay the input view); every row ignored: zeros without a
+  further launch; otherwise the compacted plan over the counted rows with
+  chunk 0's gather and GEMM skipped.  The same kernels per row, so `loss` /
+  `logp` / `dX` / `dW` are bitwise the previous path's.  Calls the
+  device-count GEMM cannot serve -- an `X` that needs a contiguous copy or
+  whose base is not 16-byte aligned, a program without the kernels --, calls
+  of fewer than three chunks (`ceil(T / chunk_size) < 3`,
+  `cake_backend.HIDDEN_COUNT_MIN_CHUNKS`: the path's fixed host cost per call
+  is hidden behind chunk 0's logits GEMM only from three chunks on; one- and
+  two-chunk calls measured 5-16 % slower with it, so, like the dW side
+  stream's `auto` rule, it serves calls of three or more chunks) and every
+  `sm_103a` call on CUDA 13.0 (the toolchain note below) take the previous
+  path; the prepared runner (`prepare_lm_head_loss`) is
+  unchanged.  The chunk buffers and the gather buffer exist at the buffer
+  extent before the count is known (`memory_report(..., hidden_count=True)`;
+  `cake_backend.hidden_count_eligible` / `_hidden_count_begin`).
 * Memory rule: no logits, probability or `dlogits` buffer ever spans more than
   `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
@@ -109,7 +190,9 @@ any device (the host-layer tests use it); the public API accepts
 Per chunk of `rows_c <= chunk_size` rows the host launches, in this order
 (a compacted plan first gathers the chunk's valid rows of `X` into the `x_c`
 workspace buffer with a torch `index_select`, `gather_rows`; the row operands
-are gathered once per step):
+are gathered once per step; under the hidden valid-row count chunk 0's
+gather and logits GEMM ran before the count was known, see
+`gather_rows_bf16` below):
 
 * `gemm_logits`: `z_c = bf16(X_c @ W^T)` (2-CTA tensor-core GEMM, 128-row
   tiles, 256 vocabulary columns per accumulator) together with the
@@ -125,20 +208,108 @@ are gathered once per step):
   the loss accumulator; the last chunk writes the finished loss.
 * `row_grad`: `dz_c = d_t * (1[v = y_t] - exp(z - lse_t))` in BF16, in place
   over `z_c`; ignored rows become zero.
-* `gemm_dx`: `dX_acc[rows] = fp32(dz_c @ W)`.  A record may also register
-  `gemm_dx_s2` / `gemm_dx_s3` / `gemm_dx_s4`, the same GEMM as 2 / 3 / 4
-  K-slice work items per output tile (the persistent grid fills its last
-  wave; a record registers a contiguous prefix of them): slice 0 writes
-  `dX_acc`, slices `>= 1` write FP32 workspace slabs (`dx_ws`, temporary
-  bucket) that the host adds into `dX_acc` in fixed slab order (one RN add per
-  element per slab, no atomics).  The slice count of a chunk follows from its
-  row count and the SM count (`cake_backend.recommended_k_slices`), so it is
-  deterministic in the shapes.
+* `gemm_dx`: `dX_acc[rows] = fp32(dz_c @ W)`.  A record also registers
+  `gemm_dx_s`, the same GEMM as `k_slices` (2 .. 4, a launch scalar) K-slice
+  work items per output tile (the persistent grid fills its last wave): slice
+  0 writes `dX_acc`, slices `>= 1` write FP32 workspace slabs (`dx_ws`,
+  temporary bucket) that the host adds into `dX_acc` in fixed slab order (one
+  RN add per element per slab, no atomics).  The slice count of a chunk
+  follows from its row count and the SM count
+  (`cake_backend.recommended_k_slices`), so it is deterministic in the shapes.
+  Both forms exist with the 512-column pair tile (the default) and the
+  256-column tile (`_tn256`), see the structural forms below.
 * `gemm_dw_acc`: `dW_acc = fp32(dz_c^T @ X_c)` on the first chunk,
   `dW_acc += ...` afterwards (the chunk order is the reduction order).
+* `gemm_dw_cast_bf16` / `gemm_dw_cast_f32`: the last chunk's `dz_c^T @ X_c`
+  with the upstream scale and the output cast fused into the epilogue,
+  `dW = cast(g * (dW_acc + tile))` -- `cast(g * tile)` for a one-chunk plan
+  -- run in the backward (`fuse_dw_cast`); `dW_acc` is read, never written.
 * `scale_cast_bf16` / `scale_cast_f32`: `out = g * acc` over the flat FP32
-  accumulators -- the single output cast of `dX` and `dW` in the backward,
-  with the upstream gradient `g` read from a device scalar.
+  accumulators -- the single output cast of `dX` (and of `dW` without
+  `fuse_dw_cast`) in the backward, with the upstream gradient `g` read from a
+  device scalar.
+* `slab_sum`: after a K-sliced `gemm_dx_s`, `dX_acc[rows] += slab_0 + ...
+  + slab_{k-2}` in one launch, one RN add per element per slab in ascending
+  slab order (the fused dX finalize; `dx_reduce`, the host's `add_` chain,
+  when it is off).
+* `scale_cast_scatter_bf16`: the dX output boundary of a compacted call with
+  the fused dX finalize -- `out[r] = bf16(g * acc[scan[r] - 1])` when
+  `row_index[scan[r] - 1] == r`, exact zeros otherwise, one CTA per output row
+  per iteration, every element written once (launched by `finalize_dx`, not
+  by the chunk loop).
+* `gather_rows_bf16`: chunk 0's row gather of the hidden valid-row count
+  (the eager entry points) -- `out[r] = X[idx[r]]` for `r < min(count,
+  num_rows)` with the count read from device memory, exact zeros after; one
+  CTA per row per iteration over 16-byte words, `X` addressed by its base
+  pointer and row pitch (no contiguous copy), the int64 index read as int32
+  pairs.  Launched before chunk 0's logits GEMM, which runs in its
+  device-count form (`gemm_logits_mcnt` / `gemm_logits_nostats_mcnt`: `M`,
+  `m_tiles` and the raster are the buffer extent `min(chunk_size, T)`, every
+  store and statistics write is bounded by `min(count, M)`; bitwise the
+  host-bound form per row).
+
+### Structural forms and launch scalars
+
+The GEMM stages are registered as structural *forms* -- one stage name per
+kernel body the program carries, named by the outputs of the per-chunk rules
+the production launchers of the kernel source apply that select a different
+body (`cake_backend.stage_variant` / `parse_stage`; suffixes in this order).
+The call geometry and the rules' numeric outputs are *launch scalars* of every
+form (`cake_backend.gemm_scalars`: `ldc` and `k_iters` from `H` / `V`, the
+K-slice count `k_slices` and slice length `k_slice_iters`, the raster height
+`group_m` in row tiles, the raster block width `group_n` in column items), so
+a record serves every admissible geometry and the host never selects by shape:
+
+* `_mcnt`: the device-count form of the logits GEMMs (`gemm_logits_mcnt`,
+  `gemm_logits_nostats_mcnt`) -- chunk 0 of the hidden valid-row count, whose
+  valid-row bound is read from device memory while `M`, `m_tiles` and the
+  raster height are evaluated at the buffer extent `min(chunk_size, T)`
+  (`cake_backend.hidden_count_eligible`, `Plan.hidden_logits_stage`).
+  Bitwise: the same per-row arithmetic, rows at and beyond the count are not
+  written;
+* `_s`: the K-sliced dX GEMM (`k_slices` 2 .. 4 from `recommended_k_slices`;
+  one slice runs the plain form);
+* `_tn256`: the narrow dX tile, taken when `H % 512 != 0`, when the launch's
+  512-wide work items would not fill the device's SM pairs, or -- on SM100
+  below `H` 7168 -- when a one-slice launch fills the SM pairs' waves below
+  0.83 (`DX_WIDE_MIN_EFF`: the badly wave-quantized chunk tails such as the
+  3591 / 3663-row tails of `T` 65031 / 32463 at chunk 4096)
+  (`cake_backend.dx_tile_rule`, evaluated after the slice count; `dX` is
+  bitwise the same on both tiles);
+* `_st3`: the 3-deep operand ring of the 512-wide `dX` tile below `H` 7168 for
+  chunks of more than 4096 rows on both architectures
+  (`cake_backend.dx_stages_variant`, `DX_LONG_CHUNK_STAGES`); the 256-wide
+  fallback keeps its depth.  Bitwise: the ring depth only changes when a stage
+  is refilled;
+* `_gn`: the 2-D blocked raster of the weight-gradient accumulate and the fp32
+  fused cast below `H` 7168 for chunks of 2049 .. 4096 rows on both
+  architectures, with `group_n` = 12 column tiles per block
+  (`cake_backend.dw_block_variant`, `DW_BLOCK_GROUPS`); the bf16 cast keeps the
+  1-D raster.  Bitwise: a permutation of the same tiles.
+
+The raster height is a scalar of the base forms: `group_m` 16 for the logits
+GEMMs and 32 for the weight-gradient GEMMs (accumulate and fused cast) at
+`H >= 7168` for chunks of more than 2048 rows (`cake_backend.raster_variant`,
+`RASTER_WIDE_GROUPS` per architecture); below that `H`, 16 for the logits
+GEMMs of chunks of at least 3841 rows (31 row tiles of 128:
+`LOGITS_LONG_RASTER_GROUPS` / `LOGITS_LONG_RASTER_MIN_ROWS`) and 16 for the
+weight-gradient GEMMs of chunks of more than 4096 rows, both on both
+architectures (`DW_LONG_CHUNK_GROUP_M` / `DW_LONG_CHUNK_MIN_ROWS`); every
+other chunk -- the default geometry's chunks of up to 30 row tiles, short tail
+chunks -- takes the GEMM's default height from the record geometry
+(`logits_group_m` / `dx_group_m` / `dw_group_m`).  Bitwise: only the tile
+order changes.
+
+`make_plan` resolves the forms and scalars per chunk (`Plan.variants`,
+`Plan.logits_stage` / `dx_stage_of` / `dw_acc_stage` / `dw_cast_stage`;
+`stage_values` forms the scalars); a record carries exactly the forms its
+architecture's rules can reach (`cake_backend.reachable_variants`, checked by
+`generated_program_available`), and a form the record lacks fails closed.
+`gemm_tuning` (`prepare_lm_head_loss`; `FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`
+as a JSON object for the eager entry points) pins knobs explicitly per GEMM --
+`{"logits": {"group_m": 16}, "dx": {"tile_n": 256, "k_slices": 2, "stages": 4},
+"dw": {"group_m": 32, "group_n": 0}}`, a knob given as `null` pins the default
+-- and wins over the rule for the knobs it names.
 
 Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
 `row_finalize`, `V/8/1024 x rows_c` for `row_grad`) and are evaluated by the
@@ -150,29 +321,70 @@ instance launches a persistent grid capped by `resident`, the device's
 co-resident clusters of that width (`cluster_resident`: the SM pairs for a
 two-CTA cluster, the driver's occupancy answer for wider ones), while a
 dynamically scheduled instance launches its whole work-item domain.  The
-`dX` K-slice rule uses the same co-resident count.  The GEMM operands are
+`dX` K-slice rule uses the same co-resident count.  A GEMM compiled for the
+preferred-cluster launch (the generated host binding passes the preferred
+cluster dimension next to the required one, so the hardware forms the wider
+clusters where the GPC topology allows and the required ones elsewhere)
+declares its required cluster in the geometry; its grid rule counts the
+wider work items, and the kernel reads the runtime cluster size.  The GEMM operands are
 described by TMA descriptors the host prepares in a per-runner descriptor
 workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 
 ## Layout of this package
 
-* `cake_jit.py` -- `MODULES` registry (one record per architecture, filled by
-  the generated-program export), stage names and the JIT specs.
+* `cake_jit.py` -- `MODULES` registry (one record per architecture, expanded
+  from the compact tables the generated-program export writes between the
+  `generated registry` markers), stage names
+  (`STAGES`, `BASE_STAGES`, `GEMM_STAGES`), record selection
+  (`select_module`) and the JIT specs.
 * `cake_backend.py` -- validation, chunk plans, workspace layout, memory
   accounting, argument-plan binding, the prepared runner, the torch reference
   path, the autograd `Function`s and the eager entry points.
-* `csrc/cake_lm_head_loss/<arch>/` -- generated kernel and binding
-  translation units (`.clang-format` disables formatting: the sources are
-  identity-checked by the registry's closure digests).
+* `csrc/cake_lm_head_loss/` -- generated kernel translation units
+  (`cake_lm_head_loss_<unit>_kernel.cu`, one architecture-neutral unit per
+  kernel shared by the records of both architectures, the per-architecture
+  lowering under `__CUDA_ARCH__` guards -- except the four logits GEMM forms,
+  whose sm_103a lowering stages the C tile in shared memory for a TMA store
+  behind a six-stage operand pipeline while sm_100a stores from registers
+  behind seven, so each of those has one unit per architecture) and their two-line launch stubs
+  (`..._launch.cu`: `#define CAKE_KERNEL_SYMBOL` + the include of the shared
+  launcher); `csrc/cake_lm_head_loss/shim/` -- the shared tvm-ffi launchers
+  (`cake_lm_head_loss_shim_<digest>.cuh`, one per distinct host contract:
+  descriptor encoders, argument checks, dynamic shared memory and launch
+  geometry).  `.clang-format` disables formatting: the sources are
+  identity-checked by the registry's closure digests.
 
 ## Status
 
-The registry holds one record per architecture (`sm_100a`, `sm_103a`) with
-the nine stages above (`abi = lm_head_loss_v1`), exported from the kernel
-snapshot named in the pull request, pinned to hidden size 6144 and vocabulary
-154880.
+The registry holds one record per architecture (`sm_100a`, `sm_103a`),
+`cake_lm_head_loss_<arch>`, geometry-free (`H` / `V` and the rules' outputs are
+launch scalars: every `H` a multiple of 512 and `V` a multiple of 256 runs on
+it), with the fourteen base stages above plus the nine structural forms the
+rules can reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot
+named in the pull request.
 
 Tests: `tests/experimental/test_cake_lm_head_loss.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
 registered program or a compute capability 10.0 / 10.3 device).  Benchmark:
 `benchmarks/bench_cake_lm_head_loss.py`.
+
+Toolchain note: on CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built
+with `-Xptxas -O0` (`cake_jit.toolchain_workaround_flags`).  That toolchain's
+ptxas mis-schedules their 2-CTA TMA producer loops: at -O3 (and -O2, which
+emits the same code), with a short K loop (`chunk_size <= 1024`) the dW
+accumulate GEMM's second B-operand TMA load is rejected by the TMA unit with
+`cudaErrorIllegalInstruction` although every operand is legal; at -O1 the
+structural-form programs' dW cast GEMM (the last chunk's `dz_c^T @ X_c`) faults
+the same way on every call whose last chunk is partial (`T % chunk_size != 0`).
+The -O0 code and the code of CUDA 12.9, 13.3 and 13.4 are correct.  With the
+earlier -O1 code the hidden
+valid-row count's schedule (the compaction index, chunk 0's row gather and
+device-count logits GEMM queued before the count is read back) still reaches a
+`cudaErrorIllegalInstruction` from the dW accumulate GEMM at its shortest K
+schedule (the one-row tail chunk of a two-chunk call) in every run of the test
+file, while the host-count path passes (as does the -O0 code with the hidden
+count); so on CUDA 13.0 the `sm_103a` calls also take the host-count path
+(`cake_jit.toolchain_runs_hidden_count`; the same kernels per row, bitwise the
+same outputs).  Every other architecture / toolchain pair builds at the default
+optimization level and runs the hidden count.  Both are mitigations of the
+observed ptxas 13.0 fault, not a root-cause fix.

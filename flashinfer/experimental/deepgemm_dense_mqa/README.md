@@ -2,24 +2,34 @@
 
 `from flashinfer.dense_mqa import prepare_dense_mqa_logits` prepares the dense
 DeepSeek-V3.2 lightning-indexer (`logits[q, k] = sum_h relu(Q[q,h] . KV[k]) * w[q,h]`
-inside each query's `[start, end)` window, `-inf` elsewhere) on SM100a (148 SMs) and
-SM103a (152 SMs). Each prepared call returns a plan; `plan.run()` submits on the current
-PyTorch stream and returns the logical `[Q, K]` view of the FP32 output.
+inside each query's `[start, end)` window, `-inf` elsewhere) on SM100a and SM103a. Each
+prepared call returns a plan; `plan.run()` submits on the current PyTorch stream and
+returns the logical `[Q, K]` view of the FP32 output.
 
-The exported routes use 32 heads and D = 128 for FP4 (packed E2M1 with UE8M0 scales per
-32 channels) and FP8 (E4M3 with one FP32 scale per KV token) inputs at Q in {1, 16, 128}
-with K in {4096, 32768, 131072} plus Q = 16 with K = 1048576. Every route generates the
-DeepGEMM-compatible schedule metadata (per-SM work headers and per-query-block spans) and
-consumes it in the same submission: most routes are a metadata program followed by the
-fused logits/cleanup program; the FP8 single-query rows and the FP8 Q = 128, K = 4096 row
-produce the metadata inside the logits launch.
+The generated programs use 32 heads and D = 128 for FP4 (packed E2M1 with UE8M0 scales
+per 32 channels) and FP8 (E4M3 with one FP32 scale per KV token) inputs. Any query count
+`1 <= Q <= max_queries()` and any KV length `K` that is a multiple of 256 are accepted;
+the query count and the KV length are runtime arguments and every program takes the launch
+grid of the logits consumers (the device's SM count) as the compile-line definition
+`SM_COUNT`, so one program text per physical schedule serves both architectures and every
+SM count (one JIT build per device SM count). The schedule
+metadata producer is specialised on a query ceiling (tiers `le16`, `le128`, `le2048`,
+`any`), which bounds its prefix arrays and boundary search at compile time; a route name
+carries the tier of its query count. Routes are chosen from host-known scalars only: FP4
+rows run the DeepGEMM-compatible metadata producer and the fused logits/cleanup kernel in
+one prepared submission; FP8 rows with `Q = 1` and `K <= 131072` or `Q = 128` and
+`K <= 4096` produce the metadata inside the logits launch (their cost partition and
+metadata offsets fold on the compile-line SM count exactly as in the shipped kernels); the
+other FP8 rows run the
+metadata program followed by the logits program (a `Q % 4 != 0` tail uses the
+partial-block logits program).
 
 `prepare_dense_mqa_logits(precision, q, kv, weights, starts, ends, q_scales=None,
 kv_scales=None, output=None, metadata=None)` binds FP4 `q` uint8/int8 `[Q, 32, 64]`,
 `kv` `[K, 64]`, `q_scales` uint8 `[Q, 32, 4]`, `kv_scales` uint8 `[K, 4]` and FP32 weights
 `[Q, 32]`, or FP8 `q` E4M3 `[Q_storage, 32, 128]` with `Q_storage >= max(4, Q)`, `kv`
 `[K, 128]`, `kv_scales` FP32 `[K]` and FP32 weights `[Q_storage, 32]`. `starts`/`ends` are
-int32 `[Q]` with `0 <= start <= end <= K`; K is a multiple of 256. The output is FP32
+int32 `[Q]` with `0 <= start <= end <= K`. The output is FP32
 `[Q, logits_stride(K)]` with `logits_stride(K) = align(K + 256, 8)`; consume
 `plan.logical_output` (`output[:, :K]`). Every cell of the padded output is written by each
 submission, and for FP4 the output storage must include the final four-row query tile
@@ -30,9 +40,9 @@ or tensor identities change. Do not use one plan's output/metadata concurrently 
 different streams.
 
 Generated CUDA and bindings live in `csrc/experimental/deepgemm_dense_mqa/generated`
-(one directory per architecture). The runtime and the per-architecture route catalog are in
-this directory. The public API is `flashinfer/dense_mqa.py`; see
-`examples/experimental/dense_mqa.py`. Build/install FlashInfer with its supported CUDA
+(one device/binding pair per program, shared by both architectures). The runtime and the
+program/route catalog are in this directory. The public API is `flashinfer/dense_mqa.py`;
+see `examples/experimental/dense_mqa.py`. Build/install FlashInfer with its supported CUDA
 toolchain before running:
 
 ```bash
@@ -40,11 +50,10 @@ python examples/experimental/dense_mqa.py
 pytest tests/experimental/test_dense_mqa_generated.py -q
 ```
 
-The test covers all twenty routes of the present architecture against the DeepGEMM oracle
-(values within the original FP4/FP8 tolerances, the FP4 cosine-distance gate, the `-inf`
-mask, exact schedule metadata) on a non-default stream and under changed-input graph
-replay; it skips on devices without catalogued programs or SM counts. Performance
-qualification measures the complete prepared submission with prepacked inputs over the
-twenty model rows. Per-row exported execution must remain within 3% of its source route.
-Performance results accompany the generated bundle; preparation is excluded from both
-timed arms.
+The test covers the twenty model rows (Q in {1, 16, 128} x K in {4096, 32768, 131072}
+plus Q = 16 with K = 1048576, FP4 and FP8) and rows outside that table against a PyTorch
+reference (values within the FP4/FP8 tolerances, the FP4 cosine-distance gate, the `-inf`
+mask, exact schedule metadata against a scalar specification of the DeepGEMM schedule) on
+a non-default stream and under changed-input graph replay; DeepGEMM is used as an
+additional oracle when its build exposes the dense MQA logits API. The test skips on devices without catalogued
+programs.

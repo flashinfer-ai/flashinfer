@@ -33,9 +33,10 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
 * `indices [T, topk]` int32 (any row stride) hold **global** key rows; `-1` or `>= S` marks an
   invalid slot anywhere in the row; `topk_length [T]` int32 optionally
   invalidates slots `>= topk_length[t]`; any positive `topk`.  Without
-  `topk_length` the public entries derive the per-row length once per step
-  (last valid slot + 1, on device) so the kernels skip the trailing invalid key
-  blocks of short rows; the results are those of the full row.
+  `topk_length` the forward kernel derives each row's length (last valid slot
+  + 1) itself while it runs and the training entry hands that vector to the
+  backward, so both skip the trailing invalid key blocks of short rows; the
+  results are those of the full row.
 * The varlen form takes per-document indices (`gather_kv_indices`, relative
   to `cu_seqlens_k[d]`) and offsets them on device before the flat kernels
   run (one glue pass that also yields the per-row lengths).  `cu_seqlens_q`
@@ -138,8 +139,28 @@ context-parallel window):
   that does not accumulate passes inert placeholders with `accumulate = 0`.
   The eager plan cache keys the backward on the geometry (shape, strides,
   dtype, device, alignment) of `dkv_acc` and `dkv_dst_map` as well -- the row
-  stride and the presence of a map are launch constants of the cast -- and the
-  caller's buffer and map are re-supplied per call.
+  stride and the presence of a map are launch constants of the accumulating
+  launch -- and the caller's buffer and map are re-supplied per call.
+
+#### Direct accumulation from the main stage
+
+A program may register natural-layout variants of the main stage
+(`bwd_main_natural`, and `bwd_main_pass_natural` next to the key-range-pass
+form): the same kernel traced with a drain that transposes each key's FP32
+contributions across lanes and `red.global.add`s them at their natural
+position straight into the caller's packed rows (`dkv_acc` through
+`dkv_dst_map`).  Such a binding has no FP32 accumulators, no zero fill and no
+`bwd_cast` launch (`dsa_train_workspace_size(..., dkv_acc=True)` is smaller by
+`S * 2304` B, the runner's `dkv_direct` is set).  The lane transpose costs the
+reduce-bound rows per tile, and only rows with many keys per query token pay
+it back (B200 backward: `S / T >= 16` 0.5-4 % faster, `S = T` 3.7 % slower), so
+the host takes the direct path by the size rule the record carries
+(`dkv_direct`: `min_keys_per_query`, 4 -- direct iff `S >= 4 T`) whenever
+`dkv_acc` is given; `FLASHINFER_CAKE_DSA_DKV_DIRECT=1` / `=0` forces or
+disables it (`auto` = the rule; the value is part of the binding key).  Both
+paths add the same FP32 contributions into the same rows in another summation
+order; dq is bitwise the same.  Without the natural stages every `dkv_acc`
+call takes the cast's accumulate path.
 
 Explicit forward / backward entry points without autograd, a prepared
 allocation-free runner (`prepare_dsa_train`, CUDA-graph capturable) and the
@@ -158,7 +179,9 @@ untouched.  The bindings encode the tensor maps by value, so a step is its
 kernels -- one launch for the forward; three for the single-pass backward
 (`bwd_delta`, `bwd_main`, `bwd_cast`); `2 + 2 x passes` for the key-range-pass
 backward (`bwd_delta`, then `bwd_main_pass` + `bwd_compact` per pass, `bwd_cast`)
--- plus the two fills of the FP32 dK/dV accumulators.  A call without query rows
+-- plus the two fills of the FP32 dK/dV accumulators; a direct binding (see
+"Direct accumulation from the main stage") launches the natural-layout variant
+of the main stage instead and has neither the fills nor the cast.  A call without query rows
 (`T == 0`) returns empty outputs and zero gradients without launching; `S == 0`
 is rejected.
 
@@ -195,9 +218,16 @@ graph (`benchmarks/bench_cake_dsa_train.py --host-us` reports both; `--host-call
   `[S, 64]` BF16 outputs (or FP32 in the `dkv_fp32` mode), or adds them into
   the caller's packed FP32 rows through the optional destination-row map
   (`dkv_acc` / `dkv_dst_map`).
+* `bwd_main_natural` / `bwd_main_pass_natural`: the main stage (single-pass /
+  pass form) whose reduce warps add straight into the caller's packed FP32
+  rows (see "Direct accumulation from the main stage"); selected instead of
+  `bwd_main` / `bwd_main_pass` for a `dkv_acc` binding that meets the record's
+  size rule, with no `bwd_cast` afterwards.  The reduce traffic of every main
+  stage carries an L2 `evict_last` policy for the accumulator lines.
 
 Launch grids are functions of the problem scalars in `cake_launch.py`
-(`num_queries` CTAs for `fwd`, `bwd_main` and `bwd_main_pass`,
+(`num_queries` CTAs for `fwd`, `bwd_main`, `bwd_main_pass` and their
+natural-layout variants,
 `num_queries * 8` for `bwd_delta`, `ceil(num_queries / 4)` for `bwd_compact`,
 `ceil(num_kv * 18 / 256)` for `bwd_cast`).
 
@@ -210,12 +240,15 @@ disjoint key ranges (`R = ceil(S / P)` keys each), so that the accumulator
 slice one pass touches stays L2-resident: `bwd_delta`, then per pass
 `bwd_compact` + `bwd_main_pass` over the whole row, then `bwd_cast`.  The
 policy the record carries (`key_pass_policy`: L2 budget 100 MiB, 2304 B per
-key, workspace budget 640 MiB, token chunk multiple 128) takes the pass path
-only when `P > 1` and the whole row fits the pass workspace budget
-(`T <= 4224` tokens at top-k 2048; there is no token chunking); otherwise the
-single-pass `bwd_main` runs unchanged.  At top-k 2048 that is `T <= 4224` and
-`S >= 45,512`: two passes at `S = 65,536`, three at `131,072`; 4k x 4k rows
-and 32k-token rows stay single-pass.  The passes split the whole key row
+key, workspace budget 640 MiB, token chunk multiple 128, at most
+`max_passes = 4` passes) takes the pass path only when `1 < P <= 4` and the
+whole row fits the pass workspace budget (`T <= 4224` tokens at top-k 2048;
+there is no token chunking); otherwise the single-pass `bwd_main` runs
+unchanged.  At top-k 2048 that is `T <= 4224` and `45,512 <= S <= 182,044`:
+two passes at `S = 65,536`, three at `131,072`, four up to `182,044`; beyond
+that (five passes and more) the per-pass FP32 dQ-partial round trip and
+pipeline fill outweigh the L2 benefit, so `S = 225,280` or `267,520` rows run
+one pass; 4k x 4k rows and 32k-token rows stay single-pass.  The passes split the whole key row
 into equal ranges, which matches an index row whose keys spread over the whole
 row (one document); in a packed multi-segment row every token's keys lie
 inside its own segment, so the policy applies to one-segment rows only
@@ -242,7 +275,8 @@ pass stages serves the single pass only.
 * `cake_backend.py` -- validation, workspace layout, varlen index offsetting,
   the prepared runner, the autograd `Function` and the eager entry points.
 * `csrc/cake_dsa_h64_train/` -- generated kernel and binding translation units:
-  six pairs, one per stage, shared by `sm_100a`, `sm_103a` and `sm_107a` and
+  eight pairs, one per stage (the main stage and its key-range-pass form each
+  with a natural-layout variant), shared by `sm_100a`, `sm_103a` and `sm_107a` and
   compiled once per architecture (`.clang-format` disables formatting: the sources are
   identity-checked by the registry's closure digests).
 
@@ -250,8 +284,9 @@ pass stages serves the single pass only.
 
 The registry holds one program for `sm_100a`, `sm_103a` and `sm_107a` with the forward,
 backward preprocess, backward main (single-pass and key-range-pass form with
-its compaction) and cast stages plus the key-range-pass policy, exported from
-the kernel snapshot named in the pull request.
+its compaction, each with its natural-layout direct-accumulation variant) and
+cast stages plus the key-range-pass and direct-accumulation policies, exported
+from the kernel snapshot named in the pull request.
 
 Tests: `tests/experimental/test_cake_dsa_train.py` (skips without a registered
 program or a compute capability 10.0 / 10.3 / 10.7 device).  Benchmark:

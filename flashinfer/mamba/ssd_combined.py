@@ -851,7 +851,7 @@ class _SSDCombinedRunnerConfig:
     backend: str
 
 
-@functools.cache
+@functools.lru_cache(maxsize=64)
 def _get_ssd_combined_runner(
     device_index: int,
     cuda_stream: int,
@@ -861,7 +861,9 @@ def _get_ssd_combined_runner(
 
     # ``cuda_stream`` participates in the cache key even though construction
     # itself only needs the device. Runner workspaces are mutable, so sharing
-    # one across concurrently active streams would make reuse unsafe.
+    # one across concurrently active streams would make reuse unsafe. Streams
+    # are created and destroyed over a process lifetime, so the cache is
+    # bounded; an evicted runner is rebuilt on its next call.
     with torch.cuda.device(device_index):
         return SSDCombined(
             config.chunk_size,

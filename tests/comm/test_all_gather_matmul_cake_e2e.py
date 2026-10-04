@@ -1,5 +1,23 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Multi-GPU numerical test of the Cake all-gather matmul backend on an NCCL
+subgroup of two, four or eight SM100 / SM103 devices.
+"""
+
 import gc
-import importlib
 import random
 import weakref
 
@@ -11,6 +29,16 @@ import torch.multiprocessing as mp
 
 from flashinfer.comm import all_gather_matmul, prepare_all_gather_matmul
 from flashinfer.utils import get_compute_capability
+
+PACKED_QKV_N_BY_WORLD_SIZE = {4: 2560, 8: 1280}
+
+
+def _expected(inp, weight, group, world_size):
+    gathered = torch.empty(
+        world_size * inp.shape[0], inp.shape[1], dtype=inp.dtype, device=inp.device
+    )
+    dist.all_gather_into_tensor(gathered, inp, group=group)
+    return (gathered.float() @ weight.float()).to(inp.dtype)
 
 
 def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype):
@@ -28,57 +56,11 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     symm_mem.enable_symm_mem_for_group(group.group_name)
     torch.manual_seed(41 + rank)
     rows = 384
-    inp = symm_mem.empty(rows, 8192, dtype=dtype, device=device).normal_()
+    inp = torch.randn(rows, 8192, dtype=dtype, device=device)
     weight = torch.randn(8192, 2048, dtype=dtype, device=device)
+    expected = _expected(inp, weight, group, world_size)
 
-    gathered = torch.empty(world_size * rows, 8192, dtype=dtype, device=device)
-    dist.all_gather_into_tensor(gathered, inp, group=group)
-    expected = gathered @ weight
-
-    if (
-        world_size == 8
-        and dtype == torch.bfloat16
-        and get_compute_capability(device) in ((10, 0), (10, 3))
-    ):
-        packed_rows = 512
-        packed_weight = torch.randn(8192, 1280, dtype=dtype, device=device)
-        active_inp = symm_mem.empty(
-            packed_rows, 8192, dtype=dtype, device=device
-        ).normal_()
-        packed_gathered = torch.empty(
-            world_size * packed_rows, 8192, dtype=dtype, device=device
-        )
-        dist.all_gather_into_tensor(packed_gathered, active_inp, group=group)
-        packed_expected = packed_gathered @ packed_weight
-        packed_launcher = prepare_all_gather_matmul(
-            active_inp, packed_weight, group, backend="cake"
-        )
-        packed_stream = torch.cuda.Stream(device=device)
-        packed_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(packed_stream):
-            packed_first = packed_launcher(active_inp)
-            packed_first_snapshot = packed_first.clone()
-            active_inp.neg_()
-            packed_second = packed_launcher(active_inp)
-        torch.cuda.current_stream(device).wait_stream(packed_stream)
-        assert packed_first.data_ptr() != packed_second.data_ptr()
-        torch.testing.assert_close(packed_first, packed_first_snapshot, atol=0, rtol=0)
-        torch.testing.assert_close(packed_first, packed_expected, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(
-            packed_second, -packed_expected, atol=1e-2, rtol=1e-2
-        )
-        del (
-            active_inp,
-            packed_expected,
-            packed_first,
-            packed_first_snapshot,
-            packed_gathered,
-            packed_launcher,
-            packed_second,
-            packed_stream,
-            packed_weight,
-        )
-
+    # Two consecutive calls return fresh outputs and the first is not overwritten.
     first = all_gather_matmul(inp, weight, group, backend="cake")
     torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
     first_snapshot = first.clone()
@@ -87,127 +69,70 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     torch.testing.assert_close(first, first_snapshot, atol=0, rtol=0)
     torch.testing.assert_close(second, expected, atol=1e-2, rtol=1e-2)
 
-    backend = importlib.import_module(
-        "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
+    # The backend callable writes a caller-provided output in place; a strided
+    # input is rejected, not copied.
+    from flashinfer.comm.all_gather_matmul.cake_all_gather_matmul import (
+        all_gather_matmul_cake,
     )
-    assert (
-        sum(
-            len(workspace.descriptor_cache)
-            for workspace in backend._WORKSPACES.values()
-        )
-        == 1
+
+    out = torch.full(
+        (world_size * rows, 2048), float("nan"), dtype=dtype, device=device
     )
+    assert all_gather_matmul_cake(inp, weight, group, backend="cake", out=out) is out
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+    with pytest.raises(ValueError, match="contiguous"):
+        all_gather_matmul(inp.t().contiguous().t(), weight, group, backend="cake")
+
+    # The backend keeps no reference to the caller's tensors.
     inp_ref = weakref.ref(inp)
     weight_ref = weakref.ref(weight)
     torch.cuda.synchronize(device)
-    del first, first_snapshot, second, expected, gathered, inp, weight
+    del first, first_snapshot, second, expected, out, inp, weight
     gc.collect()
     assert inp_ref() is None
     assert weight_ref() is None
 
-    for workspace in backend._WORKSPACES.values():
-        workspace.descriptor_cache.clear()
-    backend._DESCRIPTOR_CACHE_MAX_ENTRIES = 1
-
+    # A different input on another stream reuses the same symmetric scratch.
     producer_stream = torch.cuda.Stream(device=device)
-    owner_stream = torch.cuda.Stream(device=device)
-    cached_use_stream = torch.cuda.Stream(device=device)
     torch.manual_seed(141 + rank)
     with torch.cuda.stream(producer_stream):
         inp = torch.randn(rows, 8192, dtype=dtype, device=device)
         weight = torch.randn(8192, 2048, dtype=dtype, device=device)
-        gathered = torch.empty(world_size * rows, 8192, dtype=dtype, device=device)
-        dist.all_gather_into_tensor(gathered, inp, group=group)
-        expected = gathered @ weight
-    owner_stream.wait_stream(producer_stream)
-    cold_miss_gate = torch.cuda.Event(enable_timing=False)
-    with torch.cuda.stream(owner_stream):
-        torch.cuda._sleep(2_000_000_000)
-        cold_miss_gate.record()
-        ordinary = all_gather_matmul(inp, weight, group, backend="cake")
-    assert not cold_miss_gate.query()
-    pinned_descriptor_churn = [
-        torch.empty(384, dtype=torch.uint8, device="cpu", pin_memory=True).fill_(index)
-        for index in range(32)
-    ]
-    torch.cuda.current_stream(device).wait_stream(owner_stream)
-    torch.testing.assert_close(ordinary, expected, atol=1e-2, rtol=1e-2)
-
-    descriptor_caches = [
-        workspace.descriptor_cache for workspace in backend._WORKSPACES.values()
-    ]
-    assert sum(len(cache) for cache in descriptor_caches) == 1
-    descriptor_cache = next(cache for cache in descriptor_caches if cache)
-    descriptor_ptr = next(iter(descriptor_cache.values())).data_ptr()
-
-    cached_use_stream.wait_stream(producer_stream)
-    cached_use_complete = torch.cuda.Event(enable_timing=False)
-    with torch.cuda.stream(cached_use_stream):
-        torch.cuda._sleep(2_000_000_000)
-        cached = all_gather_matmul(inp, weight, group, backend="cake")
-        cached_use_complete.record()
-    assert not cached_use_complete.query()
-
-    input_ptr = inp.data_ptr()
-    weight_ptr = weight.data_ptr()
-    inp_ref = weakref.ref(inp)
-    weight_ref = weakref.ref(weight)
-    del inp, weight, gathered, ordinary
-    assert inp_ref() is None
-    assert weight_ref() is None
-
-    with torch.cuda.stream(producer_stream):
-        replacement_inp = torch.empty(rows, 8192, dtype=dtype, device=device).normal_()
-        replacement_weight = torch.empty(
-            8192, 2048, dtype=dtype, device=device
-        ).normal_()
-        replacement_gathered = torch.empty(
-            world_size * rows, 8192, dtype=dtype, device=device
-        )
-        dist.all_gather_into_tensor(replacement_gathered, replacement_inp, group=group)
-        replacement_expected = replacement_gathered @ replacement_weight
-    assert replacement_inp.data_ptr() != input_ptr
-    assert replacement_weight.data_ptr() != weight_ptr
-
-    eviction_stream = torch.cuda.Stream(device=device)
-    eviction_stream.wait_stream(producer_stream)
-    with torch.cuda.stream(eviction_stream):
-        replacement = all_gather_matmul(
-            replacement_inp, replacement_weight, group, backend="cake"
-        )
-    assert sum(len(cache) for cache in descriptor_caches) == 1
-    assert all(
-        descriptor.data_ptr() != descriptor_ptr
-        for cache in descriptor_caches
-        for descriptor in cache.values()
-    )
-    assert not cached_use_complete.query()
-
-    with torch.cuda.stream(owner_stream):
-        descriptor_churn = [
-            torch.empty(384, dtype=torch.uint8, device=device) for _ in range(32)
-        ]
-    assert descriptor_ptr not in {tensor.data_ptr() for tensor in descriptor_churn}
-
-    torch.cuda.current_stream(device).wait_stream(cached_use_stream)
+        expected = _expected(inp, weight, group, world_size)
+        result = all_gather_matmul(inp, weight, group, backend="cake")
     torch.cuda.current_stream(device).wait_stream(producer_stream)
-    torch.cuda.current_stream(device).wait_stream(owner_stream)
-    torch.cuda.current_stream(device).wait_stream(eviction_stream)
-    torch.testing.assert_close(cached, expected, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(replacement, replacement_expected, atol=1e-2, rtol=1e-2)
-    del (
-        cached,
-        expected,
-        replacement,
-        replacement_expected,
-        replacement_gathered,
-        replacement_inp,
-        replacement_weight,
-        descriptor_churn,
-        pinned_descriptor_churn,
-    )
-    gc.collect()
+    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+    del inp, weight, expected, result
 
+    packed_n = PACKED_QKV_N_BY_WORLD_SIZE.get(world_size)
+    capability = get_compute_capability(device)
+    packed_routed = packed_n is not None and (world_size == 8 or capability == (10, 3))
+    if packed_routed and dtype == torch.bfloat16:
+        packed_rows = 512
+        packed_weight = torch.randn(8192, packed_n, dtype=dtype, device=device)
+        active_inp = torch.randn(packed_rows, 8192, dtype=dtype, device=device)
+        packed_expected = _expected(active_inp, packed_weight, group, world_size)
+        launcher = prepare_all_gather_matmul(
+            active_inp, packed_weight, group, backend="cake"
+        )
+        packed_stream = torch.cuda.Stream(device=device)
+        packed_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(packed_stream):
+            packed_first = launcher(active_inp)
+            packed_first_snapshot = packed_first.clone()
+            active_inp.neg_()
+            packed_second = launcher(active_inp)
+        torch.cuda.current_stream(device).wait_stream(packed_stream)
+        assert packed_first.data_ptr() != packed_second.data_ptr()
+        torch.testing.assert_close(packed_first, packed_first_snapshot, atol=0, rtol=0)
+        torch.testing.assert_close(packed_first, packed_expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            packed_second, -packed_expected, atol=1e-2, rtol=1e-2
+        )
+        with pytest.raises(ValueError, match="shape"):
+            launcher(torch.randn(packed_rows * 2, 8192, dtype=dtype, device=device))
+
+    torch.cuda.synchronize(device)
     dist.destroy_process_group(group)
     dist.destroy_process_group()
 
