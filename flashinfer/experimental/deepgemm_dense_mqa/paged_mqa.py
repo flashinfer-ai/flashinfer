@@ -151,8 +151,10 @@ def logits_bindings(
     ``[B * next_n * H, 128]`` u8, the fused cache as its byte rows ``[pages,
     block_kv * 132]`` with the FP32 scale tail aliased as ``[pages,
     block_kv * 33]`` f32, weights, logits, flattened context lengths, the
-    block table as a flat view with its row stride, the metadata, and the
-    scalar geometry.
+    block table as a flat view with its row stride, the metadata, the scalar
+    geometry, and the CTA budget ``num_sms`` (the logits program partitions the
+    (request, KV split) walk over this many CTAs in-kernel, so it is both the
+    launch grid and a kernel argument).
     """
     import torch
 
@@ -176,6 +178,7 @@ def logits_bindings(
         max_context_len=int(output.shape[1]),
         stride_logits=int(output.stride(0)),
         block_table_stride=int(block_table.stride(0)),
+        num_sms=int(num_sms),
         grid_x=int(num_sms),
         grid_y=1,
         grid_z=1,
