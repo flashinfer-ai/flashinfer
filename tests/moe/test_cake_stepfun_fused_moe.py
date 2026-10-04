@@ -164,6 +164,8 @@ KNOWN_NATIVE_FALLBACK: set[tuple[str, int]] = set()
 
 # Rows whose FC1 tile candidates all have a bitwise Cake twin (bf16, per-tensor fp8 and mxfp8
 # reproduce the native FC1 twin bit for bit; nvfp4 does not and is checked by tolerance).
+# fp8 tile 64: bitwise at one tile per expert (T=512); <= 1 e4m3 ulp when an expert spans several
+# tiles (T=2048, measured 0.25 at magnitude 4-8), so that row is covered by the tolerance test only.
 BITWISE_ROWS = [
     ("bf16", 8),
     ("bf16", 64),
@@ -172,7 +174,6 @@ BITWISE_ROWS = [
     ("fp8", 8),
     ("fp8", 64),
     ("fp8", 512),
-    ("fp8", 2048),
     ("mxfp8", 8),
     ("mxfp8", 512),
     ("mxfp8", 2048),
