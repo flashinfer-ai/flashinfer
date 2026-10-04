@@ -838,6 +838,8 @@ def autotune(
     round_up: bool | None = None,
     skip_ops: str | set[str] | None = None,
     cuda_graph_profile_replays: int | None = None,
+    *,
+    moe_search_strategy: str | None = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -910,10 +912,18 @@ def autotune(
             operations configured with ``use_cold_l2_cache=True`` flush L2
             before every replay. ``None`` inherits the enclosing context or
             each operation's ``TuningConfig`` value.
+        moe_search_strategy: Strategy for uncached ordinary MoE searches only.
+            ``None`` inherits an enclosing context, defaulting to
+            ``"exhaustive"``. ``"factorized"`` opts into a bounded search;
+            unsupported metadata or filtered tactic spaces use exhaustive
+            fallback. Existing cached tactic entries remain valid under either
+            strategy. All distributed tuning participants must set the same
+            strategy.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty.
         ValueError: If ``cuda_graph_profile_replays`` is less than one.
+        ValueError: If ``moe_search_strategy`` is not a supported strategy.
 
     .. rubric:: Edge-case behaviour
 
@@ -974,6 +984,10 @@ def autotune(
         with autotune(True, cuda_graph_profile_replays=20):
             model(inputs)
     """
+    if moe_search_strategy not in (None, "exhaustive", "factorized"):
+        raise ValueError(
+            "moe_search_strategy must be None, 'exhaustive', or 'factorized'"
+        )
     tuner = AutoTuner.get()
 
     if tuning_buckets is not None and len(tuning_buckets) == 0:
@@ -1033,6 +1047,13 @@ def autotune(
     if pushed:
         override_stack.append((new_buckets, new_round_up, new_profile_replays))
 
+    moe_search_stack = tuner._get_moe_search_stack()
+    moe_search_stack.append(
+        moe_search_strategy
+        if moe_search_strategy is not None
+        else tuner._effective_moe_search_strategy
+    )
+
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
     # autotune(False) context overlaps on another thread.
@@ -1046,6 +1067,7 @@ def autotune(
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process starts ...")
     except BaseException:
+        moe_search_stack.pop()
         if pushed:
             override_stack.pop()
         if skip_ops is not None:
@@ -1061,6 +1083,7 @@ def autotune(
             tuner.is_tuning_mode = tuner._active_tuning_contexts > 0
 
         # Pop the overrides we pushed (thread-local, no lock needed).
+        moe_search_stack.pop()
         if pushed:
             override_stack.pop()
         if skip_ops is not None:
@@ -1483,6 +1506,7 @@ OverrideStack: TypeAlias = list[Override]
 
 class _OverrideLocal(threading.local):
     stack: OverrideStack
+    moe_search_stack: list[str]
 
 
 class _SkipOpsLocal(threading.local):
@@ -1697,6 +1721,19 @@ class AutoTuner:
         if not hasattr(local, "stack"):
             local.stack = OverrideStack()
         return local.stack
+
+    def _get_moe_search_stack(self) -> list[str]:
+        """Return this thread's MoE search strategies, separate from overrides."""
+        local = self._override_local
+        if not hasattr(local, "moe_search_stack"):
+            local.moe_search_stack = []
+        return local.moe_search_stack
+
+    @property
+    def _effective_moe_search_strategy(self) -> str:
+        """Inherit the enclosing strategy, using exhaustive outside contexts."""
+        stack = self._get_moe_search_stack()
+        return stack[-1] if stack else "exhaustive"
 
     @property
     def _effective_measure_policy(self):
@@ -2449,7 +2486,8 @@ class AutoTuner:
                                 )
                                 return runners[0], -1
 
-                            for tac in valid_tactics:
+                            def profile(tac):
+                                nonlocal skipped_count
                                 try:
                                     time_measured = self._profile_single_kernel(
                                         r,
@@ -2527,6 +2565,26 @@ class AutoTuner:
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
+                                return time_measured
+
+                            if self._effective_moe_search_strategy == "factorized":
+                                from flashinfer.autotuner.moe_search import (
+                                    iter_moe_tactic_results,
+                                )
+
+                                tactic_results = iter_moe_tactic_results(
+                                    r,
+                                    tensors,
+                                    valid_tactics,
+                                    profile,
+                                    normalize=_tactic_to_json_hashable,
+                                    process_group=_tune_process_group,
+                                )
+                            else:
+                                tactic_results = (
+                                    (tac, profile(tac)) for tac in valid_tactics
+                                )
+                            for tac, time_measured in tactic_results:
                                 if time_measured < min_time:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
