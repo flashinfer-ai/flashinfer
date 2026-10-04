@@ -73,6 +73,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_S_DECAY_STRIDE 96
 #define SMEM_TOTAL 49408
 #define THREADS 288
+#define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
 
@@ -145,7 +146,8 @@ __device__ __forceinline__ void tma_4d_gmem2smem(int dst, const void* tmap_ptr, 
 
 extern "C" {
 
-__global__ __launch_bounds__(288, 4) void kernel_cake_selective_state_update_08b0852b0be22a7ed2d8(
+__global__
+__launch_bounds__(288, LAUNCH_MIN_BLOCKS) void kernel_cake_selective_state_update_f79b459e051a3762d2f5(
     const __grid_constant__ CUtensorMap state_tma, const __grid_constant__ CUtensorMap x_tma,
     const __grid_constant__ CUtensorMap b_tma, const __grid_constant__ CUtensorMap c_tma,
     float* __restrict__ dt, float* __restrict__ A, float* __restrict__ D,

@@ -116,6 +116,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #ifndef C_STEP_STRIDE
 #error "C_STEP_STRIDE is a downstream specialization of this program; define it on the compile line"
 #endif
+#define LAUNCH_MIN_BLOCKS 7
 
 #include <math_constants.h>
 
@@ -132,7 +133,8 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 7) void kernel_cake_selective_state_update_4ececa3a791410c1bb3a(
+__global__
+__launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_selective_state_update_da654c98ebe8c52ad280(
     __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ output,
     __nv_bfloat16* __restrict__ intermediate_state, unsigned long long dt_addr,
