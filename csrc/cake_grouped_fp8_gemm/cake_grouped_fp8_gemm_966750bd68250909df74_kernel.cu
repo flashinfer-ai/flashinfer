@@ -50,11 +50,12 @@
 #define SMEM_SMEM_BSCALE_STRIDE 16
 #define SMEM_TOTAL 231680
 #define THREADS 384
+#define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) void
-kernel_cake_grouped_fp8_gemm_4cb684af9950c96d43f1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, const __grid_constant__ CUtensorMap a_scale, const __grid_constant__ CUtensorMap b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
+kernel_cake_grouped_fp8_gemm_966750bd68250909df74(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, const __grid_constant__ CUtensorMap a_scale, const __grid_constant__ CUtensorMap b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

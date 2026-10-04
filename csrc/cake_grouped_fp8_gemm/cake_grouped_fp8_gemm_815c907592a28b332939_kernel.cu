@@ -48,7 +48,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(384) void
-kernel_cake_grouped_fp8_gemm_f1969b1c8be8317cb028(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
+kernel_cake_grouped_fp8_gemm_815c907592a28b332939(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -251,10 +251,17 @@ kernel_cake_grouped_fp8_gemm_f1969b1c8be8317cb028(const __grid_constant__ CUtens
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         float h_first_b_s = smem_bscale[s_stage * 4 + (unsigned int)epi_wg];
                         float h_first_combined = a_s * h_first_b_s;
+                        #if __CUDA_ARCH__ >= 1000
                         const float2 _scale2_1 = {h_first_combined, h_first_combined};
                         #pragma unroll
                         for (int _ls = 0; _ls < 16; _ls++)
                             reinterpret_cast<float2*>(_tmem_load_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(_tmem_load_0)[_ls], _scale2_1);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            _tmem_load_0[_ls] = _tmem_load_0[_ls] * h_first_combined;
+                        }
+                        #endif
                         uint32_t _tmem_load_0_bf16[16];
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
@@ -279,10 +286,17 @@ kernel_cake_grouped_fp8_gemm_f1969b1c8be8317cb028(const __grid_constant__ CUtens
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             float h_b_s = smem_bscale[s_stage * 4 + (unsigned int)epi_wg + (unsigned int)(h_sub / 4)];
                             float h_combined = a_s * h_b_s;
+                            #if __CUDA_ARCH__ >= 1000
                             const float2 _scale2_2 = {h_combined, h_combined};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
                                 reinterpret_cast<float2*>(_tmem_load_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_2);
+                            #else
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 32; _ls++) {
+                                _tmem_load_1[_ls] = _tmem_load_1[_ls] * h_combined;
+                            }
+                            #endif
                             uint32_t _tmem_load_1_bf16[16];
                             #pragma unroll
                             for (int _lp = 0; _lp < 16; _lp++) {
@@ -309,10 +323,17 @@ kernel_cake_grouped_fp8_gemm_f1969b1c8be8317cb028(const __grid_constant__ CUtens
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             float b_s = smem_bscale[s_stage * 4 + (unsigned int)epi_wg + (unsigned int)(sub / 4)];
                             float combined = a_s * b_s;
+                            #if __CUDA_ARCH__ >= 1000
                             const float2 _scale2_3 = {combined, combined};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
                                 reinterpret_cast<float2*>(_tmem_load_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_3);
+                            #else
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 32; _ls++) {
+                                _tmem_load_2[_ls] = _tmem_load_2[_ls] * combined;
+                            }
+                            #endif
                             if (row >= run_begin) {
                                 if (row < run_end) {
                                     long long output_row = m_tile * 128 + row;

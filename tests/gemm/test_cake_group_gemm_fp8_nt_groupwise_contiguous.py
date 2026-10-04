@@ -12,8 +12,14 @@ from flashinfer.gemm import (
     prepare_group_gemm_fp8_nt_groupwise_contiguous,
 )
 from flashinfer.gemm.cake_grouped_fp8_gemm import (
+    BS_N128_ROUTE,
+    BS_N128_RUN32_ROUTE,
+    BS_N256_ROUTE,
+    BS_N256_RUN32_ROUTE,
+    BS_ROUTES,
     DEEPK_CG2_FOUR_LOAD_GRID128_ROUTE,
     DEEPK_CG2_RECURRENCE_ROUTE,
+    bs_route_for_shape,
     is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available,
     launch_plan,
 )
@@ -109,6 +115,121 @@ def _random_token_counts(rng, total, groups):
     cuts = sorted(rng.randint(0, total) for _ in range(groups - 1))
     bounds = [0, *cuts, total]
     return [bounds[i + 1] - bounds[i] for i in range(groups)]
+
+
+# --- block-scaled family (packed UE8M0 scales, compact layout) -----------------
+
+
+def _pack_ue8m0_mn_major(scale):
+    """DeepGEMM's packed activation-scale layout: ``(rows, ceil(k/4))`` int32, stride ``(1, rows)``."""
+    rows, k = scale.shape
+    exponents = (scale.contiguous().view(torch.int32) >> 23).to(torch.uint8)
+    cols = -(-k // 4)
+    padded = torch.zeros((rows, 4 * cols), dtype=torch.uint8, device=scale.device)
+    padded[:, :k] = exponents
+    packed = torch.empty((cols, rows), dtype=torch.int32, device=scale.device).mT
+    packed.copy_(padded.view(torch.int32))
+    return packed
+
+
+def _pack_ue8m0_row_repeated(scale):
+    """sglang's ``transform_scale_ue8m0`` weight layout: ``(G, N, ceil(k/4))`` int32, stride ``(N*cols, 1, N)``."""
+    groups, n_blocks, k = scale.shape
+    exponents = (
+        (scale.contiguous().view(torch.int32) >> 23)
+        .to(torch.uint8)
+        .reshape(groups * n_blocks, k)
+    )
+    cols = -(-k // 4)
+    padded = torch.zeros(
+        (groups * n_blocks, 4 * cols), dtype=torch.uint8, device=scale.device
+    )
+    padded[:, :k] = exponents
+    words = (
+        padded.view(torch.int32)
+        .view(groups, n_blocks, cols)
+        .repeat_interleave(128, dim=1)
+    )
+    packed = torch.empty(
+        (groups, cols, n_blocks * 128), dtype=torch.int32, device=scale.device
+    ).permute(0, 2, 1)
+    packed.copy_(words)
+    return packed
+
+
+def _compact_layout(group_counts, alignment, device, *, tail=True):
+    """``m_indices`` of the compact MoE layout: each expert's rows then -1 padding to ``alignment``,
+    plus the engine's ``G * (alignment - 1)`` tail rounded up to 128 rows."""
+    pieces = []
+    for g, count in enumerate(group_counts):
+        padded = -(-count // alignment) * alignment
+        if count:
+            pieces.append(torch.full((count,), g, dtype=torch.int32))
+        if padded > count:
+            pieces.append(torch.full((padded - count,), -1, dtype=torch.int32))
+    m_indices = torch.cat(pieces)
+    total = int(m_indices.numel())
+    if tail:
+        total = max(total, sum(group_counts) + len(group_counts) * (alignment - 1))
+    total = -(-total // 128) * 128
+    if total > m_indices.numel():
+        m_indices = torch.cat(
+            [m_indices, torch.full((total - m_indices.numel(),), -1, dtype=torch.int32)]
+        )
+    return m_indices.to(device).contiguous()
+
+
+def _make_block_scaled_inputs(
+    group_counts, n, k, *, alignment, seed, device, weight_rows_repeated=True
+):
+    """FP8 operands with power-of-two scales delivered as packed UE8M0 words on the compact layout."""
+    m_indices = _compact_layout(group_counts, alignment, device)
+    m = int(m_indices.numel())
+    groups = len(group_counts)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    a = torch.randn((m, k), generator=generator, device=device).to(torch.float8_e4m3fn)
+    b = torch.randn((groups, n, k), generator=generator, device=device).to(
+        torch.float8_e4m3fn
+    )
+    a_scale = torch.pow(
+        2.0,
+        torch.randint(-8, 1, (m, k // 128), generator=generator, device=device).float(),
+    )
+    b_scale = torch.pow(
+        2.0,
+        torch.randint(
+            -8, 1, (groups, n // 128, k // 128), generator=generator, device=device
+        ).float(),
+    )
+    a_packed = _pack_ue8m0_mn_major(a_scale)
+    if weight_rows_repeated:
+        b_packed = _pack_ue8m0_row_repeated(b_scale)
+    else:
+        b_packed = (
+            _pack_ue8m0_mn_major(b_scale.reshape(-1, k // 128))
+            .contiguous()
+            .view(groups, n // 128, -1)
+        )
+    return a, b, a_scale, b_scale, a_packed, b_packed, m_indices
+
+
+def _assert_block_scaled(out, expected, m_indices):
+    """Routed rows match the reference; padding is skipped per 32-row sub-block.
+
+    Every row of a 32-row sub-block whose leading ``m_indices`` entry is ``-1`` stays
+    untouched (NaN-filled before the launch); ``-1`` rows sharing a sub-block with
+    routed rows hold finite values of no meaning (DeepGEMM does the same per 128-row
+    block).
+    """
+    valid = m_indices >= 0
+    _assert_close(out[valid], expected[valid])
+    leading = m_indices.view(-1, 32)[:, :1].expand(-1, 32).reshape(-1)
+    untouched = leading < 0
+    if bool(untouched.any()):
+        assert torch.isnan(out[untouched].float()).all()
+    touched_padding = (~valid) & ~untouched
+    if bool(touched_padding.any()):
+        assert torch.isfinite(out[touched_padding].float()).all()
 
 
 # (group_counts, N, K, arbitrary_scales): small deterministic rows covering the
@@ -297,6 +418,56 @@ def test_cuda_graph_capture_of_first_launch():
     _assert_close(prepared.out, _reference(a, b, a_scale, b_scale, m_indices))
 
 
+def test_first_launch_after_queued_frees_on_a_busy_side_stream():
+    """Regression for the descriptor-upload race (sglang moe_fp8_grouped route).
+
+    An earlier runner uploaded its tensor maps with a synchronous host-to-device
+    copy into a caching-allocator block whose previous tenant's kernels were
+    still queued on the stream; the first launch then read overwritten
+    descriptors.  Tensor maps now travel by value, so a first launch (eager or
+    graph-captured) right after queued work and frees on a non-default stream
+    must match the clean result bitwise.
+    """
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        [512] * 8, 256, 1024, seed=4746, device=device
+    )
+    clean = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices
+    ).launch()
+    torch.cuda.synchronize()
+    clean = clean.clone()
+    x = torch.randn((4096, 4096), device=device, dtype=torch.bfloat16)
+    side = torch.cuda.Stream(device=device)
+    for _ in range(4):
+        with torch.cuda.stream(side):
+            junk = [
+                torch.empty(384, dtype=torch.uint8, device=device) for _ in range(8)
+            ]
+            for _ in range(8):
+                y = x @ x  # noqa: F841 queued work
+            for j in junk:
+                j.fill_(255)
+            del junk  # blocks return to the allocator with their fills still queued
+            prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+                a, b, a_scale, b_scale, m_indices
+            )
+            out = prepared.launch()  # first launch, nothing synchronized before it
+            torch.cuda.synchronize()
+            assert torch.equal(out, clean)
+            graph = torch.cuda.CUDAGraph()
+            captured = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+                a, b, a_scale, b_scale, m_indices
+            )
+            with torch.cuda.graph(graph, stream=side):
+                captured.launch()
+            captured.out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(captured.out, clean)
+            del graph, prepared, captured
+
+
 def test_re_preparing_per_step_retains_no_device_memory():
     """A new token count per step re-prepares the launch; nothing accumulates."""
     device = torch.device("cuda")
@@ -325,6 +496,261 @@ def test_re_preparing_per_step_retains_no_device_memory():
         del prepared, out, a, a_scale, m_indices
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated(device) == baseline
+
+
+def test_launch_rebinds_per_call_operands():
+    """One prepared object per layer: the token operands are swapped per call without copies."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        [200, 56, 128], 256, 1024, seed=4743, device=device
+    )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices
+    )
+    _assert_close(prepared.launch(), _reference(a, b, a_scale, b_scale, m_indices))
+    a2, _, a_scale2, _, _ = _make_inputs(
+        [200, 56, 128], 256, 1024, seed=4744, device=device
+    )
+    m_indices2 = torch.repeat_interleave(
+        torch.arange(3, dtype=torch.int32, device=device),
+        torch.tensor([64, 256, 64], dtype=torch.int64, device=device),
+    ).contiguous()
+    out2 = torch.empty_like(prepared.out)
+    result = prepared.launch(a=a2, a_scale=a_scale2, m_indices=m_indices2, out=out2)
+    assert result is out2
+    torch.cuda.synchronize()
+    _assert_close(out2, _reference(a2, b, a_scale2, b_scale, m_indices2))
+    # The prepared operands are untouched and still bound.
+    _assert_close(prepared.launch(), _reference(a, b, a_scale, b_scale, m_indices))
+    with pytest.raises(ValueError, match="a must have shape"):
+        prepared.launch(a=a2[:128].contiguous())
+    with pytest.raises(ValueError, match="alignment class"):
+        storage = torch.empty(
+            prepared.m * prepared.n + 8, dtype=torch.bfloat16, device=device
+        )
+        prepared.launch(
+            out=storage[1 : 1 + prepared.m * prepared.n].view(prepared.m, prepared.n)
+        )
+
+
+def test_fill_padding_accepts_compact_layout():
+    """-1 padding rows (compact MoE layout) are forward-filled onto the preceding expert."""
+    device = torch.device("cuda")
+    counts = [100, 128, 5]
+    padded = [128, 128, 128]
+    a, b, a_scale, b_scale, _ = _make_inputs(padded, 256, 512, seed=4745, device=device)
+    blocks = []
+    for g, (c, p) in enumerate(zip(counts, padded, strict=True)):
+        blocks.append(torch.full((c,), g, dtype=torch.int32))
+        blocks.append(torch.full((p - c,), -1, dtype=torch.int32))
+    m_indices = torch.cat(blocks).to(device).contiguous()
+    with pytest.raises(ValueError, match="fill_padding"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_scale, b_scale, m_indices, validate_indices=True
+        )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True, fill_padding=True
+    )
+    filled = torch.clamp(torch.cummax(m_indices, 0).values, min=0)
+    expected = _reference(a, b, a_scale, b_scale, filled)
+    valid = m_indices >= 0
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    _assert_close(out[valid], expected[valid])
+    # Graph capture includes the two forward-fill kernels.
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        prepared.launch()
+    out.fill_(float("nan"))
+    m_indices.copy_(
+        torch.cat([torch.full((128,), 0), torch.full((256,), 2)]).to(torch.int32)
+    )
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_close(out, _reference(a, b, a_scale, b_scale, m_indices))
+
+
+BLOCK_SCALED_CASES = [
+    # (group_counts, N, K, alignment): the compact layout at the engine's 128-row alignment
+    # (single-run schedule) and the 32/64/96-row alignments (multi-run schedule).
+    ([100, 0, 3, 128, 300, 1], 256, 512, 128),
+    ([257, 640, 3, 0, 128], 1024, 2048, 128),
+    ([5, 33, 0, 97, 32, 1, 129], 4096, 256, 128),
+    ([100, 0, 3, 69, 128, 200, 1, 64], 256, 512, 64),
+    ([5, 33, 0, 0, 97, 32, 1, 129], 1024, 256, 32),
+    ([95, 97, 2, 193, 0, 100], 384, 128, 96),
+]
+
+
+@pytest.mark.parametrize("group_counts,n,k,alignment", BLOCK_SCALED_CASES)
+def test_block_scaled_packed_scales_match_reference(group_counts, n, k, alignment):
+    """Packed UE8M0 scales select the block-scaled family: native -1 padding, in-place packed layouts."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = _make_block_scaled_inputs(
+        group_counts, n, k, alignment=alignment, seed=4750 + alignment, device=device
+    )
+    expected = _reference(a, b, a_scale, b_scale, m_indices)
+    out = torch.full(
+        (int(m_indices.numel()), n), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a,
+        b,
+        a_packed,
+        b_packed,
+        m_indices,
+        out=out,
+        validate_indices=True,
+        alignment=alignment,
+    )
+    assert prepared.route in BS_ROUTES
+    assert (prepared.route in (BS_N128_RUN32_ROUTE, BS_N256_RUN32_ROUTE)) == (
+        alignment % 128 != 0
+    )
+    prepared.launch()
+    torch.cuda.synchronize()
+    _assert_block_scaled(out, expected, m_indices)
+
+
+def test_block_scaled_accepts_block_rows_weight_scales():
+    """Weight scales may be ``(G, N//128, cols)`` instead of the row-repeated ``(G, N, cols)``."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = _make_block_scaled_inputs(
+        [130, 64, 0, 200],
+        512,
+        1024,
+        alignment=128,
+        seed=4760,
+        device=device,
+        weight_rows_repeated=False,
+    )
+    assert tuple(b_packed.shape) == (4, 4, 2)
+    out = torch.full(
+        (int(m_indices.numel()), 512), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_packed, b_packed, m_indices, out=out
+    ).launch()
+    torch.cuda.synchronize()
+    _assert_block_scaled(out, _reference(a, b, a_scale, b_scale, m_indices), m_indices)
+
+
+def test_block_scaled_launch_rebinds_token_operands_and_captures():
+    """Per-call rebinding of a / a_scale / m_indices / out (same packed layout) and CUDA-graph capture.
+
+    K=1024 gives two packed scale columns, so a row-major copy of the MN-major scales is a
+    genuinely different layout (at K<=512 the single column makes every stride contiguous).
+    """
+    device = torch.device("cuda")
+    counts = [128, 100, 0, 256]
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = _make_block_scaled_inputs(
+        counts, 1024, 1024, alignment=128, seed=4761, device=device
+    )
+    m = int(m_indices.numel())
+    out = torch.full((m, 1024), float("nan"), dtype=torch.bfloat16, device=device)
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_packed, b_packed, m_indices, out=out
+    )
+    prepared.launch()
+    torch.cuda.synchronize()
+    _assert_block_scaled(out, _reference(a, b, a_scale, b_scale, m_indices), m_indices)
+    a2, _, a_scale2, _, a_packed2, _, _ = _make_block_scaled_inputs(
+        counts, 1024, 1024, alignment=128, seed=4762, device=device
+    )
+    m_indices2 = _compact_layout([64, 200, 5, 128], 128, device)
+    assert int(m_indices2.numel()) == m
+    out2 = torch.full_like(out, float("nan"))
+    result = prepared.launch(a=a2, a_scale=a_packed2, m_indices=m_indices2, out=out2)
+    assert result is out2
+    torch.cuda.synchronize()
+    _assert_block_scaled(
+        out2, _reference(a2, b, a_scale2, b_scale, m_indices2), m_indices2
+    )
+    with pytest.raises(ValueError, match="packed layout"):
+        prepared.launch(a_scale=a_packed2.contiguous())
+    # First launch of a fresh prepared object inside a CUDA graph on a side stream.
+    out3 = torch.full_like(out, float("nan"))
+    fresh = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a2, b, a_packed2, b_packed, m_indices2, out=out3
+    )
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        fresh.launch()
+    torch.cuda.synchronize()
+    out3.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_block_scaled(
+        out3, _reference(a2, b, a_scale2, b_scale, m_indices2), m_indices2
+    )
+
+
+def test_block_scaled_route_rule():
+    """BLOCK_N 256 for short K or at least three waves of M blocks, 128 otherwise; run32 below 128-row alignment."""
+    assert (
+        bs_route_for_shape(48896, 1024, 2048, alignment=128, sm_count=152)
+        == BS_N128_ROUTE
+    )
+    assert (
+        bs_route_for_shape(65280, 1024, 2048, alignment=128, sm_count=152)
+        == BS_N256_ROUTE
+    )
+    assert (
+        bs_route_for_shape(48896, 2048, 512, alignment=128, sm_count=152)
+        == BS_N256_ROUTE
+    )
+    assert (
+        bs_route_for_shape(48896, 384, 512, alignment=128, sm_count=152)
+        == BS_N128_ROUTE
+    )
+    assert (
+        bs_route_for_shape(32512, 1024, 2048, alignment=64, sm_count=148)
+        == BS_N128_RUN32_ROUTE
+    )
+    assert (
+        bs_route_for_shape(16256, 4096, 256, alignment=32, sm_count=148)
+        == BS_N256_RUN32_ROUTE
+    )
+    for route in BS_ROUTES:
+        assert route in ROUTES or any(
+            route in table for table in ROUTES.values() if isinstance(table, dict)
+        )
+    with pytest.raises(ValueError, match="multiple of 32"):
+        bs_route_for_shape(4096, 1024, 2048, alignment=48, sm_count=148)
+
+
+def test_block_scaled_rejects_invalid_inputs():
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = _make_block_scaled_inputs(
+        [128, 64], 256, 512, alignment=128, seed=4763, device=device
+    )
+    with pytest.raises(ValueError, match="fill_padding"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, b_packed, m_indices, fill_padding=True
+        )
+    with pytest.raises(ValueError, match="packed int32 b_scale|int32 tensor"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, b_scale, m_indices
+        )
+    with pytest.raises(ValueError, match="multiple of 32"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, b_packed, m_indices, alignment=100
+        )
+    with pytest.raises(ValueError, match="16-byte-aligned output"):
+        storage = torch.empty(
+            int(m_indices.numel()) * 256 + 8, dtype=torch.bfloat16, device=device
+        )
+        prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a,
+            b,
+            a_packed,
+            b_packed,
+            m_indices,
+            out=storage[1 : 1 + int(m_indices.numel()) * 256].view(-1, 256),
+        )
 
 
 def test_launch_plan_below_128_ctas_uses_a_registered_route():
