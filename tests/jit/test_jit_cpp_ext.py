@@ -1,4 +1,6 @@
+import re
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -408,3 +410,129 @@ def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     assert ("batch", "fa3", 512, 512) not in calls
     assert ("single", "fa2", 512, 512) in calls
     assert ("batch", "fa2", 512, 512) in calls
+
+
+# ---------------------------------------------------------------------------
+# Object-naming consistency: ninja build vs get_object_paths() vs
+# get_compile_commands() must all agree on where objects land.
+# ---------------------------------------------------------------------------
+
+
+def _ninja_object_paths(ninja_content: str) -> list[str]:
+    return [
+        m.group(1)
+        for line in ninja_content.splitlines()
+        if (m := re.match(r"^build (\S+): (compile|cuda_compile) ", line))
+    ]
+
+
+def _compile_command_outputs(compile_commands: list[dict]) -> list[str]:
+    outputs = []
+    for entry in compile_commands:
+        parts = entry["command"].split()
+        outputs.append(parts[parts.index("-o") + 1])
+    return outputs
+
+
+def _resolve_all(paths) -> list[str]:
+    return sorted(str(Path(p).resolve()) for p in paths)
+
+
+def _make_spec(tmp_path, monkeypatch, sources):
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "7.5")
+    for source in sources:
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.touch()
+    return core.JitSpecNvcc(
+        name="test_module",
+        sources=sources,
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+
+
+def test_object_naming_matches_across_ninja_object_paths_and_compile_commands(
+    monkeypatch, tmp_path
+):
+    spec = _make_spec(
+        tmp_path,
+        monkeypatch,
+        [
+            tmp_path / "gen_a" / "kernel_a.cu",
+            tmp_path / "gen_b" / "kernel_b.cu",
+            tmp_path / "gen_a" / "binding.cc",
+        ],
+    )
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name=spec.name,
+        sources=spec.sources,
+        extra_cflags=spec.extra_cflags,
+        extra_cuda_cflags=spec.extra_cuda_cflags,
+        extra_ldflags=spec.extra_ldflags,
+        extra_include_dirs=spec.extra_include_dirs,
+    )
+
+    ninja_outputs = _ninja_object_paths(ninja)
+    # Non-colliding sources keep the historical {parent.name}_{stem} naming, so
+    # existing JIT caches remain valid.
+    assert [Path(o).name for o in ninja_outputs] == [
+        "gen_a_kernel_a.cuda.o",
+        "gen_b_kernel_b.cuda.o",
+        "gen_a_binding.o",
+    ]
+    assert _resolve_all(spec.get_object_paths()) == _resolve_all(ninja_outputs)
+    assert _resolve_all(_compile_command_outputs(spec.get_compile_commands())) == (
+        _resolve_all(ninja_outputs)
+    )
+
+
+def test_object_naming_disambiguates_sources_with_same_parent_dir_name_and_stem(
+    monkeypatch, tmp_path
+):
+    spec = _make_spec(
+        tmp_path,
+        monkeypatch,
+        [
+            tmp_path / "one" / "x" / "kernel.cu",
+            tmp_path / "two" / "x" / "kernel.cu",
+        ],
+    )
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name=spec.name,
+        sources=spec.sources,
+        extra_cflags=spec.extra_cflags,
+        extra_cuda_cflags=spec.extra_cuda_cflags,
+        extra_ldflags=spec.extra_ldflags,
+        extra_include_dirs=spec.extra_include_dirs,
+    )
+
+    # Both sources would map to x_kernel.cuda.o under the bare scheme, which
+    # ninja rejects ("multiple rules generate"); they must get distinct names.
+    ninja_outputs = _ninja_object_paths(ninja)
+    assert len(ninja_outputs) == 2
+    assert len(set(ninja_outputs)) == 2
+    assert all("x_kernel_" in Path(o).name for o in ninja_outputs)
+    assert _resolve_all(spec.get_object_paths()) == _resolve_all(ninja_outputs)
+    assert _resolve_all(_compile_command_outputs(spec.get_compile_commands())) == (
+        _resolve_all(ninja_outputs)
+    )
+
+
+def test_resolve_object_names_is_deterministic_for_colliding_sources():
+    sources = [Path("one/x/kernel.cu"), Path("two/x/kernel.cu")]
+    first = cpp_ext.resolve_object_names(sources)
+    second = cpp_ext.resolve_object_names(sources)
+    assert first == second
+    assert len(set(first)) == 2
+
+
+def test_resolve_object_names_handles_duplicate_source_entries():
+    sources = [Path("csrc/x/kernel.cu"), Path("csrc/x/kernel.cu")]
+    names = cpp_ext.resolve_object_names(sources)
+    assert len(set(names)) == 2
