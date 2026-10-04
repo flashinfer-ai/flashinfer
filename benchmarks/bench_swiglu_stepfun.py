@@ -121,6 +121,15 @@ def parse_args():
         default=["trtllm"],
         help="FC1 backends measured on the same inputs; cake applies to nvfp4 only.",
     )
+    parser.add_argument(
+        "--skip-native-baseline",
+        action="store_true",
+        help=(
+            "Do not measure the native SwiGLU baseline (OpenAI SwiGLU, or the default "
+            "SwiGLU for fp8); only rows pairing another backend against the native "
+            "StepFun kernel are emitted. For kernel artifacts shipping StepFun kernels only."
+        ),
+    )
     parser.add_argument("--tokens", nargs="+", type=int, default=[8, 64, 512, 2048])
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--intermediate", type=int, default=1536)
@@ -492,7 +501,10 @@ def main():
             backend, runner_cls, fmt = MODES[precision]
             quant = QuantConfig(weight=fmt, activation=fmt)
             baseline = baseline_variant(precision)
-            variants = {baseline: baselines[baseline], **step_variants}
+            variants = {
+                **({} if args.skip_native_baseline else {baseline: baselines[baseline]}),
+                **step_variants,
+            }
             prepare_kwargs = dict(
                 num_local_experts=args.experts,
                 hidden_size=args.hidden,
@@ -601,7 +613,7 @@ def main():
                             f"{precision} tokens={tokens} round={round_idx} {name}: {med:.3f} us ({method})",
                             flush=True,
                         )
-                oai = round_medians[baseline]
+                oai = round_medians.get(baseline)
                 for name, step in round_medians.items():
                     if name == baseline:
                         continue
@@ -611,6 +623,9 @@ def main():
                     arm, _, variant_name = name.rpartition(":")
                     arm = arm or "trtllm"
                     reference_name = baseline if arm == "trtllm" else variant_name
+                    if reference_name not in round_medians:
+                        # Native step variants have no pair without the native baseline.
+                        continue
                     reference = round_medians[reference_name]
                     ratio, low, high = paired_interval(reference, step, args.seed + tokens)
                     threshold = 1 + args.regression_threshold
@@ -636,7 +651,7 @@ def main():
                         cache_policy=args.cache_policy,
                         tuning_graph_replays=args.tuning_graph_replays,
                         tuning_repeat=args.tuning_repeat,
-                        oai_median_us=statistics.median(oai),
+                        oai_median_us=statistics.median(oai) if oai else None,
                         step_median_us=statistics.median(step),
                         baseline_median_us=statistics.median(reference),
                         candidate_median_us=statistics.median(step),
@@ -663,6 +678,11 @@ def main():
                 del candidates, act
             del base_view
             torch.cuda.empty_cache()
+    if not rows:
+        raise SystemExit(
+            "no paired rows: --skip-native-baseline needs an alternative backend "
+            "(--backends trtllm cake) on a precision it supports"
+        )
     with (args.output_dir / "summary.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
