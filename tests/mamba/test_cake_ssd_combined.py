@@ -2432,11 +2432,17 @@ def test_source_program_table_names_shipped_sources():
         assert f'"{program.main.kernel}"' in rendered
         assert f"namespace cake_mamba_ssd_combined_host_{name} {{" in rendered
         assert f"stream, {program.main_smem_bytes}u)" in rendered
-        state_check = (
-            f'"initial_states", {program.state_dtype_code}, '
-            f"{program.state_dtype_bits}, 1)"
-        )
-        assert state_check in rendered
+        # The regenerated host shim brace-initialises the DLDataType of the
+        # three state tensors from the two state placeholders; delta checks
+        # are FP16 for every program (D1) and not factored.
+        for state_tensor in ("initial_states", "final_states", "checkpoint_states"):
+            state_check = (
+                f"check_dtype(arg_{state_tensor}, DLDataType{{"
+                f"{program.state_dtype_code}, {program.state_dtype_bits}, 1}}, "
+                f'"{state_tensor}");'
+            )
+            assert state_check in rendered, state_check
+        assert "DLDataType{kDLFloat, 16, 1}" in rendered
     # One shared source per physical kernel: six scan sources plus the one
     # preprocess kernel, no architecture copies.
     assert len(device_sources) == 7
