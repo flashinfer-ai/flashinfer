@@ -105,9 +105,9 @@ def _fma_f32(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
 def _rope_gptj_fp32(x: torch.Tensor, cos_sin_rows: torch.Tensor) -> torch.Tensor:
     """GPT-J RoPE of dims 448..511 of ``x[..., 512]`` with fp32 ``cos_sin_rows[..., 64]`` -> fp32.
 
-    The even element is ``x_e * cos - x_o * sin`` with three fp32 roundings and the odd element
-    the fused ``fma(x_e, sin, x_o * cos)`` -- the instruction shapes the serving stack's fused
-    insert op compiles to, which the generated kernel reproduces.
+    Both elements are one exact fp32 FMA over one rounded product -- ``fma(x_e, cos, -(x_o * sin))``
+    and ``fma(x_e, sin, x_o * cos)`` -- the shapes the generated kernel emits (explicit FMA, so the
+    assembler cannot re-contract them and every variant produces identical bits).
     """
 
     xf = x.float()
@@ -115,7 +115,7 @@ def _rope_gptj_fp32(x: torch.Tensor, cos_sin_rows: torch.Tensor) -> torch.Tensor
     sin = cos_sin_rows[..., 32:].float()
     rope = xf[..., _D_NOPE:].reshape(*xf.shape[:-1], 32, 2)
     x_even, x_odd = rope[..., 0], rope[..., 1]
-    even = x_even * cos - x_odd * sin
+    even = _fma_f32(x_even, cos, -(x_odd * sin))
     odd = _fma_f32(x_even, sin, x_odd * cos)
     out = xf.clone()
     out[..., _D_NOPE:] = torch.stack((even, odd), dim=-1).reshape(
