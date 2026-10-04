@@ -55,10 +55,11 @@ destination map the reference dK/dV is mapped the same way).
 
 ``--host-us`` measures the host side of the eager entry points (``forward``,
 ``backward``, the public ``dsa_sparse_attention`` forward / autograd backward /
-step) as wall-clock microseconds per call with the GPU running asynchronously,
-alternating the binding cache off / on inside one process (``--host-rounds``
-rounds of ``--host-calls`` calls each), and checks that both paths produce the
-same results and the same kernel-only time.
+step) and of a prepared runner as wall-clock microseconds per call with the GPU
+running asynchronously (``--host-rounds`` rounds of ``--host-calls`` calls
+each, the order of the entry points rotated every round and recorded per
+round), and checks that both paths produce the same results and the same
+kernel-only time.
 
 Usage::
 
@@ -87,7 +88,10 @@ from flashinfer.dsa_sparse_attention import (  # noqa: E402
     dsa_sparse_attention,
     dsa_sparse_attention_varlen,
 )
-from flashinfer.experimental.cake_dsa_train import cake_backend  # noqa: E402
+from flashinfer.experimental.cake_dsa_train import (  # noqa: E402
+    cake_backend,
+    cake_jit,
+)
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from tests.test_helpers.cake_dsa_train_reference import (  # noqa: E402
     D_LATENT,
@@ -119,17 +123,17 @@ for _s in (65536, 131072, 196608):
 # segments alternating a full document and the tail of a long prefix,
 #   cu_seqlens_q = [0, 1777, 3532, 5655, 7765, 9888, 11998, 14121, 16231]
 #   cu_seqlens_k = [0, 1777, 58619, 60742, 128665, 130788, 198711, 200834, 268757]
-# (T 16231, Tkv 268757, max_seqlen_q 2123, max_seqlen_k 67923); packed_glm_b is its
-# deterministic sibling (T 16172, Tkv 267520,
-#   cu_seqlens_q = [0, 1770, 3518, 5634, 7736, 9852, 11954, 14070, 16172]
-#   cu_seqlens_k = [0, 1770, 58390, 60506, 128100, 130216, 197810, 199926, 267520]).
+# (T 16231, Tkv 268757, max_seqlen_q 2123, max_seqlen_k 67923); packed_glm_b is the
+# second recorded batch (T 16172, Tkv 267520, max_seqlen_q 2027, max_seqlen_k 64853,
+#   cu_seqlens_q = [0, 2027, 4043, 6070, 8086, 10113, 12129, 14156, 16172]
+#   cu_seqlens_k = [0, 2027, 66880, 68907, 133760, 135787, 200640, 202667, 267520]).
 GLM_A = (
     [1777, 1755, 2123, 2110, 2123, 2110, 2123, 2110],
     [1777, 56842, 2123, 67923, 2123, 67923, 2123, 67923],
 )
 GLM_B = (
-    [1770, 1748, 2116, 2102, 2116, 2102, 2116, 2102],
-    [1770, 56620, 2116, 67594, 2116, 67594, 2116, 67594],
+    [2027, 2016, 2027, 2016, 2027, 2016, 2027, 2016],
+    [2027, 64853, 2027, 64853, 2027, 64853, 2027, 64853],
 )
 ROWS["packed_glm_a"] = GLM_A
 ROWS["packed_glm_b"] = GLM_B
@@ -542,16 +546,13 @@ class ArmCake:
         if self.runner is not None:
             return dict(
                 module=self.runner.module_name,
-                abi=self.runner.abi,
                 stages=list(self.runner.stages),
                 entry="prepare_dsa_train",
             )
-        module_name, record = cake_backend.record_for(self.inp.q_latent.device)
-        stages = getattr(cake_backend, "registered_stages", lambda _m: ())(module_name)
+        module_name, _record = cake_backend.record_for(self.inp.q_latent.device)
         return dict(
             module=module_name,
-            abi=cake_backend.record_abi(record),
-            stages=list(stages),
+            stages=list(cake_jit.registered_stages()),
             entry="dsa_sparse_attention_varlen",
             layout=self.layout.describe(),
         )
@@ -1028,16 +1029,14 @@ def _host_us_per_call(fn, calls):
 
 
 def measure_host_path(inp, *, calls, rounds, kernel_steps):
-    """Host microseconds per call of the eager entry points with the binding cache off / on.
+    """Host microseconds per call of the eager entry points against the prepared runner.
 
-    Each round measures every entry point in both modes back to back (off
-    first), so the two modes see the same process state; the medians over the
-    rounds are reported.  Also checks that both modes give the same results
-    (``out``, ``lse``, ``dq_*`` bitwise; ``dkv_*`` within the ``red.global``
-    run-to-run spread) and reports the CUPTI kernel-only medians of both.
+    Each round measures every entry point back to back, so they see the same
+    process state; the medians over the rounds are reported.  Also checks that
+    the eager path and the runner give the same results (``out``, ``lse``,
+    ``dq_*`` bitwise; ``dkv_*`` within the ``red.global`` run-to-run spread)
+    and reports the CUPTI kernel-only medians of both.
     """
-    cache = cake_backend.BINDING_CACHE
-    was_enabled = cache.enabled
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
     backward_available = cake_backend.generated_program_available(
         inp.q_latent.device, backward=True
@@ -1047,6 +1046,11 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
         dsa_sparse_attention(*args)  # the experimental banner fires once per process
     leaves = [t.detach().clone().requires_grad_() for t in args[:4]]
     saved = cake_backend.forward(*args)
+    runner = cake_backend.prepare_dsa_train(
+        *args,
+        dout=inp.dout if backward_available else None,
+        backward=backward_available,
+    )
     torch.cuda.synchronize()
 
     def eager_forward():
@@ -1054,6 +1058,12 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
 
     def eager_backward():
         return cake_backend.backward(*args, saved[0], saved[2], saved[1], inp.dout)
+
+    def runner_forward():
+        return runner.forward()
+
+    def runner_backward():
+        return runner.backward()
 
     def public_forward():
         return dsa_sparse_attention(*leaves, inp.idx_global)
@@ -1067,91 +1077,77 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
         out = dsa_sparse_attention(*leaves, inp.idx_global)
         return torch.autograd.grad(out, leaves, inp.dout)
 
-    entry_points = [("forward", eager_forward), ("public_forward", public_forward)]
+    entry_points = [
+        ("forward", eager_forward),
+        ("runner_forward", runner_forward),
+        ("public_forward", public_forward),
+    ]
     if backward_available:
         entry_points += [
             ("backward", eager_backward),
+            ("runner_backward", runner_backward),
             ("public_backward", public_backward),
             ("autograd_step", autograd_step),
         ]
-    samples = {name: {"off": [], "on": []} for name, _ in entry_points}
-    lookups = {
-        name: [] for name, _ in entry_points
-    }  # (hits, misses) of the measured cache-on calls
+    samples = {name: [] for name, _ in entry_points}
+    orders = []
+    for r in range(rounds):
+        # rotate the measurement order every round so no entry point always runs
+        # first (cache state and clock drift would otherwise favour one position)
+        start = r % len(entry_points)
+        order = entry_points[start:] + entry_points[:start]
+        orders.append([name for name, _ in order])
+        for name, fn in order:
+            fn()  # warm the entry point; measured calls follow
+            samples[name].append(_host_us_per_call(fn, calls))
+    # same results from both paths
+    e_fwd = eager_forward()
+    r_fwd = runner_forward()
+    e_bwd = eager_backward() if backward_available else None
+    r_bwd = runner_backward() if backward_available else None
+    torch.cuda.synchronize()
+    same = dict(
+        out=torch.equal(e_fwd[0], r_fwd[0]), lse=torch.equal(e_fwd[1], r_fwd[1])
+    )
+    if backward_available:
+        same.update(
+            dq_latent=torch.equal(e_bwd[0], r_bwd[0]),
+            dq_rope=torch.equal(e_bwd[1], r_bwd[1]),
+            dkv_latent_rel_l2=rel_l2(e_bwd[2], r_bwd[2]),
+            dk_rope_rel_l2=rel_l2(e_bwd[3], r_bwd[3]),
+        )
+    del e_fwd, r_fwd, e_bwd, r_bwd
+    # kernel-only time of both paths (CUPTI, per-iteration GPU span)
+    kernel_ms = {}
     try:
-        for _ in range(rounds):
-            for mode in ("off", "on"):
-                cache.enabled = mode == "on"
-                for name, fn in entry_points:
-                    fn()  # the first call of a mode binds (a miss); measured calls follow
-                    hits, misses = cache.hits, cache.misses
-                    samples[name][mode].append(_host_us_per_call(fn, calls))
-                    if mode == "on":
-                        lookups[name].append((cache.hits - hits, cache.misses - misses))
-        # same results from both paths
-        cache.enabled = False
-        off_fwd = eager_forward()
-        off_bwd = eager_backward() if backward_available else None
-        cache.enabled = True
-        on_fwd = eager_forward()
-        on_bwd = eager_backward() if backward_available else None
-        torch.cuda.synchronize()
-        same = dict(
-            out=torch.equal(off_fwd[0], on_fwd[0]),
-            lse=torch.equal(off_fwd[1], on_fwd[1]),
-        )
+        for mode, fwd, bwd in (
+            ("eager", eager_forward, eager_backward),
+            ("runner", runner_forward, runner_backward),
+        ):
+            kernel_ms[mode] = dict(forward=median_ms(fwd, kernel_steps))
+            if backward_available:
+                kernel_ms[mode]["backward"] = median_ms(bwd, kernel_steps)
         if backward_available:
-            same.update(
-                dq_latent=torch.equal(off_bwd[0], on_bwd[0]),
-                dq_rope=torch.equal(off_bwd[1], on_bwd[1]),
-                dkv_latent_rel_l2=rel_l2(off_bwd[2], on_bwd[2]),
-                dk_rope_rel_l2=rel_l2(off_bwd[3], on_bwd[3]),
-            )
-        del off_fwd, off_bwd, on_fwd, on_bwd
-        # kernel-only time of both paths (CUPTI, per-iteration GPU span)
-        kernel_ms = {}
-        try:
-            for mode in ("off", "on"):
-                cache.enabled = mode == "on"
-                kernel_ms[mode] = dict(forward=median_ms(eager_forward, kernel_steps))
-                if backward_available:
-                    kernel_ms[mode]["backward"] = median_ms(
-                        eager_backward, kernel_steps
-                    )
-                    kernel_ms[mode]["autograd_step"] = median_ms(
-                        autograd_step, kernel_steps
-                    )
-        except Exception as exc:  # the host figures stand on their own when CUPTI tracing is unavailable
-            kernel_ms["error"] = f"{type(exc).__name__}: {exc}"
-    finally:
-        cache.enabled = was_enabled
+            kernel_ms["eager"]["autograd_step"] = median_ms(autograd_step, kernel_steps)
+    except (
+        Exception
+    ) as exc:  # the host figures stand on their own when CUPTI tracing is unavailable
+        kernel_ms["error"] = f"{type(exc).__name__}: {exc}"
     host_us = {
-        name: {
-            mode: dict(
-                median=float(statistics.median(v)),
-                min=float(min(v)),
-                rounds=[float(x) for x in v],
-            )
-            for mode, v in modes.items()
-        }
-        for name, modes in samples.items()
-    }
-    for name, hm in lookups.items():
-        host_us[name]["on"]["lookups"] = dict(
-            hits=sum(h for h, _ in hm), misses=sum(m for _, m in hm)
+        name: dict(
+            median=float(statistics.median(v)),
+            min=float(min(v)),
+            rounds=[float(x) for x in v],
         )
+        for name, v in samples.items()
+    }
     return dict(
         calls=calls,
         rounds=rounds,
+        order_per_round=orders,
         host_us=host_us,
         same_results=same,
         kernel_ms=kernel_ms,
-        cache=dict(
-            hits=cache.hits,
-            misses=cache.misses,
-            bindings=len(cache),
-            owned_bytes=cache.owned_bytes,
-        ),
     )
 
 
@@ -1174,12 +1170,9 @@ def run_host_path(args, results):
             )
             print(f"{row:22s} host path failed: {entry['error']}", flush=True)
         else:
-            for name, modes in entry["host_us"].items():
-                off, on = modes["off"]["median"], modes["on"]["median"]
-                lk = modes["on"]["lookups"]
+            for name, stats in entry["host_us"].items():
                 print(
-                    f"{row:22s} {name:16s} host us/call  cache off {off:8.1f}  cache on {on:8.1f}  ({off / on:5.2f}x)"
-                    f"  lookups hit {lk['hits']} miss {lk['misses']}",
+                    f"{row:22s} {name:16s} host us/call  median {stats['median']:8.1f}  min {stats['min']:8.1f}",
                     flush=True,
                 )
             print(
@@ -1188,8 +1181,7 @@ def run_host_path(args, results):
             )
             for mode, ms in entry["kernel_ms"].items():
                 print(
-                    f"{row:22s} kernel-only ms (cache {mode}): {json.dumps(ms)}",
-                    flush=True,
+                    f"{row:22s} kernel-only ms ({mode}): {json.dumps(ms)}", flush=True
                 )
         entry["row"] = row
         results["host_path"].append(entry)
@@ -1254,7 +1246,7 @@ def main():
     parser.add_argument(
         "--host-us",
         action="store_true",
-        help="host microseconds per call, binding cache off / on",
+        help="host microseconds per call, eager entry points and prepared runner",
     )
     parser.add_argument("--host-calls", type=int, default=20)
     parser.add_argument("--host-rounds", type=int, default=3)

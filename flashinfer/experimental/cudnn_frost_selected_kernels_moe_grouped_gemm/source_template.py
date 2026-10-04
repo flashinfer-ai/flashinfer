@@ -144,7 +144,9 @@ def render_source(template: str, parameters: dict) -> str:
     if not isinstance(symbol, str) or not symbol.isidentifier():
         raise ValueError("invalid Frost kernel symbol")
     source = re.sub(rf"\b{_SYMBOL}\b", symbol, source)
-    source = source.replace("FROST_EPI_N", dict(assignments)["epi_n"])
+    # SM120 templates have no TMA-store epilogue and hence no epi_n constant.
+    if "FROST_EPI_N" in source:
+        source = source.replace("FROST_EPI_N", dict(assignments)["epi_n"])
     if "FROST_EPI_ROW_ELEMS" in source:
         row_elems = ast.literal_eval(dict(assignments)["epi_row_elems"])
         _, element_bytes = _TMA_CARRIERS[dict(assignments)["epi_store_dtype"]]
@@ -173,8 +175,12 @@ def extract_template(source: str, *, swap_ab: bool) -> tuple[str, dict]:
     end = source.find("# Tensormap workspace slots", begin)
     if end < 0:
         # The block-scale swap-AB template starts its workspace formulas
-        # directly, without the dense/normal template's section comment.
+        # directly, without the dense/normal template's section comment. The
+        # SM120 template first guards its K-major token with an if statement.
         end = source.index("moe_desc_slots =", begin)
+        guard = source.find("\nif a_is_m_major:", begin, end)
+        if guard >= 0:
+            end = guard + 1
     constants = []
     for statement in ast.parse(source[begin:end]).body:
         # Quantized epilogues can inject conversion helpers before the
@@ -195,7 +201,7 @@ def extract_template(source: str, *, swap_ab: bool) -> tuple[str, dict]:
             raise ValueError("unexpected Frost tile constant statement")
         constants.append([statement.targets[0].id, ast.unparse(statement.value)])
     template = source[:begin] + _CONSTANTS + "\n\n" + source[end:]
-    symbols = set(re.findall(r"\bfrost_sm100_\w+(?=\(|\.set_name_prefix)", template))
+    symbols = set(re.findall(r"\bfrost_sm\d+_\w+(?=\(|\.set_name_prefix)", template))
     if len(symbols) != 1:
         raise ValueError("expected one Frost grouped GEMM kernel symbol")
     symbol = symbols.pop()
@@ -219,7 +225,8 @@ def extract_template(source: str, *, swap_ab: bool) -> tuple[str, dict]:
         r"^\1nvvm\.barrier_cta_sync\(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps \* 32\)"
     )
     template, count = re.subn(pattern, rf"\g<1>{_STORE}", template, flags=re.S)
-    if count != int(dict(constants)["n_tma_outputs"]):
+    # SM120 templates always store through STG and define no TMA outputs.
+    if count != int(dict(constants).get("n_tma_outputs", "0")):
         raise ValueError("unsupported Frost TMA store layout")
     parameters = dict(
         version=1, constants=constants, kernel_symbol=symbol, swap_ab=swap_ab

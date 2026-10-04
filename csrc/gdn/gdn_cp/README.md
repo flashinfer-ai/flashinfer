@@ -1,13 +1,12 @@
-# Blackwell GDN CP-prefill CUDA source
+# Cake GDN CP-prefill kernels
 
-This source export contains CUDA kernels and their TVM FFI host launchers for
-context-parallel GDN prefill. `manifest.json` contains only the metadata needed
-by the JIT loader: the manifest schema, shared-header paths and hashes, and each
-kernel's architecture-specific CUDA source and host binding paths, hashes,
-module identifier and entry point.
+Generated device sources (`*_kernel.cu`) and their thin TVM-FFI launchers
+(`*_binding.cu`) for the context-parallel GDN prefill backend on SM100 and
+SM103.  One source per physical program compiles for both architectures; the
+registry in `flashinfer/jit/cake_gdn_cp_backend.py` maps each logical kernel
+to its program and the host in
+`flashinfer/gdn_kernels/blackwell/cake_gdn_cp_backend.py` owns planning,
+workspaces and dispatch behind the public `flashinfer.gdn_prefill`
+`chunk_gated_delta_rule` API.
 
-Shared device utilities live in `cuda/cake_gdn_cp_common.cuh`. The host launchers
-encode tensor maps and expose the low-level kernel ABI. The prepared launcher
-in `flashinfer.gdn_kernels.blackwell.cake_gdn_cp_backend` handles workspace
-allocation, dispatch and graph replay through the public
-`flashinfer.gdn_prefill.chunk_gated_delta_rule` API.
+These files are produced by the Cake exporter; do not edit them by hand.

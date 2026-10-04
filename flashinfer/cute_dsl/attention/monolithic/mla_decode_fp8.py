@@ -80,6 +80,8 @@ _ARCH_SM107 = getattr(Arch, "sm_107", Arch.sm_103f)
 _ARCH_SM107F = getattr(Arch, "sm_107f", Arch.sm_103f)
 
 
+from .mla_reducer import MLAReducer
+
 from .mla_helpers import (
     ceil_div,
     compute_q_tile_layout,
@@ -258,7 +260,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if reducer_d_tiles not in (1, 2, 4):
             raise ValueError(f"unsupported reducer_d_tiles={reducer_d_tiles}")
         self.reducer_d_tiles = reducer_d_tiles
-        self.reducer_d_tile = self.latent_dim // reducer_d_tiles
+        self.reducer = MLAReducer(
+            acc_dtype=acc_dtype,
+            lse_dtype=lse_dtype,
+            qk_tile_shape=mma_qk_tiler_mn,
+            num_heads=num_heads,
+            seq_len_q=seq_len_q,
+            max_splits=reducer_max_splits,
+            d_tiles=reducer_d_tiles,
+            is_var_q=is_var_q,
+            is_var_split_kv=is_var_split_kv,
+            enable_dcp=enable_dcp,
+            enable_pdl=enable_pdl,
+        )
         mma_qk_tiler_k = self.rope_dim * 2
         self.mma_qk_tiler = (
             self.mma_qk_tiler_mn[0],
@@ -1023,7 +1037,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             use_pdl=self.enable_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
-            self.reduction_kernel(
+            self.reducer(
                 o_unpacked,
                 lse_unpacked,
                 acc_o,
@@ -1033,17 +1047,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 cum_seq_lens_q,
                 block_split_kvs,
                 lse_scale,
-            ).launch(
-                grid=(
-                    o_unpacked.shape[0] * self.reducer_d_tiles,
-                    self.seq_len_q,
-                    runtime_batch_size,
-                ),
-                block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
-                smem=self.reducer_max_splits * self.acc_dtype.width // 8,
-                stream=stream,
-                min_blocks_per_mp=1,
-                use_pdl=self.enable_pdl,
+                stream,
             )
 
     @cute.jit
@@ -1950,186 +1954,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if q_tile_idx == self.num_q_tiles - 1:
             valid_rows = self.tail_q_rows
         return valid_rows
-
-    @cute.kernel
-    def reduction_kernel(
-        self,
-        mO: cute.Tensor,
-        mLSE: cute.Tensor,
-        mAccO: cute.Tensor,
-        mAccLSE: cute.Tensor,
-        split_kv: cutlass.Int32,
-        cache_seqs: cute.Tensor,
-        cum_seq_lens_q: Optional[cute.Tensor],
-        block_split_kvs: cute.Tensor,
-        lse_scale: cutlass.Float32,
-    ):
-        """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
-        from multiple split_kv blocks into final outputs.
-
-        :param mO: Output tensor for storing final results
-        :type mO: cute.Tensor
-        :param mLSE: Log-sum-exp tensor for storing final LSE values
-        :type mLSE: cute.Tensor
-        :param mAccO: Accumulated output tensor from split_kv blocks
-        :type mAccO: cute.Tensor
-        :param mAccLSE: Accumulated LSE tensor from split_kv blocks
-        :type mAccLSE: cute.Tensor
-        :param split_kv: Number of split_kv blocks
-        :type split_kv: cutlass.Int32
-        :param cache_seqs: Cache sequence lengths tensor
-        :type cache_seqs: cute.Tensor
-        :param block_split_kvs: Per-block split_kv values tensor (for variable split_kv)
-        :type block_split_kvs: cute.Tensor
-        :param lse_scale: Multiplier applied to the stored LSE. This kernel
-            accumulates LSE in base 2, so ``1 / log2(e)`` yields natural-log
-            values and ``1.0`` keeps base 2. Plumbed from
-            ``return_lse_base`` on the public MLA decode API.
-        :type lse_scale: cutlass.Float32
-        """
-        bidx, bidy, bidz = cute.arch.block_idx()
-        tidx, _, _ = cute.arch.thread_idx()
-        d_tile_idx = bidx % self.reducer_d_tiles
-        head_idx = bidx // self.reducer_d_tiles
-        q_begin = cutlass.Int32(0)
-        q_len = cutlass.Int32(self.seq_len_q)
-        is_active = True
-        if cutlass.const_expr(self.is_var_q):
-            q_begin, q_len, _ = get_variable_query_tile_info(
-                self.num_heads,
-                cutlass.Int32(0),
-                bidz,
-                cum_seq_lens_q,
-                self.mma_qk_tiler[0],
-            )
-            is_active = bidy < q_len
-
-        # Inactive compact rows still complete the PDL protocol, but do not
-        # touch workspace or enter the active-row shared-memory barrier.
-        smem = utils.SmemAllocator()
-        storage = smem.allocate(self.reducer_max_splits * self.acc_dtype.width // 8, 16)
-        lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
-        smem_lse_scale = cute.make_tensor(
-            lse_scale_ptr, cute.make_layout(self.reducer_max_splits)
-        )
-
-        if cutlass.const_expr(self.enable_pdl):
-            cute.arch.griddepcontrol_wait()
-        if is_active:
-            flat_q_row = bidy * self.num_heads + head_idx
-            q_tile = flat_q_row >> 7
-            q_tile_row = flat_q_row & 127
-            local_split_kv = split_kv
-            if cutlass.const_expr(self.is_var_split_kv):
-                local_split_kv = block_split_kvs[bidz]
-            k_tile_total = cute.ceil_div(cache_seqs[bidz], self.mma_qk_tiler[1])
-            if cutlass.const_expr(self.enable_dcp):
-                k_tile_per_cta = cutlass.max(
-                    cute.ceil_div(k_tile_total, local_split_kv), cutlass.Int32(1)
-                )
-                local_split_kv = cutlass.max(
-                    cute.ceil_div(k_tile_total, k_tile_per_cta), cutlass.Int32(1)
-                )
-            else:
-                k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
-                local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
-
-            gLSE = mAccLSE[q_tile_row, None, q_tile, bidz]
-            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-            if warp_idx == 0:
-                lse_per_thread = cute.ceil_div(
-                    self.reducer_max_splits, self.threads_per_warp
-                )
-                local_lse = cute.make_rmem_tensor(
-                    cute.make_layout(lse_per_thread), self.lse_dtype
-                )
-                lse_max = -self.lse_dtype.inf
-                for i in cutlass.range_constexpr(lse_per_thread):
-                    split_kv_idx = tidx + i * self.threads_per_warp
-                    local_lse[i] = (
-                        gLSE[split_kv_idx]
-                        if cute.elem_less(split_kv_idx, local_split_kv)
-                        else -self.lse_dtype.inf
-                    )
-                    lse_max = cute.arch.fmax(lse_max, local_lse[i])
-                lse_max = cute.arch.warp_reduction_max(lse_max)
-                if cutlass.const_expr(self.enable_dcp):
-                    has_valid_lse = lse_max != -self.lse_dtype.inf
-                    lse_max = lse_max if has_valid_lse else 0.0
-                else:
-                    lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
-                sum_lse = 0.0
-                for i in cutlass.range_constexpr(lse_per_thread):
-                    sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
-                sum_lse = cute.arch.warp_reduction_sum(sum_lse)
-                if cutlass.const_expr(self.enable_dcp):
-                    global_lse = (
-                        lse_max + cute.math.log2(sum_lse, fastmath=True)
-                        if has_valid_lse
-                        else -self.lse_dtype.inf
-                    )
-                else:
-                    global_lse = (
-                        lse_max + cute.math.log2(sum_lse, fastmath=True)
-                        if sum_lse != self.lse_dtype(0.0) or sum_lse != sum_lse
-                        else self.lse_dtype.inf
-                    )
-                if d_tile_idx == 0:
-                    if tidx == 0:
-                        if cutlass.const_expr(self.is_var_q):
-                            mLSE[head_idx, q_begin + bidy] = global_lse * lse_scale
-                        else:
-                            mLSE[head_idx, bidy, bidz] = global_lse * lse_scale
-                for i in cutlass.range_constexpr(lse_per_thread):
-                    split_kv_idx = tidx + i * self.threads_per_warp
-                    if cute.elem_less(split_kv_idx, local_split_kv):
-                        if cutlass.const_expr(self.enable_dcp):
-                            smem_lse_scale[split_kv_idx] = (
-                                cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
-                                if has_valid_lse
-                                else self.acc_dtype(0.0)
-                            )
-                        else:
-                            smem_lse_scale[split_kv_idx] = cute.math.exp2(
-                                local_lse[i] - global_lse, fastmath=True
-                            )
-
-            pipeline.sync(barrier_id=4)
-
-            elements_per_thread = cute.ceil_div(
-                self.reducer_d_tile,
-                self.threads_per_warp * self.num_compute_warps,
-            )
-            gAccO = mAccO[q_tile_row, None, None, q_tile, bidz]
-            rAccO = cute.make_rmem_tensor(
-                cute.make_layout(elements_per_thread), self.acc_dtype
-            )
-            rO = cute.make_rmem_tensor(
-                cute.make_layout(elements_per_thread), self.o_dtype
-            )
-            rAccO.fill(0.0)
-            for i in range(local_split_kv):
-                for j in cutlass.range_constexpr(elements_per_thread):
-                    element_idx = (
-                        d_tile_idx * self.reducer_d_tile
-                        + tidx
-                        + j * self.threads_per_warp * self.num_compute_warps
-                    )
-                    rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
-            rO.store(rAccO.load().to(self.o_dtype))
-            for j in cutlass.range_constexpr(elements_per_thread):
-                element_idx = (
-                    d_tile_idx * self.reducer_d_tile
-                    + tidx
-                    + j * self.threads_per_warp * self.num_compute_warps
-                )
-                if cutlass.const_expr(self.is_var_q):
-                    mO[head_idx, element_idx, q_begin + bidy] = rO[j]
-                else:
-                    mO[head_idx, element_idx, bidy, bidz] = rO[j]
-        if cutlass.const_expr(self.enable_pdl):
-            cute.arch.griddepcontrol_launch_dependents()
-        return
 
     @staticmethod
     def get_split_kv(

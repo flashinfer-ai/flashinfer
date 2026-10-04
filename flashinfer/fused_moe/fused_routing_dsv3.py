@@ -17,6 +17,13 @@ from flashinfer.utils import (
 _CAKE_DTYPES = frozenset((torch.float16, torch.bfloat16, torch.float32))
 
 
+@functools.cache
+def _device_capability(device_index: int) -> tuple[int, int]:
+    """Return the compute capability of one CUDA device, queried once per process."""
+
+    return torch.cuda.get_device_capability(device_index)
+
+
 def _is_cake_dsv3_fused_routing_supported(
     *,
     capability: tuple[int, int],
@@ -74,7 +81,7 @@ def _check_cake_dsv3_fused_routing_backend_supported(
 ) -> bool:
     """Validate the explicit Cake backend's executable contract."""
 
-    capability = torch.cuda.get_device_capability(scores.device)
+    capability = _device_capability(scores.get_device())
     if not _is_cake_dsv3_fused_routing_supported(
         capability=capability,
         num_tokens=scores.shape[0],
@@ -123,6 +130,21 @@ def _check_dsv3_fused_routing_supported(
     Raises:
         ValueError: If configuration is invalid or exceeds kernel limits
     """
+    # Both backends address scores as a dense [num_tokens, num_experts] row-major
+    # matrix and write dense [num_tokens, topk] outputs; a strided view would be
+    # read or written through the wrong offsets, so it is rejected here.
+    for name, tensor in (
+        ("scores", scores),
+        ("bias", bias),
+        ("topk_values", topk_values),
+        ("topk_indices", topk_indices),
+        ("routing_replay_out", routing_replay_out),
+    ):
+        if tensor is not None and not tensor.is_contiguous():
+            raise ValueError(
+                f"{name} must be contiguous, got strides {tensor.stride()}"
+            )
+
     if routing_replay_out is not None:
         num_tokens = scores.shape[0]
         if routing_replay_out.dtype != torch.int16:
@@ -260,7 +282,8 @@ def fused_topk_deepseek(
     ----------
     scores : torch.Tensor
         Router logits of shape ``(num_tokens, num_experts)``, before any
-        activation.  ``bfloat16`` / ``float16`` / ``float32``.
+        activation.  ``bfloat16`` / ``float16`` / ``float32``.  Must be
+        contiguous, as must every other tensor argument.
     bias : torch.Tensor
         Per-expert routing bias of shape ``(num_experts,)``, same dtype as
         ``scores``.  Added to the sigmoid-activated scores before grouping.

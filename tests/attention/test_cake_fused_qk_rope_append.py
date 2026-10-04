@@ -478,3 +478,89 @@ def test_rejects_bad_arguments():
             num_kv_heads=1,
             out_q=torch.empty((1, 8, 64), dtype=torch.bfloat16, device="cuda"),
         )
+
+
+# ----------------------------------------------------------------------------------------------
+# Stage policy (CPU): the host mirrors the Cake v4 policy and must only select shipped builds.
+
+_POLICY_TABLE = {
+    # (arch, Hq, Hkv, num_rows, num_requests, page_size, num_sms) -> stage
+    ("sm_90a", 8, 1, 32, 32, 64, 132): "hq8_hkv1_vsub3_d",
+    ("sm_90a", 8, 1, 128, 1, 64, 132): "hq8_hkv1_vsub3_d",
+    ("sm_90a", 8, 1, 512, 512, 64, 132): "hq8_hkv1_vsub3_d",
+    ("sm_90a", 64, 8, 32, 32, 64, 132): "hq64_hkv8_w20_vsub18_d",
+    ("sm_90a", 64, 8, 128, 8, 64, 132): "hq64_hkv8",
+    ("sm_90a", 64, 8, 128, 128, 64, 132): "hq64_hkv8",
+    ("sm_90a", 64, 8, 128, 1, 64, 132): "hq64_hkv8_w20_vsub18_d",
+    ("sm_90a", 64, 8, 512, 512, 64, 132): "hq64_hkv8_d",
+    ("sm_100a", 8, 1, 32, 32, 64, 148): "hq8_hkv1",
+    ("sm_100a", 8, 1, 128, 128, 64, 148): "hq8_hkv1_vsub3_d",
+    ("sm_100a", 8, 1, 256, 32, 64, 148): "hq8_hkv1",
+    ("sm_100a", 8, 1, 512, 512, 64, 148): "hq8_hkv1_vsub3_d",
+    ("sm_100a", 64, 8, 32, 32, 64, 148): "hq64_hkv8_w20_vsub18_d",
+    ("sm_100a", 64, 8, 128, 8, 64, 148): "hq64_hkv8_w20_vsub18",
+    ("sm_100a", 64, 8, 128, 128, 64, 148): "hq64_hkv8_d_u2",
+    ("sm_100a", 64, 8, 128, 1, 64, 148): "hq64_hkv8_w20_vsub18",
+    ("sm_103a", 64, 8, 128, 128, 64, 148): "hq64_hkv8_d_u2",
+}
+
+
+@pytest.mark.parametrize("key,expected", sorted(_POLICY_TABLE.items()))
+def test_stage_policy_table(key, expected):
+    from flashinfer.jit.cake_fused_qk_rope_append import stage_for
+
+    arch, hq, hkv, rows, reqs, page, sms = key
+    assert (
+        stage_for(
+            hq,
+            hkv,
+            arch=arch,
+            num_rows=rows,
+            num_requests=reqs,
+            page_size=page,
+            num_sms=sms,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("arch", ["sm_90a", "sm_100a", "sm_103a"])
+def test_stage_policy_only_selects_shipped_builds(arch):
+    from flashinfer.jit.cake_fused_qk_rope_append import stage_for, stages_for
+
+    shipped = set(stages_for(arch))
+    for hq, hkv in ((8, 1), (64, 8)):
+        for page in (16, 32, 64, 128):
+            for reqs in (1, 2, 8, 32, 64, 128, 256, 257, 512, 1024):
+                for rows in sorted({reqs, 1, 32, 128, 148, 256, 512, 4096}):
+                    if rows < reqs:
+                        continue
+                    for sms in (132, 148):
+                        stage = stage_for(
+                            hq,
+                            hkv,
+                            arch=arch,
+                            num_rows=rows,
+                            num_requests=reqs,
+                            page_size=page,
+                            num_sms=sms,
+                        )
+                        assert stage in shipped, (
+                            arch,
+                            hq,
+                            hkv,
+                            rows,
+                            reqs,
+                            page,
+                            sms,
+                            stage,
+                        )
+
+
+def test_stage_for_without_shape_is_the_base_build():
+    from flashinfer.jit.cake_fused_qk_rope_append import stage_for
+
+    assert stage_for(8, 1) == "hq8_hkv1"
+    assert stage_for(64, 8) == "hq64_hkv8"
+    with pytest.raises(ValueError):
+        stage_for(16, 2)

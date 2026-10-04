@@ -4,7 +4,6 @@
   "compile_flags": [],
   "fused_block_tail_kcap": 1024,
   "fused_tail_kcap": 64,
-  "kernel_count": 91,
   "kernel_symbols": [
     "kernel_cake_radix_topk_c1_e4",
     "kernel_cake_radix_topk_c1_e8",
@@ -84,93 +83,34 @@
     "kernel_cake_sparse_topp_sample_t128_i2",
     "kernel_cake_sparse_topp_sample_t256_i2",
     "kernel_cake_sparse_topp_sample_t256_i4",
-    "kernel_cake_sparse_topp_sample_t512_i2",
     "kernel_cake_sparse_topp_sample_t32_i2_sel1",
     "kernel_cake_sparse_topp_sample_t64_i2_sel1",
     "kernel_cake_sparse_topp_sample_t128_i2_sel1",
     "kernel_cake_sparse_topp_sample_t256_i2_sel1",
     "kernel_cake_sparse_topp_sample_t256_i4_sel1",
-    "kernel_cake_sparse_topp_sample_t512_i2_sel1",
     "kernel_cake_sparse_topp_sample_t32_i2_int_sel1",
     "kernel_cake_sparse_topp_sample_t64_i2_int_sel1",
     "kernel_cake_sparse_topp_sample_t128_i2_int_sel1",
     "kernel_cake_sparse_topp_sample_t256_i2_int_sel1",
-    "kernel_cake_sparse_topp_sample_t256_i4_int_sel1",
-    "kernel_cake_sparse_topp_sample_t512_i2_int_sel1"
+    "kernel_cake_sparse_topp_sample_t256_i4_int_sel1"
   ],
   "min_compute_capability": [
     9,
     0
   ],
-  "schema_version": 1,
-  "semantics": {
-    "coarse_push": "launch_flags bit 8 selects the pushed-coarse-sums form of a streaming variant's default build (manifest entries with coarse_push true, symbol suffix _lg): on the variants whose cluster runs the two-level select, each CTA stores its 128 coarse histogram sums into every CTA's shared memory as it builds them, so the cluster-wide lower-bucket select reads its peers' sums locally instead of over distributed shared memory inside the select loop (round 8, lever L-G(d); outputs bit-identical); it is a twin of the default build only (bits 3, 4, 6 and 7 excluded) for two-launch chains (bit 0 excluded), and the host sets it only on the capabilities where it measured faster (9.0 / 10.3; B200 keeps the plain build)",
-    "coarse_sample": "launch_flags bit 4 selects a streaming variant's coarse-sample build (manifest entries with coarse_sample true, symbol suffix _cs): its sampled first pass reads one 64-byte block per 512 bytes of the row (1/8) instead of one per 256 (1/4), with the lower-bucket margin, the sampled-mass cap and the filter-arm density switch scaled to the rate; the exact passes and the fallbacks are unchanged, so every output is bit-identical to the default build; the host sets it for launches whose largest top-k is at most fused_tail_kcap (rows at the gather capacity, k ~ 1000, lose with the coarser estimate)",
-    "determinism": "strict: no atomics decide any output; slab (vals, idx) is rewritten in sorted order and renorm_out is emitted in that order, bitwise identical across launches, CUDA-graph replay and every kernel variant",
-    "early_trigger": "launch_flags bit 1 makes stage 1 issue griddepcontrol.launch_dependents early (register-resident variants: once the row is in registers; streaming variants: see stream_prepass) so a PDL-chained stage-2/3 launch starts on the SMs this grid leaves free; the host sets it only when batch <= sm_count - (batch * cluster mod sm_count, or sm_count) so the dependent CTAs are not packed onto a few SMs; otherwise the trigger is left to CTA exit",
-    "fused_tail": "stage 1 takes the stage-2/3 parameters and a host launch_flags word (bit 0 = fuse the tail, bit 1 = early PDL trigger, bit 2 = stream pre-pass trigger point); on a variant whose entry has fused_tail true, bit 0 set and max top-k <= fused_tail_kcap runs every row's stage 2/3 inside the stage-1 kernel (warp 0 of rank 0 after one cluster barrier) with the same outputs, and the stage-2/3 kernel is not launched; variants with fused_tail false (the ept = 48 resident, a large-k pick) are built without the tail and reject bit 0",
-    "nan_inf": "NaN, negative and -0.0 probabilities are sanitized to +0 and never sampled; a row containing +inf keeps exactly its +inf entries, samples uniformly among them and renormalizes to 1/m; a zero-mass row returns its smallest slab index with an all-zero renorm",
-    "rng": "one curand_uniform per row from curand_init(seed, row, offset) (Philox4x32-10); a shared torch.Generator is advanced by 32 * batch like the FlashInfer top-p routes",
-    "slab_tail": "launch_flags bit 7 (with bit 0 and bit 4 or bit 6) selects the slab-tail form of a streaming variant's sample build (manifest entries with slab_tail true: symbol suffix _cs_lb with coarse_sample, _sp_lb with spec_sample): the selected (key, index) pairs of a fused launch are pushed into rank 0's shared-memory slab with DSM stores and the two-warp tail reads them there instead of re-reading the global slab (round 8, lever L-B; outputs bit-identical); the default / whole-CTA-tail builds never carry it, so the k > fused_tail_kcap chains run binaries without the slab code; the host sets bit 7 only for fused launches on the capabilities where it measured faster (10.0 / 10.3)",
-    "spec_sample": "launch_flags bit 6 selects a streaming variant's speculative-sample build (manifest entries with spec_sample true, symbol suffix _sp): no separate sampled read; every warp loads its first register chunk (and the second where the row has one), histograms a strided subset of those registers as the sample (target 1/8 of the row for a largest top-k at most fused_tail_kcap, 1/2 above), keeps the chunk for the filter pass, which continues from the next chunk, and scales the lower-bucket margin and the sampled-mass cap to the realised sample rate; the exact passes and the fallbacks are unchanged, so every output is bit-identical to the default build; the host selects it per launch from the variant's cluster / ept and the row's register-chunk count (the measured win / loss table lives in the host policy, radix_sampling_pipeline.spec_sample_for); bits 4 and 6 are exclusive",
-    "stream_prepass": "launch_flags bit 2 selects the streaming variants' early-trigger site: with bits 1 and 2 they trigger before the first (sampled) pass, with bit 1 alone after the filter pass (once the whole row has been read); the host sets bit 2 on compute capability >= 10 (Blackwell, Rubin) and leaves it clear on Hopper; residents ignore it",
-    "top_k": "first k entries of lexsort(-prob, index): k largest sanitized probabilities, ties toward the lower vocabulary index; k clamped to [1, min(vocab, slab_entries)]",
-    "top_p": "shortest sorted prefix whose exclusive exact fixed-point mass is below p * mass(top-k), renormalized in float64; p clamped to (0, 1] (p <= 0 -> argmax, NaN -> 1)"
-  },
+  "schema_version": 2,
   "slab_entries": 1024,
   "source_files": [
-    {
-      "bytes": 1576,
-      "path": "cake_sampling_kernels.cu",
-      "sha256": "11a2418b169746e78ef2b7ef66fd85d683d0b6f55484d94f063136d01216493e"
-    },
-    {
-      "bytes": 4022252,
-      "path": "cake_sampling_kernels_part1.cuh",
-      "sha256": "b180250dc8ce531b92733dad000296443c7bd990f9f50ceb236d078a9ab0c76d"
-    },
-    {
-      "bytes": 4149012,
-      "path": "cake_sampling_kernels_part2.cuh",
-      "sha256": "6456a3b8a50d0058567aa5082dd78b9f180ca66df684c1379271049c7acf09f4"
-    },
-    {
-      "bytes": 3727352,
-      "path": "cake_sampling_kernels_part3.cuh",
-      "sha256": "2a9a88a4529d73cd172d0592bab5f9defeb0a23c7526d534f181e38d5474cd60"
-    },
-    {
-      "bytes": 3937837,
-      "path": "cake_sampling_kernels_part4.cuh",
-      "sha256": "2b53fb5111c38cf45a9dfb2ce7f4f2c09eac2ac76fd0d6349983391ae2c2402a"
-    },
-    {
-      "bytes": 4096715,
-      "path": "cake_sampling_kernels_part5.cuh",
-      "sha256": "13cbca6e6fe97f82f20f9982950313ea9a7f000ef0137ad5086b2fba5d668d22"
-    },
-    {
-      "bytes": 3875141,
-      "path": "cake_sampling_kernels_part6.cuh",
-      "sha256": "81124033f869bdb2c9eeb007bfb6cc73c1aa971aee92ebef9489c4235e9887f5"
-    },
-    {
-      "bytes": 4098849,
-      "path": "cake_sampling_kernels_part7.cuh",
-      "sha256": "d3e0de6a47f07ae6f4bad2f42bec09220cc94f64267656e63ebc2f7ce9cb0d1c"
-    },
-    {
-      "bytes": 3747185,
-      "path": "cake_sampling_kernels_part8.cuh",
-      "sha256": "1a2d13b4f52204c2413e33e2e89765e0ac1f41d1aa1ae94bdec2f1741af22e73"
-    },
-    {
-      "bytes": 1418110,
-      "path": "cake_sampling_kernels_part9.cuh",
-      "sha256": "893d2aa86f9cfa9b0cc34c024560f754b36c23f7c71416e3ce7d56079aab1e2f"
-    }
+    "cake_sampling_kernels.cu",
+    "cake_sampling_kernels_part1.cuh",
+    "cake_sampling_kernels_part2.cuh",
+    "cake_sampling_kernels_part3.cuh",
+    "cake_sampling_kernels_part4.cuh",
+    "cake_sampling_kernels_part5.cuh",
+    "cake_sampling_kernels_part6.cuh",
+    "cake_sampling_kernels_part7.cuh",
+    "cake_sampling_kernels_part8.cuh"
   ],
-  "source_sha256": "0df0c68387ec4e7b85522136b317c812228b103da69326ce15a0c9bb2fe3942f",
   "stage1": [
     {
       "block_threads": 512,
@@ -1271,6 +1211,7 @@
   "stage23": [
     {
       "block_threads": 32,
+      "capabilities": null,
       "capacity": 64,
       "dynamic_smem_bytes": 1152,
       "features": [],
@@ -1281,6 +1222,7 @@
     },
     {
       "block_threads": 64,
+      "capabilities": null,
       "capacity": 128,
       "dynamic_smem_bytes": 2176,
       "features": [],
@@ -1291,6 +1233,7 @@
     },
     {
       "block_threads": 128,
+      "capabilities": null,
       "capacity": 256,
       "dynamic_smem_bytes": 4224,
       "features": [],
@@ -1301,6 +1244,7 @@
     },
     {
       "block_threads": 256,
+      "capabilities": null,
       "capacity": 512,
       "dynamic_smem_bytes": 8320,
       "features": [],
@@ -1311,6 +1255,7 @@
     },
     {
       "block_threads": 256,
+      "capabilities": null,
       "capacity": 1024,
       "dynamic_smem_bytes": 16512,
       "features": [],
@@ -1320,17 +1265,17 @@
       "variant_flags": 0
     },
     {
-      "block_threads": 512,
-      "capacity": 1024,
-      "dynamic_smem_bytes": 16640,
-      "features": [],
-      "items": 2,
-      "symbol": "kernel_cake_sparse_topp_sample_t512_i2",
-      "threads": 512,
-      "variant_flags": 0
-    },
-    {
       "block_threads": 32,
+      "capabilities": [
+        [
+          9,
+          0
+        ],
+        [
+          10,
+          0
+        ]
+      ],
       "capacity": 64,
       "dynamic_smem_bytes": 1152,
       "features": [
@@ -1343,6 +1288,16 @@
     },
     {
       "block_threads": 64,
+      "capabilities": [
+        [
+          9,
+          0
+        ],
+        [
+          10,
+          0
+        ]
+      ],
       "capacity": 128,
       "dynamic_smem_bytes": 2176,
       "features": [
@@ -1355,6 +1310,16 @@
     },
     {
       "block_threads": 128,
+      "capabilities": [
+        [
+          9,
+          0
+        ],
+        [
+          10,
+          0
+        ]
+      ],
       "capacity": 256,
       "dynamic_smem_bytes": 4224,
       "features": [
@@ -1367,6 +1332,16 @@
     },
     {
       "block_threads": 256,
+      "capabilities": [
+        [
+          9,
+          0
+        ],
+        [
+          10,
+          0
+        ]
+      ],
       "capacity": 512,
       "dynamic_smem_bytes": 8320,
       "features": [
@@ -1379,6 +1354,16 @@
     },
     {
       "block_threads": 256,
+      "capabilities": [
+        [
+          9,
+          0
+        ],
+        [
+          10,
+          0
+        ]
+      ],
       "capacity": 1024,
       "dynamic_smem_bytes": 16512,
       "features": [
@@ -1390,19 +1375,13 @@
       "variant_flags": 2
     },
     {
-      "block_threads": 512,
-      "capacity": 1024,
-      "dynamic_smem_bytes": 16640,
-      "features": [
-        "one_cmp_select"
-      ],
-      "items": 2,
-      "symbol": "kernel_cake_sparse_topp_sample_t512_i2_sel1",
-      "threads": 512,
-      "variant_flags": 2
-    },
-    {
       "block_threads": 32,
+      "capabilities": [
+        [
+          10,
+          3
+        ]
+      ],
       "capacity": 64,
       "dynamic_smem_bytes": 1152,
       "features": [
@@ -1416,6 +1395,12 @@
     },
     {
       "block_threads": 64,
+      "capabilities": [
+        [
+          10,
+          3
+        ]
+      ],
       "capacity": 128,
       "dynamic_smem_bytes": 2176,
       "features": [
@@ -1429,6 +1414,12 @@
     },
     {
       "block_threads": 128,
+      "capabilities": [
+        [
+          10,
+          3
+        ]
+      ],
       "capacity": 256,
       "dynamic_smem_bytes": 4224,
       "features": [
@@ -1442,6 +1433,12 @@
     },
     {
       "block_threads": 256,
+      "capabilities": [
+        [
+          10,
+          3
+        ]
+      ],
       "capacity": 512,
       "dynamic_smem_bytes": 8320,
       "features": [
@@ -1455,6 +1452,12 @@
     },
     {
       "block_threads": 256,
+      "capabilities": [
+        [
+          10,
+          3
+        ]
+      ],
       "capacity": 1024,
       "dynamic_smem_bytes": 16512,
       "features": [
@@ -1465,20 +1468,6 @@
       "symbol": "kernel_cake_sparse_topp_sample_t256_i4_int_sel1",
       "threads": 256,
       "variant_flags": 3
-    },
-    {
-      "block_threads": 512,
-      "capacity": 1024,
-      "dynamic_smem_bytes": 16640,
-      "features": [
-        "int_tests",
-        "one_cmp_select"
-      ],
-      "items": 2,
-      "symbol": "kernel_cake_sparse_topp_sample_t512_i2_int_sel1",
-      "threads": 512,
-      "variant_flags": 3
     }
-  ],
-  "tma_abi": "grid_constant"
+  ]
 }

@@ -38,10 +38,16 @@ at ``(page_indices[b, pos // page_size], pos % page_size, kv_head)``.
 
 Supported: ``(Hq, Hkv) in {(8, 1), (64, 8)}``, head_dim 128, BF16 in/out, SM90
 (H100/H200), SM100 (B200) and SM103 (B300).  The kernel is generated from the
-Cake Weave schedule ``fused_qk_rmsnorm_rope_paged_kv_append_bf16``; sources and
-manifest live under ``csrc/cake_fused_qk_rope_append`` (JIT-only).  The call is
-CUDA-graph capturable: every launch argument is a by-value scalar or a tensor
-pointer, no host synchronisation or workspace is involved.
+Cake program ``fused_qk_rmsnorm_rope_paged_kv_append_bf16_v4``; sources
+and manifest live under ``csrc/cake_fused_qk_rope_append`` (JIT-only).  Several
+builds of the same schedule are shipped per architecture (warps per row, request
+lookup, V placement, clearing granularity); the host picks one from the
+architecture and the problem shape with the Cake policy mirrored in
+:func:`flashinfer.jit.cake_fused_qk_rope_append.stage_for` - every build writes
+bit-identical outputs.  The call is CUDA-graph capturable: every launch argument
+is a by-value scalar or a tensor pointer, no host synchronisation or workspace
+is involved; the selected build depends only on shapes, so a captured graph
+replays the same build.
 """
 
 from __future__ import annotations
@@ -52,20 +58,14 @@ import torch
 
 from .jit.cake_fused_qk_rope_append import (
     arch_for,
+    clear_units_per_request,
     load_cake_fused_qk_rope_append_module,
     stage_for,
 )
 from .utils import get_compute_capability
 
 HEAD_DIM = 128
-_VEC = 8
-_CLEAR_UNIT_CHUNKS = 256
 _THREADS = 128
-
-
-def _clear_units_per_request(page_size: int, num_kv_heads: int) -> int:
-    chunks = page_size * num_kv_heads * HEAD_DIM // _VEC
-    return 2 * ((chunks + _CLEAR_UNIT_CHUNKS - 1) // _CLEAR_UNIT_CHUNKS)
 
 
 def launch_plan(
@@ -74,13 +74,18 @@ def launch_plan(
     page_size: int,
     num_kv_heads: int,
     warps_per_row: int,
+    clear_units_per_warp: int = 1,
 ) -> dict[str, Any]:
-    """Grid and host-derived scalars (mirrors the Cake kernel's ``launch_plan``)."""
+    """Grid and host-derived scalars (mirrors the Cake kernel's ``launch_plan``).
+
+    ``warps_per_row`` / ``clear_units_per_warp`` are the selected stage's constexpr specialization.
+    """
     rows_per_cta = max(1, 4 // warps_per_row)
-    ctas_per_row = max(1, warps_per_row // 4)
+    ctas_per_row = (warps_per_row + 3) // 4
     num_row_ctas = ((num_rows + rows_per_cta - 1) // rows_per_cta) * ctas_per_row
-    units = _clear_units_per_request(page_size, num_kv_heads)
-    num_clear_ctas = (num_requests * units + 3) // 4
+    units = clear_units_per_request(page_size, num_kv_heads)
+    warps_per_request = (units + clear_units_per_warp - 1) // clear_units_per_warp
+    num_clear_ctas = (num_requests * warps_per_request + 3) // 4
     return {
         "num_row_ctas": num_row_ctas,
         "clear_units_per_request": units,
@@ -250,13 +255,27 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
         _check(t.is_contiguous(), f"{name} must be contiguous")
         _check(t.device == device, f"{name} must be on {device}")
 
-    stage = stage_for(num_q_heads, num_kv_heads)
     arch = arch_for(get_compute_capability(device))
-    module, record = load_cake_fused_qk_rope_append_module(stage, arch)
-    warps_per_row = int(
-        dict(record["route"]).get("specialization", {}).get("WARPS_PER_ROW", 1)
+    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    stage = stage_for(
+        num_q_heads,
+        num_kv_heads,
+        arch=arch,
+        num_rows=num_rows,
+        num_requests=num_requests,
+        page_size=page_size,
+        num_sms=num_sms,
     )
-    plan = launch_plan(num_rows, num_requests, page_size, num_kv_heads, warps_per_row)
+    module, record = load_cake_fused_qk_rope_append_module(stage, arch)
+    specialization = dict(record["route"]).get("specialization", {})
+    plan = launch_plan(
+        num_rows,
+        num_requests,
+        page_size,
+        num_kv_heads,
+        int(specialization.get("WARPS_PER_ROW", 1)),
+        int(specialization.get("CLEAR_UNITS_PER_WARP", 1)),
+    )
     scalars = {
         "num_rows": num_rows,
         "num_requests": num_requests,

@@ -47,13 +47,14 @@ Host work is split exactly like the Cake production launcher:
   tiles.
 * :func:`allocate_kimi_k3_fp8_projection_workspace` -- once per ``M``: the E4M3
   activation ``[M, K]`` and the auxiliary byte workspace (activation scale
-  tiles, split-K partial tiles and self-resetting per-tile counters; zero
-  initialised once).
-* :func:`prepare_kimi_k3_fp8_projection` -- selects the route from the measured
-  per-architecture dispatch table (:mod:`.decode_table`) and binds the launch
-  sequence to the generated argument plans.  The returned runner's ``launch()``
-  performs no allocation and no host synchronisation and is CUDA-graph
-  capturable.
+  tiles and self-resetting per-tile counters, zero initialised once; split-K
+  partial tiles, written before they are read).
+* :func:`prepare_kimi_k3_fp8_projection` -- resolves the route once from the
+  measured dispatch table (:mod:`.decode_table`; one table for both
+  architectures with per-architecture overrides) and the device's cached
+  architecture / SM count, and binds the launch sequence to the generated
+  argument plans.  The returned runner's ``launch()`` performs no allocation
+  and no host synchronisation and is CUDA-graph capturable.
 
 The host dispatch reproduces the Cake dispatcher's measured table for the
 representative ``(N, K)`` families; the generated-program export checks route,
@@ -63,6 +64,7 @@ configuration and bitwise output parity on every contract row.  See
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional, Sequence
 
@@ -74,13 +76,14 @@ from .cake_jit import (
     GEMM_RSTAGED_KERNEL_KEY,
     GEMM_TSTORE_KERNEL_KEY,
     MODULES,
+    Defines,
     decode_kernel_key,
-    kernel_module_name,
+    kernel_program,
     load_cake_kimi_k3_fp8_projection_module,
     quant_kernel_key,
     route_available,
 )
-from .decode_table import DECODE_TABLE
+from .decode_table import ARCHES, decode_table
 
 # ---------------------------------------------------------------------------
 # Fixed geometry of the generated programs
@@ -117,7 +120,35 @@ DEC_QUANT_WARPS = (
 )
 DEC_RES_SLOTS = 4  # work items per CTA the resident decode instance can hold
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-ARCHES = tuple(sorted(DECODE_TABLE))
+
+
+class DeviceFacts(NamedTuple):
+    """The two device properties the host dispatch depends on (queried once per device)."""
+
+    arch: str
+    sm_count: int
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+@functools.cache
+def _device_facts(device_index: int) -> DeviceFacts:
+    """Architecture and SM count of ``cuda:device_index`` from one property query, cached per device."""
+    props = torch.cuda.get_device_properties(device_index)
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get((int(props.major), int(props.minor)))
+    if arch is None:
+        raise ValueError(
+            "the Kimi-K3 FP8 projection requires compute capability 10.0 or 10.3 "
+            f"(got {props.major}.{props.minor})"
+        )
+    return DeviceFacts(arch, int(props.multi_processor_count))
+
+
+def device_facts(device: torch.device) -> DeviceFacts:
+    return _device_facts(_device_index(device))
+
 
 # Contract families (n_valid, K) of the Kimi-K3 FP8_PB_WO projections: TP8 first, then TP1.
 PROJECTION_FAMILIES: dict[str, dict[str, tuple[int, int]]] = {
@@ -268,15 +299,15 @@ def activation_sf_workspace_bytes(M: int, K: int, sf_rows: int = SF_TILE_ROWS) -
 # ---------------------------------------------------------------------------
 
 
-def quant_units(M: int, k_blocks: int) -> int:
+def quant_units(M: int, k_blocks: int, sm_count: int) -> int:
     """K blocks per half warp of the quantization launch: 1 for M <= 256 (maximal parallelism), 4 / 2 / 8
-    for large M when they divide the K blocks and keep at least four CTAs per SM busy."""
+    for large M when they divide the K blocks and keep at least four CTAs per SM of the device busy."""
     if M <= DECODE_MAX_M:
         return 1
     for units in (4, 2, 8):
         if (
             k_blocks % units == 0
-            and (M * k_blocks) // units >= 148 * QUANT_WARPS * 2 * 4
+            and (M * k_blocks) // units >= int(sm_count) * QUANT_WARPS * 2 * 4
         ):
             return units
     return 1
@@ -308,21 +339,18 @@ def decode_module_stages(
     )
 
 
-# Co-resident cluster capacity of the cluster split-K decode instances per architecture and cluster size
+# Co-resident cluster capacity of the cluster split-K decode instances per cluster size
 # (``cuOccupancyMaxActiveClusters`` of the ``_cs<C>`` instance; one CTA per SM, so it depends only on the GPC topology).
 # A persistent cluster grid larger than ``C x capacity`` serialises whole clusters into a second pass.  Measured on
-# B200 / B300; mirrors the source repository's table.
-DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
-    "sm_100a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15},  # B200, 148 SMs
-    "sm_103a": {
-        2: 74,
-        3: 45,
-        4: 33,
-        5: 26,
-        6: 22,
-        7: 15,
-        8: 15,
-    },  # B300, 148 SMs (same GPC topology)
+# B200 and B300 (148 SMs, the same GPC topology, identical capacities); mirrors the source repository's table.
+DECODE_MAX_ACTIVE_CLUSTERS: dict[int, int] = {
+    2: 74,
+    3: 45,
+    4: 33,
+    5: 26,
+    6: 22,
+    7: 15,
+    8: 15,
 }
 
 
@@ -383,14 +411,13 @@ def decode_cs_small_inbox_rounds(
     return -(-tpc // max(chunk, 4))
 
 
-def decode_cluster_capacity(arch: str, csplit: int) -> int:
-    """Co-resident cluster capacity of ``arch`` for cluster size ``csplit`` (tabulated; raises when not measured)."""
-    table = DECODE_MAX_ACTIVE_CLUSTERS.get(arch, {})
-    if csplit not in table:
+def decode_cluster_capacity(csplit: int) -> int:
+    """Co-resident cluster capacity for cluster size ``csplit`` (tabulated; raises when not measured)."""
+    if csplit not in DECODE_MAX_ACTIVE_CLUSTERS:
         raise ValueError(
-            f"cluster capacity of {arch} for csplit {csplit} is not tabulated (DECODE_MAX_ACTIVE_CLUSTERS)"
+            f"cluster capacity for csplit {csplit} is not tabulated (DECODE_MAX_ACTIVE_CLUSTERS)"
         )
-    return int(table[csplit])
+    return int(DECODE_MAX_ACTIVE_CLUSTERS[csplit])
 
 
 @dataclass(frozen=True)
@@ -440,9 +467,9 @@ def decode_table_entry(
     M: int, n_tiles128: int, num_k_iters: int, arch: str
 ) -> Optional[dict[str, Any]]:
     """Measured table entry for the shape, or ``None`` when the architecture / family is not tabulated."""
-    per_arch = DECODE_TABLE.get(arch)
-    if not per_arch:
+    if arch not in ARCHES:
         return None
+    per_arch = decode_table(arch)
     bucket = next((b for b in DECODE_TABLE_BUCKETS if b >= M), None)
     if bucket is None:
         return None
@@ -524,9 +551,7 @@ def decode_config(
     )
     if csplit > 1:
         # Whole clusters, and no more clusters than the GPCs co-schedule (a second pass of clusters doubles the time).
-        grid = csplit * max(
-            1, min(grid // csplit, decode_cluster_capacity(arch, csplit))
-        )
+        grid = csplit * max(1, min(grid // csplit, decode_cluster_capacity(csplit)))
     resident = (
         bool(entry.get("resident", False))
         and fused
@@ -569,7 +594,7 @@ def decode_config(
     )
 
 
-def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
+def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
     """Every logical kernel the dispatch table can select on ``arch`` (all buckets of every tabulated family)
     plus the GEMM and the quantization widths the large-M rule can pick (``u8`` needs a K-block count divisible
     by 8 but not by 4, which does not exist)."""
@@ -581,7 +606,7 @@ def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
         GEMM_TSTORE_KERNEL_KEY,
         GEMM_RSTAGED_KERNEL_KEY,
     ]
-    for key in DECODE_TABLE.get(arch, {}):
+    for key in decode_table(arch):
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
         for M in _bucket_rows(bucket):
             cfg = decode_config(M, n_tiles128, num_k_iters, arch, sm_count)
@@ -757,25 +782,10 @@ def prepare_kimi_k3_fp8_projection_weights(
 
 class ProjectionWorkspace(NamedTuple):
     """Caller-owned workspaces of one ``M``: the E4M3 activation ``q [M, K]`` and the auxiliary byte buffer
-    ``sf`` (activation scale tiles + decode split-K partials + per-tile counters; zero initialised once)."""
+    ``sf`` (activation scale tiles + decode split-K partials + per-tile counters)."""
 
     q: torch.Tensor
     sf: torch.Tensor
-
-
-def _device_arch(device: torch.device) -> str:
-    capability = torch.cuda.get_device_capability(device)
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
-    if arch is None:
-        raise ValueError(
-            "the Kimi-K3 FP8 projection requires compute capability 10.0 or 10.3 "
-            f"(got {capability[0]}.{capability[1]})"
-        )
-    return arch
-
-
-def _sm_count(device: torch.device) -> int:
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
 def reduction_layout(
@@ -815,18 +825,25 @@ def workspace_sf_bytes(
 def allocate_kimi_k3_fp8_projection_workspace(
     prepared: PreparedProjectionWeight, M: int
 ) -> ProjectionWorkspace:
-    """Allocate the caller-owned workspaces for ``M`` activation rows on the weight's device (no launch)."""
+    """Allocate the caller-owned workspaces for ``M`` activation rows on the weight's device (no launch).
+
+    Only the activation scale tiles (their padding rows must read as zero scales) and the per-tile counters are
+    zero initialised; the split-K partials need no initial value: every producer CTA writes its partial tile
+    before its release-add on the tile counter, and only the last-arriving CTA reads the partials of the other
+    ranks after its acquire of that counter, so no partial is read before it is written.  The programs leave the
+    counters reset, so one workspace serves every launch of this ``M``."""
     M = int(M)
     if M < 1:
         raise ValueError("M must be positive")
     device = prepared.device
-    arch = _device_arch(device)
-    q = torch.empty((M, prepared.K), dtype=torch.float8_e4m3fn, device=device)
-    sf = torch.zeros(
-        (workspace_sf_bytes(prepared, M, arch, _sm_count(device)),),
-        dtype=torch.uint8,
-        device=device,
+    facts = device_facts(device)
+    cfg = decode_config(
+        M, prepared.n_tiles128, prepared.num_k_iters, facts.arch, facts.sm_count
     )
+    _c_off, _c_bytes, p_off, p_bytes = reduction_layout(prepared, M, cfg)
+    q = torch.empty((M, prepared.K), dtype=torch.float8_e4m3fn, device=device)
+    sf = torch.empty((p_off + p_bytes,), dtype=torch.uint8, device=device)
+    sf[:p_off].zero_()
     return ProjectionWorkspace(q, sf)
 
 
@@ -861,8 +878,8 @@ def _store_vec(data_ptr: int, ldo: int) -> int:
 
 
 def gemm_reg_staged_eligible(tma_store: bool, store_vec: int) -> bool:
-    """Staged row-coalesced register epilogue (round 5) for output views the TMA store cannot address but whose rows
-    are at least 8-byte aligned (``store_vec >= 4``; e.g. ``n_valid = 6284``): the tile is staged in SMEM and copied
+    """Staged row-coalesced register epilogue for output views the TMA store cannot address but whose rows are
+    at least 8-byte aligned (``store_vec >= 4``; e.g. ``n_valid = 6284``): the tile is staged in SMEM and copied
     out row by row so every store instruction writes whole 32-byte sectors."""
     return not tma_store and int(store_vec) >= 4
 
@@ -882,6 +899,15 @@ GEMM_TS_COLS = (
 )  # [rows, BF16 columns] of the ``OUT`` descriptor placeholder of the register-epilogue GEMM
 
 
+@functools.cache
+def _placeholder_out_map(device_index: int) -> torch.Tensor:
+    """The tensor behind the ``OUT`` descriptor of the register-epilogue GEMM programs, which never access it:
+    one per device, allocated on first use and shared by every prepared runner."""
+    return torch.zeros(
+        GEMM_TS_COLS, dtype=torch.bfloat16, device=torch.device("cuda", device_index)
+    )
+
+
 @dataclass(frozen=True)
 class ProjectionPlan:
     """The resolved route of one ``(x, prepared, out, workspace)`` binding."""
@@ -896,11 +922,18 @@ class ProjectionPlan:
     quant_units: Optional[int]  # None when the decode instance quantizes in-CTA
     sf_rows: int
     kernels: tuple[str, ...]  # logical kernel key per launch, in launch order
-    modules: tuple[str, ...]  # registered module per launch
+    programs: tuple[
+        tuple[str, Defines], ...
+    ]  # (registered program, compile-line defines) per launch
     grids: tuple[int, ...]
     counters_offset: int
+    counters_bytes: int
     partials_offset: int
     partials_bytes: int
+
+    @property
+    def workspace_sf_bytes(self) -> int:
+        return self.partials_offset + self.partials_bytes
 
 
 def route_plan(
@@ -908,22 +941,24 @@ def route_plan(
     M: int,
     arch: str,
     sm_count: int,
+    cfg: Optional[DecodeConfig],
+    *,
     gemm_tma_store: bool = True,
     gemm_reg_staged: bool = False,
 ) -> ProjectionPlan:
-    """Resolve the launch sequence of ``M`` rows without touching device memory.
+    """Resolve the launch sequence of ``M`` rows from the resolved decode route ``cfg`` (``None`` = quantization
+    launch + GEMM) without touching device memory.
 
     ``gemm_tma_store`` / ``gemm_reg_staged`` select the GEMM epilogue program (``gemm_tma_store_eligible`` /
     ``gemm_reg_staged_eligible`` of the output view)."""
     M = int(M)
-    cfg = decode_config(M, prepared.n_tiles128, prepared.num_k_iters, arch, sm_count)
-    c_off, _c_bytes, p_off, p_bytes = reduction_layout(prepared, M, cfg)
+    c_off, c_bytes, p_off, p_bytes = reduction_layout(prepared, M, cfg)
     kernels: list[str] = []
     grids: list[int] = []
     units: Optional[int] = None
     if cfg is None or not cfg.fused:
         k_blocks = prepared.K // BLOCK
-        units = quant_units(M, k_blocks)
+        units = quant_units(M, k_blocks, sm_count)
         units_per_row = k_blocks // units
         kernels.append(quant_kernel_key(units))
         grids.append(-(-(M * units_per_row) // (QUANT_WARPS * 2)))
@@ -950,9 +985,10 @@ def route_plan(
         quant_units=units,
         sf_rows=cfg.tok if cfg is not None else SF_TILE_ROWS,
         kernels=tuple(kernels),
-        modules=tuple(kernel_module_name(arch, key) for key in kernels),
+        programs=tuple(kernel_program(arch, key) for key in kernels),
         grids=tuple(grids),
         counters_offset=c_off,
+        counters_bytes=c_bytes,
         partials_offset=p_off,
         partials_bytes=p_bytes,
     )
@@ -967,38 +1003,45 @@ def generated_program_available(
 
     With ``M`` and ``prepared`` the check names the exact launch sequence of that call; without them it asks
     whether every kernel the dispatch table can select on the device's architecture is registered."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
-    if arch is None:
+    try:
+        facts = device_facts(device)
+    except ValueError:
         return False
     if M is None and prepared is None:
         return bool(MODULES) and route_available(
-            arch, required_kernel_keys(arch, _sm_count(device))
+            facts.arch, required_kernel_keys(facts.arch, facts.sm_count)
         )
     if M is None or prepared is None:
         raise ValueError("pass both M and prepared or neither")
+    cfg = decode_config(
+        int(M), prepared.n_tiles128, prepared.num_k_iters, facts.arch, facts.sm_count
+    )
     try:
-        route_plan(prepared, int(M), arch, _sm_count(device))
+        route_plan(prepared, int(M), facts.arch, facts.sm_count, cfg)
     except NotImplementedError:
         return False
     return True
 
 
-def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the generated argument plan of ``module_name`` and load its entry."""
-    record = MODULES[module_name]
+def _bind(
+    program: tuple[str, Defines], arch: str, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple]:
+    """Order ``kwargs`` by the generated argument plan of ``program`` and load its entry for ``arch``."""
+    name, defines = program
+    record = MODULES[name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
-    for kind, name in record["arg_plan"]:
+    for kind, argument in record["arg_plan"]:
         if kind == "grid":
-            arguments.append(grid[name])
-        elif name in kwargs:
-            arguments.append(kwargs[name])
+            arguments.append(grid[argument])
+        elif argument in kwargs:
+            arguments.append(kwargs[argument])
         else:
             raise KeyError(
-                f"generated module {module_name!r} expects argument {name!r} "
+                f"generated program {name!r} expects argument {argument!r} "
                 f"({kind}); host binding provides {sorted(kwargs)}"
             )
-    module = load_cake_kimi_k3_fp8_projection_module(module_name)
+    module = load_cake_kimi_k3_fp8_projection_module(name, arch, defines)
     return getattr(module, record["ffi_entry"]), tuple(arguments)
 
 
@@ -1032,16 +1075,8 @@ class KimiK3Fp8ProjectionRunner:
         return len(self.launches)
 
 
-def validate_kimi_k3_fp8_projection_inputs(
-    x: torch.Tensor,
-    prepared: PreparedProjectionWeight,
-    out: torch.Tensor,
-    workspace: ProjectionWorkspace,
-    *,
-    arch: str,
-    sm_count: int,
-) -> int:
-    """Shape / dtype / alignment validation of one call; returns ``M``."""
+def _activation_rows(x: torch.Tensor, prepared: PreparedProjectionWeight) -> int:
+    """``M`` of a valid activation binding (the kernels read ``x`` row-major with row stride ``K``)."""
     if (
         x.dtype != torch.bfloat16
         or x.dim() != 2
@@ -1052,6 +1087,20 @@ def validate_kimi_k3_fp8_projection_inputs(
     M = int(x.shape[0])
     if M < 1:
         raise ValueError("M must be positive")
+    return M
+
+
+def validate_kimi_k3_fp8_projection_inputs(
+    x: torch.Tensor,
+    prepared: PreparedProjectionWeight,
+    out: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    *,
+    sf_bytes: int,
+) -> int:
+    """Shape / dtype / alignment validation of one call (``sf_bytes``: the auxiliary workspace the resolved route
+    needs); returns ``M``."""
+    M = _activation_rows(x, prepared)
     if x.device != prepared.device or out.device != prepared.device:
         raise ValueError("x, out and the prepared weight must be on one CUDA device")
     if (
@@ -1079,7 +1128,7 @@ def validate_kimi_k3_fp8_projection_inputs(
         raise ValueError(
             f"workspace.q must be a contiguous float8_e4m3fn [{M}, {prepared.K}] tensor"
         )
-    needed = workspace_sf_bytes(prepared, M, arch, sm_count)
+    needed = int(sf_bytes)
     if (
         sf.dtype != torch.uint8
         or sf.dim() != 1
@@ -1107,28 +1156,33 @@ def prepare_kimi_k3_fp8_projection(
 
     ``out`` is a ``[M, n_valid]`` BF16 view with unit column stride and an even row stride (any view into a
     wider buffer); ``workspace`` comes from :func:`allocate_kimi_k3_fp8_projection_workspace` for this ``M``
-    (its ``sf`` buffer must have been zero initialised once; the programs keep the counters reset).  The JIT
-    modules of the route are built and loaded here, so prepare outside CUDA Graph capture."""
+    (its scale-tile and counter bytes zero initialised once; the programs keep the counters reset).  The route
+    is resolved once here from the device's cached architecture / SM count; the JIT modules of the route are
+    built and loaded here, so prepare outside CUDA Graph capture."""
     device = prepared.device
-    arch = _device_arch(device)
-    device_index = (
-        device.index if device.index is not None else torch.cuda.current_device()
+    device_index = _device_index(device)
+    facts = device_facts(device)
+    M = _activation_rows(x, prepared)
+    cfg = decode_config(
+        M, prepared.n_tiles128, prepared.num_k_iters, facts.arch, facts.sm_count
     )
-    sm_count = _sm_count(device)
-    M = validate_kimi_k3_fp8_projection_inputs(
-        x, prepared, out, workspace, arch=arch, sm_count=sm_count
-    )
-    q, sf = workspace
-    ldo = int(out.stride(0))
+    ldo = int(out.stride(0)) if out.dim() == 2 else 0
     tma_store = gemm_tma_store_eligible(out.data_ptr(), ldo, prepared.n_valid)
     plan = route_plan(
         prepared,
         M,
-        arch,
-        sm_count,
-        tma_store,
-        gemm_reg_staged_eligible(tma_store, _store_vec(out.data_ptr(), ldo)),
+        facts.arch,
+        facts.sm_count,
+        cfg,
+        gemm_tma_store=tma_store,
+        gemm_reg_staged=gemm_reg_staged_eligible(
+            tma_store, _store_vec(out.data_ptr(), ldo)
+        ),
     )
+    validate_kimi_k3_fp8_projection_inputs(
+        x, prepared, out, workspace, sf_bytes=plan.workspace_sf_bytes
+    )
+    q, sf = workspace
     out_flat = torch.as_strided(
         out, (ldo * (M - 1) + prepared.n_valid,), (1,), out.storage_offset()
     )
@@ -1144,7 +1198,8 @@ def prepare_kimi_k3_fp8_projection(
             k_blocks = prepared.K // BLOCK
             launches.append(
                 _bind(
-                    plan.modules[stage],
+                    plan.programs[stage],
+                    facts.arch,
                     dict(
                         x=x,
                         a_q=q,
@@ -1159,18 +1214,14 @@ def prepare_kimi_k3_fp8_projection(
                 )
             )
             stage += 1
-        cfg = plan.decode
         if cfg is None:
             # ``OUT`` is the TMA-store descriptor over the [M, n_valid] output view (clipped rows / columns are never
-            # written); the register-epilogue program receives a placeholder map it never accesses.
-            out_map = (
-                out
-                if plan.gemm_tma_store
-                else torch.zeros(GEMM_TS_COLS, dtype=torch.bfloat16, device=device)
-            )
+            # written); the register-epilogue programs receive the per-device placeholder map they never access.
+            out_map = out if plan.gemm_tma_store else _placeholder_out_map(device_index)
             launches.append(
                 _bind(
-                    plan.modules[stage],
+                    plan.programs[stage],
+                    facts.arch,
                     dict(
                         A=a_u8,
                         B=b_u8,
@@ -1193,10 +1244,16 @@ def prepare_kimi_k3_fp8_projection(
                 )
             )
         else:
-            c_off, c_bytes, p_off, p_bytes = reduction_layout(prepared, M, cfg)
+            c_off, c_bytes, p_off, p_bytes = (
+                plan.counters_offset,
+                plan.counters_bytes,
+                plan.partials_offset,
+                plan.partials_bytes,
+            )
             launches.append(
                 _bind(
-                    plan.modules[stage],
+                    plan.programs[stage],
+                    facts.arch,
                     dict(
                         W=b_u8,
                         X=a_u8,

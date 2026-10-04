@@ -197,16 +197,6 @@ def fill_w_ptr(
     return weights.stride(0)
 
 
-def _cake_tensor_signature(tensor: torch.Tensor) -> tuple:
-    return (
-        int(tensor.data_ptr()),
-        tuple(int(dim) for dim in tensor.shape),
-        tuple(int(stride) for stride in tensor.stride()),
-        tensor.dtype,
-        tensor.device,
-    )
-
-
 def _cake_dtype_name(dtype: torch.dtype) -> Literal["bfloat16", "float16"]:
     if dtype == torch.bfloat16:
         return "bfloat16"
@@ -247,9 +237,12 @@ class _BGMVMoEGraphPlan:
         self.y_accum = y_accum
         self.shrink_out = shrink_out
         self.x = x
-        self._bound_tensors = bound_tensors
-        self._bound_signatures = tuple(
-            _cake_tensor_signature(tensor) for tensor in bound_tensors
+        # One (tensor, data_ptr, shape, stride) record per bound tensor. A
+        # tensor's dtype and device cannot change in place, so the per-call
+        # check compares only what ``set_``/``resize_`` can move.
+        self._bound = tuple(
+            (tensor, tensor.data_ptr(), tensor.shape, tensor.stride())
+            for tensor in bound_tensors
         )
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._capture_stream: Optional[torch.cuda.Stream] = None
@@ -257,14 +250,16 @@ class _BGMVMoEGraphPlan:
         self._lock = threading.RLock()
 
     def _validate_binding(self) -> None:
-        current = tuple(
-            _cake_tensor_signature(tensor) for tensor in self._bound_tensors
-        )
-        if current != self._bound_signatures:
-            raise RuntimeError(
-                f"{type(self).__name__} tensor storage, shape, stride, dtype, or "
-                "device changed after preparation"
-            )
+        for tensor, data_ptr, shape, stride in self._bound:
+            if (
+                tensor.data_ptr() != data_ptr
+                or tensor.shape != shape
+                or tensor.stride() != stride
+            ):
+                raise RuntimeError(
+                    f"{type(self).__name__} tensor storage, shape or stride "
+                    "changed after preparation"
+                )
 
     def _launch(self) -> None:  # pragma: no cover - implemented by subclasses
         raise NotImplementedError
@@ -582,7 +577,7 @@ def prepare_bgmv_moe(
     topk_weights: torch.Tensor,
     num_experts: int,
     *,
-    backend: Literal["cake", "blackwell"] = "cake",
+    backend: Literal["cake"] = "cake",
     fallback: bool = True,
     shrink_out: Optional[torch.Tensor] = None,
     y_accum: Optional[torch.Tensor] = None,
@@ -629,14 +624,16 @@ def prepare_bgmv_moe(
         lora_indices: LoRA index for each input token.
         topk_weights: FP32 routing weight for each routed pair.
         num_experts: Number of experts in the LoRA tensors.
-        backend: Backend selector. ``"cake"`` selects the generated Cake
-            programs; ``"blackwell"`` is accepted as a compatible alias.
+        backend: Backend selector; only ``"cake"`` (the generated Cake
+            programs) is supported.
         fallback: Serve unsupported inputs with the portable path instead of
             raising.
         shrink_out: Optional pointer-stable shrink workspace with shape
             ``[num_slices, num_pairs, rank]`` and the weight dtype.
         y_accum: Optional pointer-stable FP32 output accumulator with shape
-            ``[num_tokens, sum(feat_out)]``.
+            ``[num_tokens, sum(feat_out)]``. The Cake path writes it through
+            its row stride, so it may be a column slice of a wider row-major
+            buffer; the portable fallback needs a contiguous accumulator.
 
     Returns:
         A reusable graph-backed execution plan whose ``run`` method returns
@@ -644,9 +641,9 @@ def prepare_bgmv_moe(
         ``"portable"``.
     """
 
-    if backend not in ("cake", "blackwell"):
+    if backend != "cake":
         raise ValueError(
-            f"prepare_bgmv_moe only supports backend='cake' (alias 'blackwell'), got {backend}"
+            f"prepare_bgmv_moe only supports backend='cake', got {backend}"
         )
     from ..jit.cake_bgmv_moe import cake_bgmv_moe_arch_for_capability
 
@@ -775,12 +772,17 @@ def prepare_bgmv_moe(
             f"y_accum must have shape {expected_output} and dtype torch.float32"
         )
     for name, tensor in (("shrink_out", shrink_out), ("y_accum", y_accum)):
-        if (
-            not tensor.is_cuda
-            or tensor.device != x.device
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(f"{name} must be a contiguous tensor on {x.device}")
+        if not tensor.is_cuda or tensor.device != x.device:
+            raise ValueError(f"{name} must be a tensor on {x.device}")
+    if not shrink_out.is_contiguous():
+        raise ValueError("shrink_out must be contiguous")
+    if y_accum.stride(1) != 1 or y_accum.stride(0) < y_accum.shape[1]:
+        raise ValueError(
+            "y_accum must be contiguous along its last dimension with a row "
+            "stride of at least its width"
+        )
+    if reason is not None and not y_accum.is_contiguous():
+        raise ValueError("y_accum must be contiguous for the portable fallback path")
 
     if reason is not None:
         _warn_fallback_once(reason)
