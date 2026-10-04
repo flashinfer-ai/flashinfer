@@ -96,6 +96,7 @@ def _get_split_kv_and_workspace_size(
     max_active_blocks: int,
     max_seq_len: Optional[int] = None,
     occupancy_q_tiles: Optional[int] = None,
+    split_kv_override: Optional[int] = None,
 ) -> Tuple[int, int]:
     """Return the nonempty split count and its workspace requirement.
 
@@ -123,9 +124,21 @@ def _get_split_kv_and_workspace_size(
             "occupancy_q_tiles must be in "
             f"[1, {rectangular_q_tiles}], got {occupancy_q_tiles}"
         )
-    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
-        1, occupancy_q_tiles, max_active_blocks, _STATIC_REDUCER_MAX_SPLITS
-    )
+    if split_kv_override is None:
+        split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
+            1, occupancy_q_tiles, max_active_blocks, _STATIC_REDUCER_MAX_SPLITS
+        )
+    else:
+        if (
+            not isinstance(split_kv_override, int)
+            or isinstance(split_kv_override, bool)
+            or not 1 <= split_kv_override <= MAX_SPLITS
+        ):
+            raise ValueError(
+                f"split_kv must be an integer in [1, {MAX_SPLITS}], "
+                f"got {split_kv_override!r}"
+            )
+        split_kv = split_kv_override
     if max_seq_len is not None:
         if max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
@@ -468,6 +481,7 @@ def cute_dsl_mla_decode(
     cp_world: int = 1,
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+    split_kv: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -499,6 +513,10 @@ def cute_dsl_mla_decode(
         [B] — per-request KV sequence lengths.
     max_seq_len : int
         Maximum sequence length across the batch.
+    split_kv : Optional[int]
+        Requested upper bound on the number of KV partitions. The final count
+        may be reduced when ``max_seq_len`` cannot fill every partition. If
+        ``None``, the default occupancy heuristic selects the split count.
     softmax_scale : float
         Scale factor for QK^T before softmax.
     output_scale : float
@@ -729,6 +747,7 @@ def cute_dsl_mla_decode(
         max_active_blocks,
         max_seq_len,
         occupancy_q_tiles=occupancy_q_tiles,
+        split_kv_override=split_kv,
     )
 
     is_persistent = not is_var_seq
