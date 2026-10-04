@@ -228,7 +228,9 @@ def _config(
         ),
         activation=SwiGLUStep() if activation is None else activation,
         backend=backend,
-        execution=ExecutionConfig(enable_pdl=enable_pdl, tune_max_num_tokens=num_tokens),
+        execution=ExecutionConfig(
+            enable_pdl=enable_pdl, tune_max_num_tokens=num_tokens
+        ),
     )
 
 
@@ -283,7 +285,9 @@ def _kernel_view(precision: str, static: dict, limits: torch.Tensor) -> dict:
     raise KeyError(precision)
 
 
-def _kernel_activations(precision, moe_impl, hidden_states, hidden_states_scale_global, inputs):
+def _kernel_activations(
+    precision, moe_impl, hidden_states, hidden_states_scale_global, inputs
+):
     """The (hidden_states_q, hidden_states_scale) pair the runners consume (linear scale layouts)."""
     if precision == "nvfp4":
         linear = moe_impl.quantize_inputs(
@@ -366,7 +370,9 @@ def _build_case(
 
     moe_impl = spec.make_impl()
     moe_impl._cache_permute_indices = cache_permute_indices
-    weights_data = moe_impl.quantize_weights(gemm1_weights, gemm2_weights, hidden_states)
+    weights_data = moe_impl.quantize_weights(
+        gemm1_weights, gemm2_weights, hidden_states
+    )
     hidden_states_scale_global = weights_data["hidden_states_scale_global"]
     inputs_data = moe_impl.quantize_inputs(hidden_states, hidden_states_scale_global)
     args = moe_args(
@@ -450,14 +456,20 @@ def _layer_runner(config, device, runner_cls, act, weights):
     runner.build()
     packed = runner.pack_inputs(act, weights)
     kwargs = runner.launch_kwargs_for(packed)
-    tactics = [list(map(int, tactic)) for tactic in runner.get_valid_tactics(packed, None)]
+    tactics = [
+        list(map(int, tactic)) for tactic in runner.get_valid_tactics(packed, None)
+    ]
     assert tactics, f"{runner_cls.__name__} enumerated no tactics"
     return layer, runner, packed, kwargs, tactics
 
 
 def _cake_runner(case, device):
     return _layer_runner(
-        case.config, device, PRECISIONS[case.precision].runner_cls, case.act, case.weights
+        case.config,
+        device,
+        PRECISIONS[case.precision].runner_cls,
+        case.act,
+        case.weights,
     )
 
 
@@ -512,9 +524,9 @@ def test_config_is_explicit_exact_sm100_sm103_and_stepfun_only():
         assert CakeStepFunRunner.supports_quant(spec.quant)
         assert CakeStepFunRunner.runner_class_for(spec.quant) is spec.runner_cls
         assert spec.runner_cls.backend_key == "cake"
-        assert spec.runner_cls.supported_activation_classes_by_quant[spec.quant.pair] == (
-            SwiGLUStep,
-        )
+        assert spec.runner_cls.supported_activation_classes_by_quant[
+            spec.quant.pair
+        ] == (SwiGLUStep,)
     assert CakeStepFunRunner.supports_quant(NVFP4_PER_TOKEN)
     assert CakeStepFunRunner.runner_class_for(NVFP4_PER_TOKEN) is CakeStepFunNvfp4Runner
     for unsupported in (
@@ -565,7 +577,9 @@ def test_prepare_weights_requires_supported_quant_and_stepfun():
     w1 = torch.zeros(2, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE, dtype=torch.bfloat16)
     w2 = torch.zeros(2, HIDDEN_SIZE, INTERMEDIATE_SIZE, dtype=torch.bfloat16)
     common = dict(
-        num_local_experts=2, hidden_size=HIDDEN_SIZE, intermediate_size=INTERMEDIATE_SIZE
+        num_local_experts=2,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
     )
     with pytest.raises(ValueError, match="supports NVFP4xNVFP4"):
         CakeStepFunConfig.prepare_weights(
@@ -580,15 +594,20 @@ def test_prepare_weights_requires_supported_quant_and_stepfun():
         CakeStepFunConfig.prepare_weights(w1, w2, quant=FP8, **common)
     with pytest.raises(ValueError, match="supports NVFP4xNVFP4"):
         CakeStepFunConfig.prepare_activations(
-            w1[0], quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+            w1[0],
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         )
 
 
 def _fp8_global_scales(hidden, limit, device):
     hidden_global = torch.tensor(
-        [448.0 / float(hidden.float().abs().max().item())], device=device, dtype=torch.float32
+        [448.0 / float(hidden.float().abs().max().item())],
+        device=device,
+        dtype=torch.float32,
     )
-    intermediate_global = torch.tensor([448.0 / (2.0 * limit)], device=device, dtype=torch.float32)
+    intermediate_global = torch.tensor(
+        [448.0 / (2.0 * limit)], device=device, dtype=torch.float32
+    )
     return hidden_global, intermediate_global
 
 
@@ -599,11 +618,21 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
     spec = PRECISIONS[precision]
     torch.manual_seed(0)
     num_experts, hidden_size, intermediate_size, num_tokens = 4, 512, 512, 8
-    w1 = torch.randn(num_experts, 2 * intermediate_size, hidden_size, device=device, dtype=torch.bfloat16)
+    w1 = torch.randn(
+        num_experts,
+        2 * intermediate_size,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
     w1 /= math.sqrt(hidden_size)
-    w2 = torch.randn(num_experts, hidden_size, intermediate_size, device=device, dtype=torch.bfloat16)
+    w2 = torch.randn(
+        num_experts, hidden_size, intermediate_size, device=device, dtype=torch.bfloat16
+    )
     w2 /= math.sqrt(intermediate_size)
-    hidden = 12.0 * torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16)
+    hidden = 12.0 * torch.randn(
+        num_tokens, hidden_size, device=device, dtype=torch.bfloat16
+    )
     step_limits = torch.tensor([7.0, 16.0, 7.0, 16.0], device=device)
     common = dict(
         quant=spec.quant,
@@ -616,15 +645,17 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
     if precision == "fp8":
         hidden_global, intermediate_global = _fp8_global_scales(hidden, 7.0, device)
         common.update(
-            hidden_states_scale_global=hidden_global, intermediate_scale_global=intermediate_global
+            hidden_states_scale_global=hidden_global,
+            intermediate_scale_global=intermediate_global,
         )
         activation_kwargs["hidden_states_scale_global"] = hidden_global
     view = CakeStepFunConfig.prepare_weights(
         w1, w2, activation=SwiGLUStep(limit=7.0), step_limits=step_limits, **common
     )
-    gate_key = {"nvfp4": "output1_scale_gate_scalar", "fp8": "output1_scales_gate_scalar"}.get(
-        precision
-    )
+    gate_key = {
+        "nvfp4": "output1_scale_gate_scalar",
+        "fp8": "output1_scales_gate_scalar",
+    }.get(precision)
     expected = step_limits / view[gate_key] if gate_key else step_limits
     assert torch.equal(view["gemm1_clamp_limit"], expected)
     default_view = CakeStepFunConfig.prepare_weights(w1, w2, **common)
@@ -656,7 +687,9 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
         config = MoEConfig(
             routing=RoutingConfig(num_experts=num_experts, top_k=2),
             quant=spec.quant,
-            experts=ExpertConfig(intermediate_size=intermediate_size, local_num_experts=num_experts),
+            experts=ExpertConfig(
+                intermediate_size=intermediate_size, local_num_experts=num_experts
+            ),
             activation=SwiGLUStep(limit=7.0),
             backend=BackendOptions(candidates=(backend,)),
             execution=ExecutionConfig(enable_pdl=True, tune_max_num_tokens=num_tokens),
@@ -665,7 +698,9 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
         runner.check_support()
         runner.build()
         packed = runner.pack_inputs(act, weights)
-        outputs[runner_cls.__name__] = _forward(runner, packed, runner.launch_kwargs_for(packed), -1)
+        outputs[runner_cls.__name__] = _forward(
+            runner, packed, runner.launch_kwargs_for(packed), -1
+        )
     tolerances = spec.make_impl().get_tolerances()
     check_accuracy(
         outputs[spec.native_runner.__name__].float(),
@@ -710,7 +745,8 @@ def test_stepfun_mixed_expert_limits(precision, cache_permute_indices):
     spec = PRECISIONS[precision]
     shared = 1 if spec.fused_shared_experts else 0
     limits = torch.tensor(
-        [7.0 if expert % 2 == 0 else 16.0 for expert in range(NUM_EXPERTS)] + [16.0] * shared,
+        [7.0 if expert % 2 == 0 else 16.0 for expert in range(NUM_EXPERTS)]
+        + [16.0] * shared,
         device="cuda",
         dtype=torch.float32,
     )
@@ -755,16 +791,22 @@ def test_stepfun_cuda_graph_replay(precision, num_tokens, cache_permute_indices)
     for tactic in [t for t in tactics if t[0] in cake_tiles][:2]:
         eager = _forward(runner, packed, kwargs, tactic)
         replayed, graph = _capture_and_replay(runner, packed, kwargs, tactic)
-        assert torch.equal(replayed, eager), f"tactic {tactic}: first replay differs from eager"
+        assert torch.equal(replayed, eager), (
+            f"tactic {tactic}: first replay differs from eager"
+        )
         replayed.zero_()
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(replayed, eager), f"tactic {tactic}: second replay differs from eager"
+        assert torch.equal(replayed, eager), (
+            f"tactic {tactic}: second replay differs from eager"
+        )
         check_accuracy(case.reference, replayed.float(), **case.tolerances)
 
 
 @pytest.mark.parametrize("precision,num_tokens", BITWISE_ROWS)
-def test_stepfun_reproduces_native_fc1_twin_bitwise(precision, num_tokens, cache_permute_indices):
+def test_stepfun_reproduces_native_fc1_twin_bitwise(
+    precision, num_tokens, cache_permute_indices
+):
     """Every Cake tactic reproduces some native tactic of the same FC1 tile byte for byte.
 
     The BF16, per-tensor FP8 and MXFP8 Cake FC1 kernels write the same bytes as
@@ -780,7 +822,9 @@ def test_stepfun_reproduces_native_fc1_twin_bitwise(precision, num_tokens, cache
         cache_permute_indices, precision=precision, num_tokens=num_tokens, limits=limits
     )
     _, cake, cake_packed, cake_kwargs, cake_tactics = _cake_runner(case, device)
-    _, native, native_packed, native_kwargs, native_tactics = _native_runner(case, device)
+    _, native, native_packed, native_kwargs, native_tactics = _native_runner(
+        case, device
+    )
     cake_tiles = _cake_tiles(cake, spec.family)
     native_outputs = {}
     for tactic in native_tactics:
@@ -796,7 +840,10 @@ def test_stepfun_reproduces_native_fc1_twin_bitwise(precision, num_tokens, cache
         candidates = native_outputs.get(tactic[0], [])
         matches = [nt for nt, nout in candidates if torch.equal(output, nout)]
         closest = min(
-            ((nt, (output.float() - nout.float()).abs().max().item()) for nt, nout in candidates),
+            (
+                (nt, (output.float() - nout.float()).abs().max().item())
+                for nt, nout in candidates
+            ),
             key=lambda item: item[1],
             default=None,
         )
@@ -805,7 +852,9 @@ def test_stepfun_reproduces_native_fc1_twin_bitwise(precision, num_tokens, cache
             f"{tactic[0]} bitwise ({len(candidates)} candidates; closest {closest})"
         )
         checked += 1
-    assert checked, f"no Cake tactic at T={num_tokens}: {cake_tactics} vs tiles {sorted(cake_tiles)}"
+    assert checked, (
+        f"no Cake tactic at T={num_tokens}: {cake_tactics} vs tiles {sorted(cake_tiles)}"
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [8, 512, 2048])
@@ -819,16 +868,26 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
 
     device = _require_cake_device()
     torch.manual_seed(0)
-    w1 = torch.randn(NUM_EXPERTS, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE, device=device, dtype=torch.bfloat16)
+    w1 = torch.randn(
+        NUM_EXPERTS,
+        2 * INTERMEDIATE_SIZE,
+        HIDDEN_SIZE,
+        device=device,
+        dtype=torch.bfloat16,
+    )
     w1 /= math.sqrt(HIDDEN_SIZE)
-    w2 = torch.randn(NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE, device=device, dtype=torch.bfloat16)
+    w2 = torch.randn(
+        NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE, device=device, dtype=torch.bfloat16
+    )
     w2 /= math.sqrt(INTERMEDIATE_SIZE)
     hidden = HIDDEN_STATE_AMPLITUDE * torch.randn(
         num_tokens, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
     )
     logits = torch.randn(num_tokens, NUM_EXPERTS, device=device, dtype=torch.bfloat16)
     global_scale = make_nvfp4_global_scale(
-        hidden, per_token_activation=True, nvfp4_4over6_config=current_nvfp4_4over6_config()
+        hidden,
+        per_token_activation=True,
+        nvfp4_4over6_config=current_nvfp4_4over6_config(),
     )
     quantized, block_scales, per_token_scale = nvfp4_quantize(
         hidden,
@@ -854,7 +913,9 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
     weights.prepare_for(TrtllmFp4RoutedRunner.backend_key, view)
     act = MoEActivationPack(
         hidden_states_q=quantized,
-        hidden_states_scale=block_scales.view(torch.float8_e4m3fn).reshape(num_tokens, -1),
+        hidden_states_scale=block_scales.view(torch.float8_e4m3fn).reshape(
+            num_tokens, -1
+        ),
         per_token_scale=per_token_scale.contiguous(),
         routing_logits=logits,
         routing_input_mode=RoutingInputMode.FromLogits,
@@ -886,8 +947,12 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
         output = _forward(cake, cake_packed, cake_kwargs, tactic)
         check_accuracy(reference, output.float(), **tolerances)
         checked += 1
-    assert checked, f"no per-token Cake tactic at T={num_tokens}: {cake_tactics} vs {sorted(per_token_tiles)}"
-    check_accuracy(reference, _forward(cake, cake_packed, cake_kwargs, -1).float(), **tolerances)
+    assert checked, (
+        f"no per-token Cake tactic at T={num_tokens}: {cake_tactics} vs {sorted(per_token_tiles)}"
+    )
+    check_accuracy(
+        reference, _forward(cake, cake_packed, cake_kwargs, -1).float(), **tolerances
+    )
 
 
 def _first_replay_probe(precision: str, num_tokens: int, tactic_index: int) -> dict:
@@ -935,7 +1000,9 @@ def test_stepfun_first_graph_replay_in_fresh_processes():
     script = _PROBE_SCRIPT.format(
         root=root, precisions=list(PRECISIONS), tactic_indices=[0, 1], num_tokens=8
     )
-    env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    env = dict(
+        os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
     failures = []
     checked = 0
     for index in range(processes):
@@ -947,7 +1014,11 @@ def test_stepfun_first_graph_replay_in_fresh_processes():
             text=True,
             timeout=1800,
         )
-        marker = [line for line in proc.stdout.splitlines() if line.startswith("FIRST_REPLAY_RESULT ")]
+        marker = [
+            line
+            for line in proc.stdout.splitlines()
+            if line.startswith("FIRST_REPLAY_RESULT ")
+        ]
         assert proc.returncode == 0 and marker, (
             f"probe process {index} failed (rc={proc.returncode}):\n{proc.stdout[-2000:]}\n{proc.stderr[-4000:]}"
         )
@@ -956,5 +1027,7 @@ def test_stepfun_first_graph_replay_in_fresh_processes():
             checked += 1
             if not result["bitwise"]:
                 failures.append((index, key, result))
-    assert not failures, f"{len(failures)}/{checked} first replays differ from eager: {failures}"
+    assert not failures, (
+        f"{len(failures)}/{checked} first replays differ from eager: {failures}"
+    )
     assert checked == processes * len(PRECISIONS) * 2

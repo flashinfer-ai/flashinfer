@@ -863,7 +863,9 @@ class CakeStepFunConfig:
             )
             gate_scale = view["output1_scales_gate_scalar"]
         elif pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
-            view = TrtllmFp8BlockConfig.prepare_weights(w1_bf16, w2_bf16, quant=quant, **common)
+            view = TrtllmFp8BlockConfig.prepare_weights(
+                w1_bf16, w2_bf16, quant=quant, **common
+            )
             gate_scale = None
         else:
             raise ValueError(
@@ -874,7 +876,9 @@ class CakeStepFunConfig:
         reference = (
             gate_scale
             if gate_scale is not None
-            else torch.empty(rows, dtype=torch.float32, device=view["gemm1_weights"].device)
+            else torch.empty(
+                rows, dtype=torch.float32, device=view["gemm1_weights"].device
+            )
         )
         if step_limits is None:
             limits = torch.full_like(reference, activation.limit)
@@ -890,7 +894,9 @@ class CakeStepFunConfig:
             if not bool(torch.isfinite(limits).all()) or not bool((limits > 0).all()):
                 raise ValueError("step_limits must be finite and positive.")
         view["gemm1_clamp_limit"] = (
-            (limits / gate_scale).contiguous() if gate_scale is not None else limits.contiguous()
+            (limits / gate_scale).contiguous()
+            if gate_scale is not None
+            else limits.contiguous()
         )
         return view
 
@@ -918,10 +924,13 @@ class CakeStepFunConfig:
                     "hidden_states_scale_global."
                 )
             return TrtllmFp8PerTensorConfig.prepare_activations(
-                hidden_states_bf16, hidden_states_scale_global=hidden_states_scale_global
+                hidden_states_bf16,
+                hidden_states_scale_global=hidden_states_scale_global,
             )
         if pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
-            return TrtllmFp8BlockConfig.prepare_activations(hidden_states_bf16, quant=quant)
+            return TrtllmFp8BlockConfig.prepare_activations(
+                hidden_states_bf16, quant=quant
+            )
         raise ValueError(
             "Cake StepFun activation preparation supports NVFP4xNVFP4, BF16xBF16, "
             f"FP8PerTensorxFP8PerTensor and MXFP8xMXFP8, got {quant!r}."

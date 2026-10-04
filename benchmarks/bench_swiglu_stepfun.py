@@ -511,7 +511,9 @@ def main():
             quant = QuantConfig(weight=fmt, activation=fmt)
             baseline = baseline_variant(precision)
             variants = {
-                **({} if args.skip_native_baseline else {baseline: baselines[baseline]}),
+                **(
+                    {} if args.skip_native_baseline else {baseline: baselines[baseline]}
+                ),
                 **step_variants,
             }
             prepare_kwargs = dict(
@@ -529,8 +531,12 @@ def main():
                     dtype=torch.bfloat16,
                 )
                 hidden_states_scale_global = 448.0 / sample.float().abs().max()
-                prepare_kwargs["hidden_states_scale_global"] = hidden_states_scale_global
-                prepare_kwargs["intermediate_scale_global"] = FP8_INTERMEDIATE_SCALE_GLOBAL
+                prepare_kwargs["hidden_states_scale_global"] = (
+                    hidden_states_scale_global
+                )
+                prepare_kwargs["intermediate_scale_global"] = (
+                    FP8_INTERMEDIATE_SCALE_GLOBAL
+                )
             elif precision != "bf16":
                 prepare_kwargs["quant"] = quant
             base_view = backend.prepare_weights(w1, w2, **prepare_kwargs)
@@ -632,7 +638,9 @@ def main():
                         # Native step variants have no pair without the native baseline.
                         continue
                     reference = round_medians[reference_name]
-                    ratio, low, high = paired_interval(reference, step, args.seed + tokens)
+                    ratio, low, high = paired_interval(
+                        reference, step, args.seed + tokens
+                    )
                     threshold = 1 + args.regression_threshold
                     status = (
                         "pass"

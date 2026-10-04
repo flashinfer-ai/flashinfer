@@ -6243,10 +6243,15 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+    )
     # The per-tensor cubin manifest has SwiGLU and ReLU2 epilogues. GeGLU is
     # representable by the enum but has no matching generated kernel.
-    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLU, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        ReLU2,
+    )
 
     def _check_activation_parameters(self) -> None:
         if (
@@ -6561,10 +6566,15 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
     )
-    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = ((QuantFormat.BF16, QuantFormat.BF16),)
+    supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
+        (QuantFormat.BF16, QuantFormat.BF16),
+    )
     # The BF16 cubin manifest currently contains SwiGLU and ReLU2. GeGLU and
     # SiTU are represented by the launcher enum but have no matching kernels.
-    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLU, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        ReLU2,
+    )
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -6801,9 +6811,17 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
     """
 
     backend_key = "cake"
-    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLUStep,)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLUStep,
+    )
 
-    def __new__(cls, config: MoEConfig | None = None, device: Any = None, *args: Any, **kwargs: Any):
+    def __new__(
+        cls,
+        config: MoEConfig | None = None,
+        device: Any = None,
+        *args: Any,
+        **kwargs: Any,
+    ):
         if cls is CakeStepFunRunner:
             if config is None:
                 raise TypeError("CakeStepFunRunner requires a MoEConfig")
@@ -6883,7 +6901,9 @@ class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
     supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
         (QuantFormat.BF16, QuantFormat.BF16),
     )
-    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLUStep,)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLUStep,
+    )
     supports_fused_shared_experts = TrtllmBf16RoutedRunner.supports_fused_shared_experts
 
 
@@ -6893,8 +6913,12 @@ class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner)
     supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = (
         (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
     )
-    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLUStep,)
-    supports_fused_shared_experts = TrtllmFp8PerTensorRunner.supports_fused_shared_experts
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLUStep,
+    )
+    supports_fused_shared_experts = (
+        TrtllmFp8PerTensorRunner.supports_fused_shared_experts
+    )
 
 
 class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
@@ -6918,18 +6942,25 @@ _CAKE_STEPFUN_RUNNERS: tuple[type[CakeStepFunRunner], ...] = (
     CakeStepFunMxfp8Runner,
 )
 CakeStepFunRunner.supported_quant_variants = tuple(
-    variant for runner in _CAKE_STEPFUN_RUNNERS for variant in runner.supported_quant_variants
+    variant
+    for runner in _CAKE_STEPFUN_RUNNERS
+    for variant in runner.supported_quant_variants
 )
 CakeStepFunRunner.supported_routing_modes = tuple(
-    dict.fromkeys(mode for runner in _CAKE_STEPFUN_RUNNERS for mode in runner.supported_routing_modes)
+    dict.fromkeys(
+        mode
+        for runner in _CAKE_STEPFUN_RUNNERS
+        for mode in runner.supported_routing_modes
+    )
 )
 CakeStepFunRunner.supports_fused_shared_experts = any(
     runner.supports_fused_shared_experts for runner in _CAKE_STEPFUN_RUNNERS
 )
 CakeStepFunRunner.supported_activation_classes_by_quant = {
-    pair: (SwiGLUStep,) for runner in _CAKE_STEPFUN_RUNNERS for pair in runner.supported_quant_variants
+    pair: (SwiGLUStep,)
+    for runner in _CAKE_STEPFUN_RUNNERS
+    for pair in runner.supported_quant_variants
 }
-
 
 
 # ---------------------------------------------------------------------------

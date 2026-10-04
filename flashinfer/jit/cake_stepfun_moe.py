@@ -45,7 +45,9 @@ _BINDING_SOURCE = "cake_stepfun_moe_binding.cu"
 
 def _get_cake_stepfun_csrc_dir() -> Path:
     """Locate the Cake StepFun sources in installed and source checkouts."""
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "fused_moe" / "cake_stepfun"
+    checkout = (
+        Path(__file__).resolve().parents[2] / "csrc" / "fused_moe" / "cake_stepfun"
+    )
     if checkout.exists():
         return checkout
     installed = jit_env.FLASHINFER_CSRC_DIR / "fused_moe" / "cake_stepfun"
@@ -58,7 +60,9 @@ def _get_cake_stepfun_csrc_dir() -> Path:
     )
 
 
-def _load_inventory(csrc_dir: Path, target: CakeStepFunTarget) -> tuple[list[Path], dict[Path, list[str]]]:
+def _load_inventory(
+    csrc_dir: Path, target: CakeStepFunTarget
+) -> tuple[list[Path], dict[Path, list[str]]]:
     """Validate the generated inventory and return the exact-architecture device units."""
     generated_dir = csrc_dir / "generated"
     inventory_path = generated_dir / _INVENTORY
@@ -70,15 +74,24 @@ def _load_inventory(csrc_dir: Path, target: CakeStepFunTarget) -> tuple[list[Pat
     try:
         inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"Cake StepFun inventory could not be read: {inventory_path}") from error
+        raise ValueError(
+            f"Cake StepFun inventory could not be read: {inventory_path}"
+        ) from error
     if not isinstance(inventory, dict) or inventory.get("schema") != _INVENTORY_SCHEMA:
         raise ValueError(f"Cake StepFun inventory schema must be {_INVENTORY_SCHEMA}")
     kernels = inventory.get("kernels")
     files = inventory.get("files")
-    if not isinstance(kernels, list) or not kernels or not isinstance(files, dict) or not files:
+    if (
+        not isinstance(kernels, list)
+        or not kernels
+        or not isinstance(files, dict)
+        or not files
+    ):
         raise ValueError("Cake StepFun inventory kernels and files must be non-empty")
     program = {
-        key: inventory[key] for key in ("kernels", "families", "files") if key in inventory
+        key: inventory[key]
+        for key in ("kernels", "families", "files")
+        if key in inventory
     }
     program_bytes = (
         json.dumps(program, sort_keys=True, separators=(",", ":")) + "\n"
@@ -89,12 +102,16 @@ def _load_inventory(csrc_dir: Path, target: CakeStepFunTarget) -> tuple[list[Pat
     for relative, digest in files.items():
         source = (repo_root / relative).resolve()
         if not source.is_file() or not source.is_relative_to(repo_root):
-            raise FileNotFoundError(f"Cake StepFun inventory source not found: {relative}")
+            raise FileNotFoundError(
+                f"Cake StepFun inventory source not found: {relative}"
+            )
         if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
             raise ValueError(f"Cake StepFun inventory file hash mismatch: {relative}")
     manifest_relative = inventory.get("manifest")
     if manifest_relative not in files or Path(manifest_relative).name != _MANIFEST:
-        raise ValueError("Cake StepFun inventory must list the generated manifest header")
+        raise ValueError(
+            "Cake StepFun inventory must list the generated manifest header"
+        )
     families = inventory.get("families")
     if not isinstance(families, dict) or not families:
         raise ValueError("Cake StepFun inventory families must be a non-empty mapping")
@@ -106,24 +123,42 @@ def _load_inventory(csrc_dir: Path, target: CakeStepFunTarget) -> tuple[list[Pat
             raise ValueError(f"Cake StepFun inventory kernels[{index}] is invalid")
         device = kernel.get("device")
         flags = kernel.get("compile_flags")
-        if device not in files or not isinstance(flags, list) or not all(isinstance(f, str) and f for f in flags):
-            raise ValueError(f"Cake StepFun inventory kernels[{index}] device or compile_flags are invalid")
+        if (
+            device not in files
+            or not isinstance(flags, list)
+            or not all(isinstance(f, str) and f for f in flags)
+        ):
+            raise ValueError(
+                f"Cake StepFun inventory kernels[{index}] device or compile_flags are invalid"
+            )
         if kernel["arch"] != target:
             continue
         family = kernel.get("family")
         tile = kernel.get("tile_n")
-        if family not in families or not isinstance(tile, int) or tile not in families[family].get("tiles", ()):
-            raise ValueError(f"Cake StepFun inventory kernels[{index}] family or tile is invalid")
+        if (
+            family not in families
+            or not isinstance(tile, int)
+            or tile not in families[family].get("tiles", ())
+        ):
+            raise ValueError(
+                f"Cake StepFun inventory kernels[{index}] family or tile is invalid"
+            )
         if (family, tile) in seen:
-            raise ValueError(f"Cake StepFun inventory kernels[{index}] duplicates ({family}, tile {tile})")
+            raise ValueError(
+                f"Cake StepFun inventory kernels[{index}] duplicates ({family}, tile {tile})"
+            )
         seen.add((family, tile))
         source = (repo_root / device).resolve()
         device_sources.append(source)
         compile_flags[source] = list(flags)
     for family, spec in families.items():
-        missing = sorted(set(spec.get("tiles", ())) - {tile for fam, tile in seen if fam == family})
+        missing = sorted(
+            set(spec.get("tiles", ())) - {tile for fam, tile in seen if fam == family}
+        )
         if missing:
-            raise ValueError(f"Cake StepFun inventory lacks {family} tiles {missing} for target {target}")
+            raise ValueError(
+                f"Cake StepFun inventory lacks {family} tiles {missing} for target {target}"
+            )
     if not device_sources:
         raise ValueError(f"Cake StepFun inventory has no kernels for target {target}")
     return device_sources, compile_flags
@@ -176,7 +211,12 @@ def gen_cake_stepfun_fused_moe_module(target: CakeStepFunTarget) -> JitSpec:
     )
     spec = gen_jit_spec(
         uri,
-        [*sources, csrc_dir / _RUNNER_SOURCE, csrc_dir / _BINDING_SOURCE, *device_sources],
+        [
+            *sources,
+            csrc_dir / _RUNNER_SOURCE,
+            csrc_dir / _BINDING_SOURCE,
+            *device_sources,
+        ],
         extra_cuda_cflags=cflags,
         extra_cuda_cflags_by_source={
             source: [*target_flags, *flags] for source, flags in device_flags.items()
