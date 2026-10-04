@@ -300,20 +300,8 @@ def _resolve_stream(_ctx, device, _stream):
     return cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
-def _launch_or_plan(compiled, args, plan_sink):
-    """Run the compiled stage, or hand the call to a caller that replays it.
-
-    `plan_sink` is how the composition captures the four launches; what it
-    records is exactly what a direct call would have passed.
-    """
-    if plan_sink is not None:
-        plan_sink.append((compiled, args))
-    else:
-        compiled(*args)
-
-
-def _compile_and_launch(kernel, args, compile_options, plan_sink):
-    """Compile once per (kernel, options), then `_launch_or_plan`.
+def _compile_and_launch(kernel, args, compile_options):
+    """Compile once per (kernel, options), then launch.
 
     Only the pointer entries take this path. Their compile-time and run-time
     arguments are the same tuple, where a tensor entry has to build DLPack
@@ -322,7 +310,7 @@ def _compile_and_launch(kernel, args, compile_options, plan_sink):
     compiled = get_cached_compile(kernel, compile_options)
     if compiled is None:
         compiled = cached_compile(kernel, *args, compile_options=compile_options)
-    _launch_or_plan(compiled, args, plan_sink)
+    compiled(*args)
 
 
 class CPDeltaRuleTPrecomputeSm80(KeyedCompileMixin):
@@ -1582,7 +1570,6 @@ def cp_delta_rule_t_precompute_dsl_sm80(
     # execution is built: explicitly, at this layer, rather than by patching
     # the DSL's own classes from outside. The tuple is (compiled, args), and
     # the caller owns whatever it keeps alive.
-    _plan_sink: list | None = None,
     _device=None,
     _stream=None,
 ):
@@ -1698,7 +1685,7 @@ def cp_delta_rule_t_precompute_dsl_sm80(
             cutlass.Int32(num_seqs),
             stream,
         )
-        _compile_and_launch(kernel, args, compile_options, _plan_sink)
+        _compile_and_launch(kernel, args, compile_options)
         return t
     kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype, False)
     compiled = get_cached_compile(kernel, compile_options)
@@ -1729,7 +1716,7 @@ def cp_delta_rule_t_precompute_dsl_sm80(
         num_seqs,
         stream,
     )
-    _launch_or_plan(compiled, call_args, _plan_sink)
+    compiled(*call_args)
     return t
 
 
@@ -1841,7 +1828,6 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
     # execution is built: explicitly, at this layer, rather than by patching
     # the DSL's own classes from outside. The tuple is (compiled, args), and
     # the caller owns whatever it keeps alive.
-    _plan_sink: list | None = None,
     _device=None,
     _stream=None,
 ):
@@ -1980,7 +1966,7 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
             cutlass.Int32(num_seqs),
             stream,
         )
-        _compile_and_launch(kernel, args, compile_options, _plan_sink)
+        _compile_and_launch(kernel, args, compile_options)
         return transfer_VK, state_VK
     kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype, False)
     compiled = get_cached_compile(kernel, compile_options)
@@ -2023,7 +2009,7 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
         num_seqs,
         stream,
     )
-    _launch_or_plan(compiled, call_args, _plan_sink)
+    compiled(*call_args)
     return transfer_VK, state_VK
 
 
@@ -2577,7 +2563,6 @@ def cp_delta_rule_fixup_dsl_sm80(
     # execution is built: explicitly, at this layer, rather than by patching
     # the DSL's own classes from outside. The tuple is (compiled, args), and
     # the caller owns whatever it keeps alive.
-    _plan_sink: list | None = None,
     _kernel_kind: str | None = None,
     _device=None,
     _stream=None,
@@ -2768,7 +2753,7 @@ def cp_delta_rule_fixup_dsl_sm80(
             if _ctx is not None
             else _sm80_cp_compile_options(device)
         )
-        _compile_and_launch(kernel, args, opts, _plan_sink)
+        _compile_and_launch(kernel, args, opts)
         return fixed_state
     kernel = _get_fixup_kernel(*spec)
     compiled = get_cached_compile(
@@ -2830,7 +2815,7 @@ def cp_delta_rule_fixup_dsl_sm80(
         num_heads,
         stream,
     )
-    _launch_or_plan(compiled, call_args, _plan_sink)
+    compiled(*call_args)
     return fixed_state
 
 
@@ -2846,7 +2831,9 @@ def cp_delta_rule_fixup_dsl_sm80(
 # helper, which is an sm90 instruction. Nothing here calls them -- the aux
 # role's work is folded into `kernel` -- so they are not carried over rather
 # than carried over broken. `load_t_tma`, `run_load_t_role` and `cp_qk_and_t_epi`
-# reach for TMA and are rewritten against `cp.async`. `__call__` and `kernel`
+# are not carried over either: `issue_block_loads` loads T through
+# `load_t_tile_into_stage`, and `kk_epi` writes it in place of the KK
+# accumulator. `__call__` and `kernel`
 # are built from the fused sm80 versions with the CP differences folded in --
 # taking the sm90 ones would drag in TMA descriptors and a pipeline this target
 # cannot build.
@@ -3293,122 +3280,6 @@ class CPDeltaRulePrefillSm80(_FullyFusedDeltaRuleSm80):
             barrier_id=FusedNamedBarrier.KK_SYNC,
             number_of_threads=_FUSED_WG_THREADS,
         )
-
-    @cute.jit
-    def cp_qk_and_t_epi(
-        self,
-        tQKrQK: cute.Tensor,
-        tQKcMqk: cute.Tensor,
-        sT: cute.Tensor,
-        sQK: cute.Tensor,
-        sKK_opd: cute.Tensor,
-        sAlpha: cute.Tensor,
-        alpha_stage: cutlass.Int32,
-        is_final_block: bool,
-        B: cutlass.Int32,
-        scale: cutlass.Float32,
-        qk_tiled_mma,
-        kk_tiled_mma,
-        aux_tidx: cutlass.Int32,
-    ):
-        alpha_log = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
-        # `stmatrix` is sm90's. The fused kernel's `qk_store` already writes
-        # this same accumulator to shared through `CopyR2SOp` and passes, so
-        # that is the atom here too.
-        r2s_atom = cute.make_copy_atom(cute.nvgpu.CopyR2SOp(), self.dtype)
-        qk_tiled_store = cute.make_tiled_copy_C(r2s_atom, qk_tiled_mma)
-        kk_tiled_store = cute.make_tiled_copy_C(r2s_atom, kk_tiled_mma)
-        qk_thr_store = qk_tiled_store.get_slice(aux_tidx)
-        kk_thr_store = kk_tiled_store.get_slice(aux_tidx)
-        tQKsQK = qk_thr_store.partition_D(sQK)
-        tKKsKK = kk_thr_store.partition_D(sKK_opd)
-        tQKcMqk_cv = kk_thr_store.retile(tQKcMqk)
-        tQKrQK_cv = kk_thr_store.retile(tQKrQK)
-        tQKrQK_cvt = cute.make_fragment_like(tQKrQK, self.dtype)
-        tQKrQK_cvt_cv = kk_thr_store.retile(tQKrQK_cvt)
-        tKKrT = cute.make_fragment_like(tKKsKK, self.dtype)
-
-        for i in cutlass.range_constexpr(cute.size(tKKrT)):
-            s, t = tQKcMqk_cv[i]
-            gamma = cutlass.Float32(0.0)
-            qk_value = cutlass.Float32(0.0)
-            t_value = cutlass.Float32(0.0)
-            pred = s >= t
-            if cutlass.const_expr(is_final_block):
-                pred = pred and s < B and t < B
-            if pred:
-                gamma = cute.math.exp2(
-                    cutlass.Float32(alpha_log[s]) - cutlass.Float32(alpha_log[t]),
-                    fastmath=True,
-                )
-            qk_value = tQKrQK_cv[i] * gamma * scale
-            t_value = -gamma * cutlass.Float32(sT[t, s])
-            if cutlass.const_expr(is_final_block):
-                qk_value = qk_value if pred else cutlass.Float32(0.0)
-                t_value = t_value if pred else cutlass.Float32(0.0)
-
-            tQKrQK_cvt_cv[i] = self.dtype(qk_value)
-            tKKrT[i] = self.dtype(t_value)
-        cute.copy(qk_tiled_store, qk_thr_store.retile(tQKrQK_cvt), tQKsQK)
-        cute.copy(kk_tiled_store, tKKrT, tKKsKK)
-
-    @cute.jit
-    def load_t_cpasync(
-        self,
-        sT: cute.Tensor,
-        gT_full: cute.Tensor,
-        t_pipeline,
-        t_producer_state,
-        blk: cutlass.Int32,
-        t_block_start: cutlass.Int32,
-        head_idx: cutlass.Int32,
-        tid: cutlass.Int32,
-    ):
-        """One T tile into a stage, in place of the sm90 TMA load.
-
-        The fused kernel's own `_copy_tile` does the work, so this stays the
-        same shape as the K, Q and V loads beside it: acquire, copy, commit the
-        cp.async group, release. A T tile is square and always whole -- it is
-        indexed by block, not by token -- so `rows_live` is the full block and
-        there is no tail to predicate.
-        """
-        sT_stage = sT[None, None, t_producer_state.index]
-        mT = gT_full[None, None, head_idx, t_block_start + blk]
-        gT = cute.zipped_divide(mT, (self.BLK_KV, self.BLK_KV))[
-            ((None, None), (cutlass.Int32(0), cutlass.Int32(0)))
-        ]
-        t_pipeline.producer_acquire(t_producer_state)
-        self._copy_tile(gT, sT_stage, self.BLK_KV, tid, self.BLK_KV, False)
-        cute.arch.cp_async_commit_group()
-        t_pipeline.producer_commit(t_producer_state)
-        t_producer_state.advance()
-        return t_producer_state
-
-    @cute.jit
-    def run_load_t_role(
-        self,
-        sT: cute.Tensor,
-        gT_full: cute.Tensor,
-        t_pipeline,
-        num_blocks: cutlass.Int32,
-        t_block_start: cutlass.Int32,
-        head_idx: cutlass.Int32,
-        tid: cutlass.Int32,
-    ):
-        t_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.t_stage
-        )
-        for blk in cutlass.range(num_blocks, unroll=1):
-            t_producer_state = self.load_t_cpasync(
-                sT,
-                gT_full,
-                t_pipeline,
-                t_producer_state,
-                blk,
-                t_block_start,
-                head_idx,
-                tid,
-            )
 
     @cute.jit
     def run_cp_state_math_role(
@@ -4521,7 +4392,6 @@ def cp_delta_rule_prefill_dsl_sm80(
     # execution is built: explicitly, at this layer, rather than by patching
     # the DSL's own classes from outside. The tuple is (compiled, args), and
     # the caller owns whatever it keeps alive.
-    _plan_sink: list | None = None,
     _device=None,
     _stream=None,
 ):
@@ -4906,7 +4776,7 @@ def cp_delta_rule_prefill_dsl_sm80(
             if _ctx is not None
             else _sm80_cp_compile_options(device)
         )
-        _compile_and_launch(kernel, args, opts, _plan_sink)
+        _compile_and_launch(kernel, args, opts)
         return
     kernel = _get_prefill_kernel(kernel_dtype, **spec, ptr_abi=False)
     compiled = get_cached_compile(
@@ -5007,7 +4877,7 @@ def cp_delta_rule_prefill_dsl_sm80(
         int(num_seqs),
         stream,
     )
-    _launch_or_plan(compiled, call_args, _plan_sink)
+    compiled(*call_args)
 
 
 def cp_delta_rule_dsl_sm80(
@@ -5036,7 +4906,6 @@ def cp_delta_rule_dsl_sm80(
     # Opt-in for all four stages at once. Off by default: the entries
     # are proven one at a time and nothing public reaches this yet.
     _ptr_abi: bool = False,
-    _plan_sink: list | None = None,
 ):
     """Run the CP SM80 delta-rule prefill pipeline on flat varlen tensors.
 
@@ -5251,7 +5120,6 @@ def cp_delta_rule_dsl_sm80(
         _stream=stream,
         _ptr_abi=_ptr_abi,
         _ctx=ctx,
-        _plan_sink=_plan_sink,
     )
     local_transfer, local_state = cp_delta_rule_mn_precompute_dsl_sm80(
         k,
@@ -5267,7 +5135,6 @@ def cp_delta_rule_dsl_sm80(
         _stream=stream,
         _ptr_abi=_ptr_abi,
         _ctx=ctx,
-        _plan_sink=_plan_sink,
     )
     fixed_state = cp_delta_rule_fixup_dsl_sm80(
         local_transfer,
@@ -5282,7 +5149,6 @@ def cp_delta_rule_dsl_sm80(
         _stream=stream,
         _ptr_abi=_ptr_abi,
         _ctx=ctx,
-        _plan_sink=_plan_sink,
     )
 
     cp_delta_rule_prefill_dsl_sm80(
@@ -5309,5 +5175,4 @@ def cp_delta_rule_dsl_sm80(
         _stream=stream,
         _ptr_abi=_ptr_abi,
         _ctx=ctx,
-        _plan_sink=_plan_sink,
     )
