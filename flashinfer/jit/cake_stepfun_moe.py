@@ -40,6 +40,7 @@ _INVENTORY_SCHEMA = "flashinfer.cake_stepfun.inventory.v1"
 _MANIFEST = "cake_stepfun_generated_manifest.cuh"
 _RUNNER_SOURCE = "cake_stepfun_fc1_runner.cu"
 _RUNNER_HEADER = "cake_stepfun_fc1_runner.cuh"
+_BINDING_SOURCE = "cake_stepfun_moe_binding.cu"
 
 
 def _get_cake_stepfun_csrc_dir() -> Path:
@@ -135,25 +136,39 @@ def gen_cake_stepfun_fused_moe_module(target: CakeStepFunTarget) -> JitSpec:
     and the batched-GEMM runner over the published cubins) compiled with
     ``-DCAKE_STEPFUN_FC1``, which replaces the GEMM1 stage by the exported Cake
     StepFun FC1 kernels of ``csrc/fused_moe/cake_stepfun/``. It exports the same
-    TVM-FFI operations as ``fused_moe_trtllm_sm100`` under its own module name.
+    TVM-FFI operations as ``fused_moe_trtllm_sm100`` under its own module name plus
+    the standalone FC1 entry points ``cake_stepfun_fc1_tiles`` and
+    ``cake_stepfun_fc1_nvfp4``.
     """
     uri = get_cake_stepfun_fused_moe_uri(target)
     csrc_dir = _get_cake_stepfun_csrc_dir()
     device_sources, device_flags = _load_inventory(csrc_dir, target)
-    for source in (csrc_dir / _RUNNER_SOURCE, csrc_dir / _RUNNER_HEADER, csrc_dir / "generated" / _MANIFEST):
+    for source in (
+        csrc_dir / _RUNNER_SOURCE,
+        csrc_dir / _RUNNER_HEADER,
+        csrc_dir / _BINDING_SOURCE,
+        csrc_dir / "generated" / _MANIFEST,
+    ):
         if not source.is_file():
             raise FileNotFoundError(f"Cake StepFun source not found: {source}")
     target_flags = [
         *_TARGET_FLAGS[target],
         "-DCAKE_STEPFUN_FC1",
         f"-DFLASHINFER_CAKE_STEPFUN_TARGET_MINOR={_TARGET_MINOR[target]}",
+        # This module defines the trtllm-gen fused-MoE host symbols with a GEMM1
+        # runner of a different layout than the public module. Hide every host
+        # symbol so the two libraries never bind to each other's definitions
+        # (the TVM-FFI entry points and the cubin-loader hooks declare default
+        # visibility explicitly).
+        "-Xcompiler=-fvisibility=hidden",
+        "-Xcompiler=-fvisibility-inlines-hidden",
     ]
     sources, cflags, include_paths = trtllm_gen_fused_moe_build_inputs(
         uri, enable_rubin=False, nvcc_flags=target_flags
     )
     spec = gen_jit_spec(
         uri,
-        [*sources, csrc_dir / _RUNNER_SOURCE, *device_sources],
+        [*sources, csrc_dir / _RUNNER_SOURCE, csrc_dir / _BINDING_SOURCE, *device_sources],
         extra_cuda_cflags=cflags,
         extra_cuda_cflags_by_source={
             source: [*target_flags, *flags] for source, flags in device_flags.items()
