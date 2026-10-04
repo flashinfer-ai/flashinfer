@@ -635,3 +635,98 @@ def test_h64_admission_matches_the_catalog_table():
             route in catalog["routes"]
         ), (queries, route)
         assert (route in catalog["routes"]) == (route not in withheld), (queries, route)
+
+
+def _route_point(route_name, record):
+    """A legal ``(queries, keys)`` of one dense route: the KV length that selects the
+    route's KV range (``:short`` fused routes below their ceiling, the non-fused
+    ``fp8:q1`` above ``fused_q1_max_kv``, the 64-head routes any length) and the
+    smallest query count the router maps to the route name."""
+    policy = _runtime._catalog()["policy"]
+    precision = route_name.split(":")[0]
+    num_heads = int(record["num_heads"])
+    if route_name.endswith(":short"):
+        keys = 512
+    elif route_name == "fp8:q1":
+        keys = int(policy["fused_q1_max_kv"]) + 256
+    else:
+        keys = 512 if num_heads == _runtime.NUM_HEADS else 300
+    for queries in range(1, 4200):
+        if _runtime.route_name(precision, queries, keys, num_heads) == route_name:
+            return queries, keys
+    raise AssertionError(f"no query count in 1..4199 selects {route_name} at K = {keys}")
+
+
+def test_dense_bindings_cover_every_program_argument():
+    """Host-only, every dense route (32- and 64-head, every tier): every operand of
+    every program the route launches -- its prepared ``sequence`` (``stage.name``
+    keys) or each of its ``stages`` -- is produced by ``stage_bindings`` under the
+    name the catalog ``arg_plan`` uses, looked up exactly as ``_submission`` does.
+    The contract-level check that fails before a prebuild or launch would (an earlier
+    export left the paged logits programs' ``num_sms`` parameter unbound);
+    ``stage_bindings`` only reshapes and views, so CPU tensors suffice."""
+    catalog = _runtime._catalog()
+    num_sms = 4
+    checked = 0
+    for route_name, record in catalog["routes"].items():
+        precision = route_name.split(":")[0]
+        num_heads, bq = int(record["num_heads"]), int(record["block_q"])
+        queries, keys = _route_point(route_name, record)
+        assert _runtime.dense_route_available(num_heads, queries, keys, precision), (
+            route_name,
+            queries,
+            keys,
+        )
+        starts = torch.zeros(queries, dtype=torch.int32)
+        ends = torch.full((queries,), keys, dtype=torch.int32)
+        if precision == "fp4":
+            q = torch.zeros((queries, num_heads, 64), dtype=torch.uint8)
+            kv = torch.zeros((keys, 64), dtype=torch.uint8)
+            q_scales = torch.zeros((queries, num_heads, 4), dtype=torch.uint8)
+            kv_scales = torch.zeros((keys, 4), dtype=torch.uint8)
+            rows = queries
+        else:
+            rows = max(bq, queries) if num_heads == _runtime.NUM_HEADS else queries
+            head_dim = _runtime.HEAD_DIM
+            q = torch.zeros((rows, num_heads, head_dim), dtype=torch.float8_e4m3fn)
+            kv = torch.zeros((keys, head_dim), dtype=torch.float8_e4m3fn)
+            q_scales = None
+            kv_scales = torch.zeros(_runtime.align4(keys), dtype=torch.float32)[:keys]
+        weights = torch.zeros((rows, num_heads), dtype=torch.float32)
+        stride = _runtime.logits_stride(keys)
+        output = torch.zeros((queries, stride), dtype=torch.float32)
+        metadata = None
+        if _runtime.schedules_metadata(num_heads):
+            words = _runtime.metadata_words(queries, num_sms, num_heads)
+            metadata = torch.zeros(words, dtype=torch.int32)
+        bindings = _runtime.stage_bindings(
+            precision,
+            q,
+            kv,
+            weights,
+            starts,
+            ends,
+            output,
+            metadata,
+            q_scales=q_scales,
+            kv_scales=kv_scales,
+            num_sms=num_sms,
+            num_heads=num_heads,
+        )
+        sequence = record.get("sequence")
+        if sequence:
+            selections = [(None, sequence)]
+        else:
+            selections = [tuple(stage) for stage in record["stages"]]
+        for stage, program in selections:
+            missing = []
+            for kind, key in catalog["programs"][program]["arg_plan"]:
+                assert kind != "workspace", (route_name, program, key)
+                selected, name = key.split(".", 1) if stage is None else (stage, key)
+                if name not in bindings.get(selected, {}):
+                    missing.append(key)
+            assert not missing, (
+                f"{route_name} program {program} (stage {stage}): unbound arguments {missing}"
+            )
+            checked += 1
+    assert checked >= len(catalog["routes"])
