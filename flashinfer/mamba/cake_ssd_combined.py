@@ -77,9 +77,8 @@ class _Program:
 # Generated-source identities, ``generated/device/<module>.cu``: the Cake
 # kernel symbol followed by the export's module identity hash.  This block is
 # the single place the Cake export refreshes; every program binding below
-# derives from it.  Entries suffixed ``PENDINGEXPORT`` name programs whose
-# sources have not been exported yet.  One kernel family ships: the exact
-# scan x {bf16, f16, f32 state} x {batched, varlen}, plus one preprocess.
+# derives from it.  One kernel family ships: the exact scan x {bf16, f16, f32
+# state} x {batched, varlen}, plus one preprocess.
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_7ae61d5f32"
 _SCAN_MODULES = {
     "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f",
