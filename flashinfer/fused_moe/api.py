@@ -593,6 +593,216 @@ class TrtllmFp4Config:
         activation: Optional[ActivationConfig] = None,
         device=None,
         permute_cache=None,
+    ):
+        """Build a ``trtllm_fp4_routed`` weight view from canonical BF16 weights.
+
+        Register the result with ``MoEWeightPack.prepare_for("trtllm_fp4_routed", ...)``.
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16 (TRTLLM W4A16).
+        Defaults to NVFP4×NVFP4.
+        See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
+
+        .. warning::
+           ``num_local_experts`` is the physical row count: ``E_local + S``
+           when fused shared experts are present. :class:`ExpertConfig` keeps
+           ``local_num_experts`` as the routed-only count ``E_local``.
+        """
+        from .prepare import prepare_trtllm_fp4_weights
+
+        return prepare_trtllm_fp4_weights(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            permute_cache=permute_cache,
+        )
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+    ):
+        """Prepare activations for NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16.
+
+        MXFP4×BF16 (TRTLLM W4A16) returns raw BF16 activations without an
+        activation scale. Defaults to NVFP4×NVFP4.
+        """
+        from .prepare import prepare_trtllm_fp4_activations
+
+        return prepare_trtllm_fp4_activations(
+            hidden_states_bf16,
+            quant=quant,
+        )
+
+    def __repr__(self) -> str:
+        return "TrtllmFp4Config()"
+
+
+@dataclass(frozen=True)
+class CakeWarpDecodeConfig:
+    """Explicit Cake NVFP4 warp-decode backend for exact SM100 and SM103.
+
+    This backend is intentionally narrow: it accepts only the
+    activation-qualified expert geometries documented by
+    :class:`CakeWarpDecodeRunner`, 1--32 tokens, and unpacked precomputed routing.
+    It is never part of the default backend list; users opt in with
+    ``CakeWarpDecodeConfig(backend="cake")``.
+
+    The physical weight and activation layouts are exactly those produced by
+    :class:`TrtllmFp4Config` for NVFP4×NVFP4. This keeps one quantized
+    representation usable by both runners.
+    """
+
+    backend: Literal["cake"] = "cake"
+
+    def __post_init__(self) -> None:
+        if self.backend != "cake":
+            raise ValueError(
+                f"CakeWarpDecodeConfig backend must be 'cake', got {self.backend!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the shared TRTLLM NVFP4 physical weight view.
+
+        Register the returned dictionary with
+        ``MoEWeightPack.prepare_for("cake", view)``. Default SwiGLU and SiTU
+        may register that dictionary for ``"trtllm_fp4_routed"`` as well.
+        Parameterized SwiGLU consumes logical beta/clamp here; the official
+        runner requires each divided by ``output1_scale_gate_scalar``. For
+        non-unit gate scales, prepare a separate official dictionary with those
+        derived FP32 per-expert buffers, keeping alpha and physical tensors
+        shared. Refresh the derived buffers outside timing/capture when logical
+        beta, clamp, or gate scale changes, preserving captured addresses.
+        """
+        if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            raise ValueError(
+                "Cake warp decode weight preparation requires "
+                f"NVFP4×NVFP4, got {quant!r}."
+            )
+        activation = SwiGLU() if activation is None else activation
+        geometry = (hidden_size, intermediate_size, num_local_experts)
+        supported = (
+            (SwiGLU(), (2048, 512, 512)),
+            (SwiGLU(), (2048, 1536, 60)),
+            (SwiGLU(), (2560, 768, 384)),
+            (SiLU(), (6144, 1536, 192)),
+            (SwiGLU(), (2048, 768, 128)),
+            (SwiGLU(), (4096, 1536, 128)),
+            (SwiGLU(), (2048, 512, 256)),
+            (SwiGLU(), (4096, 1024, 512)),
+            (SwiGLU(), (3072, 1536, 256)),
+            (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), (6144, 3072, 128)),
+            (SiTU(gate_scale=4.0, linear_scale=25.0), (3584, 3072, 896)),
+        )
+        if not any(
+            activation == supported_activation and geometry == supported_geometry
+            for supported_activation, supported_geometry in supported
+        ):
+            raise ValueError(
+                "Cake warp decode weight preparation supports only default "
+                "SwiGLU() with (hidden_size, intermediate_size, num_local_experts) "
+                "= (2048, 512, 512), (2048, 1536, 60), (2560, 768, 384), "
+                "(2048, 768, 128), (4096, 1536, 128), (2048, 512, 256), "
+                "(4096, 1024, 512), or (3072, 1536, 256), "
+                "and SiLU() with "
+                "(6144, 1536, 192), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
+                "with (6144, 3072, 128), or SiTU(gate_scale=4.0, linear_scale=25.0) "
+                "with (3584, 3072, 896); got "
+                f"activation={activation!r}, geometry={geometry}."
+            )
+        return TrtllmFp4Config.prepare_weights(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            permute_cache=permute_cache,
+        )
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+    ):
+        """Build the shared TRTLLM NVFP4 packed activation view."""
+        if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            raise ValueError(
+                "Cake warp decode activation preparation requires "
+                f"NVFP4×NVFP4, got {quant!r}."
+            )
+        return TrtllmFp4Config.prepare_activations(
+            hidden_states_bf16,
+            quant=quant,
+        )
+
+    def __repr__(self) -> str:
+        return "CakeWarpDecodeConfig(backend='cake')"
+
+
+@dataclass(frozen=True)
+class CakeStepFunConfig:
+    """Cake StepFun FC1 kernels inside the trtllm-gen fused-MoE pipeline.
+
+    The backend runs the trtllm-gen routing, GEMM2 and finalize stages unchanged
+    and serves the GEMM1 stage with exported Cake NVFP4 kernels that evaluate the
+    StepFun activation ``clamp(up, -L, L) * min(silu(gate), L)`` with a per-expert
+    limit ``L``. It accepts NVFP4×NVFP4 with :class:`SwiGLUStep` on exact SM100
+    and SM103 only and is never part of the default backend list; users opt in
+    with ``CakeStepFunConfig(backend="cake")``.
+
+    The physical weight and activation layouts are exactly those produced by
+    :class:`TrtllmFp4Config` for NVFP4×NVFP4; the view additionally carries the
+    per-expert ``gemm1_clamp_limit`` the Cake kernels read.
+    """
+
+    backend: Literal["cake"] = "cake"
+
+    def __post_init__(self) -> None:
+        if self.backend != "cake":
+            raise ValueError(
+                f"CakeStepFunConfig backend must be 'cake', got {self.backend!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
         step_limits: Optional[Tensor] = None,
         hidden_states_scale_global=None,
         intermediate_scale_global=None,
