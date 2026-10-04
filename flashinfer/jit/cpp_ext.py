@@ -1,15 +1,17 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
 import functools
+import hashlib
 import logging
 import os
 import re
 import subprocess
 import sys
 import sysconfig
+from collections import Counter
 from packaging.version import Version
 from pathlib import Path
-from typing import List, Mapping, Optional
+from typing import List, Mapping, Optional, Sequence
 
 import tvm_ffi
 import torch
@@ -249,6 +251,54 @@ def build_cuda_cflags(
     return cuda_cflags
 
 
+def get_object_basename(source: Path, object_suffix: str) -> str:
+    """Basename of the object file compiled from ``source``.
+
+    Single source of truth for object naming: the ninja build, ``get_object_paths()``
+    and ``get_compile_commands()`` all derive object locations from it, so the
+    built artifacts and every path/query/export interface agree.
+    """
+    return f"{source.parent.name}_{source.stem}{object_suffix}"
+
+
+def resolve_object_names(sources: Sequence[Path]) -> List[str]:
+    """Collision-free object basenames for ``sources``, index-aligned with it.
+
+    Two sources can share a parent directory *name* and stem (e.g.
+    ``a/x/kernel.cu`` and ``b/x/kernel.cu``) and would both compile to
+    ``x_kernel.cuda.o``, which ninja rejects with ``multiple rules generate``.
+    Every member of a colliding group gets a digest of its resolved source path
+    inserted before the suffix (``x_kernel_<digest>.cuda.o``); a source listed
+    more than once additionally gets its occurrence index. Non-colliding names
+    are returned unchanged, so existing JIT caches stay valid.
+    """
+    suffixes = [".cuda.o" if source.suffix == ".cu" else ".o" for source in sources]
+    names = [
+        get_object_basename(source, suffix)
+        for source, suffix in zip(sources, suffixes, strict=True)
+    ]
+    counts = Counter(names)
+    resolved = [str(source.resolve()) for source in sources]
+    occurrences: dict[str, int] = {}
+    object_names: List[str] = []
+    for source, suffix, name, path in zip(
+        sources, suffixes, names, resolved, strict=True
+    ):
+        if counts[name] == 1:
+            object_names.append(name)
+            continue
+        digest = hashlib.sha1(path.encode()).hexdigest()[:8]
+        disambiguated = f"{source.parent.name}_{source.stem}_{digest}{suffix}"
+        occurrence = occurrences.get(path, 0) + 1
+        occurrences[path] = occurrence
+        if occurrence > 1:
+            disambiguated = (
+                f"{source.parent.name}_{source.stem}_{digest}_{occurrence}{suffix}"
+            )
+        object_names.append(disambiguated)
+    return object_names
+
+
 def generate_ninja_build_for_op(
     name: str,
     sources: List[Path],
@@ -354,11 +404,10 @@ def generate_ninja_build_for_op(
     output_dir = jit_env.FLASHINFER_JIT_DIR / name
 
     objects = []
-    for source in sources:
+    object_names = resolve_object_names(sources)
+    for source, obj_name in zip(sources, object_names, strict=True):
         is_cuda = source.suffix == ".cu"
-        object_suffix = ".cuda.o" if is_cuda else ".o"
         cmd = "cuda_compile" if is_cuda else "compile"
-        obj_name = f"{source.parent.name}_{source.stem}{object_suffix}"
         obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
