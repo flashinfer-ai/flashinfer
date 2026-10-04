@@ -305,9 +305,22 @@ def test_cudnn_log2_capture_replan_and_base_switch(monkeypatch, kind, dtype, nat
             return wrapper.run(q, keys, values, **kwargs)
         return wrapper.run(q, (k, v), **kwargs)
 
-    def graph_of(wrapper):
+    # Paged preparation needs mixed-form sequence lengths (cuDNN 9.25+).
+    # Older runtimes still exercise correctness, capture and replan below.
+    prepared_supported = kind != "paged" or prefill._cudnn_supports_direct_seqlens(
+        dtype, mixed=True
+    )
+
+    def check_graph(wrapper, expected_native):
         prepared = wrapper._cudnn_prepared
-        return prepared.graph
+        if not prepared_supported:
+            assert prepared is None
+            return
+        assert prepared is not None
+        assert (
+            bool(getattr(prepared.graph, "_flashinfer_stats_use_log2", False))
+            == expected_native
+        )
 
     def check(base="log2"):
         expected, expected_lse = _reference(q, k, v, q_lens, kv_lens)
@@ -331,8 +344,7 @@ def test_cudnn_log2_capture_replan_and_base_switch(monkeypatch, kind, dtype, nat
     plan(wrapper)
     run(wrapper)
     check()
-    built = graph_of(wrapper)
-    assert bool(getattr(built, "_flashinfer_stats_use_log2", False)) == native
+    check_graph(wrapper, native)
 
     capture = torch.cuda.CUDAGraph()
     try:
@@ -348,16 +360,13 @@ def test_cudnn_log2_capture_replan_and_base_switch(monkeypatch, kind, dtype, nat
         if kind != "decode":
             run(wrapper, "ln")
             check("ln")
-            assert not getattr(graph_of(wrapper), "_flashinfer_stats_use_log2", False)
+            check_graph(wrapper, False)
             q_lens[:] = [4, 4]
         plan(wrapper)
         out.fill_(float("nan"))
         lse.fill_(float("nan"))
         run(wrapper)
         check()
-        assert (
-            bool(getattr(graph_of(wrapper), "_flashinfer_stats_use_log2", False))
-            == native
-        )
+        check_graph(wrapper, native)
     finally:
         capture.reset()
