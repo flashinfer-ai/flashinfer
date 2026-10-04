@@ -23,7 +23,6 @@ from .pre_indexer import (
 )
 from .route import (
     qsa_expand_block_route,
-    qsa_route_from_blocks,
     qsa_route_from_logical,
 )
 from .runtime import QSA, QSAConfig, QSAWorkspaceRequirements
@@ -50,6 +49,5 @@ __all__ = [
     "qsa_paged_scores",
     "qsa_pre_indexer",
     "qsa_pre_indexer_dispatch_mask",
-    "qsa_route_from_blocks",
     "qsa_route_from_logical",
 ]

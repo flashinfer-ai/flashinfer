@@ -165,39 +165,6 @@ qsa_expand_block_route_trace = TraceTemplate(
     tags=["status:verified", "sparse"],
 )
 
-qsa_route_from_blocks_trace = TraceTemplate(
-    op_type="qsa_route",
-    name_prefix="qsa_route_from_blocks",
-    description=(
-        "QSA route expansion fused with the block-table lookup: the logical route, "
-        "its physical KV slots, and their packed validity mask."
-    ),
-    axes={
-        "num_rows": Var(),
-        "block_topk": Const(abbrev="k"),
-        "num_requests": Var(),
-        "table_width": Var(),
-        "route_width": Var(description="block_topk * ratio + ratio - 1."),
-        "mask_bytes": Var(description="num_rows * ceil(route_width / 8)."),
-    },
-    inputs={
-        "indexer_block_ids": Tensor(["num_rows", "block_topk"]),
-        **_INDEX,
-        "block_table": _TABLE,
-        "out_logical": Tensor(_ROUTE),
-        "out_route": Tensor(_ROUTE),
-        "out_mask": Tensor(["mask_bytes"]),
-        "compress_ratio": Scalar("int32"),
-        **_PAGING,
-    },
-    outputs={
-        "out_logical": Tensor(_ROUTE, param="out_logical", dtype_from="out_logical"),
-        "out_route": Tensor(_ROUTE, param="out_route", dtype_from="out_route"),
-        "out_mask": Tensor(["mask_bytes"], param="out_mask", dtype="uint8"),
-    },
-    tags=["status:verified", "sparse"],
-)
-
 qsa_route_from_logical_trace = TraceTemplate(
     op_type="qsa_route",
     name_prefix="qsa_route_from_logical",

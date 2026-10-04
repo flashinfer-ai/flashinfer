@@ -464,26 +464,22 @@ def _slot_ref(logical, t2r, table, page, slots, valid):
 def _check_route(
     blocks, pos, lens, t2r, table, ratio, page, slots, valid=None, logical=None
 ):
-    """All three entry points against the reference, in every output they write."""
+    """Both entry points against the reference, in every output they write."""
     rows, valid = len(blocks), len(blocks) if valid is None else valid
     want = _expand_ref(blocks, pos, lens, t2r, ratio)
     logical = want if logical is None else logical
     mask = torch.empty(rows * -(-want.shape[1] // 8), dtype=torch.uint8, device=DEV)
-    fused = [torch.empty_like(want), torch.empty_like(want), mask]
-    two_step = [torch.empty_like(want), torch.empty_like(mask)]
+    two_step = [torch.empty_like(want), mask]
     indptr = torch.full((rows + 1,), -1, dtype=INT, device=DEV)
-    qsa.qsa_route_from_blocks(blocks, pos, lens, t2r, table, *fused, ratio, page, slots)
     qsa.qsa_route_from_logical(
         logical, t2r, table, *two_step, valid, page, slots, out_indptr=indptr
     )
-    got = [qsa.qsa_expand_block_route(blocks, pos, lens, t2r, ratio), *fused, *two_step]
+    got = [qsa.qsa_expand_block_route(blocks, pos, lens, t2r, ratio), *two_step]
     ref = lambda lg, n: _slot_ref(lg, t2r, table, page, slots, n)
     rows_in = (
         torch.arange(rows + 1, device=DEV).clamp(max=valid) * want.shape[1]
     ).int()
-    _exact(
-        got + [indptr], [want, want, *ref(want, rows), *ref(logical, valid), rows_in]
-    )
+    _exact(got + [indptr], [want, *ref(logical, valid), rows_in])
 
 
 def _rcase(rows, topk, cr, page=16, seq=512, nreq=4, valid=None, fill=None, t2r=None):
@@ -577,10 +573,6 @@ def test_route_from_logical_writes_the_row_pointers_of_an_empty_step():
         (lambda a, lg: qsa.qsa_expand_block_route(*a[:4], 4, out=a[5]), "shape"),
         (lambda a, lg: qsa.qsa_expand_block_route(*a[:4], 3), "compress_ratio"),
         (lambda a, lg: qsa.qsa_route_from_logical(*lg, 1, 2**16, 2**31 + 1), "dtype"),
-        (lambda a, lg: qsa.qsa_route_from_blocks(*a, 2**63 - 1, 16, 256), "32 bits"),
-        (lambda a, lg: qsa.qsa_route_from_blocks(*a, 2**32, 16, 256), "32 bits"),
-        (lambda a, lg: qsa.qsa_route_from_blocks(*a, 1, 2**32, 256), "32 bits"),
-        (lambda a, lg: qsa.qsa_route_from_blocks(*a, 1, 16, 2**32), "32 bits"),
         (lambda a, lg: qsa.qsa_route_from_logical(*lg, 1, 16, 256, a[3]), "rows \\+ 1"),
     ],
 )

@@ -163,7 +163,6 @@ captured CUDA graph can replay them. The scorer needs SM80 or newer, and
     qsa_pre_indexer_dispatch_mask
     qsa_paged_scores
     qsa_expand_block_route
-    qsa_route_from_blocks
     qsa_route_from_logical
     qsa_output_gate
     qsa_capabilities

@@ -22,7 +22,6 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.qsa import (
     qsa_expand_block_route_trace,
-    qsa_route_from_blocks_trace,
     qsa_route_from_logical_trace,
 )
 from ..jit.qsa_ops import gen_qsa_route_module
@@ -159,145 +158,6 @@ def qsa_expand_block_route(
 
 
 @register_custom_op(
-    "flashinfer::qsa_route_from_blocks",
-    mutates_args=("out_logical", "out_route", "out_mask"),
-)
-def _qsa_route_from_blocks(
-    indexer_block_ids: torch.Tensor,
-    query_positions: torch.Tensor,
-    seq_lens: torch.Tensor,
-    token_to_request: torch.Tensor,
-    block_table: torch.Tensor,
-    out_logical: torch.Tensor,
-    out_route: torch.Tensor,
-    out_mask: torch.Tensor,
-    compress_ratio: int,
-    page_size: int,
-    num_slots: int,
-) -> None:
-    get_qsa_route_module().qsa_route_from_blocks(
-        indexer_block_ids,
-        query_positions,
-        seq_lens,
-        token_to_request,
-        block_table,
-        out_logical,
-        out_route,
-        out_mask,
-        compress_ratio,
-        page_size,
-        num_slots,
-    )
-
-
-@register_fake_op("flashinfer::qsa_route_from_blocks")
-def _qsa_route_from_blocks_fake(
-    indexer_block_ids: torch.Tensor,
-    query_positions: torch.Tensor,
-    seq_lens: torch.Tensor,
-    token_to_request: torch.Tensor,
-    block_table: torch.Tensor,
-    out_logical: torch.Tensor,
-    out_route: torch.Tensor,
-    out_mask: torch.Tensor,
-    compress_ratio: int,
-    page_size: int,
-    num_slots: int,
-) -> None:
-    pass
-
-
-@flashinfer_api(trace=qsa_route_from_blocks_trace)
-def qsa_route_from_blocks(
-    indexer_block_ids: torch.Tensor,
-    query_positions: torch.Tensor,
-    seq_lens: torch.Tensor,
-    token_to_request: torch.Tensor,
-    block_table: torch.Tensor,
-    out_logical: torch.Tensor,
-    out_route: torch.Tensor,
-    out_mask: torch.Tensor,
-    compress_ratio: int,
-    page_size: int,
-    num_slots: int,
-) -> None:
-    r"""Turn a per-query block selection straight into a paged attention route.
-
-    Fuses what would otherwise be three passes over the same route: expanding the
-    selected blocks into tokens (see :func:`qsa_expand_block_route`), mapping each token
-    through the block table into a physical KV slot, and packing per-entry validity
-    into the bitmask a block-sparse attention reads.
-
-    An entry is valid when it names a real token: inside the request, on a logical
-    page the block table covers, on a page the table maps, and in a slot the cache
-    holds. Invalid entries keep their mask bit clear and route to the slot of the
-    row's first valid entry: they are read before the mask applies, and a masked entry
-    still meets its V row with a zero weight, so the slot has to hold finite values.
-    Slot 0 is the caller's padding and need not. A row with no valid entry -- one
-    without a request, or one that sees nothing -- is fully masked on slot 0, and its
-    attention output is undefined: the caller must not keep it.
-
-    The logical route is written out as well, for callers that reuse a selection
-    across steps after the physical route derived from it has been consumed.
-
-    Parameters
-    ----------
-    indexer_block_ids : torch.Tensor
-        Selected block ids, shape ``[rows, block_topk]``, int32 or int64.
-    query_positions : torch.Tensor
-        Position of each query inside its request, shape ``[rows]``.
-    seq_lens : torch.Tensor
-        KV length of each request, shape ``[num_requests]``.
-    token_to_request : torch.Tensor
-        Request each row belongs to, shape ``[rows]``. A negative entry empties the row.
-    block_table : torch.Tensor
-        Logical page to physical page per request, shape ``[num_requests, table_width]``.
-        A negative entry marks an unmapped page.
-    out_logical : torch.Tensor
-        Receives the logical token route, shape ``[>= rows, width]``.
-    out_route : torch.Tensor
-        Receives the physical slot route, shape ``[rows, width]``, contiguous.
-    out_mask : torch.Tensor
-        Receives the packed validity, ``ceil(width / 8)`` uint8 per row, contiguous.
-    compress_ratio : int
-        Tokens per block.
-    page_size : int
-        KV entries per physical page.
-    num_slots : int
-        Total KV entries the cache holds.
-
-    Notes
-    -----
-    ``width`` is ``block_topk * compress_ratio + compress_ratio - 1``: every selected
-    block expands to ``compress_ratio`` tokens, and the query's own block contributes
-    at most ``compress_ratio - 1`` already-seen tokens.
-    """
-    if indexer_block_ids.ndim != 2:
-        raise ValueError(
-            f"indexer_block_ids must be 2D [rows, block_topk], got {indexer_block_ids.ndim}D"
-        )
-    if compress_ratio < 1:
-        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
-    if page_size < 1:
-        raise ValueError(f"page_size must be positive, got {page_size}")
-    if indexer_block_ids.shape[0] == 0:
-        return
-    _qsa_route_from_blocks(
-        indexer_block_ids,
-        query_positions,
-        seq_lens,
-        token_to_request,
-        block_table,
-        out_logical,
-        out_route,
-        out_mask,
-        compress_ratio,
-        page_size,
-        num_slots,
-    )
-
-
-@register_custom_op(
     "flashinfer::qsa_route_from_logical",
     mutates_args=("out_route", "out_mask", "out_indptr"),
 )
@@ -354,15 +214,16 @@ def qsa_route_from_logical(
 ) -> None:
     r"""Map a logical token route through a block table into physical KV slots.
 
-    The second half of :func:`qsa_route_from_blocks`, for callers whose logical route
-    was produced earlier and outlived the physical one -- a speculative decoder reuses
+    The logical route is the one :func:`qsa_expand_block_route` writes. It is mapped
+    separately because it can outlive the physical one -- a speculative decoder reuses
     a selection across its steps.
 
     An entry is valid when it names a real token: non-negative, on a logical page the
     block table covers, on a page the table maps, and in a slot the cache holds.
     Invalid entries keep their mask bit clear and route to the slot of the row's first
-    valid entry, for the reason :func:`qsa_route_from_blocks` gives. A row with no
-    valid entry -- padding at or past ``valid_rows``, a row without a request, or one
+    valid entry: they are read before the mask applies, and a masked entry still meets
+    its V row with a zero weight, so the slot has to hold finite values. Slot 0 is the
+    caller's padding and need not. A row with no valid entry -- padding at or past ``valid_rows``, a row without a request, or one
     whose route names nothing the table maps -- is fully masked on slot 0, and its
     attention output is undefined: the caller must not keep it.
 

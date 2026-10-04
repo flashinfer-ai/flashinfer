@@ -119,7 +119,6 @@ qsa_expand_block_route_k8.json
 qsa_output_gate_h4_d128.json
 qsa_paged_scores_h4_d128_ps16.json
 qsa_pre_indexer_h4_d128_ring8_ps4.json
-qsa_route_from_blocks_k8.json
 qsa_route_from_logical.json
 qsa_selection_h4_d128_ps16_w35.json
 quantize_nvfp4_smooth_N3072.json
@@ -2948,7 +2947,7 @@ with contextlib.suppress(Exception):
 # ── Qwen4Exp quantized sparse attention (QSA) (SM80+) ────────────────────────
 # One QSA step, selection then gated paged attention, traces the scorer, the
 # route expansion, the slot route and the gate along with both runs; the
-# pre-indexer and the fused route are called on their own.
+# pre-indexer is called on its own.
 with contextlib.suppress(Exception):
     import flashinfer.qsa_ops as _qsa
 
@@ -2978,14 +2977,6 @@ with contextlib.suppress(Exception):
         token_to_request=_qt2r,
         output_gate=torch.randn(8, 512, **_qbf),
     )
-
-    with contextlib.suppress(Exception):
-        _qout = [torch.empty(8, 35, **_qi) for _ in range(2)]
-        _qmask = torch.empty(40, dtype=torch.uint8, device=device)
-        _qblocks = torch.zeros(8, 8, **_qi)
-        _qsa.qsa_route_from_blocks(
-            _qblocks, _qpos, _qlens, _qt2r, _qtab, *_qout, _qmask, 4, 16, 256
-        )
 
     with contextlib.suppress(Exception):
         _qp = torch.arange(16, device=device)

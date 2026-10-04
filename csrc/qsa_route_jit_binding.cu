@@ -21,15 +21,9 @@ void qsa_expand_block_route(TensorView indexer_block_ids, TensorView query_posit
                             TensorView seq_lens, TensorView token_to_request, TensorView out,
                             int64_t compress_ratio);
 
-void qsa_route_from_blocks(TensorView indexer_block_ids, TensorView query_positions,
-                           TensorView seq_lens, TensorView token_to_request, TensorView block_table,
-                           TensorView out_logical, TensorView out_route, TensorView out_mask,
-                           int64_t compress_ratio, int64_t page_size, int64_t num_slots);
-
 void qsa_route_from_logical(TensorView logical, TensorView token_to_request, TensorView block_table,
                             TensorView out_route, TensorView out_mask, int64_t valid_rows,
                             int64_t page_size, int64_t num_slots, Optional<TensorView> out_indptr);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_expand_block_route, qsa_expand_block_route);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_route_from_logical, qsa_route_from_logical);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_route_from_blocks, qsa_route_from_blocks);
