@@ -180,19 +180,21 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x):
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
 @pytest.mark.parametrize("pdl", (False, True))
 @pytest.mark.parametrize(
-    "M,K", ((1, 1), (16, 7), (64, 4), (256, 7), (1024, 1), (4096, 4))
+    "M,K",
+    ((1, 1), (16, 7), (64, 4), (256, 7), (256, 4), (1024, 1), (1024, 4), (4096, 4)),
 )
 def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
     """Round r4 (direction 4 / 4b): the block-boundary snapshot write (block K written) runs
     the write variant of the dense cell's program - the small-M write programs inside the
-    dense family's M table, the persistent write variant where the dense cell is persistent."""
+    dense family's M table, the persistent write variant above it (also where the dense cell
+    runs a native port, e.g. sm_100a K4 M1024 / sm_103a K4 M256)."""
     plan = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=K)
-    dense = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl)
+    dense = cb._persistent_plan_exact(arch, SM_COUNT, M, K, pdl)
     max_m = cb._SMALL_M_DIRECT_MAX_M[arch].get(K)
     assert plan.fallback_from is None
     assert f".k{K}.delta1.write1.norm1.pdl{int(pdl)}." in plan.route_id
     assert plan.schedule_id.endswith("_write") and plan.kernel_key.endswith("_write")
-    if (max_m is not None and max_m >= M) or dense.kind != "persistent":
+    if max_m is not None and max_m >= M:
         cluster = cb._small_m_cluster(arch, M, K)
         nc = cb._small_m_sources_per_chunk(arch, M, K)
         nc_suffix = "" if nc is None else f"_nc{nc}"
@@ -604,7 +606,9 @@ def test_semantic_variants_take_the_bootstrap(
     _check(inputs, expected)
 
 
-@pytest.mark.parametrize("M,K", [(17, 4), (3, 7), (1, 1), (300, 4), (1024, 1)])
+@pytest.mark.parametrize(
+    "M,K", [(17, 4), (3, 7), (1, 1), (300, 4), (1024, 1), (1024, 4)]
+)
 @pytest.mark.parametrize("pdl", [False, True])
 def test_snapshot_write_matches_reference_on_the_write_variants(M, K, pdl):
     """Round r4: the block-boundary snapshot write (delta + output norm, block K written) runs the

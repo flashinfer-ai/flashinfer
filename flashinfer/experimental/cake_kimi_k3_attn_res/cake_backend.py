@@ -588,8 +588,9 @@ def _plan_route_exact(
     if write_idx >= 0:
         # Round r4 (direction 4 / 4b): the block-boundary snapshot write (block K written)
         # runs the write variant of the dense cell's program: the small-M write programs
-        # inside the dense family's M table, the persistent write variant where the dense
-        # cell is persistent, one small-M CTA per token elsewhere. The written index is the
+        # inside the dense family's M table, the persistent write variant above it (K >= 1,
+        # also where the dense cell runs a native port), one small-M CTA per token for K = 0
+        # only. The written index is the
         # program's K; any other index keeps the bootstrap (``common_path_eligible``).
         if write_idx != K or not 0 <= K < MAX_BLOCKS:
             raise ValueError(
@@ -597,11 +598,14 @@ def _plan_route_exact(
                 f"{MAX_BLOCKS}, observed {write_idx} at K={K}"
             )
         max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
-        dense = (
-            None
-            if max_m is not None and max_m >= M
-            else _plan_route_exact(arch, num_sms, M, K, use_pdl)
-        )
+        if max_m is not None and max_m >= M:
+            dense = None
+        elif K == 0:
+            dense = _plan_route_exact(arch, num_sms, M, K, use_pdl)
+        else:
+            # Above the table the write runs the persistent write variant even where the dense
+            # cell runs a native port (Cake select_route persistent_dense_only).
+            dense = _persistent_plan_exact(arch, num_sms, M, K, use_pdl)
         if dense is None or dense.kind != "persistent":
             return _small_m_plan(
                 arch,
@@ -670,6 +674,14 @@ def _plan_route_exact(
             arch,
             use_pdl,
         )
+    return _persistent_plan_exact(arch, num_sms, M, K, use_pdl)
+
+
+def _persistent_plan_exact(
+    arch: str, num_sms: int, M: int, K: int, use_pdl: bool
+) -> RoutePlan:
+    """The persistent program of a cell (the dense tail of ``_plan_route_exact``), mirrored from the
+    Cake dispatcher's persistent policies."""
     defer = _wait_policy(arch)
     nc, depth = _schedule(arch, M, K)
     grid_x, grid_policy = _grid(M, num_sms, nc)
