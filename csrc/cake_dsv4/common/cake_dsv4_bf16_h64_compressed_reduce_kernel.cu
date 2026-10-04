@@ -26,12 +26,9 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -40,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -80,7 +76,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_dsv4_697c8662eb01c8d6bd50(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_heads, int num_splits)
+kernel_cake_dsv4_ff2e22a8db18dbc0c76e(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, int num_heads, int num_splits)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -190,17 +186,13 @@ kernel_cake_dsv4_697c8662eb01c8d6bd50(__nv_bfloat16* __restrict__ partial_O, flo
                     : "r"(_vpairs_3[_pair]));
             }
         }
-        float _shfl_0;
-        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(normalized_weight), "r"(0));
+        float _shfl_0 = __shfl_sync(0xFFFFFFFF, normalized_weight, 0);
         float weight0 = _shfl_0;
-        float _shfl_1;
-        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_1) : "f"(normalized_weight), "r"(1));
+        float _shfl_1 = __shfl_sync(0xFFFFFFFF, normalized_weight, 1);
         float weight1 = _shfl_1;
-        float _shfl_2;
-        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_2) : "f"(normalized_weight), "r"(2));
+        float _shfl_2 = __shfl_sync(0xFFFFFFFF, normalized_weight, 2);
         float weight2 = _shfl_2;
-        float _shfl_3;
-        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_3) : "f"(normalized_weight), "r"(3));
+        float _shfl_3 = __shfl_sync(0xFFFFFFFF, normalized_weight, 3);
         float weight3 = _shfl_3;
         #pragma unroll
         for (int elem_1 = 0; elem_1 < 4; elem_1++) {
@@ -258,14 +250,11 @@ kernel_cake_dsv4_697c8662eb01c8d6bd50(__nv_bfloat16* __restrict__ partial_O, flo
                     : "r"(_vpairs_6[_pair]));
             }
         }
-        float _shfl_4;
-        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_4) : "f"(normalized_weight), "r"(0));
+        float _shfl_4 = __shfl_sync(0xFFFFFFFF, normalized_weight, 0);
         float weight0_1 = _shfl_4;
-        float _shfl_5;
-        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_5) : "f"(normalized_weight), "r"(1));
+        float _shfl_5 = __shfl_sync(0xFFFFFFFF, normalized_weight, 1);
         float weight1_1 = _shfl_5;
-        float _shfl_6;
-        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_6) : "f"(normalized_weight), "r"(2));
+        float _shfl_6 = __shfl_sync(0xFFFFFFFF, normalized_weight, 2);
         float weight2_1 = _shfl_6;
         #pragma unroll
         for (int elem_2 = 0; elem_2 < 4; elem_2++) {
@@ -292,8 +281,7 @@ kernel_cake_dsv4_697c8662eb01c8d6bd50(__nv_bfloat16* __restrict__ partial_O, flo
                         : "r"(_vpairs_7[_pair]));
                 }
             }
-            float _shfl_7;
-            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_7) : "f"(normalized_weight), "r"(split));
+            float _shfl_7 = __shfl_sync(0xFFFFFFFF, normalized_weight, split);
             float weight = _shfl_7;
             #pragma unroll
             for (int elem_3 = 0; elem_3 < 4; elem_3++) {
