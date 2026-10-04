@@ -92,10 +92,11 @@ struct Fc1KernelSpec {
   uint32_t cluster[3];
   // True when the kernel needs the cluster-dimension launch attribute (no compile-time cluster).
   bool cluster_attribute;
-  // True when the kernel reads num_non_exiting_ctas and bounds every tile it processes (its initial
-  // CTA and every tile acquired through cluster launch control) by that count. False when it takes
-  // total_tiles: only the initial CTA exit is bounded, so the launcher must make the routing entries
-  // in [total_tiles, grid_n) benign before the launch (expert 0, mn_limit = tile * tile_n, route -1).
+  // True when every tile the kernel processes is bounded by num_non_exiting_ctas: it reads that count
+  // itself, or it processes only its initial CTA (no cluster-launch-control acquisition) so the device
+  // grid exit on total_tiles suffices. False when it takes total_tiles and acquires cancelled CTAs: the
+  // launcher must make the routing entries in [total_tiles, grid_n) benign before the launch
+  // (expert 0, mn_limit = tile * tile_n, route slots -1).
   bool bounds_acquired_tiles;
   size_t dynamic_smem_bytes;
   // nullptr when the kernel takes the operand as a pointer (or does not take it at all).
@@ -1717,9 +1718,9 @@ inline constexpr Fc1KernelSpec kFc1Kernels[] = {
     {"kernel_cake_stepfun_moe_b8eedc76ca57a37e412b", 2, 64, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 210048u, &EncodeTensorMap_13_A, &EncodeTensorMap_13_B, nullptr, nullptr, &EncodeTensorMap_13_C, &Configure_13, &Submit_13},
     {"kernel_cake_stepfun_moe_d451550cf2cf6873ef39", 2, 128, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 152704u, &EncodeTensorMap_14_A, &EncodeTensorMap_14_B, nullptr, nullptr, &EncodeTensorMap_14_C, &Configure_14, &Submit_14},
     {"kernel_cake_stepfun_moe_cfd60da4d7b7115ecf6d", 2, 256, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 201856u, &EncodeTensorMap_15_A, &EncodeTensorMap_15_B, nullptr, nullptr, &EncodeTensorMap_15_C, &Configure_15, &Submit_15},
-    {"kernel_cake_stepfun_moe_4b159cb3776ced087900", 3, 8, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 210432u, &EncodeTensorMap_16_A, &EncodeTensorMap_16_B, nullptr, nullptr, &EncodeTensorMap_16_C, &Configure_16, &Submit_16},
-    {"kernel_cake_stepfun_moe_aa631989f7128edcfb17", 3, 16, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 223232u, &EncodeTensorMap_17_A, &EncodeTensorMap_17_B, nullptr, nullptr, &EncodeTensorMap_17_C, &Configure_17, &Submit_17},
-    {"kernel_cake_stepfun_moe_a3f4da1fcd71ddb90d23", 3, 32, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 207872u, &EncodeTensorMap_18_A, &EncodeTensorMap_18_B, nullptr, nullptr, &EncodeTensorMap_18_C, &Configure_18, &Submit_18},
+    {"kernel_cake_stepfun_moe_4b159cb3776ced087900", 3, 8, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, true, 210432u, &EncodeTensorMap_16_A, &EncodeTensorMap_16_B, nullptr, nullptr, &EncodeTensorMap_16_C, &Configure_16, &Submit_16},
+    {"kernel_cake_stepfun_moe_aa631989f7128edcfb17", 3, 16, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, true, 223232u, &EncodeTensorMap_17_A, &EncodeTensorMap_17_B, nullptr, nullptr, &EncodeTensorMap_17_C, &Configure_17, &Submit_17},
+    {"kernel_cake_stepfun_moe_a3f4da1fcd71ddb90d23", 3, 32, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, true, 207872u, &EncodeTensorMap_18_A, &EncodeTensorMap_18_B, nullptr, nullptr, &EncodeTensorMap_18_C, &Configure_18, &Submit_18},
     {"kernel_cake_stepfun_moe_c0ed54d60a6512474675", 4, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 217600u, &EncodeTensorMap_19_A, &EncodeTensorMap_19_B, &EncodeTensorMap_19_SFA, nullptr, &EncodeTensorMap_19_C, &Configure_19, &Submit_19},
     {"kernel_cake_stepfun_moe_6499782a39e979a64c1b", 4, 16, 64, 512, {640u, 1u, 1u}, {1u, 1u, 1u}, false, true, 193280u, &EncodeTensorMap_20_A, &EncodeTensorMap_20_B, &EncodeTensorMap_20_SFA, nullptr, &EncodeTensorMap_20_C, &Configure_20, &Submit_20},
     {"kernel_cake_stepfun_moe_fb2c144da915e6ebb41a", 4, 64, 64, 256, {512u, 1u, 1u}, {2u, 1u, 1u}, false, true, 176256u, &EncodeTensorMap_21_A, &EncodeTensorMap_21_B, &EncodeTensorMap_21_SFA, nullptr, &EncodeTensorMap_21_C, &Configure_21, &Submit_21},
@@ -3335,9 +3336,9 @@ inline constexpr Fc1KernelSpec kFc1Kernels[] = {
     {"kernel_cake_stepfun_moe_7db406f0c04d4fd6ecef", 2, 64, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 210048u, &EncodeTensorMap_1013_A, &EncodeTensorMap_1013_B, nullptr, nullptr, &EncodeTensorMap_1013_C, &Configure_1013, &Submit_1013},
     {"kernel_cake_stepfun_moe_218fef426c49ccc14fff", 2, 128, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 152704u, &EncodeTensorMap_1014_A, &EncodeTensorMap_1014_B, nullptr, nullptr, &EncodeTensorMap_1014_C, &Configure_1014, &Submit_1014},
     {"kernel_cake_stepfun_moe_9dce1dd514a72f60cc34", 2, 256, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 201856u, &EncodeTensorMap_1015_A, &EncodeTensorMap_1015_B, nullptr, nullptr, &EncodeTensorMap_1015_C, &Configure_1015, &Submit_1015},
-    {"kernel_cake_stepfun_moe_113a5a5b83f8dace4055", 3, 8, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 210432u, &EncodeTensorMap_1016_A, &EncodeTensorMap_1016_B, nullptr, nullptr, &EncodeTensorMap_1016_C, &Configure_1016, &Submit_1016},
-    {"kernel_cake_stepfun_moe_3bdd0b58896221d6a938", 3, 16, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 223232u, &EncodeTensorMap_1017_A, &EncodeTensorMap_1017_B, nullptr, nullptr, &EncodeTensorMap_1017_C, &Configure_1017, &Submit_1017},
-    {"kernel_cake_stepfun_moe_25ecc7bcbbba81aa3ebe", 3, 32, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 207872u, &EncodeTensorMap_1018_A, &EncodeTensorMap_1018_B, nullptr, nullptr, &EncodeTensorMap_1018_C, &Configure_1018, &Submit_1018},
+    {"kernel_cake_stepfun_moe_113a5a5b83f8dace4055", 3, 8, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, true, 210432u, &EncodeTensorMap_1016_A, &EncodeTensorMap_1016_B, nullptr, nullptr, &EncodeTensorMap_1016_C, &Configure_1016, &Submit_1016},
+    {"kernel_cake_stepfun_moe_3bdd0b58896221d6a938", 3, 16, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, true, 223232u, &EncodeTensorMap_1017_A, &EncodeTensorMap_1017_B, nullptr, nullptr, &EncodeTensorMap_1017_C, &Configure_1017, &Submit_1017},
+    {"kernel_cake_stepfun_moe_25ecc7bcbbba81aa3ebe", 3, 32, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, true, 207872u, &EncodeTensorMap_1018_A, &EncodeTensorMap_1018_B, nullptr, nullptr, &EncodeTensorMap_1018_C, &Configure_1018, &Submit_1018},
     {"kernel_cake_stepfun_moe_4d6a9ed197299d2cbf7f", 4, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 217600u, &EncodeTensorMap_1019_A, &EncodeTensorMap_1019_B, &EncodeTensorMap_1019_SFA, nullptr, &EncodeTensorMap_1019_C, &Configure_1019, &Submit_1019},
     {"kernel_cake_stepfun_moe_2fdd64b1ef9c92ebb03b", 4, 16, 64, 512, {640u, 1u, 1u}, {1u, 1u, 1u}, false, true, 193280u, &EncodeTensorMap_1020_A, &EncodeTensorMap_1020_B, &EncodeTensorMap_1020_SFA, nullptr, &EncodeTensorMap_1020_C, &Configure_1020, &Submit_1020},
     {"kernel_cake_stepfun_moe_46f032627936cd0f1a48", 4, 64, 64, 256, {512u, 1u, 1u}, {2u, 1u, 1u}, false, true, 176256u, &EncodeTensorMap_1021_A, &EncodeTensorMap_1021_B, &EncodeTensorMap_1021_SFA, nullptr, &EncodeTensorMap_1021_C, &Configure_1021, &Submit_1021},
