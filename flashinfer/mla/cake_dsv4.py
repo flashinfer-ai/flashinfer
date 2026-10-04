@@ -744,6 +744,7 @@ _RAGGED_ONLY_ROUTES = frozenset(
         "fp8_h128_prefill_source_persistent",
         "fp8_h128_prefill_source_persistent_uniform",
         "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
     }
 )
 # Mirrors the Cake seed's LANE_GATHER_MIN_TOKENS. Below it the
@@ -770,6 +771,19 @@ def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bo
     if num_query_tokens <= 12:
         return full_tiles >= 3
     return full_tiles >= 2 or num_query_tokens >= 128
+
+
+# Mirrors the Cake M64 seed's box_k_gather_for_width (TILE_KV = 128).  The M64
+# body is exported twice: single-tile items (the SWA tile is the whole item)
+# run the program whose load warp gathers contiguous 16-key SWA chunks through
+# one box TMA (-0.35..-0.42 us on the 128/256-token SWA rows); every wider item
+# runs the program without that block, which measured at +0.03..+0.11 us of
+# load-warp code layout on the multi-tile rows even when the in-kernel gate
+# kept it off.  Same bits from both programs.
+def _fp8_h64_m64_program(sparse_topk: int) -> str:
+    if sparse_topk == _TILE_KV:
+        return "fp8_h64_prefill_source_persistent_m64"
+    return "fp8_h64_prefill_source_persistent_m64_multi_tile"
 
 
 _UNAVAILABLE_HINTS: Mapping[str, str] = {
@@ -1015,8 +1029,9 @@ def _route(
                 # H64-specific single-CTA M64 persistent body (one
                 # CTA per token, unified 128-row KV stage, no V gathers): GB300
                 # 1.25-1.55x / B200 1.22-1.44x on the 128-512 token rows where
-                # the FP8/H128 body sat at 0.81-1.13x.
-                return "fp8_h64_prefill_source_persistent_m64"
+                # the FP8/H128 body sat at 0.81-1.13x.  Two exported programs,
+                # selected by the item width.
+                return _fp8_h64_m64_program(sparse_topk)
             return _fp8_persistent_program(num_query_tokens)
         if is_swa:
             return "fp8_lowhead_prefill"
@@ -1651,10 +1666,14 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         L.run(L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts))
         return
 
-    if route == "fp8_h64_prefill_source_persistent_m64":
+    if route in (
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
+    ):
         # One CTA per token (cta_group::1, M = 64); same kernel kwargs as the
         # FP8/H128 persistent body (num_heads runtime, -1 masking, padded rows,
-        # caller-owned workspace), grid = tokens.
+        # caller-owned workspace), grid = tokens.  Both M64 programs share the
+        # kernel ABI; _fp8_h64_m64_program picks one by the item width.
         parts = L.partials(1)
         L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts))
         return
