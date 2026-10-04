@@ -183,6 +183,10 @@ constexpr int32_t kExpertTier384 = 384;
 constexpr int32_t kExpertTier512 = 512;
 constexpr int32_t kExpertTier1024 = flashinfer::da_moe::kDAMaxExperts;
 constexpr int32_t kStandardMaxTopK = 8;
+// Match ordinary precomputed routing: each tile owns an eight-block cluster
+// whose register-resident permutation covers the full 8192-token DA capacity.
+constexpr int32_t kMultiTileThreads = routingCustom::NumThreads;
+static_assert(NumBlocksPerCluster * kMultiTileThreads >= kMaxTokensMultiTileCluster);
 
 /// Return the compiled expert tier covering one routing problem, or zero when unsupported.
 int32_t getMaxNumExpertsTier(int32_t numExperts) {
@@ -219,9 +223,8 @@ struct MultiTileKernelArgs {
 /// Run the permutation topology once per tile inside a single clustered CUDA kernel.
 template <typename KernelParams, typename ExpertId, bool CooperativePadding>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-__global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
-    __launch_bounds__(KernelParams::MaxNumExperts)
-        routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelParams, ExpertId> args) {
+__global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(kMultiTileThreads)
+    routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelParams, ExpertId> args) {
   using OutputT = typename KernelParams::OutputT;
 
   int32_t const tileIdx = blockIdx.x / NumBlocksPerCluster;
@@ -238,10 +241,10 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
   }
-  // Request extended capacity from the existing device routine; ordinary callers retain its
-  // default cluster-sized capacity and generated implementation.
-  routingPermutation<KernelParams, OutputT, KernelParams::MaxNumExperts,
-                     KernelParams::MaxNumExperts / WarpSize, KernelParams::MaxNumTopExperts,
+  // Keep ranks in registers, as in ordinary routing. Clusters are independent:
+  // each writes the permutation and padding for its own selected tile size.
+  routingPermutation<KernelParams, OutputT, kMultiTileThreads, kMultiTileThreads / WarpSize,
+                     KernelParams::MaxNumTopExperts,
                      /*LoadExpertIdxFromGlobal=*/true, ExpertId, kMaxTokensMultiTileCluster,
                      CooperativePadding>(params, nullptr, warpIdx, clusterBlockRank,
                                          args.expertIds);
@@ -252,7 +255,7 @@ __global__ void routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelP
 }
 #endif
 
-/// Pack host-side tile descriptors and issue the extended clustered-kernel launch.
+/// Pack host-side tile descriptors and issue one clustered-kernel launch.
 template <typename KernelParams, typename ExpertId, bool CooperativePadding>
 void launchMultiTileClusterKernel(Data* data, int32_t numTiles, int32_t numBlocks,
                                   int32_t numThreads, int32_t smemSize, void* stream) {
@@ -378,7 +381,7 @@ void launchMultiTileCluster(Data* data, int32_t numTiles, int32_t numBlocks, int
 
 }  // namespace
 
-/// Return the graph-stable token capacity implemented by the two-phase cluster decomposition.
+/// Return the graph-stable token capacity implemented by each tile cluster.
 int32_t maxTokensMultiTileCluster(int32_t numExperts) {
   FLASHINFER_CHECK(getMaxNumExpertsTier(numExperts) > 0,
                    "fused multi-tile routing requires numExperts <= ", kExpertTier1024);
@@ -429,7 +432,7 @@ void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
                      "all multi-tile routing entries must have the same local expert count");
   }
 
-  int32_t const numThreads = getMaxNumExpertsTier(first.mNumExperts);
+  int32_t const numThreads = kMultiTileThreads;
   int32_t const numBlocks = NumBlocksPerCluster * numTiles;
   launchMultiTileCluster(data, numTiles, numBlocks, numThreads, /*smemSize=*/0, stream);
 }

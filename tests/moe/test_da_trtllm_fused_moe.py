@@ -95,26 +95,13 @@ def _matching_from_logits_diagnostic(shape, distributions):
     return matches[0]
 
 
-def _assert_routing_metadata_slots_bit_exact(actual, expected) -> None:
-    """Compare every initialized body-facing routing-metadata element exactly."""
+def _assert_routing_metadata_slots_equivalent(actual, expected, expert_ids) -> None:
+    """Check metadata and bijective expert-grouped mappings, allowing atomic row order."""
     assert torch.equal(actual.total_num_padded_tokens, expected.total_num_padded_tokens)
-    assert torch.equal(
-        actual.expanded_idx_to_permuted_idx,
-        expected.expanded_idx_to_permuted_idx,
-    )
     assert torch.equal(actual.expert_weights, expected.expert_weights)
     assert torch.equal(actual.num_tokens_per_expert, expected.num_tokens_per_expert)
     assert torch.equal(actual.num_non_exiting_ctas, expected.num_non_exiting_ctas)
-
-    # Padded permutation holes and capacity tails are intentionally undefined. Compare only row
-    # indices proven live by the already-exact expanded mapping, plus the live grouped-GEMM prefix.
-    live_permuted_indices = actual.expanded_idx_to_permuted_idx
-    live_permuted_indices = live_permuted_indices[live_permuted_indices >= 0]
     num_ctas = int(actual.num_non_exiting_ctas.item())
-    assert torch.equal(
-        actual.permuted_idx_to_token_idx[live_permuted_indices],
-        expected.permuted_idx_to_token_idx[live_permuted_indices],
-    )
     assert torch.equal(
         actual.cta_idx_xy_to_batch_idx[:num_ctas],
         expected.cta_idx_xy_to_batch_idx[:num_ctas],
@@ -123,6 +110,24 @@ def _assert_routing_metadata_slots_bit_exact(actual, expected) -> None:
         actual.cta_idx_xy_to_mn_limit[:num_ctas],
         expected.cta_idx_xy_to_mn_limit[:num_ctas],
     )
+    ids = expert_ids.flatten().long()
+    counts = torch.bincount(ids, minlength=actual.num_tokens_per_expert.numel())
+    assert torch.equal(actual.num_tokens_per_expert, counts)
+    padded = (counts + actual.tile_n - 1) // actual.tile_n * actual.tile_n
+    offsets = padded.cumsum(0) - padded
+    num_rows = int(padded.sum().item())
+    assert int(actual.total_num_padded_tokens.item()) == num_rows
+    for slot in (actual, expected):
+        permutation = slot.expanded_idx_to_permuted_idx.flatten().long()
+        # Each assignment has one unique row within its expert's live prefix.
+        assert permutation.unique().numel() == ids.numel()
+        assert torch.all(permutation >= offsets[ids])
+        assert torch.all(permutation < offsets[ids] + counts[ids])
+        inverse = torch.full((num_rows,), -1, dtype=torch.int32, device=ids.device)
+        inverse[permutation] = torch.arange(
+            expert_ids.shape[0], dtype=torch.int32, device=ids.device
+        ).repeat_interleave(expert_ids.shape[1])
+        assert torch.equal(slot.permuted_idx_to_token_idx[:num_rows], inverse)
 
 
 def _capture_kernel_node_count(invoke) -> int:
@@ -156,6 +161,7 @@ def _capture_kernel_node_count(invoke) -> int:
 
 
 @pytest.mark.parametrize("num_tokens", (2048, 2049, 8192))
+@pytest.mark.parametrize("num_experts,top_k", ((256, 8), (512, 22)))
 @pytest.mark.parametrize(
     "tile_ns",
     (
@@ -177,14 +183,14 @@ def _capture_kernel_node_count(invoke) -> int:
 )
 def test_fused_multi_tile_routing_matches_independent_tiles_at_capacity_boundaries(
     num_tokens: int,
+    num_experts: int,
+    top_k: int,
     routing_input_mode: RoutingInputMode,
     expert_id_dtype: torch.dtype,
     tile_ns: tuple[int, ...],
 ) -> None:
-    """Fused packed and unpacked routing must match independent tile launches bit-exactly."""
+    """Fused and independent tiles must describe the same expert-grouped assignments."""
     require_sm100()
-    num_experts = 256
-    top_k = 8
 
     # Give every token unique experts with deterministic wraparound, plus nonuniform live weights.
     token_index = torch.arange(num_tokens, dtype=torch.int64).unsqueeze(1)
@@ -210,7 +216,7 @@ def test_fused_multi_tile_routing_matches_independent_tiles_at_capacity_boundari
         routing_weights_arg = routing_weights
 
     # Materialize an arbitrary tile mixture with one fused launch, then independently materialize
-    # the same slots through the public one-tile ABI to establish the exact metadata reference.
+    # the same slots through the public one-tile ABI to establish equivalent metadata.
     fused = trtllm_moe_allocate_routing_metadata_multi_tile(
         routing_ids,
         num_experts=num_experts,
@@ -242,18 +248,7 @@ def test_fused_multi_tile_routing_matches_independent_tiles_at_capacity_boundari
 
     for actual, expected in zip(fused.slots, references, strict=True):
         assert actual.tile_n == expected.tile_n
-        _assert_routing_metadata_slots_bit_exact(actual, expected)
-        # Independently verify live rows and padding, including unwritten-tail bugs
-        # that comparing two invocations of the same kernel cannot detect.
-        num_rows = int(actual.total_num_padded_tokens.item())
-        inverse = torch.full(
-            (num_rows,), -1, dtype=torch.int32, device=expert_ids.device
-        )
-        permutation = actual.expanded_idx_to_permuted_idx.reshape(-1).long()
-        inverse[permutation] = torch.arange(
-            num_tokens, device=expert_ids.device, dtype=torch.int32
-        ).repeat_interleave(top_k)
-        assert torch.equal(actual.permuted_idx_to_token_idx[:num_rows], inverse)
+        _assert_routing_metadata_slots_equivalent(actual, expected, expert_ids)
 
 
 @pytest.mark.parametrize("num_tokens", (2730, 2731, 8192))
