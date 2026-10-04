@@ -1,3 +1,4 @@
+import hashlib
 import re
 import subprocess
 from pathlib import Path
@@ -536,3 +537,91 @@ def test_resolve_object_names_handles_duplicate_source_entries():
     sources = [Path("csrc/x/kernel.cu"), Path("csrc/x/kernel.cu")]
     names = cpp_ext.resolve_object_names(sources)
     assert len(set(names)) == 2
+
+
+def _adversarial_trio(root: Path) -> list[Path]:
+    """Sources where a digest-disambiguated name collides with a kept name.
+
+    ``one/x/kernel.cu`` and ``two/x/kernel.cu`` share (parent name, stem); the
+    third file is literally named after the digest of the first one, so its
+    kept object name equals the first one's disambiguated candidate.
+    """
+    first = root / "one" / "x" / "kernel.cu"
+    second = root / "two" / "x" / "kernel.cu"
+    digest = (
+        cpp_ext.resolve_object_names([first, second])[0]
+        .rsplit("_", 1)[-1]
+        .removesuffix(".cuda.o")
+    )
+    return [first, second, root / "three" / "x" / f"kernel_{digest}.cu"]
+
+
+def test_object_naming_keeps_disambiguated_names_globally_unique(monkeypatch, tmp_path):
+    sources = _adversarial_trio(tmp_path)
+
+    spec = _make_spec(tmp_path, monkeypatch, sources)
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name=spec.name,
+        sources=spec.sources,
+        extra_cflags=spec.extra_cflags,
+        extra_cuda_cflags=spec.extra_cuda_cflags,
+        extra_ldflags=spec.extra_ldflags,
+        extra_include_dirs=spec.extra_include_dirs,
+    )
+
+    # Three distinct ninja outputs (no "multiple rules generate"), the
+    # coincidentally-named source keeps its object name, and all three
+    # interfaces agree.
+    outputs = _ninja_object_paths(ninja)
+    assert len(set(outputs)) == 3
+    kept = f"x_kernel_{sources[2].stem.removeprefix('kernel_')}.cuda.o"
+    assert kept in {Path(o).name for o in outputs}
+    assert _resolve_all(spec.get_object_paths()) == _resolve_all(outputs)
+    assert _resolve_all(_compile_command_outputs(spec.get_compile_commands())) == (
+        _resolve_all(outputs)
+    )
+
+
+def test_object_naming_resolves_digest_collisions_between_members(monkeypatch):
+    real_sha1 = hashlib.sha1
+
+    fixed_digest = real_sha1(b"fixed-digest-collision").hexdigest()[:8]
+
+    def colliding_sha1(data):
+        if b"#" not in data:
+            # Salt-1 candidates of all members share one digest, forcing a
+            # digest-vs-digest collision the uniqueness check must resolve.
+            return real_sha1(b"fixed-digest-collision")
+        return real_sha1(data)
+
+    monkeypatch.setattr(cpp_ext.hashlib, "sha1", colliding_sha1)
+
+    names = cpp_ext.resolve_object_names(
+        [Path("one/x/kernel.cu"), Path("two/x/kernel.cu")]
+    )
+
+    assert len(set(names)) == 2
+    assert sum(f"_{fixed_digest}.cuda.o" in name for name in names) == 1
+
+
+def test_resolve_object_names_is_independent_of_source_order(tmp_path):
+    sources = _adversarial_trio(tmp_path)
+
+    forward = dict(
+        zip(
+            (str(source) for source in sources),
+            cpp_ext.resolve_object_names(sources),
+            strict=True,
+        )
+    )
+    rotated = [sources[i] for i in (2, 0, 1)]
+    rotated_mapping = dict(
+        zip(
+            (str(source) for source in rotated),
+            cpp_ext.resolve_object_names(rotated),
+            strict=True,
+        )
+    )
+
+    assert forward == rotated_mapping
