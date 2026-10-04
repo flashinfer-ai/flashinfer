@@ -2323,7 +2323,7 @@ def test_source_direct_preprocess_and_sequence_argument_order():
         1,
         0x1234,
     )
-    assert len(bound) == 22 + 3 + 43 + 3 + 1
+    assert len(bound) == 22 + 3 + 41 + 3 + 1
 
     assert module._persistent_grid_size(total_work=256, sm_count=148) == 128
     assert module._persistent_grid_size(total_work=384, sm_count=148) == 128
