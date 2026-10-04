@@ -86,7 +86,7 @@ __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_minimax_h3_varlen_attention_f3e0c2ed3c60f798ede5(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp8, float* __restrict__ v_amax, float* __restrict__ v_amax_partial, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
+kernel_cake_minimax_h3_varlen_attention_d685cb8f9d9ceebf67f6(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v, uint8_t* __restrict__ q_fp4, uint8_t* __restrict__ k_fp4, uint8_t* __restrict__ q_scale, uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_fp8, float* __restrict__ v_amax, float* __restrict__ v_amax_partial, int* __restrict__ block_token, int* __restrict__ block_valid, int heads, int PB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -394,7 +394,7 @@ kernel_cake_minimax_h3_varlen_attention_f3e0c2ed3c60f798ede5(__nv_bfloat16* __re
         float normalized[16];
         #pragma unroll
         for (int element_1 = 0; element_1 < 16; element_1++) {
-            normalized[element_1] = (q_values + iteration_1 * 16)[element_1] * inverse_scale;
+            normalized[element_1] = q_values[iteration_1 * 16 + element_1] * inverse_scale;
         }
         unsigned int packed[2];
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed[0]) : "f"(normalized[0]), "f"(normalized[1]), "f"(normalized[2]), "f"(normalized[3]), "f"(normalized[4]), "f"(normalized[5]), "f"(normalized[6]), "f"(normalized[7]));
@@ -428,7 +428,7 @@ kernel_cake_minimax_h3_varlen_attention_f3e0c2ed3c60f798ede5(__nv_bfloat16* __re
         float normalized_7[16];
         #pragma unroll
         for (int element_2 = 0; element_2 < 16; element_2++) {
-            normalized_7[element_2] = (k_values + iteration_1 * 16)[element_2] * inverse_scale_6;
+            normalized_7[element_2] = k_values[iteration_1 * 16 + element_2] * inverse_scale_6;
         }
         unsigned int packed_8[2];
         asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(packed_8[0]) : "f"(normalized_7[0]), "f"(normalized_7[1]), "f"(normalized_7[2]), "f"(normalized_7[3]), "f"(normalized_7[4]), "f"(normalized_7[5]), "f"(normalized_7[6]), "f"(normalized_7[7]));

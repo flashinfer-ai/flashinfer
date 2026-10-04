@@ -23,7 +23,7 @@ bias, dropout, sliding window or LSE output.
 
 | Tensor | Shape | dtype |
 | --- | --- | --- |
-| `query`, `key`, `value` | `[T, H, 128]` packed THD, contiguous | bfloat16 |
+| `query`, `key`, `value` | `[T, H, 128]` packed THD. BF16 route: any view with unit innermost stride, a head stride that is a 16-byte multiple (>= 128 elements), a token stride that is a 16-byte multiple (>= H x head stride) and a 16-byte-aligned base, e.g. the column slices of a fused `[T, 3*H*128]` QKV projection (strides `(3*H*128, 128, 1)`) or the slices of a `[T, H, 3, 128]` pack (strides `(H*384, 384, 1)`); the three may differ in strides and are read in place. NVFP4 routes: contiguous | bfloat16 |
 | `cu_seqlens` | `[B + 1]`, `cu_seqlens[0] == 0`, non-decreasing, `cu_seqlens[B] == T` | int32 (CUDA) |
 | `out` | `[T, H, 128]` (optional, caller-owned) | bfloat16 |
 
@@ -226,6 +226,11 @@ is CUDA-Graph capturable.
   lack the tcgen05/TMEM path and are not supported; SM90 is not a target.
 * BF16 THD inputs and BF16 output only, head dimension 128, noncausal,
   self-attention (`H_q == H_kv`), no bias/mask/window/LSE/dropout.
+* The BF16 route reads strided `query` / `key` / `value` views in place: the
+  host binding encodes the TMA descriptors from the views' strides and
+  passes the Q view's token/head strides to the kernel's ragged-tail copy
+  path. `out` is always contiguous. The NVFP4 routes (whose quantizers
+  read contiguous THD) require contiguous operands.
 * The NVFP4 variants trade accuracy for speed: validated tolerance against an
   FP32 reference is `atol=1.0, rtol=0.1` (BF16: `atol=rtol=1e-2`). The
   `fp8` PV mode is the default because its error is lower at similar speed;
