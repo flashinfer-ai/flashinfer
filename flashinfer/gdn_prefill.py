@@ -16,6 +16,8 @@ limitations under the License.
 
 import math
 import warnings
+import collections
+import functools
 import weakref
 from typing import Callable, Literal, Optional, Tuple, Union, cast
 import torch
@@ -66,10 +68,41 @@ _GDN_CP_STATE_DTYPES: tuple[torch.dtype, ...] = (
 )
 
 
-_CAKE_GDN_HOST_INTS: dict[
+# Resolved cu_seqlens / metadata ints keyed by tensor identity; bounded LRU so
+# a long-running server with rotating metadata tensors cannot grow it without
+# limit.  One entry per distinct live metadata tensor is all a replay needs.
+_CAKE_GDN_HOST_INTS_MAX = 1024
+_CAKE_GDN_HOST_INTS: collections.OrderedDict[
     tuple[int, int, Optional[int], int],
     tuple[weakref.ReferenceType[torch.Tensor], tuple[int, ...]],
-] = {}
+] = collections.OrderedDict()
+
+
+@functools.cache
+def _cake_gdn_arch(device_index: int) -> "_cake_gdn.CakeGDNArch":
+    """Resolve the Cake GDN architecture of one CUDA device once."""
+
+    major, minor = torch.cuda.get_device_capability(device_index)
+    return _cake_gdn.arch_for_compute_capability(major, minor)
+
+
+@functools.cache
+def _cake_gdn_sm_count(device_index: int) -> int:
+    """Streaming-multiprocessor count of one CUDA device, resolved once."""
+
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+@functools.cache
+def _cake_gdn_sentinel(device_index: int, dtype: torch.dtype) -> torch.Tensor:
+    """One-element placeholder passed for absent optional tensors.
+
+    The kernel never reads or writes it (the matching specialization flag is
+    off), so one tensor per device and dtype serves every call and keeps the
+    launch path allocation-free.
+    """
+
+    return torch.empty(1, dtype=dtype, device=torch.device("cuda", device_index))
 
 
 def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...]:
@@ -87,6 +120,7 @@ def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...
     )
     cached = _CAKE_GDN_HOST_INTS.get(key)
     if cached is not None and cached[0]() is values:
+        _CAKE_GDN_HOST_INTS.move_to_end(key)
         return cached[1]
     if torch.cuda.is_current_stream_capturing():
         raise _cake_gdn.CakeGDNUnsupportedError(
@@ -94,6 +128,8 @@ def _cake_gdn_host_ints(values: torch.Tensor, *, purpose: str) -> tuple[int, ...
         )
     resolved = tuple(int(value) for value in values.detach().cpu().tolist())
     _CAKE_GDN_HOST_INTS[key] = (weakref.ref(values), resolved)
+    while len(_CAKE_GDN_HOST_INTS) > _CAKE_GDN_HOST_INTS_MAX:
+        _CAKE_GDN_HOST_INTS.popitem(last=False)
     return resolved
 
 
@@ -198,8 +234,10 @@ def _run_cake_gdn_prefill(
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP prefill requires all tensors on one CUDA device"
         )
-    major, minor = torch.cuda.get_device_capability(q.device)
-    arch = _cake_gdn.arch_for_compute_capability(major, minor)
+    device_index = int(
+        q.device.index if q.device.index is not None else torch.cuda.current_device()
+    )
+    arch = _cake_gdn_arch(device_index)
     if q.dtype not in (torch.float16, torch.bfloat16) or any(
         tensor.dtype != q.dtype for tensor in (k, v, output)
     ):
@@ -373,9 +411,7 @@ def _run_cake_gdn_prefill(
         seq_lens=seq_lens,
     )
     entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
-    active_clusters = int(
-        torch.cuda.get_device_properties(q.device).multi_processor_count
-    )
+    active_clusters = _cake_gdn_sm_count(device_index)
     dvsplit = route.route_id.endswith(".dvsplit")
     total_tiles = num_seqs * num_o_heads * (2 if dvsplit else 1)
     if dvsplit or total_tiles <= 128:
@@ -389,7 +425,7 @@ def _run_cake_gdn_prefill(
         else:
             grid_x = min(active_clusters, total_tiles)
 
-    empty_i32 = torch.empty(1, dtype=torch.int32, device=q.device)
+    empty_i32 = _cake_gdn_sentinel(device_index, torch.int32)
     cu_seqlens_i32 = (
         cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
     )
@@ -400,7 +436,7 @@ def _run_cake_gdn_prefill(
         if state_indices.dtype == torch.int32
         else state_indices.to(torch.int32)
     )
-    empty_state = torch.empty(1, dtype=state_dtype, device=q.device)
+    empty_state = _cake_gdn_sentinel(device_index, state_dtype)
     launch_initial_state = initial_state if initial_state is not None else empty_state
     launch_output_state = (
         output_state if output_final_state and output_state is not None else empty_state

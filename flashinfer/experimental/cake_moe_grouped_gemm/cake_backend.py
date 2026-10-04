@@ -34,6 +34,7 @@ decisions exactly from ``HOST_PLAN_CONSTANTS``.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -44,10 +45,12 @@ import tvm_ffi
 from ...api_logging import warn_experimental_backend_once
 from .cake_jit import (
     HOST_PLAN_CONSTANTS,
-    MODULES,
+    PROGRAMS,
+    ROUTES,
     load_module,
     program_registered,
     select_module,
+    stage_binding,
 )
 
 SUPPORTED_COMPUTE_CAPABILITIES = {
@@ -75,13 +78,28 @@ def host_plan_constants() -> dict[str, Any]:
     return HOST_PLAN_CONSTANTS
 
 
+def _device_index(device: torch.device) -> int:
+    index = device.index
+    return torch.cuda.current_device() if index is None else int(index)
+
+
+@functools.cache
+def _device_facts(index: int) -> tuple[Optional[str], int]:
+    """(exact architecture or None, SM count) of CUDA device ``index``: queried once per process."""
+    capability = torch.cuda.get_device_capability(index)
+    properties = torch.cuda.get_device_properties(index)
+    return SUPPORTED_COMPUTE_CAPABILITIES.get(capability), int(
+        properties.multi_processor_count
+    )
+
+
 def arch_for(device: torch.device) -> Optional[str]:
     """Exact architecture name of ``device`` or ``None`` when unsupported."""
-    return SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    return _device_facts(_device_index(device))[0]
 
 
 def sm_count(device: torch.device) -> int:
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+    return _device_facts(_device_index(device))[1]
 
 
 def generated_program_available(
@@ -315,8 +333,6 @@ class _Launch:
     module: str
     entry: Callable[..., Any] = field(repr=False)
     arguments: tuple = field(repr=False)
-    # Descriptor preparation entry of a pointer-ABI stage (same arguments); None otherwise.
-    prepare: Optional[Callable[..., Any]] = field(default=None, repr=False)
 
     def __call__(self) -> None:
         self.entry(*self.arguments)
@@ -328,12 +344,14 @@ class GroupedGemmLaunch:
 
     ``launch()`` runs the bound program on the current torch stream into the
     caller-owned ``out`` with no CUDA allocation and no host synchronisation
-    and returns ``out``.  The kernels read ``offs`` on device at every launch,
-    so the same prepared launch (or a CUDA Graph capturing it) stays valid when
-    the caller writes new group boundaries into ``offs`` or new values into the
-    operands.  Prepare a new launch when a shape, dtype or tensor binding
-    changes.  ``plan`` records the host decisions (grid, k tile, tail split,
-    raster, launch count); ``stages`` is the stage set of the bound program.
+    and returns ``out``.  Each launch passes the operands' TMA descriptors by
+    value (encoded by the binding from the bound tensors' metadata), and the
+    kernels read ``offs`` on device at every launch, so the same prepared
+    launch (or a CUDA Graph capturing it) stays valid when the caller writes
+    new group boundaries into ``offs`` or new values into the operands.
+    Prepare a new launch when a shape, dtype or tensor binding changes.
+    ``plan`` records the host decisions (grid, k tile, tail split, raster,
+    launch count); ``stages`` is the stage set of the bound route.
     """
 
     op: str
@@ -343,7 +361,7 @@ class GroupedGemmLaunch:
     out: torch.Tensor
     launches: tuple[_Launch, ...] = field(repr=False)
     zero_fill: bool = False
-    # Caller-owned buffers of this launch: descriptor workspaces, the per-CTA
+    # Caller-owned buffers of this launch (weight gradient): the per-CTA
     # descriptor slots and the fp32 tail partials.  Kept alive with the launch.
     workspaces: tuple[torch.Tensor, ...] = field(default=(), repr=False)
 
@@ -437,55 +455,30 @@ def _aligned_bytes(nbytes: int, device: torch.device, what: str) -> torch.Tensor
     return ws
 
 
-def _bind(
-    name: str, stage: str, kwargs: dict[str, Any], device: torch.device
-) -> tuple[_Launch, list]:
-    """Order ``kwargs`` by the generated argument plan of ``stage`` and load its entries.
-
-    Allocates the stage's caller-owned TMA descriptor workspace when the record
-    declares one (pointer ABI) and returns it with the launch so the caller
-    keeps it alive.
-    """
-    record = MODULES[name]
-    physical = record[stage]
-    retained = []
-    workspace_bytes = int(physical.get("tma_workspace_bytes", 0))
-    if workspace_bytes:
-        kwargs = dict(kwargs)
-        kwargs["tma_descriptor_workspace"] = _aligned_bytes(
-            workspace_bytes, device, f"{name}/{stage} descriptor workspace"
-        )
-        retained.append(kwargs["tma_descriptor_workspace"])
+def _bind(name: str, stage: str, kwargs: dict[str, Any], arch: str) -> _Launch:
+    """Order ``kwargs`` by the generated argument plan of ``stage`` of route ``name`` and load its entry
+    for ``arch`` (the binding encodes the operands' TMA descriptors by value at every launch)."""
+    binding = stage_binding(name, stage)
+    program = PROGRAMS[binding["program"]]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
-    for kind, arg in physical["arg_plan"]:
+    for kind, arg in program["arg_plan"]:
         if kind == "grid":
             arguments.append(int(grid[arg]))
         elif arg in kwargs:
             arguments.append(kwargs[arg])
         else:
             raise KeyError(
-                f"generated program {name!r} stage {stage!r} expects argument {arg!r} "
-                f"({kind}); the host binding provides {sorted(kwargs)}"
+                f"generated program {binding['program']!r} (route {name!r}, stage {stage!r}) "
+                f"expects argument {arg!r} ({kind}); the host binding provides {sorted(kwargs)}"
             )
-    module = load_module(name, stage)
-    prepare_entry = physical.get("tma_prepare_entry")
-    launch = _Launch(
+    module = load_module(binding["program"], arch, binding["specializations"])
+    return _Launch(
         stage=stage,
-        module=physical["module"],
-        entry=getattr(module, physical["ffi_entry"]),
+        module=binding["program"],
+        entry=getattr(module, program["ffi_entry"]),
         arguments=tuple(arguments),
-        prepare=getattr(module, prepare_entry) if prepare_entry else None,
     )
-    return launch, retained
-
-
-def _prepare_descriptors(launches: list[_Launch]) -> None:
-    """Encode the TMA descriptors of every pointer-ABI stage once (outside graph capture)."""
-    with tvm_ffi.use_torch_stream():
-        for item in launches:
-            if item.prepare is not None:
-                item.prepare(*item.arguments)
 
 
 def _finish(
@@ -498,11 +491,10 @@ def _finish(
     *,
     zero_fill: bool = False,
 ) -> GroupedGemmLaunch:
-    _prepare_descriptors(launches)
     return GroupedGemmLaunch(
         op=op,
         record_name=name,
-        stages=tuple(MODULES[name]["stages"]),
+        stages=tuple(stage["name"] for stage in ROUTES[name]["stages"]),
         plan=plan,
         out=out,
         launches=tuple(launches),
@@ -597,8 +589,7 @@ def _prepare_row_op(
         ldc=int(out.stride(0)),
         grid=plan["grid"],
     )
-    launch, retained = _bind(name, "main", kwargs, device)
-    return _finish(op, name, plan, out, [launch], retained)
+    return _finish(op, name, plan, out, [_bind(name, "main", kwargs, arch)], [])
 
 
 def prepare_grouped_gemm_fwd(
@@ -697,10 +688,10 @@ def prepare_grouped_gemm_wgrad(
     name = select_module(
         "wgrad", arch, out_dtype=_DTYPE_NAMES[out_dtype], tile_k=tile_k
     )
-    record = MODULES[name]
+    stages = {stage["name"]: stage for stage in ROUTES[name]["stages"]}
     reduce_threads = (
-        int(record["tail_reduce"]["launch"]["block"][0])
-        if "tail_reduce" in record
+        int(PROGRAMS[stages["tail_reduce"]["program"]]["launch"]["block"][0])
+        if "tail_reduce" in stages
         else 0
     )
     plan = plan_wgrad(
@@ -744,9 +735,7 @@ def prepare_grouped_gemm_wgrad(
         stride_e=int(out.stride(0)),
         grid=plan["grid"],
     )
-    launch, retained = _bind(name, "main", main_kwargs, device)
-    launches = [launch]
-    workspaces.extend(retained)
+    launches = [_bind(name, "main", main_kwargs, arch)]
     if splits > 1:
         reduce_kwargs = dict(
             partials=partials,
@@ -762,9 +751,7 @@ def prepare_grouped_gemm_wgrad(
             raster_rows=plan["raster_rows"],
             grid=plan["tail_reduce_grid"],
         )
-        reduce_launch, retained = _bind(name, "tail_reduce", reduce_kwargs, device)
-        launches.append(reduce_launch)
-        workspaces.extend(retained)
+        launches.append(_bind(name, "tail_reduce", reduce_kwargs, arch))
     return _finish("wgrad", name, plan, out, launches, workspaces)
 
 
