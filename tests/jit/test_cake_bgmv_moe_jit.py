@@ -304,6 +304,10 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL 37120",
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE_PDL 221824",
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_PDL 37120",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_S3 ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_S3_PDL ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_REMAP 37120",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_REMAP_PDL 37120",
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64 ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128 ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64_PF ",
@@ -314,13 +318,15 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
         "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED ",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD ",
     ):
         assert macro in body
-    # Route-index publication in the four shrink kernels plus the three grouping
+    # Route-index publication in the eight shrink kernels plus the three grouping
     # counters (shared-memory histogram and fill counters, per-token route
-    # counters) in group_hist / group_scatter; the expands keep one owner per
-    # output (no output atomics).
-    assert body.count("atomicAdd(") == 7
+    # counters) in group_hist / group_scatter and the two block-local bin
+    # counters (histogram, cursor) of the order_build prologue; the expands
+    # keep one owner per output (no output atomics).
+    assert body.count("atomicAdd(") == 13
     assert "atomicAdd(&reinterpret_cast<float" not in body
     binding = spec.sources[0].read_text()
     assert f'#define CAKE_BGMV_MOE_BODY_FILE "{metadata.body}"' in binding
@@ -423,17 +429,24 @@ def test_route_index_workspace_sizing():
 @pytest.mark.parametrize(
     ("num_pairs", "rank", "hidden_size", "expected"),
     [
-        # 16 tokens x top-k 2 at hidden 7168, rank 32: 128 CTAs already -> no split
-        (32, 32, 7168, (0, 1)),
+        # 16 tokens x top-k 2 at hidden 7168, rank 32: 128 CTAs already -> no split;
+        # small grid -> three-stage ring (form 2)
+        (32, 32, 7168, (2, 1)),
         # rank 8 at 32 pairs: 32 CTAs -> 4 splits (7 tiles available)
-        (32, 8, 7168, (0, 4)),
+        (32, 8, 7168, (2, 4)),
         # 4 tokens at hidden 5888: 32 CTAs -> 4 of the 6 tiles' worth of splits
-        (8, 32, 5888, (0, 4)),
+        (8, 32, 5888, (2, 4)),
         # hidden 736 has one tile: no split possible
-        (8, 64, 736, (0, 1)),
-        # wide prefill grids never split
+        (8, 64, 736, (2, 1)),
+        # wide prefill grids never split and run the two-stage ring (form 0)
         (8192, 32, 3072, (0, 1)),
         (256, 64, 4096, (0, 1)),
+        # ring-depth break-even: 512 CTAs still three stages, 520 and 1024 two
+        (64, 64, 7168, (2, 1)),
+        (65, 64, 7168, (0, 1)),
+        (128, 64, 7168, (0, 1)),
+        (256, 16, 4096, (2, 1)),
+        (512, 16, 4096, (0, 1)),
     ],
 )
 def test_generic_shrink_launch_selection(num_pairs, rank, hidden_size, expected):
@@ -499,6 +512,7 @@ def test_grouped_workspace_sizing_and_selector():
             metadata.shrink_grouped_single_symbol,
             metadata.expand_grouped_symbol,
             metadata.combine_grouped_symbol,
+            metadata.order_build_symbol,
         ):
             assert body.count(f"{symbol}(") == 1, symbol
         for macro in (
@@ -508,5 +522,29 @@ def test_grouped_workspace_sizing_and_selector():
             "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED",
             "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED",
             "CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED",
+            "CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD",
         ):
             assert f"#define {macro} " in body, macro
+
+
+def test_order_remap_selector_and_workspace():
+    assert cake_bgmv_moe.cake_bgmv_moe_order_workspace_words(3000) == 3000
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_ORDER_REMAP_MAX_PAIRS == 4096
+    select = cake_bgmv_moe.select_cake_bgmv_moe_order_remap
+    # 1024 routes x 7168 x 64 x 2 B = 939 MB of per-route A traffic: SM90 only.
+    assert select(1024, 512, 8, 128, 7168, 64, "sm90a")
+    assert not select(1024, 512, 8, 128, 7168, 64, "sm100a")
+    assert not select(1024, 512, 8, 128, 7168, 64, "sm103a")
+    assert select(2048, 1024, 8, 128, 7168, 16, "sm90a")  # 470 MB
+    assert select(1024, 512, 8, 128, 7168, 16, "sm90a")  # 235 MB: above the floor
+    assert not select(1024, 512, 8, 128, 2048, 64, "sm90a")  # rank 64 below hidden 4096
+    assert not select(1024, 512, 8, 128, 3072, 64, "sm90a")
+    assert select(1024, 512, 8, 128, 4096, 64, "sm90a")
+    assert select(
+        1024, 512, 8, 128, 16384, 8, "sm90a"
+    )  # 1024 CTAs is a two-stage grid again (deep ring <= 512), 268 MB
+    assert not select(1024, 512, 8, 128, 8192, 8, "sm90a")  # 134 MB: below the floor
+    assert not select(1024, 512, 8, 128, 3072, 32, "sm90a")  # 201 MB: below it
+    assert not select(512, 256, 8, 128, 7168, 64, "sm90a")  # too few routes
+    assert not select(8192, 4096, 8, 128, 7168, 64, "sm90a")  # beyond one CTA
+    assert not select(2048, 1024, 64, 128, 7168, 64, "sm90a")  # 8192 bins

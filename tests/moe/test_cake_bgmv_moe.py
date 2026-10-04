@@ -682,6 +682,104 @@ def test_grouped_pipeline_is_selected_for_wide_generic_prefill():
     forced_off.close()
 
 
+@pytest.mark.parametrize(
+    ("hidden_size", "rank", "num_tokens", "dtype", "arbitrary_routes", "expert_sorted"),
+    [
+        (7168, 16, 512, torch.bfloat16, False, False),
+        (4096, 64, 512, torch.bfloat16, True, False),
+        (2944, 32, 1024, torch.float16, False, True),
+        (3072, 8, 128, torch.bfloat16, True, True),
+    ],
+)
+def test_order_remap_matches_identity_and_replays_bitwise(
+    hidden_size, rank, num_tokens, dtype, arbitrary_routes, expert_sorted
+):
+    """Bin-ordered shrink dispatch (forced): bitwise equal to the identity dispatch, replay-stable.
+
+    Generic-variant shapes only (hidden 2688/3072 at rank 32 take the specialized bodies inside the
+    per-arch token window, where forcing the remap is rejected).
+    """
+
+    _require_cake_arch()
+    inputs = _make_inputs(
+        hidden_size,
+        num_tokens,
+        dtype,
+        rank=rank,
+        arbitrary_routes=arbitrary_routes,
+        expert_sorted=expert_sorted,
+    )
+    expected = _reference(inputs)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        plan = prepare_bgmv_moe(
+            *inputs, backend="cake", fallback=False, grouped=False, order_remap=True
+        )
+        baseline = prepare_bgmv_moe(
+            *inputs, backend="cake", fallback=False, grouped=False, order_remap=False
+        )
+    assert isinstance(plan, BGMVMoECakePlan)
+    assert plan.variant == "generic" and plan.order_remap and not plan.grouped
+    assert baseline.variant == "generic" and not baseline.order_remap
+    first = plan.run().clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
+    reference_run = baseline.run().clone()
+    torch.cuda.synchronize()
+    # Every route's shrink row is computed by the same code on the same
+    # operands in the same order; only the CTA order changes, so the whole
+    # pipeline is bitwise identical to the identity dispatch.
+    assert torch.equal(plan.shrink_out, baseline.shrink_out)
+    assert torch.equal(first, reference_run)
+    # The prologue wrote a full permutation of the routes.
+    num_pairs = int(inputs[3].shape[0])
+    order = plan.order_workspace[:num_pairs].to(torch.int64).cpu()
+    assert torch.equal(torch.sort(order).values, torch.arange(num_pairs))
+    for _ in range(3):
+        replay = plan.run().clone()
+        torch.cuda.synchronize()
+        assert torch.equal(replay, first)
+    # Replays consume current tensor contents through the same pointers (the
+    # route order is rebuilt every launch).
+    inputs[0].mul_(0.5)
+    torch.testing.assert_close(plan.run(), _reference(inputs), atol=1e-2, rtol=1e-2)
+    plan.close()
+    baseline.close()
+
+
+def test_order_remap_is_selected_for_sm90_wide_per_route_prefill():
+    _require_cake_arch()
+    sm90 = torch.cuda.get_device_capability() == (9, 0)
+    # 1024 routes x 7168 x 64 x 2 B of per-route A traffic: above the 220 MiB
+    # floor and below the grouped pipeline's 2048 routes -> SM90 dispatches in
+    # bin order; Blackwell keeps the identity dispatch.
+    wide = _make_inputs(7168, 512, torch.bfloat16, rank=64)
+    plan = prepare_bgmv_moe(*wide, backend="cake", fallback=False)
+    assert plan.variant == "generic" and not plan.grouped
+    assert plan.order_remap == sm90
+    assert plan.order_workspace.numel() == (1024 if sm90 else 1)
+    plan.close()
+    # 1024 routes x 2944 x 32 x 2 B = 193 MB: below the floor everywhere.
+    below = _make_inputs(2944, 512, torch.bfloat16, rank=32)
+    plan = prepare_bgmv_moe(*below, backend="cake", fallback=False)
+    assert plan.variant == "generic" and not plan.order_remap
+    plan.close()
+    # The grouped pipeline takes precedence and the two are exclusive.
+    grouped = _make_inputs(2048, 1024, torch.bfloat16, rank=64)
+    plan = prepare_bgmv_moe(*grouped, backend="cake", fallback=False)
+    assert plan.grouped and not plan.order_remap
+    plan.close()
+    with pytest.raises(ValueError):
+        prepare_bgmv_moe(
+            *grouped, backend="cake", fallback=False, grouped=True, order_remap=True
+        )
+    forced_off = prepare_bgmv_moe(
+        *wide, backend="cake", fallback=False, order_remap=False
+    )
+    assert not forced_off.order_remap
+    forced_off.close()
+
+
 @pytest.mark.parametrize("hidden_size", [2688, 3072])
 def test_specialized_variant_window_at_rank_32(hidden_size):
     _require_cake_arch()

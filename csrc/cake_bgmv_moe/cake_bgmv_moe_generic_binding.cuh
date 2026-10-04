@@ -13,10 +13,17 @@
  *   CAKE_BGMV_MOE_SHRINK_PREFILL      generated prefill shrink kernel (PPB=1, 2 stages)
  *   CAKE_BGMV_MOE_SHRINK_DECODE_PDL   decode shrink + griddepcontrol.launch_dependents (PDL)
  *   CAKE_BGMV_MOE_SHRINK_PREFILL_PDL  prefill shrink + griddepcontrol.launch_dependents (PDL)
+ *   CAKE_BGMV_MOE_SHRINK_PREFILL_S3   prefill shrink, 3-stage ring (small grids, lever 11c)
+ *   CAKE_BGMV_MOE_SHRINK_PREFILL_S3_PDL  3-stage prefill shrink, PDL form
+ *   CAKE_BGMV_MOE_SHRINK_PREFILL_REMAP   2-stage prefill shrink reading its route through the
+ *                                        lever-27 permutation (SM90 bin-ordered dispatch)
+ *   CAKE_BGMV_MOE_SHRINK_PREFILL_REMAP_PDL  its PDL form
  *   CAKE_BGMV_MOE_EXPAND_T64          generated 64-lane token-owned expand kernel
  *   CAKE_BGMV_MOE_EXPAND_T128         generated 128-lane token-owned expand kernel
  *   CAKE_BGMV_MOE_EXPAND_T64_PF       64-lane expand, B rows register-prefetched before PDL wait
  *   CAKE_BGMV_MOE_EXPAND_T128_PF      128-lane expand, B rows register-prefetched before PDL wait
+ *   CAKE_BGMV_MOE_ORDER_BUILD         single-CTA route-order prologue of the SM90 per-route shrink
+ *   (the grouped-pipeline kernels CAKE_BGMV_MOE_GROUP_* / *_GROUPED are listed below)
  */
 #pragma once
 
@@ -48,6 +55,20 @@ static_assert(CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE_PDL == kShrinkDecodeSmemB
               "decode shrink forms must share smem");
 static_assert(CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_PDL == kShrinkPrefillSmemBytes,
               "prefill shrink forms must share smem");
+// Lever 11c: three-stage prefill ring (one more x + weight stage) for grids of at most
+// kShrinkDeepRingMaxCtas CTAs; shrink form 2 (0 = two-stage prefill, 1 = decode).
+constexpr int32_t kShrinkPrefillS3SmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_S3;
+static_assert(CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_S3_PDL == kShrinkPrefillS3SmemBytes,
+              "three-stage prefill shrink forms must share smem");
+static_assert(kShrinkPrefillS3SmemBytes > kShrinkPrefillSmemBytes,
+              "the three-stage prefill ring must be deeper than the two-stage one");
+constexpr int32_t kShrinkPrefillRemapSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_REMAP;
+static_assert(kShrinkPrefillRemapSmemBytes == kShrinkPrefillSmemBytes &&
+                  CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL_REMAP_PDL == kShrinkPrefillSmemBytes,
+              "the bin-ordered prefill shrink forms share the two-stage prefill smem");
+constexpr int32_t kShrinkFormPrefill = 0;
+constexpr int32_t kShrinkFormDecode = 1;
+constexpr int32_t kShrinkFormPrefillS3 = 2;
 constexpr int32_t kExpandT64SmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64;
 constexpr int32_t kExpandT128SmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128;
 constexpr int32_t kExpandT64PfSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64_PF;
@@ -147,6 +168,18 @@ constexpr int32_t kGroupScatterSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_GROUP_SCAT
 constexpr int32_t kShrinkGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_GROUPED;
 constexpr int32_t kExpandGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_GROUPED;
 constexpr int32_t kCombineGroupedSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_COMBINE_GROUPED;
+
+// Lever 27: bin-ordered dispatch of the per-route shrink.  One CTA of kOrderBuildThreads lanes,
+// each holding kOrderRoutesPerLane routes in registers between the bin-count and the scatter
+// pass, writes the route permutation (routes sorted by (LoRA, expert) bin, invalid routes last)
+// that the shrink kernels map their CTA slot through when route_remap != 0.  Every route is still
+// computed by the same code on the same operands in the same order: bitwise identical to the
+// identity dispatch; only the CTA order (and so the L2 hit rate of repeated A rows) changes.
+constexpr int32_t kOrderBuildThreads = 1024;
+constexpr int32_t kOrderRoutesPerLane = 4;
+constexpr int32_t kOrderRemapMaxPairs = kOrderBuildThreads * kOrderRoutesPerLane;
+constexpr int32_t kOrderBuildSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_ORDER_BUILD;
+static_assert(kOrderBuildSmemBytes <= 48 * 1024, "order_build must fit the default smem carveout");
 
 // Lever 22: programmatic dependent launch helper for the grouped chain.  Every kernel launched
 // through it executes griddepcontrol.wait before reading its predecessor's outputs, so the
@@ -258,6 +291,15 @@ void Configure() {
       cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_DECODE_PDL,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkDecodeSmemBytes),
       "cudaFuncSetAttribute(Cake BGMV MoE decode shrink, PDL form)");
+  // Lever 11c: the three-stage prefill ring exceeds the default 48 KiB carveout.
+  CheckCuda(
+      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_PREFILL_S3,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkPrefillS3SmemBytes),
+      "cudaFuncSetAttribute(Cake BGMV MoE three-stage prefill shrink)");
+  CheckCuda(
+      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_PREFILL_S3_PDL,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkPrefillS3SmemBytes),
+      "cudaFuncSetAttribute(Cake BGMV MoE three-stage prefill shrink, PDL form)");
   TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkGroupedSmemBytes)
       << "Cake BGMV MoE grouped shrink requires " << kShrinkGroupedSmemBytes
       << " bytes of dynamic shared memory, but device " << device_id << " supports "
@@ -296,12 +338,16 @@ inline int32_t OutputRowStride(const TensorView& y_accum, int64_t num_tokens, in
 void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lora_a,
          TensorView lora_b, TensorView sorted_token_ids, TensorView expert_ids,
          TensorView lora_indices, TensorView topk_weights, TensorView route_index,
-         int64_t schedule_value, int64_t shrink_decode, int64_t shrink_splits, int64_t grouped,
-         TensorView group_workspace, TensorView group_partials, int64_t pdl_mode,
-         int64_t cuda_stream) {
+         int64_t schedule_value, int64_t shrink_form, int64_t shrink_splits, int64_t grouped,
+         TensorView group_workspace, TensorView group_partials, int64_t order_remap,
+         TensorView order_workspace, int64_t pdl_mode, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   TVM_FFI_ICHECK(pdl_mode >= 0 && pdl_mode <= 2)
       << "pdl_mode must be 0 (off), 1 (early trigger) or 2 (late trigger), got " << pdl_mode;
+  TVM_FFI_ICHECK(order_remap == 0 || grouped == 0)
+      << "order_remap applies to the per-route pipeline only (grouped must be 0)";
+  TVM_FFI_ICHECK(order_remap == 0 || shrink_form == kShrinkFormPrefill)
+      << "order_remap applies to the two-stage prefill shrink form only (shrink_form must be 0)";
   // Programmatic dependent launch of the expand behind the shrink: the shrink
   // kernels trigger their dependents at entry (pdl_early) or after the tile
   // loop; every expand kernel executes griddepcontrol.wait before it reads the
@@ -511,17 +557,46 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   TVM_FFI_ICHECK(shrink_splits == 1 || num_pairs <= kShrinkSplitMaxPairs)
       << "hidden-split shrink supports at most " << kShrinkSplitMaxPairs << " pairs, got "
       << num_pairs;
-  TVM_FFI_ICHECK(shrink_decode == 0 || num_pairs <= 32)
+  TVM_FFI_ICHECK(shrink_form >= kShrinkFormPrefill && shrink_form <= kShrinkFormPrefillS3)
+      << "shrink_form must be 0 (two-stage prefill), 1 (decode) or 2 (three-stage prefill), got "
+      << shrink_form;
+  TVM_FFI_ICHECK(shrink_form != kShrinkFormDecode || num_pairs <= 32)
       << "the decode shrink kernel supports at most 32 pairs, got " << num_pairs;
   const int32_t splits = static_cast<int32_t>(shrink_splits);
   auto* split_partials = reinterpret_cast<float*>(route_ptr + route_words);
   auto* split_counters = route_ptr + route_words + kShrinkSplitPartialWords;
+  // Lever 27: bin-ordered dispatch.  The order_build prologue writes the route
+  // permutation into order_workspace and the shrink kernels read their route
+  // through it (route_remap = 1).  Without the remap the kernels never
+  // dereference the pointer (the plan passes a 1-word dummy).
+  CHECK_CUDA(order_workspace);
+  CHECK_DEVICE(x, order_workspace);
+  CHECK_INPUT_TYPE(order_workspace, dl_int32);
+  CheckCompact(order_workspace, "order_workspace");
+  auto* order_ptr = static_cast<unsigned int*>(order_workspace.data_ptr());
+  const int32_t route_remap = order_remap != 0 ? 1 : 0;
+  constexpr int32_t kOrderOffset = 0;
+  if (route_remap != 0) {
+    const int64_t num_loras = lora_a.size(0);
+    const int64_t bins = num_loras * static_cast<int64_t>(num_experts);
+    TVM_FFI_ICHECK(bins >= 1 && bins <= kGroupBinsMax)
+        << "order_remap supports at most " << kGroupBinsMax << " (lora, expert) bins, got " << bins;
+    TVM_FFI_ICHECK(num_pairs <= kOrderRemapMaxPairs)
+        << "order_remap supports at most " << kOrderRemapMaxPairs << " routes, got " << num_pairs;
+    TVM_FFI_ICHECK(order_workspace.ndim() == 1 && order_workspace.size(0) >= num_pairs)
+        << "order_workspace must hold at least num_pairs = " << num_pairs << " int32 words";
+    CAKE_BGMV_MOE_ORDER_BUILD<<<dim3(1, 1, 1), dim3(kOrderBuildThreads, 1, 1), kOrderBuildSmemBytes,
+                                stream>>>(token_ptr, expert_ptr, lora_ptr, num_pairs, num_tokens,
+                                          num_experts, static_cast<int32_t>(num_loras), order_ptr,
+                                          kOrderOffset);
+    CheckCuda(cudaGetLastError(), "Cake BGMV MoE order_build launch");
+  }
   const dim3 shrink_block(kShrinkThreads, 1, 1);
   // Kernel forms by launch mode: the PDL forms carry griddepcontrol (shrink:
   // launch_dependents, early or late by pdl_early; expand: wait after the
   // register B-row prefetch); the plain forms carry no PDL instruction.
   const bool prefetch_form = pdl_mode != 0;
-  if (shrink_decode != 0) {
+  if (shrink_form == kShrinkFormDecode) {
     const dim3 shrink_grid(
         (num_pairs + kShrinkDecodePairsPerBlock - 1) / kShrinkDecodePairsPerBlock,
         kRank / kRankTile, splits);
@@ -530,12 +605,45 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
                                         stream>>>(
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
-          splits, pdl_early);
+          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
     } else {
       CAKE_BGMV_MOE_SHRINK_DECODE<<<shrink_grid, shrink_block, kShrinkDecodeSmemBytes, stream>>>(
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
-          splits, pdl_early);
+          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
+    }
+  } else if (shrink_form == kShrinkFormPrefillS3) {
+    // Lever 11c: three-stage ring for small grids (same FMA chain per lane: bitwise identical
+    // to the two-stage form).
+    const dim3 shrink_grid(num_pairs, kRank / kRankTile, splits);
+    if (prefetch_form) {
+      CAKE_BGMV_MOE_SHRINK_PREFILL_S3_PDL<<<shrink_grid, shrink_block, kShrinkPrefillS3SmemBytes,
+                                            stream>>>(
+          shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
+          num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
+          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
+    } else {
+      CAKE_BGMV_MOE_SHRINK_PREFILL_S3<<<shrink_grid, shrink_block, kShrinkPrefillS3SmemBytes,
+                                        stream>>>(
+          shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
+          num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
+          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
+    }
+  } else if (route_remap != 0) {
+    // Lever 27: bin-ordered dispatch forms (the identity forms never read the permutation).
+    const dim3 shrink_grid(num_pairs, kRank / kRankTile, splits);
+    if (prefetch_form) {
+      CAKE_BGMV_MOE_SHRINK_PREFILL_REMAP_PDL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes,
+                                               stream>>>(
+          shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
+          num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
+          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
+    } else {
+      CAKE_BGMV_MOE_SHRINK_PREFILL_REMAP<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes,
+                                           stream>>>(
+          shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
+          num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
+          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
     }
   } else {
     const dim3 shrink_grid(num_pairs, kRank / kRankTile, splits);
@@ -544,12 +652,12 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
                                          stream>>>(
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
-          splits, pdl_early);
+          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
     } else {
       CAKE_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes, stream>>>(
           shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
           num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
-          splits, pdl_early);
+          splits, pdl_early, order_ptr, kOrderOffset, route_remap);
     }
   }
   CheckCuda(cudaGetLastError(), "Cake BGMV MoE generic shrink launch");
