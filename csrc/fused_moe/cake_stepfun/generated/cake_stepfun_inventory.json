@@ -95,7 +95,7 @@
     }
   },
   "files": {
-    "csrc/fused_moe/cake_stepfun/generated/cake_stepfun_generated_manifest.cuh": "e0688955c4ed4cf4b1fcb20adcb4b02a4e081c8b7ac642ef5662d16678aafcfd",
+    "csrc/fused_moe/cake_stepfun/generated/cake_stepfun_generated_manifest.cuh": "12b50ac2a8da74cb3907099b8f2cec695c34ed88122d17f680e16ee818a8213b",
     "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_061ea89239e052816f5b_kernel.cu": "27f3c54307070b4143280d192b0017dd237a35a446457f791e311b44af52fa1c",
     "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_340303a9dd615ce980ba_kernel.cu": "030b9f156d5ee0334d9e19ce24f113ff7a7f56b1f84e5bc943604f3b060ad2cc",
     "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_3b6b9929c1afac081d07_kernel.cu": "ebc7d17c0e2a4665c2093d62cb824225dd91263e1ea1d0b45bcc556ae23d3a1a",
@@ -1575,7 +1575,7 @@
         1,
         1
       ],
-      "block_k": 128,
+      "block_k": 64,
       "cluster": [
         2,
         1,
@@ -1655,7 +1655,7 @@
         1,
         1
       ],
-      "block_k": 128,
+      "block_k": 64,
       "cluster": [
         2,
         1,
@@ -2115,7 +2115,7 @@
         1,
         1
       ],
-      "block_k": 512,
+      "block_k": 256,
       "cluster": [
         1,
         1,
@@ -3815,7 +3815,7 @@
         1,
         1
       ],
-      "block_k": 128,
+      "block_k": 64,
       "cluster": [
         2,
         1,
@@ -3895,7 +3895,7 @@
         1,
         1
       ],
-      "block_k": 128,
+      "block_k": 64,
       "cluster": [
         2,
         1,
@@ -4355,7 +4355,7 @@
         1,
         1
       ],
-      "block_k": 512,
+      "block_k": 256,
       "cluster": [
         1,
         1,
@@ -4626,6 +4626,6 @@
     }
   ],
   "manifest": "csrc/fused_moe/cake_stepfun/generated/cake_stepfun_generated_manifest.cuh",
-  "program_hash": "08cb63f3c447af67343181ff84a66e271a97141d55417fd6385a1b16ac3f3372",
+  "program_hash": "e4afe578e7e5041b456271629bcf534750ee8c6c32b11069d3344446baa5bfe1",
   "schema": "flashinfer.cake_stepfun.inventory.v2"
 }
