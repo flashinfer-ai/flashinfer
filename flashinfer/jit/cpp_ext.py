@@ -262,15 +262,24 @@ def get_object_basename(source: Path, object_suffix: str) -> str:
 
 
 def resolve_object_names(sources: Sequence[Path]) -> List[str]:
-    """Collision-free object basenames for ``sources``, index-aligned with it.
+    """Globally unique object basenames for ``sources``, index-aligned with it.
 
     Two sources can share a parent directory *name* and stem (e.g.
     ``a/x/kernel.cu`` and ``b/x/kernel.cu``) and would both compile to
     ``x_kernel.cuda.o``, which ninja rejects with ``multiple rules generate``.
-    Every member of a colliding group gets a digest of its resolved source path
-    inserted before the suffix (``x_kernel_<digest>.cuda.o``); a source listed
-    more than once additionally gets its occurrence index. Non-colliding names
-    are returned unchanged, so existing JIT caches stay valid.
+
+    Sources whose base name is unique keep it unchanged, so existing JIT caches
+    stay valid; those names are reserved. Every member of a colliding group is
+    renamed to ``{parent}_{stem}_{digest}{suffix}``, where digest is the first
+    8 hex chars of SHA-1 over the resolved source path, re-hashed with a
+    ``#<salt>`` counter for as long as a candidate is already taken — by a
+    reserved name, by a coincidentally identical object name (e.g. a source
+    literally named ``x/kernel_<digest>.cu``), or by another member's
+    candidate. A source listed more than once additionally gets its occurrence
+    index.
+
+    Members are keyed by resolved path and processed in sorted order, so the
+    source-to-name mapping does not depend on the order of ``sources``.
     """
     suffixes = [".cuda.o" if source.suffix == ".cu" else ".o" for source in sources]
     names = [
@@ -279,23 +288,49 @@ def resolve_object_names(sources: Sequence[Path]) -> List[str]:
     ]
     counts = Counter(names)
     resolved = [str(source.resolve()) for source in sources]
-    occurrences: dict[str, int] = {}
+
+    # Base names that are already unique are final and reserved for their
+    # source; colliding members must not claim them.
+    claimed = {name for name, count in counts.items() if count == 1}
+
+    # Colliding groups keyed by base name -> resolved path -> occurrence count.
+    # Iterating in sorted order makes the assignment independent of the order
+    # of ``sources``.
+    groups: dict[str, Counter] = {}
+    for name, path in zip(names, resolved, strict=True):
+        if counts[name] > 1:
+            groups.setdefault(name, Counter())[path] += 1
+
+    assigned: dict[tuple[str, str, int], str] = {}
+    for name in sorted(groups):
+        if name.endswith(".cuda.o"):
+            stem, obj_suffix = name[: -len(".cuda.o")], ".cuda.o"
+        else:
+            stem, obj_suffix = name[: -len(".o")], ".o"
+        for path in sorted(groups[name]):
+            for occurrence in range(1, groups[name][path] + 1):
+                salt = 1
+                while True:
+                    token = path if salt == 1 else f"{path}#{salt}"
+                    digest = hashlib.sha1(token.encode()).hexdigest()[:8]
+                    candidate = f"{stem}_{digest}{obj_suffix}"
+                    if occurrence > 1:
+                        candidate = f"{stem}_{digest}_{occurrence}{obj_suffix}"
+                    if candidate not in claimed:
+                        claimed.add(candidate)
+                        assigned[(name, path, occurrence)] = candidate
+                        break
+                    salt += 1
+
     object_names: List[str] = []
-    for source, suffix, name, path in zip(
-        sources, suffixes, names, resolved, strict=True
-    ):
+    seen: Counter = Counter()
+    for name, path in zip(names, resolved, strict=True):
         if counts[name] == 1:
             object_names.append(name)
             continue
-        digest = hashlib.sha1(path.encode()).hexdigest()[:8]
-        disambiguated = f"{source.parent.name}_{source.stem}_{digest}{suffix}"
-        occurrence = occurrences.get(path, 0) + 1
-        occurrences[path] = occurrence
-        if occurrence > 1:
-            disambiguated = (
-                f"{source.parent.name}_{source.stem}_{digest}_{occurrence}{suffix}"
-            )
-        object_names.append(disambiguated)
+        seen[(name, path)] += 1
+        object_names.append(assigned[(name, path, seen[(name, path)])])
+    assert len(set(object_names)) == len(object_names)
     return object_names
 
 
