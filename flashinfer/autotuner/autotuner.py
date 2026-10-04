@@ -2567,7 +2567,10 @@ class AutoTuner:
                                     time_measured = float("inf")
                                 return time_measured
 
-                            if self._effective_moe_search_strategy == "factorized":
+                            if (
+                                self._effective_moe_search_strategy == "factorized"
+                                and not race_default
+                            ):
                                 from flashinfer.autotuner.moe_search import (
                                     iter_moe_tactic_results,
                                 )

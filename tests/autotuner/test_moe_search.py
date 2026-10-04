@@ -265,3 +265,30 @@ def test_default_chooser_retains_order_and_failure_accounting(tuner, monkeypatch
         ] == (8, 0)
     assert calls == [(8, i) for i in range(9)]
     assert tuner.stats.failed_tactics["test_moe::Runner"] == {(8, 3)}
+
+
+def test_v2_multiple_runners_retain_exhaustive_search(tuner, monkeypatch):
+    runners = [Runner(), Runner()]
+    calls = []
+    metadata_calls = []
+    get_space = Runner.get_factorized_tactic_space
+
+    def factorization(runner, inputs):
+        metadata_calls.append(runner)
+        return get_space(runner, inputs)
+
+    def profile(runner, tensors, tactic, config, **kwargs):
+        calls.append((runners.index(runner), tactic))
+        return 100.0 if tactic == -1 else 1 + tactic[1] // 3 + tactic[1] % 3
+
+    monkeypatch.setattr(Runner, "get_factorized_tactic_space", factorization)
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    monkeypatch.setattr(tuner._v2_local, "active", True)
+    with autotune(moe_search_strategy="factorized"):
+        tuner.choose_one("test_v2_moe", runners, TuningConfig(), [torch.ones(4)])
+
+    assert calls == [
+        (0, -1),
+        *[(index, (8, i)) for index in range(2) for i in range(9)],
+    ]
+    assert not metadata_calls
