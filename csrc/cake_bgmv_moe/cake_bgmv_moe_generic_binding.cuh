@@ -142,10 +142,14 @@ inline int32_t GroupShrinkRankTilesPerCta(int32_t num_tiles) {
 // on Blackwell a single-tile CTA has nothing to overlap and pays the ring's two barriers (768-wide
 // rows lost 1.2-2.2 %), so it keeps the register-direct form there; on sm_90 the ring wins on every
 // row including the single-tile ones (768x16 0.983, 768x64 0.976), so the jit sets
-// CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE to 1 for sm90a (lever 3c).  Both forms store
-// bitwise-identical rows.
+// CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE to 1 for sm90a (lever 3c).  Lever 36b: where the
+// lever-34 mixed-precision form exists (CAKE_BGMV_MOE_GROUP_SHRINK_MIXED, bf16 sm100a/sm103a) the
+// ring form -- barrier-free, register-direct x rows, weights-only ring at 6 CTAs/SM -- also wins
+// on single-tile rows (GB300 768x16/32/64 x 4096 tokens 0.94-0.95 of the direct form), so it
+// serves them too.  Both forms store bitwise-identical rows.
 inline bool GroupShrinkRing(int32_t num_tiles) {
-  return CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE != 0 || num_tiles > 1;
+  return CAKE_BGMV_MOE_GROUP_SHRINK_RING_SINGLE_TILE != 0 || num_tiles > 1 ||
+         CAKE_BGMV_MOE_GROUP_SHRINK_MIXED != 0;
 }
 // Lever 34: the bf16 bundles of sm_100a/sm_103a run the mixed-precision grouped shrink
 // (fma.rn.f32.bf16 on the packed BF16 halves, weights-only cp.async ring, x rows register-direct)
