@@ -814,7 +814,12 @@ def test_decode_reads_back_fused_cache() -> None:
     num_rows = num_pages * page_size
     num_heads, topk, num_queries = 8, 128, 3
     cos_sin = _cos_sin_cache()
-    _q, kv, positions = _inputs(num_rows, num_heads, generator)
+    _q, _kv, positions = _inputs(num_rows, num_heads, generator)
+    # The Cake decode kernel is validated against the fp32 reference at kv ~ N(0, 1), q ~ N(0, 1) with _OUT_TOL
+    # (test_cake_sparse_mla_sm120_dsv4_nvfp4); the read-back comparison uses the same regime.
+    kv = torch.randn(
+        num_rows, _D, dtype=torch.float32, generator=generator, device="cuda"
+    ).to(torch.bfloat16)
     fused, prefix = _Cache(num_pages, page_size), _Cache(num_pages, page_size)
     slots = _slot_mapping(num_rows, num_rows, torch.int64, generator=generator)
     cake_dsv4_nvfp4_kv_rope_quantize_insert(kv, fused.view, slots, positions, cos_sin)
@@ -822,16 +827,13 @@ def test_decode_reads_back_fused_cache() -> None:
     torch.cuda.synchronize()
     _assert_same_cache(fused, prefix)
 
-    q_attn = (
-        torch.randn(
-            num_queries,
-            num_heads,
-            _D,
-            dtype=torch.float32,
-            generator=generator,
-            device="cuda",
-        )
-        / 10.0
+    q_attn = torch.randn(
+        num_queries,
+        num_heads,
+        _D,
+        dtype=torch.float32,
+        generator=generator,
+        device="cuda",
     ).to(torch.bfloat16)
     indices = torch.randint(
         0, num_rows, (num_queries, topk), generator=generator, device="cuda"
