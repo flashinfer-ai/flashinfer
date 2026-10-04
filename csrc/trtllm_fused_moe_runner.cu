@@ -448,7 +448,7 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
       mUsePerTokenScalingGemm2(usePerTokenScalingGemm2),
       mUsePerChannelScalingGemm1(usePerChannelScalingGemm1),
       mUsePerChannelScalingGemm2(usePerChannelScalingGemm2),
-      mPermuteGemm1(PermuteGemm1::Runner(
+      mPermuteGemm1(Gemm1Runner(
           dtypeAct, dtypeWeights, usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
           gemm1BiasType, usePerTokenScalingGemm1, usePerChannelScalingGemm1)),

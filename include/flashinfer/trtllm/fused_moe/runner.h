@@ -266,6 +266,12 @@ class Runner {
 };
 }  // namespace PermuteGemm1
 
+#ifdef CAKE_STEPFUN_FC1
+// Cake StepFun FC1 kernels take the GEMM1 slot of the fused-MoE runner (module
+// fused_moe_cake_stepfun_*); the public trtllm module never defines this macro.
+#include "fused_moe/cake_stepfun/cake_stepfun_fc1_runner.cuh"
+#endif
+
 namespace Gemm2 {
 class Runner {
  public:
@@ -459,6 +465,14 @@ struct MoEConfig {
   int64_t gemm2Config;
 };
 
+// GEMM1 stage of the fused-MoE runner: trtllm-gen batched GEMM, or the exported Cake StepFun FC1
+// kernels when the module is built with -DCAKE_STEPFUN_FC1.
+#ifdef CAKE_STEPFUN_FC1
+using Gemm1Runner = cake_stepfun::Fc1Runner;
+#else
+using Gemm1Runner = PermuteGemm1::Runner;
+#endif
+
 class Runner {
  public:
   // FIXME: tileTokensDim is hardcoded for now
@@ -508,7 +522,7 @@ class Runner {
   bool mUsePerTokenScalingGemm2;
   bool mUsePerChannelScalingGemm1;
   bool mUsePerChannelScalingGemm2;
-  PermuteGemm1::Runner mPermuteGemm1;
+  Gemm1Runner mPermuteGemm1;
   Gemm2::Runner mGemm2;
 
   // This will be the cartesian product of the passing configs for gemm1 and gemm2
