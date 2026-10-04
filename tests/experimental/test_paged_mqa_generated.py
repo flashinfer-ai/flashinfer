@@ -297,10 +297,9 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
     one_shot = fp8_paged_mqa_logits(
         q, kv_cache, weights, ctx_2d, block_table, meta, max_len
     )
-    assert torch.equal(
-        one_shot.masked_fill(torch.isnan(one_shot), 0.0),
-        plan.logical_output.masked_fill(torch.isnan(plan.logical_output), 0.0),
-    )
+    # Identical bits on every written cell; the one-shot entry's fresh buffer is unspecified elsewhere.
+    written = ~torch.isnan(plan.logical_output)
+    assert torch.equal(one_shot[written], plan.logical_output[written])
     # Graph replay with changed contents.
     with torch.cuda.stream(stream):
         graph = torch.cuda.CUDAGraph()
