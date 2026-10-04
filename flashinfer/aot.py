@@ -101,6 +101,7 @@ from .jit.cake_kda_packed_t1 import (
 from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.cudnn_frost import FROST_DTYPES, gen_cudnn_frost_moe_module
 from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
     gen_alphamoe_sm100_module,
@@ -915,6 +916,9 @@ def gen_all_modules(
         if sm_capabilities.get("sm103a_exact", False):
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm103a"))
         if has_sm107:
+            jit_specs.extend(
+                gen_cudnn_frost_moe_module(dtype) for dtype in FROST_DTYPES
+            )
             jit_specs.append(gen_fp4_quantization_sm107_module())
             jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
@@ -925,6 +929,7 @@ def gen_all_modules(
             if not has_sm100:
                 jit_specs.append(gen_cutlass_fused_moe_sm100_module())
         if has_sm120:
+            jit_specs.append(gen_cudnn_frost_moe_module("bf16", "sm_120a"))
             jit_specs.append(gen_fp4_quantization_sm120_module())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())

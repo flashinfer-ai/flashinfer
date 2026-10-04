@@ -1,11 +1,54 @@
 # cuDNN Frost-selected MoE grouped GEMM kernels
 
 This package contains Frost-selected MoE grouped GEMM kernels.
-This experimental backend follows Cake's source-distribution model. cuDNN Frost is
+The MoELayer backend uses source distribution. cuDNN Frost is
 an offline generator: FlashInfer ships standalone Python/CuTe DSL kernels and a
 SHA-256 manifest, with no precompiled `.o` files. Required cuDNN Frost device helpers
 are included in each generated source. The deployed process does not import
 `cudnn-frontend`, construct a cuDNN Frost graph, or run the cuDNN Frost graph compiler.
+
+The stable MoELayer configurations are `CudnnFrostBf16Config`,
+`CudnnFrostMxfp8Config`, `CudnnFrostNvfp4Config`, and
+`CudnnFrostMxfp8Mxfp4Config`, exported from `flashinfer.fused_moe`. They can be
+selected explicitly through `BackendOptions`. Each provides `prepare_weights`
+and `prepare_activations`; register the returned weight dictionary under the
+matching `cudnn_frost_*` key. An existing canonical `cutlass_*` view remains
+usable. A Frost-named view takes precedence when both names are present.
+
+```python
+from flashinfer.fused_moe import (
+    BackendOptions, CudnnFrostNvfp4Config, ExecutionConfig, ExpertConfig,
+    MoEActivationPack, MoEConfig, MoELayer, MoEWeightPack, QuantConfig,
+    QuantFormat, RoutingConfig,
+)
+
+config = MoEConfig(
+    routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+    experts=ExpertConfig(intermediate_size=intermediate_size),
+    quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+    backend=BackendOptions((CudnnFrostNvfp4Config(),)),
+    execution=ExecutionConfig(tune_max_num_tokens=max_tokens),
+)
+view = CudnnFrostNvfp4Config.prepare_weights(
+    w1_bf16, w2_bf16, num_local_experts=num_experts,
+    hidden_size=hidden_size, intermediate_size=intermediate_size,
+    activation=config.activation,
+)
+weights = MoEWeightPack({"cudnn_frost_nvfp4": view})
+xq, xsf = CudnnFrostNvfp4Config.prepare_activations(x_bf16, quant=config.quant)
+act = MoEActivationPack(xq, xsf, topk_ids, topk_weights)
+layer = MoELayer(config)
+# Warm and optionally autotune before CUDA Graph capture.
+out = layer(act, weights)
+```
+
+Automatic Frost admission still checks its supported architecture and geometry, compiler
+capabilities, routing mode, and weight layout. It participates during autotuning
+and can reuse the selected runner afterward. Explicit selection also works
+without an autotuning context. Kernel loading and compilation remain deferred.
+The existing standalone `cudnn_frost_grouped_gemm1_swiglu` public API remains
+experimental. The former `flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm`
+imports forward to this implementation for one compatibility release.
 
 On first use, `runtime.py` fills the selected template's geometry constants and
 TMA-store expansion, then compiles the instantiated source through
@@ -22,20 +65,21 @@ map API. Admission checks compiler capabilities instead of imposing a version
 number: `capabilities.py` reads the frozen sources without executing them and
 checks their imported symbols, nested enum members, and statically specified
 calls against Python signatures where available. It also checks native
-`sm_107a` compile-option support, TVM-FFI support, and conflicting
+target-architecture compile-option support, TVM-FFI support, and conflicting
 `CUTE_DSL_ARCH` overrides. Probe results are cached per architecture and source
 set; no kernel is compiled or launched by the probe.
 
 Missing capabilities skip cuDNN Frost in automatic MoE selection and raise an
 actionable `NotImplementedError` for explicit cuDNN Frost use. Source integrity errors
 and later compiler/runtime failures remain errors; static capability checks do
-not guarantee compiler correctness. Validation uses the installed internal DSL
-build, not a public 4.8 wheel; public 4.8+ remains the planned deployment baseline.
+not guarantee compiler correctness. The release qualification covers public CuTe DSL 4.8.0 and the development DSL
+build, with the selected external assembler. Python API capability checks remain
+in place in addition to the documented dependency baseline.
 This backend does not change the repository-wide dependency floor.
 MoE runners additionally require PyTorch's
 `CUDAGraph.get_currently_capturing_graph()` and
 `CUDAGraph.retain_object(..., synchronize_before_release=True)` APIs, verified
-with PyTorch 2.14. Missing graph ownership capabilities decline automatic
+with PyTorch 2.14.1. Missing graph ownership capabilities decline automatic
 admission and raise `NotImplementedError` for explicit MoE runner use.
 The native routing/finalize adapter additionally needs a CUDA toolkit supporting
 the target architecture. Set `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` to compile
@@ -51,12 +95,15 @@ launch arguments and kernel algorithm are unchanged. The resolved executable
 path, version and SHA-256 participate in memory, disk and tactic cache identities.
 Disabled disk caching and failed persistence also execute the external binary.
 
-The SM107 MXFP8, NVFP4 and MXFP8 × MXFP4 validation uses CUDA 13.5 PTXAS:
-the installed DSL's bundled CUDA 13.4 assembler produced incorrect dynamic
-tensor-map dimension updates in the original MXFP8 kernels. Setting `CUDA_HOME`
-alone does not select the
-external assembler. Without the explicit Frost option, the existing bundled
-compiler path remains in use; it is not covered by this compiler workaround.
+SM107 validation covers public external PTXAS 13.4.92 and CUDA 13.5 PTXAS.
+The DSL's bundled CUDA 13.4 assembler produced incorrect dynamic tensor-map
+dimension updates in the original MXFP8 kernels; it exposes no patch level.
+SM107 MoELayer admission therefore requires external PTXAS 13.4.92 or newer, or a
+bundled CUDA 13.5 or newer assembler. Setting `CUDA_HOME` alone does not select
+the external assembler. Older or unidentified assemblers are rejected,
+including on cached runners. Explicit use reports the requirement; automatic
+selection retains the other candidates. SM120 BF16 sources do not patch tensor
+maps and retain capability-based admission without this SM107 assembler minimum.
 
 The original operation in this prototype is cuDNN Frost's fused dual grouped GEMM1:
 
@@ -162,7 +209,7 @@ precomputed top-k ids/weights
   -> FP32 weighted reduction -> BF16 output
 ```
 
-The runner consumes the existing `cutlass_mxfp8` weight view, including its
+The runner consumes a `cudnn_frost_mxfp8` or canonical `cutlass_mxfp8` weight view, including its
 packed per-expert weight scales. Activation scales may use linear or swizzled
 F8_128x4 layout. Gated weights retain the canonical **[up, gate]** data layout;
 their scale buffers are split into the frozen kernels' contiguous expert layout
@@ -171,8 +218,8 @@ experts, expert parallelism, non-default activation parameters and logits-based
 routing are unsupported.
 
 Automatic admission requires SM107a, MXFP8 operands, BF16 finalized output,
-precomputed routing and legal artifacts for both stages. The experimental auto
-gate still requires `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`. Existing
+precomputed routing and legal artifacts for both stages. No experimental auto
+opt-in is required. Existing
 `(activation,E,H,I,top_k,tokens)` measurements retain their two FC1/activation
 and two FC2 configurations and fused variants. Intermediate token counts use
 the next measured profile; native plans use the exact input shape.
@@ -272,7 +319,7 @@ multiplies the activation output for every FC1, including non-gated variants.
 Export a geometry using the same exporter as BF16:
 
 ```bash
-python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export \
+python -m flashinfer.fused_moe.backends.cudnn_frost.export \
   --dtype mxfp8 --op grouped_gemm1_swiglu \
   --config CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma \
   --cta-group 1 --store-mode stg \
@@ -298,8 +345,8 @@ unexpected source difference is an error rather than a new geometry-named file.
 For prepared grouped execution:
 
 ```python
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import runtime as mxfp8
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runtime import (
+from flashinfer.fused_moe.backends.cudnn_frost.mxfp8 import runtime as mxfp8
+from flashinfer.fused_moe.backends.cudnn_frost.runtime import (
     _arch_for, _dimension_matches,
 )
 
@@ -347,11 +394,10 @@ for discovery, scale packing, JIT, or execution.
 
 The `benchmark` subcommand measures the complete MoELayer pipeline and compares
 the original eligible backend pool, the same pool with automatic Frost
-admission, and Frost alone. Enable experimental automatic selection when running
-the full-MoE benchmarks for any dtype:
+admission, and Frost alone. Full-MoE benchmarks use the stable automatic
+registrations for every dtype:
 
 ```bash
-export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1
 python benchmarks/bench_cudnn_frost_moe_mxfp8.py benchmark \
   --activation swiglu --experts 8 --hidden 4096 --intermediate 14336 \
   --top-k 2 --tokens 1,16,128,512,2048,4096,8192,12288 \
@@ -451,7 +497,7 @@ and persistent compilation path as the frozen Tensor Core kernels. Conversion
 helpers and the native adapter participate in source/tactic identities. Compiled
 functions remain owned by the native plan and retained during CUDA Graph replay.
 
-The runner consumes the canonical `cutlass_nvfp4` weight view. Activation
+The runner consumes a `cudnn_frost_nvfp4` or canonical `cutlass_nvfp4` weight view. Activation
 scales may use linear or F8_128x4 layout. FC1 dequantization multiplies the
 FP32 GEMM accumulators **before** activation; the standalone grouped API
 accepts separate per-group gate and up multipliers through `gemm_scales`.
@@ -461,18 +507,14 @@ already part of the canonical `fc2_dequant_scale`. Global scales must be
 positive and finite. Default activation contracts and shape/shortlist
 admission follow the same policy as MXFP8.
 
-Automatic admission requires the caller to prepare the `cutlass_nvfp4`
-weight view. The default NVFP4 backend list does not prepare this view;
-Frost skips weight packs that lack it. Use
-`CutlassNvfp4Config.prepare_weights(...)` and
-`weight_pack.prepare_for("cutlass_nvfp4", view)` before calling the layer
-inside `flashinfer.autotune()`. An already usable backend selection can remain
-unchanged. `MoELayer` construction still requires a configured native backend
-that supports the activation; explicitly include `CutlassNvfp4Config()` for
-activations unsupported by the default backend list. If this view is already
-present, Frost reuses it without another
-copy; otherwise, retaining it alongside other backend views consumes
-additional weight memory. Frost does not convert other backends' views.
+Automatic admission accepts either a `cudnn_frost_nvfp4` weight view prepared
+with `CudnnFrostNvfp4Config.prepare_weights(...)`, or an existing canonical
+`cutlass_nvfp4` view. Frost skips packs containing neither view. Explicit
+`BackendOptions((CudnnFrostNvfp4Config(),))` can construct a Frost-only layer;
+its weights can be registered with
+`weight_pack.prepare_for("cudnn_frost_nvfp4", view)`. Reusing a canonical view
+adds no weight copy. Keeping distinct backend layouts consumes additional
+weight memory; Frost does not convert other backends' views.
 
 `artifacts/nvfp4/` retains 154 selected BF16-output configurations in 34
 geometry-parameterized source templates and 400 measured two-by-two profiles.
@@ -517,16 +559,11 @@ unscaled E4M3 products or block sums can overflow FP16 before the E8M0 scales
 are applied. Their intermediate quantization and finalized output contracts
 match the existing Tensor Core paths.
 
-The runner reuses the canonical `cutlass_mxfp8_mxfp4` weight view, including
-its packed weights, F8_128x4 scales and unit input multipliers. Input scales
-may be linear or F8_128x4. Automatic admission requires this view; callers
-with other backend views must first add it using
-`CutlassMxfp8Mxfp4Config.prepare_weights(...)` and
-`weight_pack.prepare_for("cutlass_mxfp8_mxfp4", view)`. As with NVFP4, an
-additional view consumes weight memory, while an existing view is reused.
-`MoELayer` still requires at least one usable configured native backend;
-include `CutlassMxfp8Mxfp4Config()` for activations unsupported by the default
-backend list. Automatic Frost candidates are added when the layer is called.
+The runner accepts a `cudnn_frost_mxfp8_mxfp4` weight view prepared by
+`CudnnFrostMxfp8Mxfp4Config.prepare_weights(...)`, or reuses an existing
+canonical `cutlass_mxfp8_mxfp4` view. Input scales may be linear or F8_128x4.
+A Frost-only layer uses `BackendOptions((CudnnFrostMxfp8Mxfp4Config(),))`.
+Automatic candidates are added during tuning when a compatible view exists.
 The quantization configuration uses
 `QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)`.
 
@@ -589,11 +626,7 @@ reuses the grouped-input buffer after FC1 finishes consuming it. Exact-shape
 host plans share power-of-two-sized workspace allocations on the layer's
 stream; varying the token count does not allocate a large buffer per shape.
 
-Enable experimental automatic selection before using the original API:
-
-```bash
-export FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1
-```
+Frost participates in automatic selection during autotuning:
 
 ```python
 with flashinfer.autotune():
@@ -611,7 +644,7 @@ Automatic admission is deliberately narrow:
   shortlists for `(E,H,I,top_k)` = `(12,7168,3072,1/2/4)`, `(8,4096,14336,2)`,
   or `(64,2048,1408,6)`, with `1 <= num_tokens <= 12288`;
 - `PackedPrecomputed` routing, int32 ids and FP32 routing weights;
-- an existing contiguous row-major `cutlass_bf16` weight view containing only
+- a contiguous row-major `cudnn_frost_bf16` or canonical `cutlass_bf16` weight view containing only
   `fc1_expert_weights[E,2I,H]` in **[up, gate]** order for gated activations
   (or `[E,I,H]` for non-gated activations), and
   `fc2_expert_weights[E,H,I]`. This is layout reuse, not CUTLASS execution;
@@ -629,15 +662,16 @@ Automatic candidates are registered lazily through
 checks, runner fields, or cache branches. Each dtype's `support.py` owns admission
 and the deferred runner factory. Winner keys include the eligible automatic candidate
 set and exact input shape, so incompatible weight views cannot reuse a cuDNN Frost
-winner. All four cuDNN Frost registrations require
-`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`, including reuse of cached
-runners and winners after autotuning. Disabling the gate removes these
-candidates from subsequent calls while retaining resources used by captured graphs.
+winner. All four Frost registrations are stable: the experimental environment
+variable does not affect their admission, cached runners, or cached winners.
+Experimental registrations still apply their own opt-in gate and warning.
+Explicit Frost runners also validate each pack and use exact-shape winner keys;
+they are not duplicated by automatic registration.
 
 ### Rubin artifacts and swap AB
 
-Runtime matching requires the exact SM107a device architecture. The routing/finalize
-adapter is also compiled for SM107a.
+Runtime matching requires the selected sources' exact device architecture. The
+routing/finalize adapter is compiled for the same target.
 cuDNN Frost's `CONFIG_sm100_*` names describe its template family, which includes SM107;
 they do not specify the source kernel's target architecture.
 
@@ -733,7 +767,7 @@ python benchmarks/bench_cudnn_frost_moe_bf16.py sweep --source-jit --adaptive \
   --output /tmp/cudnn_frost-sm107-refine.jsonl
 python benchmarks/bench_cudnn_frost_moe_bf16.py select \
   --artifacts /tmp/cudnn_frost-sm107 --results /tmp/cudnn_frost-sm107-refine.jsonl \
-  --selected-dir flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/bf16 \
+  --selected-dir flashinfer/fused_moe/backends/cudnn_frost/artifacts/bf16 \
   --output /tmp/cudnn_frost-sm107-selection.jsonl
 ```
 
@@ -763,15 +797,13 @@ unexplained E64/16-token/skew illegal-memory-access failure; subsequent reruns
 and memchecks passed. The source-distribution change does not establish a fix
 for that historical failure.
 
-Automatic admission follows the experimental-auto gate. Explicit experimental
-API calls remain an opt-in and do not require the environment variable. A
-once-per-backend experimental warning is issued if cuDNN Frost actually wins.
-Release admission/ownership and the tracking issue remain to be settled before
-publishing this research integration.
+MoELayer admission does not require the experimental-auto gate and selecting
+Frost does not emit an experimental warning. The standalone grouped-GEMM API
+retains its experimental annotation.
 
 Keep the layer alive while its CUDA graphs are used, and use one instance per
 thread/stream. Input contents, including expert ids, may change between
-replays. Routing ids outside `[0,E)` are masked by this private runner rather
+replays. Routing ids outside `[0,E)` are masked by this runner rather
 than used as addresses. Profiling cache keys include both artifact identities.
 
 The full-MoE tests cover all 16 small-shape tactics, top-k 1/2/4,
@@ -955,9 +987,9 @@ these records, retaining its separate candidate pool.
 Example build-box export (repeat with the other tile/store modes and shape):
 
 ```bash
-python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export \
+python -m flashinfer.fused_moe.backends.cudnn_frost.export \
   --op grouped_gemm2 \
-  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/bf16 \
+  --output-dir flashinfer/fused_moe/backends/cudnn_frost/artifacts/bf16 \
   --cudnn-frost-revision 667fe4ce8ce437866217066f075fd4dcecad6eac \
   --config CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma \
   --cta-group 2 --store-mode stg --experts 12 --n 7168 --k 3072
@@ -975,7 +1007,7 @@ and a default artifact id starts `<arch>_cudnn_frost_<op>_` (e.g.
 store mode, including `swapAB` for swapped configurations. `select` verifies
 source hashes and refuses to replace different bytes.
 
-`tests/experimental/test_cudnn_frost_selected_kernels.py` focuses on the complete
+`tests/moe/test_cudnn_frost_kernels.py` focuses on the complete
 **cuDNN Frost FC1 + SwiGLU -> cuDNN Frost FC2 -> finalize** path: every compound tactic on
 small shapes and both auto-admitted model geometries, empty and uneven groups,
 non-default streams, changed routing and repeated graph replay. The independent
@@ -988,15 +1020,14 @@ execution with a selected cuDNN Frost winner. It does not assert performance ran
 
 The old mixed cuDNN Frost/CUTLASS MoE runner, native GEMM1 plan adapter/interface,
 associated tests and full-MoE benchmark have been deleted. The CUTLASS CUDA
-sources and its Python runner remain identical to HEAD. Their workspace
+sources and runner behavior are unaffected. Their workspace
 planning, tactic pools and cache keys are not modified for cuDNN Frost. Other backend
-runners do not import or inspect the cuDNN Frost manifest during execution. The only
-execution-dispatch change in core is `MoELayer` adding a separate candidate;
+runners do not import or inspect the cuDNN Frost manifest during execution. Core dispatch registers explicit configs and additional automatic candidates;
 backend-specific implementation and shape admission stay in this directory.
 
 The standalone FC1 API, offline exporter, FC2 prepared launcher and packaged
 source kernels remain. Core correctness and integration tests live in
-`tests/experimental/test_cudnn_frost_selected_kernels.py`; redundant standalone and
+`tests/moe/test_cudnn_frost_kernels.py`; redundant standalone and
 auxiliary mock tests are omitted. BF16 benchmarking and offline tuning share
 `benchmarks/bench_cudnn_frost_moe_bf16.py`; the earlier standalone FC1/FC2 benchmark
 scripts have been removed. MXFP8 grouped-stage measurements use
@@ -1009,8 +1040,8 @@ Run on SM107a in the build environment containing the matching cuDNN Frost and
 CuTe DSL revisions:
 
 ```bash
-python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export \
-  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/bf16 \
+python -m flashinfer.fused_moe.backends.cudnn_frost.export \
+  --output-dir flashinfer/fused_moe/backends/cudnn_frost/artifacts/bf16 \
   --cudnn-frost-revision 667fe4ce8ce437866217066f075fd4dcecad6eac \
   --config CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma \
   --store-mode tma \
@@ -1082,3 +1113,20 @@ tactic cache identities use the rendered source digest, including geometry, so
 two configurations sharing a template cannot alias one specialization.
 Schema-v1 precompiled-object manifests are intentionally rejected; re-export
 research candidates with this source exporter before sweeping them.
+
+The four fixed routing/finalize adapters use `jit/cudnn_frost.py` for both JIT
+and AOT registration (all four formats on SM107, BF16 on SM120). Geometry-specialized device kernels remain
+source-distributed. Public configuration GPU coverage lives in
+`tests/moe/test_unified_moe_frost.py`; the standalone public grouped-GEMM API
+retains its experimental API test.
+
+Run the backend suites from the repository root on SM107 or SM120 (BF16 only) with the dependencies
+described in `docs/api/fused_moe.rst`:
+
+```bash
+pytest tests/moe/test_unified_moe_frost.py tests/moe/test_cudnn_frost_kernels.py
+pytest tests/trace/test_moe_layer_trace.py tests/trace/test_template_registry.py
+```
+
+Regenerate the four metadata-only trace examples with
+`python -m tests.trace.example_moe_layer`.

@@ -1,0 +1,73 @@
+name: SM107 Frost MoELayer tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: 'JSON array of labels for a provisioned Rubin runner'
+        required: true
+        type: string
+      python:
+        description: 'Python executable with the supported Frost dependencies'
+        default: python3
+        required: true
+        type: string
+      ptxas:
+        description: 'External PTXAS path; empty uses the DSL bundled assembler'
+        default: ''
+        type: string
+  workflow_call:
+    inputs:
+      runner_labels:
+        required: true
+        type: string
+      python:
+        default: python3
+        type: string
+      ptxas:
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 120
+    env:
+      QUALIFY_PYTHON: ${{ inputs.python }}
+      CUDA_VISIBLE_DEVICES: '0'
+      CUTE_DSL_ARCH: sm_107a
+      FLASHINFER_CUDNN_FROST_PTXAS: ${{ inputs.ptxas }}
+      FLASHINFER_WORKSPACE_BASE: ${{ runner.temp }}/frost-workspace
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Check SM107 and compiler dependencies
+        run: |
+          "$QUALIFY_PYTHON" - <<'PY'
+          import torch
+          from flashinfer.fused_moe.backends.cudnn_frost.compiler import require_moe_assembler
+          from flashinfer.fused_moe.backends.cudnn_frost.cache import require_graph_resource_retention
+
+          assert torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
+          require_moe_assembler()
+          require_graph_resource_retention()
+          PY
+      - name: Run MoELayer and trace tests
+        run: >-
+          "$QUALIFY_PYTHON" -m pytest -v
+          tests/moe/test_unified_moe_frost.py
+          tests/moe/test_cudnn_frost_kernels.py
+          tests/trace/test_moe_layer_trace.py
+          --junitxml="$RUNNER_TEMP/frost-results.xml"
+      - name: Preserve test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frost-sm107-tests
+          path: ${{ runner.temp }}/frost-results.xml
+          if-no-files-found: error
