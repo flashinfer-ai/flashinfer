@@ -1065,6 +1065,14 @@ def chunk_gated_delta_rule(
                 f"[*, {num_sab_heads}, {head_size}, {head_size}], "
                 f"got {list(state_checkpoints.shape)}"
             )
+        # Refused on every arch, as the SM8x entry already does: a strided
+        # state_checkpoints is written through a copy and lost.
+        for name, tensor in (
+            ("state_checkpoints", state_checkpoints),
+            ("checkpoint_cu_starts", checkpoint_cu_starts),
+        ):
+            if not tensor.is_contiguous():
+                raise RuntimeError(f"{name} must be contiguous")
 
     # Allocate output if not provided
     if output is None:
