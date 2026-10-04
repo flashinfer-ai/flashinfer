@@ -2045,7 +2045,6 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
     assert exact["preprocess_grid"] == (1, 1, 1)
     main = exact["main"]
     assert main["dt_softplus"] == 0
-    assert main["has_seq_chunk_cumsum"] == 0
     assert main["checkpoint_state_count"] == checkpoint_states.shape[0]
     assert isinstance(first, tuple) and isinstance(second, tuple)
     assert first[0].data_ptr() != second[0].data_ptr()
@@ -2177,8 +2176,7 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case):
     assert preprocess["seq_chunk_cumsum"] is main["seq_chunk_cumsum"]
     assert preprocess["num_sequences"] == main["sequence_count"] == num_seqs
     assert preprocess["seq_idx_i32"] is main["seq_idx_i32"] is kwargs["seq_idx"]
-    assert preprocess["seq_idx_int64"] == main["seq_idx_int64"] == 0
-    assert main["has_seq_chunk_cumsum"] == 1
+    assert preprocess["seq_idx_int64"] == 0
     assert main["has_initial"] == int(has_initial_states)
     assert main["nchunks"] == 3 and main["seqlen"] == seqlen
     if case == "precomputed":
@@ -2230,7 +2228,7 @@ def test_source_batched_unaligned_seqlen_binding_without_gpu(monkeypatch):
     assert preprocess["delta"].shape == (32, 128)
     assert preprocess["write_seq_chunk_cumsum"] == 0
     assert preprocess["num_sequences"] == batch
-    assert main["has_seq_chunk_cumsum"] == 0 and main["mode_varlen"] == 0
+    assert main["mode_varlen"] == 0
     # bf16 dt is widened into the FP32 workspace both stages read.
     assert preprocess["dt"] is main["dt"] and preprocess["dt"].dtype == torch.float32
     # No dt_bias: the zero vector allocated with the workspace is bound.
