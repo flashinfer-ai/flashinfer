@@ -45,6 +45,7 @@ from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.jit.env import FLASHINFER_CUBIN_DIR
 from flashinfer.fused_moe import (
     BackendOptions,
+    CakeStepFunConfig,
     ExecutionConfig,
     ExpertConfig,
     MoEActivationPack,
@@ -59,12 +60,15 @@ from flashinfer.fused_moe import (
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
 )
 from flashinfer.fused_moe.prepare import _activation_param_view
 from flashinfer.fused_moe.runners import (
+    CakeStepFunRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
+    TrtllmFp8PerTensorRunner,
 )
 from flashinfer.testing.utils import bench_gpu_time
 
@@ -73,7 +77,30 @@ MODES = {
     "bf16": (TrtllmBf16Config, TrtllmBf16RoutedRunner, QuantFormat.BF16),
     "mxfp8": (TrtllmFp8BlockConfig, TrtllmFp8BlockRunner, QuantFormat.MXFP8),
     "nvfp4": (TrtllmFp4Config, TrtllmFp4RoutedRunner, QuantFormat.NVFP4),
+    "fp8": (
+        TrtllmFp8PerTensorConfig,
+        TrtllmFp8PerTensorRunner,
+        QuantFormat.FP8PerTensor,
+    ),
 }
+# The per-tensor FP8 mode is opt-in; the default precision set is unchanged.
+DEFAULT_PRECISIONS = ("bf16", "mxfp8", "nvfp4")
+# Alternative FC1 backends measured next to the native trtllm-gen kernels on the
+# same weights, activations and autotune policy. Cake runs NVFP4 StepFun only.
+BACKENDS = {
+    "trtllm": None,
+    "cake": (CakeStepFunConfig, CakeStepFunRunner),
+}
+# Per-tensor FP8 calibration as in the FlashInfer tests: 448 / amax(sample) for
+# the activations and 448 / 256 for the FC1 output (StepFun is bounded by L^2).
+FP8_CALIBRATION_TOKENS = 2048
+FP8_INTERMEDIATE_SCALE_GLOBAL = 448.0 / 256.0
+
+
+def baseline_variant(precision):
+    # Per-tensor FP8 cannot represent the OpenAI SwiGLU scalars; its paired
+    # baseline is the default SwiGLU.
+    return "swiglu" if precision == "fp8" else "oai"
 
 
 def parse_args():
@@ -82,7 +109,17 @@ def parse_args():
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
-        "--precisions", nargs="+", choices=tuple(MODES), default=list(MODES)
+        "--precisions",
+        nargs="+",
+        choices=tuple(MODES),
+        default=list(DEFAULT_PRECISIONS),
+    )
+    parser.add_argument(
+        "--backends",
+        nargs="+",
+        choices=tuple(BACKENDS),
+        default=["trtllm"],
+        help="FC1 backends measured on the same inputs; cake applies to nvfp4 only.",
     )
     parser.add_argument("--tokens", nargs="+", type=int, default=[8, 64, 512, 2048])
     parser.add_argument("--hidden", type=int, default=4096)
@@ -137,6 +174,8 @@ def parse_args():
         parser.error("require rounds >= 3 and regression-threshold >= 0")
     if args.cache_policy == "cold" and not args.cupti:
         parser.error("cold graph timing requires CUPTI to flush L2 before each sample")
+    if "cake" in args.backends and "nvfp4" not in args.precisions:
+        parser.error("the cake backend runs NVFP4 only; include nvfp4 in --precisions")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error("output-dir must be empty or absent")
     return args
@@ -163,7 +202,7 @@ def tensor_digest(tensor):
     return hashlib.sha256(data).hexdigest()
 
 
-def make_activations(args, tokens, backend, quant):
+def make_activations(args, tokens, backend, quant, hidden_states_scale_global=None):
     # Reset the seed so every precision also sees the same canonical tokens.
     torch.manual_seed(args.seed + tokens)
     hidden = torch.randn(tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
@@ -177,6 +216,10 @@ def make_activations(args, tokens, backend, quant):
     weights /= weights.sum(-1, keepdim=True)
     if quant.weight is QuantFormat.BF16:
         prepared, scales = hidden, None
+    elif quant.weight is QuantFormat.FP8PerTensor:
+        prepared, scales = backend.prepare_activations(
+            hidden, hidden_states_scale_global=hidden_states_scale_global
+        )
     else:
         prepared, scales = backend.prepare_activations(hidden, quant=quant)
     pack = MoEActivationPack(
@@ -195,7 +238,7 @@ def make_activations(args, tokens, backend, quant):
 
 
 def make_candidate(
-    args, tokens, runner_cls, backend, quant, activation, base_view, act
+    args, tokens, runner_cls, backend, quant, activation, base_view, act, arm="trtllm"
 ):
     config = MoEConfig(
         routing=RoutingConfig(num_experts=args.experts, top_k=args.top_k),
@@ -220,6 +263,20 @@ def make_candidate(
     view.update(
         _activation_param_view(activation, args.experts, act.hidden_states_q.device)
     )
+    if arm == "cake":
+        # The Cake FC1 kernels read an explicit per-expert limit in raw accumulator
+        # units (no implicit default), as CakeStepFunConfig.prepare_weights stores it.
+        view["gemm1_clamp_limit"] = (
+            activation.limit / base_view["output1_scale_gate_scalar"]
+        ).contiguous()
+    elif quant.weight is QuantFormat.FP8PerTensor and isinstance(
+        activation, SwiGLUStep
+    ):
+        # Per-tensor FP8 clamps raw accumulators; convert the logical limit as
+        # TrtllmFp8PerTensorConfig.prepare_weights does.
+        view["gemm1_clamp_limit"] = (
+            activation.limit / base_view["output1_scales_gate_scalar"]
+        ).contiguous()
     native = MoEWeightPack({runner.backend_key: view})
     packed = runner.pack_inputs(act, native)
     launch_kwargs = runner.launch_kwargs_for(packed)
@@ -354,7 +411,8 @@ def main():
         "timing_scope": "native unified runner forward: routing, fused FC1 activation, FC2, finalize; preparation and input quantization excluded",
         "routing": "uniform round-robin expert ids; normalized FP32 weights; UnpackedPrecomputed",
         "cold_l2_cache": args.cache_policy == "cold",
-        "autotune": "independent per activation, precision, token count",
+        "autotune": "independent per activation, precision, backend, token count",
+        "backends": list(args.backends),
         "tuning_policy": {
             "timer": "AutoTuner-selected v1 CUDA graph timer",
             "requested_timer_environment": os.environ.get("FLASHINFER_AUTOTUNE_TIMER"),
@@ -423,26 +481,47 @@ def main():
     (args.output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, default=json_default) + "\n"
     )
-    variants = {"oai": SwiGLU(alpha=1.702, beta=1.0, limit=7.0)}
-    variants.update(
-        {f"step_limit_{limit:g}": SwiGLUStep(limit=limit) for limit in args.step_limits}
-    )
+    step_variants = {
+        f"step_limit_{limit:g}": SwiGLUStep(limit=limit) for limit in args.step_limits
+    }
+    baselines = {"oai": SwiGLU(alpha=1.702, beta=1.0, limit=7.0), "swiglu": SwiGLU()}
     rows = []
     actual_methods = set()
     with (args.output_dir / "samples.jsonl").open("w") as raw:
         for precision in args.precisions:
             backend, runner_cls, fmt = MODES[precision]
             quant = QuantConfig(weight=fmt, activation=fmt)
+            baseline = baseline_variant(precision)
+            variants = {baseline: baselines[baseline], **step_variants}
             prepare_kwargs = dict(
                 num_local_experts=args.experts,
                 hidden_size=args.hidden,
                 intermediate_size=args.intermediate,
             )
-            if precision != "bf16":
+            hidden_states_scale_global = None
+            if precision == "fp8":
+                torch.manual_seed(args.seed)
+                sample = torch.randn(
+                    FP8_CALIBRATION_TOKENS,
+                    args.hidden,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                hidden_states_scale_global = 448.0 / sample.float().abs().max()
+                prepare_kwargs["hidden_states_scale_global"] = hidden_states_scale_global
+                prepare_kwargs["intermediate_scale_global"] = FP8_INTERMEDIATE_SCALE_GLOBAL
+            elif precision != "bf16":
                 prepare_kwargs["quant"] = quant
             base_view = backend.prepare_weights(w1, w2, **prepare_kwargs)
+            arms = [
+                arm
+                for arm in args.backends
+                if arm == "trtllm" or precision == "nvfp4"
+            ]
             for tokens in args.tokens:
-                act, hashes = make_activations(args, tokens, backend, quant)
+                act, hashes = make_activations(
+                    args, tokens, backend, quant, hidden_states_scale_global
+                )
                 print(f"Preparing {precision} tokens={tokens}", flush=True)
                 candidates = {
                     name: make_candidate(
@@ -456,6 +535,31 @@ def main():
                         act,
                     )
                     for name, activation in variants.items()
+                }
+                # Alternative backends share the view, activations and tuning policy;
+                # each is paired with the native kernel on the same activation.
+                for arm in arms:
+                    if arm == "trtllm":
+                        continue
+                    arm_backend, arm_runner_cls = BACKENDS[arm]
+                    candidates.update(
+                        {
+                            f"{arm}:{name}": make_candidate(
+                                args,
+                                tokens,
+                                arm_runner_cls,
+                                arm_backend,
+                                quant,
+                                activation,
+                                base_view,
+                                act,
+                                arm=arm,
+                            )
+                            for name, activation in step_variants.items()
+                        }
+                    )
+                variant_of = {
+                    name: variants[name.split(":", 1)[-1]] for name in candidates
                 }
                 round_medians = {name: [] for name in candidates}
                 methods = {name: set() for name in candidates}
@@ -475,9 +579,10 @@ def main():
                         actual_methods.add(method)
                         record = dict(
                             precision=precision,
+                            backend=name.split(":", 1)[0] if ":" in name else "trtllm",
                             tokens=tokens,
                             variant=name,
-                            activation=repr(variants[name]),
+                            activation=repr(variant_of[name]),
                             round=round_idx,
                             position=position,
                             method=method,
@@ -496,11 +601,18 @@ def main():
                             f"{precision} tokens={tokens} round={round_idx} {name}: {med:.3f} us ({method})",
                             flush=True,
                         )
-                oai = round_medians["oai"]
+                oai = round_medians[baseline]
                 for name, step in round_medians.items():
-                    if name == "oai":
+                    if name == baseline:
                         continue
-                    ratio, low, high = paired_interval(oai, step, args.seed + tokens)
+                    # Native step variants pair with the native baseline; another
+                    # backend's step variant pairs with the native kernel on the
+                    # same activation.
+                    arm, _, variant_name = name.rpartition(":")
+                    arm = arm or "trtllm"
+                    reference_name = baseline if arm == "trtllm" else variant_name
+                    reference = round_medians[reference_name]
+                    ratio, low, high = paired_interval(reference, step, args.seed + tokens)
                     threshold = 1 + args.regression_threshold
                     status = (
                         "pass"
@@ -511,20 +623,25 @@ def main():
                     )
                     row = dict(
                         precision=precision,
+                        backend=arm,
+                        baseline=f"trtllm:{reference_name}",
+                        candidate=f"{arm}:{variant_name}",
                         tokens=tokens,
                         hidden=args.hidden,
                         intermediate=args.intermediate,
                         experts=args.experts,
                         top_k=args.top_k,
-                        step_limit=variants[name].limit,
+                        step_limit=variant_of[name].limit,
                         pdl=args.pdl,
                         cache_policy=args.cache_policy,
                         tuning_graph_replays=args.tuning_graph_replays,
                         tuning_repeat=args.tuning_repeat,
                         oai_median_us=statistics.median(oai),
                         step_median_us=statistics.median(step),
+                        baseline_median_us=statistics.median(reference),
+                        candidate_median_us=statistics.median(step),
                         median_latency_ratio=statistics.median(step)
-                        / statistics.median(oai),
+                        / statistics.median(reference),
                         paired_median_ratio=ratio,
                         ratio_ci95_low=low,
                         ratio_ci95_high=high,
@@ -537,7 +654,9 @@ def main():
                         ),
                         regression_threshold=args.regression_threshold,
                         status=status,
-                        timing_method=";".join(sorted(methods[name] | methods["oai"])),
+                        timing_method=";".join(
+                            sorted(methods[name] | methods[reference_name])
+                        ),
                     )
                     rows.append(row)
                     print(json.dumps(row), flush=True)
