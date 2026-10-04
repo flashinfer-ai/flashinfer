@@ -3,10 +3,27 @@
     "sm_100a",
     "sm_103a"
   ],
+  "paged_routes": {},
   "policy": {
+    "block_q": {
+      "32": 4
+    },
     "fused_q128_max_kv": 4096,
     "fused_q1_max_kv": 131072,
+    "heads": [
+      32
+    ],
+    "kv_alignment": {
+      "32": 256
+    },
+    "max_q_blocks": 29046,
     "max_q_tokens": 116184,
+    "metadata_tier_blocks": [
+      4,
+      32,
+      512,
+      null
+    ],
     "metadata_tiers": [
       [
         "le16",
@@ -24,7 +41,14 @@
         "any",
         116184
       ]
-    ]
+    ],
+    "paged": {
+      "block_kv": [],
+      "max_batch": 4096,
+      "metadata_program": null,
+      "next_n_atoms": {},
+      "split_kv": 256
+    }
   },
   "programs": {
     "cake_deepgemm_dense_mqa_02b4c115af4105c42fa0": {
@@ -1475,6 +1499,10 @@
   },
   "routes": {
     "fp4:any": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_782b56326fdc5f10a297",
       "stages": [
         [
@@ -1488,6 +1516,10 @@
       ]
     },
     "fp4:le128": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_f7832d9ebdc75c73c457",
       "stages": [
         [
@@ -1501,6 +1533,10 @@
       ]
     },
     "fp4:le16": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_2fec0466f019407dcbba",
       "stages": [
         [
@@ -1514,6 +1550,10 @@
       ]
     },
     "fp4:le2048": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_4511ebf99b66737b82be",
       "stages": [
         [
@@ -1527,6 +1567,10 @@
       ]
     },
     "fp4:q1": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": "cake_deepgemm_dense_mqa_seq_1a24b9536b1464fac439",
       "stages": [
         [
@@ -1540,6 +1584,10 @@
       ]
     },
     "fp8:full:any": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1553,6 +1601,10 @@
       ]
     },
     "fp8:full:le128": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1566,6 +1618,10 @@
       ]
     },
     "fp8:full:le16": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1579,6 +1635,10 @@
       ]
     },
     "fp8:full:le2048": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1592,6 +1652,10 @@
       ]
     },
     "fp8:partial:any": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1605,6 +1669,10 @@
       ]
     },
     "fp8:partial:le128": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1618,6 +1686,10 @@
       ]
     },
     "fp8:partial:le16": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1631,6 +1703,10 @@
       ]
     },
     "fp8:partial:le2048": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1644,6 +1720,10 @@
       ]
     },
     "fp8:q1": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1657,6 +1737,10 @@
       ]
     },
     "fp8:q128:short": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1666,6 +1750,10 @@
       ]
     },
     "fp8:q1:short": {
+      "block_q": 4,
+      "clean_logits": "fused",
+      "kv_alignment": 256,
+      "num_heads": 32,
       "sequence": null,
       "stages": [
         [
@@ -1675,5 +1763,5 @@
       ]
     }
   },
-  "schema": "dense_mqa.v5"
+  "schema": "dense_mqa.v6"
 }
