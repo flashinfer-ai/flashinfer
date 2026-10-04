@@ -56,9 +56,9 @@ def _validate_report(report: dict, *, require_qualified_row: bool) -> None:
 
 
 def _packed_varlen_metadata(sequence_lengths: list[int]):
+    """Packed-varlen metadata; the stream may end inside a physical chunk."""
+
     total_seqlen = sum(sequence_lengths)
-    if total_seqlen % 128 != 0:
-        raise ValueError("packed sequence lengths must sum to a multiple of 128")
     if not sequence_lengths or any(length <= 0 for length in sequence_lengths):
         raise ValueError("packed sequence lengths must all be positive")
 
@@ -74,7 +74,7 @@ def _packed_varlen_metadata(sequence_lengths: list[int]):
 
     chunk_indices = []
     chunk_offsets = []
-    for chunk in range(total_seqlen // 128):
+    for chunk in range(-(-total_seqlen // 128)):
         values = seq_idx[0, chunk * 128 : (chunk + 1) * 128]
         previous = torch.cat((values[:1] - 1, values[:-1]))
         for offset in (values != previous).nonzero(as_tuple=True)[0].tolist():
@@ -89,21 +89,44 @@ def _packed_varlen_metadata(sequence_lengths: list[int]):
     )
 
 
+def _pad_stream(value: torch.Tensor, pad: int) -> torch.Tensor:
+    """Append ``pad`` zero tokens to a packed ``[1, T, ...]`` stream."""
+
+    if pad == 0:
+        return value
+    padding = torch.zeros(
+        (value.shape[0], pad, *value.shape[2:]), dtype=value.dtype, device=value.device
+    )
+    return torch.cat((value, padding), dim=1).contiguous()
+
+
 def main() -> None:
     _require_cupti()
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("batched", "varlen"), default="batched")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--nchunks", type=int, default=1)
+    parser.add_argument(
+        "--seqlen",
+        type=int,
+        help="batched sequence length (any positive value; default nchunks * 128)",
+    )
     parser.add_argument("--num-seqs", type=int, default=4)
     parser.add_argument("--chunks-per-seq", type=int, default=1)
     parser.add_argument(
         "--sequence-lengths",
         type=int,
         nargs="+",
-        help="packed varlen lengths; overrides --num-seqs/--chunks-per-seq",
+        help="packed varlen lengths (any positive values); overrides "
+        "--num-seqs/--chunks-per-seq",
     )
     parser.add_argument("--zero-initial-states", action="store_true")
+    parser.add_argument(
+        "--no-initial-states",
+        action="store_true",
+        help="run Cake with initial_states=None (zero state); the CuTe arm gets "
+        "explicit zero states since it requires them in varlen mode",
+    )
     parser.add_argument("--has-z", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--require-qualified-row", action="store_true")
@@ -118,21 +141,26 @@ def main() -> None:
         if args.sequence_lengths is not None:
             raise ValueError("--sequence-lengths requires --mode varlen")
         batch = args.batch
-        nchunks = args.nchunks
+        seqlen = args.seqlen if args.seqlen is not None else args.nchunks * 128
         num_sequences = batch
         sequence_lengths = None
-        seq_idx = chunk_indices = chunk_offsets = seq_chunk_cumsum = None
     else:
+        if args.seqlen is not None:
+            raise ValueError("--seqlen requires --mode batched")
         batch = 1
         sequence_lengths = (
             args.sequence_lengths or [args.chunks_per_seq * 128] * args.num_seqs
         )
         num_sequences = len(sequence_lengths)
-        nchunks = sum(sequence_lengths) // 128
-        seq_idx, chunk_indices, chunk_offsets, seq_chunk_cumsum = (
-            _packed_varlen_metadata(sequence_lengths)
-        )
-    seqlen = nchunks * 128
+        seqlen = sum(sequence_lengths)
+    if seqlen <= 0:
+        raise ValueError("the sequence length must be positive")
+    nchunks = -(-seqlen // 128)
+    # The CuTe backend needs seqlen % 128 == 0: pad its stream with zero tokens
+    # (varlen: one extra packed sequence) and compare the real-token slice.
+    cute_pad = nchunks * 128 - seqlen
+    if cute_pad and args.mode == "batched" and batch != 1:
+        raise ValueError("an unaligned batched --seqlen requires --batch 1")
     shape = (batch, seqlen, args.nheads)
     x = torch.randn(*shape, 64, device="cuda").to(torch.bfloat16)
     dt = torch.randn(*shape, device="cuda", dtype=torch.float32)
@@ -145,60 +173,101 @@ def main() -> None:
     initial_states = torch.randn(num_sequences, args.nheads, 64, 128, device="cuda").to(
         torch.bfloat16
     )
-    if args.zero_initial_states:
+    if args.zero_initial_states or args.no_initial_states:
         initial_states.zero_()
-    inputs = (x, dt, A, B, C)
-    backend_arguments = {"D": D, "z": z}
 
-    constructor = dict(
-        chunk_size=128,
-        nheads=args.nheads,
-        headdim=64,
-        dstate=128,
-        ngroups=args.ngroups,
-        io_dtype=torch.bfloat16,
-        state_dtype=torch.bfloat16,
-        has_d=True,
-        d_has_hdim=False,
-        has_initial_states=True,
-        has_varlen=args.mode == "varlen",
-        has_z=args.has_z,
-        seq_idx_dtype=torch.int32,
-    )
-    runners = {
-        backend: SSDCombined(**constructor, backend=backend)
-        for backend in ("cute", "cake")
-    }
-    outputs = {}
-    timings = {}
-    for backend, runner in runners.items():
-        out = torch.empty(
-            batch,
-            args.nheads,
-            64,
-            nchunks,
-            128,
-            dtype=torch.bfloat16,
-            device="cuda",
+    arms = {}
+    for backend in ("cute", "cake"):
+        pad = cute_pad if backend == "cute" else 0
+        lengths = sequence_lengths
+        if pad and args.mode == "varlen":
+            lengths = [*sequence_lengths, pad]
+        elif pad:
+            # Batched 1 x seqlen: CuTe runs the padded stream as packed varlen
+            # [seqlen, pad] so the padding never reaches the real sequence.
+            lengths = [seqlen, pad]
+        varlen = args.mode == "varlen" or (pad > 0)
+        states = initial_states
+        if pad:
+            states = torch.cat((states, torch.zeros_like(states[:1])), dim=0)
+        # CuTe needs explicit states in varlen mode; zero states are the
+        # semantic equivalent of Cake's initial_states=None.
+        has_initial_states = not args.no_initial_states or (
+            backend == "cute" and varlen
         )
-
-        def invoke():
-            return runner.run(
-                *inputs,
-                **backend_arguments,
+        if varlen:
+            seq_idx, chunk_indices, chunk_offsets, seq_chunk_cumsum = (
+                _packed_varlen_metadata(lengths)
+            )
+        else:
+            seq_idx = chunk_indices = chunk_offsets = seq_chunk_cumsum = None
+        tensors = tuple(_pad_stream(value, pad) for value in (x, dt, B, C))
+        arms[backend] = dict(
+            pad=pad,
+            varlen=varlen,
+            has_initial_states=has_initial_states,
+            tensors=(tensors[0], tensors[1], A, tensors[2], tensors[3]),
+            arguments=dict(
+                D=D,
+                z=_pad_stream(z, pad) if z is not None else None,
                 dt_bias=dt_bias,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
-                initial_states=initial_states,
+                initial_states=states if has_initial_states else None,
                 seq_idx=seq_idx,
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
                 seq_chunk_cumsum=seq_chunk_cumsum,
-                out=out,
                 return_final_states=True,
-            )
+                num_seqs=None if has_initial_states or not varlen else num_sequences,
+            ),
+        )
 
-        outputs[backend] = invoke()
+    outputs = {}
+    timings = {}
+    for backend, arm in arms.items():
+        runner = SSDCombined(
+            chunk_size=128,
+            nheads=args.nheads,
+            headdim=64,
+            dstate=128,
+            ngroups=args.ngroups,
+            io_dtype=torch.bfloat16,
+            state_dtype=torch.bfloat16,
+            has_d=True,
+            d_has_hdim=False,
+            has_initial_states=arm["has_initial_states"],
+            has_varlen=arm["varlen"],
+            has_z=args.has_z,
+            seq_idx_dtype=torch.int32,
+            backend=backend,
+        )
+        padded_seqlen = seqlen + arm["pad"]
+        # Each backend's kernel output layout: CuTe chunked, Cake token-major.
+        out = (
+            torch.empty(
+                batch, seqlen, args.nheads, 64, dtype=torch.bfloat16, device="cuda"
+            )
+            if backend == "cake"
+            else torch.empty(
+                batch,
+                args.nheads,
+                64,
+                padded_seqlen // 128,
+                128,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        )
+
+        def invoke(runner=runner, arm=arm, out=out):
+            return runner.run(*arm["tensors"], **arm["arguments"], out=out)
+
+        result_out, result_states = invoke()
+        outputs[backend] = (
+            result_out[:, :seqlen],
+            result_states[:num_sequences],
+        )
         samples = bench_gpu_time(
             invoke,
             enable_cupti=True,
@@ -223,9 +292,16 @@ def main() -> None:
             "chunk_size": 128,
             "input_layout": "contiguous",
             "sequence_lengths": sequence_lengths,
-            "initial_states": "zero" if args.zero_initial_states else "random",
+            "initial_states": (
+                "none"
+                if args.no_initial_states
+                else "zero"
+                if args.zero_initial_states
+                else "random"
+            ),
             "has_z": args.has_z,
             "seed": args.seed,
+            "cute_padded_tokens": cute_pad,
         },
         "out": _diagnostic(outputs["cake"][0], outputs["cute"][0]),
         "final_states": _diagnostic(outputs["cake"][1], outputs["cute"][1]),
