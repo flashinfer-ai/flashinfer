@@ -786,7 +786,7 @@ def test_stepfun_reproduces_native_fc1_twin_bitwise(precision, num_tokens, cache
     assert checked, f"no Cake tactic at T={num_tokens}: {cake_tactics} vs tiles {sorted(cake_tiles)}"
 
 
-@pytest.mark.parametrize("num_tokens", [8, 512])
+@pytest.mark.parametrize("num_tokens", [8, 512, 2048])
 def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
     """Per-token NVFP4 (bf16 FC1 output, FlashInfer quantizes GEMM2's input) agrees with trtllm."""
     from flashinfer.quantization import SfLayout, nvfp4_quantize
