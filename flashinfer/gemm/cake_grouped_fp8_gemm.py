@@ -386,14 +386,19 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
     dispatcher produced.  ``launch()`` submits exactly one kernel (plus two
     tiny index kernels when ``fill_padding`` is on) on PyTorch's current stream
     for the bound device and returns the output tensor.  Every launch,
-    including the first, may be captured into a CUDA graph; apart from the
-    optional padding scratch the prepared object retains no device memory.
+    including the first, may be captured into a CUDA graph.  The prepared
+    object keeps the operands given at preparation alive (so a bare
+    ``launch()`` works); a long-lived plan that always launches on the caller's
+    buffers calls ``release_prepared_operands()`` once, after which it holds no
+    per-token device memory and every ``launch`` must supply ``a``,
+    ``a_scale``, ``m_indices`` and ``out``.
     """
 
     route: str
     module_name: str
     grid: tuple[int, int, int]
-    out: torch.Tensor
+    device: torch.device
+    _out: Optional[torch.Tensor]
     m: int
     n: int
     k: int
@@ -407,10 +412,39 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
     # Block-scaled family: the prepared activation-scale layout (shape, strides); a
     # replacement a_scale must match it because the strides are bound as parameters.
     _a_scale_layout: Optional[tuple[tuple[int, ...], tuple[int, ...]]] = None
+    _released: bool = False
 
     @property
     def block_scaled(self) -> bool:
         return self.route in BS_ROUTES
+
+    @property
+    def out(self) -> torch.Tensor:
+        """The output tensor bound at preparation (unavailable after ``release_prepared_operands``)."""
+        if self._out is None:
+            raise ValueError(
+                "the prepared operands were released; launch(a=..., a_scale=..., "
+                "m_indices=..., out=...) returns the caller's output"
+            )
+        return self._out
+
+    def release_prepared_operands(self) -> None:
+        """Drop the references to the per-token operands bound at preparation.
+
+        ``a``, ``a_scale``, ``out`` and (unless ``fill_padding`` keeps the
+        prepared ``m_indices`` as its forward-fill source) ``m_indices`` are
+        released so that a plan kept per layer does not pin a dispatcher's
+        buffers.  Afterwards every ``launch`` must supply all of them.
+        """
+        arguments = list(self._arguments)
+        names = ("A", "A64", "A32", "C", "C_tma", "a_scale", "SFA")
+        if not self.fill_padding:
+            names += ("m_indices",)
+        for name in names:
+            self._rebind(arguments, name, None)
+        self._arguments = tuple(arguments)
+        self._out = None
+        self._released = True
 
     def _rebind(self, arguments: list[Any], name: str, value: Any) -> None:
         for position in self._slots.get(name, ()):
@@ -430,9 +464,19 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
         2-byte-aligned one and vice versa, because the store route is fixed at
         preparation).  Rebinding allocates nothing on the device.
         """
-        device = self.out.device
+        device = self.device
         arguments = self._arguments
         scalar = self.route == DEEPK_C2_SCALAR_OUTPUT_ROUTE
+        if self._released and (
+            a is None
+            or a_scale is None
+            or out is None
+            or (m_indices is None and not self.fill_padding)
+        ):
+            raise ValueError(
+                "the prepared operands were released; launch must receive a, "
+                "a_scale, m_indices and out"
+            )
         if (
             a is not None
             or a_scale is not None
@@ -517,7 +561,7 @@ class PreparedGroupGemmFp8NtGroupwiseContiguous:
                 _forward_fill_padding(source, *self._padding_scratch)
             with tvm_ffi.use_torch_stream():
                 self._entry(*arguments)
-        return self.out if out is None else out
+        return self._out if out is None else out
 
     __call__ = launch
 
@@ -778,7 +822,8 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         route=route,
         module_name=module_name,
         grid=grid,
-        out=out,
+        device=out.device,
+        _out=out,
         m=m,
         n=n,
         k=k,

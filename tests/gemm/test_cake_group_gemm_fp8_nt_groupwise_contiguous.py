@@ -498,6 +498,41 @@ def test_re_preparing_per_step_retains_no_device_memory():
     assert torch.cuda.memory_allocated(device) == baseline
 
 
+def test_release_prepared_operands_frees_token_buffers():
+    """A plan kept per layer must not pin the dispatcher's buffers: after
+    ``release_prepared_operands`` only the weights stay referenced, a bare
+    ``launch()`` is refused and a fully rebinding launch still works."""
+    device = torch.device("cuda")
+    counts = [100, 28, 128]
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        counts, 256, 1024, seed=4746, device=device
+    )
+    expected = _reference(a, b, a_scale, b_scale, m_indices)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    baseline = torch.cuda.memory_allocated(device)
+    out = torch.empty((a.shape[0], 256), dtype=torch.bfloat16, device=device)
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices, out=out
+    )
+    prepared.release_prepared_operands()
+    with pytest.raises(ValueError, match="released"):
+        prepared.launch()
+    with pytest.raises(ValueError, match="released"):
+        prepared.out
+    del a, a_scale, m_indices, out
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated(device) == baseline
+    a, _, a_scale, _, m_indices = _make_inputs(
+        counts, 256, 1024, seed=4746, device=device
+    )
+    out = torch.empty((a.shape[0], 256), dtype=torch.bfloat16, device=device)
+    result = prepared.launch(a=a, a_scale=a_scale, m_indices=m_indices, out=out)
+    assert result is out
+    torch.cuda.synchronize()
+    _assert_close(out, expected)
+
+
 def test_launch_rebinds_per_call_operands():
     """One prepared object per layer: the token operands are swapped per call without copies."""
     device = torch.device("cuda")
