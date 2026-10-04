@@ -132,7 +132,7 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 7) void kernel_cake_selective_state_update_e300725b6cb20c94fe61(
+__global__ __launch_bounds__(128, 7) void kernel_cake_selective_state_update_4ececa3a791410c1bb3a(
     __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ output,
     __nv_bfloat16* __restrict__ intermediate_state, unsigned long long dt_addr,

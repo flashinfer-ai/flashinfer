@@ -76,9 +76,15 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+__device__ __forceinline__ float max_noftz(float a, float b) {
+  float c;
+  asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+  return c;
+}
+
 extern "C" {
 
-__global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_aefe43c6cb600cfd08f3(
+__global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_0aac35fc16c30d81a328(
     float* __restrict__ state, __nv_bfloat16* __restrict__ x, float* __restrict__ dt,
     float* __restrict__ A, __nv_bfloat16* __restrict__ B, __nv_bfloat16* __restrict__ C,
     float* __restrict__ D, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ output,
@@ -195,9 +201,11 @@ __global__ __launch_bounds__(128, 8) void kernel_cake_selective_state_update_aef
     int step_3 = tid;
     float dt_value = dt[(token_base + step_3) * 16 + head];
     dt_value += dt_bias[head];
-    float _exp_0 = expf(dt_value);
+    float _min_0 = fminf(dt_value, 20.0f);
+    float _exp_0 = expf(_min_0);
     float _log1p_0 = log1pf(_exp_0);
-    s_dt[step_3] = _log1p_0;
+    float _max_0 = max_noftz(_log1p_0, dt_value);
+    s_dt[step_3] = _max_0;
   }
   if (tid < token_steps) {
     s_dst[tid] = dst_state_batch_indices[batch * token_steps + tid];

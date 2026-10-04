@@ -182,6 +182,24 @@ def test_cake_selective_state_update_matches_flashinfer(case, cake_hits) -> None
 
 
 @requires_blackwell
+@pytest.mark.parametrize("name", ("mtp_short2", "dynamic0_b8"))
+def test_softplus_is_the_identity_above_the_threshold(name, cake_hits) -> None:
+    """``dt`` above 20 passes through softplus unchanged (``exp`` overflows past ~88); the reference thresholds too."""
+    inputs = _make_case(_case(name))
+    inputs["dt_softplus"] = True
+    dt_rows = torch.full(inputs["dt"].shape[:-1], 100.0, device="cuda")
+    dt_rows.flatten()[::3] = 30.0
+    dt_rows.flatten()[1::3] = -0.5
+    inputs["dt"] = dt_rows.as_strided(inputs["dt"].shape, (*dt_rows.stride(), 0))
+    reference, candidate = _split_arms(inputs)
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True]
+    assert torch.isfinite(out_candidate).all()
+    _assert_arms_close(candidate, out_candidate, reference, out_reference)
+
+
+@requires_blackwell
 def test_destination_table_with_per_sequence_columns(cake_hits) -> None:
     """Every non-pad entry of the destination table is a checkpoint; rows may differ."""
     case = ("dynamic_columns", 4, 16, 1, 64, 128, 8, torch.float32, "simple", False, 3)
@@ -694,6 +712,19 @@ def test_jit_names_stay_within_the_file_name_limit() -> None:
         cake.define_digest(raw)
         in cake.MODULES[cake.PROGRAMS["mtp_cache_c4_t6"]]["instantiations"]
     )
+
+
+def test_aot_table_names_every_delivered_build() -> None:
+    """The AOT specifications are exactly the loader's build specifications, one per program instantiation."""
+    for arch in ("sm_100a", "sm_103a"):
+        expected = set()
+        for module, record in cake.MODULES.items():
+            for values in (record["instantiations"] or {"": {}}).values():
+                defines = tuple((name, int(values[name])) for name in record["defines"])
+                expected.add(cake.jit_spec(module, arch, defines).name)
+        specs = cake.gen_cake_selective_state_update_modules(arch)
+        assert len(specs) == len(expected)
+        assert {spec.name for spec in specs} == expected
 
 
 def test_registry_names_every_program() -> None:
