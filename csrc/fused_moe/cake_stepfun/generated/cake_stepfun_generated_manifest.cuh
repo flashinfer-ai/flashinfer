@@ -92,6 +92,11 @@ struct Fc1KernelSpec {
   uint32_t cluster[3];
   // True when the kernel needs the cluster-dimension launch attribute (no compile-time cluster).
   bool cluster_attribute;
+  // True when the kernel reads num_non_exiting_ctas and bounds every tile it processes (its initial
+  // CTA and every tile acquired through cluster launch control) by that count. False when it takes
+  // total_tiles: only the initial CTA exit is bounded, so the launcher must make the routing entries
+  // in [total_tiles, grid_n) benign before the launch (expert 0, mn_limit = tile * tile_n, route -1).
+  bool bounds_acquired_tiles;
   size_t dynamic_smem_bytes;
   // nullptr when the kernel takes the operand as a pointer (or does not take it at all).
   EncodeTensorMapFn encode_a;
@@ -1696,29 +1701,29 @@ inline cudaError_t Submit_22(const cudaLaunchConfig_t* config, const Fc1Args& ar
 }
 
 inline constexpr Fc1KernelSpec kFc1Kernels[] = {
-    {"kernel_cake_stepfun_moe_3b6b9929c1afac081d07", 0, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_0_A, nullptr, &EncodeTensorMap_0_SFA, nullptr, &EncodeTensorMap_0_C, &Configure_0, &Submit_0},
-    {"kernel_cake_stepfun_moe_b7d35d82eb495a3505b4", 0, 16, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 210560u, &EncodeTensorMap_1_A, nullptr, &EncodeTensorMap_1_SFA, nullptr, &EncodeTensorMap_1_C, &Configure_1, &Submit_1},
-    {"kernel_cake_stepfun_moe_e80e6397791a299acb31", 0, 32, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 188544u, &EncodeTensorMap_2_A, nullptr, &EncodeTensorMap_2_SFA, nullptr, &EncodeTensorMap_2_C, &Configure_2, &Submit_2},
-    {"kernel_cake_stepfun_moe_ac0a51f6a2f1f94ab5fd", 0, 64, 64, 512, {896u, 1u, 1u}, {2u, 1u, 1u}, false, 193152u, &EncodeTensorMap_3_A, &EncodeTensorMap_3_B, &EncodeTensorMap_3_SFA, &EncodeTensorMap_3_SFB, &EncodeTensorMap_3_C, &Configure_3, &Submit_3},
-    {"kernel_cake_stepfun_moe_9c37b5d6d27ed4dff42e", 0, 256, 64, 256, {640u, 1u, 1u}, {2u, 1u, 1u}, false, 170112u, &EncodeTensorMap_4_A, &EncodeTensorMap_4_B, &EncodeTensorMap_4_SFA, nullptr, &EncodeTensorMap_4_C, &Configure_4, &Submit_4},
-    {"kernel_cake_stepfun_moe_c0bc50c569435278918f", 1, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_5_A, nullptr, &EncodeTensorMap_5_SFA, nullptr, nullptr, &Configure_5, &Submit_5},
-    {"kernel_cake_stepfun_moe_3d04c03557e32d7fd0a5", 1, 16, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 210560u, &EncodeTensorMap_6_A, nullptr, &EncodeTensorMap_6_SFA, nullptr, nullptr, &Configure_6, &Submit_6},
-    {"kernel_cake_stepfun_moe_d9d027f3686df7b18b90", 1, 32, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 188544u, &EncodeTensorMap_7_A, nullptr, &EncodeTensorMap_7_SFA, nullptr, nullptr, &Configure_7, &Submit_7},
-    {"kernel_cake_stepfun_moe_340303a9dd615ce980ba", 1, 64, 64, 512, {896u, 1u, 1u}, {2u, 1u, 1u}, false, 193152u, &EncodeTensorMap_8_A, &EncodeTensorMap_8_B, &EncodeTensorMap_8_SFA, &EncodeTensorMap_8_SFB, nullptr, &Configure_8, &Submit_8},
-    {"kernel_cake_stepfun_moe_a0dd4c80a48cc17a021e", 1, 256, 64, 256, {640u, 1u, 1u}, {2u, 1u, 1u}, false, 170112u, &EncodeTensorMap_9_A, &EncodeTensorMap_9_B, &EncodeTensorMap_9_SFA, nullptr, nullptr, &Configure_9, &Submit_9},
-    {"kernel_cake_stepfun_moe_88eb494e40032b8fca58", 2, 8, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 211072u, &EncodeTensorMap_10_A, nullptr, nullptr, nullptr, &EncodeTensorMap_10_C, &Configure_10, &Submit_10},
-    {"kernel_cake_stepfun_moe_9113f5e1e9f73b91ac0d", 2, 16, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 224384u, &EncodeTensorMap_11_A, nullptr, nullptr, nullptr, &EncodeTensorMap_11_C, &Configure_11, &Submit_11},
-    {"kernel_cake_stepfun_moe_8cd64028996cf99ee48d", 2, 32, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 210048u, &EncodeTensorMap_12_A, nullptr, nullptr, nullptr, &EncodeTensorMap_12_C, &Configure_12, &Submit_12},
-    {"kernel_cake_stepfun_moe_b8eedc76ca57a37e412b", 2, 64, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 210048u, &EncodeTensorMap_13_A, &EncodeTensorMap_13_B, nullptr, nullptr, &EncodeTensorMap_13_C, &Configure_13, &Submit_13},
-    {"kernel_cake_stepfun_moe_d451550cf2cf6873ef39", 2, 128, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 152704u, &EncodeTensorMap_14_A, &EncodeTensorMap_14_B, nullptr, nullptr, &EncodeTensorMap_14_C, &Configure_14, &Submit_14},
-    {"kernel_cake_stepfun_moe_cfd60da4d7b7115ecf6d", 2, 256, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 201856u, &EncodeTensorMap_15_A, &EncodeTensorMap_15_B, nullptr, nullptr, &EncodeTensorMap_15_C, &Configure_15, &Submit_15},
-    {"kernel_cake_stepfun_moe_4b159cb3776ced087900", 3, 8, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 210432u, &EncodeTensorMap_16_A, &EncodeTensorMap_16_B, nullptr, nullptr, &EncodeTensorMap_16_C, &Configure_16, &Submit_16},
-    {"kernel_cake_stepfun_moe_aa631989f7128edcfb17", 3, 16, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 223232u, &EncodeTensorMap_17_A, &EncodeTensorMap_17_B, nullptr, nullptr, &EncodeTensorMap_17_C, &Configure_17, &Submit_17},
-    {"kernel_cake_stepfun_moe_a3f4da1fcd71ddb90d23", 3, 32, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 207872u, &EncodeTensorMap_18_A, &EncodeTensorMap_18_B, nullptr, nullptr, &EncodeTensorMap_18_C, &Configure_18, &Submit_18},
-    {"kernel_cake_stepfun_moe_c0ed54d60a6512474675", 4, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 217600u, &EncodeTensorMap_19_A, &EncodeTensorMap_19_B, &EncodeTensorMap_19_SFA, nullptr, &EncodeTensorMap_19_C, &Configure_19, &Submit_19},
-    {"kernel_cake_stepfun_moe_6499782a39e979a64c1b", 4, 16, 64, 512, {640u, 1u, 1u}, {1u, 1u, 1u}, false, 193280u, &EncodeTensorMap_20_A, &EncodeTensorMap_20_B, &EncodeTensorMap_20_SFA, nullptr, &EncodeTensorMap_20_C, &Configure_20, &Submit_20},
-    {"kernel_cake_stepfun_moe_fb2c144da915e6ebb41a", 4, 64, 64, 256, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 176256u, &EncodeTensorMap_21_A, &EncodeTensorMap_21_B, &EncodeTensorMap_21_SFA, nullptr, &EncodeTensorMap_21_C, &Configure_21, &Submit_21},
-    {"kernel_cake_stepfun_moe_061ea89239e052816f5b", 4, 256, 64, 256, {640u, 1u, 1u}, {4u, 1u, 1u}, false, 224384u, &EncodeTensorMap_22_A, &EncodeTensorMap_22_B, &EncodeTensorMap_22_SFA, nullptr, &EncodeTensorMap_22_C, &Configure_22, &Submit_22},
+    {"kernel_cake_stepfun_moe_3b6b9929c1afac081d07", 0, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 199040u, &EncodeTensorMap_0_A, nullptr, &EncodeTensorMap_0_SFA, nullptr, &EncodeTensorMap_0_C, &Configure_0, &Submit_0},
+    {"kernel_cake_stepfun_moe_b7d35d82eb495a3505b4", 0, 16, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 210560u, &EncodeTensorMap_1_A, nullptr, &EncodeTensorMap_1_SFA, nullptr, &EncodeTensorMap_1_C, &Configure_1, &Submit_1},
+    {"kernel_cake_stepfun_moe_e80e6397791a299acb31", 0, 32, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 188544u, &EncodeTensorMap_2_A, nullptr, &EncodeTensorMap_2_SFA, nullptr, &EncodeTensorMap_2_C, &Configure_2, &Submit_2},
+    {"kernel_cake_stepfun_moe_ac0a51f6a2f1f94ab5fd", 0, 64, 64, 512, {896u, 1u, 1u}, {2u, 1u, 1u}, false, false, 193152u, &EncodeTensorMap_3_A, &EncodeTensorMap_3_B, &EncodeTensorMap_3_SFA, &EncodeTensorMap_3_SFB, &EncodeTensorMap_3_C, &Configure_3, &Submit_3},
+    {"kernel_cake_stepfun_moe_9c37b5d6d27ed4dff42e", 0, 256, 64, 256, {640u, 1u, 1u}, {2u, 1u, 1u}, false, false, 170112u, &EncodeTensorMap_4_A, &EncodeTensorMap_4_B, &EncodeTensorMap_4_SFA, nullptr, &EncodeTensorMap_4_C, &Configure_4, &Submit_4},
+    {"kernel_cake_stepfun_moe_c0bc50c569435278918f", 1, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 199040u, &EncodeTensorMap_5_A, nullptr, &EncodeTensorMap_5_SFA, nullptr, nullptr, &Configure_5, &Submit_5},
+    {"kernel_cake_stepfun_moe_3d04c03557e32d7fd0a5", 1, 16, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 210560u, &EncodeTensorMap_6_A, nullptr, &EncodeTensorMap_6_SFA, nullptr, nullptr, &Configure_6, &Submit_6},
+    {"kernel_cake_stepfun_moe_d9d027f3686df7b18b90", 1, 32, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 188544u, &EncodeTensorMap_7_A, nullptr, &EncodeTensorMap_7_SFA, nullptr, nullptr, &Configure_7, &Submit_7},
+    {"kernel_cake_stepfun_moe_340303a9dd615ce980ba", 1, 64, 64, 512, {896u, 1u, 1u}, {2u, 1u, 1u}, false, false, 193152u, &EncodeTensorMap_8_A, &EncodeTensorMap_8_B, &EncodeTensorMap_8_SFA, &EncodeTensorMap_8_SFB, nullptr, &Configure_8, &Submit_8},
+    {"kernel_cake_stepfun_moe_a0dd4c80a48cc17a021e", 1, 256, 64, 256, {640u, 1u, 1u}, {2u, 1u, 1u}, false, false, 170112u, &EncodeTensorMap_9_A, &EncodeTensorMap_9_B, &EncodeTensorMap_9_SFA, nullptr, nullptr, &Configure_9, &Submit_9},
+    {"kernel_cake_stepfun_moe_88eb494e40032b8fca58", 2, 8, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, true, 211072u, &EncodeTensorMap_10_A, nullptr, nullptr, nullptr, &EncodeTensorMap_10_C, &Configure_10, &Submit_10},
+    {"kernel_cake_stepfun_moe_9113f5e1e9f73b91ac0d", 2, 16, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, true, 224384u, &EncodeTensorMap_11_A, nullptr, nullptr, nullptr, &EncodeTensorMap_11_C, &Configure_11, &Submit_11},
+    {"kernel_cake_stepfun_moe_8cd64028996cf99ee48d", 2, 32, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, true, 210048u, &EncodeTensorMap_12_A, nullptr, nullptr, nullptr, &EncodeTensorMap_12_C, &Configure_12, &Submit_12},
+    {"kernel_cake_stepfun_moe_b8eedc76ca57a37e412b", 2, 64, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 210048u, &EncodeTensorMap_13_A, &EncodeTensorMap_13_B, nullptr, nullptr, &EncodeTensorMap_13_C, &Configure_13, &Submit_13},
+    {"kernel_cake_stepfun_moe_d451550cf2cf6873ef39", 2, 128, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 152704u, &EncodeTensorMap_14_A, &EncodeTensorMap_14_B, nullptr, nullptr, &EncodeTensorMap_14_C, &Configure_14, &Submit_14},
+    {"kernel_cake_stepfun_moe_cfd60da4d7b7115ecf6d", 2, 256, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 201856u, &EncodeTensorMap_15_A, &EncodeTensorMap_15_B, nullptr, nullptr, &EncodeTensorMap_15_C, &Configure_15, &Submit_15},
+    {"kernel_cake_stepfun_moe_4b159cb3776ced087900", 3, 8, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 210432u, &EncodeTensorMap_16_A, &EncodeTensorMap_16_B, nullptr, nullptr, &EncodeTensorMap_16_C, &Configure_16, &Submit_16},
+    {"kernel_cake_stepfun_moe_aa631989f7128edcfb17", 3, 16, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 223232u, &EncodeTensorMap_17_A, &EncodeTensorMap_17_B, nullptr, nullptr, &EncodeTensorMap_17_C, &Configure_17, &Submit_17},
+    {"kernel_cake_stepfun_moe_a3f4da1fcd71ddb90d23", 3, 32, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 207872u, &EncodeTensorMap_18_A, &EncodeTensorMap_18_B, nullptr, nullptr, &EncodeTensorMap_18_C, &Configure_18, &Submit_18},
+    {"kernel_cake_stepfun_moe_c0ed54d60a6512474675", 4, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 217600u, &EncodeTensorMap_19_A, &EncodeTensorMap_19_B, &EncodeTensorMap_19_SFA, nullptr, &EncodeTensorMap_19_C, &Configure_19, &Submit_19},
+    {"kernel_cake_stepfun_moe_6499782a39e979a64c1b", 4, 16, 64, 512, {640u, 1u, 1u}, {1u, 1u, 1u}, false, true, 193280u, &EncodeTensorMap_20_A, &EncodeTensorMap_20_B, &EncodeTensorMap_20_SFA, nullptr, &EncodeTensorMap_20_C, &Configure_20, &Submit_20},
+    {"kernel_cake_stepfun_moe_fb2c144da915e6ebb41a", 4, 64, 64, 256, {512u, 1u, 1u}, {2u, 1u, 1u}, false, true, 176256u, &EncodeTensorMap_21_A, &EncodeTensorMap_21_B, &EncodeTensorMap_21_SFA, nullptr, &EncodeTensorMap_21_C, &Configure_21, &Submit_21},
+    {"kernel_cake_stepfun_moe_061ea89239e052816f5b", 4, 256, 64, 256, {640u, 1u, 1u}, {4u, 1u, 1u}, false, true, 224384u, &EncodeTensorMap_22_A, &EncodeTensorMap_22_B, &EncodeTensorMap_22_SFA, nullptr, &EncodeTensorMap_22_C, &Configure_22, &Submit_22},
 };
 inline constexpr size_t kFc1KernelCount = 23;
 #else
@@ -3314,29 +3319,29 @@ inline cudaError_t Submit_1022(const cudaLaunchConfig_t* config, const Fc1Args& 
 }
 
 inline constexpr Fc1KernelSpec kFc1Kernels[] = {
-    {"kernel_cake_stepfun_moe_bdbdbc20d03963df6e30", 0, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_1000_A, nullptr, &EncodeTensorMap_1000_SFA, nullptr, &EncodeTensorMap_1000_C, &Configure_1000, &Submit_1000},
-    {"kernel_cake_stepfun_moe_f2d77c4211d7f9a81f36", 0, 16, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 210560u, &EncodeTensorMap_1001_A, nullptr, &EncodeTensorMap_1001_SFA, nullptr, &EncodeTensorMap_1001_C, &Configure_1001, &Submit_1001},
-    {"kernel_cake_stepfun_moe_34d5515fb5275ffa6da6", 0, 32, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 188544u, &EncodeTensorMap_1002_A, nullptr, &EncodeTensorMap_1002_SFA, nullptr, &EncodeTensorMap_1002_C, &Configure_1002, &Submit_1002},
-    {"kernel_cake_stepfun_moe_3139846bb4e3b6dc8968", 0, 64, 64, 512, {896u, 1u, 1u}, {2u, 1u, 1u}, false, 193152u, &EncodeTensorMap_1003_A, &EncodeTensorMap_1003_B, &EncodeTensorMap_1003_SFA, &EncodeTensorMap_1003_SFB, &EncodeTensorMap_1003_C, &Configure_1003, &Submit_1003},
-    {"kernel_cake_stepfun_moe_7e9cfa17e533352f21ef", 0, 256, 64, 256, {640u, 1u, 1u}, {2u, 1u, 1u}, false, 170112u, &EncodeTensorMap_1004_A, &EncodeTensorMap_1004_B, &EncodeTensorMap_1004_SFA, nullptr, &EncodeTensorMap_1004_C, &Configure_1004, &Submit_1004},
-    {"kernel_cake_stepfun_moe_60ff2e25fad791084162", 1, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 199040u, &EncodeTensorMap_1005_A, nullptr, &EncodeTensorMap_1005_SFA, nullptr, nullptr, &Configure_1005, &Submit_1005},
-    {"kernel_cake_stepfun_moe_fcb13a981ad101b07dae", 1, 16, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 210560u, &EncodeTensorMap_1006_A, nullptr, &EncodeTensorMap_1006_SFA, nullptr, nullptr, &Configure_1006, &Submit_1006},
-    {"kernel_cake_stepfun_moe_6710e3c4a6d4bfdd7794", 1, 32, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 188544u, &EncodeTensorMap_1007_A, nullptr, &EncodeTensorMap_1007_SFA, nullptr, nullptr, &Configure_1007, &Submit_1007},
-    {"kernel_cake_stepfun_moe_6eaf7199593df2474156", 1, 64, 64, 512, {896u, 1u, 1u}, {2u, 1u, 1u}, false, 193152u, &EncodeTensorMap_1008_A, &EncodeTensorMap_1008_B, &EncodeTensorMap_1008_SFA, &EncodeTensorMap_1008_SFB, nullptr, &Configure_1008, &Submit_1008},
-    {"kernel_cake_stepfun_moe_fb3c76992abd40c415e6", 1, 256, 64, 256, {640u, 1u, 1u}, {2u, 1u, 1u}, false, 170112u, &EncodeTensorMap_1009_A, &EncodeTensorMap_1009_B, &EncodeTensorMap_1009_SFA, nullptr, nullptr, &Configure_1009, &Submit_1009},
-    {"kernel_cake_stepfun_moe_a95b09f9322aa5385174", 2, 8, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 211072u, &EncodeTensorMap_1010_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1010_C, &Configure_1010, &Submit_1010},
-    {"kernel_cake_stepfun_moe_a7237dc88c80ca38b136", 2, 16, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 224384u, &EncodeTensorMap_1011_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1011_C, &Configure_1011, &Submit_1011},
-    {"kernel_cake_stepfun_moe_a3f8e20510dfff150959", 2, 32, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, 210048u, &EncodeTensorMap_1012_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1012_C, &Configure_1012, &Submit_1012},
-    {"kernel_cake_stepfun_moe_7db406f0c04d4fd6ecef", 2, 64, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 210048u, &EncodeTensorMap_1013_A, &EncodeTensorMap_1013_B, nullptr, nullptr, &EncodeTensorMap_1013_C, &Configure_1013, &Submit_1013},
-    {"kernel_cake_stepfun_moe_218fef426c49ccc14fff", 2, 128, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 152704u, &EncodeTensorMap_1014_A, &EncodeTensorMap_1014_B, nullptr, nullptr, &EncodeTensorMap_1014_C, &Configure_1014, &Submit_1014},
-    {"kernel_cake_stepfun_moe_9dce1dd514a72f60cc34", 2, 256, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, 201856u, &EncodeTensorMap_1015_A, &EncodeTensorMap_1015_B, nullptr, nullptr, &EncodeTensorMap_1015_C, &Configure_1015, &Submit_1015},
-    {"kernel_cake_stepfun_moe_113a5a5b83f8dace4055", 3, 8, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 210432u, &EncodeTensorMap_1016_A, &EncodeTensorMap_1016_B, nullptr, nullptr, &EncodeTensorMap_1016_C, &Configure_1016, &Submit_1016},
-    {"kernel_cake_stepfun_moe_3bdd0b58896221d6a938", 3, 16, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 223232u, &EncodeTensorMap_1017_A, &EncodeTensorMap_1017_B, nullptr, nullptr, &EncodeTensorMap_1017_C, &Configure_1017, &Submit_1017},
-    {"kernel_cake_stepfun_moe_25ecc7bcbbba81aa3ebe", 3, 32, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, 207872u, &EncodeTensorMap_1018_A, &EncodeTensorMap_1018_B, nullptr, nullptr, &EncodeTensorMap_1018_C, &Configure_1018, &Submit_1018},
-    {"kernel_cake_stepfun_moe_4d6a9ed197299d2cbf7f", 4, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, 217600u, &EncodeTensorMap_1019_A, &EncodeTensorMap_1019_B, &EncodeTensorMap_1019_SFA, nullptr, &EncodeTensorMap_1019_C, &Configure_1019, &Submit_1019},
-    {"kernel_cake_stepfun_moe_2fdd64b1ef9c92ebb03b", 4, 16, 64, 512, {640u, 1u, 1u}, {1u, 1u, 1u}, false, 193280u, &EncodeTensorMap_1020_A, &EncodeTensorMap_1020_B, &EncodeTensorMap_1020_SFA, nullptr, &EncodeTensorMap_1020_C, &Configure_1020, &Submit_1020},
-    {"kernel_cake_stepfun_moe_46f032627936cd0f1a48", 4, 64, 64, 256, {512u, 1u, 1u}, {2u, 1u, 1u}, false, 176256u, &EncodeTensorMap_1021_A, &EncodeTensorMap_1021_B, &EncodeTensorMap_1021_SFA, nullptr, &EncodeTensorMap_1021_C, &Configure_1021, &Submit_1021},
-    {"kernel_cake_stepfun_moe_dc0ce4e0d9be093617c9", 4, 256, 64, 256, {640u, 1u, 1u}, {4u, 1u, 1u}, false, 224384u, &EncodeTensorMap_1022_A, &EncodeTensorMap_1022_B, &EncodeTensorMap_1022_SFA, nullptr, &EncodeTensorMap_1022_C, &Configure_1022, &Submit_1022},
+    {"kernel_cake_stepfun_moe_bdbdbc20d03963df6e30", 0, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 199040u, &EncodeTensorMap_1000_A, nullptr, &EncodeTensorMap_1000_SFA, nullptr, &EncodeTensorMap_1000_C, &Configure_1000, &Submit_1000},
+    {"kernel_cake_stepfun_moe_f2d77c4211d7f9a81f36", 0, 16, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 210560u, &EncodeTensorMap_1001_A, nullptr, &EncodeTensorMap_1001_SFA, nullptr, &EncodeTensorMap_1001_C, &Configure_1001, &Submit_1001},
+    {"kernel_cake_stepfun_moe_34d5515fb5275ffa6da6", 0, 32, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 188544u, &EncodeTensorMap_1002_A, nullptr, &EncodeTensorMap_1002_SFA, nullptr, &EncodeTensorMap_1002_C, &Configure_1002, &Submit_1002},
+    {"kernel_cake_stepfun_moe_3139846bb4e3b6dc8968", 0, 64, 64, 512, {896u, 1u, 1u}, {2u, 1u, 1u}, false, false, 193152u, &EncodeTensorMap_1003_A, &EncodeTensorMap_1003_B, &EncodeTensorMap_1003_SFA, &EncodeTensorMap_1003_SFB, &EncodeTensorMap_1003_C, &Configure_1003, &Submit_1003},
+    {"kernel_cake_stepfun_moe_7e9cfa17e533352f21ef", 0, 256, 64, 256, {640u, 1u, 1u}, {2u, 1u, 1u}, false, false, 170112u, &EncodeTensorMap_1004_A, &EncodeTensorMap_1004_B, &EncodeTensorMap_1004_SFA, nullptr, &EncodeTensorMap_1004_C, &Configure_1004, &Submit_1004},
+    {"kernel_cake_stepfun_moe_60ff2e25fad791084162", 1, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 199040u, &EncodeTensorMap_1005_A, nullptr, &EncodeTensorMap_1005_SFA, nullptr, nullptr, &Configure_1005, &Submit_1005},
+    {"kernel_cake_stepfun_moe_fcb13a981ad101b07dae", 1, 16, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 210560u, &EncodeTensorMap_1006_A, nullptr, &EncodeTensorMap_1006_SFA, nullptr, nullptr, &Configure_1006, &Submit_1006},
+    {"kernel_cake_stepfun_moe_6710e3c4a6d4bfdd7794", 1, 32, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 188544u, &EncodeTensorMap_1007_A, nullptr, &EncodeTensorMap_1007_SFA, nullptr, nullptr, &Configure_1007, &Submit_1007},
+    {"kernel_cake_stepfun_moe_6eaf7199593df2474156", 1, 64, 64, 512, {896u, 1u, 1u}, {2u, 1u, 1u}, false, false, 193152u, &EncodeTensorMap_1008_A, &EncodeTensorMap_1008_B, &EncodeTensorMap_1008_SFA, &EncodeTensorMap_1008_SFB, nullptr, &Configure_1008, &Submit_1008},
+    {"kernel_cake_stepfun_moe_fb3c76992abd40c415e6", 1, 256, 64, 256, {640u, 1u, 1u}, {2u, 1u, 1u}, false, false, 170112u, &EncodeTensorMap_1009_A, &EncodeTensorMap_1009_B, &EncodeTensorMap_1009_SFA, nullptr, nullptr, &Configure_1009, &Submit_1009},
+    {"kernel_cake_stepfun_moe_a95b09f9322aa5385174", 2, 8, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, true, 211072u, &EncodeTensorMap_1010_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1010_C, &Configure_1010, &Submit_1010},
+    {"kernel_cake_stepfun_moe_a7237dc88c80ca38b136", 2, 16, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, true, 224384u, &EncodeTensorMap_1011_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1011_C, &Configure_1011, &Submit_1011},
+    {"kernel_cake_stepfun_moe_a3f8e20510dfff150959", 2, 32, 64, 128, {384u, 1u, 1u}, {1u, 1u, 1u}, false, true, 210048u, &EncodeTensorMap_1012_A, nullptr, nullptr, nullptr, &EncodeTensorMap_1012_C, &Configure_1012, &Submit_1012},
+    {"kernel_cake_stepfun_moe_7db406f0c04d4fd6ecef", 2, 64, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 210048u, &EncodeTensorMap_1013_A, &EncodeTensorMap_1013_B, nullptr, nullptr, &EncodeTensorMap_1013_C, &Configure_1013, &Submit_1013},
+    {"kernel_cake_stepfun_moe_218fef426c49ccc14fff", 2, 128, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 152704u, &EncodeTensorMap_1014_A, &EncodeTensorMap_1014_B, nullptr, nullptr, &EncodeTensorMap_1014_C, &Configure_1014, &Submit_1014},
+    {"kernel_cake_stepfun_moe_9dce1dd514a72f60cc34", 2, 256, 64, 128, {384u, 1u, 1u}, {2u, 1u, 1u}, false, true, 201856u, &EncodeTensorMap_1015_A, &EncodeTensorMap_1015_B, nullptr, nullptr, &EncodeTensorMap_1015_C, &Configure_1015, &Submit_1015},
+    {"kernel_cake_stepfun_moe_113a5a5b83f8dace4055", 3, 8, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 210432u, &EncodeTensorMap_1016_A, &EncodeTensorMap_1016_B, nullptr, nullptr, &EncodeTensorMap_1016_C, &Configure_1016, &Submit_1016},
+    {"kernel_cake_stepfun_moe_3bdd0b58896221d6a938", 3, 16, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 223232u, &EncodeTensorMap_1017_A, &EncodeTensorMap_1017_B, nullptr, nullptr, &EncodeTensorMap_1017_C, &Configure_1017, &Submit_1017},
+    {"kernel_cake_stepfun_moe_25ecc7bcbbba81aa3ebe", 3, 32, 64, 256, {256u, 1u, 1u}, {1u, 1u, 1u}, false, false, 207872u, &EncodeTensorMap_1018_A, &EncodeTensorMap_1018_B, nullptr, nullptr, &EncodeTensorMap_1018_C, &Configure_1018, &Submit_1018},
+    {"kernel_cake_stepfun_moe_4d6a9ed197299d2cbf7f", 4, 8, 64, 512, {512u, 1u, 1u}, {1u, 1u, 1u}, false, true, 217600u, &EncodeTensorMap_1019_A, &EncodeTensorMap_1019_B, &EncodeTensorMap_1019_SFA, nullptr, &EncodeTensorMap_1019_C, &Configure_1019, &Submit_1019},
+    {"kernel_cake_stepfun_moe_2fdd64b1ef9c92ebb03b", 4, 16, 64, 512, {640u, 1u, 1u}, {1u, 1u, 1u}, false, true, 193280u, &EncodeTensorMap_1020_A, &EncodeTensorMap_1020_B, &EncodeTensorMap_1020_SFA, nullptr, &EncodeTensorMap_1020_C, &Configure_1020, &Submit_1020},
+    {"kernel_cake_stepfun_moe_46f032627936cd0f1a48", 4, 64, 64, 256, {512u, 1u, 1u}, {2u, 1u, 1u}, false, true, 176256u, &EncodeTensorMap_1021_A, &EncodeTensorMap_1021_B, &EncodeTensorMap_1021_SFA, nullptr, &EncodeTensorMap_1021_C, &Configure_1021, &Submit_1021},
+    {"kernel_cake_stepfun_moe_dc0ce4e0d9be093617c9", 4, 256, 64, 256, {640u, 1u, 1u}, {4u, 1u, 1u}, false, true, 224384u, &EncodeTensorMap_1022_A, &EncodeTensorMap_1022_B, &EncodeTensorMap_1022_SFA, nullptr, &EncodeTensorMap_1022_C, &Configure_1022, &Submit_1022},
 };
 inline constexpr size_t kFc1KernelCount = 23;
 #endif
