@@ -419,11 +419,12 @@ class DenseMqaPlan:
     FP32 with physical row stride logits_stride(K) = align8(K + 256); consume
     output[:, :K] (``logical_output``). On the 32-head routes every cell of the
     output is written by each submission (``clean_logits == "fused"``); the
-    64-head routes are single-stage (no metadata buffer: ``metadata`` must be
-    None, ``plan.metadata`` is None, the program is gridDim-strided over the
+    64-head routes are single-stage without a metadata buffer (``metadata`` must
+    be None, ``plan.metadata`` is None, the program is gridDim-strided over the
     tiles from the ``sm_count`` launch grid) and store raw tiles only (cells
-    outside the windows are unspecified). FP4 output storage must include the
-    final query tile.
+    outside the windows are unspecified); the 32-head fused short-KV routes have
+    no metadata stage but still own the buffer their program writes in-kernel.
+    FP4 output storage must include the final query tile.
     """
 
     def __init__(
@@ -563,10 +564,11 @@ class DenseMqaPlan:
             raise ValueError(
                 f"FP4 output backing storage must include the final {bq}-row tile"
             )
-        has_metadata_stage = any(
-            stage == "metadata" for stage, _program in self.route["stages"]
-        )
-        if has_metadata_stage:
+        # The metadata buffer belongs to the head count's schedule, not to the route's stage list: the
+        # shipped 32-head fused routes (fp8:q1:short / fp8:q128:short) have no metadata stage yet WRITE
+        # their schedule into ScheduleMeta in-kernel, so every 32-head plan owns the buffer; the 64-head
+        # programs never touch it (ScheduleMeta bound to ks).
+        if schedules_metadata(num_heads):
             words = metadata_words(queries, num_sms, num_heads)
             if metadata is None:
                 metadata = torch.empty(words, dtype=torch.int32, device=q.device)
@@ -581,7 +583,7 @@ class DenseMqaPlan:
                 )
         elif metadata is not None:
             raise ValueError(
-                f"route {self.route_name} has no metadata stage; metadata must be None"
+                f"route {self.route_name}: the {num_heads}-head programs have no metadata buffer; metadata must be None"
             )
         bindings = stage_bindings(
             precision,
