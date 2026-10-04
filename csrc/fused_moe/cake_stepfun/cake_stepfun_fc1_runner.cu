@@ -55,6 +55,39 @@ generated::TensorLayout denseLayout(void const* data, std::initializer_list<int6
   return layout;
 }
 
+// Routing tail for kernels that do not bound the tiles they acquire through cluster launch control
+// by num_non_exiting_ctas (Fc1KernelSpec::bounds_acquired_tiles == false; they take total_tiles and
+// exit only their initial CTA). trtllm-gen routing writes cta_idx_xy_to_batch_idx and
+// cta_idx_xy_to_mn_limit for the first *numNonExitingCtas CTAs and permuted_idx_to_token_idx for
+// their token slots only; a running CTA of such a kernel processes every cancelled CTA it acquires,
+// so the entries in [*numNonExitingCtas, gridN) must describe a benign tile: expert 0, zero valid
+// rows (mn_limit = tile * tileN) and padded token slots (-1). The kernel is launched in-stream between
+// routing and FC1 with the FC1's programmatic-dependent-launch attribute; it waits for routing
+// before reading the count and releases the FC1 once the tail is written.
+constexpr unsigned kRoutingTailBlocks = 4;
+constexpr unsigned kRoutingTailThreads = 256;
+
+__global__ void __launch_bounds__(kRoutingTailThreads)
+    padRoutingTailKernel(int32_t* tileExpert, int32_t* tileMnLimit, int32_t* routeMap,
+                         int32_t const* numNonExitingCtas, int32_t gridN, int32_t tileN) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  int32_t const first = *numNonExitingCtas;
+  int32_t const stride = static_cast<int32_t>(gridDim.x * blockDim.x);
+  int32_t const lane = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  for (int32_t tile = first + lane; tile < gridN; tile += stride) {
+    tileExpert[tile] = 0;
+    tileMnLimit[tile] = tile * tileN;
+  }
+  for (int32_t slot = first * tileN + lane; slot < gridN * tileN; slot += stride) {
+    routeMap[slot] = -1;
+  }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
+
 // The generated-manifest family served by the native cubin selection arguments, or -1.
 int selectFamily(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOutput,
                  bool useDeepSeekFp8, MoE::ActivationType activationType, bool useShuffledMatrix,
@@ -371,13 +404,6 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
     mSmemConfigured[configIndex] = true;
   }
 
-  cudaLaunchConfig_t config{};
-  config.gridDim = dim3(static_cast<unsigned>(gridM), static_cast<unsigned>(gridN), 1u);
-  config.blockDim = dim3(spec.block[0], spec.block[1], spec.block[2]);
-  config.dynamicSmemBytes = spec.dynamic_smem_bytes;
-  config.stream = stream;
-  std::array<cudaLaunchAttribute, 2> attributes{};
-  unsigned numAttrs = 0;
   // Diagnostic override: CAKE_STEPFUN_FC1_PDL=0 launches the FC1 kernel without the programmatic
   // stream-serialization attribute, =1 launches it with the attribute, while the rest of the
   // pipeline keeps the caller's PDL setting; unset follows enable_pdl.
@@ -387,9 +413,36 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
     return value[0] == '0' ? 0 : value[0] == '1' ? 1 : -1;
   }();
   bool const fc1Pdl = fc1PdlOverride < 0 ? enable_pdl : fc1PdlOverride == 1;
+  cudaLaunchAttribute pdlAttribute{};
+  pdlAttribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  pdlAttribute.val.programmaticStreamSerializationAllowed = 1;
+
+  if (!spec.bounds_acquired_tiles) {
+    cudaLaunchConfig_t tailConfig{};
+    tailConfig.gridDim = dim3(kRoutingTailBlocks, 1u, 1u);
+    tailConfig.blockDim = dim3(kRoutingTailThreads, 1u, 1u);
+    tailConfig.dynamicSmemBytes = 0;
+    tailConfig.stream = stream;
+    tailConfig.attrs = &pdlAttribute;
+    tailConfig.numAttrs = fc1Pdl ? 1u : 0u;
+    cudaError_t const padded =
+        cudaLaunchKernelEx(&tailConfig, padRoutingTailKernel, ptrCtaIdxXyToBatchIdx,
+                           ptrCtaIdxXyToMnLimit, permutedIdxToTokenIdx,
+                           static_cast<int32_t const*>(ptrNumNonExitingCtas), gridN,
+                           mTileTokensDim);
+    FLASHINFER_CHECK(padded == cudaSuccess, "Cake StepFun FC1 routing-tail launch failed for ",
+                     spec.symbol, " grid_n=", gridN, " : ", cudaGetErrorString(padded));
+  }
+
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(static_cast<unsigned>(gridM), static_cast<unsigned>(gridN), 1u);
+  config.blockDim = dim3(spec.block[0], spec.block[1], spec.block[2]);
+  config.dynamicSmemBytes = spec.dynamic_smem_bytes;
+  config.stream = stream;
+  std::array<cudaLaunchAttribute, 2> attributes{};
+  unsigned numAttrs = 0;
   if (fc1Pdl) {
-    attributes[numAttrs].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attributes[numAttrs].val.programmaticStreamSerializationAllowed = 1;
+    attributes[numAttrs] = pdlAttribute;
     ++numAttrs;
   }
   if (spec.cluster_attribute) {

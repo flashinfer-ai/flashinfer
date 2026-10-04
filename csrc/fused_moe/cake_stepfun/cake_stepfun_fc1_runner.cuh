@@ -73,7 +73,11 @@ class Fc1Runner {
   // Generated-manifest family index of this runner (-1 on the native fallback).
   [[nodiscard]] int family() const { return mFamily; }
 
-  // Same argument list as PermuteGemm1::Runner::run. Per family the Cake kernels consume:
+  // Same argument list as PermuteGemm1::Runner::run. Kernels whose manifest entry does not bound
+  // the tiles acquired through cluster launch control by num_non_exiting_ctas are preceded by a
+  // small in-stream kernel that writes a benign routing tail (expert 0, zero valid rows, padded
+  // token slots) into the entries beyond that count, which trtllm-gen routing leaves unwritten.
+  // Per family the Cake kernels consume:
   //  NVFP4            hiddenState E2m1, hiddenStateScale linear E4m3 blocks, weight / weightScale
   //                   (trtllm-shuffled E2m1 + 128x4 block scales), outputScalesScalar /
   //                   outputScalesGateScalar / ptrClampLimit (raw units); output E2m1 with 8x4
