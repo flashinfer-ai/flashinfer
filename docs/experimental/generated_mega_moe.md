@@ -8,6 +8,15 @@ shapes (384 experts, top-6, hidden 5120, intermediate 2304; routed FP4 at 1,
 shape has no fallback. Input preparation and JIT compilation occur before
 repeated `run()`.
 
+The catalog (`mega_moe_v3.v3`) lists one program per schedule, compiled for
+both architectures from one source: the pipeline kernels read the SM count
+from the compile line (`-DNUM_CTAS=<physical SMs>`, supplied by the loader
+from the route), the grouped kernels carry no SM count at all. Two FP4
+pipeline schedules (16 and 128 tokens) select different producer
+instructions per architecture and stay as per-architecture pairs. Every
+route names its SM count and launch grid per architecture; the bindings are
+thin `tvm_ffi_utils.h` launchers.
+
 `flashinfer.mega_moe_v3.prepare_pipeline` executes dispatch, two projections,
 clamped SwiGLU and combine in one submission. Routed weights may use packed
 FP4 E2M1 or FP8 E4M3. It accepts logical gate/up weight halves and float
