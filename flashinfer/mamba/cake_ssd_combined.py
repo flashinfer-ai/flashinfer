@@ -31,18 +31,10 @@ from filelock import FileLock
 from tvm_ffi import cpp
 
 from ..jit import env as jit_env
-from ..jit.mamba.seq_chunk_cumsum import gen_seq_chunk_cumsum_module
 
 _CHUNK_SIZE = 128
 _HEADDIM = 64
 _DSTATE = 128
-
-_ROUTE_EXACT_SCAN = "exact_scan"
-_ROUTE_SHALLOW_VARLEN = "shallow_varlen"
-_ROUTE_PREFIX_VARLEN = "prefix_varlen"
-# The packed-varlen prefix program is promoted for the 128-head / 8-group
-# domain; every other shallow packed-varlen input runs the direct program.
-_PREFIX_ROUTE_SELECTED = True
 
 _TARGET_ARCHS = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 _DEVICE_DIR = Path("generated") / "device"
@@ -74,6 +66,7 @@ class _Program:
     preprocess: _Kernel
     main: _Kernel
     state_dtype_code: int
+    state_dtype_bits: int
     main_smem_bytes: int
 
     @property
@@ -81,22 +74,36 @@ class _Program:
         return (self.preprocess, self.main)
 
 
+# Generated-source identities, ``generated/device/<module>.cu``: the Cake
+# kernel symbol followed by the export's module identity hash.  This block is
+# the single place the Cake export refreshes; every program binding below
+# derives from it.  Entries suffixed ``PENDINGEXPORT`` name programs whose
+# sources have not been exported yet.  One kernel family ships: the exact
+# scan x {bf16, f16, f32 state} x {batched, varlen}, plus one preprocess.
+_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_7ae61d5f32"
+_SCAN_MODULES = {
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_PENDINGEXPORT",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_1895881324",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_PENDINGEXPORT",
+}
+
 _SEGMENT_PREPROCESS = _Kernel(
-    "factorized_persistent_segment_preprocess_7ae61d5f32",
+    _SEGMENT_PREPROCESS_MODULE,
     "kernel_factorized_persistent_segment_preprocess",
     threads=128,
     fast_math=False,
 )
-_PREFIX_PREPROCESS = _Kernel(
-    "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f",
-    "kernel_prefix_factorized_segment_preprocess_onewarp",
-    threads=32,
-    fast_math=False,
-)
-# DLDataType codes of the state tensors: kDLFloat=2 (float16), kDLBfloat=4.
-_STATE_DTYPE_CODES = {"bf16": 4, "f16": 2}
+# DLDataType (code, bits) of the state tensors: kDLFloat=2, kDLBfloat=4.
+_STATE_DTYPE_CODES = {"bf16": (4, 16), "f16": (2, 16), "f32": (2, 32)}
+_STATE_DTYPE_KEYS = {
+    torch.bfloat16: "bf16",
+    torch.float16: "f16",
+    torch.float32: "f32",
+}
 _EXACT_SMEM_BYTES = 231936
-_SHALLOW_SMEM_BYTES = 149248
 
 
 def _scan(module: str) -> _Kernel:
@@ -106,59 +113,30 @@ def _scan(module: str) -> _Kernel:
     return _Kernel(module, f"kernel_{symbol}", threads=512, fast_math=True)
 
 
+def _program(name: str, module: str) -> _Program:
+    """Bind program ``exact_<state>_<mode>`` to its generated scan source."""
+
+    _family, state_key, _mode = name.split("_")
+    code, bits = _STATE_DTYPE_CODES[state_key]
+    return _Program(_SEGMENT_PREPROCESS, _scan(module), code, bits, _EXACT_SMEM_BYTES)
+
+
 _PROGRAMS: dict[str, _Program] = {
-    "exact_bf16_batched": _Program(
-        _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f"),
-        _STATE_DTYPE_CODES["bf16"],
-        _EXACT_SMEM_BYTES,
-    ),
-    "exact_f16_batched": _Program(
-        _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb"),
-        _STATE_DTYPE_CODES["f16"],
-        _EXACT_SMEM_BYTES,
-    ),
-    "exact_bf16_varlen": _Program(
-        _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d"),
-        _STATE_DTYPE_CODES["bf16"],
-        _EXACT_SMEM_BYTES,
-    ),
-    "exact_f16_varlen": _Program(
-        _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_q_tmem_alias_f16_varlen_1895881324"),
-        _STATE_DTYPE_CODES["f16"],
-        _EXACT_SMEM_BYTES,
-    ),
-    "shallow_bf16_varlen": _Program(
-        _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0"),
-        _STATE_DTYPE_CODES["bf16"],
-        _SHALLOW_SMEM_BYTES,
-    ),
-    "shallow_f16_varlen": _Program(
-        _SEGMENT_PREPROCESS,
-        _scan("mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2"),
-        _STATE_DTYPE_CODES["f16"],
-        _SHALLOW_SMEM_BYTES,
-    ),
-    "prefix_bf16_varlen": _Program(
-        _PREFIX_PREPROCESS,
-        _scan("mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2"),
-        _STATE_DTYPE_CODES["bf16"],
-        _SHALLOW_SMEM_BYTES,
-    ),
-    "prefix_f16_varlen": _Program(
-        _PREFIX_PREPROCESS,
-        _scan("mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436"),
-        _STATE_DTYPE_CODES["f16"],
-        _SHALLOW_SMEM_BYTES,
-    ),
+    name: _program(name, module) for name, module in _SCAN_MODULES.items()
 }
 
+
+def _program_name(state_dtype: torch.dtype, mode_varlen: bool) -> str:
+    """The program serving a state dtype in batched or packed-varlen mode."""
+
+    mode_key = "varlen" if mode_varlen else "batched"
+    return f"exact_{_STATE_DTYPE_KEYS[state_dtype]}_{mode_key}"
+
+
 # Positional launcher ABI shared by every program: preprocess arguments, its
-# grid, main arguments, its grid, then the explicit CUDA stream.
+# grid, main arguments, its grid, then the explicit CUDA stream.  The
+# preprocess also derives ``seq_chunk_cumsum`` from the packed-varlen metadata
+# (``write_seq_chunk_cumsum``), so one launcher call covers the whole forward.
 _PREPROCESS_ARGS = (
     "dt",
     "A",
@@ -176,6 +154,12 @@ _PREPROCESS_ARGS = (
     "dt_softplus",
     "dt_min",
     "dt_max",
+    "seq_idx_i32",
+    "seq_idx_i64",
+    "seq_idx_int64",
+    "seq_chunk_cumsum",
+    "num_sequences",
+    "write_seq_chunk_cumsum",
 )
 _MAIN_ARGS = (
     "x_map",
@@ -224,26 +208,6 @@ _MAIN_ARGS = (
 )
 
 
-def _select_scan_route(
-    *,
-    mode_varlen: bool,
-    num_logical_chunks: int,
-    num_sequences: int,
-    nheads: int,
-    ngroups: int,
-    dt_min: float,
-    prefix_route_selected: bool,
-) -> str:
-    """Resolve the semantic route from host-known shape predicates."""
-
-    shallow_varlen = mode_varlen and num_logical_chunks <= num_sequences
-    if dt_min < 0.0 or not shallow_varlen:
-        return _ROUTE_EXACT_SCAN
-    if prefix_route_selected and nheads == 128 and ngroups == 8:
-        return _ROUTE_PREFIX_VARLEN
-    return _ROUTE_SHALLOW_VARLEN
-
-
 def _direct_preprocess_inputs(
     *,
     dt: object,
@@ -262,6 +226,12 @@ def _direct_preprocess_inputs(
     dt_softplus: bool,
     dt_limit: Tuple[float, float],
     threads: int,
+    seq_idx_i32: object,
+    seq_idx_i64: object,
+    seq_idx_int64: bool,
+    seq_chunk_cumsum: object,
+    num_sequences: int,
+    write_seq_chunk_cumsum: bool,
 ) -> tuple[dict[str, object], tuple[int, int, int]]:
     """Build the metadata-fused preprocess values and launch grid."""
 
@@ -285,13 +255,19 @@ def _direct_preprocess_inputs(
         "dt_softplus": int(dt_softplus),
         "dt_min": dt_min,
         "dt_max": dt_max,
+        "seq_idx_i32": seq_idx_i32,
+        "seq_idx_i64": seq_idx_i64,
+        "seq_idx_int64": int(seq_idx_int64),
+        "seq_chunk_cumsum": seq_chunk_cumsum,
+        "num_sequences": num_sequences,
+        "write_seq_chunk_cumsum": int(write_seq_chunk_cumsum),
     }
     total_tiles = num_segments * nheads
     return values, ((total_tiles + threads - 1) // threads, 1, 1)
 
 
 def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
-    """Match the balanced-grid policy shared by shallow and prefix routes."""
+    """Balanced persistent grid for ``total_work`` (sequence, head) items."""
 
     full_grid = min(total_work, sm_count)
     if total_work <= sm_count:
@@ -401,6 +377,7 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
         "CAKE_SSD_MAIN_MODULE": program.main.module,
         "CAKE_SSD_MAIN_KERNEL": program.main.kernel,
         "CAKE_SSD_STATE_DTYPE_CODE": str(program.state_dtype_code),
+        "CAKE_SSD_STATE_DTYPE_BITS": str(program.state_dtype_bits),
         "CAKE_SSD_MAIN_SMEM_BYTES": str(program.main_smem_bytes),
     }
     source = template
@@ -480,18 +457,19 @@ def _load_generated_program(name: str, arch: str):
         )
 
 
-@functools.cache
-def _seq_chunk_cumsum_module():
-    return gen_seq_chunk_cumsum_module().build_and_load()
-
-
 class CakeSSDCombined:
     """Source-built Cake implementation of the admitted SSDCombined domain.
 
     The kernels require chunk size 128, head dimension 64, state dimension
-    128, BF16 inputs/outputs, BF16 or FP16 states, and SM100/SM103.
+    128, BF16 inputs/outputs, BF16, FP16, or FP32 states, and SM100/SM103.
     Head and group counts are runtime values and may be any positive pair for
-    which ``nheads`` is divisible by ``ngroups``.
+    which ``nheads`` is divisible by ``ngroups``.  Any positive sequence
+    length is accepted; the kernels handle a partial trailing chunk.  The
+    output is token-major ``[batch, seqlen, nheads, 64]`` (packed varlen:
+    ``[1, total_seqlen, nheads, 64]``), written directly by the kernels.
+    Every call issues one launcher call: the preprocess (which also derives
+    ``seq_chunk_cumsum`` from the packed-varlen metadata unless the caller
+    supplies a precomputed vector) followed by the scan.
     """
 
     def __init__(
@@ -521,8 +499,10 @@ class CakeSSDCombined:
             )
         if io_dtype != torch.bfloat16:
             raise ValueError("Cake SSDCombined requires bfloat16 IO")
-        if state_dtype not in (torch.bfloat16, torch.float16):
-            raise ValueError("Cake SSDCombined state dtype must be bfloat16 or float16")
+        if state_dtype not in _STATE_DTYPE_KEYS:
+            raise ValueError(
+                "Cake SSDCombined state dtype must be bfloat16, float16, or float32"
+            )
         if seq_idx_dtype not in (torch.int32, torch.int64):
             raise ValueError("Cake SSDCombined seq_idx dtype must be int32 or int64")
         _target_arch(torch.cuda.current_device())
@@ -556,11 +536,17 @@ class CakeSSDCombined:
         workspace: dict[str, torch.Tensor],
         name: str,
         value: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        """Materialize public strided inputs in graph-stable runner storage."""
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Resolve graph-stable packed storage for a public strided input.
+
+        Returns the tensor to bind and the source still to be copied into
+        it, or ``None`` when the input is already contiguous.  The copies are
+        issued together right before the launch so no Python runs between the
+        auxiliary device work and the kernels.
+        """
 
         if value is None or value.is_contiguous():
-            return value
+            return value, None
         buffer_name = f"contiguous_{name}"
         buffer = workspace.get(buffer_name)
         if (
@@ -573,8 +559,7 @@ class CakeSSDCombined:
                 tuple(value.shape), dtype=value.dtype, device=value.device
             )
             workspace[buffer_name] = buffer
-        buffer.copy_(value)
-        return buffer
+        return buffer, value
 
     def _get_workspace(
         self,
@@ -597,10 +582,11 @@ class CakeSSDCombined:
         )
         if self._workspace_key != key:
             ids = torch.arange(num_segments, dtype=torch.int32, device=device)
-            starts = (ids // nchunks) * seqlen + (ids % nchunks) * _CHUNK_SIZE
-            lengths = torch.full(
-                (num_segments,), _CHUNK_SIZE, dtype=torch.int32, device=device
-            )
+            chunks = ids % nchunks
+            starts = (ids // nchunks) * seqlen + chunks * _CHUNK_SIZE
+            # Batched segments are physical chunks; the trailing chunk of a
+            # sequence whose length is not a multiple of 128 is partial.
+            lengths = torch.clamp(seqlen - chunks * _CHUNK_SIZE, max=_CHUNK_SIZE)
             sequence_offsets = (
                 torch.arange(num_sequences + 1, dtype=torch.int32, device=device)
                 * nchunks
@@ -611,7 +597,7 @@ class CakeSSDCombined:
                 "lengths": lengths,
                 "sequence_offsets": sequence_offsets,
                 "delta": torch.empty(
-                    (tile_count, _CHUNK_SIZE), dtype=torch.bfloat16, device=device
+                    (tile_count, _CHUNK_SIZE), dtype=torch.float16, device=device
                 ),
                 "cumsum": torch.empty(
                     (tile_count, _CHUNK_SIZE), dtype=torch.float32, device=device
@@ -622,6 +608,13 @@ class CakeSSDCombined:
                     device=device,
                 ),
                 "dt_bias_float": torch.empty(
+                    self.nheads,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                # Bound when the caller passes no dt_bias; never written after
+                # allocation, so it costs no per-call fill.
+                "dt_bias_zero": torch.zeros(
                     self.nheads,
                     dtype=torch.float32,
                     device=device,
@@ -642,41 +635,18 @@ class CakeSSDCombined:
         assert workspace is not None
         return workspace
 
-    def _compute_seq_chunk_cumsum(
-        self,
-        seq_idx: torch.Tensor,
-        chunk_indices: torch.Tensor,
-        chunk_offsets: torch.Tensor,
-        num_sequences: int,
-        output: Optional[torch.Tensor],
+    def _seq_chunk_cumsum_buffer(
+        self, device: torch.device, num_sequences: int
     ) -> torch.Tensor:
-        if output is None:
-            size = num_sequences + 1
-            key = (seq_idx.device.index, size)
-            if self._seq_cumsum_key != key:
-                self._seq_cumsum_buf = torch.empty(
-                    size, dtype=torch.int32, device=seq_idx.device
-                )
-                self._seq_cumsum_key = key
-            output = self._seq_cumsum_buf
-            assert output is not None
-        module = _seq_chunk_cumsum_module()
-        workspace_bytes = module.seq_chunk_cumsum_tile_state_size(num_sequences)
-        tile_state = (
-            torch.empty(workspace_bytes, dtype=torch.uint8, device=seq_idx.device)
-            if workspace_bytes
-            else None
-        )
-        module.seq_chunk_cumsum(
-            seq_idx,
-            chunk_indices,
-            chunk_offsets,
-            output,
-            tile_state,
-            _CHUNK_SIZE,
-            len(chunk_indices),
-            num_sequences,
-        )
+        """The runner-owned ``seq_chunk_cumsum`` the preprocess fills."""
+
+        size = num_sequences + 1
+        key = (device.index, size)
+        if self._seq_cumsum_key != key:
+            self._seq_cumsum_buf = torch.empty(size, dtype=torch.int32, device=device)
+            self._seq_cumsum_key = key
+        output = self._seq_cumsum_buf
+        assert output is not None
         return output
 
     def run(
@@ -702,10 +672,9 @@ class CakeSSDCombined:
         checkpoint_states: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
+        num_seqs: Optional[int] = None,
     ):
         batch, seqlen, nheads, headdim = x.shape
-        if seqlen % _CHUNK_SIZE:
-            raise ValueError("seqlen must be divisible by chunk_size=128")
         if (nheads, headdim) != (self.nheads, _HEADDIM):
             raise ValueError(f"x must have shape [batch, seqlen, {self.nheads}, 64]")
         if tuple(B.shape) != (batch, seqlen, self.ngroups, _DSTATE):
@@ -735,29 +704,40 @@ class CakeSSDCombined:
                 "varlen mode requires seq_idx, chunk_indices, and chunk_offsets"
             )
         if not mode_varlen and (
-            any(value is not None for value in metadata) or seq_chunk_cumsum is not None
+            any(value is not None for value in metadata)
+            or seq_chunk_cumsum is not None
+            or num_seqs is not None
         ):
             raise ValueError(
-                "batched mode does not accept varlen metadata or seq_chunk_cumsum"
+                "batched mode does not accept varlen metadata, seq_chunk_cumsum, "
+                "or num_seqs"
             )
-        if mode_varlen and initial_states is None:
-            raise ValueError("varlen mode requires initial_states")
         if initial_states is not None and initial_states.dtype != self.state_dtype:
             raise ValueError("initial_states dtype must match state_dtype")
 
-        nchunks = seqlen // _CHUNK_SIZE
-        num_sequences = initial_states.shape[0] if mode_varlen else batch
+        nchunks = -(-seqlen // _CHUNK_SIZE)
+        if not mode_varlen:
+            num_sequences = batch
+        elif initial_states is not None:
+            num_sequences = int(initial_states.shape[0])
+        elif seq_chunk_cumsum is not None:
+            num_sequences = int(seq_chunk_cumsum.numel()) - 1
+        elif num_seqs is not None:
+            num_sequences = int(num_seqs)
+        else:
+            raise ValueError(
+                "varlen mode without initial_states requires seq_chunk_cumsum or "
+                "num_seqs to determine the sequence count"
+            )
+        if num_seqs is not None and int(num_seqs) != num_sequences:
+            raise ValueError(
+                f"num_seqs ({num_seqs}) does not match the sequence count "
+                f"({num_sequences}) implied by initial_states/seq_chunk_cumsum"
+            )
+        if num_sequences <= 0:
+            raise ValueError("the sequence count must be positive")
         num_segments = len(chunk_indices) if mode_varlen else batch * nchunks
         dt_min, dt_max = (float(value) for value in dt_limit)
-        scan_route = _select_scan_route(
-            mode_varlen=mode_varlen,
-            num_logical_chunks=num_segments,
-            num_sequences=num_sequences,
-            nheads=self.nheads,
-            ngroups=self.ngroups,
-            dt_min=dt_min,
-            prefix_route_selected=_PREFIX_ROUTE_SELECTED,
-        )
         checkpoint_args = (
             checkpoint_token_indices,
             checkpoint_state_slots,
@@ -843,30 +823,34 @@ class CakeSSDCombined:
         if seq_chunk_cumsum is not None and (
             tuple(seq_chunk_cumsum.shape) != (num_sequences + 1,)
             or seq_chunk_cumsum.dtype != torch.int32
+            or not seq_chunk_cumsum.is_contiguous()
         ):
-            raise ValueError("seq_chunk_cumsum shape or dtype is invalid")
-        if out is not None:
-            expected_out = (
-                batch,
-                self.nheads,
-                _HEADDIM,
-                nchunks,
-                _CHUNK_SIZE,
+            raise ValueError(
+                "seq_chunk_cumsum shape or dtype is invalid: expected a contiguous "
+                f"int32 vector of {num_sequences + 1} entries"
             )
+        if dt_bias is not None and (
+            tuple(dt_bias.shape) != (self.nheads,)
+            or dt_bias.dtype not in (torch.bfloat16, torch.float32)
+        ):
+            raise ValueError(
+                f"dt_bias must have shape [{self.nheads}] and dtype bfloat16 or float32"
+            )
+        # The kernels write the token-major output directly (TMA store per
+        # chunk; vectorised stores for packed-varlen segments that share a
+        # physical chunk), so the public layout is also the kernel layout.
+        expected_out = (batch, seqlen, self.nheads, _HEADDIM)
+        if out is not None:
             if tuple(out.shape) != expected_out or out.dtype != torch.bfloat16:
                 raise ValueError(
                     f"out must have shape {expected_out} and dtype bfloat16"
                 )
             if not out.is_contiguous():
                 raise ValueError("out must be contiguous")
-        if out is None:
+        else:
             # Match SSDCombined's ownership contract: each allocation-returning
             # call owns fresh output storage that later calls cannot overwrite.
-            out = torch.empty(
-                (batch, self.nheads, _HEADDIM, nchunks, _CHUNK_SIZE),
-                dtype=torch.bfloat16,
-                device=x.device,
-            )
+            out = torch.empty(expected_out, dtype=torch.bfloat16, device=x.device)
         workspace = self._get_workspace(
             device=x.device,
             batch=batch,
@@ -887,27 +871,30 @@ class CakeSSDCombined:
         # The TMA descriptors preserve the physical strides of x/B/C,
         # including the row padding produced by framework projection splits.
         # Only inputs consumed through flat pointer indexing need packed,
-        # graph-stable storage.
-        dt = self._contiguous_input(workspace, "dt", dt)
-        A = self._contiguous_input(workspace, "A", A)
-        D = self._contiguous_input(workspace, "D", D)
-        z = self._contiguous_input(workspace, "z", z)
-        dt_bias = self._contiguous_input(workspace, "dt_bias", dt_bias)
-        initial_states = self._contiguous_input(
-            workspace, "initial_states", initial_states
+        # graph-stable storage.  Resolve the storage now; copy later, together.
+        pending_copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def packed(name: str, value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            buffer, source = self._contiguous_input(workspace, name, value)
+            if source is not None:
+                assert buffer is not None
+                pending_copies.append((buffer, source))
+            return buffer
+
+        dt = packed("dt", dt)
+        A = packed("A", A)
+        D = packed("D", D)
+        z = packed("z", z)
+        dt_bias = packed("dt_bias", dt_bias)
+        initial_states = packed("initial_states", initial_states)
+        seq_idx = packed("seq_idx", seq_idx)
+        chunk_indices = packed("chunk_indices", chunk_indices)
+        chunk_offsets = packed("chunk_offsets", chunk_offsets)
+        checkpoint_token_indices = packed(
+            "checkpoint_token_indices", checkpoint_token_indices
         )
-        seq_idx = self._contiguous_input(workspace, "seq_idx", seq_idx)
-        chunk_indices = self._contiguous_input(
-            workspace, "chunk_indices", chunk_indices
-        )
-        chunk_offsets = self._contiguous_input(
-            workspace, "chunk_offsets", chunk_offsets
-        )
-        checkpoint_token_indices = self._contiguous_input(
-            workspace, "checkpoint_token_indices", checkpoint_token_indices
-        )
-        checkpoint_state_slots = self._contiguous_input(
-            workspace, "checkpoint_state_slots", checkpoint_state_slots
+        checkpoint_state_slots = packed(
+            "checkpoint_state_slots", checkpoint_state_slots
         )
         assert x is not None and dt is not None and A is not None
         assert B is not None and C is not None
@@ -934,45 +921,31 @@ class CakeSSDCombined:
             if chunk_offsets is not None
             else self._dummy(x.device, torch.int32)
         )
-        if mode_varlen and (seq_chunk_cumsum is None or update_seq_chunk_cumsum):
-            with torch.cuda.device(x.device):
-                seq_chunk_cumsum = self._compute_seq_chunk_cumsum(
-                    seq_idx,
-                    chunk_indices,
-                    chunk_offsets,
-                    num_sequences,
-                    seq_chunk_cumsum,
-                )
+        # Packed varlen: the preprocess writes seq_chunk_cumsum (into the
+        # caller's buffer when update_seq_chunk_cumsum is set, else into the
+        # runner-owned one) unless the caller passed a precomputed vector.
+        if not mode_varlen:
+            write_seq_chunk_cumsum = False
+            cumsum_arg = self._dummy(x.device, torch.int32)
+        elif seq_chunk_cumsum is None:
+            write_seq_chunk_cumsum = True
+            cumsum_arg = self._seq_chunk_cumsum_buffer(x.device, num_sequences)
+        else:
+            write_seq_chunk_cumsum = bool(update_seq_chunk_cumsum)
+            cumsum_arg = seq_chunk_cumsum
 
         dt_float = dt
         if dt.dtype != torch.float32:
-            workspace["dt_float"].copy_(dt)
             dt_float = workspace["dt_float"]
-        if dt_bias is not None and (
-            tuple(dt_bias.shape) != (self.nheads,)
-            or dt_bias.dtype not in (torch.bfloat16, torch.float32)
-        ):
-            raise ValueError(
-                f"dt_bias must have shape [{self.nheads}] and dtype bfloat16 or float32"
-            )
+            pending_copies.append((dt_float, dt))
         if dt_bias is None:
-            workspace["dt_bias_float"].zero_()
-            dt_bias_float = workspace["dt_bias_float"]
+            dt_bias_float = workspace["dt_bias_zero"]
         elif dt_bias.dtype == torch.float32:
             dt_bias_float = dt_bias
         else:
-            workspace["dt_bias_float"].copy_(dt_bias)
             dt_bias_float = workspace["dt_bias_float"]
-        state_key = "f16" if self.state_dtype == torch.float16 else "bf16"
-        mode_key = "varlen" if mode_varlen else "batched"
-        family = (
-            "prefix"
-            if scan_route == _ROUTE_PREFIX_VARLEN
-            else "shallow"
-            if scan_route == _ROUTE_SHALLOW_VARLEN
-            else "exact"
-        )
-        program_name = f"{family}_{state_key}_{mode_key}"
+            pending_copies.append((dt_bias_float, dt_bias))
+        program_name = _program_name(self.state_dtype, mode_varlen)
         program = _PROGRAMS[program_name]
         preprocess_values, preprocess_grid = _direct_preprocess_inputs(
             dt=dt_float,
@@ -991,25 +964,24 @@ class CakeSSDCombined:
             dt_softplus=bool(dt_softplus),
             dt_limit=(dt_min, dt_max),
             threads=program.preprocess.threads,
+            seq_idx_i32=seq_i32,
+            seq_idx_i64=seq_i64,
+            seq_idx_int64=seq_idx_int64,
+            seq_chunk_cumsum=cumsum_arg,
+            num_sequences=num_sequences,
+            write_seq_chunk_cumsum=write_seq_chunk_cumsum,
         )
-        sm_count = _sm_count(device_index)
-        if scan_route == _ROUTE_PREFIX_VARLEN:
-            preprocess_grid = (
-                max(1, min(preprocess_grid[0], sm_count)),
-                preprocess_grid[1],
-                preprocess_grid[2],
-            )
         grid = _persistent_grid_size(
             total_work=num_sequences * self.nheads,
-            sm_count=sm_count,
+            sm_count=_sm_count(device_index),
         )
 
         d_arg = D if D is not None else self._dummy(x.device, torch.bfloat16)
         if D is not None and D.ndim == 2 and not self.d_has_hdim:
             # Match CuTe's public runner: a 2D D passed to a per-head
             # constructor consumes its first column.
-            workspace["d_head"].copy_(D[:, 0])
             d_arg = workspace["d_head"]
+            pending_copies.append((d_arg, D[:, 0]))
         z_arg = z if z is not None else self._dummy(x.device, torch.bfloat16)
         initial_arg = (
             initial_states
@@ -1031,63 +1003,63 @@ class CakeSSDCombined:
             if checkpoint_state_slots is not None
             else self._dummy(x.device, torch.int32)
         )
-        cumsum_arg = (
-            seq_chunk_cumsum
-            if seq_chunk_cumsum is not None
-            else self._dummy(x.device, torch.int32)
-        )
         d_mode = 0 if D is None else 2 if self.d_has_hdim and D.ndim == 2 else 1
+        # x/B/C are consumed through their stride-aware TMA descriptors.
+        # The kernel signature retains unused raw-pointer slots for the
+        # same buffers; pass a valid packed dummy so the host checks do
+        # not reject the descriptor-compatible public views.
+        unused_bf16 = self._dummy(x.device, torch.bfloat16)
+        main_values: dict[str, object] = {
+            "x_map": x,
+            "b_map": B,
+            "c_map": C,
+            "out_map": out,
+            "x": unused_bf16,
+            "dt": dt_float,
+            "delta_precomputed": workspace["delta"],
+            "cumsum_precomputed": workspace["cumsum"],
+            "A": A,
+            "B_tensor": unused_bf16,
+            "C": unused_bf16,
+            "D": d_arg,
+            "z": z_arg,
+            "dt_bias": dt_bias_float,
+            "initial_states": initial_arg,
+            "final_states": final_states_arg,
+            "checkpoint_states": checkpoint_states_arg,
+            "checkpoint_token_indices": checkpoint_token_indices_arg,
+            "checkpoint_state_slots": checkpoint_state_slots_arg,
+            "seq_idx_i32": seq_i32,
+            "seq_idx_i64": seq_i64,
+            "chunk_indices": chunk_indices_arg,
+            "chunk_offsets": chunk_offsets_arg,
+            "seq_chunk_cumsum": cumsum_arg,
+            "out_native": out,
+            "nheads": self.nheads,
+            "ngroups": self.ngroups,
+            "batch": batch,
+            "seqlen": seqlen,
+            "nchunks": nchunks,
+            "sequence_count": num_sequences,
+            "num_logical_chunks": num_segments if mode_varlen else nchunks,
+            "mode_varlen": int(mode_varlen),
+            "has_seq_chunk_cumsum": int(mode_varlen),
+            "seq_idx_int64": int(seq_idx_int64),
+            "D_mode": d_mode,
+            "has_z": int(z is not None),
+            "has_initial": int(initial_states is not None),
+            "dt_softplus": int(bool(dt_softplus)),
+            "dt_min": dt_min,
+            "dt_max": dt_max,
+            "write_final_states": int(return_final_states),
+            "checkpoint_state_count": checkpoint_state_count,
+        }
+        # Every host-side decision is made; from here on only device work is
+        # issued: the packed-input copies, then the single launcher call that
+        # runs the preprocess and the scan.
         with torch.cuda.device(x.device):
-            # x/B/C are consumed through their stride-aware TMA descriptors.
-            # The kernel signature retains unused raw-pointer slots for the
-            # same buffers; pass a valid packed dummy so the host checks do
-            # not reject the descriptor-compatible public views.
-            unused_bf16 = self._dummy(x.device, torch.bfloat16)
-            main_values: dict[str, object] = {
-                "x_map": x,
-                "b_map": B,
-                "c_map": C,
-                "out_map": out,
-                "x": unused_bf16,
-                "dt": dt_float,
-                "delta_precomputed": workspace["delta"],
-                "cumsum_precomputed": workspace["cumsum"],
-                "A": A,
-                "B_tensor": unused_bf16,
-                "C": unused_bf16,
-                "D": d_arg,
-                "z": z_arg,
-                "dt_bias": dt_bias_float,
-                "initial_states": initial_arg,
-                "final_states": final_states_arg,
-                "checkpoint_states": checkpoint_states_arg,
-                "checkpoint_token_indices": checkpoint_token_indices_arg,
-                "checkpoint_state_slots": checkpoint_state_slots_arg,
-                "seq_idx_i32": seq_i32,
-                "seq_idx_i64": seq_i64,
-                "chunk_indices": chunk_indices_arg,
-                "chunk_offsets": chunk_offsets_arg,
-                "seq_chunk_cumsum": cumsum_arg,
-                "out_native": out,
-                "nheads": self.nheads,
-                "ngroups": self.ngroups,
-                "batch": batch,
-                "seqlen": seqlen,
-                "nchunks": nchunks,
-                "sequence_count": num_sequences,
-                "num_logical_chunks": num_segments if mode_varlen else nchunks,
-                "mode_varlen": int(mode_varlen),
-                "has_seq_chunk_cumsum": int(seq_chunk_cumsum is not None),
-                "seq_idx_int64": int(seq_idx_int64),
-                "D_mode": d_mode,
-                "has_z": int(z is not None),
-                "has_initial": int(initial_states is not None),
-                "dt_softplus": int(bool(dt_softplus)),
-                "dt_min": dt_min,
-                "dt_max": dt_max,
-                "write_final_states": int(return_final_states),
-                "checkpoint_state_count": checkpoint_state_count,
-            }
+            for destination, source in pending_copies:
+                destination.copy_(source)
             _launch_program(
                 program_name,
                 arch,
@@ -1097,11 +1069,8 @@ class CakeSSDCombined:
                 main_grid=(grid, 1, 1),
                 cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
             )
-        out_view = out.permute(0, 3, 4, 1, 2).reshape(
-            batch, seqlen, self.nheads, _HEADDIM
-        )
         final = final_states_arg if return_final_states else None
-        return out_view, final
+        return out, final
 
 
 __all__ = ["CakeSSDCombined"]
