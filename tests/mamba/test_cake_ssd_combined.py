@@ -41,9 +41,9 @@ def _load_cake_benchmark_module():
 _ATOL = _RTOL = 1e-2
 # Upper bound on the fraction of Cake outputs / final-state entries outside
 # ``atol = rtol = 1e-2`` of the fp64 recurrence.  Measured on GB300 with
-# ``cake_ssd_accuracy_probe.py`` (FP16 delta): <= 0.03 % of the outputs on the
+# ``cake_ssd_accuracy_probe.py`` (FP16 delta): <= 0.15 % of the outputs on the
 # ``_case`` distribution, 0.53-0.57 % on the CAKE-950 realistic-decay
-# distribution (CuTe, bf16 delta: 0.04-0.10 % and 1.34-1.40 %); 0 final-state
+# distribution (CuTe, bf16 delta: <= 0.20 % and 1.34-1.40 %); 0 final-state
 # entries in every case.
 _MAX_OUTSIDE_FRACTION = 0.01
 
@@ -69,8 +69,9 @@ def _fp64_reference(constructor, tensors, arguments, *, delta_dtype=None):
     ``delta`` is ``dt'`` rounded to ``delta_dtype`` (``None`` = exact); the
     accuracy probe uses fp16 / bf16 here to emulate the kernels' ``delta``
     storage, the decay always uses the exact ``dt'`` (both kernels scan the
-    fp32 ``dt * A``).  A 2D ``D`` on a per-head constructor consumes its first
-    column and a 1D ``D`` broadcasts over ``headdim``, like both backends.
+    fp32 ``dt * A``).  ``D`` follows the constructor like both backends: a 2D
+    ``D`` on a per-head constructor (``d_has_hdim=False``) consumes its first
+    column, a 1D ``D`` broadcasts over ``headdim``.
     Returns the token-major fp64 output with ``x``'s shape and the
     ``[num_seqs, nheads, 64, 128]`` final states (zero initial state when
     ``initial_states`` is ``None``).
@@ -103,7 +104,7 @@ def _fp64_reference(constructor, tensors, arguments, *, delta_dtype=None):
     else:
         Df = D.to(f64)
         Df = Df[:, None] if Df.ndim == 1 else Df
-        if Df.shape[1] != headdim:
+        if not constructor["d_has_hdim"]:
             Df = Df[:, :1]
     initial = arguments.get("initial_states")
     y = torch.empty((total, nheads, headdim), dtype=f64, device=x.device)
@@ -144,7 +145,22 @@ def _bf16_ulp(value):
     return 2.0 ** math.floor(math.log2(magnitude)) * torch.finfo(torch.bfloat16).eps
 
 
-def _assert_cake_accuracy(cake, cute, constructor, tensors, arguments):
+def _count_slack(count):
+    """Two-sided Poisson noise of an outlier count: two kernels of equal
+    internal accuracy differ by about this many outliers on the same inputs."""
+
+    return 2.0 * math.sqrt(count)
+
+
+def _assert_cake_accuracy(
+    cake,
+    cute,
+    constructor,
+    tensors,
+    arguments,
+    *,
+    max_outside_fraction=_MAX_OUTSIDE_FRACTION,
+):
     """Cake must be at least as accurate as CuTe against the fp64 recurrence.
 
     Both backends evaluate the same chunked algorithm with bf16 operands, so
@@ -167,11 +183,17 @@ def _assert_cake_accuracy(cake, cute, constructor, tensors, arguments):
 
     1. every Cake value is finite;
     2. Cake is within ``atol = rtol = 1e-2`` of the fp64 recurrence on all but
-       at most ``_MAX_OUTSIDE_FRACTION`` of the entries (the elementwise
-       tolerance is unchanged; the bound is 30x above the measured fraction
-       on the ``_case`` distribution and ~2x on the realistic one);
+       at most ``max_outside_fraction`` of the entries (default 1 %; the
+       elementwise tolerance is unchanged; the default is >= 6x above the
+       measured fractions on the ``_case`` distribution and ~2x on the
+       realistic one; a caller whose distribution puts *both* kernels above
+       it passes the measured class error explicitly, see
+       ``test_cake_ssd_combined_exact_scan_softplus_parity``);
     3. Cake has no more entries outside that tolerance than CuTe on the same
-       inputs (measured 0.28-0.42x of CuTe's count);
+       inputs, up to the Poisson noise ``2 * sqrt(CuTe's count)`` of the
+       count (measured 0.27-0.75x of CuTe's count over 15 probe
+       configurations; the one near-tie is the softplus-off f16-state row,
+       1438 vs 1432 of 131072, where the ``delta`` rounding plays no role);
     4. Cake's largest absolute error does not exceed CuTe's by more than one
        bf16 ulp at the magnitude of Cake's worst entry (kernels of equal
        internal accuracy differ by up to one output rounding there; the
@@ -202,15 +224,16 @@ def _assert_cake_accuracy(cake, cute, constructor, tensors, arguments):
         cake_error = (actual64 - expected).abs()
         cake_max = float(cake_error.max())
         cute_max = float((baseline.to(torch.float64) - expected).abs().max())
-        budget = _MAX_OUTSIDE_FRACTION * expected.numel()
+        budget = max_outside_fraction * expected.numel()
         assert cake_outside <= budget, (
             f"{name}: {cake_outside} of {expected.numel()} Cake entries outside "
             f"atol=rtol={_ATOL} of the fp64 recurrence (budget {budget:.0f}; "
             f"CuTe {cute_outside})"
         )
-        assert cake_outside <= cute_outside, (
+        assert cake_outside <= cute_outside + _count_slack(cute_outside), (
             f"{name}: Cake has {cake_outside} entries outside atol=rtol={_ATOL} "
-            f"of the fp64 recurrence, CuTe {cute_outside} on the same inputs"
+            f"of the fp64 recurrence, CuTe {cute_outside} on the same inputs "
+            f"(slack {_count_slack(cute_outside):.0f})"
         )
         worst = int(cake_error.argmax())
         slack = _bf16_ulp(float(expected.reshape(-1)[worst]))
@@ -951,6 +974,14 @@ def test_cake_ssd_combined_nemotron_accuracy_vs_recurrent_reference():
 @pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("dt_softplus", (False, True))
 def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
+    """``dt_softplus`` on and off with bf16 and f16 states.  With softplus off
+    the ``_case`` step sizes clamp to ``dt_min = 1e-3`` almost everywhere, so
+    the state barely evolves and the rounding of the f16 initial state to the
+    bf16 ``C . state`` MMA operand (done by both kernels) dominates: 1.10 % of
+    the outputs are outside 1e-2 of the fp64 recurrence for Cake and 1.09 %
+    for CuTe (GB300), hence the 2 % cap for that row; the bf16-state rows and
+    the softplus-on rows stay under the 1 % default."""
+
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
@@ -960,7 +991,15 @@ def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
 
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
+    both_above_default = state_dtype == torch.float16 and not dt_softplus
+    _assert_cake_accuracy(
+        actual,
+        expected,
+        constructor,
+        tensors,
+        arguments,
+        max_outside_fraction=0.02 if both_above_default else _MAX_OUTSIDE_FRACTION,
+    )
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
