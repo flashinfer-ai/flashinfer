@@ -174,24 +174,18 @@ def main():
 
     import torch
     import flashinfer
-    from flashinfer.experimental.sm110_xqa.jit import get_manifest, require_sm110
+    from flashinfer.experimental.sm110_xqa.jit import require_sm110
     from flashinfer.sm110_xqa import prepare
     from flashinfer.testing import bench_gpu_time
 
     started = time.monotonic()  # Physical turnaround only; never GPU timing.
     require_sm110(torch.device("cuda", torch.cuda.current_device()))
-    manifest = get_manifest()
     ledger_bytes = args.ledger.read_bytes()
     ledger = json.loads(ledger_bytes)
-    if (
-        ledger["architecture"] != "sm_110a"
-        or ledger["shape_count"] != len(ledger["shapes"])
-        or [row["name"] for row in ledger["shapes"]] != manifest["shape_denominator"]
-        or hashlib.sha256(ledger_bytes).hexdigest() != manifest["shape_ledger_sha256"]
+    if ledger["architecture"] != "sm_110a" or ledger["shape_count"] != len(
+        ledger["shapes"]
     ):
-        raise ValueError(
-            "benchmark ledger must match the frozen manifest shape denominator"
-        )
+        raise ValueError("benchmark ledger must be a complete sm_110a shape ledger")
     if ledger["inputs"] != {
         "tree": {"distribution": "uniform", "minimum": -1.0, "maximum": 1.0, "seed": 0},
         "decode": {"distribution": "normal", "mean": 0.0, "std": 1.0, "seed": 0},
@@ -206,9 +200,7 @@ def main():
         "cuda": torch.version.cuda,
         "flashinfer": flashinfer.__version__,
         "cupti": cupti_version,
-        "manifest_sha256": hashlib.sha256(
-            json.dumps(manifest, sort_keys=True).encode()
-        ).hexdigest(),
+        "ledger_sha256": hashlib.sha256(ledger_bytes).hexdigest(),
         "timing": {
             "backend": "cupti",
             "cold_l2": True,
@@ -252,6 +244,7 @@ def main():
         row = {
             "shape": shape,
             "route": plan.route,
+            "program": plan.program,
             "correct": True,
             "median_us": 1000 * statistics.median(samples),
             "samples_ms": list(samples),

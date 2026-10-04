@@ -128,6 +128,14 @@ def test_workspace_layout(backward):
     assert ("delta" in layout) == backward
     assert ("dkv_latent_acc" in layout) == backward
     assert layout["topk_length"][1] == 300 * 4
+    # a direct binding adds into the caller's dkv_acc: no FP32 accumulators in the workspace
+    direct = workspace_layout(300, 1000, 96, backward=backward, dkv_direct=True)
+    assert "dkv_latent_acc" not in direct and "dk_rope_acc" not in direct
+    assert ("delta" in direct) == backward
+    if backward:
+        assert layout["total"] - direct["total"] >= 1000 * D_QK * 4
+    else:
+        assert direct["total"] == layout["total"]
 
 
 def test_workspace_layout_key_pass_regions():
@@ -160,6 +168,7 @@ _POLICY = dict(
     key_bytes=2304,
     workspace_budget_bytes=640 << 20,
     token_chunk_multiple=128,
+    max_passes=4,
 )
 _ALL_STAGES = (
     "fwd",
@@ -170,6 +179,18 @@ _ALL_STAGES = (
     "bwd_cast",
 )
 _SINGLE_PASS_STAGES = ("fwd", "bwd_delta", "bwd_main", "bwd_cast")
+# a program with the natural-layout (direct accumulation) variants of the main stage next to the regular ones
+_DIRECT_STAGES = (
+    "fwd",
+    "bwd_delta",
+    "bwd_main",
+    "bwd_main_natural",
+    "bwd_compact",
+    "bwd_main_pass",
+    "bwd_main_pass_natural",
+    "bwd_cast",
+)
+_DIRECT_POLICY = dict(min_keys_per_query=4)
 
 
 def test_key_pass_policy_rule():
@@ -197,6 +218,15 @@ def test_key_pass_policy_rule():
     assert policy.passes(4096, 268757, 2048, num_segments=9) == 1
     with pytest.raises(ValueError, match="num_segments"):
         policy.passes(4096, 65536, 2048, num_segments=0)
+    # the cap: the formula's count is taken only up to max_passes (per-pass dQ-partial round trip + pipeline fill)
+    assert policy.formula_passes(267520) == 6 and policy.formula_passes(225280) == 5
+    assert policy.passes(3884, 267520, 2048) == 1
+    assert policy.passes(4096, 225280, 2048) == 1
+    assert policy.passes(4096, 180224, 2048) == 4
+    assert policy.passes(4096, 182044, 2048) == 4
+    assert policy.passes(4096, 182045, 2048) == 1
+    assert KeyPassPolicy(**dict(_POLICY, max_passes=6)).passes(3884, 267520, 2048) == 6
+    assert KeyPassPolicy(**dict(_POLICY, max_passes=2)).passes(4096, 131072, 2048) == 1
     assert key_pass_ranges(65536, 2) == ((0, 32768), (32768, 65536))
     assert key_pass_ranges(131072, 3) == ((0, 43691), (43691, 87382), (87382, 131072))
     assert key_pass_ranges(10, 1) == ((0, 10),)
@@ -210,6 +240,10 @@ def test_key_pass_policy_rule():
         )
     with pytest.raises(ValueError, match="positive"):
         KeyPassPolicy.from_record({"key_pass_policy": dict(_POLICY, key_bytes=0)})
+    with pytest.raises(ValueError, match="max_passes"):
+        KeyPassPolicy.from_record(
+            {"key_pass_policy": {k: v for k, v in _POLICY.items() if k != "max_passes"}}
+        )
 
 
 def test_plan_key_passes_override_and_policy():
@@ -235,6 +269,132 @@ def test_plan_key_passes_override_and_policy():
             plan_key_passes(record, _ALL_STAGES, 4096, 4096, 2048, key_passes=bad)
     with pytest.raises(NotImplementedError, match="bwd_compact"):
         plan_key_passes(record, _SINGLE_PASS_STAGES, 4096, 65536, 2048, key_passes=2)
+
+
+def test_plan_dkv_direct_rule_and_env(monkeypatch):
+    """Direct accumulation needs dkv_acc, the natural stages and the record's size rule (or the forced mode)."""
+    record = {"dkv_direct": dict(_DIRECT_POLICY), "key_pass_policy": dict(_POLICY)}
+    monkeypatch.delenv(cake_backend.DKV_DIRECT_ENV, raising=False)
+    assert cake_backend.record_direct_stages(record, _DIRECT_STAGES)
+    assert not cake_backend.record_direct_stages(record, _ALL_STAGES)
+    assert cake_backend.plan_dkv_direct(
+        record, _DIRECT_STAGES, 1000, 4000, accumulate=True
+    )
+    assert not cake_backend.plan_dkv_direct(
+        record, _DIRECT_STAGES, 1000, 3999, accumulate=True
+    )
+    assert not cake_backend.plan_dkv_direct(
+        record, _DIRECT_STAGES, 1000, 4000, accumulate=False
+    )
+    assert not cake_backend.plan_dkv_direct(
+        record, _ALL_STAGES, 1000, 4000, accumulate=True
+    )
+    monkeypatch.setenv(cake_backend.DKV_DIRECT_ENV, "0")
+    assert cake_backend.dkv_direct_mode() == "0"
+    assert not cake_backend.plan_dkv_direct(
+        record, _DIRECT_STAGES, 1000, 4000, accumulate=True
+    )
+    monkeypatch.setenv(cake_backend.DKV_DIRECT_ENV, "1")
+    assert cake_backend.plan_dkv_direct(
+        record, _DIRECT_STAGES, 1000, 1, accumulate=True
+    )
+    assert not cake_backend.plan_dkv_direct(
+        record, _ALL_STAGES, 1000, 1, accumulate=True
+    )
+    monkeypatch.setenv(cake_backend.DKV_DIRECT_ENV, "maybe")
+    with pytest.raises(ValueError, match="FLASHINFER_CAKE_DSA_DKV_DIRECT"):
+        cake_backend.plan_dkv_direct(
+            record, _DIRECT_STAGES, 1000, 4000, accumulate=True
+        )
+    monkeypatch.delenv(cake_backend.DKV_DIRECT_ENV)
+    # malformed records fail closed
+    with pytest.raises(ValueError, match="bwd_main stage"):
+        cake_backend.record_direct_stages(
+            record, ("fwd", "bwd_delta", "bwd_main_natural")
+        )
+    with pytest.raises(ValueError, match="accompany"):
+        cake_backend.record_direct_stages(
+            record,
+            (
+                "fwd",
+                "bwd_delta",
+                "bwd_main",
+                "bwd_main_natural",
+                "bwd_compact",
+                "bwd_main_pass",
+            ),
+        )
+    with pytest.raises(ValueError, match="dkv_direct policy"):
+        cake_backend.record_direct_stages(
+            {}, ("fwd", "bwd_delta", "bwd_main", "bwd_main_natural")
+        )
+    with pytest.raises(ValueError, match="without bwd_main_natural"):
+        cake_backend.record_direct_stages(
+            record, _ALL_STAGES + ("bwd_main_pass_natural",)
+        )
+    with pytest.raises(ValueError, match="min_keys_per_query"):
+        cake_backend.DkvDirectPolicy.from_record({"dkv_direct": {}})
+    with pytest.raises(ValueError, match="positive"):
+        cake_backend.DkvDirectPolicy.from_record(
+            {"dkv_direct": {"min_keys_per_query": 0}}
+        )
+    assert cake_backend.DkvDirectPolicy.from_record({}) is None
+
+
+def test_main_accumulator_constants_and_direct_bound_values():
+    """A direct plan binds the caller's packed rows to the main stage's accumulator operands (``dkv_f32`` /
+    ``dkr_f32`` addressed through ``dkv_stride`` / ``dkr_stride`` / ``dkr_col0`` / ``dkv_dst_map`` / ``dkv_has_map``)
+    and no cast operands; a plan that does not accumulate directly carries the private-accumulator geometry (inert
+    on the permuted program)."""
+    assert cake_backend._main_accumulator_constants(True, 704, True) == dict(
+        dkv_stride=704, dkr_stride=704, dkr_col0=D_LATENT, dkv_has_map=1
+    )
+    assert cake_backend._main_accumulator_constants(True, 576, False) == dict(
+        dkv_stride=576, dkr_stride=576, dkr_col0=D_LATENT, dkv_has_map=0
+    )
+    assert cake_backend._main_accumulator_constants(False, 704, True) == dict(
+        dkv_stride=D_LATENT, dkr_stride=D_ROPE, dkr_col0=0, dkv_has_map=0
+    )
+    packed = torch.zeros(5, 704)
+    dst_map = torch.zeros(3, dtype=torch.int32)
+    t = dict(
+        indices=torch.zeros(3, 4, dtype=torch.int32),
+        topk_length=torch.full((3,), 4, dtype=torch.int32),
+        delta=torch.zeros(3, NUM_HEADS),
+        dkv_latent=torch.empty(0, dtype=torch.bfloat16),
+        dk_rope=torch.empty(0, dtype=torch.bfloat16),
+        dkv_acc=packed,
+        dkv_dst_map=dst_map,
+    )
+    plan = SimpleNamespace(
+        constants=cake_backend._main_accumulator_constants(True, 704, True),
+        backward=True,
+        accumulate_dkv=True,
+        dkv_direct=True,
+        key_passes=1,
+    )
+    values = cake_backend._bound_values(plan, t)
+    assert values["dkv_f32"] is packed and values["dkr_f32"] is packed
+    assert (
+        values["dkv_stride"],
+        values["dkr_stride"],
+        values["dkr_col0"],
+        values["dkv_has_map"],
+    ) == (
+        704,
+        704,
+        D_LATENT,
+        1,
+    )
+    assert values["dkv_dst_map"] is dst_map
+    assert (
+        "dst_packed" not in values and "src_latent" not in values
+    )  # no cast on a direct binding
+    # the same plan without a map: the map placeholder is the int32 topk_length vector
+    del t["dkv_dst_map"]
+    plan.constants = cake_backend._main_accumulator_constants(True, 704, False)
+    values = cake_backend._bound_values(plan, t)
+    assert values["dkv_dst_map"] is t["topk_length"] and values["dkv_has_map"] == 0
 
 
 def test_offset_gather_kv_indices_matches_loop():
@@ -293,6 +453,31 @@ def test_registry_record_is_well_formed():
         assert policy is not None
         assert policy.token_chunk(2048) % policy.token_chunk_multiple == 0
         assert policy.passes(1, 1, 2048) == 1
+    if cake_backend.record_direct_stages(record, stages):
+        # the natural-layout variants are the same kernel ABI as the regular main stage, with the size rule
+        direct = cake_backend.DkvDirectPolicy.from_record(record)
+        assert direct is not None
+        assert direct.wants(1, direct.min_keys_per_query)
+        assert not direct.wants(1, direct.min_keys_per_query - 1)
+        assert (
+            cake_launch.STAGE_ARGS["bwd_main_natural"]
+            == cake_launch.STAGE_ARGS["bwd_main"]
+        )
+        assert cake_launch.GRID["bwd_main_natural"](
+            130, 4096, 2048
+        ) == cake_launch.GRID["bwd_main"](130, 4096, 2048)
+        if "bwd_main_pass_natural" in stages:
+            assert (
+                cake_launch.STAGE_ARGS["bwd_main_pass_natural"]
+                == cake_launch.STAGE_ARGS["bwd_main_pass"]
+            )
+        assert {
+            "dkv_stride",
+            "dkr_stride",
+            "dkr_col0",
+            "dkv_dst_map",
+            "dkv_has_map",
+        } <= set(cake_launch.STAGE_ARGS["bwd_main_natural"])
     for stage in stages:
         physical = record[stage]
         assert len(physical["sources"]) == 2
@@ -1270,6 +1455,69 @@ def test_public_entry_derives_row_lengths_and_matches_full_rows():
     _check_backward(grads_b, ref)
 
 
+def test_forward_derives_row_lengths_in_kernel_and_binding_key_covers_it():
+    """``forward(..., topk_length=buf, derive_topk_length=True)`` fills ``buf`` with the row lengths (bitwise
+    :func:`derive_topk_length`) and returns bitwise the outputs of the explicit-length call; a call without lengths
+    returns the same outputs (the kernel derives into the binding's own vector); the prepared runner derives as
+    well; the binding key separates the three forms, and a derived call without a tensor to fill is rejected."""
+    _require_program()
+    inp = make_inputs([200, 96, 300], [200, 96, 4096], seed=SEED + 753, topk=256)
+    S, T = int(inp.kv_latent.shape[0]), int(inp.q_latent.shape[0])
+    expected = derive_topk_length(inp.idx_global, S)
+    assert int((expected < 256).sum()) > 0 and int(expected.max()) <= 256
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
+    buf = torch.full((T,), -1, dtype=torch.int32, device=inp.q_latent.device)
+    cache = cake_backend.BINDING_CACHE
+    cache.clear()
+    out_d, lse_d, o_lo_d = cake_backend.forward(
+        *args, topk_length=buf, derive_topk_length=True
+    )
+    out_e, lse_e, o_lo_e = cake_backend.forward(*args, topk_length=expected)
+    out_n, lse_n, o_lo_n = cake_backend.forward(*args)
+    torch.cuda.synchronize()
+    assert torch.equal(buf, expected)
+    assert (
+        torch.equal(out_d, out_e)
+        and torch.equal(lse_d, lse_e)
+        and torch.equal(o_lo_d, o_lo_e)
+    )
+    assert (
+        torch.equal(out_n, out_e)
+        and torch.equal(lse_n, lse_e)
+        and torch.equal(o_lo_n, o_lo_e)
+    )
+    assert len(cache) == 3
+    buf.fill_(
+        -1
+    )  # the remembered derived binding rewrites the caller's vector on every call
+    out_d2, _, _ = cake_backend.forward(*args, topk_length=buf, derive_topk_length=True)
+    torch.cuda.synchronize()
+    assert torch.equal(buf, expected) and torch.equal(out_d2, out_e)
+    assert len(cache) == 3
+    buf.fill_(-1)
+    runner = prepare_dsa_train(
+        *args, topk_length=buf, derive_topk_length=True, backward=False
+    )
+    r_out, r_lse, _ = runner.forward()
+    torch.cuda.synchronize()
+    assert (
+        torch.equal(buf, expected)
+        and torch.equal(r_out, out_e)
+        and torch.equal(r_lse, lse_e)
+    )
+    scale = default_softmax_scale()
+    assert forward_binding_key(*args, buf, scale, True) != forward_binding_key(
+        *args, buf, scale, False
+    )
+    assert forward_binding_key(*args, buf, scale) == forward_binding_key(
+        *args, buf, scale, False
+    )
+    with pytest.raises(ValueError, match="derive_topk_length"):
+        cake_backend.forward(*args, derive_topk_length=True)
+    with pytest.raises(ValueError, match="derive_topk_length"):
+        prepare_dsa_train(*args, derive_topk_length=True, backward=False)
+
+
 def test_varlen_multi_segment_row_plans_single_pass():
     """A packed two-segment key row whose total length triggers the whole-row formula (2 x 23,000 keys >
     45,511) plans the single-pass stage through the varlen entry (``num_segments = len(cu_seqlens_k) - 1``:
@@ -2221,10 +2469,17 @@ def test_bound_values_serve_the_accumulating_cast_operands():
     dst_map = torch.arange(S, dtype=torch.int32)
     constants = dict(dst_row_stride=704, has_dst_map=1, accumulate=1)
     plan = SimpleNamespace(
-        constants=constants, backward=True, accumulate_dkv=True, key_passes=1
+        constants=constants,
+        backward=True,
+        accumulate_dkv=True,
+        dkv_direct=False,
+        key_passes=1,
     )
     values = cake_backend._bound_values(plan, dict(t, dkv_acc=acc, dkv_dst_map=dst_map))
     assert values["dst_packed"] is acc and values["dst_map"] is dst_map
+    assert (
+        values["dkv_dst_map"] is dst_map
+    )  # the main stage's map operand (inert on the permuted program)
     assert (values["dst_row_stride"], values["has_dst_map"], values["accumulate"]) == (
         704,
         1,
@@ -2244,6 +2499,7 @@ def test_bound_values_serve_the_accumulating_cast_operands():
         constants=dict(dst_row_stride=0, has_dst_map=0, accumulate=0),
         backward=True,
         accumulate_dkv=False,
+        dkv_direct=False,
         key_passes=1,
     )
     values = cake_backend._bound_values(plan, t)
@@ -2326,6 +2582,95 @@ def test_backward_dkv_acc_identity_accumulates_in_place():
         acc[:, :D_QK], pre[:, :D_QK] + 2 * nat, rtol=1e-4, atol=1e-4
     )
     assert torch.equal(acc[:, D_QK:], pre[:, D_QK:])
+
+
+def _require_direct_program():
+    """The registered program with the natural-layout (direct accumulation) main stage (skip otherwise)."""
+    _require_program(backward=True)
+    _, record = record_for(torch.device("cuda"))
+    stages = cake_jit.registered_stages()
+    if not cake_backend.record_direct_stages(record, stages):
+        pytest.skip(
+            "the registered program has no natural-layout (direct accumulation) main stage"
+        )
+    return record, stages
+
+
+def test_backward_dkv_acc_direct_and_cast_paths_agree(monkeypatch):
+    """With dkv_acc and S >= 4 T the natural-layout main stage adds into the caller's rows itself (no accumulators, no
+    cast); forced through the cast path (FLASHINFER_CAKE_DSA_DKV_DIRECT=0) the same rows receive the same gradients
+    (another FP32 summation order), dq is bitwise the same and untouched rows / columns stay untouched -- through a
+    duplicating destination map into a [S_dst, 704] buffer, on the prepared runner and the eager entry."""
+    record, stages = _require_direct_program()
+    inp = make_inputs(
+        [256], [2048], seed=SEED + 24, topk=128
+    )  # S / T = 8: the size rule picks direct
+    args, dq_l, dq_r, nat = _forward_and_natural_dkv(inp)
+    S, S_dst = inp.total_k, 400
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    dst_map = torch.randint(
+        0, S_dst, (S,), device="cuda", generator=gen, dtype=torch.int32
+    )
+    pre = torch.randn(S_dst + 8, 704, device="cuda", generator=gen)
+    expect = pre.clone()
+    expect[:S_dst, :D_QK].index_add_(0, dst_map.long(), nat)
+    results = {}
+    for mode in ("1", "0", "auto"):
+        monkeypatch.setenv(cake_backend.DKV_DIRECT_ENV, mode)
+        acc = pre.clone()
+        runner = prepare_dsa_train(
+            *args[:5],
+            dout=args[8],
+            backward=True,
+            dkv_acc=acc[:S_dst],
+            dkv_dst_map=dst_map,
+        )
+        assert runner.dkv_direct == (mode != "0")
+        if runner.dkv_direct:
+            assert (
+                "bwd_main_natural" in runner.launches
+                and "bwd_cast" not in runner.launches
+            )
+            assert (
+                "dkv_latent_acc" not in runner.tensors
+                and "dkv_latent_acc" not in runner.layout
+            )
+        else:
+            assert "bwd_main" in runner.launches and "bwd_cast" in runner.launches
+        runner.step()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            acc[:S_dst, :D_QK], expect[:S_dst, :D_QK], rtol=1e-4, atol=1e-4
+        )
+        assert torch.equal(acc[:, D_QK:], pre[:, D_QK:]) and torch.equal(
+            acc[S_dst:], pre[S_dst:]
+        )
+        acc = pre.clone()
+        aq_l, aq_r, none_l, none_r = cake_backend.backward(
+            *args, dkv_acc=acc[:S_dst], dkv_dst_map=dst_map
+        )
+        torch.cuda.synchronize()
+        assert none_l is None and none_r is None
+        assert torch.equal(aq_l, dq_l) and torch.equal(aq_r, dq_r)
+        torch.testing.assert_close(
+            acc[:S_dst, :D_QK], expect[:S_dst, :D_QK], rtol=1e-4, atol=1e-4
+        )
+        assert torch.equal(acc[:, D_QK:], pre[:, D_QK:]) and torch.equal(
+            acc[S_dst:], pre[S_dst:]
+        )
+        results[mode] = acc[:S_dst, :D_QK].clone()
+    torch.testing.assert_close(results["1"], results["0"], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(results["auto"], results["1"], rtol=1e-4, atol=1e-4)
+    monkeypatch.delenv(cake_backend.DKV_DIRECT_ENV)
+    # the workspace of a direct binding has no FP32 accumulators
+    T, device = inp.total_q, torch.device("cuda")
+    plain = dsa_train_workspace_size(T, S, 128, device)
+    assert (
+        plain - dsa_train_workspace_size(T, S, 128, device, dkv_acc=True)
+        >= S * D_QK * 4
+    )
+    # S < 4 T keeps the cast path by the rule
+    assert not cake_backend.plan_dkv_direct(record, stages, 1000, 3999, accumulate=True)
 
 
 def test_bwd_cast_accumulate_without_map_is_one_fp32_add_bitwise():

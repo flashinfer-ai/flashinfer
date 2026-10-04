@@ -31,8 +31,10 @@ from ...jit.core import (
 # Explicit target-owned registration of the generated training program: one
 # record (``PROGRAM``) shared by every architecture it compiles for
 # (``arches``), the kernel ``stages`` it registers in launch order, the host
-# policy that selects the key-range-pass form of the backward
-# (``key_pass_policy``, see ``cake_backend.KeyPassPolicy``) and one physical
+# policies that select the key-range-pass form of the backward
+# (``key_pass_policy``, see ``cake_backend.KeyPassPolicy``) and the direct
+# accumulation into the caller's packed rows through the natural-layout main
+# stages (``dkv_direct``, see ``cake_backend.DkvDirectPolicy``), and one physical
 # entry per stage (translation units, compile flags, FFI entry, launch block /
 # cluster and closure identity).  The positional argument order of every stage
 # lives in the generated ``cake_launch`` module.  Populated verbatim by the
@@ -44,8 +46,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "fwd",
             "bwd_delta",
             "bwd_main",
+            "bwd_main_natural",
             "bwd_compact",
             "bwd_main_pass",
+            "bwd_main_pass_natural",
             "bwd_cast",
         ],
         "key_pass_policy": {
@@ -53,16 +57,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "key_bytes": 2304,
             "workspace_budget_bytes": 671088640,
             "token_chunk_multiple": 128,
+            "max_passes": 4,
         },
+        "dkv_direct": {"min_keys_per_query": 4},
         "fwd": {
-            "module": "cake_dsa_h64_train_877b7797bb6b1bd6a37e",
+            "module": "cake_dsa_h64_train_561ca97baafaba4074ad",
             "sources": [
-                "cake_dsa_h64_train/cake_dsa_h64_train_877b7797bb6b1bd6a37e_kernel.cu",
-                "cake_dsa_h64_train/cake_dsa_h64_train_877b7797bb6b1bd6a37e_binding.cu",
+                "cake_dsa_h64_train/cake_dsa_h64_train_561ca97baafaba4074ad_kernel.cu",
+                "cake_dsa_h64_train/cake_dsa_h64_train_561ca97baafaba4074ad_binding.cu",
             ],
             "compile_flags": ["--use_fast_math"],
             "ffi_entry": "run",
-            "closure_sha256": "e22741ea0b74dd6de31912ee31dddaa56a05588af3925957d5802093c0348370",
+            "closure_sha256": "cf5e3ed1375df07d06c74a849d5629351bf56728065ea6666923c1f426d4f77d",
             "launch": {"block": [384, 1, 1], "cluster": [1, 1, 1]},
         },
         "bwd_delta": {
@@ -77,14 +83,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
         },
         "bwd_main": {
-            "module": "cake_dsa_h64_train_39efe002ad7020fd9d33",
+            "module": "cake_dsa_h64_train_520a6d422b2638b1ebb0",
             "sources": [
-                "cake_dsa_h64_train/cake_dsa_h64_train_39efe002ad7020fd9d33_kernel.cu",
-                "cake_dsa_h64_train/cake_dsa_h64_train_39efe002ad7020fd9d33_binding.cu",
+                "cake_dsa_h64_train/cake_dsa_h64_train_520a6d422b2638b1ebb0_kernel.cu",
+                "cake_dsa_h64_train/cake_dsa_h64_train_520a6d422b2638b1ebb0_binding.cu",
             ],
             "compile_flags": ["--use_fast_math"],
             "ffi_entry": "run",
-            "closure_sha256": "b0c30eb8d084022f61a179f5be6943221ae20c535502f5bf29064cef8a31124f",
+            "closure_sha256": "2cfcf5e360bda9fb000f87ef4532442772f3f8317a037016cedaf3c62be3e5d1",
+            "launch": {"block": [640, 1, 1], "cluster": [1, 1, 1]},
+        },
+        "bwd_main_natural": {
+            "module": "cake_dsa_h64_train_984ca578391d90eb4245",
+            "sources": [
+                "cake_dsa_h64_train/cake_dsa_h64_train_984ca578391d90eb4245_kernel.cu",
+                "cake_dsa_h64_train/cake_dsa_h64_train_984ca578391d90eb4245_binding.cu",
+            ],
+            "compile_flags": ["--use_fast_math"],
+            "ffi_entry": "run",
+            "closure_sha256": "2e8b920ec356f294be2e5776f42da801d6a80b4bc967a3fa5afb300b993b04a6",
             "launch": {"block": [640, 1, 1], "cluster": [1, 1, 1]},
         },
         "bwd_compact": {
@@ -99,14 +116,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "launch": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
         },
         "bwd_main_pass": {
-            "module": "cake_dsa_h64_train_1ef045c316e8c838c26f",
+            "module": "cake_dsa_h64_train_fc6f6977a76b8212cb2c",
             "sources": [
-                "cake_dsa_h64_train/cake_dsa_h64_train_1ef045c316e8c838c26f_kernel.cu",
-                "cake_dsa_h64_train/cake_dsa_h64_train_1ef045c316e8c838c26f_binding.cu",
+                "cake_dsa_h64_train/cake_dsa_h64_train_fc6f6977a76b8212cb2c_kernel.cu",
+                "cake_dsa_h64_train/cake_dsa_h64_train_fc6f6977a76b8212cb2c_binding.cu",
             ],
             "compile_flags": ["--use_fast_math"],
             "ffi_entry": "run",
-            "closure_sha256": "d55bb7aa4b309e42d6a5fed6fdbda6620642d5ec6d6efebc117cab1435148f7d",
+            "closure_sha256": "b675a268c419489514379e474899f15d22e3a5cabe0ba41cab09e2d9859d8337",
+            "launch": {"block": [640, 1, 1], "cluster": [1, 1, 1]},
+        },
+        "bwd_main_pass_natural": {
+            "module": "cake_dsa_h64_train_b9eb1c4fa0bf2a7f815c",
+            "sources": [
+                "cake_dsa_h64_train/cake_dsa_h64_train_b9eb1c4fa0bf2a7f815c_kernel.cu",
+                "cake_dsa_h64_train/cake_dsa_h64_train_b9eb1c4fa0bf2a7f815c_binding.cu",
+            ],
+            "compile_flags": ["--use_fast_math"],
+            "ffi_entry": "run",
+            "closure_sha256": "0d1d7edfc868d8d0e55ea59d723de4d885719927c9e3a9fb201445f4ac22a10d",
             "launch": {"block": [640, 1, 1], "cluster": [1, 1, 1]},
         },
         "bwd_cast": {
@@ -117,7 +145,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ],
             "compile_flags": ["--use_fast_math"],
             "ffi_entry": "run",
-            "closure_sha256": "1738785f27ee923c0002cd48d8a375374d990ee5c48f911eacf15d01efc6bf9a",
+            "closure_sha256": "2f7290d4ccabcf8d3e733ffd70d00d398d85dd28586b3cdce56483522efceae1",
             "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
         },
     },
@@ -128,8 +156,10 @@ STAGES = (
     "fwd",
     "bwd_delta",
     "bwd_main",
+    "bwd_main_natural",
     "bwd_compact",
     "bwd_main_pass",
+    "bwd_main_pass_natural",
     "bwd_cast",
 )
 FORWARD_STAGES = ("fwd",)

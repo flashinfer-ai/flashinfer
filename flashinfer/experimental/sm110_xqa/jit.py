@@ -1,286 +1,656 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Native JIT loader for frozen SM110a attention sources."""
+"""JIT loader for the Cake-generated SM110 (Thor) XQA attention programs.
+
+``MODULES`` is the physical record of every generated program (its two translation units, nvcc flags, launch
+geometry, argument plan and the GQA ratios its launcher dispatches on); ``ROUTES`` maps
+``<route>__<cluster form>`` to the program that serves it. The GQA ratio is a runtime argument of every program.
+``FROZEN`` records the routes without a generating program (the ``tcgen05`` D512 tree routes and D128 decode): their
+frozen kernel/binding pairs, compiler flags, content hash and the launch facts the host needs.
+All three tables are written by the Cake export; edit the generator, not this file.
+"""
 
 from __future__ import annotations
 
 import functools
-import hashlib
-import json
 from pathlib import Path
 from typing import Any
 
 from ...jit import env as jit_env
 from ...jit.core import JitSpec, gen_jit_spec, sm110a_nvcc_flags
 
-SCHEMA = "flashinfer.sm110_xqa.v1"
-DECODE_SINGLE_PARTITION_ROUTE = "decode_fp16_contiguous_single_partition"
-TREE_KERNELS = ("tcgen05", "register_mma", "register_mma_split", "tmem", "pair")
-MMA_ROUTE_SUFFIX = "_mma"
-SPLIT_ROUTE_SUFFIX = "_mma_split"
-TMEM_ROUTE_SUFFIX = "_tmem"
-PAIR_ROUTE_SUFFIX = "_pair"
-TMEM_CLUSTER = [2, 2, 1]
-TMEM_FALLBACK_CLUSTER = [2, 1, 1]
-PAIR_CLUSTER = [4, 1, 1]
-# One frozen tmem / pair trace per GQA ratio (the 128-row Q tile is ratio heads x 128 / ratio tokens).
-TREE_GQA_RATIOS = (2, 4, 8, 16)
-ROUTE_ENTRIES = {
-    "tree_fp16_contiguous": "run_tree",
-    "tree_fp16_paged": "run_tree",
-    "tree_fp8_contiguous": "run_tree",
-    "tree_fp8_paged": "run_tree",
-    "tree_fp16_contiguous_mma": "run_tree",
-    "tree_fp16_paged_mma": "run_tree",
-    "tree_fp8_contiguous_mma": "run_tree",
-    "tree_fp8_paged_mma": "run_tree",
-    "tree_fp16_paged_mma_split": "run_tree",
-    "tree_fp16_contiguous_tmem": "run_tree",
-    "tree_fp16_paged_tmem": "run_tree",
-    "tree_fp8_contiguous_tmem": "run_tree",
-    "tree_fp8_paged_tmem": "run_tree",
-    "tree_fp8_contiguous_pair": "run_tree",
-    "tree_fp8_paged_pair": "run_tree",
-    "decode_fp16_contiguous": "run_decode",
-    "decode_merge": "run_decode_merge",
+MODULES: dict[str, dict[str, Any]] = {
+    "cake_sm110_xqa_3cfa3fff904122235a20": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_3cfa3fff904122235a20_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_3cfa3fff904122235a20_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "q"],
+            ["buffer", "mask"],
+            ["nullable_raw_pointer", "attention_sinks"],
+            ["pod_field", "kv_cache_list.pool"],
+            ["pod_field", "kv_cache_list.page_list"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.max_pages"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["nullable_raw_pointer", "semaphores"],
+            ["nullable_raw_pointer", "scratch"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "46ed77bffff3f7aeb5c4fc7a785fe366adb3dc22929d96d6c06643d7eb56c4a5",
+        "cluster": [1, 1, 1],
+        "block": [256, 1, 2],
+        "dynamic_smem_bytes": 199936,
+        "ratios": None,
+    },
+    "cake_sm110_xqa_54565e936e3282810172": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_54565e936e3282810172_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_54565e936e3282810172_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.pool"],
+            ["pod_field", "kv_cache_list.page_list"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.max_pages"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "4fd37754a38cbc845ca051f7c496d69174f730dfa8158ddd04b4bf2a1a37e2a3",
+        "cluster": [2, 1, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+    "cake_sm110_xqa_592d4b174580cfa83352": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_592d4b174580cfa83352_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_592d4b174580cfa83352_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "q"],
+            ["buffer", "mask"],
+            ["nullable_raw_pointer", "attention_sinks"],
+            ["pod_field", "kv_cache_list.pool"],
+            ["pod_field", "kv_cache_list.page_list"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.max_pages"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["nullable_raw_pointer", "semaphores"],
+            ["nullable_raw_pointer", "scratch"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "57cd5a35465ad60a39e332add1578cd5b66c92b136b180ff0b90a4875c39de5c",
+        "cluster": [1, 1, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 221312,
+        "ratios": None,
+    },
+    "cake_sm110_xqa_6b0044818ad0f283933b": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_6b0044818ad0f283933b_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_6b0044818ad0f283933b_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.pool"],
+            ["pod_field", "kv_cache_list.page_list"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.max_pages"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "52e5781b4df8b2c64480c5b7be071b46a449a4a814bcf60e3a6c419bd5798cfd",
+        "cluster": [2, 2, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+    "cake_sm110_xqa_6ffac8ce51ada6796619": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_6ffac8ce51ada6796619_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_6ffac8ce51ada6796619_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.data"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.capacity"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "dc195af5d8f8150fcfcba7e96a20d165225f251a6fe7c4b8622d2bf1732c9b3a",
+        "cluster": [2, 1, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+    "cake_sm110_xqa_740ec4c562420f85bf0d": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_740ec4c562420f85bf0d_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_740ec4c562420f85bf0d_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "q"],
+            ["buffer", "mask"],
+            ["nullable_raw_pointer", "attention_sinks"],
+            ["pod_field", "kv_cache_list.pool"],
+            ["pod_field", "kv_cache_list.page_list"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.max_pages"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["nullable_raw_pointer", "semaphores"],
+            ["nullable_raw_pointer", "scratch"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "d36cbf298e8c00aef3496b92a50f91a5d2ddcc5389ccbd1ef937db928ba98cb2",
+        "cluster": [1, 1, 1],
+        "block": [256, 1, 2],
+        "dynamic_smem_bytes": 167168,
+        "ratios": None,
+    },
+    "cake_sm110_xqa_8dba6cead2e911357936": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_8dba6cead2e911357936_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_8dba6cead2e911357936_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.data"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.capacity"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "af737329c422b2d2cf48f94eb5d1c77b3689140e2eb6e02da2213734b3c7565b",
+        "cluster": [2, 1, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+    "cake_sm110_xqa_ab666bc23ce8517d8ebf": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_ab666bc23ce8517d8ebf_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_ab666bc23ce8517d8ebf_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.data"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.capacity"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "c795e947b95a45d79459db80fdd37e9340c500cce476a1900bb82057ec563865",
+        "cluster": [2, 2, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+    "cake_sm110_xqa_ab88990066c20a0e5c48": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_ab88990066c20a0e5c48_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_ab88990066c20a0e5c48_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "q"],
+            ["buffer", "mask"],
+            ["nullable_raw_pointer", "attention_sinks"],
+            ["pod_field", "kv_cache_list.data"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.capacity"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["nullable_raw_pointer", "semaphores"],
+            ["nullable_raw_pointer", "scratch"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "acd55a1456362f27666edc71d2b91051ea3728b9ce150c8badca18796c0660e7",
+        "cluster": [1, 1, 1],
+        "block": [256, 1, 2],
+        "dynamic_smem_bytes": 167168,
+        "ratios": None,
+    },
+    "cake_sm110_xqa_ae6b57d0dc4b00124be2": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_ae6b57d0dc4b00124be2_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_ae6b57d0dc4b00124be2_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.pool"],
+            ["pod_field", "kv_cache_list.page_list"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.max_pages"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "9faf250b076f83598d4afaf16e7e22171e66e18dedebf33fa72bc79594d75a81",
+        "cluster": [2, 1, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+    "cake_sm110_xqa_bb53a09a352e5ce923b2": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_bb53a09a352e5ce923b2_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_bb53a09a352e5ce923b2_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.pool"],
+            ["pod_field", "kv_cache_list.page_list"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.max_pages"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "20e54329867e29141fc57d4ac49620ab36fa5bf455c4fa838a66aa333fbc982c",
+        "cluster": [2, 2, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+    "cake_sm110_xqa_d1b82721b9e95e271209": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_d1b82721b9e95e271209_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_d1b82721b9e95e271209_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "q"],
+            ["buffer", "mask"],
+            ["nullable_raw_pointer", "attention_sinks"],
+            ["pod_field", "kv_cache_list.data"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.capacity"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["nullable_raw_pointer", "semaphores"],
+            ["nullable_raw_pointer", "scratch"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "ea135409213f4548e10e256241208135ed8b562487c50e76f5a9e9a4d5a929df",
+        "cluster": [1, 1, 1],
+        "block": [256, 1, 2],
+        "dynamic_smem_bytes": 199936,
+        "ratios": None,
+    },
+    "cake_sm110_xqa_d71430c33daffe18d791": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_d71430c33daffe18d791_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_d71430c33daffe18d791_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["tma_buffer", "KVV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.pool"],
+            ["pod_field", "kv_cache_list.page_list"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.max_pages"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "32a31db71718fb474f1e41c20d99d98f7007773b77099c1f1192b7722d98bea7",
+        "cluster": [4, 1, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+    "cake_sm110_xqa_e8ff1ff761836b06a6f1": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_e8ff1ff761836b06a6f1_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_e8ff1ff761836b06a6f1_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["tma_buffer", "KVV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.data"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.capacity"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "8bd8363898468b1558d6688bd6da89a0b6c1b1153ca2b46b4b816eb7cd74f45d",
+        "cluster": [4, 1, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+    "cake_sm110_xqa_f7026d2473a82bb2e3c0": {
+        "role": "kernel",
+        "sources": [
+            "csrc/sm110_xqa/cake_sm110_xqa_f7026d2473a82bb2e3c0_kernel.cu",
+            "csrc/sm110_xqa/cake_sm110_xqa_f7026d2473a82bb2e3c0_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "Q"],
+            ["tma_buffer", "KV"],
+            ["parameter", "q_seq_len"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "head_group_size"],
+            ["nullable_raw_pointer", "q_cu_seq_lens"],
+            ["parameter", "attention_scale"],
+            ["buffer", "output"],
+            ["buffer", "mask"],
+            ["pod_field", "kv_cache_list.data"],
+            ["pod_field", "kv_cache_list.sequence_lengths"],
+            ["pod_field", "kv_cache_list.capacity"],
+            ["parameter", "batch_size"],
+            ["parameter", "k_cache_scale"],
+            ["parameter", "v_cache_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": "21b4c42f472532a1441778bfe6f41c6b3839bff4eb38a7cd1a540013bb66db29",
+        "cluster": [2, 2, 1],
+        "block": [512, 1, 1],
+        "dynamic_smem_bytes": 230400,
+        "ratios": [2, 4, 8, 16],
+    },
+}
+
+FROZEN: dict[str, dict[str, Any]] = {
+    "tree_fp16_contiguous": {
+        "role": "frozen",
+        "sources": [
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_tree_fp16_contiguous_kernel.cu",
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_tree_fp16_contiguous_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "sources_sha256": "24a9d3848e6c786eda3e6f4bfb4cc81d4ae93fdd130eb1c438ff61900bad0272",
+        "ffi_entry": "run_tree",
+        "tile_rows": 64,
+        "output_tile_columns": 256,
+    },
+    "tree_fp16_paged": {
+        "role": "frozen",
+        "sources": [
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_tree_fp16_paged_kernel.cu",
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_tree_fp16_paged_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "sources_sha256": "b285a7e9247002646df3345f0bab3f5f8c4a4292a93fd49dd615adbb0619eb78",
+        "ffi_entry": "run_tree",
+        "tile_rows": 64,
+        "output_tile_columns": 256,
+    },
+    "tree_fp8_contiguous": {
+        "role": "frozen",
+        "sources": [
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_tree_fp8_contiguous_kernel.cu",
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_tree_fp8_contiguous_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "sources_sha256": "367090396cfdeaf4325e6089fc368d95432213a92aea3f76bb1908a75997c03c",
+        "ffi_entry": "run_tree",
+        "tile_rows": 64,
+        "output_tile_columns": 256,
+    },
+    "tree_fp8_paged": {
+        "role": "frozen",
+        "sources": [
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_tree_fp8_paged_kernel.cu",
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_tree_fp8_paged_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "sources_sha256": "400f11561dd01374f7f4a011ae6cf46b0dba866f5eb39fee8723b3c64c14e0e8",
+        "ffi_entry": "run_tree",
+        "tile_rows": 64,
+        "output_tile_columns": 256,
+    },
+    "decode_fp16_contiguous": {
+        "role": "frozen",
+        "sources": [
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_decode_fp16_contiguous_kernel.cu",
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_decode_fp16_contiguous_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "sources_sha256": "7b7137cb8ce2504c71c5ade404c656b3295c1e0ce35fbc3a9da7c95a31f56e2e",
+        "ffi_entry": "run_decode",
+        "partition_tokens": 256,
+        "fused_merge": True,
+        "merge_stats_cache": True,
+        "single_partition_route": "decode_fp16_contiguous_single_partition",
+    },
+    "decode_fp16_contiguous_single_partition": {
+        "role": "frozen",
+        "sources": [
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_decode_fp16_contiguous_single_partition_kernel.cu",
+            "csrc/sm110_xqa/sm_110a/sm110_xqa_decode_fp16_contiguous_single_partition_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "sources_sha256": "c34d7097ef626557a2b0eb5eafa9eeb72c52246442b2fc17ca785d1643f26d07",
+        "ffi_entry": "run_decode",
+        "partition_tokens": 256,
+        "fused_merge": True,
+        "merge_stats_cache": False,
+    },
+}
+
+ROUTES: dict[str, str] = {
+    "tree_fp16_contiguous_mma__any": "cake_sm110_xqa_d1b82721b9e95e271209",
+    "tree_fp16_contiguous_tmem__even": "cake_sm110_xqa_ab666bc23ce8517d8ebf",
+    "tree_fp16_contiguous_tmem__odd": "cake_sm110_xqa_8dba6cead2e911357936",
+    "tree_fp16_paged_mma__any": "cake_sm110_xqa_3cfa3fff904122235a20",
+    "tree_fp16_paged_mma_split__any": "cake_sm110_xqa_592d4b174580cfa83352",
+    "tree_fp16_paged_tmem__even": "cake_sm110_xqa_bb53a09a352e5ce923b2",
+    "tree_fp16_paged_tmem__odd": "cake_sm110_xqa_54565e936e3282810172",
+    "tree_fp8_contiguous_mma__any": "cake_sm110_xqa_ab88990066c20a0e5c48",
+    "tree_fp8_contiguous_pair__even": "cake_sm110_xqa_e8ff1ff761836b06a6f1",
+    "tree_fp8_contiguous_tmem__even": "cake_sm110_xqa_f7026d2473a82bb2e3c0",
+    "tree_fp8_contiguous_tmem__odd": "cake_sm110_xqa_6ffac8ce51ada6796619",
+    "tree_fp8_paged_mma__any": "cake_sm110_xqa_740ec4c562420f85bf0d",
+    "tree_fp8_paged_pair__even": "cake_sm110_xqa_d71430c33daffe18d791",
+    "tree_fp8_paged_tmem__even": "cake_sm110_xqa_6b0044818ad0f283933b",
+    "tree_fp8_paged_tmem__odd": "cake_sm110_xqa_ae6b57d0dc4b00124be2",
 }
 
 
-def route_kernel(name: str, route: dict[str, Any]) -> str:
-    """Physical kernel family of a route: ``pair`` for the ``*_pair`` tree routes, ``tmem``
-    for the ``*_tmem`` tree routes, ``register_mma_split`` for the ``*_mma_split`` tree route,
-    ``register_mma`` for the other ``*_mma`` tree routes, else ``tcgen05``."""
-    kernel = route.get("kernel", "tcgen05")
-    if kernel not in TREE_KERNELS:
-        raise ValueError(f"unknown kernel family for {name}")
-    if name.startswith("tree_"):
-        if name.endswith(PAIR_ROUTE_SUFFIX):
-            expected = "pair"
-        elif name.endswith(TMEM_ROUTE_SUFFIX):
-            expected = "tmem"
-        elif name.endswith(SPLIT_ROUTE_SUFFIX):
-            expected = "register_mma_split"
-        elif name.endswith(MMA_ROUTE_SUFFIX):
-            expected = "register_mma"
-        else:
-            expected = "tcgen05"
-        if kernel != expected:
-            raise ValueError(f"route name and kernel family disagree for {name}")
-    return kernel
-
-
-def _ratio_symbols(route: dict[str, Any], forms: tuple[str, ...] | None) -> bool:
-    """True when the route names one kernel symbol per supported GQA ratio (one per
-    cluster form when ``forms`` is given)."""
-    symbols = route.get("kernel_symbols")
-    if route.get("gqa_ratios") != list(TREE_GQA_RATIOS) or not isinstance(
-        symbols, dict
-    ):
-        return False
-    if sorted(symbols) != sorted(str(ratio) for ratio in TREE_GQA_RATIOS):
-        return False
-    for entry in symbols.values():
-        if forms is None:
-            if not isinstance(entry, str):
-                return False
-        elif (
-            not isinstance(entry, dict)
-            or sorted(entry) != sorted(forms)
-            or any(not isinstance(entry[form], str) for form in forms)
-        ):
-            return False
-    return True
-
-
-def _source_root() -> Path:
-    return Path(__file__).resolve().parent / "csrc" / "sm110_xqa"
-
-
-def _read_manifest(source_root: Path) -> dict[str, Any]:
-    path = source_root / "manifest.json"
-    if not path.is_file():
-        raise FileNotFoundError(
-            "Frozen SM110 XQA sources have not been installed; "
-            "this integration scaffold cannot execute attention."
-        )
-    manifest = json.loads(path.read_text())
-    if manifest.get("schema") != SCHEMA or manifest.get("architecture") != "sm_110a":
-        raise ValueError("SM110 XQA requires the versioned exact-sm_110a manifest")
-    routes = manifest.get("routes")
-    if not isinstance(routes, dict) or not set(ROUTE_ENTRIES).issubset(routes):
-        raise ValueError("SM110 XQA manifest must enumerate every base physical route")
-    producer = routes["decode_fp16_contiguous"]
-    expected_entries = dict(ROUTE_ENTRIES)
-    if producer.get("merge_stats_cache") is True:
-        expected_entries[DECODE_SINGLE_PARTITION_ROUTE] = "run_decode"
-    if set(routes) != set(expected_entries):
-        raise ValueError(
-            "stats-cache selection requires exactly its declared physical routes"
-        )
-    files = manifest.get("files")
-    if not isinstance(files, dict) or not files:
-        raise ValueError("SM110 XQA manifest has no frozen source files")
-    for name, metadata in files.items():
-        relative = Path(name)
-        if (
-            relative.is_absolute()
-            or ".." in relative.parts
-            or relative.suffix not in {".cu", ".cuh", ".h"}
-        ):
-            raise ValueError(f"invalid source path: {name}")
-        source = source_root / relative
-        if not source.is_file():
-            raise FileNotFoundError(f"frozen source file is missing: {name}")
-        if hashlib.sha256(source.read_bytes()).hexdigest() != metadata["sha256"]:
-            raise ValueError(f"frozen source digest mismatch: {name}")
-    for name, route in routes.items():
-        if route.get("ffi_entry") != expected_entries[name]:
-            raise ValueError(f"unexpected FFI entry for {name}")
-        sources = route.get("sources")
-        if (
-            not isinstance(sources, list)
-            or not sources
-            or any(
-                source not in files or Path(source).suffix != ".cu"
-                for source in sources
-            )
-        ):
-            raise ValueError(f"invalid CUDA translation-unit list for {name}")
-        options = route.get("nvcc_options")
-        if not isinstance(options, list) or any(
-            not isinstance(option, str) for option in options
-        ):
-            raise ValueError(f"invalid compiler options for {name}")
-        if any(
-            "gpu-architecture" in option
-            or "gencode" in option
-            or option.startswith("-arch")
-            for option in options
-        ):
-            raise ValueError("route options must not override the exact SM110a target")
-        if name.startswith("tree_"):
-            rows, columns = route.get("tile_rows"), route.get("output_tile_columns")
-            if route_kernel(name, route) == "register_mma":
-                # Register-MMA tree route: one 32-row Q tile per CTA covering all 512 output
-                # columns, eight QK warps and eight PV warps (512 threads).
-                if (
-                    rows != 32
-                    or columns != 512
-                    or route.get("qk_warps") != 8
-                    or route.get("pv_warps") != 8
-                ):
-                    raise ValueError(
-                        f"unsupported register-MMA tree launch geometry for {name}"
-                    )
-            elif route_kernel(name, route) == "register_mma_split":
-                # Split-KV register-MMA tree route: the same 32-row Q tile per CTA, two
-                # eight-warp groups over the two KV halves with an in-CTA merge (512 threads).
-                if (
-                    rows != 32
-                    or columns != 512
-                    or route.get("groups") != 2
-                    or route.get("group_warps") != 8
-                    or route.get("kv_split") != 2
-                ):
-                    raise ValueError(
-                        f"unsupported split register-MMA tree launch geometry for {name}"
-                    )
-            elif route_kernel(name, route) == "tmem":
-                # tcgen05/TMEM tree route: one 128-row Q tile x one 256-column output half per
-                # CTA (512 threads), K/V and Q multicast over a (2, 2, 1) KV-head cluster; the
-                # (2, 1, 1) Q-multicast form serves heads with an odd number of Q tiles. One
-                # frozen trace per GQA ratio and form (Q tile = ratio heads x 128 / ratio tokens).
-                if (
-                    rows != 128
-                    or columns != 256
-                    or route.get("cluster") != TMEM_CLUSTER
-                    or route.get("fallback_cluster") != TMEM_FALLBACK_CLUSTER
-                    or route.get("block") != [512, 1, 1]
-                    or not _ratio_symbols(route, ("even", "odd"))
-                ):
-                    raise ValueError(
-                        f"unsupported TMEM tree launch geometry for {name}"
-                    )
-            elif route_kernel(name, route) == "pair":
-                # cta_group::2 pair tree route: a (4, 1, 1) cluster of two CTA pairs covers the
-                # two 128-row Q tiles of one KV head x the two 256-column output halves (512
-                # threads per CTA); heads need an even Q-tile count. One frozen trace per GQA ratio.
-                if (
-                    rows != 128
-                    or columns != 256
-                    or route.get("cluster") != PAIR_CLUSTER
-                    or route.get("cta_group") != 2
-                    or route.get("q_tiles_per_cluster") != 2
-                    or route.get("block") != [512, 1, 1]
-                    or not _ratio_symbols(route, None)
-                ):
-                    raise ValueError(
-                        f"unsupported pair tree launch geometry for {name}"
-                    )
-            elif (
-                rows not in (64, 128)
-                or columns not in (128, 256)
-                or route.get("copy_warps") not in (4, 8)
-            ):
-                raise ValueError(f"unsupported tree launch geometry for {name}")
-        elif route_kernel(name, route) != "tcgen05":
-            raise ValueError(f"decode routes have a single kernel family: {name}")
-        elif name in ("decode_fp16_contiguous", DECODE_SINGLE_PARTITION_ROUTE):
-            tokens = route.get("partition_tokens")
-            if (
-                type(tokens) is not int
-                or not 0 < tokens <= (1 << 32) - 1
-                or tokens % 64
-            ):
-                raise ValueError(
-                    "decode partition size must fit uint32 and be a positive multiple of 64"
-                )
-            for field in ("fused_merge", "half_warp_merge", "merge_stats_cache"):
-                if type(route.get(field)) is not bool:
-                    raise ValueError(
-                        f"decode route must declare its physical {field} selection"
-                    )
-            if (
-                route.get("counter_initialization") != "zero_at_prepare"
-                or route.get("workspace_replay") != "ordered"
-            ):
-                raise ValueError(
-                    "decode route requires zero-at-prepare counters and ordered workspace replay"
-                )
-    if producer["merge_stats_cache"]:
-        if not producer["fused_merge"] or not producer["half_warp_merge"]:
-            raise ValueError("stats-cache route requires a fused half-warp merge")
-        if producer.get("single_partition_route") != DECODE_SINGLE_PARTITION_ROUTE:
-            raise ValueError(
-                "stats-cache route must name its single-partition specialization"
-            )
-        direct = routes[DECODE_SINGLE_PARTITION_ROUTE]
-        if direct["merge_stats_cache"] or "single_partition_route" in direct:
-            raise ValueError(
-                "single-partition route must disable stats cache and cannot redirect"
-            )
-        for field in (
-            "partition_tokens",
-            "fused_merge",
-            "half_warp_merge",
-            "counter_initialization",
-            "workspace_replay",
-            "nvcc_options",
-        ):
-            if direct[field] != producer[field]:
-                raise ValueError(
-                    f"single-partition route disagrees with producer {field}"
-                )
-    elif "single_partition_route" in producer:
-        raise ValueError(
-            "disabled stats-cache route cannot redirect single-partition launches"
-        )
-    return manifest
-
-
-@functools.cache
-def get_manifest() -> dict[str, Any]:
-    return _read_manifest(_source_root())
+def _package_root() -> Path:
+    return Path(__file__).resolve().parent
 
 
 def _header_directories() -> list[Path]:
@@ -293,26 +663,23 @@ def _header_directories() -> list[Path]:
     raise FileNotFoundError("FlashInfer's native TVM-FFI headers are unavailable")
 
 
-@functools.cache
-def gen_sm110_xqa_module(route_name: str) -> JitSpec:
-    manifest = get_manifest()
-    if route_name not in manifest["routes"]:
-        raise ValueError(f"unknown SM110 XQA route: {route_name}")
-    route = manifest["routes"][route_name]
-    identity = hashlib.sha256(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:20]
+def route_module(route: str, form: str) -> str:
+    """Program name serving ``route`` in cluster ``form`` (``even`` / ``odd`` for tmem, ``even`` for pair, else ``any``)."""
+    return ROUTES[f"{route}__{form}"]
+
+
+def gen_sm110_xqa_module(name: str) -> JitSpec:
+    """Build spec of a generated program (``MODULES``) or a frozen route (``FROZEN``)."""
+    module = MODULES[name] if name in MODULES else FROZEN[name]
+    identity = module["closure_sha256"] if name in MODULES else module["sources_sha256"]
+    root = _package_root()
     return gen_jit_spec(
-        name=f"sm110_xqa_{route_name}_{identity}",
-        sources=[_source_root() / source for source in route["sources"]],
-        extra_cuda_cflags=[*sm110a_nvcc_flags, *route["nvcc_options"]],
+        name=f"sm110_xqa_{name}_{identity[:16]}",
+        sources=[root / source for source in module["sources"]],
+        extra_cuda_cflags=[*sm110a_nvcc_flags, *module["compile_flags"]],
         extra_ldflags=["-lcuda"],
-        extra_include_paths=[
-            _source_root(),
-            _source_root() / "sm_110a",
-            *_header_directories(),
-        ],
-        # Math flags belong to the frozen route, not the JIT helper's default.
+        extra_include_paths=[root / "csrc" / "sm110_xqa", *_header_directories()],
+        # Math flags belong to the generated program, not the JIT helper's default.
         use_fast_math=False,
     )
 
@@ -328,5 +695,5 @@ def require_sm110(device: Any) -> None:
 
 
 @functools.cache
-def load_sm110_xqa_module(route_name: str) -> Any:
-    return gen_sm110_xqa_module(route_name).build_and_load()
+def load_sm110_xqa_module(name: str) -> Any:
+    return gen_sm110_xqa_module(name).build_and_load()

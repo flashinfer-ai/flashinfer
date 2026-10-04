@@ -20,6 +20,14 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value)
 
 
+def arch_tag(arch: str) -> str:
+    """Leading name component of an export target, e.g. ``sm_120a`` -> ``sm120``."""
+    match = re.fullmatch(r"sm_(\d+)[af]?", arch)
+    if match is None:
+        raise ValueError(f"unsupported export architecture {arch!r}")
+    return f"sm{match[1]}"
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -248,19 +256,55 @@ def _build_graph(
     return graph
 
 
+_DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _reachable_definitions(source: str, optional: set[str]) -> set[str]:
+    """Names in ``optional`` that the rest of the module reaches, transitively."""
+
+    def names(node):
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+    pending: dict[str, list[ast.stmt]] = {}
+    reached: set[str] = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, _DEFINITIONS) and node.name in optional:
+            pending.setdefault(node.name, []).append(node)
+        else:
+            reached |= names(node)
+    frontier = reached & set(pending)
+    while frontier:
+        reached |= set().union(
+            *(names(n) for name in frontier for n in pending.pop(name))
+        )
+        frontier = reached & set(pending)
+    return reached & optional
+
+
 def _standalone_source(path: Path) -> str:
     """Freeze generated code and its helpers; leave only CUDA/CuTe dependencies.
 
     Keep device function bodies byte-faithful. Only imports and the ordinary
     Python compile() call are rewritten. FlashInfer owns the persistent cache.
+    Inlined helper definitions the kernel never reaches are dropped: shared
+    Frost helper modules also carry other pipelines' wrappers (e.g. SM100
+    tcgen05 for an SM120 kernel), whose APIs admission would otherwise require.
     """
     inlined: set[str] = set()
+    helpers: set[str] = set()
+    keep: set[str] | None = None
 
     def freeze(source: str, *, helper: bool = False) -> str:
         lines = source.splitlines(keepends=True)
         edits = []
         tree = ast.parse(source)
         for node in tree.body:
+            if helper and isinstance(node, _DEFINITIONS):
+                helpers.add(node.name)
+                if keep is not None and node.name not in keep:
+                    start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+                    edits.append((start - 1, node.end_lineno, ""))
+                continue
             if not isinstance(node, ast.ImportFrom):
                 continue
             if helper and node.module == "__future__":
@@ -314,7 +358,11 @@ def _standalone_source(path: Path) -> str:
                     ]
         return "".join(lines)
 
-    source = freeze(path.read_text())
+    text = path.read_text()
+    own = {node.name for node in ast.parse(text).body if isinstance(node, _DEFINITIONS)}
+    keep = _reachable_definitions(freeze(text), helpers - own)
+    inlined.clear()
+    source = freeze(text)
     for node in ast.walk(ast.parse(source)):
         modules = []
         if isinstance(node, ast.ImportFrom):
@@ -358,7 +406,7 @@ def _export_source(
     name = _slug(artifact_id if template_family is None else template_family)
     if not name.startswith("cudnn_frost_"):
         name = f"cudnn_frost_{name}"
-    name = f"{arch.replace('_', '').removesuffix('a')}_{name}"
+    name = f"{arch_tag(arch)}_{name}"
     path = output_dir / "sources" / f"{name}.py"
     record: dict[str, Any] = {
         "path": path.relative_to(output_dir).as_posix(),
@@ -395,11 +443,13 @@ def _compile_graph(graph: Any, config: Any, cta_group: int, scheduler: str) -> A
 
     parameters = inspect.signature(jit_from_cudnn_graph).parameters
     kwargs: dict[str, Any] = {"config": config}
+    # SM120 configurations have no CTA pair, and therefore no cta_group field.
+    config_cta_group = getattr(config, "cta_group", 1)
     if "cta_group" in parameters:
         kwargs["cta_group"] = cta_group
-    elif config.cta_group != cta_group:
+    elif config_cta_group != cta_group:
         raise ValueError(
-            f"tile config {config.name!r} has cta_group={config.cta_group}, "
+            f"tile config {config.name!r} has cta_group={config_cta_group}, "
             f"but --cta-group={cta_group} was requested"
         )
     if "scheduler" in parameters:
@@ -505,8 +555,9 @@ def _export_compiled(args, compiled, config, arch):
         )
     template = _select_template(compiled.chain, config, args.cta_group, args.scheduler)
     prefix = op if dtype == "bf16" else f"block_scale_{op}"
+    # Artifact ids lead with the architecture, like their source templates.
     artifact_id = args.id or _slug(
-        f"{prefix}_{arch}_e{args.experts}_n{args.n}_k{args.k}_"
+        f"{arch_tag(arch)}_cudnn_frost_{prefix}_e{args.experts}_n{args.n}_k{args.k}_"
         f"g{args.groups}_{config.name}_{args.cta_group}cta_{args.scheduler}_"
         f"{actual_store_mode}{'_quantized' if quantize_output else ''}"
     )

@@ -65,6 +65,24 @@ supported_gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
     reason="packaged cuDNN Frost sources target SM107a",
 )
+# BF16 additionally packages SM120a sources of the warp-MMA template.
+bf16_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 7), (12, 0)),
+    reason="packaged BF16 cuDNN Frost sources target SM107a and SM120a",
+)
+BF16_SHORTLIST_GEOMETRIES = {
+    (12, 7168, 3072, 1),
+    (12, 7168, 3072, 2),
+    (12, 7168, 3072, 4),
+    (8, 4096, 14336, 2),
+    (64, 2048, 1408, 6),
+}
+
+
+def _sm120():
+    """SM120 has STG normal-orientation kernels only: no swap-AB or TMA store."""
+    return torch.cuda.get_device_capability() == (12, 0)
 
 
 def bf16_config(topk=2, experts=8, intermediate=256, ceiling=16384):
@@ -118,12 +136,10 @@ def _bf16_moe_reference(act, weights, activation=None):
     return expanded.sum(dim=1).bfloat16()
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize("name", [name for name in ACTIVATIONS if name != "swiglu"])
 @pytest.mark.parametrize("tokens,topk", [(17, 1), (129, 4)])
 def test_bf16_extended_activations_graph_and_routing(name, tokens, topk, monkeypatch):
-    if torch.cuda.get_device_capability() != (10, 7):
-        pytest.skip("Extended activation sources have been selected on SM107")
     monkeypatch.setitem(sys.modules, "cudnn", None)
     torch.manual_seed(81)
     activation = ACTIVATIONS[name]()
@@ -144,7 +160,7 @@ def test_bf16_extended_activations_graph_and_routing(name, tokens, topk, monkeyp
         tokens * topk, 128, 256, 8, act.hidden_states_q.device, activation
     )
     assert {k.activation for k in first} == {name}
-    assert {k.swap_ab for k in first} == {False, True}
+    assert {k.swap_ab for k in first} == ({False} if _sm120() else {False, True})
     reference = _bf16_moe_reference(act, weights, activation)
     for tactic in runner.get_valid_tactics(inputs, None):
         out = runner.forward(inputs, tactic)
@@ -183,8 +199,9 @@ def test_bf16_extended_activation_scalars_are_not_silently_dropped(activation):
         activation_name(activation)
 
 
-def test_bf16_activation_artifact_pools_are_disjoint(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
+@pytest.mark.parametrize("capability", [(10, 7), (12, 0)])
+def test_bf16_activation_artifact_pools_are_disjoint(capability, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
     seen = set()
     shared_fc2 = None
     for name, cls in ACTIVATIONS.items():
@@ -200,7 +217,7 @@ def test_bf16_activation_artifact_pools_are_disjoint(monkeypatch):
         shared_fc2 = fc2_ids
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize("topk", [1, 2, 4])
 def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     topk, monkeypatch
@@ -222,7 +239,8 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     inputs = runner.pack_inputs(act, weights)
     expected = _bf16_moe_reference(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
-    assert len(tactics) == 16
+    # SM107: normal/swap-AB x STG/TMA per stage. SM120: three STG geometries.
+    assert len(tactics) == (9 if _sm120() else 16)
     if torch.cuda.get_device_capability() == (10, 7):
         first, second = bf16_moe._kernels(129 * topk, 128, 256, 8, torch.device("cuda"))
         assert {k.swap_ab for k in first} == {False, True}
@@ -255,7 +273,7 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     torch.cuda.current_stream().wait_stream(stream)
 
 
-@supported_gpu
+@bf16_gpu
 def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics():
     runner = bf16_moe.CudnnFrostBf16MoeRunner(bf16_config(), "cuda")
     runner.check_support()
@@ -282,7 +300,7 @@ def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics
         runner.pack_inputs(a, wa)
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
     [(12, 7168, 3072), (8, 4096, 14336), (64, 2048, 1408)],
@@ -291,8 +309,6 @@ def test_bf16_model_geometry_artifacts_ragged_graph(
     experts, hidden, intermediate, monkeypatch
 ):
     """Exercise every packaged pair on partial tiles and initially empty experts."""
-    if experts == 64 and torch.cuda.get_device_capability() != (10, 7):
-        pytest.skip("E64 artifacts are packaged for Rubin only")
     monkeypatch.setitem(sys.modules, "cudnn.gemm.frost.compiler", None)
     torch.manual_seed(97)
     act, weights = bf16_packs(
@@ -329,7 +345,7 @@ def test_bf16_model_geometry_artifacts_ragged_graph(
     assert error.item() < 0.01
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -539,7 +555,7 @@ def test_bf16_layer_adds_independent_candidate_and_separates_winner_cache(monkey
     assert not layer._winners
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
     [(12, 7168, 3072), (8, 4096, 14336)],
@@ -602,6 +618,11 @@ def test_bf16_auto_admission_uses_validated_architecture_profiles(activation):
         (1, 7168, 107, True),
         (12289, 7168, 107, False),
         (4096, 4096, 100, False),
+        (4096, 7168, 120, True),
+        (1, 7168, 120, True),
+        (12289, 7168, 120, False),
+        (4096, 4096, 120, False),
+        (4096, 7168, 121, False),  # SM121a sources have not been selected
     ):
         act, _ = bf16_packs(
             tokens=tokens, experts=12, hidden=hidden, intermediate=3072, device="meta"
@@ -624,6 +645,7 @@ def test_bf16_auto_admission_uses_validated_architecture_profiles(activation):
     )
     assert not large_bf16_moe(cfg, act, 100)  # unsupported architecture
     assert large_bf16_moe(cfg, act, 107)  # four shortlisted plans compete normally
+    assert large_bf16_moe(cfg, act, 120)
 
 
 def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
@@ -631,16 +653,22 @@ def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
         runtime,
     )
 
-    for capability in ((10, 0), (10, 7), (10, 3)):
+    for capability in ((10, 0), (10, 7), (10, 3), (12, 0), (12, 1)):
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
         first, second = bf16_moe._kernels(258, 128, 256, 8, torch.device("cuda"))
-        if capability != (10, 7):
+        if capability not in ((10, 7), (12, 0)):
             assert not first and not second
         else:
             assert first and second
             assert {k.arch for k in (*first, *second)} == {
                 f"sm_{capability[0]}{capability[1]}a"
             }
+            if capability == (12, 0):
+                # The SM120 template has neither swap-AB nor TMA-store variants.
+                assert {
+                    (k.swap_ab, k.tactic_metadata["store_mode"])
+                    for k in (*first, *second)
+                } == {(False, "stg")}
     # Swapping changes the native signature: a flag alone cannot reinterpret
     # an old normal object, nor can a swapped object omit its orientation.
     for abi, swap in (
@@ -687,7 +715,7 @@ def test_bf16_source_distribution_has_no_binary_or_cudnn_frost_dependency():
         assert options == [f"--enable-tvm-ffi --gpu-arch {record['arch']}"]
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize("stage", ["fc1", "fc2"])
 @pytest.mark.parametrize("swap", [False, True])
 @pytest.mark.parametrize("store", ["stg", "tma"])
@@ -782,6 +810,160 @@ def test_bf16_source_manifest_rejects_tampering_and_legacy_objects(tmp_path):
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(RuntimeError, match="unsupported cuDNN Frost manifest schema"):
         runtime._read_root(tmp_path)
+
+
+def test_bf16_sm120_sources_roundtrip_without_cudnn(monkeypatch):
+    """SM120 warp-MMA templates: one STG family per op and exact re-extraction."""
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
+
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    root = runtime.artifact_root("bf16")
+    records = [
+        record
+        for record in json.loads((root / runtime._MANIFEST).read_text())["kernels"]
+        if record["arch"] == "sm_120a"
+    ]
+    families = {}
+    for record in records:
+        entry = record["source"]
+        template = (root / entry["path"]).read_text()
+        families.setdefault(record["op"], set()).add(entry["path"])
+        # Kernel names are sm120_cudnn_frost_<op>...
+        assert record["id"].startswith(f"sm120_cudnn_frost_{record['op']}_")
+        assert entry["path"] == (
+            f"sources/sm120_cudnn_frost_{record['op']}_bf16_normal_stg.py"
+        )
+        # Explicit G+1 group boundaries: no final endpoint inferred from S.
+        assert record["abi"] == f"cudnn_frost_{record['op']}_v2"
+        assert "first_token_arr[my_group + 1]" in template
+        assert "gemm_s" not in template
+        # Unreached helpers (e.g. SM100 tcgen05 wrappers) are not frozen in.
+        assert not any(
+            isinstance(node, ast.FunctionDef)
+            and node.name.startswith("tcgen05")
+            or isinstance(node, ast.Attribute)
+            and node.attr.startswith("tcgen05")
+            for node in ast.walk(ast.parse(template))
+        )
+        assert "# @@FROST_TMA_STORE@@" not in template
+        # PTX setmaxnreg is .sync.aligned over the warpgroup: the producer
+        # warpgroup (TMA, scheduler and donor warps) releases registers once,
+        # before its per-warp roles diverge, and the compute warpgroups grow once.
+        assert template.count("nvvm.setmaxregister(") == 2
+        assert (
+            "    if warp_idx >= NUM_COMPUTE_WARPS:\n"
+            "        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)\n"
+        ) in template
+        assert "SCHED_REG_COUNT" not in template
+        tactic = record["tactic"]
+        assert tactic["template"] == "sm120_moe_grouped_matmul_fwd.py"
+        assert (tactic["swap_ab"], tactic["store_mode"], tactic["cta_group"]) == (
+            False,
+            "stg",
+            1,
+        )
+        # Only the scheduler counter: the template patches no tensormap.
+        assert record["workspace_bytes"] == 128
+        constants = dict(entry["parameters"]["constants"])
+        assert "n_tma_outputs" not in constants and "epi_n" not in constants
+        assert constants["frost_compile_options"] == repr(
+            "--enable-tvm-ffi --gpu-arch sm_120a"
+        )
+        assert int(constants["grid_num_clusters"]) > 0
+        concrete = render_source(template, entry["parameters"])
+        # The host zeroes the tile-scheduler counter before every launch, so
+        # the exported TVM-FFI function needs no caller-side reset.
+        assert "_dynamic_scheduler_counter_initialization(a_tma_workspace" in concrete
+        first = entry["parameters"]["constants"][0][0]
+        produced = concrete.replace(
+            f"\n{first} = ", f"\n# Tile config: {tactic['tile']}\n{first} = ", 1
+        )
+        assert extract_template(produced, swap_ab=False) == (
+            template,
+            entry["parameters"],
+        )
+    assert set(families) == {
+        *(f"grouped_gemm1_{name}" for name in ACTIVATIONS),
+        "grouped_gemm2",
+    }
+    assert all(len(paths) == 1 for paths in families.values())
+
+
+def test_frost_export_names_architecture_first_and_prunes_unreached_helpers():
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+        _reachable_definitions,
+        arch_tag,
+    )
+
+    assert (arch_tag("sm_107a"), arch_tag("sm_120a")) == ("sm107", "sm120")
+    with pytest.raises(ValueError, match="architecture"):
+        arch_tag("sm120")
+    source = "\n".join(
+        (
+            "def used(x):\n    return nested(x)",
+            "def nested(x):\n    return x",
+            "def unused(x):\n    return orphan(x)",
+            "def orphan(x):\n    return x",
+            "alias = used",
+            "def kernel():\n    return alias(1)",
+        )
+    )
+    optional = {"used", "nested", "unused", "orphan"}
+    assert _reachable_definitions(source, optional) == {"used", "nested"}
+    gate = torch.empty(1, 3, 4, dtype=torch.bfloat16)
+    args = (torch.empty(2, 4, dtype=torch.bfloat16), gate, gate)
+    scale = torch.ones(1)
+    # G+1 boundaries: one boundary alone describes no group.
+    with pytest.raises(ValueError, match="G\\+1"):
+        runtime._validate_common(*args, torch.zeros(1, dtype=torch.int32), scale, None)
+    assert runtime._validate_common(
+        *args, torch.tensor([0, 2], dtype=torch.int32), scale, None
+    ) == (2, 3, 4, 1, 1)
+
+
+@bf16_gpu
+def test_bf16_sm120_launches_need_no_workspace_reset(monkeypatch):
+    """The SM120 host zeroes its scheduler counter, even in a garbage workspace."""
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        fc2,
+    )
+
+    if not _sm120():
+        pytest.skip("SM107 sources rely on PreparedFc2.run() resetting the workspace")
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    torch.manual_seed(7)
+    device = torch.device("cuda", torch.cuda.current_device())
+    sizes = [64, 0, 200, 128, 100, 12, 196, 68]
+    bounds = [sum(sizes[:g]) for g in range(len(sizes) + 1)]
+    rows = bounds[-1] + 37  # routed capacity beyond every group
+    x = torch.randn(rows, 256, dtype=torch.bfloat16, device=device)
+    w = torch.randn(8, 128, 256, dtype=torch.bfloat16, device=device) * 0.1
+    offsets = torch.tensor(bounds, dtype=torch.int32, device=device)
+    expected = torch.cat(
+        [
+            x[a:b].float() @ w[g].float().T
+            for g, (a, b) in enumerate(zip(bounds[:-1], bounds[1:], strict=True))
+        ]
+    )
+    kernels = fc2.matching_kernels(rows, 128, 256, 8, device)
+    assert kernels
+    for kernel in kernels:
+        out = torch.full((rows, 128), float("nan"), dtype=torch.bfloat16, device=device)
+        workspace = torch.full(
+            (kernel.workspace_bytes,), 0x7F, dtype=torch.uint8, device=device
+        )
+        plan = fc2.PreparedFc2(kernel, x, w, offsets, out, workspace)
+        for _ in range(2):
+            # Bypass PreparedFc2.run()'s reset: the frozen host zeroes its counter.
+            plan._launch(*plan._args, fc2._current_custream(device))
+            error = (out[: bounds[-1]].float() - expected).norm() / expected.norm()
+            assert error.item() < 0.01, (kernel.artifact_id, error.item())
+        assert torch.isnan(out[bounds[-1] :]).all(), kernel.artifact_id
 
 
 @pytest.fixture
@@ -1068,6 +1250,59 @@ def test_bf16_moe_shortlist_rejects_more_than_two_stage_candidates(tmp_path):
     )
     with pytest.raises(ValueError, match="one or two"):
         shortlist._read((tmp_path,))
+
+
+@pytest.mark.parametrize("arch", ["sm_107a", "sm_120a"])
+def test_bf16_packaged_shortlists_resolve_all_profiles(arch, monkeypatch):
+    """Every measured profile maps to two FC1 and two FC2 packaged artifacts."""
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        shortlist,
+    )
+
+    runtime = bf16_moe.runtime
+    table = {
+        key: profiles
+        for key, profiles in shortlist._read(runtime._artifact_roots()).items()
+        if key[0] == arch
+    }
+    assert {key[1] for key in table} == set(ACTIVATIONS)
+    assert {key[2:] for key in table} == BF16_SHORTLIST_GEOMETRIES
+    monkeypatch.setattr(runtime, "_arch_for", lambda device: arch)
+    runtime.clear_artifact_cache()
+    try:
+        for (_, name, experts, hidden, intermediate, topk), profiles in table.items():
+            assert sorted(profiles) == [1, 16, 128, 512, 2048, 4096, 8192, 12288]
+            previous = 0
+            for tokens, (fc1, fc2) in sorted(profiles.items()):
+                # Measured counts and the next-bucket rule, without compiling.
+                for query in {tokens, previous + 1}:
+                    first, second = bf16_moe._selected_kernels(
+                        query,
+                        hidden,
+                        intermediate,
+                        experts,
+                        topk,
+                        "cpu",
+                        ACTIVATIONS[name](),
+                    )
+                    assert tuple(k.artifact_id for k in first) == fc1
+                    assert tuple(k.artifact_id for k in second) == fc2
+                    assert all(k.arch == arch and k.activation == name for k in first)
+                    assert all(k.arch == arch for k in second)
+                previous = tokens
+    finally:
+        runtime.clear_artifact_cache()
+
+
+def test_bf16_fma_tactic_is_limited_to_sm107(monkeypatch):
+    """SM120 keeps its Tensor Core candidates at the SM107 FMA geometries."""
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(bf16_moe.fma, "check_support", lambda *_: None)
+    for arch, expected in (("sm_120a", False), ("sm_107a", True)):
+        monkeypatch.setattr(bf16_moe.runtime, "_arch_for", lambda _: arch)
+        for geometry in ((1, 7168, 3072, 12, 2), (4, 2048, 1408, 64, 6)):
+            tactic = bf16_moe._fma_tactic(*geometry, SwiGLU(), device)
+            assert (tactic is not None) == expected
 
 
 def test_bf16_shortlist_survives_autotuner_plain_tensor_profiles(monkeypatch):
@@ -3402,8 +3637,16 @@ def test_frost_layer_bounds_exact_shape_winners_and_refreshes_lru(monkeypatch):
     assert len(selected) == 131
 
 
-@supported_gpu
-@pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4"])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param("bf16", marks=bf16_gpu),
+        *(
+            pytest.param(dtype, marks=supported_gpu)
+            for dtype in ("mxfp8", "nvfp4", "mxfp8_mxfp4")
+        ),
+    ],
+)
 def test_moe_graph_retains_evicted_plans_and_weight_scales(dtype, monkeypatch):
     """A graph owns temporary packed-call resources after bounded-cache eviction."""
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.cache import (

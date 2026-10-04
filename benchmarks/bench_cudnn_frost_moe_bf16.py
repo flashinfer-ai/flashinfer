@@ -1,15 +1,18 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
 """Benchmark and tune cuDNN Frost BF16 MoE kernels on the target GPU.
 
-Use ``benchmark`` to compare the original CUTLASS/TRTLLM pool with the same
-pool plus cuDNN Frost, timing complete routed MoE calls with alternating CUDA graph
-replay. Both original backends retain their unmodified tactic pools, and
-cuDNN Frost-only timing is reported even when it loses cross-backend selection.
+Use ``benchmark`` to compare the original eligible pool (CUTLASS/TRTLLM on
+SM107, CUTLASS/cuTile on SM120) with the same pool plus cuDNN Frost, timing
+complete routed MoE calls with alternating CUDA graph replay. The original
+backends retain their unmodified tactic pools, and cuDNN Frost-only timing is
+reported even when it loses cross-backend selection.
 
 Use ``export``, ``sweep`` and ``select`` for offline kernel tuning. FC1 and FC2
 normal/swap-AB candidates are shortlisted independently, then ranked as complete
-MoE pairs. Export and sweep need an idle target GPU; only export needs the cuDNN Frost
-compiler. Selection copies validated winners to an explicit destination.
+MoE pairs. SM120 exports the warp-MMA template's normal STG kernels only. Export
+and sweep need an idle target GPU; only export needs the cuDNN Frost compiler.
+Selection copies validated winners to an explicit destination; ``shortlist``
+instead writes each profile's two FC1 and two FC2 stage finalists.
 """
 
 import argparse
@@ -74,6 +77,7 @@ def benchmark(args):
     from flashinfer.autotuner import autotune
     from flashinfer.fused_moe import (
         BackendOptions,
+        CuTileBf16Config,
         CutlassBf16Config,
         ExecutionConfig,
         ExpertConfig,
@@ -116,7 +120,11 @@ def benchmark(args):
     }
     # Fail visibly if a new applicable runner needs a prepared weight view;
     # silently omitting it would invalidate the all-backend comparison.
-    unsupported_views = set(eligible) - {CutlassBf16Config, TrtllmBf16Config}
+    unsupported_views = set(eligible) - {
+        CutlassBf16Config,
+        CuTileBf16Config,
+        TrtllmBf16Config,
+    }
     if unsupported_views:
         raise RuntimeError(
             "Add benchmark weight preparation for all applicable backends: "
@@ -144,7 +152,16 @@ def benchmark(args):
     )
     w2 = torch.randn(e, h, i, device="cuda", dtype=torch.bfloat16) * 0.02
     views = {"cutlass_bf16": dict(fc1_expert_weights=w1, fc2_expert_weights=w2)}
-    if args.activation in ("swiglu", "relu2"):
+    if CuTileBf16Config in eligible:
+        views["cutile_bf16"] = CuTileBf16Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=e,
+            hidden_size=h,
+            intermediate_size=i,
+            activation=activation,
+        )
+    if TrtllmBf16Config in eligible:
         views["trtllm_bf16_routed"] = prepare_trtllm_bf16_weights(
             w1,
             w2,
@@ -297,6 +314,15 @@ def benchmark(args):
                 )
         check_idle_gpu(gpu_uuid)
         medians = {label: statistics.median(times) for label, times in samples.items()}
+        # Pools run back to back within each rotated round, so per-round ratios
+        # also cancel clock drift across rounds (e.g. power capping when SM
+        # clocks are not locked), which the medians of whole runs retain.
+        paired = statistics.median(
+            original / frost
+            for original, frost in zip(
+                samples["original"], samples["with_cudnn_frost"], strict=True
+            )
+        )
         print(
             json.dumps(
                 dict(
@@ -304,6 +330,7 @@ def benchmark(args):
                     routed_rows=tokens * args.top_k,
                     milliseconds=medians,
                     speedup=medians["original"] / medians["with_cudnn_frost"],
+                    paired_speedup=paired,
                     relative_l2=errors,
                     samples_ms=samples,
                 )
@@ -370,7 +397,58 @@ def benchmark(args):
             print(json.dumps(dict(tokens=tokens, cudnn_frost_sweep=ranked)), flush=True)
 
 
-def configs(small=False, wide_swap=False):
+# SM120 warp-MMA tiles: CTA M/N, K bytes and the compute-warp grid M x N. The
+# template has no swap-AB orientation, CTA pair, cluster or TMA-store epilogue.
+_SM120_SMALL_TILES = ((32, 64, 64, 2, 4), (64, 64, 128, 4, 2), (128, 128, 32, 1, 8))
+_SM120_TILES = (
+    *((32, n, k, 2, 4) for n, k in ((64, 64), (64, 128), (128, 32), (128, 64))),
+    *((32, n, k, 1, 8) for n, k in ((128, 64), (256, 32), (256, 64))),
+    (32, 256, 32, 2, 4),
+    *((64, 32, k, 4, 2) for k in (64, 128)),
+    *((64, 64, 64, w, 8 // w) for w in (2, 4)),
+    (64, 64, 128, 4, 2),
+    *((64, 128, k, 2, 4) for k in (32, 64)),
+    (64, 128, 64, 4, 2),
+    *((64, 256, k, 2, 4) for k in (32, 64)),
+    *((128, 32, 64, w, 8 // w) for w in (4, 8)),
+    *((128, 64, k, 4, 2) for k in (32, 64)),
+    (128, 64, 64, 8, 1),
+    *((128, 128, k, w, 8 // w) for k in (32, 64) for w in (2, 4)),
+    *((128, 256, k, 2, 4) for k in (32, 64)),
+    *((256, 64, k, 4, 2) for k in (32, 64)),
+    (256, 64, 64, 8, 1),
+    *((256, 128, k, 4, 2) for k in (32, 64)),
+)
+
+
+def sm120_configs(small=False):
+    for m, n, k_bytes, warps_m, warps_n in (
+        _SM120_SMALL_TILES if small else _SM120_TILES
+    ):
+        name = (
+            f"CONFIG_sm120_{m}x{n}x{k_bytes}_16x16x32_"
+            f"cluster1x1_warps{warps_m}x{warps_n}"
+        )
+        yield name, 1, "stg"
+
+
+def store_modes(config):
+    """SM120 always stores through STG; SM100 exports both store variants."""
+    return ("stg",) if config.pipeline == "sm120" else ("stg", "tma")
+
+
+def mma_size_m(tile):
+    """MMA-M multiplicity of one CTA (SM100) or one compute warp (SM120)."""
+    parts = tile.split("_")
+    m, mma_m = int(parts[2].split("x")[0]), int(parts[3].split("x")[0])
+    warps = next((p for p in parts if p.startswith("warps")), None)
+    return m // mma_m if warps is None else m // int(warps[5:].split("x")[0]) // mma_m
+
+
+def configs(small=False, wide_swap=False, arch=(10, 7)):
+    if arch[0] == 12:
+        yield from sm120_configs(small)
+        return
     # CTA M/N, MMA M, CTA group, cluster N. K is 128 bytes.
     normal = [(128, 128, 128, 1, 1)]
     swapped = [(128, 16, 128, 1, 1)]
@@ -459,13 +537,13 @@ def catalog_configs(op, e, n, k, file):
                     quiet=True,
                 )
                 continue
-            for mode in ("stg", "tma"):
+            for mode in store_modes(config):
                 emit(
                     file,
                     dict(kind="catalog_candidate", **record, store_mode=mode),
                     quiet=True,
                 )
-                yield config.name, config.cta_group, mode
+                yield config.name, record["cta_group"], mode
 
 
 def export_task(opts):
@@ -533,14 +611,15 @@ def export(args, file):
             record = json.loads(line)
             if record["kind"] == "export_failed":
                 failed.add(record["id"])
-    candidate_configs = list(configs(args.small, args.wide_swap))
+    candidate_configs = list(configs(args.small, args.wide_swap, (major, minor)))
     if args.config:
         from cudnn.gemm.frost import tile_config
 
         candidate_configs = [
-            (name, tile_config.by_name(name).cta_group, mode)
+            (name, getattr(config, "cta_group", 1), mode)
             for name in args.config
-            for mode in ("stg", "tma")
+            for config in (tile_config.by_name(name),)
+            for mode in store_modes(config)
         ]
     tasks = []
     catalog_plan = None
@@ -583,7 +662,7 @@ def export(args, file):
             for index, (name, cta, mode) in enumerate(pool):
                 if index % args.num_shards != args.shard_index:
                     continue
-                identity = f"{op}_sm{major}{minor}_e{e}_n{n}_k{k}_{name}_{mode}_{revision[:12]}"
+                identity = f"sm{major}{minor}_cudnn_frost_{op}_e{e}_n{n}_k{k}_{name}_{mode}_{revision[:12]}"
                 if identity in existing or identity in failed or args.catalog_only:
                     continue
                 opts = argparse.Namespace(
@@ -735,6 +814,24 @@ def sweep(args, file):
             r = json.loads(line)
             if r["kind"] == "stage":
                 prior[(tuple(r["geometry"]), r["tokens"], r["routing"], r["stage"])] = r
+    # Staged search across activations: activations of one FC1 class share the
+    # mainloop, so screen only the tiles another sweep ranked fastest per case.
+    screened_tiles = {}
+    if args.candidates_from is not None:
+        tiles = {
+            k.artifact_id: k.tactic_metadata["tile"]
+            for k in (
+                *runtime._discover((args.artifacts,)),
+                *fc2.discover((args.artifacts,)),
+            )
+        }
+        for line in args.candidates_from.read_text().splitlines():
+            r = json.loads(line)
+            if r["kind"] == "stage":
+                key = (tuple(r["geometry"]), r["tokens"], r["routing"], r["stage"])
+                screened_tiles[key] = {
+                    tiles[x["id"]] for x in r["ranked"][: args.candidates_top]
+                }
     for e, h, i, topk in args.geometries:
         activation = ACTIVATIONS[args.activation]()
         w1 = (
@@ -815,6 +912,13 @@ def sweep(args, file):
                         k
                         for k in pool
                         if k.artifact_id not in screened or k.artifact_id in finalists
+                    )
+                if args.candidates_from is not None:
+                    allowed = screened_tiles[
+                        ((e, h, i, topk), tokens, routing, stage + 1)
+                    ]
+                    pool = tuple(
+                        k for k in pool if k.tactic_metadata["tile"] in allowed
                     )
                 if not pool:
                     raise RuntimeError(f"No matching stage {stage} sources for {case}")
@@ -900,13 +1004,11 @@ def sweep(args, file):
                         # it cannot validate any subsequent candidate reliably.
                         torch.cuda.synchronize()
                         continue
-                    tile = kernel.tactic_metadata["tile"].split("_")
                     record = dict(
                         id=kernel.artifact_id,
                         swap_ab=kernel.swap_ab,
                         source_sha256=kernel.source_sha256,
-                        mma_size_m=int(tile[2].split("x")[0])
-                        // int(tile[3].split("x")[0]),
+                        mma_size_m=mma_size_m(kernel.tactic_metadata["tile"]),
                         **timing,
                     )
                     ranked.append(record)
@@ -1011,13 +1113,6 @@ def sweep(args, file):
 
 def select(args, file):
     """Copy the union of full-MoE winners, preserving existing architectures."""
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
-        _write_manifest,
-    )
-    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runtime import (
-        _safe_child,
-    )
-
     results = [json.loads(line) for line in args.results.read_text().splitlines()]
     options = results[0]["options"]
     expected = {
@@ -1031,18 +1126,37 @@ def select(args, file):
     if actual != expected or len(cases) != len(expected):
         raise ValueError("Selection requires a complete sweep without duplicate cases")
     identities = {r["winner"][stage] for r in cases for stage in ("fc1", "fc2")}
-    manifest = json.loads(
-        (args.artifacts / "cudnn_frost_selected_kernels.json").read_text()
+    copy_selected(args.artifacts, args.selected_dir, identities, file)
+
+
+def copy_selected(artifacts, selected_dir, identities, file):
+    """Copy verified sources and manifest records, never replacing other bytes.
+
+    Packaged records keep their order; new records are appended by identity.
+    """
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runtime import (
+        _safe_child,
     )
+
+    manifest = json.loads((artifacts / "cudnn_frost_selected_kernels.json").read_text())
     if manifest.get("schema_version") != 2:
         raise ValueError(
             "Selection requires a source manifest; re-export legacy objects"
         )
     records = {r["id"]: r for r in manifest["kernels"]}
+    target_manifest = selected_dir / "cudnn_frost_selected_kernels.json"
+    payload = (
+        json.loads(target_manifest.read_text())
+        if target_manifest.exists()
+        else dict(schema_version=2, producer=dict(name="cudnn_frost"), kernels=[])
+    )
+    if payload.get("schema_version") != 2:
+        raise ValueError(f"refusing to update unsupported manifest {target_manifest}")
+    previous = {r["id"]: r for r in payload["kernels"]}
     for identity in sorted(identities):
         record = records[identity]
-        source = _safe_child(args.artifacts, record["source"]["path"])
-        target = _safe_child(args.selected_dir, record["source"]["path"])
+        source = _safe_child(artifacts, record["source"]["path"])
+        target = _safe_child(selected_dir, record["source"]["path"])
         digest = record["source"]["sha256"]
         if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
             raise ValueError(f"Candidate source digest mismatch: {source}")
@@ -1052,20 +1166,233 @@ def select(args, file):
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
-        target_manifest = args.selected_dir / "cudnn_frost_selected_kernels.json"
-        previous = (
-            json.loads(target_manifest.read_text())["kernels"]
-            if target_manifest.exists()
-            else []
-        )
-        existing = next((r for r in previous if r["id"] == identity), None)
+        existing = previous.get(identity)
         if existing is not None and existing != record:
             raise ValueError(
                 f"Selected manifest already has a different record for {identity}"
             )
         if existing is None:
-            _write_manifest(args.selected_dir, record, False)
+            payload["kernels"].append(record)
+            previous[identity] = record
         emit(file, dict(kind="selected", id=identity))
+    temporary = target_manifest.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(target_manifest)
+
+
+def rank_stage(runs, width):
+    """Geomean over routings of latency normalized by each routing's best.
+
+    ``runs`` maps a routing to candidate milliseconds; only candidates measured
+    under every routing are ranked. Ties keep the artifact identity order.
+    """
+    common = set.intersection(*(set(times) for times in runs.values()))
+    if not common:
+        raise ValueError("No stage candidate was measured under every routing")
+    best = {routing: min(times.values()) for routing, times in runs.items()}
+    score = {
+        identity: statistics.geometric_mean(
+            times[identity] / best[routing] for routing, times in runs.items()
+        )
+        for identity in common
+    }
+    return sorted(common, key=lambda identity: (score[identity], identity))[:width]
+
+
+def build_shortlist(results, width):
+    """Combine stage sweeps into ``moe_shortlists.json`` entries.
+
+    FC1 rankings are activation-specific. FC2 does not depend on the
+    activation, so repeated FC2 sweeps of one case use each candidate's median.
+    """
+    fc1, fc2, arches = {}, {}, set()
+    for record in results:
+        if record["kind"] in ("environment", "resume"):
+            arches.add(record["arch"])
+        if record["kind"] != "stage":
+            continue
+        geometry = tuple(record["geometry"])
+        times = {r["id"]: r["milliseconds"] for r in record["ranked"]}
+        if record["stage"] == 1:
+            case = fc1.setdefault(
+                (record["activation"], geometry, record["tokens"]), {}
+            )
+            if record["routing"] in case:
+                raise ValueError(f"duplicate FC1 stage sweep for {record}")
+            case[record["routing"]] = times
+        else:
+            case = fc2.setdefault((geometry, record["tokens"]), {})
+            for identity, value in times.items():
+                case.setdefault(record["routing"], {}).setdefault(identity, []).append(
+                    value
+                )
+    if len(arches) != 1:
+        raise ValueError(f"Shortlist sweeps must share one architecture: {arches}")
+    (arch,) = arches
+    routings = {frozenset(case) for case in (*fc1.values(), *fc2.values())}
+    if len(routings) != 1:
+        raise ValueError("Every stage case must cover the same routings")
+    entries = []
+    for (activation, geometry, tokens), runs in fc1.items():
+        if (geometry, tokens) not in fc2:
+            raise ValueError(f"Missing FC2 stage sweep for {geometry}, {tokens}")
+        second = {
+            routing: {k: statistics.median(v) for k, v in times.items()}
+            for routing, times in fc2[(geometry, tokens)].items()
+        }
+        e, h, i, topk = geometry
+        entries.append(
+            dict(
+                arch=arch,
+                activation=activation,
+                experts=e,
+                hidden=h,
+                intermediate=i,
+                top_k=topk,
+                tokens=tokens,
+                fc1=rank_stage(runs, width),
+                fc2=rank_stage(second, width),
+            )
+        )
+    return entries
+
+
+def validate_shortlist(args, entries, file):
+    """Check every shortlisted pair as a complete routed MoE and graph replay."""
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        fc2,
+        moe,
+        runtime,
+    )
+    from flashinfer.fused_moe import MoEActivationPack
+
+    runtime._artifact_roots = lambda: (args.artifacts,)
+    fc2._artifact_roots = runtime._artifact_roots
+    device = torch.device("cuda", 0)
+    kernels = {
+        k.artifact_id: k
+        for k in (
+            *runtime._discover((args.artifacts,)),
+            *fc2.discover((args.artifacts,)),
+        )
+    }
+    weights = {}
+    for entry in entries:
+        e, h, i = (entry[k] for k in ("experts", "hidden", "intermediate"))
+        key = (entry["activation"], e, h, i)
+        if key not in weights:
+            weights.clear()  # bound memory to one model geometry at a time
+            torch.manual_seed(41)
+            gated = ACTIVATIONS[entry["activation"]]().is_gated
+            weights[key] = (
+                torch.randn(e, (2 if gated else 1) * i, h, device=device).bfloat16()
+                * 0.02,
+                torch.randn(e, h, i, device=device).bfloat16() * 0.02,
+            )
+        w1, w2 = weights[key]
+        tokens, topk = entry["tokens"], entry["top_k"]
+        first = [kernels[identity] for identity in entry["fc1"]]
+        second = [kernels[identity] for identity in entry["fc2"]]
+        plans = moe._Plans(tokens, h, i, e, topk, device, first, second, {})
+        for routing in ("uniform", "skew"):
+            torch.manual_seed(tokens)
+            x = torch.randn(tokens, h, device=device, dtype=torch.bfloat16) * 0.02
+            logits = torch.rand(tokens, e, device=device)
+            if routing == "skew":
+                logits[: tokens // 2, 0] += 2
+            ids = logits.topk(topk, dim=1).indices.int()
+            scores = torch.rand(tokens, topk, device=device).softmax(-1)
+            act = MoEActivationPack(x, None, ids, scores)
+            expected = reference(act, w1, w2, entry["activation"])
+            output = torch.empty_like(x)
+            l2 = 0.0
+            for launch in plans.launches.values():
+                fn = partial(launch, output, x, ids, scores, w1, w2, plans.workspace)
+                fn()
+                l2 = max(l2, error(output, expected))
+                graph = capture(fn, 1, warmup=0)
+                output.fill_(float("nan"))
+                graph.replay()
+                l2 = max(l2, error(output, expected))
+            emit(
+                file,
+                dict(
+                    kind="validated",
+                    **{k: v for k, v in entry.items() if k not in ("fc1", "fc2")},
+                    routing=routing,
+                    pairs=len(plans.launches),
+                    relative_l2=l2,
+                ),
+                quiet=True,
+            )
+        del plans
+        gc.collect()
+
+
+def shortlist(args, file):
+    """Write two FC1 and two FC2 artifacts per profile and copy their kernels."""
+    results = [
+        json.loads(line)
+        for path in args.results
+        for line in path.read_text().splitlines()
+    ]
+    entries = build_shortlist(results, args.width)
+    if args.validate:
+        validate_shortlist(args, entries, file)
+    path = args.selected_dir / "moe_shortlists.json"
+    payload = (
+        json.loads(path.read_text()) if path.exists() else dict(version=1, entries=[])
+    )
+    if payload.get("version") != 1:
+        raise ValueError("unsupported Frost MoE shortlist version")
+
+    def profile(entry):
+        return tuple(
+            entry[k]
+            for k in (
+                "arch",
+                "activation",
+                "experts",
+                "hidden",
+                "intermediate",
+                "top_k",
+                "tokens",
+            )
+        )
+
+    index = {profile(entry): n for n, entry in enumerate(payload["entries"])}
+    activations = {name: n for n, name in enumerate(ACTIVATIONS)}
+    geometries = [tuple(g) for g in results[0]["options"]["geometries"]]
+
+    def order(entry):
+        # Match the packaged tables: activation, sweep geometry order, tokens.
+        geometry = profile(entry)[2:6]
+        rank = geometries.index(geometry) if geometry in geometries else len(geometries)
+        return activations[entry["activation"]], rank, entry["tokens"]
+
+    for entry in sorted(entries, key=order):
+        existing = index.get(profile(entry))
+        if existing is None:
+            payload["entries"].append(entry)
+        elif payload["entries"][existing] != entry:
+            if not args.replace:
+                raise ValueError(f"Shortlist already differs for {profile(entry)}")
+            payload["entries"][existing] = entry
+    copy_selected(
+        args.artifacts,
+        args.selected_dir,
+        {
+            identity
+            for x in entries
+            for stage in ("fc1", "fc2")
+            for identity in x[stage]
+        },
+        file,
+    )
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+    emit(file, dict(kind="shortlisted", entries=len(entries)))
 
 
 def parse_args(argv=None):
@@ -1110,6 +1437,10 @@ def parse_args(argv=None):
         ("export", "Export normal/swap-AB FC1 and FC2 candidates with cuDNN Frost"),
         ("sweep", "Check and time stage candidates, then complete MoE pairs"),
         ("select", "Copy the union of complete-MoE winners from a finished sweep"),
+        (
+            "shortlist",
+            "Write per-profile FC1/FC2 shortlists from stage sweeps and copy them",
+        ),
     ):
         command = commands.add_parser(mode, help=help_text)
         command.add_argument("--artifacts", required=True, type=Path)
@@ -1208,6 +1539,18 @@ def parse_args(argv=None):
         help="Re-sweep prior stage finalists plus newly exported sources",
     )
     sweeper.add_argument(
+        "--candidates-from",
+        type=Path,
+        help="Screen only tiles a completed sweep ranked fastest for the same "
+        "stage case, e.g. SwiGLU's for another gated activation",
+    )
+    sweeper.add_argument(
+        "--candidates-top",
+        type=int,
+        default=8,
+        help="Tiles retained per case with --candidates-from",
+    )
+    sweeper.add_argument(
         "--resume",
         action="store_true",
         help="Append to an interrupted sweep, skipping complete cases",
@@ -1237,6 +1580,32 @@ def parse_args(argv=None):
         "--selected-dir", required=True, type=Path, help="Copy full-MoE winners here"
     )
 
+    shortlister = offline["shortlist"]
+    shortlister.add_argument(
+        "--results",
+        required=True,
+        type=Path,
+        action="append",
+        help="Stage sweep JSONL; repeat for FC1 activation and shared FC2 sweeps",
+    )
+    shortlister.add_argument(
+        "--selected-dir",
+        required=True,
+        type=Path,
+        help="Merge shortlist entries and copy their kernels here",
+    )
+    shortlister.add_argument(
+        "--width", type=int, default=2, help="Candidates per stage per profile"
+    )
+    shortlister.add_argument(
+        "--validate",
+        action="store_true",
+        help="Check every shortlisted pair with routed inputs and graph replay",
+    )
+    shortlister.add_argument(
+        "--replace", action="store_true", help="Replace differing profile entries"
+    )
+
     args = parser.parse_args(argv)
     if args.mode == "benchmark":
         if min(args.rounds, args.iterations, args.graph_batch) <= 0:
@@ -1256,8 +1625,10 @@ def parse_args(argv=None):
 
     command = offline[args.mode]
     args.artifacts = args.artifacts.resolve()
-    if args.mode == "select":
+    if args.mode in ("select", "shortlist"):
         args.selected_dir = args.selected_dir.resolve()
+        if args.mode == "shortlist" and not 1 <= args.width <= 2:
+            command.error("the Frost shortlist runtime accepts one or two per stage")
         return args
     try:
         args.geometries = [
@@ -1342,18 +1713,18 @@ def parse_args(argv=None):
             "stage_only",
             "keep_going",
             "shortlist_by_mma",
+            "candidates_from",
+            "candidates_top",
         ):
             current = getattr(args, key)
-            if json.loads(json.dumps(current, default=str)) != old.get(
-                key,
-                (
-                    "swiglu"
-                    if key == "activation"
-                    else False
-                    if key in ("keep_going", "shortlist_by_mma")
-                    else None
-                ),
-            ):
+            # Defaults for options added after a sweep output was started.
+            default = dict(
+                activation="swiglu",
+                keep_going=False,
+                shortlist_by_mma=False,
+                candidates_top=8,
+            ).get(key)
+            if json.loads(json.dumps(current, default=str)) != old.get(key, default):
                 command.error(f"cannot resume with changed {key}")
     return args
 
@@ -1368,6 +1739,10 @@ def main():
     if args.mode == "select":
         with args.output.open("x") as file:
             select(args, file)
+        return
+    if args.mode == "shortlist":
+        with args.output.open("x") as file:
+            shortlist(args, file)
         return
     check_idle_gpu(torch.cuda.get_device_properties(0).uuid)
     with args.output.open("a" if args.resume else "x") as file:
