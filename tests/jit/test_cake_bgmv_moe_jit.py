@@ -466,6 +466,11 @@ def test_grouped_workspace_sizing_and_selector():
     assert select(8192, 4096, 8, 128, 4096, 32)
     assert select(4096, 2048, 8, 128, 3072, 32)  # 4 routes per bin
     assert not select(2048, 1024, 8, 128, 3072, 32)  # 2 routes per bin
+    # 2048 <= routes < 4096: only rank 64 reuses enough weight per route
+    assert select(2048, 1024, 4, 128, 4096, 64)
+    assert not select(2048, 1024, 4, 128, 4096, 32)
+    assert not select(3072, 1536, 4, 128, 7168, 8)
+    assert select(4096, 2048, 4, 128, 7168, 8)
     assert not select(1024, 512, 8, 128, 4096, 32)
     assert not select(8192, 4096, 64, 128, 4096, 32)  # too many bins
     assert not select(8192, 4096, 0, 128, 4096, 32)

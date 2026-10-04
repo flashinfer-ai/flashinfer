@@ -116,6 +116,23 @@ inline int32_t GroupShrinkRankTilesPerCta(int32_t num_tiles) {
   while (per_cta * 2 <= budget) per_cta *= 2;
   return per_cta;
 }
+// Column blocks (kGroupExpandThreads columns each) one grouped-expand CTA walks.
+// Blackwell: 8 at hidden >= 4096, 4 below (the expand is a per-CTA latency chain; 8 blocks at
+// hidden 2048 leaves too few CTAs); sm_90 rank 64 the same, rank 8-32 2 (neutral at 2-8 on H100).
+inline int32_t GroupExpandColBlocksPerCta(int32_t hidden, int32_t col_blocks) {
+  static thread_local int cached_device = -1;
+  static thread_local int cached_major = 0;
+  int device = 0;
+  cudaGetDevice(&device);
+  if (device != cached_device) {
+    cudaDeviceGetAttribute(&cached_major, cudaDevAttrComputeCapabilityMajor, device);
+    cached_device = device;
+  }
+  int32_t per_cta = hidden >= 4096 ? 8 : 4;
+  if (cached_major == 9 && kRank < 32) per_cta = 2;
+  if (per_cta > col_blocks) per_cta = col_blocks;
+  return per_cta < 1 ? 1 : per_cta;
+}
 static_assert(kGroupTileTokens % kGroupShrinkRoutes == 0,
               "route tile must split into whole grouped-shrink parts");
 static_assert(kRank % kGroupShrinkRankTile == 0,
@@ -462,12 +479,19 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
                                static_cast<int32_t>(off.tile_table),
                                static_cast<int32_t>(off.sorted_routes)),
               "Cake BGMV MoE grouped shrink launch");
-    const dim3 expand_grid(max_tiles, (hidden + kGroupExpandThreads - 1) / kGroupExpandThreads, 1);
-    CheckCuda(LaunchGroupedPdl(
-                  CAKE_BGMV_MOE_EXPAND_GROUPED, expand_grid, dim3(kGroupExpandThreads, 1, 1),
-                  kExpandGroupedSmemBytes, stream, partials_ptr, shrink_ptr, b_ptr, num_pairs,
-                  num_experts, hidden, ws_ptr, static_cast<int32_t>(off.group_offset),
-                  static_cast<int32_t>(off.tile_table), static_cast<int32_t>(off.sorted_routes)),
+    // Column blocks one grouped-expand CTA walks (see GroupExpandColBlocksPerCta): the tile's route
+    // ids and shrink rows are staged once per CTA and the expand's dependent lookup chain is paid
+    // once per group of blocks; the per-(route, column) MMA and stores are unchanged (bitwise
+    // identical partials for any value).
+    const int32_t expand_col_blocks = (hidden + kGroupExpandThreads - 1) / kGroupExpandThreads;
+    const int32_t expand_cbpc = GroupExpandColBlocksPerCta(hidden, expand_col_blocks);
+    const dim3 expand_grid(max_tiles, (expand_col_blocks + expand_cbpc - 1) / expand_cbpc, 1);
+    CheckCuda(LaunchGroupedPdl(CAKE_BGMV_MOE_EXPAND_GROUPED, expand_grid,
+                               dim3(kGroupExpandThreads, 1, 1), kExpandGroupedSmemBytes, stream,
+                               partials_ptr, shrink_ptr, b_ptr, num_pairs, num_experts, hidden,
+                               ws_ptr, static_cast<int32_t>(off.group_offset),
+                               static_cast<int32_t>(off.tile_table),
+                               static_cast<int32_t>(off.sorted_routes), expand_cbpc),
               "Cake BGMV MoE grouped expand launch");
     const int32_t output_stride = hidden;
     const int32_t output_offset = 0;

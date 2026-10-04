@@ -642,11 +642,24 @@ def test_grouped_pipeline_matches_reference_and_replays_bitwise(
 
 def test_grouped_pipeline_is_selected_for_wide_generic_prefill():
     _require_cake_arch()
-    wide = _make_inputs(2048, 1024, torch.bfloat16, rank=16)
+    # 2048 routes over 256 (lora, expert) bins: between 2048 and 4096 routes only
+    # rank 64 reuses enough weight per route to beat the per-route kernels
+    # (rank 8-32 stay per-route there; see select_cake_bgmv_moe_generic_grouped).
+    wide = _make_inputs(2048, 1024, torch.bfloat16, rank=64)
     plan = prepare_bgmv_moe(*wide, backend="cake", fallback=False)
     assert plan.variant == "generic"
-    assert plan.grouped, "2048 routes over 256 (lora, expert) bins should group"
+    assert plan.grouped, (
+        "2048 routes over 256 (lora, expert) bins should group at rank 64"
+    )
     assert plan.group_partials.numel() == 2048 * 2048
+    mid_rank = _make_inputs(2048, 1024, torch.bfloat16, rank=16)
+    plan16 = prepare_bgmv_moe(*mid_rank, backend="cake", fallback=False)
+    assert plan16.variant == "generic" and not plan16.grouped
+    plan16.close()
+    wide16 = _make_inputs(2048, 2048, torch.bfloat16, rank=16)
+    plan16 = prepare_bgmv_moe(*wide16, backend="cake", fallback=False)
+    assert plan16.grouped, "4096 routes over 256 bins should group at rank 16"
+    plan16.close()
     # Same numerics as the per-route pipeline (bitwise shrink, FP32-reordered
     # expand). The FP64 reference is covered by the forced-grouped test; at this
     # 2M-element shape the bf16 shrink intermediate shared by both pipelines can
@@ -659,7 +672,7 @@ def test_grouped_pipeline_is_selected_for_wide_generic_prefill():
     assert torch.equal(plan.shrink_out, ungrouped.shrink_out)
     ungrouped.close()
     plan.close()
-    narrow = _make_inputs(2048, 64, torch.bfloat16, rank=16)
+    narrow = _make_inputs(2048, 64, torch.bfloat16, rank=64)
     plan = prepare_bgmv_moe(*narrow, backend="cake", fallback=False)
     assert plan.variant == "generic" and not plan.grouped
     assert plan.group_partials.numel() == 1

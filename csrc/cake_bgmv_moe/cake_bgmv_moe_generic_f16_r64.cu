@@ -6413,11 +6413,11 @@ __global__ __launch_bounds__(128, 4) void kernel_flashinfer_bgmv_moe_shrink_grou
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) void kernel_flashinfer_bgmv_moe_expand_grouped_f16_r64(
+__global__ __launch_bounds__(256, 3) void kernel_flashinfer_bgmv_moe_expand_grouped_f16_r64(
     float* __restrict__ partials_raw, uint16_t* __restrict__ shrink_raw,
     uint16_t* __restrict__ lora_b_raw, int num_pairs, int num_experts, int hidden,
     unsigned int* __restrict__ workspace_raw, int off_group_offset, int off_tile_table,
-    int off_sorted_routes) {
+    int off_sorted_routes, int col_blocks_per_cta) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -6464,12 +6464,16 @@ __global__ __launch_bounds__(256, 1) void kernel_flashinfer_bgmv_moe_expand_grou
     int tig = lane % 4;
     long long weight_row_base = (long long)(lora * num_experts + expert) * (long long)hidden;
     unsigned int a_frag[32];
+    unsigned int a_next[32];
+    int col_blocks = (hidden + 256 - 1) / 256;
+    int cb_first = blockIdx.y * col_blocks_per_cta;
+    int first_base = cb_first * 256;
 #pragma unroll
     for (int c = 0; c < 8; c++) {
       int w_chunk = c * 256 + tid;
       int w_col = w_chunk / 8;
       int w_part = w_chunk % 8;
-      int w_gcol = blockIdx.y * 256 + w_col;
+      int w_gcol = first_base + w_col;
       int w_scol = w_gcol;
       if (w_gcol >= hidden) {
         w_scol = 0;
@@ -6504,106 +6508,137 @@ __global__ __launch_bounds__(256, 1) void kernel_flashinfer_bgmv_moe_expand_grou
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
     float acc[16];
-#pragma unroll
-    for (int i = 0; i < 16; i++) {
-      acc[i] = 0.0f;
-    }
     unsigned int b_lo[1];
     unsigned int b_hi[1];
+#pragma unroll 1
+    for (int cb = 0; cb < col_blocks_per_cta; cb++) {
+      int col_block = cb_first + cb;
+      if (col_block < col_blocks) {
+        int col_base = col_block * 256;
+        if (cb > 0) {
+          __syncthreads();
 #pragma unroll
-    for (int ks = 0; ks < 4; ks++) {
-      unsigned int a0[4];
-      unsigned int a1[4];
-      int w_lane_row = warp * 32 + lane % 16;
-      int w_hi = lane / 16 * 16;
-      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                   : "=r"(a0[0]), "=r"(a0[1]), "=r"(a0[2]), "=r"(a0[3])
-                   : "r"(w_smem_addr + (unsigned int)(w_lane_row * 144) + (unsigned int)(ks * 32) +
-                         (unsigned int)w_hi)
-                   : "memory");
-      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                   : "=r"(a1[0]), "=r"(a1[1]), "=r"(a1[2]), "=r"(a1[3])
-                   : "r"(w_smem_addr + (unsigned int)((w_lane_row + 16) * 144) +
-                         (unsigned int)(ks * 32) + (unsigned int)w_hi)
-                   : "memory");
-#pragma unroll
-      for (int nt = 0; nt < 2; nt++) {
-        int slot = nt * 8 + group_id;
-        b_lo[0] = 0;
-        b_hi[0] = 0;
-        if (slot < count) {
-          asm volatile("ld.shared.b32 %0, [%1];"
-                       : "=r"(*reinterpret_cast<uint32_t*>(&b_lo[0]))
-                       : "r"(s_smem_addr + (unsigned int)((slot * 64 + ks * 16 + tig * 2) * 2)));
-          asm volatile(
-              "ld.shared.b32 %0, [%1];"
-              : "=r"(*reinterpret_cast<uint32_t*>(&b_hi[0]))
-              : "r"(s_smem_addr + (unsigned int)((slot * 64 + ks * 16 + 8 + tig * 2) * 2)));
-        }
-        uint32_t _mma_sync_m16n8k16_b_0[2];
-        _mma_sync_m16n8k16_b_0[0] = b_lo[0];
-        _mma_sync_m16n8k16_b_0[1] = b_hi[0];
-#pragma unroll
-        for (int m_tile = 0; m_tile < 2; m_tile++) {
-          float grp[4];
-#pragma unroll
-          for (int i_1 = 0; i_1 < 4; i_1++) {
-            grp[i_1] = 0.0f;
-          }
-          if (m_tile == 0) {
+          for (int c_1 = 0; c_1 < 8; c_1++) {
+            int n_chunk = c_1 * 256 + tid;
+            int n_col = n_chunk / 8;
+            int n_part = n_chunk % 8;
+            int n_gcol = col_base + n_col;
+            int n_scol = n_gcol;
+            if (n_gcol >= hidden) {
+              n_scol = 0;
+            }
             asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, "
-                "%7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                : "+f"(grp[0]), "+f"(grp[1]), "+f"(grp[2]), "+f"(grp[3])
-                : "r"(a0[0]), "r"(a0[1]), "r"(a0[2]), "r"(a0[3]), "r"(_mma_sync_m16n8k16_b_0[0]),
-                  "r"(_mma_sync_m16n8k16_b_0[1]));
-          } else {
-            asm volatile(
-                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, "
-                "%7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                : "+f"(grp[0]), "+f"(grp[1]), "+f"(grp[2]), "+f"(grp[3])
-                : "r"(a1[0]), "r"(a1[1]), "r"(a1[2]), "r"(a1[3]), "r"(_mma_sync_m16n8k16_b_0[0]),
-                  "r"(_mma_sync_m16n8k16_b_0[1]));
+                "cp.async.cg.shared::cta.global [%0], [%1], 16, %2;" ::"r"(
+                    w_smem_addr + (unsigned int)(n_col * 144) + (unsigned int)(n_part * 16)),
+                "l"(reinterpret_cast<const unsigned int*>(lora_b_raw) +
+                    ((weight_row_base + (long long)n_scol) * 32 + (long long)(n_part * 4))),
+                "r"((n_gcol < hidden) ? 16 : 0));
           }
+          asm volatile("cp.async.commit_group;");
+          asm volatile("cp.async.wait_group 0;");
+          __syncthreads();
+        }
 #pragma unroll
-          for (int i_2 = 0; i_2 < 4; i_2++) {
-            acc[(m_tile * 2 + nt) * 4 + i_2] = acc[(m_tile * 2 + nt) * 4 + i_2] + grp[i_2];
+        for (int i = 0; i < 16; i++) {
+          acc[i] = 0.0f;
+        }
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+          unsigned int a0[4];
+          unsigned int a1[4];
+          int w_lane_row = warp * 32 + lane % 16;
+          int w_hi = lane / 16 * 16;
+          asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                       : "=r"(a0[0]), "=r"(a0[1]), "=r"(a0[2]), "=r"(a0[3])
+                       : "r"(w_smem_addr + (unsigned int)(w_lane_row * 144) +
+                             (unsigned int)(ks * 32) + (unsigned int)w_hi)
+                       : "memory");
+          asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                       : "=r"(a1[0]), "=r"(a1[1]), "=r"(a1[2]), "=r"(a1[3])
+                       : "r"(w_smem_addr + (unsigned int)((w_lane_row + 16) * 144) +
+                             (unsigned int)(ks * 32) + (unsigned int)w_hi)
+                       : "memory");
+#pragma unroll
+          for (int nt = 0; nt < 2; nt++) {
+            int slot = nt * 8 + group_id;
+            b_lo[0] = 0;
+            b_hi[0] = 0;
+            if (slot < count) {
+              asm volatile(
+                  "ld.shared.b32 %0, [%1];"
+                  : "=r"(*reinterpret_cast<uint32_t*>(&b_lo[0]))
+                  : "r"(s_smem_addr + (unsigned int)((slot * 64 + ks * 16 + tig * 2) * 2)));
+              asm volatile(
+                  "ld.shared.b32 %0, [%1];"
+                  : "=r"(*reinterpret_cast<uint32_t*>(&b_hi[0]))
+                  : "r"(s_smem_addr + (unsigned int)((slot * 64 + ks * 16 + 8 + tig * 2) * 2)));
+            }
+            uint32_t _mma_sync_m16n8k16_b_0[2];
+            _mma_sync_m16n8k16_b_0[0] = b_lo[0];
+            _mma_sync_m16n8k16_b_0[1] = b_hi[0];
+#pragma unroll
+            for (int m_tile = 0; m_tile < 2; m_tile++) {
+              float grp[4];
+#pragma unroll
+              for (int i_1 = 0; i_1 < 4; i_1++) {
+                grp[i_1] = 0.0f;
+              }
+              if (m_tile == 0) {
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, "
+                    "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                    : "+f"(grp[0]), "+f"(grp[1]), "+f"(grp[2]), "+f"(grp[3])
+                    : "r"(a0[0]), "r"(a0[1]), "r"(a0[2]), "r"(a0[3]),
+                      "r"(_mma_sync_m16n8k16_b_0[0]), "r"(_mma_sync_m16n8k16_b_0[1]));
+              } else {
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, "
+                    "%6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                    : "+f"(grp[0]), "+f"(grp[1]), "+f"(grp[2]), "+f"(grp[3])
+                    : "r"(a1[0]), "r"(a1[1]), "r"(a1[2]), "r"(a1[3]),
+                      "r"(_mma_sync_m16n8k16_b_0[0]), "r"(_mma_sync_m16n8k16_b_0[1]));
+              }
+#pragma unroll
+              for (int i_2 = 0; i_2 < 4; i_2++) {
+                acc[(m_tile * 2 + nt) * 4 + i_2] = acc[(m_tile * 2 + nt) * 4 + i_2] + grp[i_2];
+              }
+            }
           }
         }
-      }
-    }
 #pragma unroll
-    for (int nt_1 = 0; nt_1 < 2; nt_1++) {
-      int route_a = nt_1 * 8 + tig * 2;
-      int route_b = nt_1 * 8 + tig * 2 + 1;
+        for (int nt_1 = 0; nt_1 < 2; nt_1++) {
+          int route_a = nt_1 * 8 + tig * 2;
+          int route_b = nt_1 * 8 + tig * 2 + 1;
 #pragma unroll
-      for (int m_tile_1 = 0; m_tile_1 < 2; m_tile_1++) {
-        int col_lo = blockIdx.y * 256 + warp * 32 + m_tile_1 * 16 + group_id;
-        int col_hi = col_lo + 8;
-        if (route_a < count) {
-          long long pair_a = (long long)route_smem[route_a] * (long long)hidden;
-          if (col_lo < hidden) {
-            *(reinterpret_cast<float*>(reinterpret_cast<float*>(partials_raw) +
-                                       (pair_a + (long long)col_lo)) +
-              (0)) = acc[(m_tile_1 * 2 + nt_1) * 4];
-          }
-          if (col_hi < hidden) {
-            *(reinterpret_cast<float*>(reinterpret_cast<float*>(partials_raw) +
-                                       (pair_a + (long long)col_hi)) +
-              (0)) = acc[(m_tile_1 * 2 + nt_1) * 4 + 2];
-          }
-        }
-        if (route_b < count) {
-          long long pair_b = (long long)route_smem[route_b] * (long long)hidden;
-          if (col_lo < hidden) {
-            *(reinterpret_cast<float*>(reinterpret_cast<float*>(partials_raw) +
-                                       (pair_b + (long long)col_lo)) +
-              (0)) = acc[(m_tile_1 * 2 + nt_1) * 4 + 1];
-          }
-          if (col_hi < hidden) {
-            *(reinterpret_cast<float*>(reinterpret_cast<float*>(partials_raw) +
-                                       (pair_b + (long long)col_hi)) +
-              (0)) = acc[(m_tile_1 * 2 + nt_1) * 4 + 3];
+          for (int m_tile_1 = 0; m_tile_1 < 2; m_tile_1++) {
+            int col_lo = col_base + warp * 32 + m_tile_1 * 16 + group_id;
+            int col_hi = col_lo + 8;
+            if (route_a < count) {
+              long long pair_a = (long long)route_smem[route_a] * (long long)hidden;
+              if (col_lo < hidden) {
+                *(reinterpret_cast<float*>(reinterpret_cast<float*>(partials_raw) +
+                                           (pair_a + (long long)col_lo)) +
+                  (0)) = acc[(m_tile_1 * 2 + nt_1) * 4];
+              }
+              if (col_hi < hidden) {
+                *(reinterpret_cast<float*>(reinterpret_cast<float*>(partials_raw) +
+                                           (pair_a + (long long)col_hi)) +
+                  (0)) = acc[(m_tile_1 * 2 + nt_1) * 4 + 2];
+              }
+            }
+            if (route_b < count) {
+              long long pair_b = (long long)route_smem[route_b] * (long long)hidden;
+              if (col_lo < hidden) {
+                *(reinterpret_cast<float*>(reinterpret_cast<float*>(partials_raw) +
+                                           (pair_b + (long long)col_lo)) +
+                  (0)) = acc[(m_tile_1 * 2 + nt_1) * 4 + 1];
+              }
+              if (col_hi < hidden) {
+                *(reinterpret_cast<float*>(reinterpret_cast<float*>(partials_raw) +
+                                           (pair_b + (long long)col_hi)) +
+                  (0)) = acc[(m_tile_1 * 2 + nt_1) * 4 + 3];
+              }
+            }
           }
         }
       }

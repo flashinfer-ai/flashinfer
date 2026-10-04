@@ -102,6 +102,7 @@ CAKE_BGMV_MOE_GROUP_HIST_THREADS = 256
 CAKE_BGMV_MOE_GROUP_HIST_PAIRS_PER_LANE = 4
 CAKE_BGMV_MOE_GROUP_HIST_CTAS_MAX = 64
 CAKE_BGMV_MOE_GROUPED_MIN_PAIRS = 2048
+CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_SUB64 = 4096
 CAKE_BGMV_MOE_GROUPED_MIN_ROUTES_PER_BIN = 4
 CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS = 12288
 CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS_R8 = 16384
@@ -163,8 +164,9 @@ def select_cake_bgmv_moe_generic_grouped(
     ``CAKE_BGMV_MOE_GROUPED_MIN_ROUTES_PER_BIN`` routes per bin) and the
     per-pair weights (``hidden_size * rank``) are large enough for the saved
     traffic to exceed the fixed grouping prologue and the FP32 partials round
-    trip; the grouping prologue bounds the bin count by
-    ``CAKE_BGMV_MOE_GROUP_BINS_MAX``.
+    trip; between ``CAKE_BGMV_MOE_GROUPED_MIN_PAIRS`` and
+    ``CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_SUB64`` routes only rank 64 wins; the
+    grouping prologue bounds the bin count by ``CAKE_BGMV_MOE_GROUP_BINS_MAX``.
     """
 
     bins = int(num_loras) * int(num_experts)
@@ -173,6 +175,8 @@ def select_cake_bgmv_moe_generic_grouped(
     if int(num_pairs) < CAKE_BGMV_MOE_GROUPED_MIN_PAIRS:
         return False
     if int(num_pairs) < CAKE_BGMV_MOE_GROUPED_MIN_ROUTES_PER_BIN * bins:
+        return False
+    if int(rank) < 64 and int(num_pairs) < CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_SUB64:
         return False
     min_elems = (
         CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS
