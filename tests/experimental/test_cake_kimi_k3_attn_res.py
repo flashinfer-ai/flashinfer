@@ -177,6 +177,57 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x):
     assert plan.route_id.startswith(schedule_id + ".")
 
 
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+@pytest.mark.parametrize("pdl", (False, True))
+@pytest.mark.parametrize(
+    "M,K", ((1, 1), (16, 7), (64, 4), (256, 7), (1024, 1), (4096, 4))
+)
+def test_plan_route_snapshot_write_takes_the_small_m_write_programs(arch, M, K, pdl):
+    """Round r4: the block-boundary snapshot write (block K written) runs the small-M write
+    programs at every M - the cluster / chunk bands of the dense family inside its M table,
+    one CTA per token above it."""
+    plan = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=K)
+    cluster = cb._small_m_cluster(arch, M, K)
+    nc = cb._small_m_sources_per_chunk(arch, M, K)
+    nc_suffix = "" if nc is None else f"_nc{nc}"
+    family = "direct" if cluster == 1 else f"cluster{cluster}"
+    assert plan.kind == "small_m"
+    assert plan.kernel_key == f"small_m_{family}:k{K}{nc_suffix}_write"
+    assert plan.grid_x == M * cluster and plan.threads == 256 // cluster
+    assert plan.schedule_id.endswith(f"_regres_fp32x2{nc_suffix}_write")
+    assert f".k{K}.delta1.write1.norm1.pdl{int(pdl)}." in plan.route_id
+    assert plan.fallback_from is None
+    with pytest.raises(ValueError):
+        cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=K - 1)
+    with pytest.raises(ValueError):
+        cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=MAX_BLOCKS)
+
+
+def test_snapshot_write_fallback_stays_in_the_write_family(monkeypatch):
+    """A registered-variant fallback of a snapshot-write plan only ever selects another
+    small-M write program (the snapshot store exists nowhere else)."""
+    table = {
+        "small_m_direct:k7_write": "m1",
+        "small_m_direct:k7": "m2",
+        "persistent:k7_nc4_d2_f110000000000000": "m3",
+    }
+    monkeypatch.setattr(cb, "KERNELS", {"sm_100a": table})
+    exact = cb._plan_route_exact("sm_100a", SM_COUNT, 64, 7, False, block_write_idx=7)
+    assert exact.kernel_key not in table
+    resolved = cb._resolve_registered(exact, SM_COUNT, 64)
+    assert resolved.kernel_key == "small_m_direct:k7_write"
+    assert resolved.fallback_from == exact.kernel_key
+    assert (
+        resolved.route_id.endswith(".registered_fallback")
+        and ".write1." in resolved.route_id
+    )
+    monkeypatch.setattr(cb, "KERNELS", {"sm_100a": {"small_m_direct:k7": "m2"}})
+    unresolved = cb._resolve_registered(exact, SM_COUNT, 64)
+    assert (
+        unresolved.kernel_key == exact.kernel_key and unresolved.fallback_from is None
+    )
+
+
 def test_plan_route_bootstrap_variants():
     plan = plan_route(
         None, 0, 17, 4, False, has_delta=False, block_write_idx=4, common_path=False
@@ -503,8 +554,7 @@ def test_matches_reference(M, K, pdl):
     "M,K,has_delta,write_idx,apply_output_norm",
     [
         (1, 0, False, 0, True),
-        (17, 4, True, 4, True),
-        (3, 7, True, 7, True),
+        (17, 4, True, 2, True),
         (17, 4, False, -1, True),
         (7, 8, True, -1, False),
     ],
@@ -543,11 +593,52 @@ def test_semantic_variants_take_the_bootstrap(
     _check(inputs, expected)
 
 
+@pytest.mark.parametrize("M,K", [(17, 4), (3, 7), (1, 1), (300, 4), (1024, 1)])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_snapshot_write_matches_reference_on_the_small_m_write_programs(M, K, pdl):
+    """Round r4: the block-boundary snapshot write (delta + output norm, block K written) runs a
+    small-M write program; the written snapshot and the prefix are bit-exact, the output within
+    tolerance, every other block byte preserved."""
+    device, arch = _device_arch()
+    if not cb.generated_program_available(
+        device, M, K, enable_pdl=pdl, block_write_idx=K
+    ):
+        pytest.skip("small-M write program not registered for this cell")
+    inputs = _make_inputs(M, K)
+    assert common_path_eligible(
+        **{k: v for k, v in inputs.items() if k != "num_blocks"},
+        num_blocks=K,
+        block_write_idx=K,
+    )
+    expected = _clone(inputs)
+    reference_kimi_k3_attn_res(
+        **{k: v for k, v in expected.items() if k != "num_blocks"},
+        num_blocks=K,
+        block_write_idx=K,
+    )
+    runner = prepare_kimi_k3_attn_res(
+        **{k: v for k, v in inputs.items() if k != "num_blocks"},
+        num_blocks=K,
+        block_write_idx=K,
+        enable_pdl=pdl,
+    )
+    assert runner.plan.kind == "small_m"
+    assert runner.plan.kernel_key.endswith("_write")
+    assert ".write1." in runner.plan.route_id
+    runner.launch()
+    torch.cuda.synchronize()
+    _check(inputs, expected)
+    assert torch.equal(
+        inputs["blocks"][:, K, :].view(torch.int16), inputs["prefix"].view(torch.int16)
+    )
+
+
 def test_row_padded_layout_takes_the_bootstrap():
     device, arch = _device_arch()
     inputs = _make_inputs(5, 4, row_padding=64)
     assert not common_path_eligible(
         **{k: v for k, v in inputs.items() if k not in ("num_blocks",)},
+        num_blocks=4,
         block_write_idx=-1,
     )
     if not cb.generated_program_available(device, 5, 4, common_path=False):

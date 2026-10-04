@@ -34,8 +34,9 @@ the semantic flags), exactly as the Cake production dispatcher does; the export
 verifies key, grid and schedule parity for every row of its denominator.  Dense
 token-major inputs with the residual add and the fused output norm take the
 persistent TMEM path (or one of the installed native ports / the exact K = 0
-path); the other semantic variants (no delta, snapshot write, no output norm,
-row-padded layouts) take the one-CTA-per-token bootstrap program.
+path); the block-boundary snapshot write (``block_write_idx`` >= K) runs the small-M
+write programs; the other semantic variants (no delta, a snapshot write below K, no
+output norm, row-padded layouts) take the one-CTA-per-token bootstrap program.
 
 ``prepare_kimi_k3_attn_res`` binds one call; its ``launch()`` performs no CUDA
 allocation and no host synchronisation and is CUDA-graph capturable (capture
@@ -339,7 +340,9 @@ _PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
 _PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
 _PERSISTENT_FLAG_ONE_TOKEN_PER_CTA = 4
 _PERSISTENT_KEY = re.compile(r"^persistent:k(\d+)_nc(\d+)_d(\d+)_f([01]+)$")
-_SMALL_M_KEY = re.compile(r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?$")
+_SMALL_M_KEY = re.compile(
+    r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_write)?$"
+)
 
 
 def _persistent_schedule_id(nc: int, depth: int, bits: str) -> str:
@@ -358,21 +361,36 @@ def _persistent_schedule_id(nc: int, depth: int, bits: str) -> str:
 
 
 def _small_m_plan(
-    arch: str, M: int, K: int, use_pdl: bool, cluster: int, exact_key: Optional[str]
+    arch: str,
+    M: int,
+    K: int,
+    use_pdl: bool,
+    cluster: int,
+    exact_key: Optional[str],
+    *,
+    sources_per_chunk: Optional[int] = None,
+    write_block: bool = False,
 ) -> RoutePlan:
+    """A small-M family plan: ``cluster`` CTAs per token, chunk ``sources_per_chunk`` (``None`` =
+    the module default of K), ``write_block`` = the snapshot-write variant (round r4).
+    ``exact_key`` marks a registered-variant fallback of that exact plan."""
     threads = DIRECT_THREADS // cluster
+    nc_suffix = "" if sources_per_chunk is None else f"_nc{int(sources_per_chunk)}"
+    write_suffix = "_write" if write_block else ""
     if cluster == 1:
-        schedule_id = "small_m_direct_cta256_regres_fp32x2"
+        schedule_id = f"small_m_direct_cta256_regres_fp32x2{nc_suffix}{write_suffix}"
         grid_policy = "one_token_per_cta"
-        kernel_key = f"small_m_direct:k{K}"
+        kernel_key = f"small_m_direct:k{K}{nc_suffix}{write_suffix}"
     else:
-        schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2"
+        schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2{nc_suffix}{write_suffix}"
         grid_policy = f"one_token_per_cluster{cluster}"
-        kernel_key = f"small_m_cluster{cluster}:k{K}"
+        kernel_key = f"small_m_cluster{cluster}:k{K}{nc_suffix}{write_suffix}"
     route_id = (
-        f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write0.norm1."
-        f"pdl{int(use_pdl)}.{grid_policy}.registered_fallback"
+        f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write{int(write_block)}.norm1."
+        f"pdl{int(use_pdl)}.{grid_policy}"
     )
+    if exact_key is not None:
+        route_id += ".registered_fallback"
     return RoutePlan(
         "small_m",
         kernel_key,
@@ -458,12 +476,24 @@ def _resolve_registered(plan: RoutePlan, num_sms: int, M: int) -> RoutePlan:
             return plan
         K = int(match.group(3))
         same_cluster = int(match.group(2)) if match.group(2) else 1
+        write_block = match.group(5) is not None
+        write_suffix = "_write" if write_block else ""
         for cluster in (same_cluster, 2, 4, 1):
-            if (
-                f"small_m_{'direct' if cluster == 1 else f'cluster{cluster}'}:k{K}"
-                in table
-            ):
-                return _small_m_plan(plan.arch, M, K, plan.use_pdl, cluster, exact_key)
+            family = "direct" if cluster == 1 else f"cluster{cluster}"
+            if f"small_m_{family}:k{K}{write_suffix}" in table:
+                return _small_m_plan(
+                    plan.arch,
+                    M,
+                    K,
+                    plan.use_pdl,
+                    cluster,
+                    exact_key,
+                    write_block=write_block,
+                )
+        if write_block:
+            # the snapshot store exists only in the small-M write programs: never substitute
+            # a program of other semantics
+            return plan
         fallback = _persistent_fallback(plan, table, num_sms, M, K, exact_key)
         return fallback if fallback is not None else plan
     if plan.kind == "persistent":
@@ -548,35 +578,37 @@ def _plan_route_exact(
     num_sms = int(num_sms)
     if num_sms <= 0:
         raise ValueError(f"invalid persistent launch geometry M={M}, num_sms={num_sms}")
+    write_idx = int(block_write_idx)
+    if write_idx >= 0:
+        # Round r4 (direction 4): the dense snapshot-write call (block K written) runs the
+        # small-M write programs at every M: the cluster / chunk bands of the dense family
+        # inside its M table, one CTA per token above it. An index below K names a block the
+        # call also reads and never reaches the dense path (``common_path_eligible``).
+        if not K <= write_idx < MAX_BLOCKS:
+            raise ValueError(
+                "dense snapshot-write route requires num_blocks <= block_write_idx < "
+                f"{MAX_BLOCKS}, observed {write_idx} at K={K}"
+            )
+        return _small_m_plan(
+            arch,
+            M,
+            K,
+            use_pdl,
+            _small_m_cluster(arch, M, K),
+            None,
+            sources_per_chunk=_small_m_sources_per_chunk(arch, M, K),
+            write_block=True,
+        )
     max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
     if max_m is not None and max_m >= M:
-        cluster = _small_m_cluster(arch, M, K)
-        threads = DIRECT_THREADS // cluster
-        sources_per_chunk = _small_m_sources_per_chunk(arch, M, K)
-        nc_suffix = "" if sources_per_chunk is None else f"_nc{sources_per_chunk}"
-        if cluster == 1:
-            schedule_id = f"small_m_direct_cta256_regres_fp32x2{nc_suffix}"
-            grid_policy = "one_token_per_cta"
-            kernel_key = f"small_m_direct:k{K}{nc_suffix}"
-        else:
-            schedule_id = (
-                f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2{nc_suffix}"
-            )
-            grid_policy = f"one_token_per_cluster{cluster}"
-            kernel_key = f"small_m_cluster{cluster}:k{K}{nc_suffix}"
-        route_id = (
-            f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write0.norm1."
-            f"pdl{int(use_pdl)}.{grid_policy}"
-        )
-        return RoutePlan(
-            "small_m",
-            kernel_key,
-            M * cluster,
-            threads,
-            schedule_id,
-            route_id,
+        return _small_m_plan(
             arch,
+            M,
+            K,
             use_pdl,
+            _small_m_cluster(arch, M, K),
+            None,
+            sources_per_chunk=_small_m_sources_per_chunk(arch, M, K),
         )
     native = _native_route(arch, num_sms, M, K, use_pdl)
     if native is not None:
@@ -800,12 +832,17 @@ def common_path_eligible(
     output_norm_weight: Optional[torch.Tensor],
     out: torch.Tensor,
     *,
+    num_blocks: int,
     block_write_idx: int,
 ) -> bool:
-    """True when the call takes the persistent common path: residual add + fused output norm,
-    no snapshot write, token-major dense layouts with 16-byte aligned rows and a full
-    ``[M, 8, H]`` snapshot bank."""
-    if delta is None or output_norm_weight is None or int(block_write_idx) >= 0:
+    """True when the call takes the dense path: residual add + fused output norm, no snapshot
+    write or (round r4) a snapshot write at an index >= ``num_blocks`` (the small-M write
+    programs; an index below K names a block the call also reads and takes the bootstrap),
+    token-major dense layouts with 16-byte aligned rows and a full ``[M, 8, H]`` snapshot bank."""
+    if delta is None or output_norm_weight is None:
+        return False
+    write_idx = int(block_write_idx)
+    if 0 <= write_idx < int(num_blocks) or write_idx >= int(blocks.shape[1]):
         return False
     if (
         prefix.stride(0) != HIDDEN_SIZE
@@ -956,6 +993,7 @@ def prepare_kimi_k3_attn_res(
         qk_weight,
         output_norm_weight,
         out,
+        num_blocks=num_blocks,
         block_write_idx=block_write_idx,
     )
     plan = plan_route(
