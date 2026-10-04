@@ -86,7 +86,7 @@ MODES = {
 # The per-tensor FP8 mode is opt-in; the default precision set is unchanged.
 DEFAULT_PRECISIONS = ("bf16", "mxfp8", "nvfp4")
 # Alternative FC1 backends measured next to the native trtllm-gen kernels on the
-# same weights, activations and autotune policy. Cake runs NVFP4 StepFun only.
+# same weights, activations and autotune policy. Cake serves every precision.
 BACKENDS = {
     "trtllm": None,
     "cake": (CakeStepFunConfig, CakeStepFunRunner),
@@ -119,7 +119,7 @@ def parse_args():
         nargs="+",
         choices=tuple(BACKENDS),
         default=["trtllm"],
-        help="FC1 backends measured on the same inputs; cake applies to nvfp4 only.",
+        help="FC1 backends measured on the same inputs (the cake arm serves every precision).",
     )
     parser.add_argument(
         "--skip-native-baseline",
