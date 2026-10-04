@@ -1,12 +1,147 @@
 {
+  "families": {
+    "bf16": {
+      "dtypes": [
+        "Bfloat16",
+        "Bfloat16",
+        "Bfloat16"
+      ],
+      "index": 2,
+      "label": "BF16",
+      "per_token": false,
+      "template": "fc1_swiglu_step_bf16",
+      "tiles": [
+        8,
+        16,
+        32,
+        64,
+        128,
+        256
+      ],
+      "weight_layout": "BlockMajorK"
+    },
+    "fp8": {
+      "dtypes": [
+        "E4m3",
+        "E4m3",
+        "E4m3"
+      ],
+      "index": 3,
+      "label": "FP8 per-tensor",
+      "per_token": false,
+      "template": "fc1_swiglu_step_fp8",
+      "tiles": [
+        8,
+        16,
+        32
+      ],
+      "weight_layout": "MajorK"
+    },
+    "mxfp8": {
+      "dtypes": [
+        "MxE4m3",
+        "MxE4m3",
+        "MxE4m3"
+      ],
+      "index": 4,
+      "label": "MXFP8",
+      "per_token": false,
+      "template": "fc1_swiglu_step_mxfp8",
+      "tiles": [
+        8,
+        16,
+        64,
+        256
+      ],
+      "weight_layout": "MajorK"
+    },
+    "nvfp4": {
+      "dtypes": [
+        "E2m1",
+        "E2m1",
+        "E2m1"
+      ],
+      "index": 0,
+      "label": "NVFP4, E2m1 output",
+      "per_token": false,
+      "template": "fc1_swiglu_step_nvfp4",
+      "tiles": [
+        8,
+        16,
+        32,
+        64,
+        256
+      ],
+      "weight_layout": "MajorK"
+    },
+    "nvfp4_bf16tok": {
+      "dtypes": [
+        "E2m1",
+        "E2m1",
+        "Bfloat16"
+      ],
+      "index": 1,
+      "label": "NVFP4 with per-token activation scale, bf16 output",
+      "per_token": true,
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tiles": [
+        8,
+        16,
+        32,
+        64,
+        256
+      ],
+      "weight_layout": "MajorK"
+    }
+  },
   "files": {
-    "csrc/fused_moe/cake_stepfun/generated/cake_stepfun_generated_manifest.cuh": "28510f6c1aaed604ac8361ce1560c2056b0e32dc8c88a3f3a855f2e0eae6709c",
-    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_bf62888ad7d404d37ead_kernel.cu": "0702e4bfa63615517b61a3c48344169a80a1069e82af4dff7a897cdf7f48ff41",
-    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_c8922eb12574367ea8bd_kernel.cu": "e54a11dd03cb26367ef92f691042c4362c423ae715aaaabe983bc5d9f0d8e233",
-    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_cdc9e85272be5bd4607d_kernel.cu": "ea41901bc51243c0ecad8e9c995b7d919926578f87aa2012ea7a173b79810947",
-    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_3b07f796c6b5d83986b3_kernel.cu": "76c4725aab8c60439beece88580f08baf8ed0d3d9ef5c389c2973bb37b3bdf76",
-    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_422960eb8e44c7832931_kernel.cu": "c862ebf3bc4b74b04adca7269cd53e87a73e4d66b1086cef9fc6d31d27d61407",
-    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_b68d0d3662d1a885f85d_kernel.cu": "4095a8afe47abc7e2905cfe0c773cae583e4a34d3639de4df54d2bbe62728247"
+    "csrc/fused_moe/cake_stepfun/generated/cake_stepfun_generated_manifest.cuh": "767a1932d21e78a9ac570d3eff177090009655be23fd85cd9669fccc7058180b",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_061ea89239e052816f5b_kernel.cu": "27f3c54307070b4143280d192b0017dd237a35a446457f791e311b44af52fa1c",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_340303a9dd615ce980ba_kernel.cu": "030b9f156d5ee0334d9e19ce24f113ff7a7f56b1f84e5bc943604f3b060ad2cc",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_3b6b9929c1afac081d07_kernel.cu": "ebc7d17c0e2a4665c2093d62cb824225dd91263e1ea1d0b45bcc556ae23d3a1a",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_3d04c03557e32d7fd0a5_kernel.cu": "2ea754de86469c6e766deeb811a4402d36ff3a28d6efe29cfbff54a032dab96b",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_4b159cb3776ced087900_kernel.cu": "985c73243c28e1a05a08c51d5d0c2748985a2f210c60e62c8c02cc9f6232707e",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_6499782a39e979a64c1b_kernel.cu": "e570b58bf3faa2bbcef16794cd55d5037f9eedc1117d7357199c4cc745ca01d5",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_88eb494e40032b8fca58_kernel.cu": "58362ae076e08095c40e8088a54d0435321b868054388616b15e965feb8f97b4",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_8cd64028996cf99ee48d_kernel.cu": "67e0a462e8fb95cada242ea7a39ab295443ba93efc3c0588ad2e1c25b3631564",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_9113f5e1e9f73b91ac0d_kernel.cu": "13d6b13cd49157fe05e46f8ec9a5a4e0c4a544196c7f801c3129f5fbb59af33c",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_9c37b5d6d27ed4dff42e_kernel.cu": "c41318c5ac47a4fe028ab037b27bf647ad171c3831afb88186e4d0df2560f0ac",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_a0dd4c80a48cc17a021e_kernel.cu": "b1f920538c560c100ec040384dfdd69d4e20d0ef0c4bbad94a75832622dd4be3",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_a3f4da1fcd71ddb90d23_kernel.cu": "ad4887a493c322ee1370bae39e8270d57101c3c424ce272d2f6548e9063e6c39",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_aa631989f7128edcfb17_kernel.cu": "afd4d2e8dff716d3b8c88e176f5a7e2c3a9194ce536e2a46df055eca80321f90",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_ac0a51f6a2f1f94ab5fd_kernel.cu": "70a0a6510a3365c9ae60c96bab7c701a00a24b0c73c1c9830f0f90b0aece5e04",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_b7d35d82eb495a3505b4_kernel.cu": "d7a05e9e693a3051b43e38b586981b0a8e4a67a0f0285e861e657a164935a9cc",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_b8eedc76ca57a37e412b_kernel.cu": "8e879871c2da6aa1c8d36f6abdc8c53681a6ac80d7f044b611385a496926b94f",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_c0bc50c569435278918f_kernel.cu": "351f7f993ae791becf1732aa47b13899e9751761a803a0f421dcbc30f856ea1f",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_c0ed54d60a6512474675_kernel.cu": "8b390e49f56bfb94afd3c4d870dc4397125e10548dd75201c0ca400e25929e41",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_cfd60da4d7b7115ecf6d_kernel.cu": "7ab30bb62f1800f8d99f9082c8673f2cb4a611c0594fef845c5ce732994e9613",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_d451550cf2cf6873ef39_kernel.cu": "2a07b814fcf16c907f11f5d72ef463955ed5f951677acf83e7443c3553672662",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_d9d027f3686df7b18b90_kernel.cu": "b13f7ac89fb3a729f497669f27ea926893af84fdbf5fd46d64dbafaf720ee22e",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_e80e6397791a299acb31_kernel.cu": "f3e20beb09ae4648b1a555dde1651e3801eb076957e575e2cfbf0b8b7a7f1828",
+    "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_fb2c144da915e6ebb41a_kernel.cu": "a11af90116f5da69319a3990cd2794896d02e2394a5f686f8497a812e8e679fd",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_113a5a5b83f8dace4055_kernel.cu": "f55a7bc07275562f78d380be4617889dd6a3fb698ba7c3fc8de310bc9c2d0160",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_218fef426c49ccc14fff_kernel.cu": "c82be0568e087e60b0bf7a96381ad6a571a5da39c183d7d38fa3f3cd5a74ff40",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_25ecc7bcbbba81aa3ebe_kernel.cu": "a4838a0c9563e363000601d6aa0b0a460704176bd5dcab71de0b2dee338c97e3",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_2fdd64b1ef9c92ebb03b_kernel.cu": "e6809e54ebb485d729df258a624e980ecf9a74b01d47854c28a4c6a3ffa7c475",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_3139846bb4e3b6dc8968_kernel.cu": "a460f452a015bb32e59d63e4fcfb03424230971e45bacd4d96d570cc91bcc944",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_34d5515fb5275ffa6da6_kernel.cu": "cbcd4fae4fc7b09ad2d0cd53af0dcc7300228a50b7ebdc8d7778a94c7a305273",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_3bdd0b58896221d6a938_kernel.cu": "d31bb2d26a5423e21564af7c72e9e38502946a0ace6a45c8329515670a2c537d",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_46f032627936cd0f1a48_kernel.cu": "68386a0e733b29ec1ef633809ce0a305fe80bf99663b619b62f55ac2de9980ba",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_4d6a9ed197299d2cbf7f_kernel.cu": "1118aa9b38802980be61800b7b2954970d751c59a7ede9e812b9c33770fd5385",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_60ff2e25fad791084162_kernel.cu": "44d97c43fc4c60078eb94adc47e5f1ea388ec053f2b524de6102d728882334d4",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_6710e3c4a6d4bfdd7794_kernel.cu": "c69d619177f08812da0c18bfb412f5a195b51154bdfa11f461a268b2b587ac13",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_6eaf7199593df2474156_kernel.cu": "7fcb07916fe4c8375b8a5193c67f0d2a5ff9e43c3b5cfa479c2e35becdf5f8e8",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_7db406f0c04d4fd6ecef_kernel.cu": "18ed9af1a9d9a2543be9aad7aed7893313e3ae05335cd9aad94a9e5c193b9648",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_7e9cfa17e533352f21ef_kernel.cu": "8da721e91b10f129f7bc53478bc8cbda0ad91078acef03fe0e81b8d55b5448ad",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_9dce1dd514a72f60cc34_kernel.cu": "25b0901aaf645468f96afaf4da3fdaa219f65c78eb2ca6ae460f4ff302d9d331",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_a3f8e20510dfff150959_kernel.cu": "961e7173b746f28b9eb31375768e89d889df3ce5e729ac07894bc095c9e9d3c9",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_a7237dc88c80ca38b136_kernel.cu": "83d65177027b09a7a1b024ce1d6bb06a0c0bc47d6aa8d59d0d239d54b22b6782",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_a95b09f9322aa5385174_kernel.cu": "f5206b8d6707ebf1fffb03ec6479121ce1595c6fab9b54eaa1be0c177fcd5bc6",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_bdbdbc20d03963df6e30_kernel.cu": "8b149631dd189e333d17fbdf10671981ebbbf0b19dd79dc0f6a9781920c6b1f4",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_dc0ce4e0d9be093617c9_kernel.cu": "19693f1d47bc1cfb02a4a025a46f511e2e82d06272dc43d151f500b641b70aff",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_f2d77c4211d7f9a81f36_kernel.cu": "4d191389c0ae77fc8b7f70b2a4b4a3c9a45aa4a017a5f356383c5f7b95232d69",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_fb3c76992abd40c415e6_kernel.cu": "1e0d1250fd840b272689d1d913e258a1d5fcc70e23cc8557c9897615f90f535e",
+    "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_fcb13a981ad101b07dae_kernel.cu": "475aa315dde3e21af3429718de07235ebbdb6457a7a9d127dd6155cf7434662c"
   },
   "kernels": [
     {
@@ -17,16 +152,108 @@
         1
       ],
       "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_c8922eb12574367ea8bd_kernel.cu",
-      "dynamic_smem_bytes": 198912,
-      "kernel_symbol": "kernel_cake_stepfun_moe_c8922eb12574367ea8bd",
-      "name": "cake_stepfun_moe_c8922eb12574367ea8bd",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_3b6b9929c1afac081d07_kernel.cu",
+      "dynamic_smem_bytes": 199040,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_3b6b9929c1afac081d07",
+      "name": "cake_stepfun_moe_3b6b9929c1afac081d07",
       "output_rows_per_cta": 64,
-      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_static_nvfp4",
-      "template": "fc1_swiglu_step_static",
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 8
     },
     {
@@ -37,16 +264,108 @@
         1
       ],
       "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_bf62888ad7d404d37ead_kernel.cu",
-      "dynamic_smem_bytes": 210432,
-      "kernel_symbol": "kernel_cake_stepfun_moe_bf62888ad7d404d37ead",
-      "name": "cake_stepfun_moe_bf62888ad7d404d37ead",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_b7d35d82eb495a3505b4_kernel.cu",
+      "dynamic_smem_bytes": 210560,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_b7d35d82eb495a3505b4",
+      "name": "cake_stepfun_moe_b7d35d82eb495a3505b4",
       "output_rows_per_cta": 64,
-      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_static_nvfp4",
-      "template": "fc1_swiglu_step_static",
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 16
     },
     {
@@ -57,17 +376,2013 @@
         1
       ],
       "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_cdc9e85272be5bd4607d_kernel.cu",
-      "dynamic_smem_bytes": 188416,
-      "kernel_symbol": "kernel_cake_stepfun_moe_cdc9e85272be5bd4607d",
-      "name": "cake_stepfun_moe_cdc9e85272be5bd4607d",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_e80e6397791a299acb31_kernel.cu",
+      "dynamic_smem_bytes": 188544,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_e80e6397791a299acb31",
+      "name": "cake_stepfun_moe_e80e6397791a299acb31",
       "output_rows_per_cta": 64,
-      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_static_nvfp4",
-      "template": "fc1_swiglu_step_static",
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 32
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        896,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_ac0a51f6a2f1f94ab5fd_kernel.cu",
+      "dynamic_smem_bytes": 193152,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_ac0a51f6a2f1f94ab5fd",
+      "name": "cake_stepfun_moe_ac0a51f6a2f1f94ab5fd",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "CUtensorMap",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4",
+      "tile_n": 64
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        640,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_9c37b5d6d27ed4dff42e_kernel.cu",
+      "dynamic_smem_bytes": 170112,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_9c37b5d6d27ed4dff42e",
+      "name": "cake_stepfun_moe_9c37b5d6d27ed4dff42e",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "int*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_nvfp4_evict_first_ear",
+      "template": "fc1_swiglu_step_nvfp4",
+      "tile_n": 256
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_c0bc50c569435278918f_kernel.cu",
+      "dynamic_smem_bytes": 199040,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_c0bc50c569435278918f",
+      "name": "cake_stepfun_moe_c0bc50c569435278918f",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 8
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_3d04c03557e32d7fd0a5_kernel.cu",
+      "dynamic_smem_bytes": 210560,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_3d04c03557e32d7fd0a5",
+      "name": "cake_stepfun_moe_3d04c03557e32d7fd0a5",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 16
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_d9d027f3686df7b18b90_kernel.cu",
+      "dynamic_smem_bytes": 188544,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_d9d027f3686df7b18b90",
+      "name": "cake_stepfun_moe_d9d027f3686df7b18b90",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 32
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        896,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_340303a9dd615ce980ba_kernel.cu",
+      "dynamic_smem_bytes": 193152,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_340303a9dd615ce980ba",
+      "name": "cake_stepfun_moe_340303a9dd615ce980ba",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "CUtensorMap",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_bf16tok_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 64
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        640,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_a0dd4c80a48cc17a021e_kernel.cu",
+      "dynamic_smem_bytes": 170112,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_a0dd4c80a48cc17a021e",
+      "name": "cake_stepfun_moe_a0dd4c80a48cc17a021e",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "int*",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_bf16tok_nvfp4_evict_first_ear",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 256
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_88eb494e40032b8fca58_kernel.cu",
+      "dynamic_smem_bytes": 211072,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_88eb494e40032b8fca58",
+      "name": "cake_stepfun_moe_88eb494e40032b8fca58",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "__nv_bfloat16*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 8
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_9113f5e1e9f73b91ac0d_kernel.cu",
+      "dynamic_smem_bytes": 224384,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_9113f5e1e9f73b91ac0d",
+      "name": "cake_stepfun_moe_9113f5e1e9f73b91ac0d",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "__nv_bfloat16*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 16
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_8cd64028996cf99ee48d_kernel.cu",
+      "dynamic_smem_bytes": 210048,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_8cd64028996cf99ee48d",
+      "name": "cake_stepfun_moe_8cd64028996cf99ee48d",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "__nv_bfloat16*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 32
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_b8eedc76ca57a37e412b_kernel.cu",
+      "dynamic_smem_bytes": 210048,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_b8eedc76ca57a37e412b",
+      "name": "cake_stepfun_moe_b8eedc76ca57a37e412b",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_evict_first_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 64
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_d451550cf2cf6873ef39_kernel.cu",
+      "dynamic_smem_bytes": 152704,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_d451550cf2cf6873ef39",
+      "name": "cake_stepfun_moe_d451550cf2cf6873ef39",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n128_fc1_swiglu_step_evict_first_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 128
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_cfd60da4d7b7115ecf6d_kernel.cu",
+      "dynamic_smem_bytes": 201856,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_cfd60da4d7b7115ecf6d",
+      "name": "cake_stepfun_moe_cfd60da4d7b7115ecf6d",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_evict_first_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 256
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_4b159cb3776ced087900_kernel.cu",
+      "dynamic_smem_bytes": 210432,
+      "family": "fp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_4b159cb3776ced087900",
+      "name": "cake_stepfun_moe_4b159cb3776ced087900",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_static_fp8_ef_l2256b",
+      "template": "fc1_swiglu_step_fp8",
+      "tile_n": 8
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_aa631989f7128edcfb17_kernel.cu",
+      "dynamic_smem_bytes": 223232,
+      "family": "fp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_aa631989f7128edcfb17",
+      "name": "cake_stepfun_moe_aa631989f7128edcfb17",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_static_fp8_ef_l2256b",
+      "template": "fc1_swiglu_step_fp8",
+      "tile_n": 16
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_a3f4da1fcd71ddb90d23_kernel.cu",
+      "dynamic_smem_bytes": 207872,
+      "family": "fp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_a3f4da1fcd71ddb90d23",
+      "name": "cake_stepfun_moe_a3f4da1fcd71ddb90d23",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_static_fp8_ef_l2256b",
+      "template": "fc1_swiglu_step_fp8",
+      "tile_n": 32
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_c0ed54d60a6512474675_kernel.cu",
+      "dynamic_smem_bytes": 217600,
+      "family": "mxfp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_c0ed54d60a6512474675",
+      "name": "cake_stepfun_moe_c0ed54d60a6512474675",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_mxfp8",
+      "template": "fc1_swiglu_step_mxfp8",
+      "tile_n": 8
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        640,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_6499782a39e979a64c1b_kernel.cu",
+      "dynamic_smem_bytes": 193280,
+      "family": "mxfp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_6499782a39e979a64c1b",
+      "name": "cake_stepfun_moe_6499782a39e979a64c1b",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_mxfp8",
+      "template": "fc1_swiglu_step_mxfp8",
+      "tile_n": 16
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_fb2c144da915e6ebb41a_kernel.cu",
+      "dynamic_smem_bytes": 176256,
+      "family": "mxfp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_fb2c144da915e6ebb41a",
+      "name": "cake_stepfun_moe_fb2c144da915e6ebb41a",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_mxfp8",
+      "template": "fc1_swiglu_step_mxfp8",
+      "tile_n": 64
+    },
+    {
+      "arch": "sm_100a",
+      "block": [
+        640,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        4,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_100a/cake_stepfun_moe_061ea89239e052816f5b_kernel.cu",
+      "dynamic_smem_bytes": 224384,
+      "family": "mxfp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_061ea89239e052816f5b",
+      "name": "cake_stepfun_moe_061ea89239e052816f5b",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_mxfp8",
+      "template": "fc1_swiglu_step_mxfp8",
+      "tile_n": 256
     },
     {
       "arch": "sm_103a",
@@ -77,16 +2392,108 @@
         1
       ],
       "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_3b07f796c6b5d83986b3_kernel.cu",
-      "dynamic_smem_bytes": 198912,
-      "kernel_symbol": "kernel_cake_stepfun_moe_3b07f796c6b5d83986b3",
-      "name": "cake_stepfun_moe_3b07f796c6b5d83986b3",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_bdbdbc20d03963df6e30_kernel.cu",
+      "dynamic_smem_bytes": 199040,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_bdbdbc20d03963df6e30",
+      "name": "cake_stepfun_moe_bdbdbc20d03963df6e30",
       "output_rows_per_cta": 64,
-      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_static_nvfp4",
-      "template": "fc1_swiglu_step_static",
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 8
     },
     {
@@ -97,16 +2504,108 @@
         1
       ],
       "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_422960eb8e44c7832931_kernel.cu",
-      "dynamic_smem_bytes": 210432,
-      "kernel_symbol": "kernel_cake_stepfun_moe_422960eb8e44c7832931",
-      "name": "cake_stepfun_moe_422960eb8e44c7832931",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_f2d77c4211d7f9a81f36_kernel.cu",
+      "dynamic_smem_bytes": 210560,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_f2d77c4211d7f9a81f36",
+      "name": "cake_stepfun_moe_f2d77c4211d7f9a81f36",
       "output_rows_per_cta": 64,
-      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_static_nvfp4",
-      "template": "fc1_swiglu_step_static",
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 16
     },
     {
@@ -117,48 +2616,2016 @@
         1
       ],
       "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
       "compile_flags": [
         "--use_fast_math"
       ],
-      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_b68d0d3662d1a885f85d_kernel.cu",
-      "dynamic_smem_bytes": 188416,
-      "kernel_symbol": "kernel_cake_stepfun_moe_b68d0d3662d1a885f85d",
-      "name": "cake_stepfun_moe_b68d0d3662d1a885f85d",
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_34d5515fb5275ffa6da6_kernel.cu",
+      "dynamic_smem_bytes": 188544,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_34d5515fb5275ffa6da6",
+      "name": "cake_stepfun_moe_34d5515fb5275ffa6da6",
       "output_rows_per_cta": 64,
-      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_static_nvfp4",
-      "template": "fc1_swiglu_step_static",
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 32
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        896,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_3139846bb4e3b6dc8968_kernel.cu",
+      "dynamic_smem_bytes": 193152,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_3139846bb4e3b6dc8968",
+      "name": "cake_stepfun_moe_3139846bb4e3b6dc8968",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "CUtensorMap",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4",
+      "tile_n": 64
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        640,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_7e9cfa17e533352f21ef_kernel.cu",
+      "dynamic_smem_bytes": 170112,
+      "family": "nvfp4",
+      "kernel_symbol": "kernel_cake_stepfun_moe_7e9cfa17e533352f21ef",
+      "name": "cake_stepfun_moe_7e9cfa17e533352f21ef",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "int*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_nvfp4_evict_first_ear",
+      "template": "fc1_swiglu_step_nvfp4",
+      "tile_n": 256
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_60ff2e25fad791084162_kernel.cu",
+      "dynamic_smem_bytes": 199040,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_60ff2e25fad791084162",
+      "name": "cake_stepfun_moe_60ff2e25fad791084162",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 8
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_fcb13a981ad101b07dae_kernel.cu",
+      "dynamic_smem_bytes": 210560,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_fcb13a981ad101b07dae",
+      "name": "cake_stepfun_moe_fcb13a981ad101b07dae",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 16
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_6710e3c4a6d4bfdd7794_kernel.cu",
+      "dynamic_smem_bytes": 188544,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_6710e3c4a6d4bfdd7794",
+      "name": "cake_stepfun_moe_6710e3c4a6d4bfdd7794",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "uint8_t*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int*",
+          "work_counter"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 32
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        896,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_6eaf7199593df2474156_kernel.cu",
+      "dynamic_smem_bytes": 193152,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_6eaf7199593df2474156",
+      "name": "cake_stepfun_moe_6eaf7199593df2474156",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "CUtensorMap",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_bf16tok_nvfp4_evict_first",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 64
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        640,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_fb3c76992abd40c415e6_kernel.cu",
+      "dynamic_smem_bytes": 170112,
+      "family": "nvfp4_bf16tok",
+      "kernel_symbol": "kernel_cake_stepfun_moe_fb3c76992abd40c415e6",
+      "name": "cake_stepfun_moe_fb3c76992abd40c415e6",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "int*",
+          "SFB"
+        ],
+        [
+          "__nv_bfloat16*",
+          "C"
+        ],
+        [
+          "float*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_bf16tok_nvfp4_evict_first_ear",
+      "template": "fc1_swiglu_step_nvfp4_bf16tok",
+      "tile_n": 256
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_a95b09f9322aa5385174_kernel.cu",
+      "dynamic_smem_bytes": 211072,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_a95b09f9322aa5385174",
+      "name": "cake_stepfun_moe_a95b09f9322aa5385174",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "__nv_bfloat16*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 8
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_a7237dc88c80ca38b136_kernel.cu",
+      "dynamic_smem_bytes": 224384,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_a7237dc88c80ca38b136",
+      "name": "cake_stepfun_moe_a7237dc88c80ca38b136",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "__nv_bfloat16*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 16
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_a3f8e20510dfff150959_kernel.cu",
+      "dynamic_smem_bytes": 210048,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_a3f8e20510dfff150959",
+      "name": "cake_stepfun_moe_a3f8e20510dfff150959",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "__nv_bfloat16*",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 32
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_7db406f0c04d4fd6ecef_kernel.cu",
+      "dynamic_smem_bytes": 210048,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_7db406f0c04d4fd6ecef",
+      "name": "cake_stepfun_moe_7db406f0c04d4fd6ecef",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_evict_first_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 64
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_218fef426c49ccc14fff_kernel.cu",
+      "dynamic_smem_bytes": 152704,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_218fef426c49ccc14fff",
+      "name": "cake_stepfun_moe_218fef426c49ccc14fff",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n128_fc1_swiglu_step_evict_first_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 128
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "block_k": 128,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_9dce1dd514a72f60cc34_kernel.cu",
+      "dynamic_smem_bytes": 201856,
+      "family": "bf16",
+      "kernel_symbol": "kernel_cake_stepfun_moe_9dce1dd514a72f60cc34",
+      "name": "cake_stepfun_moe_9dce1dd514a72f60cc34",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_evict_first_bf16",
+      "template": "fc1_swiglu_step_bf16",
+      "tile_n": 256
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_113a5a5b83f8dace4055_kernel.cu",
+      "dynamic_smem_bytes": 210432,
+      "family": "fp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_113a5a5b83f8dace4055",
+      "name": "cake_stepfun_moe_113a5a5b83f8dace4055",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_static_fp8_ef_l2256b",
+      "template": "fc1_swiglu_step_fp8",
+      "tile_n": 8
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_3bdd0b58896221d6a938_kernel.cu",
+      "dynamic_smem_bytes": 223232,
+      "family": "fp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_3bdd0b58896221d6a938",
+      "name": "cake_stepfun_moe_3bdd0b58896221d6a938",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_static_fp8_ef_l2256b",
+      "template": "fc1_swiglu_step_fp8",
+      "tile_n": 16
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_25ecc7bcbbba81aa3ebe_kernel.cu",
+      "dynamic_smem_bytes": 207872,
+      "family": "fp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_25ecc7bcbbba81aa3ebe",
+      "name": "cake_stepfun_moe_25ecc7bcbbba81aa3ebe",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "float*",
+          "scale_c"
+        ],
+        [
+          "float*",
+          "scale_gate"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "float*",
+          "act_alpha"
+        ],
+        [
+          "float*",
+          "act_beta"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ],
+        [
+          "int*",
+          "total_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_static_fp8_ef_l2256b",
+      "template": "fc1_swiglu_step_fp8",
+      "tile_n": 32
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_4d6a9ed197299d2cbf7f_kernel.cu",
+      "dynamic_smem_bytes": 217600,
+      "family": "mxfp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_4d6a9ed197299d2cbf7f",
+      "name": "cake_stepfun_moe_4d6a9ed197299d2cbf7f",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_mxfp8",
+      "template": "fc1_swiglu_step_mxfp8",
+      "tile_n": 8
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        640,
+        1,
+        1
+      ],
+      "block_k": 512,
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_2fdd64b1ef9c92ebb03b_kernel.cu",
+      "dynamic_smem_bytes": 193280,
+      "family": "mxfp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_2fdd64b1ef9c92ebb03b",
+      "name": "cake_stepfun_moe_2fdd64b1ef9c92ebb03b",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_mxfp8",
+      "template": "fc1_swiglu_step_mxfp8",
+      "tile_n": 16
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_46f032627936cd0f1a48_kernel.cu",
+      "dynamic_smem_bytes": 176256,
+      "family": "mxfp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_46f032627936cd0f1a48",
+      "name": "cake_stepfun_moe_46f032627936cd0f1a48",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_mxfp8",
+      "template": "fc1_swiglu_step_mxfp8",
+      "tile_n": 64
+    },
+    {
+      "arch": "sm_103a",
+      "block": [
+        640,
+        1,
+        1
+      ],
+      "block_k": 256,
+      "cluster": [
+        4,
+        1,
+        1
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": "csrc/fused_moe/cake_stepfun/generated/sm_103a/cake_stepfun_moe_dc0ce4e0d9be093617c9_kernel.cu",
+      "dynamic_smem_bytes": 224384,
+      "family": "mxfp8",
+      "kernel_symbol": "kernel_cake_stepfun_moe_dc0ce4e0d9be093617c9",
+      "name": "cake_stepfun_moe_dc0ce4e0d9be093617c9",
+      "output_rows_per_cta": 64,
+      "parameters": [
+        [
+          "CUtensorMap",
+          "A"
+        ],
+        [
+          "CUtensorMap",
+          "B"
+        ],
+        [
+          "CUtensorMap",
+          "SFA"
+        ],
+        [
+          "uint8_t*",
+          "SFB"
+        ],
+        [
+          "CUtensorMap",
+          "C"
+        ],
+        [
+          "uint8_t*",
+          "SFC"
+        ],
+        [
+          "int*",
+          "route_map"
+        ],
+        [
+          "int*",
+          "tile_expert"
+        ],
+        [
+          "int*",
+          "tile_mn_limit"
+        ],
+        [
+          "int*",
+          "num_non_exiting_ctas"
+        ],
+        [
+          "float*",
+          "clamp_limit"
+        ],
+        [
+          "int",
+          "M_out"
+        ],
+        [
+          "int",
+          "K"
+        ],
+        [
+          "int",
+          "grid_m"
+        ],
+        [
+          "int",
+          "grid_n"
+        ],
+        [
+          "int",
+          "K_tiles"
+        ]
+      ],
+      "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_mxfp8",
+      "template": "fc1_swiglu_step_mxfp8",
+      "tile_n": 256
     }
   ],
   "manifest": "csrc/fused_moe/cake_stepfun/generated/cake_stepfun_generated_manifest.cuh",
-  "parameters": [
-    "A",
-    "B",
-    "SFA",
-    "SFB",
-    "C",
-    "SFC",
-    "route_map",
-    "tile_expert",
-    "tile_mn_limit",
-    "scale_c",
-    "scale_gate",
-    "clamp_limit",
-    "act_alpha",
-    "act_beta",
-    "M_out",
-    "K",
-    "grid_m",
-    "grid_n",
-    "K_tiles",
-    "total_tiles"
-  ],
-  "precision": "nvfp4",
-  "program_hash": "dfd1d2250b255b90ab9b43766e3ec2a38f1ef7c12f5e74f8a03c88d2d74d25d1",
-  "schema": "flashinfer.cake_stepfun.inventory.v1",
-  "tiles": [
-    8,
-    16,
-    32
-  ]
+  "program_hash": "5ae361a9694ae2974b38266854f5c541c04d860bbc493607e62ea911b2081b7e",
+  "schema": "flashinfer.cake_stepfun.inventory.v2"
 }
