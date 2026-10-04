@@ -1,9 +1,17 @@
 """Prepared dense FP4/FP8 MQA lightning-indexer logits on SM100a/SM103a.
 
 Production runtime has no source compiler, quantizer or native oracle dependency.
-Plans bind user tensors once; run() submits the metadata producer (where the
-route has one) and the fused logits/cleanup kernel on the current PyTorch stream
-without allocating, graph capture, or a native-library fallback.
+Plans bind user tensors once; run() submits the route's generated programs on
+the current PyTorch stream without allocating, graph capture, or a fallback.
+
+Routes are selected from host-known scalars only (precision, query count, KV
+length range); the generated programs take the query count and the KV length at
+runtime, so one program per physical schedule serves every catalogued
+architecture. Every program takes the launch grid of the logits consumers (the
+device's SM count, or a plan's CTA-budget override) as the compile-line
+definition ``SM_COUNT``: the per-SM cost partition and the metadata offsets are
+compile-time literals in every build, and one source text per program serves
+every SM count.
 """
 
 from __future__ import annotations
@@ -23,28 +31,33 @@ def _catalog():
     return json.loads(Path(__file__).with_name("dense_mqa_catalog.json").read_text())
 
 
-def device_arch(device):
-    """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
+@functools.cache
+def device_facts(device_index):
+    """``(arch, sm_count)`` of one CUDA device through FlashInfer's cached device queries."""
     import torch
+    from flashinfer.utils import get_compute_capability, get_device_sm_count
 
-    device = torch.device(device)
-    catalogued = sorted(_catalog()["arches"])
-    if device.type != "cuda":
-        raise RuntimeError("Dense MQA requires a CUDA device")
-    capability = tuple(torch.cuda.get_device_capability(device))
+    device = torch.device("cuda", device_index)
+    capability = get_compute_capability(device)
     arch = _ARCHES.get(capability)
+    catalogued = sorted(_catalog()["arches"])
     if arch is None or arch not in catalogued:
         raise RuntimeError(
             f"Dense MQA has no exported programs for compute capability "
             f"{capability}; catalogued architectures: {catalogued}"
         )
-    return arch
+    return arch, int(get_device_sm_count(device))
 
 
-def supported_num_sms(arch):
-    """SM counts with catalogued routes for ``arch`` (the last route-key field)."""
-    routes = _catalog()["arches"][arch]["routes"]
-    return sorted({int(key.rsplit(":sm", 1)[1]) for key in routes})
+def device_arch(device):
+    """Generated-program architecture for ``device`` (raises when none is catalogued)."""
+    import torch
+
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise RuntimeError("Dense MQA requires a CUDA device")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return device_facts(index)[0]
 
 
 def _nvcc_flags(arch):
@@ -53,32 +66,94 @@ def _nvcc_flags(arch):
     return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
 
 
-@functools.cache
-def load_program(arch, name):
+def program_names(route=None):
+    """Names of the catalogued programs (optionally only those a route can launch)."""
+    catalog = _catalog()
+    if route is None:
+        return sorted(catalog["programs"])
+    record = catalog["routes"][route]
+    names = [program for _stage, program in record["stages"]]
+    if record.get("sequence"):
+        names.append(record["sequence"])
+    return names
+
+
+def program_definitions(record, num_sms):
+    """Compile-line definitions of a program record: ``SM_COUNT`` is the launch grid of the logits
+    consumers (the SM count, or a plan's CTA-budget override)."""
+    values = {"SM_COUNT": int(num_sms)}
+    unknown = sorted(set(record["definitions"]) - set(values))
+    if unknown:
+        raise RuntimeError(
+            f"catalog program requires definitions this runtime cannot supply: {unknown}"
+        )
+    return {name: values[name] for name in record["definitions"]}
+
+
+def program_spec(arch, name, num_sms):
+    """FlashInfer JIT build specification of one generated program for ``arch`` and the launch grid ``num_sms``
+    (a compile-line definition of every program; the name carries every supplied value)."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
 
-    record = _catalog()["arches"][arch]["programs"][name]
-    spec = gen_jit_spec(
-        name=name,
+    record = _catalog()["programs"][name]
+    if arch not in record["arches"]:
+        raise RuntimeError(f"program {name} is not exported for {arch}")
+    definitions = program_definitions(record, num_sms)
+    suffix = "".join(
+        f"_{key.lower()}{value}" for key, value in sorted(definitions.items())
+    )
+    return gen_jit_spec(
+        name=f"{name}_{arch}{suffix}",
         sources=[
             env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
         ],
         extra_cuda_cflags=[
             *_nvcc_flags(arch),
             *record["compile_flags"],
+            *(f"-D{key}={value}" for key, value in sorted(definitions.items())),
             "--device-entity-has-hidden-visibility=false",
         ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
         use_fast_math=False,  # Only explicit stage flags select fast math.
     )
+
+
+@functools.cache
+def load_program(arch, name, num_sms):
+    record = _catalog()["programs"][name]
+    spec = program_spec(arch, name, num_sms)
     module = spec.build_and_load()
     return module, {**record, "library_path": str(spec.get_library_path())}
 
 
-def route_key(config):
-    return f"{config['precision']}:q{config['queries']}:k{config['keys']}:sm{config['num_sms']}"
+def route_name(precision, queries, keys):
+    """Logical route of a problem: host-known scalars only, KV length by range."""
+    policy = _catalog()["policy"]
+    if precision == "fp4":
+        return "fp4:q1" if queries == 1 else f"fp4:{metadata_tier(queries)}"
+    if precision != "fp8":
+        raise ValueError("precision must be 'fp4' or 'fp8'")
+    if queries == 1:
+        return "fp8:q1:short" if keys <= policy["fused_q1_max_kv"] else "fp8:q1"
+    if queries == 128 and keys <= policy["fused_q128_max_kv"]:
+        return "fp8:q128:short"
+    kind = "fp8:full" if queries % BLOCK_Q == 0 else "fp8:partial"
+    return f"{kind}:{metadata_tier(queries)}"
+
+
+def metadata_tier(queries):
+    """Metadata program tier of a query count: the smallest ceiling that covers it."""
+    for tier, max_queries_of_tier in _catalog()["policy"]["metadata_tiers"]:
+        if queries <= max_queries_of_tier:
+            return tier
+    raise ValueError(f"queries must be in 1..{max_queries()}")
+
+
+def max_queries():
+    """Largest query count the generated metadata schedule accepts."""
+    return int(_catalog()["policy"]["max_q_tokens"])
 
 
 def logits_stride(num_kv_tokens):
@@ -161,8 +236,8 @@ def stage_bindings(
     return {"metadata": producer, "logits": consumer}
 
 
-def _submission(arch, program, bindings, *, stage=None):
-    module, record = load_program(arch, program)
+def _submission(arch, program, bindings, num_sms, *, stage=None):
+    module, record = load_program(arch, program, num_sms)
     arguments = []
     for kind, key in record["arg_plan"]:
         if kind == "workspace":
@@ -185,8 +260,9 @@ class DenseMqaPlan:
     [Q_storage,32,128]/[K,128], where Q_storage >= max(4,Q); kv_scales are
     FP32[K]. weights are FP32[Q,32] (FP4) or FP32[Q_storage,32] (FP8).
     starts/ends are int32[Q] windows with 0 <= start <= end <= K; K is a
-    multiple of 256. logits[q, k] = sum_h max(0, Q[q,h] . KV[k]) * weights[q,h]
-    for start[q] <= k < end[q] and -inf elsewhere.
+    multiple of 256 and 1 <= Q <= max_queries(). logits[q, k] =
+    sum_h max(0, Q[q,h] . KV[k]) * weights[q,h] for start[q] <= k < end[q]
+    and -inf elsewhere.
 
     Inputs, output and metadata stay bound to the plan. Updating their contents
     is supported, including CUDA Graph replay. One plan is not concurrently
@@ -209,15 +285,33 @@ class DenseMqaPlan:
         kv_scales=None,
         output=None,
         metadata=None,
+        sm_count=None,
     ):
         import torch
 
-        arch = device_arch(q.device)
+        if q.device.type != "cuda":
+            raise RuntimeError("Dense MQA requires CUDA tensors")
+        device_index = (
+            q.device.index
+            if q.device.index is not None
+            else torch.cuda.current_device()
+        )
+        arch, num_sms = device_facts(device_index)
+        if sm_count is not None:
+            # CTA budget override (tests, restricted serving partitions): the schedule
+            # partitions over this many CTAs, the FP8 indexer is built with this count
+            # defined and the metadata is sized for it. Any positive count is a legal
+            # grid; above the device's SM count the extra CTAs run as a second wave.
+            if int(sm_count) < 1:
+                raise ValueError("sm_count must be a positive CTA budget")
+            num_sms = int(sm_count)
         if precision not in ("fp4", "fp8"):
             raise ValueError("precision must be 'fp4' or 'fp8'")
         queries, keys = starts.numel(), kv.shape[0]
-        if queries < 1 or keys < 1 or keys % BLOCK_KV:
-            raise ValueError("positive Q and positive K divisible by 256 are required")
+        if queries < 1 or queries > max_queries():
+            raise ValueError(f"Q must be in 1..{max_queries()}")
+        if keys < 1 or keys % BLOCK_KV:
+            raise ValueError("positive K divisible by 256 is required")
         if (
             starts.dtype != torch.int32
             or ends.dtype != torch.int32
@@ -274,16 +368,16 @@ class DenseMqaPlan:
         if any(t.device != q.device or not t.is_contiguous() for t in tensors):
             raise ValueError("all inputs must be contiguous on one CUDA device")
         self.arch = arch
-        self.num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        self.num_sms = num_sms
+        self.route_name = route_name(precision, queries, keys)
+        self.route = _catalog()["routes"][self.route_name]
         self.config = dict(
-            precision=precision, queries=queries, keys=keys, num_sms=self.num_sms
+            precision=precision,
+            queries=queries,
+            keys=keys,
+            num_sms=num_sms,
+            route=self.route_name,
         )
-        try:
-            self.route = _catalog()["arches"][arch]["routes"][route_key(self.config)]
-        except KeyError as error:
-            raise NotImplementedError(
-                f"No exported {arch} dense physical schedule for {self.config}"
-            ) from error
         stride = logits_stride(keys)
         padded_rows = (queries + BLOCK_Q - 1) // BLOCK_Q * BLOCK_Q
         if output is None:
@@ -306,7 +400,7 @@ class DenseMqaPlan:
             raise ValueError(
                 "FP4 output backing storage must include the final 4-row tile"
             )
-        words = metadata_words(queries, self.num_sms)
+        words = metadata_words(queries, num_sms)
         if metadata is None:
             metadata = torch.empty(words, dtype=torch.int32, device=q.device)
         if (
@@ -327,22 +421,30 @@ class DenseMqaPlan:
             metadata,
             q_scales=q_scales,
             kv_scales=kv_scales,
-            num_sms=self.num_sms,
+            num_sms=num_sms,
         )
         self._submissions, self._programs = [], []
-        sequence = self.route["sequence"]
+        sequence = self.route.get("sequence")
         selections = (
             [(None, sequence)]
             if sequence
-            else [(stage["name"], stage["program"]) for stage in self.route["stages"]]
+            else [(stage, program) for stage, program in self.route["stages"]]
         )
+        self.program_names = [program for _stage, program in selections]
         for stage_name, program in selections:
-            submit, loaded = _submission(arch, program, bindings, stage=stage_name)
+            submit, loaded = _submission(
+                arch, program, bindings, num_sms, stage=stage_name
+            )
             self._submissions.append(submit)
             self._programs.append(loaded)
         self.output, self.metadata = output, metadata
         self.logical_output = output[:, :keys]
         self._retained = (*tensors, output, metadata)
+
+    @property
+    def launch_count(self):
+        """Number of FFI submissions ``run()`` issues (1 for sequence and fused routes)."""
+        return len(self._submissions)
 
     def run(self):
         import tvm_ffi

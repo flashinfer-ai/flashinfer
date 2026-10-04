@@ -6475,24 +6475,26 @@ def _cute_dsl_gemm_mxfp8_runner(
             sf_dtype = cutlass.Float8E8M0FNU
             batch_size = 1
 
+            if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
+                # Untuned low-M execution uses the corresponding base tactic.
+                fallback_tactic = (
+                    split_k_kernel_cls.mma_tiler_mn_for_m(m),
+                    (1, 1),
+                    True,
+                    False,
+                    1,
+                )
+            else:
+                fallback_tactic = (
+                    _SM100_DEFAULT_MMA_TILER_MN,
+                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                    False,
+                    False,
+                    1,
+                )
+
             if tactic is None or tactic == -1:
-                if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
-                    # Untuned low-M execution uses the corresponding base tactic.
-                    tactic = (
-                        split_k_kernel_cls.mma_tiler_mn_for_m(m),
-                        (1, 1),
-                        True,
-                        False,
-                        1,
-                    )
-                else:
-                    tactic = (
-                        _SM100_DEFAULT_MMA_TILER_MN,
-                        _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                        False,
-                        False,
-                        1,
-                    )
+                tactic = fallback_tactic
 
             (
                 mma_tiler_mn,
@@ -6506,20 +6508,56 @@ def _cute_dsl_gemm_mxfp8_runner(
             is_split_k = split_k_slices > 1
 
             if is_split_k:
-                if (
-                    cluster_shape_mn != (1, 1)
-                    or not swap_ab
-                    or use_prefetch
-                    or not out.is_contiguous()
-                    or not split_k_kernel_cls.is_valid_tactic(
+                structurally_invalid = (
+                    cluster_shape_mn != (1, 1) or not swap_ab or use_prefetch
+                )
+                if structurally_invalid:
+                    raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
+
+                shape_valid = (
+                    out.is_contiguous()
+                    and split_k_kernel_cls.is_valid_tactic(
                         m,
                         real_k,
                         cutlass.Float8E4M3FN,
                         split_k_slices,
                     )
-                    or mma_tiler_mn != split_k_kernel_cls.mma_tiler_mn_for_m(m)
-                ):
-                    raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
+                    and mma_tiler_mn == split_k_kernel_cls.mma_tiler_mn_for_m(m)
+                )
+                if not shape_valid:
+                    # Autotune cache entries are bucketed by M. A tactic selected
+                    # for a low-M bucket can therefore be reused by a runtime shape
+                    # that the split-K kernel cannot implement. Keep the runner's
+                    # fallback contract instead of turning a stale optimization
+                    # into a serving failure.
+                    tactic = fallback_tactic
+                    (
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        swap_ab,
+                        use_prefetch,
+                        split_k_slices,
+                    ) = tactic
+                    is_split_k = False
+
+            # Re-check whatever is about to launch against the narrow-tile
+            # envelope (Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok):
+            # a swap-AB tactic tuned for a low-M bucket and replayed at a larger
+            # runtime M (floor mapping, clamp above the top bucket, stale cache)
+            # faults with cudaErrorMisalignedAddress. fallback_tactic always
+            # passes: its narrow tile covers M <= 32, otherwise it is 128x128.
+            if not Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok(
+                mma_tiler_mn[1], m if swap_ab else n
+            ):
+                tactic = fallback_tactic
+                (
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    swap_ab,
+                    use_prefetch,
+                    split_k_slices,
+                ) = tactic
+                is_split_k = False
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -7392,7 +7430,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([100, 103, 107, 120, 121])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7407,6 +7445,26 @@ def _cute_dsl_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
+    if _match_sm_version(a.device, ["120", "121"]):
+        if backend == "auto":
+            return False
+        from .kernels.sm12x_cute.runner import check_requirement
+
+        _check_cute_dsl_availability()
+        _check_cute_dsl_arch(a.device)
+        return check_requirement(
+            a,
+            b,
+            a_descale,
+            b_descale,
+            alpha,
+            out_dtype,
+            out,
+            block_size,
+            use_nvfp4,
+            use_8x4_sf_layout,
+        )
+
     # cute_dsl backend requires 128x4 scale factor layout.
     # The kernel internally uses CUTLASS BlockScaledBasicChunk which expects
     # M/N padded to 128, K padded to 4 -- matching FlashInfer's quantization
@@ -7934,6 +7992,11 @@ def _cute_dsl_gemm_fp4_runner(
     The autotuner selects the best (kernel_type, tile, cluster, swap_ab, prefetch,
     use_tma_store) combination.
     """
+    if sm_major == 12:
+        from .kernels.sm12x_cute.runner import get_runner
+
+        return get_runner()
+
     import cutlass
 
     from .kernels.dense_blockscaled_gemm_sm100 import (
@@ -8277,22 +8340,24 @@ def _cute_dsl_gemm_fp4_runner(
             # and its swap_ab requires m % 8 == 0) -- exactly where low-concurrency
             # decode lives.
             # trtllm_fp4_block_scale_moe, which this path does not touch.
-            if tactic is None or tactic == -1:
+            def untuned_tactic():
                 if sm_version == 107 and Sm107Kernel is not None:
-                    tactic = _select_sm107_mm_fp4_cute_dsl_tactic(
+                    return _select_sm107_mm_fp4_cute_dsl_tactic(
                         m, n, real_k, get_device_sm_count(a.device), sf_vec_size
                     )
-                else:
-                    sm_count = get_device_sm_count(a.device)
-                    tactic = (
-                        _select_sm100_mm_fp4_splitk_tactic(
-                            m, n, real_k, sm_count, out.is_contiguous(), sm_minor
-                        )
-                        if use_nvfp4
-                        else None
-                    ) or _select_sm100_mm_fp4_cute_dsl_tactic(
-                        m, n, real_k, sm_count, sf_vec_size
+                sm_count = get_device_sm_count(a.device)
+                return (
+                    _select_sm100_mm_fp4_splitk_tactic(
+                        m, n, real_k, sm_count, out.is_contiguous(), sm_minor
                     )
+                    if use_nvfp4
+                    else None
+                ) or _select_sm100_mm_fp4_cute_dsl_tactic(
+                    m, n, real_k, sm_count, sf_vec_size
+                )
+
+            if tactic is None or tactic == -1:
+                tactic = untuned_tactic()
 
             (
                 mma_tiler_mn,
@@ -8302,6 +8367,40 @@ def _cute_dsl_gemm_fp4_runner(
                 kernel_type,
                 use_tma_store,
             ) = tactic
+
+            # Autotune cache entries are bucketed by M, so a tactic tuned for a
+            # low-M bucket can be replayed at a runtime M it cannot serve (floor
+            # mapping, clamp above the top bucket, stale cache): a narrow tile
+            # past Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok
+            # faults with cudaErrorMisalignedAddress, and a split-K tactic past
+            # the split-K kernel's M range is shape-invalid. Fall back to the
+            # untuned selector, which only returns tactics valid for this M.
+            # Structurally malformed split-K tactics still raise below, as in
+            # the mm_mxfp8 runner.
+            if kernel_type == _SM100_SPLITK_KERNEL_TYPE:
+                stale = (
+                    cluster_shape_mn == (1, 1) and swap_ab and not use_prefetch
+                ) and (
+                    not out.is_contiguous()
+                    or not _SplitKKernel.is_valid_tactic(
+                        m, real_k, cutlass.Float4E2M1FN, int(use_tma_store)
+                    )
+                    or not _SplitKKernel.supports_mma_tiler_for_m(mma_tiler_mn, m)
+                )
+            else:
+                stale = not Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok(
+                    mma_tiler_mn[1], m if swap_ab else n
+                )
+            if stale:
+                tactic = untuned_tactic()
+                (
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    swap_ab,
+                    use_prefetch,
+                    kernel_type,
+                    use_tma_store,
+                ) = tactic
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -8961,6 +9060,11 @@ def mm_fp4(
         contiguous ``(n, k)`` weight, ``N % 8 == 0``, ``K % 256 == 0``, and a
         contiguous bf16 / fp16 output; see
         ``flashinfer/experimental/cake_nvfp4_per_token/README.md``.
+        On SM120/SM121, explicit ``"cute-dsl"`` supports packed
+        uint8 NVFP4 inputs with BF16 output, 128x4 scale factors, and logical
+        N and K divisible by 64. Logical M may be ragged. A and B scale storage
+        must retain physical M and N padding, respectively, to multiples of
+        128 rows. Packed inputs and output retain their logical dimensions.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.
@@ -8970,7 +9074,9 @@ def mm_fp4(
         Whether to enable Programmatic Dependent Launch (PDL) for the ``cute_dsl``
         and ``cutedsl_low_latency`` backends, defaults to ``True``. PDL allows overlapping
         the tail of one kernel with the start of the next for reduced launch latency.
-        This parameter is ignored by other backends.
+        The SM120/SM121 ``"cute-dsl"`` implementation uses ordinary
+        stream-ordered launches for either value. This parameter is ignored
+        by other backends.
 
     Notes
     -----

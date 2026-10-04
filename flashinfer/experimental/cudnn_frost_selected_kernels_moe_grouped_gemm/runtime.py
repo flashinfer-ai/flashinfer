@@ -25,7 +25,7 @@ def artifact_root(dtype: str) -> Path:
 
 def _validate_abi(raw: dict[str, Any], op: str) -> bool:
     swap = raw.get("tactic", {}).get("swap_ab", False)
-    expected = f"cudnn_frost_{op}{'_swap_ab' if swap else ''}_v1"
+    expected = f"cudnn_frost_{op}{'_swap_ab' if swap else ''}_v2"
     if not isinstance(swap, bool) or raw.get("abi") != expected:
         raise RuntimeError(
             f"unsupported or inconsistent cuDNN Frost ABI: {raw.get('id')}"

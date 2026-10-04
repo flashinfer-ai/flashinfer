@@ -166,8 +166,6 @@ __host__ __device__ constexpr T divUpMulTileN(T a, T tileN) {
   return divUpTileN(a, tileN) * tileN;
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 // The thread writing a tile's MnLimit owns its unused routing-map entries.
 // TMA gathers may read these rows even though the GEMM masks their outputs.
 // Write -1 to suppress those loads, without touching live rows or allocation slack.
@@ -185,93 +183,6 @@ __device__ __forceinline__ void initRoutingTilePadding(int32_t* tokenIdx, int32_
   for (; begin < end; ++begin) {
     tokenIdx[begin] = -1;
   }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-// Dual-tile routing (DataBase::mPaddingLog2Alt): choose the tile padding at run time from the
-// padded row totals of the two tiles, scan the chosen padding and write the tile lists. Every
-// thread owns ExpertsPerThread consecutive experts (threadIdx.x * ExpertsPerThread + e); count[e]
-// is 0 for experts that are not local or past mNumExperts. The list-writing loops are strided by
-// (strideStart, stride) so co-operating blocks share the work. Runs three block scans; all
-// threads of the block must call it. Returns the chosen padding log2 and the per-expert padded
-// row offsets of the chosen padding.
-template <typename KernelParams>
-__host__ __device__ inline bool routingDualTileEnabled(KernelParams const& params) {
-  return params.mPaddingLog2Alt > params.mPaddingLog2 &&
-         params.mPtrCtaIdxXyToBatchIdxAlt != nullptr;
-}
-
-template <int ExpertsPerThread, typename Scan, typename KernelParams>
-__device__ __forceinline__ int32_t routingDualTilePadding(
-    KernelParams const& params, typename Scan::TempStorage& tempStorage,
-    int32_t const (&count)[ExpertsPerThread], int32_t (&paddedOffset)[ExpertsPerThread],
-    int32_t& paddedTotal, int32_t const strideStart, int32_t const stride, bool const writeCounts) {
-  int32_t const log2Base = params.mPaddingLog2;
-  int32_t const log2Alt = params.mPaddingLog2Alt;
-  int32_t padBase[ExpertsPerThread];
-  int32_t padAlt[ExpertsPerThread];
-#pragma unroll
-  for (int e = 0; e < ExpertsPerThread; e++) {
-    padBase[e] = divUpMulLog2<int32_t>(count[e], log2Base);
-    padAlt[e] = divUpMulLog2<int32_t>(count[e], log2Alt);
-  }
-  int32_t scratch[ExpertsPerThread];
-  int32_t totalBase;
-  int32_t totalAlt;
-  Scan(tempStorage).ExclusiveSum(padBase, scratch, totalBase);
-  __syncthreads();
-  Scan(tempStorage).ExclusiveSum(padAlt, scratch, totalAlt);
-  __syncthreads();
-  bool const useAlt = static_cast<int64_t>(totalAlt) * 1000 <=
-                      static_cast<int64_t>(totalBase) * params.mDualTileThresholdPermille;
-  int32_t const log2Chosen = useAlt ? log2Alt : log2Base;
-  int32_t padded[ExpertsPerThread];
-#pragma unroll
-  for (int e = 0; e < ExpertsPerThread; e++) {
-    padded[e] = useAlt ? padAlt[e] : padBase[e];
-  }
-  Scan(tempStorage).ExclusiveSum(padded, paddedOffset, paddedTotal);
-  __syncthreads();
-#pragma unroll
-  for (int e = 0; e < ExpertsPerThread; e++) {
-    if (count[e] > 0) {
-      int const expert = threadIdx.x * ExpertsPerThread + e;
-      int32_t const localExpertIdx =
-          (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
-      int32_t const rowLimit = paddedOffset[e] + count[e];
-      // Base-granularity list over the chosen padding (always valid: the alternate tile is a
-      // multiple of the base tile).
-      int32_t const baseTiles = padded[e] >> log2Base;
-      int32_t const baseFirst = paddedOffset[e] >> log2Base;
-      for (int32_t t = strideStart; t < baseTiles; t += stride) {
-        params.mPtrCtaIdxXyToBatchIdx[baseFirst + t] = localExpertIdx;
-        params.mPtrCtaIdxXyToMnLimit[baseFirst + t] =
-            min(paddedOffset[e] + mulLog2<int32_t>(t + 1, log2Base), rowLimit);
-        // A coarser chosen tile can contain fully padded base tiles. Keep each
-        // writer within its own base tile; the alternate list needs no second fill.
-        int32_t const tileBegin = paddedOffset[e] + mulLog2<int32_t>(t, log2Base);
-        int32_t const tileEnd = paddedOffset[e] + mulLog2<int32_t>(t + 1, log2Base);
-        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, max(tileBegin, rowLimit), tileEnd);
-      }
-      if (useAlt) {
-        int32_t const altTiles = padded[e] >> log2Alt;
-        int32_t const altFirst = paddedOffset[e] >> log2Alt;
-        for (int32_t t = strideStart; t < altTiles; t += stride) {
-          params.mPtrCtaIdxXyToBatchIdxAlt[altFirst + t] = localExpertIdx;
-          params.mPtrCtaIdxXyToMnLimitAlt[altFirst + t] =
-              min(paddedOffset[e] + mulLog2<int32_t>(t + 1, log2Alt), rowLimit);
-        }
-      }
-    }
-  }
-  if (writeCounts) {
-    int32_t const baseCount = paddedTotal >> log2Base;
-    params.mPtrPermutedIdxSize[0] = paddedTotal;
-    params.mPtrNumNonExitingCtas[0] = baseCount;
-    params.mPtrNumNonExitingCtasBaseActive[0] = useAlt ? 0 : baseCount;
-    params.mPtrNumNonExitingCtasAlt[0] = useAlt ? (paddedTotal >> log2Alt) : 0;
-  }
-  return log2Chosen;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -529,102 +440,75 @@ __device__ void routingPermutation(KernelParams params,
   // Arrive: we do not access distributed shared memory after this point.
   __cluster_barrier_arrive();
 
-  if (routingDualTileEnabled(params)) {
-    // Dual-tile routing: pad to the tile the routing selects and write both tile lists.
+  // Compute the runtime config for projections
+  // Whether or not an expert is local is taken into account when smemExpertCount is computed
+  // so we do not need to take it into account here.
+  int32_t numCta[ExpertsPerThread];
 #pragma unroll
-    for (int e = 0; e < ExpertsPerThread; e++) {
-      int expert = threadIdx.x * ExpertsPerThread + e;
-      if (expert < params.mNumExperts && clusterBlockRank == 0 &&
-          params.mPtrNumTokensPerExpert != nullptr) {
+  for (int e = 0; e < ExpertsPerThread; e++) {
+    if (params.mIsPow2) {
+      numCta[e] = divUpLog2<int32_t>(count[e], params.mPaddingLog2);
+    } else {
+      numCta[e] = divUpTileN<int32_t>(count[e], params.mTileTokensDim);
+    }
+  }
+
+  int32_t ctaOffset[ExpertsPerThread];
+  int32_t numNonExitingCtas;
+  Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
+
+#pragma unroll
+  for (int e = 0; e < ExpertsPerThread; e++) {
+    int expert = threadIdx.x * ExpertsPerThread + e;
+    if (expert < params.mNumExperts) {
+      // DA's fused multi-tile preamble reuses this routing pass as the authoritative per-expert
+      // count producer. Publish once per cluster because every cluster block sees the same count.
+      if (clusterBlockRank == 0 && params.mPtrNumTokensPerExpert != nullptr) {
         params.mPtrNumTokensPerExpert[expert] = count[e];
       }
-    }
-    bool const writeCounts =
-        clusterBlockRank == 0 && warpIdx == NumWarps - 1 && cute::elect_one_sync();
-    int32_t paddedOffset[ExpertsPerThread];
-    int32_t paddedTotal;
-    routingDualTilePadding<ExpertsPerThread, Scan>(params, tempStorage, count, paddedOffset,
-                                                   paddedTotal, clusterBlockRank,
-                                                   NumBlocksPerCluster, writeCounts);
-#pragma unroll
-    for (int e = 0; e < ExpertsPerThread; e++) {
-      int expert = threadIdx.x * ExpertsPerThread + e;
-      if (expert < params.mNumExperts) {
-        smemExpertOffset[expert] = paddedOffset[e] + blockExpertOffset[e];
-      }
-    }
-  } else {
-    // Compute the runtime config for projections
-    // Whether or not an expert is local is taken into account when smemExpertCount is computed
-    // so we do not need to take it into account here.
-    int32_t numCta[ExpertsPerThread];
-#pragma unroll
-    for (int e = 0; e < ExpertsPerThread; e++) {
-      if (params.mIsPow2) {
-        numCta[e] = divUpLog2<int32_t>(count[e], params.mPaddingLog2);
-      } else {
-        numCta[e] = divUpTileN<int32_t>(count[e], params.mTileTokensDim);
-      }
-    }
-
-    int32_t ctaOffset[ExpertsPerThread];
-    int32_t numNonExitingCtas;
-    Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
-
-#pragma unroll
-    for (int e = 0; e < ExpertsPerThread; e++) {
-      int expert = threadIdx.x * ExpertsPerThread + e;
-      if (expert < params.mNumExperts) {
-        // DA's fused multi-tile preamble reuses this routing pass as the authoritative per-expert
-        // count producer. Publish once per cluster because every cluster block sees the same count.
-        if (clusterBlockRank == 0 && params.mPtrNumTokensPerExpert != nullptr) {
-          params.mPtrNumTokensPerExpert[expert] = count[e];
-        }
-        // Strided loop to share this work between blocks.
-        for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocksPerCluster) {
-          const int32_t localExpertIdx =
-              (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
-          params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
-          // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
-          int32_t mnLimit1;
-          int32_t mnLimit2;
-          if (params.mIsPow2) {
-            mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, params.mPaddingLog2);
-            mnLimit2 = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2) + count[e];
-          } else {
-            mnLimit1 = mulTileN<int32_t>(ctaOffset[e] + cta + 1, params.mTileTokensDim);
-            mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
-          }
-          params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
-          initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2),
-                                 mnLimit1);
-        }
-
-        // get the padded offset associated with this expert (token-space, CGA granularity)
-        int32_t offset;
+      // Strided loop to share this work between blocks.
+      for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocksPerCluster) {
+        const int32_t localExpertIdx =
+            (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
+        params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
+        // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
+        int32_t mnLimit1;
+        int32_t mnLimit2;
         if (params.mIsPow2) {
-          offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
+          mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, params.mPaddingLog2);
+          mnLimit2 = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2) + count[e];
         } else {
-          offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
+          mnLimit1 = mulTileN<int32_t>(ctaOffset[e] + cta + 1, params.mTileTokensDim);
+          mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
-
-        // write expert offsets to shared
-        smemExpertOffset[expert] = offset + blockExpertOffset[e];
+        params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
       }
-    }
 
-    // write out padded count
-    if (clusterBlockRank == 0 && warpIdx == NumWarps - 1 && cute::elect_one_sync()) {
-      int32_t permutedIdxSize;
+      // get the padded offset associated with this expert (token-space, CGA granularity)
+      int32_t offset;
       if (params.mIsPow2) {
-        permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+        offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
       } else {
-        permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+        offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
       }
-      params.mPtrPermutedIdxSize[0] = permutedIdxSize;
-      params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+
+      // write expert offsets to shared
+      smemExpertOffset[expert] = offset + blockExpertOffset[e];
     }
-  }  // dual-tile routing
+  }
+
+  // write out padded count
+  if (clusterBlockRank == 0 && warpIdx == NumWarps - 1 && cute::elect_one_sync()) {
+    int32_t permutedIdxSize;
+    if (params.mIsPow2) {
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+    } else {
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+    }
+    params.mPtrPermutedIdxSize[0] = permutedIdxSize;
+    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+  }
 
   // make expert offsets available to all threads
   __syncthreads();
@@ -837,97 +721,78 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     count[e] = (expert < params.mNumExperts) ? params.mPtrExpertCounts[expert] : 0;
   }
 
-  if (routingDualTileEnabled(params)) {
-    // Dual-tile routing: pad to the tile the routing selects and write both tile lists.
-    bool const writeCounts =
-        blockIdx.x == 0 && warpIdx == NumThreadsBlock / WarpSize - 1 && cute::elect_one_sync();
-    int32_t paddedOffset[ExpertsPerThread];
-    int32_t paddedTotal;
-    routingDualTilePadding<ExpertsPerThread, Scan>(params, tempStorage, count, paddedOffset,
-                                                   paddedTotal, blockIdx.x, gridDim.x, writeCounts);
+  // Compute the runtime config for projections
+  // Whether or not an expert is local is taken into account when the histogram is computed
+  // so we do not need to take it into account here.
+  int32_t numCta[ExpertsPerThread];
 #pragma unroll
-    for (int e = 0; e < ExpertsPerThread; e++) {
-      int expert = threadIdx.x * ExpertsPerThread + e;
-      if (expert < params.mNumExperts) {
-        smemExpertOffset[expert] = paddedOffset[e];
-      }
+  for (int e = 0; e < ExpertsPerThread; e++) {
+    if (params.mIsPow2) {
+      numCta[e] = divUpLog2<int32_t>(count[e], params.mPaddingLog2);
+    } else {
+      numCta[e] = divUpTileN<int32_t>(count[e], params.mTileTokensDim);
     }
-    __syncthreads();
-  } else {
-    // Compute the runtime config for projections
-    // Whether or not an expert is local is taken into account when the histogram is computed
-    // so we do not need to take it into account here.
-    int32_t numCta[ExpertsPerThread];
-#pragma unroll
-    for (int e = 0; e < ExpertsPerThread; e++) {
-      if (params.mIsPow2) {
-        numCta[e] = divUpLog2<int32_t>(count[e], params.mPaddingLog2);
-      } else {
-        numCta[e] = divUpTileN<int32_t>(count[e], params.mTileTokensDim);
-      }
-    }
-    int32_t ctaOffset[ExpertsPerThread];
-    int32_t numNonExitingCtas;
-    Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
+  }
+  int32_t ctaOffset[ExpertsPerThread];
+  int32_t numNonExitingCtas;
+  Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
 
 #pragma unroll
-    for (int e = 0; e < ExpertsPerThread; e++) {
-      int expert = threadIdx.x * ExpertsPerThread + e;
-      if (expert < params.mNumExperts) {
-        // Get the padded offset associated with this expert (token-space, CGA granularity)
-        int32_t offset;
+  for (int e = 0; e < ExpertsPerThread; e++) {
+    int expert = threadIdx.x * ExpertsPerThread + e;
+    if (expert < params.mNumExperts) {
+      // Get the padded offset associated with this expert (token-space, CGA granularity)
+      int32_t offset;
+      if (params.mIsPow2) {
+        offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
+      } else {
+        offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
+      }
+
+      // Write expert offsets to shared
+      smemExpertOffset[expert] = offset;
+    }
+  }
+
+  // Sync to make expert offsets available to all threads.
+  __syncthreads();
+
+  // The first block writes out padded count (use last warp of actual thread count)
+  if (blockIdx.x == 0 && warpIdx == NumThreadsBlock / WarpSize - 1 && cute::elect_one_sync()) {
+    int32_t permutedIdxSize;
+    if (params.mIsPow2) {
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+    } else {
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+    }
+    params.mPtrPermutedIdxSize[0] = permutedIdxSize;
+    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+  }
+
+#pragma unroll
+  for (int e = 0; e < ExpertsPerThread; e++) {
+    int expert = threadIdx.x * ExpertsPerThread + e;
+    if (expert < params.mNumExperts) {
+      // Strided loop to share this work between blocks.
+      for (int32_t cta = blockIdx.x; cta < numCta[e]; cta += gridDim.x) {
+        const int32_t localExpertIdx =
+            (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
+        params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
+        // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
+        int32_t mnLimit1;
+        int32_t mnLimit2;
         if (params.mIsPow2) {
-          offset = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2);
+          mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, params.mPaddingLog2);
+          mnLimit2 = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2) + count[e];
         } else {
-          offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
+          mnLimit1 = mulTileN<int32_t>(ctaOffset[e] + cta + 1, params.mTileTokensDim);
+          mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
-
-        // Write expert offsets to shared
-        smemExpertOffset[expert] = offset;
+        params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
       }
     }
-
-    // Sync to make expert offsets available to all threads.
-    __syncthreads();
-
-    // The first block writes out padded count (use last warp of actual thread count)
-    if (blockIdx.x == 0 && warpIdx == NumThreadsBlock / WarpSize - 1 && cute::elect_one_sync()) {
-      int32_t permutedIdxSize;
-      if (params.mIsPow2) {
-        permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
-      } else {
-        permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
-      }
-      params.mPtrPermutedIdxSize[0] = permutedIdxSize;
-      params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
-    }
-
-#pragma unroll
-    for (int e = 0; e < ExpertsPerThread; e++) {
-      int expert = threadIdx.x * ExpertsPerThread + e;
-      if (expert < params.mNumExperts) {
-        // Strided loop to share this work between blocks.
-        for (int32_t cta = blockIdx.x; cta < numCta[e]; cta += gridDim.x) {
-          const int32_t localExpertIdx =
-              (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
-          params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
-          // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
-          int32_t mnLimit1;
-          int32_t mnLimit2;
-          if (params.mIsPow2) {
-            mnLimit1 = mulLog2<int32_t>(ctaOffset[e] + cta + 1, params.mPaddingLog2);
-            mnLimit2 = mulLog2<int32_t>(ctaOffset[e], params.mPaddingLog2) + count[e];
-          } else {
-            mnLimit1 = mulTileN<int32_t>(ctaOffset[e] + cta + 1, params.mTileTokensDim);
-            mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
-          }
-          params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
-          initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2),
-                                 mnLimit1);
-        }
-      }
-    }
-  }  // dual-tile routing
+  }
 
   //
   // Now loop on indices and compute offsets.
@@ -1280,69 +1145,57 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
     params.mPtrNumTokensPerExpert[threadIdx.x] = count;
   }
 
-  if (routingDualTileEnabled(params)) {
-    // Dual-tile routing: pad to the tile the routing selects and write both tile lists.
-    bool const writeCounts =
-        gridBlockIdx == 0 && warpIdx == NumThreads / WarpSize - 1 && cute::elect_one_sync();
-    int32_t const countArr[1] = {count};
-    int32_t paddedOffset[1];
-    int32_t paddedTotal;
-    routingDualTilePadding<1, Scan>(params, tempStorage, countArr, paddedOffset, paddedTotal,
-                                    gridBlockIdx, numBlocks, writeCounts);
-    smemExpertOffset[threadIdx.x] = paddedOffset[0] + blockExpertOffset;
+  int32_t numCta;
+  if (params.mIsPow2) {
+    numCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
   } else {
-    int32_t numCta;
+    numCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
+  }
+
+  int32_t ctaOffset;
+  int32_t numNonExitingCtas;
+  Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
+
+  for (int32_t cta = gridBlockIdx; cta < numCta; cta += numBlocks) {
+    const int32_t localExpertIdx =
+        (threadIdx.x - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
+    params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = localExpertIdx;
+    // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
+    int32_t mnLimit1;
+    int32_t mnLimit2;
     if (params.mIsPow2) {
-      numCta = divUpLog2<int32_t>(count, params.mPaddingLog2);
+      mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
+      mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count;
     } else {
-      numCta = divUpTileN<int32_t>(count, params.mTileTokensDim);
+      mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
+      mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
     }
+    params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
+    initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+  }
 
-    int32_t ctaOffset;
-    int32_t numNonExitingCtas;
-    Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
+  // get the padded offset associated with this expert (token-space, CGA granularity)
+  int32_t offset;
+  if (params.mIsPow2) {
+    offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+  } else {
+    offset = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
+  }
+  int32_t permutedIdxSize;
+  if (params.mIsPow2) {
+    permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+  } else {
+    permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+  }
 
-    for (int32_t cta = gridBlockIdx; cta < numCta; cta += numBlocks) {
-      const int32_t localExpertIdx =
-          (threadIdx.x - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
-      params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = localExpertIdx;
-      // Write CTA-level MnLimits using ctaTile = cgaTile / clusterSize
-      int32_t mnLimit1;
-      int32_t mnLimit2;
-      if (params.mIsPow2) {
-        mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
-        mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count;
-      } else {
-        mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
-        mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
-      }
-      params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
-      initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
-    }
+  // write out padded count
+  if (gridBlockIdx == 0 && warpIdx == NumThreads / WarpSize - 1 && cute::elect_one_sync()) {
+    params.mPtrPermutedIdxSize[0] = permutedIdxSize;
+    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+  }
 
-    // get the padded offset associated with this expert (token-space, CGA granularity)
-    int32_t offset;
-    if (params.mIsPow2) {
-      offset = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
-    } else {
-      offset = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
-    }
-    int32_t permutedIdxSize;
-    if (params.mIsPow2) {
-      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
-    } else {
-      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
-    }
-
-    // write out padded count
-    if (gridBlockIdx == 0 && warpIdx == NumThreads / WarpSize - 1 && cute::elect_one_sync()) {
-      params.mPtrPermutedIdxSize[0] = permutedIdxSize;
-      params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
-    }
-
-    // write expert offsets to shared
-    smemExpertOffset[threadIdx.x] = offset + blockExpertOffset;
-  }  // dual-tile routing
+  // write expert offsets to shared
+  smemExpertOffset[threadIdx.x] = offset + blockExpertOffset;
 
   // make expert offsets available to all threads
   __syncthreads();

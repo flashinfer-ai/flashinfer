@@ -23,29 +23,61 @@ Host contract (flashinfer#4671 hardening)
   ``query`` and ``out`` may carry more rows; rows ``>= T`` are neither read nor
   written. Grids and workspace views derive from ``T``, never from query rows.
 * **Argument binding.** Kernel arguments are bound *by name* through the
-  registration ``arg_plan`` (:func:`_launch_variant`) or the program signature
-  (:func:`_launch_program`), so regenerated bindings only need names from the
-  host vocabulary (:func:`is_bindable_arg`).
+  registration ``arg_plan`` (:func:`_prepare_variant`), so regenerated bindings
+  only need names from the host vocabulary (:func:`is_bindable_arg`). Every
+  route launches its variant kernels directly; two-stage routes bind the
+  producer and the reducer first and issue both through one FFI call
+  (``run_sequence`` in ``cake_dsv4_launch_sequence.cc``), so no host work
+  sits between the two kernels.
 * **Workspace.** One caller-owned ``workspace_buffer`` is carved
   deterministically (:func:`cake_dsv4_workspace_layout`)::
 
-      [0,      1024)          TMA descriptor slab (bindings refresh it on every launch)
+      [0,      1024)          reserved (formerly the TMA descriptor slab; see below)
       [1024,   1024 + 256 KiB) split-merge counters, uint32[65536]; zero at first use,
                                the kernel leaves them zero after every launch
       [P,      P + O_bytes)    partial_O  bf16 [T * H * S * 512]  (P = 1024 + 256 KiB)
       [P + O_bytes, ...)       partial_lse f32 [T * H * S]
 
-  with every region 128-byte aligned. No call path allocates device memory:
-  callers zero the counter region once (:func:`cake_dsv4_workspace_reset`, or
-  the first eager call does it for that tensor) and the kernels self-reset.
+  with every region 128-byte aligned. Callers zero the counter region once
+  (:func:`cake_dsv4_workspace_reset`, or the first eager call does it for that
+  tensor) and the kernels self-reset.
+* **Descriptor storage.** The SM103 bindings that read their TMA descriptors
+  from device memory (``tma_workspace_bytes`` in their registration; the SM100
+  twins pass descriptors by value and use none of this) take a private,
+  host-retained 1 KiB tensor per launch and write the descriptors of the call
+  into it when they differ from what it holds, in stream order and never
+  inside CUDA Graph capture. The host keeps a pool of such tensors per
+  (variant, device) (:func:`_descriptor_storage`) keyed by the *descriptor
+  set* = the TMA source geometry (pointer, shape, strides, dtype of ``Q`` and
+  the KV caches). Rules:
+
+  1. A set launched eagerly becomes a *live* entry; at most
+     :data:`_DESCRIPTOR_POOL_CAPACITY` live entries exist per pool, and a new
+     set beyond that takes the least recently used live entry's storage (the
+     binding rewrites it before the launch). A live hit does no device write.
+  2. A set launched under graph capture must be live at that moment (prepare
+     it with one eager call on the same tensors); it then becomes a *captured*
+     entry, which is never evicted or reassigned for the process lifetime
+     because its graph may replay at any time. Eviction applies to live
+     entries only.
+  3. A set that is not live when a capture reaches it raises before any
+     allocation or binding call.
+  4. One lock covers the pool bookkeeping, the bindings' descriptor checks
+     and the launch enqueues of a call; a launch on another stream than the
+     storage's last reader waits for that stream first.
+
+  Successive calls through one workspace (the layers of a model) therefore do
+  not collide, and a stream of fresh query tensors does not grow memory
+  without bound. Nothing else allocates device memory.
 """
 
 from __future__ import annotations
 
+import collections
 import functools
 import threading
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Optional, Union
+from typing import Any, Literal, Mapping, Optional, Sequence, Union
 
 import torch
 
@@ -68,19 +100,27 @@ _PARTIAL_OFFSET = _COUNTER_OFFSET + _COUNTER_REGION_BYTES
 _MAX_FIXED_SPLITS = 5
 # BF16/H128 SWA-only and topk4x rows with this many metadata tokens or more use
 # the persistent KV-reuse prefill body (mirrors the Cake dispatcher's
-# BF16_H128_PREFILL_MIN_TOKENS, CAKE-624 W11).
+# BF16_H128_PREFILL_MIN_TOKENS).
 _BF16_H128_PREFILL_MIN_TOKENS = 64
 # The two-stage split4 program (4 owners x 2 CTAs per token) runs one wave
-# only up to this many query tokens; wider grids lose to trtllm-gen (CAKE-624 W12).
+# only up to this many query tokens; wider grids lose to trtllm-gen.
 # Mirrors the Cake seed's BF16_TOPK128X_SPLIT_MAX_TOKENS.
 _BF16_TOPK128X_SPLIT_MAX_TOKENS = 16
+# Widths the BF16/H128 four-owner split and row-first producers cover (two or
+# three live KV tiles); other widths below the prefill token bound have no
+# exported kernel.
+_BF16_TOPK128X_MIN_WIDTH = 256
+_BF16_TOPK128X_MAX_WIDTH = 388
+# One FP8 low-head producer partition owns up to three sparse tiles; mirrors
+# the producer's FP8_ONE_PARTITION_MAX_TILES = 3.
+_FP8_ONE_PARTITION_MAX_WIDTH = 384
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
 _PRIMED_ATTR = "_cake_dsv4_counters_primed"
 
 
 # Work feed of the BF16/H128 persistent prefill body (mirrors the Cake seed's
-# bf16_h128_prefill_uses_snake_feed, CAKE-624 W17).  With C = min(T, SMs // 2)
+# bf16_h128_prefill_uses_snake_feed).  With C = min(T, SMs // 2)
 # clusters the striped feed gives base = T // C strided PREFIX items to the
 # C - T % C regular clusters and base + 1 contiguous SUFFIX items to the T % C
 # tail clusters; when the tail clusters are the majority the few regular
@@ -133,10 +173,6 @@ def _variant_module(variant: str, *, arch: str):
     from ..jit.cake_dsv4 import get_cake_dsv4_module
 
     return get_cake_dsv4_module(variant, arch=arch)
-
-
-def _stream_ptr(device: torch.device) -> int:
-    return int(torch.cuda.current_stream(device).cuda_stream)
 
 
 def _is_capturing(device: torch.device) -> bool:
@@ -500,23 +536,111 @@ def _counters(raw: torch.Tensor, merge_groups: int) -> torch.Tensor:
     return raw[_COUNTER_OFFSET : _COUNTER_OFFSET + merge_groups * 4].view(torch.uint32)
 
 
-def _descriptor_workspace(raw: torch.Tensor, num_bytes: int) -> torch.Tensor:
-    """Descriptor slab at a fixed offset of the workspace.
+# Descriptor storage pools (see the module docstring, "Descriptor storage").
+# Bound on the storages a pool hands to eager launches; descriptor sets that
+# were launched under CUDA Graph capture are retained separately for the
+# process lifetime because their graphs keep reading them.
+_DESCRIPTOR_POOL_CAPACITY = 4096
+_descriptor_lock = threading.Lock()
+_descriptor_pools: dict[tuple[str, str, torch.device], "_DescriptorPool"] = {}
 
-    The generated bindings encode fresh TMA descriptors and upload them into this
-    slab on every launch (by-value kernel parameters, so CUDA graphs record the
-    upload), which makes the slab plain mutable scratch: its address is stable
-    per workspace and no separate per-layout storage is needed.
+
+@dataclass
+class _DescriptorStorage:
+    tensor: torch.Tensor
+    # Stream of the last launch that read this storage; a launch on another
+    # stream waits for it before the binding may rewrite the descriptors.
+    stream: Optional[torch.cuda.Stream]
+
+
+@dataclass
+class _DescriptorPool:
+    """Descriptor storages of one variant module on one device."""
+
+    # descriptor set -> storage, least recently used first; reassignable
+    live: "collections.OrderedDict[tuple, _DescriptorStorage]"
+    # descriptor sets launched under graph capture: never reassigned
+    captured: dict[tuple, _DescriptorStorage]
+    # storages released by a capacity change, reused before allocating
+    spare: list[_DescriptorStorage]
+
+
+def _new_descriptor_storage(device: torch.device) -> _DescriptorStorage:
+    backing = torch.empty(
+        _DESCRIPTOR_SLAB_BYTES + _ALIGN, dtype=torch.uint8, device=device
+    )
+    offset = (-backing.data_ptr()) % _ALIGN
+    return _DescriptorStorage(backing[offset : offset + _DESCRIPTOR_SLAB_BYTES], None)
+
+
+def _descriptor_storage(
+    variant: str,
+    arch: str,
+    num_bytes: int,
+    sources: Sequence[tuple[str, torch.Tensor]],
+    *,
+    capturing: bool,
+) -> torch.Tensor:
+    """Private descriptor storage for ``variant`` over these TMA source tensors.
+
+    A descriptor set is a pure function of each source tensor's pointer, shape,
+    strides and dtype, so that geometry is the key. The pool of one variant on
+    one device hands out at most :data:`_DESCRIPTOR_POOL_CAPACITY` storages to
+    eager launches: a hit reuses the storage whose bytes the binding already
+    holds, a miss takes a fresh storage until the pool is full and the least
+    recently used one afterwards (the binding rewrites its descriptors in
+    stream order before the launch). A set launched under CUDA Graph capture
+    moves to the pool's retained part and is never reassigned, so replays keep
+    reading the descriptors they captured; a set that is not resident when a
+    capture reaches it is an error, because the binding cannot initialize
+    descriptors inside a capture. The caller holds :data:`_descriptor_lock`
+    from this lookup through the launch, so a storage is never reassigned
+    between the binding's descriptor check and the launch that reads it.
     """
     if num_bytes > _DESCRIPTOR_SLAB_BYTES:
         raise ValueError(
             f"CAKE DSv4 variant needs {num_bytes} TMA descriptor bytes; the "
-            f"workspace slab holds {_DESCRIPTOR_SLAB_BYTES}"
+            f"descriptor storage holds {_DESCRIPTOR_SLAB_BYTES}"
         )
-    _require_workspace_bytes(raw, _PARTIAL_OFFSET)
-    return raw[
-        _DESCRIPTOR_SLAB_OFFSET : _DESCRIPTOR_SLAB_OFFSET + _DESCRIPTOR_SLAB_BYTES
-    ]
+    device = sources[0][1].device if sources else torch.device("cpu")
+    key = tuple(
+        (name, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+        for name, t in sources
+    )
+    stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
+    pool = _descriptor_pools.get((variant, arch, device))
+    if pool is None:
+        pool = _DescriptorPool(collections.OrderedDict(), {}, [])
+        _descriptor_pools[variant, arch, device] = pool
+    storage = pool.captured.get(key)
+    if storage is not None:
+        return storage.tensor
+    storage = pool.live.get(key)
+    if capturing:
+        if storage is None:
+            raise RuntimeError(
+                f"CAKE DSv4 {variant}: the TMA descriptors for these query / "
+                "KV-cache tensors have not been initialised and the current "
+                "stream is capturing a CUDA graph; run one eager call with the "
+                "same tensors (pointers, shapes and strides) before capture"
+            )
+        del pool.live[key]
+        pool.captured[key] = storage
+        return storage.tensor
+    if storage is not None:
+        pool.live.move_to_end(key)
+    else:
+        capacity = max(1, int(_DESCRIPTOR_POOL_CAPACITY))
+        while len(pool.live) >= capacity:
+            pool.spare.append(pool.live.popitem(last=False)[1])
+        storage = pool.spare.pop() if pool.spare else _new_descriptor_storage(device)
+        pool.live[key] = storage
+    if stream is not None and storage.stream is not None and storage.stream != stream:
+        # Order this launch (and a descriptor rewrite the binding may issue
+        # on this stream) after the last launch that read the storage.
+        stream.wait_stream(storage.stream)
+    storage.stream = stream
+    return storage.tensor
 
 
 def cake_dsv4_workspace_reset(workspace_buffer: torch.Tensor) -> None:
@@ -622,7 +746,7 @@ _RAGGED_ONLY_ROUTES = frozenset(
         "fp8_h64_prefill_source_persistent_m64",
     }
 )
-# CAKE-624 W9: mirrors the Cake seed's LANE_GATHER_MIN_TOKENS. Below it the
+# Mirrors the Cake seed's LANE_GATHER_MIN_TOKENS. Below it the
 # persistent FP8 body runs the program with elected-lane uniform K/V gathers;
 # from 128 tokens on, the lane-issued gathers (several waves per cluster) win.
 _FP8_PERSISTENT_LANE_GATHER_MIN_TOKENS = 128
@@ -634,14 +758,14 @@ def _fp8_persistent_program(num_query_tokens: int) -> str:
     return "fp8_h128_prefill_source_persistent"
 
 
-# CAKE-624 W14: mirrors the Cake seed's H64_M64_MIN_TOKENS
+# Mirrors the Cake seed's H64_M64_MIN_TOKENS
 # (portfolio_v34.persistent_program): FP8/H64 rows admitted to the persistent
 # body with at least this many tokens run the H64-specific single-CTA M64 body.
 _FP8_H64_M64_MIN_TOKENS = 128
 
 
 def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bool:
-    """CAKE-624 FP8/H64 rule (Cake seed ``portfolio_v34.uses_persistent_body``)."""
+    """FP8/H64 persistent-body rule (Cake seed ``portfolio_v34.uses_persistent_body``)."""
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
         return full_tiles >= 3
@@ -742,67 +866,80 @@ def _grid_values(grid: tuple[int, int, int]) -> dict[str, int]:
     return dict(zip(_GRID_NAMES, grid, strict=True))
 
 
+class _PreparedLaunch:
+    """A bound variant launch: the FFI call is the only work left to do."""
+
+    __slots__ = ("module", "bound")
+
+    def __init__(self, module, bound: list):
+        self.module = module
+        self.bound = bound
+
+    def __call__(self):
+        # Direct-source bindings use the target FFI current stream.
+        return self.module.run(*self.bound)
+
+
+def _sequence_module():
+    from ..jit.cake_dsv4 import get_cake_dsv4_launch_sequence_module
+
+    return get_cake_dsv4_launch_sequence_module()
+
+
+def _prepare_variant(
+    variant: str,
+    *,
+    arch: str,
+    grid: tuple[int, int, int],
+    values: Mapping[str, Any],
+) -> _PreparedLaunch:
+    """Bind the generated ABI by name through the registration ``arg_plan``.
+
+    Two-stage routes prepare the producer and the reducer before launching
+    either, so no Python-side binding sits between the two kernels. The caller
+    holds :data:`_descriptor_lock` from the first preparation through the last
+    launch of the call.
+    """
+    from ..jit.cake_dsv4 import get_cake_dsv4_spec
+
+    contract = get_cake_dsv4_spec(variant, arch=arch)
+    plan = contract["arg_plan"]
+    grid_values = _grid_values(grid)
+
+    def bind(kind, name, storage=None):
+        return _bind_argument(
+            values,
+            kind,
+            name,
+            variant=variant,
+            grid=grid_values,
+            descriptor_slab=storage,
+        )
+
+    tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
+    storage = None
+    if tma_bytes:
+        sources = [
+            (name, bind(kind, name)) for kind, name in plan if kind == "tma_buffer"
+        ]
+        device = sources[0][1].device if sources else torch.device("cpu")
+        storage = _descriptor_storage(
+            variant, arch, tma_bytes, sources, capturing=_is_capturing(device)
+        )
+    bound = [bind(kind, name, storage) for kind, name in plan]
+    return _PreparedLaunch(_variant_module(variant, arch=arch), bound)
+
+
 def _launch_variant(
     variant: str,
     *,
     arch: str,
     grid: tuple[int, int, int],
-    workspace_raw: torch.Tensor,
     values: Mapping[str, Any],
 ):
-    """Bind the generated ABI by name through the registration ``arg_plan``."""
-    from ..jit.cake_dsv4 import get_cake_dsv4_spec
-
-    contract = get_cake_dsv4_spec(variant, arch=arch)
-    tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
-    slab = _descriptor_workspace(workspace_raw, tma_bytes) if tma_bytes else None
-    grid_values = _grid_values(grid)
-    bound = [
-        _bind_argument(
-            values, kind, name, variant=variant, grid=grid_values, descriptor_slab=slab
-        )
-        for kind, name in contract["arg_plan"]
-    ]
-    # Direct-source bindings use the target FFI current stream.
-    return getattr(_variant_module(variant, arch=arch), contract["entry"])(*bound)
-
-
-def _launch_program(
-    variant: str,
-    *,
-    arch: str,
-    stream: int,
-    workspace_raw: torch.Tensor,
-    values: Mapping[str, Any],
-) -> None:
-    from ..jit.cake_dsv4 import (
-        get_cake_dsv4_program,
-        get_cake_dsv4_program_for_variant,
-    )
-
-    selected = get_cake_dsv4_program_for_variant(variant, arch=arch)
-    if selected is None:
-        raise ValueError(f"CAKE DSv4 variant has no compiled program: {variant}")
-    program_id, contract = selected
-    signature = contract["signature"]
-    plan = [
-        *(("buffer", name) for name in signature["tensor_keys"]),
-        *(("workspace", name) for name in signature["workspace_keys"]),
-        *(("parameter", name) for name in signature["scalar_names"]),
-    ]
-    slab = (
-        _descriptor_workspace(workspace_raw, _DESCRIPTOR_SLAB_BYTES)
-        if signature["workspace_keys"]
-        else None
-    )
-    args = [
-        _bind_argument(
-            values, kind, name, variant=variant, grid={}, descriptor_slab=slab
-        )
-        for kind, name in plan
-    ]
-    program = get_cake_dsv4_program(program_id, arch=arch)
-    getattr(program, contract["entry"])(*args, stream)
+    """Prepare and launch one variant (single-launch convenience)."""
+    with _descriptor_lock:
+        return _prepare_variant(variant, arch=arch, grid=grid, values=values)()
 
 
 # --------------------------------------------------------------------------- #
@@ -812,7 +949,6 @@ def _launch_program(
 
 def _route(
     *,
-    arch: str,
     dtype: torch.dtype,
     num_heads: int,
     max_q_len: int,
@@ -857,7 +993,7 @@ def _route(
                 or (is_topk4x and sparse_topk == (192 if num_heads == 8 else 256))
             )
         ):
-            # CAKE-624 W18: FP8 port of the 1-CTA SwapsAb body trtllm-gen runs
+            # FP8 port of the 1-CTA SwapsAb body trtllm-gen runs
             # on these rows (heads on the MMA N side, kind::f8f6f4, P e4m3
             # x448); same shape lock as the BF16 source-exact route.  Paired
             # vs trtllm-gen: rows 55/58/67/70 GB300 1.27-1.30x / B200
@@ -867,7 +1003,7 @@ def _route(
         if num_heads == 64 and _fp8_h64_uses_persistent_body(
             sparse_topk, num_query_tokens
         ):
-            # Mirrors the Cake seed's H64_PERSISTENT_* rule (CAKE-624 W5 + W10):
+            # Mirrors the Cake seed's H64_PERSISTENT_* rule:
             # 12-token rows with >= 3 complete sparse tiles; every many-token
             # compressed row (>= 2 complete tiles); SWA-only rows from 128
             # tokens.  Same persistent FP8 body as FP8/H128 (heads >= num_heads
@@ -876,7 +1012,7 @@ def _route(
             # per-token cluster body and the SWA producer sat at 0.6-0.87x.
             # Evaluated before the SWA-only test on purpose.
             if num_query_tokens >= _FP8_H64_M64_MIN_TOKENS:
-                # CAKE-624 W14: H64-specific single-CTA M64 persistent body (one
+                # H64-specific single-CTA M64 persistent body (one
                 # CTA per token, unified 128-row KV stage, no V gathers): GB300
                 # 1.25-1.55x / B200 1.22-1.44x on the 128-512 token rows where
                 # the FP8/H128 body sat at 0.81-1.13x.
@@ -885,18 +1021,18 @@ def _route(
         if is_swa:
             return "fp8_lowhead_prefill"
         if num_heads == 64:
-            if arch == "sm_100a" and sparse_topk >= 640:
-                return "fp8_lowhead_h64_split"
             return "fp8_lowhead_h64"
         # One producer partition owns up to three sparse tiles (widths up to
-        # 384) and writes final O directly; the two-partition path splits
-        # three tiles as 2 + 1 and still pays the reducer launch, so it never
-        # shortens the critical path there (one partition measured 1.18-1.26x
-        # on the width-260 rows).  Mirrors the Cake seed's
-        # FP8_ONE_PARTITION_MAX_TILES = 3.
-        return (
-            "fp8_lowhead_one_partition" if sparse_topk <= 384 else "fp8_lowhead_split"
-        )
+        # 384) and writes final O directly (one partition measured 1.18-1.26x
+        # on the width-260 rows).  No two-partition producer is exported for
+        # wider low-head rows.
+        if sparse_topk > _FP8_ONE_PARTITION_MAX_WIDTH:
+            raise ValueError(
+                f"backend='cake' has no FP8 kernel for {num_heads} heads with "
+                f"sparse_topk {sparse_topk} > {_FP8_ONE_PARTITION_MAX_WIDTH} "
+                f"below max_q_len 257"
+            )
+        return "fp8_lowhead_one_partition"
     if dtype != torch.bfloat16:
         raise ValueError(f"unsupported CAKE DSv4 dtype: {dtype}")
     if (
@@ -913,12 +1049,15 @@ def _route(
     if num_heads in (8, 16):
         if is_swa:
             return "bf16_h8_swa128_v43" if num_heads == 8 else "bf16_h16_h32_swa128_v44"
-        return "bf16_h8_h32"
+        raise ValueError(
+            f"backend='cake' has no BF16 kernel for {num_heads} heads with a "
+            "compressed cache outside the batch-3, max_q_len-5 ragged rows"
+        )
     if num_heads == 32:
         if is_swa:
             return "bf16_h16_h32_swa128_v44"
         if is_topk4x or is_topk128x:
-            # CAKE-624 W13: the retained-KV body with the last-arriver merge
+            # The retained-KV body with the last-arriver merge
             # beats the topk4x body on the H32 topk4x rows on both targets.
             return "bf16_h32_topk128x_early_v47"
         raise ValueError("BF16 H32 compressed cache requires page size 64 or 2")
@@ -956,7 +1095,14 @@ def _route(
             return "bf16_h128_swa128"
         if is_topk4x and sparse_topk == 1152:
             return "bf16_h128_topk4x_v52"
-        return "bf16_h128_topk128x"
+        if _BF16_TOPK128X_MIN_WIDTH < sparse_topk <= _BF16_TOPK128X_MAX_WIDTH:
+            return "bf16_h128_topk128x"
+        raise ValueError(
+            f"backend='cake' has no BF16 H128 kernel for sparse_topk {sparse_topk} "
+            f"below {_BF16_H128_PREFILL_MIN_TOKENS} tokens (supported: 128, "
+            f"{_BF16_TOPK128X_MIN_WIDTH + 4}-{_BF16_TOPK128X_MAX_WIDTH} and 1152 "
+            "with page size 64)"
+        )
     raise ValueError(f"unsupported CAKE BF16 DSv4 head count: {num_heads}")
 
 
@@ -1057,32 +1203,37 @@ class _Launcher:
         arch: str,
         workspace: torch.Tensor,
         raw: torch.Tensor,
-        stream: int,
         values: dict[str, Any],
     ):
         self.arch = arch
         self.workspace = workspace
         self.raw = raw
-        self.stream = stream
         self.values = values
 
-    def variant(self, name: str, *, grid: tuple[int, int, int], **overrides: Any):
-        return _launch_variant(
-            name,
-            arch=self.arch,
-            grid=grid,
-            workspace_raw=self.raw,
-            values={**self.values, **overrides},
+    def variant(
+        self, name: str, *, grid: tuple[int, int, int], **overrides: Any
+    ) -> _PreparedLaunch:
+        return _prepare_variant(
+            name, arch=self.arch, grid=grid, values={**self.values, **overrides}
         )
 
-    def program(self, name: str, **overrides: Any) -> None:
-        _launch_program(
-            name,
-            arch=self.arch,
-            stream=self.stream,
-            workspace_raw=self.raw,
-            values={**self.values, **overrides},
-        )
+    @staticmethod
+    def run(*launches: _PreparedLaunch):
+        """Issue the launches of one route.
+
+        A single launch is one FFI call. Several launches go through the
+        ``run_sequence`` host helper in one FFI call, so the host work of the
+        second launch (argument conversion, Python-to-C transition) does not
+        sit between the two kernels.
+        """
+        if len(launches) == 1:
+            return launches[0]()
+        flat: list[Any] = []
+        for launch in launches:
+            flat.append(launch.module.run)
+            flat.append(len(launch.bound))
+            flat.extend(launch.bound)
+        return _sequence_module().run_sequence(*flat)
 
     def partials(self, num_splits: int) -> dict[str, Any]:
         partial_o, partial_lse = _partial_views(
@@ -1102,10 +1253,10 @@ class _Launcher:
         _ensure_counters_zeroed(self.workspace, self.raw)
         return _counters(self.raw, merge_groups)
 
-    def reduce(self, reducer: str, **overrides: Any) -> None:
+    def reduce(self, reducer: str, **overrides: Any) -> _PreparedLaunch:
         tokens = self.values["num_query_tokens"]
         heads = self.values["num_heads"]
-        self.variant(reducer, grid=(tokens, heads, 1), **overrides)
+        return self.variant(reducer, grid=(tokens, heads, 1), **overrides)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -1212,7 +1363,6 @@ def run_cake_dsv4(
         )
     raw = _workspace_bytes(workspace_buffer)
     route = _route(
-        arch=arch,
         dtype=query.dtype,
         num_heads=num_heads,
         max_q_len=max_q_len,
@@ -1253,10 +1403,13 @@ def run_cake_dsv4(
         arch=arch,
         workspace=workspace_buffer,
         raw=raw,
-        stream=_stream_ptr(device),
         values=values,
     )
-    _dispatch_route(route, launcher)
+    # One host-side critical section per call: descriptor-pool bookkeeping,
+    # the bindings' descriptor checks and the launch enqueues (see
+    # _descriptor_storage).
+    with _descriptor_lock:
+        _dispatch_route(route, launcher)
     return out
 
 
@@ -1266,15 +1419,6 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
     H = v["num_heads"]
     topk = v["sparse_topk"]
 
-    if route == "bf16_h8_h32":
-        # General low-head path outside the specialized profiles.
-        num_splits = _ceil_div(topk, _TILE_KV)
-        parts = L.partials(num_splits)
-        L.variant(route, grid=(T * num_splits * 4, 1, 1), **parts)
-        if num_splits > 1:
-            L.reduce("bf16_h8_h32_reduce", **parts)
-        return
-
     if route in (
         "bf16_swa128_single_cta",
         "bf16_h128_swa128",
@@ -1282,34 +1426,33 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         "bf16_h16_h32_swa128_v44",
     ):
         head_tiles = _ceil_div(H, 64) if route == "bf16_h128_swa128" else 1
-        L.variant(route, grid=(T * head_tiles * 4, 1, 1), num_head_tiles=head_tiles)
+        L.run(
+            L.variant(route, grid=(T * head_tiles * 4, 1, 1), num_head_tiles=head_tiles)
+        )
         return
 
     if route == "bf16_h8_h16_source_exact":
-        L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"]))
+        L.run(L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"])))
         return
 
     if route == "fp8_h8_h16_source_exact":
         # Same launch shape as the BF16 source-exact body (one CTA per
         # (query-within-sequence, value quarter, batch)); FP8 Q/KV pools.
-        L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"]))
+        L.run(L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"])))
         return
 
     if route == "bf16_h64_guard_q_tma_batch_r25":
-        L.variant(route, grid=(T, 2, 1))
+        L.run(L.variant(route, grid=(T, 2, 1)))
         return
 
-    if route in ("bf16_h64_compressed_q8_v38", "bf16_h64_fixed_q"):
+    if route == "bf16_h64_compressed_q8_v38":
         num_splits = _ceil_div(topk, _TILE_KV)
         parts = L.partials(num_splits)
-        L.variant(route, grid=(T * num_splits * 2, 1, 1), **parts)
+        compressed = L.variant(route, grid=(T * num_splits * 2, 1, 1), **parts)
         if num_splits > 1:
-            reducer = (
-                "bf16_h64_compressed_reduce"
-                if route == "bf16_h64_compressed_q8_v38"
-                else "bf16_h64_fixed_q_reduce"
-            )
-            L.reduce(reducer, **parts)
+            L.run(compressed, L.reduce("bf16_h64_compressed_reduce", **parts))
+        else:
+            L.run(compressed)
         return
 
     if route == "bf16_h32_topk128x_early_v47":
@@ -1317,63 +1460,88 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         head_tiles = _ceil_div(H, 8)
         parts = L.partials(num_splits)
         arrivals = L.counters(T * head_tiles)
-        L.variant(
-            route,
-            grid=(T * num_splits * head_tiles, 1, 1),
-            partition_arrivals=arrivals,
-            num_head_tiles=head_tiles,
-            **parts,
+        L.run(
+            L.variant(
+                route,
+                grid=(T * num_splits * head_tiles, 1, 1),
+                partition_arrivals=arrivals,
+                num_head_tiles=head_tiles,
+                **parts,
+            )
         )
         return
 
     if route == "bf16_h64_prefill":
-        L.variant(route, grid=(T, 1, 1), total_work_items=T)
+        L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T))
         return
 
     if route in ("bf16_h128_topk128x", "bf16_h128_topk4x_v52", "bf16_h128_prefill_v42"):
-        num_splits = 5 if route == "bf16_h128_topk4x_v52" else 1
-        program_variant = route
-        if route == "bf16_h128_prefill_v42" and _bf16_h128_prefill_uses_snake_feed(
-            T, topk, _bf16_h128_prefill_num_clusters(v["Q"].device)
-        ):
-            # CAKE-624 W17: boustrophedon work feed of the same body (see the
-            # predicate above); hardening-000037 0.77-0.90x -> 0.98-1.01x and
-            # hardening-000027 +8-10 % vs the striped program.
-            program_variant = "bf16_h128_prefill_v42_snake"
-        # The two-stage split program (four disjoint full-V KV owners + one
-        # LSE reducer) ships on both Blackwell targets: GB300 rows at width
-        # 260/388 measured 1.18-1.26x vs trtllm-gen against 0.83-1.05x for
-        # the single-owner kernel (CAKE-624 W2).  Mirrors the Cake seed's
-        # BF16_TOPK128X_SPLIT_ARCHES.  Above the token bound the rows run one
-        # full-V owner per token whose invalid (-1) sparse rows gather the
-        # tile's first index (CAKE-624 W12: hardening-000025/31 0.45-0.95x ->
-        # 1.13-1.65x); mirrors bf16_topk128x_uses_row_first_owner.
-        if (
-            route == "bf16_h128_topk128x"
-            and 256 < topk <= 388
-            and T > _BF16_TOPK128X_SPLIT_MAX_TOKENS
-        ):
-            program_variant = "bf16_h128_topk128x_row_first"
-        elif route == "bf16_h128_topk128x" and 256 < topk <= 388:
-            # Three live KV tiles run the four-owner program with a fully
-            # masked fourth tile: the split4 owner kernel is 12.3-13.0 us for
-            # width 260 against 14.8 us on the three-owner pair (GB300
-            # 1.23x -> 1.44x, B200 1.11x -> 1.29x vs trtllm-gen), so the
-            # three-owner program is retired.  Mirrors the Cake seed rule
-            # bf16_topk128x_uses_split3 (always False).
+        # The BF16/H128 producers launch directly with the grids their former
+        # single-route family libraries computed: two CTAs per work item.
+        producer = route
+        num_splits = 1
+        grid_x = 2 * T
+        if route == "bf16_h128_prefill_v42":
+            # Persistent KV-reuse body: one two-CTA cluster per item, at most
+            # half the SMs in clusters; the boustrophedon feed of the same body
+            # serves the tail-majority rows (see the predicate above:
+            # hardening-000037 0.77-0.90x -> 0.98-1.01x, hardening-000027
+            # +8-10 % vs the striped feed).
+            clusters = _bf16_h128_prefill_num_clusters(v["Q"].device)
+            if _bf16_h128_prefill_uses_snake_feed(T, topk, clusters):
+                producer = "bf16_h128_prefill_v42_snake"
+            grid_x = min(2 * T, 2 * clusters)
+        elif route == "bf16_h128_topk4x_v52":
+            # Five fixed full-V KV owners per token plus the split-5 reducer.
+            num_splits = 5
+        elif T > _BF16_TOPK128X_SPLIT_MAX_TOKENS:
+            # Above the token bound one full-V owner per token whose invalid
+            # (-1) sparse rows gather the tile's first index
+            # (hardening-000025/31 0.45-0.95x -> 1.13-1.65x).
+            producer = "bf16_h128_topk128x_row_first"
+        else:
+            # Two-stage split program on both Blackwell targets: four disjoint
+            # full-V KV owners (a three-tile row runs with the fourth tile
+            # masked: 12.3-13.0 us vs 14.8 us for a three-owner pair) plus one
+            # LSE reducer; GB300 width 260/388 rows measured 1.18-1.26x vs
+            # trtllm-gen against 0.83-1.05x for the single-owner kernel.
             num_splits = 4
-            program_variant = "bf16_h128_topk128x_split4_sm100"
+            producer = "bf16_h128_topk128x_split4_sm100"
         parts = L.partials(num_splits)
-        L.program(program_variant, total_work_items=T * num_splits, **parts)
+        if num_splits == 1:
+            L.run(L.variant(producer, grid=(grid_x, 1, 1), total_work_items=T, **parts))
+            return
+        # The split producers write their per-owner outputs through ``O``.
+        work_items = T * num_splits
+        split = L.variant(
+            producer,
+            grid=(2 * work_items, 1, 1),
+            total_work_items=work_items,
+            **{**parts, "O": parts["partial_O"]},
+        )
+        if num_splits == 5:
+            # The two split-5 reducers are different kernels with different
+            # launch contracts (copied from their former family libraries):
+            # the sm_103a body runs grid (tokens, heads / 4), the sm_100a
+            # body grid (tokens, heads).
+            reducer_heads = H // 4 if L.arch == "sm_103a" else H
+            reduce = L.variant(
+                "bf16_h128_split5_reduce", grid=(T, reducer_heads, 1), **parts
+            )
+        else:
+            reduce = L.reduce("split_reduce", **parts)
+        L.run(split, reduce)
         return
 
     if route == "fp8_h64_source_exact":
         head_tiles = _ceil_div(H, 64)
-        L.variant(
-            route,
-            grid=(v["max_q_len"], head_tiles, v["batch_size"]),
-            num_head_tiles=head_tiles,
-            total_work_items=v["max_q_len"] * head_tiles * v["batch_size"],
+        L.run(
+            L.variant(
+                route,
+                grid=(v["max_q_len"], head_tiles, v["batch_size"]),
+                num_head_tiles=head_tiles,
+                total_work_items=v["max_q_len"] * head_tiles * v["batch_size"],
+            )
         )
         return
 
@@ -1382,7 +1550,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         "fp8_h128_prefill_source_persistent_uniform",
     ):
         parts = L.partials(1)
-        L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts)
+        L.run(L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts))
         return
 
     if route == "fp8_h64_prefill_source_persistent_m64":
@@ -1390,41 +1558,23 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # FP8/H128 persistent body (num_heads runtime, -1 masking, padded rows,
         # caller-owned workspace), grid = tokens.
         parts = L.partials(1)
-        L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts)
+        L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts))
         return
 
     if route in (
-        "fp8_lowhead_swa",
         "fp8_lowhead_one_partition",
-        "fp8_lowhead_split",
         "fp8_lowhead_h64",
-        "fp8_lowhead_h64_split",
         "fp8_lowhead_prefill",
     ):
-        num_splits = 2 if route in ("fp8_lowhead_split", "fp8_lowhead_h64_split") else 1
-        parts = L.partials(num_splits)
-        work_factor = (
-            2 if route in ("fp8_lowhead_swa", "fp8_lowhead_prefill") else num_splits
+        # One producer partition writes the final output directly.  The
+        # prefill producer runs one CTA per work item over two items per
+        # token; the decode producers run one two-CTA cluster per token.
+        work_items = 2 * T if route == "fp8_lowhead_prefill" else T
+        L.run(
+            L.variant(
+                route, grid=(2 * T, 1, 1), total_work_items=work_items, **L.partials(1)
+            )
         )
-        total_work_items = T * work_factor
-        cluster = 1 if route == "fp8_lowhead_prefill" else 2
-        producer = dict(parts)
-        if num_splits > 1:
-            # The FP8 split producers write their per-partition outputs through
-            # the ``O`` argument ([tokens, heads, splits, 512], as the Cake
-            # dispatcher passes its partial buffer); only the reducer writes
-            # the caller's output rows.
-            producer["O"] = parts["partial_O"]
-        L.variant(
-            route,
-            grid=(total_work_items * cluster, 1, 1),
-            total_work_items=total_work_items,
-            **producer,
-        )
-        if route == "fp8_lowhead_h64_split":
-            L.reduce("fp8_h64_split_reduce2", **parts)
-        elif num_splits > 1:
-            L.reduce("split_reduce", **parts)
         return
 
     raise RuntimeError(f"unhandled CAKE DSv4 route: {route}")

@@ -41,8 +41,17 @@ from flashinfer.experimental.kimi_k3_fp8_projection.cake_backend import (
     swizzle_sf_128x4,
     unswizzle_sf_128x4,
 )
-from flashinfer.experimental.kimi_k3_fp8_projection.cake_jit import KERNELS, MODULES
-from flashinfer.experimental.kimi_k3_fp8_projection.decode_table import DECODE_TABLE
+from flashinfer.experimental.kimi_k3_fp8_projection.cake_jit import (
+    KERNELS,
+    MODULES,
+    kernel_program,
+    route_available,
+)
+from flashinfer.experimental.kimi_k3_fp8_projection.decode_table import (
+    DECODE_TABLE,
+    DECODE_TABLE_OVERRIDES,
+    decode_table,
+)
 from flashinfer.gemm import (
     allocate_kimi_k3_fp8_projection_workspace,
     kimi_k3_fp8_projection,
@@ -202,15 +211,39 @@ def test_padding_and_k_sets():
 
 def test_quant_units_rule():
     for M in (1, 8, 64, 256):
-        assert quant_units(M, 56) == 1
-    assert quant_units(4096, 56) == 4  # K = 7168
-    assert quant_units(4096, 1) == 1  # K = 128
+        assert quant_units(M, 56, SM_COUNT) == 1
+    assert quant_units(4096, 56, SM_COUNT) == 4  # K = 7168
+    assert quant_units(4096, 1, SM_COUNT) == 1  # K = 128
     assert (
-        quant_units(4096, 4) == 2
+        quant_units(4096, 4, SM_COUNT) == 2
     )  # K = 512: four blocks per half warp would leave < 4 CTAs/SM
-    assert quant_units(16384, 4) == 4  # K = 512
-    assert quant_units(1000, 12) == 2  # K = 1536, M = 1000
-    assert quant_units(16384, 96) == 4  # K = 12288
+    assert quant_units(16384, 4, SM_COUNT) == 4  # K = 512
+    assert quant_units(1000, 12, SM_COUNT) == 2  # K = 1536, M = 1000
+    assert quant_units(16384, 96, SM_COUNT) == 4  # K = 12288
+    # The rule scales with the device: a 64-SM part keeps four blocks per half warp at a quarter of the rows.
+    assert quant_units(1024, 56, 64) == 4
+
+
+def test_decode_table_overrides_are_per_architecture_cells():
+    # One shared table holds the cells every architecture measured alike; a cell whose fastest route differs
+    # per architecture lives only in the overrides, with one entry per architecture, and never adds a family.
+    assert set(DECODE_TABLE_OVERRIDES) == set(ARCHES)
+    override_keys = {
+        frozenset(overrides) for overrides in DECODE_TABLE_OVERRIDES.values()
+    }
+    assert len(override_keys) == 1
+    (keys,) = override_keys
+    assert not (keys & set(DECODE_TABLE))
+    for arch, overrides in DECODE_TABLE_OVERRIDES.items():
+        merged = decode_table(arch)
+        assert set(merged) == set(DECODE_TABLE) | keys
+        for key, entry in overrides.items():
+            assert merged[key] == entry
+    for key in keys:
+        entries = [DECODE_TABLE_OVERRIDES[arch][key] for arch in ARCHES]
+        assert any(entry != entries[0] for entry in entries[1:])
+    with pytest.raises(ValueError, match="no measured dispatch table"):
+        decode_table("sm_90a")
 
 
 @pytest.mark.parametrize("arch", ARCHES)
@@ -235,7 +268,7 @@ def test_decode_config_rules(arch):
     assert decode_config(257, 12, 28, arch, SM_COUNT) is None
     assert decode_config(4096, 12, 28, arch, SM_COUNT) is None
     assert decode_config(4096, 1, 28, arch, SM_COUNT) is not None
-    for key, entry in DECODE_TABLE[arch].items():
+    for key, entry in decode_table(arch).items():
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
         cfg = decode_config(bucket, n_tiles128, num_k_iters, arch, SM_COUNT)
         if entry["route"] == "gemm":
@@ -327,11 +360,23 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
     required = required_kernel_keys(arch, SM_COUNT)
     assert "gemm" in required and "quant:u1" in required and "quant:u4" in required
     assert any(key.startswith("decode:") for key in required)
-    if arch in KERNELS:
-        missing = sorted(set(required) - set(KERNELS[arch]))
+    if MODULES:
+        missing = sorted(key for key in required if not route_available(arch, (key,)))
         assert not missing, f"{arch} lacks {missing}"
-        for module_name in KERNELS[arch].values():
-            assert MODULES[module_name]["arch"] == arch
+        quant_programs = set()
+        for key in required:
+            name, defines = kernel_program(arch, key)
+            assert arch in MODULES[name]["arches"]
+            if key.startswith("quant:"):
+                quant_programs.add(name)
+                assert dict(defines) == {
+                    "QUANT_UNITS": int(key.removeprefix("quant:u"))
+                }
+            else:
+                assert defines == ()
+        # The three quantization widths are one program, specialized on the compile line.
+        assert len(quant_programs) == 1
+        assert set(KERNELS) == set(required)
 
 
 # ---------------------------------------------------------------------------

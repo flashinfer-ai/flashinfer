@@ -242,6 +242,31 @@ process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
 `bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
 
+The native BF16 Hopper backend (`sm90_bf16_bf16_bf16_push_cake`: bf16 dispatch
+payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine
+wire — no FP8 anywhere) has its own target,
+`bash tests/moe_ep/run_tests.sh sm90_bf16_push_cake` (2 GPUs; set
+`NPROC_SM90_BF16_PUSH_CAKE` for larger worlds). It compares every output
+elementwise (atol = rtol = 1e-2) against the independent bf16 torch reference
+in `tests/moe_ep/_sm90_bf16_reference.py` over uniform / all-remote / hot /
+masked / duplicate / empty-rank routing, uneven token counts, repeated calls
+and CUDA-graph replay. Supported geometry: `hidden % 256 == 0`,
+`intermediate % 128 == 0`, `top_k in {1, 2, 4, 6, 8}`, experts divisible by
+the world size; anything else raises `MoEEpConfigError` at init. The expert
+GEMMs ship as generated sources sealed by
+`kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_manifest.json`;
+the target runs the CPU frozen-sources guard
+(`tests/moe_ep/test_sm90_bf16_push_cake_frozen_sources.py`) first, and a
+hand-edited generated file fails the JIT loader closed (sha256 mismatch).
+On the receiving rank the combine tail (wait for every source, fp32 top-k
+reduce, ack) runs as one fused kernel without a per-round combine-inbox fill;
+`FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL=0` selects the vendored three-kernel
+tail (bit-identical output) for A/B checks, and peers may mix the two. Small
+dedup rounds (`T <= 128`, `T * top_k <= 1024`) dispatch through one cooperative
+kernel (count + reserve + store_publish); `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
+selects the vendored dispatch kernels, which larger rounds and non-dedup pipes
+always use. The wire format is the vendored one in every combination.
+
 ### SM107 (Rubin) mega tests
 
 The Rubin suites cover NVFP4 and MXFP8 E4M3/E5M2 on compute capability 10.7.
@@ -267,7 +292,7 @@ topk 6, 384 experts EP4, hidden 7168, intermediate 3072 post-SwiGLU, tokens
 per rank 512..32768) through the FI `MoEEpLayer` mega path, on 4×H100:
 
 ```bash
-torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
+torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py
 ```
 
 Rank 0 prints one `BENCH_CSV` row per (scale_mode, layout, tokens) point;
@@ -281,6 +306,20 @@ M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
 for the full timing/mapping notes. Measured results, comparison caveats,
 and the reproduce recipe live in
 [`kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md).
+
+The native BF16 backend is benchmarked against the same-precision split
+baseline (NCCL-EP + CUTLASS BF16 fused MoE through the same `MoEEpLayer`)
+with
+
+```bash
+python -m torch.distributed.run --nproc_per_node=8 \
+  benchmarks/bench_moe_ep_sm90_bf16_mega.py --geometry A --arms cand,b1
+```
+
+(`--geometry {A,B,C}` = DeepSeek-V3 7168/2048/256/top-8, DSV4-Pro
+7168/3072/384/top-6, DSV4-Flash 4096/2048/256/top-6; eager and CUDA-graph
+series per token count; `--check` compares both arms against the bf16 torch
+reference first). See the module docstring for the columns.
 
 ---
 
@@ -697,7 +736,9 @@ outright and points at the API below.
 
 Capture with `create_graph_state()`, which holds one long-lived handle across
 forwards (the allocating half outside the capture, `Handle.update()` recorded
-inside it):
+inside it). `MoEEpCommunication` backends (e.g. `nvlink_one_sided`) are
+long-lived already; their graph state carries no handle and only pins the
+bound buffers, and the same capture recipe applies:
 
 ```python
 state = layer.create_graph_state(t)          # outside any capture, ALL ranks
@@ -758,7 +799,7 @@ Rules, in rough order of how easily they are violated:
   long as the state and every graph captured from it.
 - **`enable_timing` is off-limits under capture.** It synchronizes the device
   to read its CUDA events, which capture forbids. Time `g.replay()` instead
-  (`benchmarks/bench_moe_ep.py --cuda-graph` does exactly this).
+  (`benchmarks/moe_ep/bench_moe_ep.py --cuda-graph` does exactly this).
 - **All EP ranks must run the same sequence of eager calls and replays.**
   Ordinary collective discipline, but nixl_ep makes it sharper: its Buffer
   toggles a *host-side* double-buffer index (`buffer_idx ^= 1`) on every

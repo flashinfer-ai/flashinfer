@@ -1,4 +1,4 @@
-"""Cold-L2 CUPTI timing of complete prepared MoE submission scope on SM103a."""
+"""Cold-L2 CUPTI timing of the complete prepared MoE submission scope on a catalogued model route (SM100a/SM103a)."""
 
 import argparse
 from importlib.metadata import version
@@ -6,7 +6,7 @@ import json
 import statistics
 import warnings
 
-from mega_moe_inputs import make_smoke, make_grouped_l2
+from mega_moe_inputs import make_model, make_grouped_l2
 
 
 def main():
@@ -15,6 +15,9 @@ def main():
         "--family", choices=("source", "v3", "grouped-l2"), default="source"
     )
     parser.add_argument("--precision", choices=("fp4", "fp8"), default="fp4")
+    parser.add_argument(
+        "--tokens", type=int, default=16, help="catalogued model token count"
+    )
     args = parser.parse_args()
     from cupti import cupti  # noqa: F401  # Required; do not silently time with CUDA events.
 
@@ -27,7 +30,7 @@ def main():
             parser.error("Grouped L2 uses packed FP4 weights")
         plan = make_grouped_l2()[0]
     else:
-        plan = make_smoke(args.family, args.precision)[0]
+        plan = make_model(args.family, args.precision, args.tokens)[0]
     plan.run()
     with warnings.catch_warnings():
         warnings.filterwarnings(

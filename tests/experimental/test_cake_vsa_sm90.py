@@ -17,6 +17,7 @@ limitations under the License.
 """Cake SM90 VSA (``backend="cake"`` on Hopper): planning, numerics, lifetime, API."""
 
 
+import contextlib
 import warnings
 
 import pytest
@@ -278,7 +279,7 @@ def test_plan_small_layout_and_padding():
         plan_small(_random_mask(2, 128, 32, 6, ragged=False))
 
 
-@pytest.mark.parametrize("kmax", [1, 3, 4, 6])
+@pytest.mark.parametrize("kmax", [4, 6])
 def test_plan_small_split_slices_cover_each_selection_once(kmax):
     mask = _random_mask(1, 16, 64, 16, seed=5, ragged=True)
     plan = plan_small(mask, kmax=kmax, split=True)
@@ -303,7 +304,29 @@ def test_plan_small_split_slices_cover_each_selection_once(kmax):
     )
     assert plan["max_nsplit"] == max(r["nsplit"] for r in rows) <= MAX_NSPLIT
     with pytest.raises(ValueError, match="slices"):
-        plan_small(torch.ones((1, 1, 64), dtype=torch.bool), kmax=1, split=True)
+        plan_small(torch.ones((1, 1, 200), dtype=torch.bool), kmax=4, split=True)
+
+
+def test_split_variants_are_the_shipped_ones():
+    """Only the KMAX 4 and 6 split-KV kernels ship: ``split_kmax`` never names
+    another variant and ``plan_small`` refuses to plan one.  The retired KMAX 1
+    split was the planner's choice only on a band of ragged masks whose grid
+    sits at the sliced-route edge (``2 * tiles`` within two of the SM count)
+    with one outlier selection; those masks now run the persistent kernel."""
+    for counts in ([2], [3] * 8, [7] * 65 + [13], [7] * 64 + [25], [9] * 40):
+        assert split_kmax(counts) in (4, 6)
+        # no shipped variant fits one wave: small_route falls through
+        with contextlib.suppress(ValueError):
+            assert split_kmax(counts, sms=132) in (4, 6)
+    for kmax in (1, 3):
+        with pytest.raises(ValueError, match="split-KV variant"):
+            plan_small(_random_mask(1, 4, 8, 6, seed=3), kmax=kmax, split=True)
+    # 66 tiles, 65 x 7 blocks + one 13-block selection: KMAX 3/4/6 exceed one wave
+    # of 132 SMs, no cluster variant holds 66 tiles -> persistent kernel.
+    mask = torch.zeros((6, 11, 16), dtype=torch.bool)
+    mask[:, :, :7] = True
+    mask[5, 10, :13] = True
+    assert small_route(mask, sms=132, cluster_capacity=CAP) is None
 
 
 def _tile_rows(plan):
@@ -629,7 +652,7 @@ def test_small_and_persistent_routes_agree(h, mb, nb, capacity, scale):
         (1, 16, 16, 16, None, False),  # the benchmark's h1-m1024-k16 row
         (1, 16, 64, 16, 0.5, True),
         (2, 8, 64, 64, None, True),  # 64 blocks -> up to 11 slices at KMAX 6
-        (1, 1, 2, 2, 1e-7, False),  # two slices of one block
+        (1, 1, 8, 6, 1e-7, False),  # one query block, two slices of KMAX 4
         (3, 5, 10, 9, 0.0, True),
         (3, 5, 10, 9, -0.125, True),
     ],
