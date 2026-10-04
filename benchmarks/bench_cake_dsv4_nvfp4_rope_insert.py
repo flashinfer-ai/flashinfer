@@ -101,6 +101,12 @@ def main() -> None:
     )
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--q-head-padded", type=int, nargs="+", default=(8, 16))
+    parser.add_argument(
+        "--unfused-filter-boundary",
+        action="store_true",
+        help="kv entry, ratio 2: the unfused baseline gathers the boundary rows before RoPE / quantize "
+        "(host sync, not CUDA-graph capturable) instead of masking the slots like the pre-fix vLLM path",
+    )
     parser.add_argument("--compress-ratio", type=int, nargs="+", default=(1, 2))
     parser.add_argument("--swa-page-size", type=int, default=256)
     parser.add_argument("--compressed-page-size", type=int, default=128)
@@ -187,11 +193,20 @@ def main() -> None:
                 def unfused() -> None:
                     boundary = (positions + 1) % ratio == 0
                     rows = cos_sin[positions // ratio * ratio]
-                    nvfp4_quantize_append_sparse_mla_cache(
-                        _rope_bf16(kv, rows),
-                        torch.where(boundary, slots, torch.full_like(slots, -1)),
-                        cache,
-                    )
+                    if args.unfused_filter_boundary:
+                        # Rope / quantize only the boundary rows.  The gather needs the row count on the host
+                        # (``nonzero`` synchronises), so this form is not CUDA-graph capturable; the default
+                        # reproduces the pre-fix vLLM path, which keeps every row and masks the slots instead.
+                        idx = boundary.nonzero().squeeze(1)
+                        nvfp4_quantize_append_sparse_mla_cache(
+                            _rope_bf16(kv[idx], rows[idx]), slots[idx], cache
+                        )
+                    else:
+                        nvfp4_quantize_append_sparse_mla_cache(
+                            _rope_bf16(kv, rows),
+                            torch.where(boundary, slots, torch.full_like(slots, -1)),
+                            cache,
+                        )
 
                 fused_us = _median_us(
                     fused, args.warmup_ms, args.measure_ms, args.cupti

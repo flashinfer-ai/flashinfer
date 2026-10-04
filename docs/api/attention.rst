@@ -247,7 +247,6 @@ PageAttention for MLA
     cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes
     cake_dsv4_nvfp4_rope_quantize_insert
     cake_dsv4_nvfp4_kv_rope_quantize_insert
-    cake_dsv4_nvfp4_rope_insert_format_info
 
 .. note::
 
