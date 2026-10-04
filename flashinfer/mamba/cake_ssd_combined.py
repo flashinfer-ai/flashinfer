@@ -79,14 +79,14 @@ class _Program:
 # the single place the Cake export refreshes; every program binding below
 # derives from it.  One kernel family ships: the exact scan x {bf16, f16, f32
 # state} x {batched, varlen}, plus one preprocess.
-_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_7ae61d5f32"
+_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_1c9113617e"
 _SCAN_MODULES = {
-    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f",
-    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb",
-    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_PENDINGEXPORT",
-    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d",
-    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_1895881324",
-    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_PENDINGEXPORT",
+    "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_47d38fe617",
+    "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_0822c70364",
+    "exact_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_739e5e5e82",
+    "exact_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_a348cd1667",
+    "exact_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_7624369c5c",
+    "exact_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_1a6df20ab1",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
