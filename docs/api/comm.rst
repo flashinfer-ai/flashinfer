@@ -38,23 +38,23 @@ All-Gather Matmul
 
 ``all_gather_matmul`` keeps its architecture-based default routing when
 ``backend="auto"``. On SM100 and SM103, ``backend="cake"`` explicitly selects
-the source-built fused backend for contiguous bfloat16 or float16 inputs with
+the Cake fused backend for contiguous bfloat16 or float16 inputs with
 ``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
-memory backend, and a two- or four-rank NCCL process group. The local input may
-be an ordinary contiguous CUDA tensor because Cake uses internal symmetric
-scratch and flags for remote access and synchronization. Unsupported explicit
-Cake requests raise instead of silently falling back.
-The packaged manifest carries the exact dynamic shared-memory requirement
-resolved for every generated main route; the loader validates that value
-against the packaged CUDA source before compiling the host launcher.
+memory backend, and a two-, four- or eight-rank NCCL process group. The local
+input may be an ordinary contiguous CUDA tensor because Cake uses internal
+symmetric scratch and flags for remote access and synchronization. Unsupported
+explicit Cake requests raise instead of silently falling back. One generated
+source per kernel serves both architectures; the JIT loader compiles it with
+the exact flag set of the device it runs on.
 
-``prepare_all_gather_matmul`` prepares the source-built packed-QKV route for
-SM103, bfloat16, four-rank NCCL groups, contiguous ``[M, 8192]`` inputs, and a
-contiguous ``[8192, 2560]`` weight, where ``M`` is a positive multiple of 128.
-It binds the weight and process group once and returns a callable that accepts
-a contiguous input with the same shape, dtype, and device. Both
-``backend="auto"`` and ``backend="cake"`` select this prepared route.
-Unsupported configurations raise during preparation instead of falling back.
+``prepare_all_gather_matmul`` prepares the packed-QKV route for bfloat16,
+contiguous ``[M, 8192]`` inputs and a contiguous ``[8192, 1280]`` weight on
+eight-rank groups (SM100 or SM103) or a ``[8192, 2560]`` weight on four-rank
+groups (SM103), where ``M`` is a positive multiple of 128. It binds the weight
+and process group once and returns a callable that accepts a contiguous input
+with the same shape, dtype, and device. Both ``backend="auto"`` and
+``backend="cake"`` select this prepared route. Unsupported configurations raise
+during preparation instead of falling back.
 
 .. autosummary::
     :toctree: ../generated
@@ -552,6 +552,13 @@ TensorRT-LLM MNNVL AllReduce
 
 MNNVL A2A (Throughput Backend)
 -------------------------------
+
+These are the kernel-level primitives of the NVLink one-sided MoE all-to-all.
+``MoeAlltoAll`` is deprecated in favor of
+:class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll` (and
+:class:`flashinfer.moe_ep.CakeAlltoAll` for ``backend="cake"``),
+which expose the dispatch/combine interface shared by all expert-parallel
+communication backends; its implementation will move into those classes.
 
 .. currentmodule:: flashinfer.comm
 

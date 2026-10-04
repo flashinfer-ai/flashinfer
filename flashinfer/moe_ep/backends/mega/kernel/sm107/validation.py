@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .....core.validation.common import MoEEpConfigError
@@ -37,6 +39,9 @@ def make_workspace_config(
             world_size=world_size,
             quant_kind=quant_kind,
             gate_up_clamp=gate_up_clamp,
+            activation=k.activation,
+            situ_beta=k.situ_beta,
+            situ_linear_beta=k.situ_linear_beta,
             apply_topk_at_fc1=k.apply_topk_in_fc1,
             max_sm_count=k.max_sm_count,
             **tuning,
@@ -49,9 +54,38 @@ def validate_unit_scalars(t) -> None:
     for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
         if getattr(t, name) is not None:
             raise MoEEpConfigError(
-                f"SM107 uses unit normalization and does not accept {name}; "
-                "pre-quantize activations with norm_const=1 and omit this scalar."
+                f"SM107 MX formats do not accept {name}; "
+                "global normalization scalars are supported only for NVFP4."
             )
+
+
+def validate_input_norm_const(value, *, name="input_norm_const") -> None:
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise MoEEpConfigError(f"{name} must be positive and finite")
+
+
+def validate_nvfp4_scalars(values, *, num_local_experts, device) -> None:
+    """Check local-expert FP32 vectors without host reads or graph breaks."""
+    for name, value in values.items():
+        if value is None:
+            continue
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.shape != (num_local_experts,)
+            or value.dtype != torch.float32
+            or not value.is_contiguous()
+        ):
+            raise MoEEpConfigError(
+                f"{name} must be a contiguous float32 vector of {num_local_experts} local experts"
+            )
+        if not value.is_cuda or value.device != device:
+            raise MoEEpConfigError(
+                f"{name} must be on the same CUDA device as the inputs"
+            )
+        torch._assert_async(
+            (torch.isfinite(value) & (value > 0)).all(),
+            f"{name} must contain positive, finite values",
+        )
 
 
 def validate_forward_metadata(
@@ -71,7 +105,7 @@ def validate_forward_metadata(
     tokens, cols = hidden_states.shape
     hidden = fleet_params.token_hidden_size
     fp4 = quant_kind == "nvfp4"
-    if quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"):
+    if quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
         raise MoEEpConfigError(f"unsupported quant_kind {quant_kind!r}")
     expected_cols = hidden // 2 if fp4 and not quantize_input else hidden
     if tokens > fleet_params.max_tokens_per_rank or cols != expected_cols:
@@ -83,7 +117,7 @@ def validate_forward_metadata(
         getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         if fp4
         else torch.float8_e4m3fn
-        if quant_kind == "mxfp8_e4m3"
+        if quant_kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
         else torch.float8_e5m2
     )
     allowed = (

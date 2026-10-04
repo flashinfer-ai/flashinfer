@@ -7867,6 +7867,233 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
+# SM12x NVFP4 x BF16 runner - shared cuTile NVFP4 weight view, fixed tactic
+# ---------------------------------------------------------------------------
+
+
+class _SM12xNvfp4Bf16Inputs(list):
+    """Packed inputs padded to a token bucket; ``num_tokens`` is the real count."""
+
+    num_tokens: int
+
+
+class SM12xNvfp4Bf16Runner(MoERunner):
+    """CuTe-DSL W4A16 over the canonical NVFP4 weights shared with W4A4.
+
+    Kernels are specialized per token count, so calls are padded to the
+    layer's hybrid token bucket: padded rows repeat row 0's experts with zero
+    router weight, which adds no weight traffic and bounds compilation.
+    """
+
+    backend_key = "sm12x_nvfp4_bf16"
+    # A view prepared for the cuTile NVFP4 runners is the same tensors.
+    weight_view_keys = (backend_key, "cutile_nvfp4")
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
+    supported_activation_classes = (SwiGLU, ReLU2)
+    supports_expert_parallelism = False
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.tuning_config = TuningConfig()
+        self._workspaces: dict[int, list[torch.Tensor]] = {}
+
+    def _check_activation_parameters(self) -> None:
+        activation = self.config.activation
+        if isinstance(activation, SwiGLU) and activation != SwiGLU():
+            raise NotImplementedError(
+                "SM12x NVFP4 x BF16 supports only default SwiGLU alpha, beta and limit."
+            )
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..cute_dsl import is_cute_dsl_available
+        from ..jit.cpp_ext import get_cuda_version
+        from ..utils import get_compute_capability
+
+        if get_cuda_version().major < 13:
+            raise ValueError("SM12x NVFP4 x BF16 requires CUDA 13 or later.")
+        if not is_cute_dsl_available():
+            raise RuntimeError("SM12x NVFP4 x BF16 requires the CuTe DSL package.")
+        if get_compute_capability(self.device) not in ((12, 0), (12, 1)):
+            raise RuntimeError("SM12x NVFP4 x BF16 requires SM120 or SM121.")
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("SM12x NVFP4 x BF16 requires do_finalize=True.")
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                "SM12x NVFP4 x BF16 does not take activation scales."
+            )
+
+    def _build(self) -> None:
+        from .cute_dsl.blackwell_sm12x.moe_nvfp4_w4a16 import (
+            allocate_workspace,
+            run_moe_w4a16,
+        )
+
+        self._run = run_moe_w4a16
+        self._allocate_workspace = allocate_workspace
+
+    def _workspace(self, capacity: int, hidden_size: int) -> list[torch.Tensor]:
+        # One per token bucket and runner: layers never share scratch, and the
+        # persistent kernel's completion counters stay private to this layer.
+        workspace = self._workspaces.get(capacity)
+        if workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{type(self).__name__} workspace for token bucket {capacity} "
+                    "must be allocated before CUDA Graph capture; warm this bucket "
+                    "first."
+                )
+            workspace = self._allocate_workspace(
+                num_tokens=capacity,
+                hidden_size=hidden_size,
+                intermediate_size=self.config.experts.intermediate_size,
+                num_experts=self.config.routing.num_experts,
+                top_k=self.config.routing.top_k,
+                is_gated=self.config.activation.is_gated,
+                device=self.device,
+            )
+            self._workspaces[capacity] = workspace
+        return workspace
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def _weight_view(self, weights: MoEWeightPack) -> dict[str, torch.Tensor]:
+        for key in self.weight_view_keys:
+            if key in weights.native_views:
+                return weights.get_view(key)
+        return weights.get_view(self.backend_key)
+
+    def _canonical_weights(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> tuple[torch.Tensor, ...]:
+        required = (
+            "w1",
+            "w1_scale",
+            "w1_global_scale",
+            "w2",
+            "w2_scale",
+            "w2_global_scale",
+        )
+        missing = [key for key in required if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        w1, s1, g1, w2, s2, g2 = (view[key] for key in required)
+        experts = self.config.routing.num_experts
+        inter = self.config.experts.intermediate_size
+        w1_rows = inter * (2 if self.config.activation.is_gated else 1)
+        pad = lambda n, m: (n + m - 1) // m * m  # noqa: E731
+        expected = {
+            "w1": (w1, (experts, w1_rows, hidden_size // 2), torch.uint8),
+            "w2": (w2, (experts, hidden_size, inter // 2), torch.uint8),
+            "w1_global_scale": (g1, (experts,), torch.float32),
+            "w2_global_scale": (g2, (experts,), torch.float32),
+        }
+        for key, (tensor, shape, dtype) in expected.items():
+            if tuple(tensor.shape) != shape or tensor.dtype is not dtype:
+                raise ValueError(
+                    f"{self.backend_key}: {key} must be {dtype} {shape}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                )
+        # The cuTile view stores 128x4-swizzled scales as [E, rows/128, K/64, 32, 16];
+        # the kernel reads the same bytes as [E, pad128(rows), pad4(K/16)].
+        scales = []
+        for key, tensor, rows, k in (
+            ("w1_scale", s1, w1_rows, hidden_size),
+            ("w2_scale", s2, hidden_size, inter),
+        ):
+            shape = (experts, pad(rows, 128), pad(k // 16, 4))
+            if tensor.dtype is not torch.float8_e4m3fn or tensor.numel() != (
+                shape[0] * shape[1] * shape[2]
+            ):
+                raise ValueError(
+                    f"{self.backend_key}: {key} must hold 128x4-swizzled E4M3 "
+                    f"scales for {shape}, got {tensor.dtype} {tuple(tensor.shape)}."
+                )
+            scales.append(tensor.view(shape))
+        for tensor in (w1, w2, g1, g2, *scales):
+            if tensor.device != self.device or not tensor.is_contiguous():
+                raise ValueError(
+                    f"{self.backend_key} weights must be contiguous on {self.device}."
+                )
+        return w1, scales[0], g1, w2, scales[1], g2
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only PackedPrecomputed routing."
+            )
+        x = act.hidden_states_q
+        if x.ndim != 2 or x.dtype is not torch.bfloat16 or not x.is_contiguous():
+            raise TypeError(
+                f"{type(self).__name__} requires contiguous 2D BF16 hidden states."
+            )
+        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+            raise ValueError(f"{type(self).__name__} requires activation scales None.")
+        num_tokens, hidden_size = x.shape
+        if num_tokens == 0:
+            raise NotImplementedError(
+                f"{type(self).__name__} needs at least one token."
+            )
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32,),
+            require_contiguous=True,
+        )
+        ceiling = self.config.execution.tune_max_num_tokens
+        if num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}."
+            )
+        w1, s1, g1, w2, s2, g2 = self._canonical_weights(
+            self._weight_view(weights), hidden_size
+        )
+        ids, topk_weights = act.topk_ids, act.topk_weights
+        capacity = map_to_hybrid_bucket(num_tokens, ceiling)
+        if capacity != num_tokens:
+            pad_rows = capacity - num_tokens
+            x = torch.cat((x, x[:1].expand(pad_rows, -1)))
+            ids = torch.cat((ids, ids[:1].expand(pad_rows, -1)))
+            topk_weights = torch.cat(
+                (topk_weights, topk_weights.new_zeros(pad_rows, topk_weights.shape[1]))
+            )
+        packed = _SM12xNvfp4Bf16Inputs(
+            [x.new_empty(x.shape), x, ids, topk_weights, w1, s1, g1, w2, s2, g2]
+        )
+        packed.num_tokens = num_tokens
+        return packed
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError(f"{type(self).__name__} supports only tactic -1.")
+        out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2 = inputs
+        workspace = self._workspace(x.shape[0], x.shape[1])
+        self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, out, workspace)
+        return out[: getattr(inputs, "num_tokens", out.shape[0])]
+
+
+# ---------------------------------------------------------------------------
 # SM12x b12x runners - fixed tactic, existing wrapper delegation
 # ---------------------------------------------------------------------------
 

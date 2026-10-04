@@ -28,26 +28,28 @@ Every launch of the call is a generated Cake program:
 | quantization launch + decode | `quant:u1`, `decode:t<tok>_p<stages>` | measured table entry with `fused = false` |
 | fused decode | `decode:t<tok>_p<stages>_fused[_res]` | measured table entry with `fused = true` (the token tile is quantized in-CTA; `_res` keeps the quantized token tiles resident for `K <= 256`); above 256 rows only the single-N-tile families (`f_a`, `b_proj`) are tabulated |
 
-`decode_table.py` is the measured per-architecture dispatch table
+`decode_table.py` is the measured dispatch table
 (`"<n_tiles128>,<num_k_iters>,<m_bucket>"`, buckets `M <= 1 / 8 / 64 / 256` for
 every family and `M <= 4096 / 16384` for the families measured faster on the
 decode kernel than on the GEMM)
 over the 22 representative families (TP8 and TP1 `q_proj`, `fused_qkvg`,
 `in_proj_qkvgfab`, `f_a`, `f_b`, `b_proj`, `kv_a`, `fused_qkv_a`, `q_b`,
-`kv_b`, `o_proj`); it is generated from the Cake sweeps and mirrors the
-production dispatcher row for row. Families outside the table take the
-quantization + GEMM route (the Cake dispatcher falls back to a calibrated cost
-model there; every representative Kimi-K3 family is covered on both
-architectures).
+`kv_b`, `o_proj`): one table shared by SM100 and SM103 (`DECODE_TABLE`) plus
+the few cells whose measured best route differs per architecture
+(`DECODE_TABLE_OVERRIDES[arch]`; `decode_table(arch)` merges them). It is
+generated from the Cake sweeps and mirrors the production dispatcher row for
+row. Families outside the table take the quantization + GEMM route (the Cake
+dispatcher falls back to a calibrated cost model there; every representative
+Kimi-K3 family is covered on both architectures).
 
 | Tensor | Shape | dtype |
 | --- | --- | --- |
 | `weight` | `[N_pad128, K]` serialized checkpoint tensor (128-row block padding), contiguous; `K % 128 == 0` | float8_e4m3fn |
 | `weight_scale` | `[N_pad128 / 128, 1, K / 128, 1]` ModelOpt block scale (or its 2-D view) | float32 |
-| `x` | `[M, K]` activations, contiguous | bfloat16 |
+| `x` | `[M, K]` activations, contiguous (the quantization program reads rows at stride `K`) | bfloat16 |
 | `out` | `[M, n_valid]` view with unit column stride and an even row stride (any view into a wider buffer; only the `n_valid` columns are written) | bfloat16 |
 | `workspace.q` | `[M, K]` quantized activation (caller-owned) | float8_e4m3fn |
-| `workspace.sf` | `[bytes]` activation scale tiles + split-K partials + per-tile counters (caller-owned, zero initialised once) | uint8 |
+| `workspace.sf` | `[bytes]` activation scale tiles + per-tile counters (zero initialised once by the allocation) + split-K partials (written before read; caller-owned) | uint8 |
 
 ```python
 import torch
@@ -69,10 +71,12 @@ scales, pads it to the 256-row CTA-pair tile and stores it as 128x128 E4M3
 tiles in the order the TMA streams (one contiguous 32 KB box per pipeline
 stage) together with the swizzled weight scale tiles; do it once per weight.
 `allocate_kimi_k3_fp8_projection_workspace` sizes the byte workspace for the
-route the device's table selects for `M`. `prepare_kimi_k3_fp8_projection`
-validates the binding, resolves the route and binds the generated argument
-plans; the runner reads `x` on device at every launch, so a CUDA graph
-capturing it stays valid when new activations are written into `x`.
+route the device's table selects for `M` and zero-fills only its scale-tile and
+counter bytes. `prepare_kimi_k3_fp8_projection` validates the binding, resolves
+the route once (architecture and SM count are read once per device and cached)
+and binds the generated argument plans; the runner reads `x` on device at
+every launch, so a CUDA graph capturing it stays valid when new activations
+are written into `x`.
 
 Correctness: `|out - ref| <= 1e-2 + 1e-2 |ref| + 2 bf16 ulp` element-wise
 against the exact quantized-operand emulation (zero budget), quantized
@@ -85,6 +89,12 @@ times the 132 representative rows (22 families x `M in {1, 8, 64, 256, 4096,
 `per_token_group_quant_8bit` + `gemm_fp8_nt_groupwise` chains (`cutlass` sm1 /
 sm2, `trtllm`, `cutile`) on the same weight.
 
-Generated sources live under `csrc/cake_kimi_k3_fp8_projection/<arch>/` and are
-registered in `cake_jit.py` (`MODULES`, `KERNELS`) by the Cake
+Generated sources live under `csrc/cake_kimi_k3_fp8_projection/`: one kernel
+and one launcher source per program for both architectures (the
+architecture-specific lowering sits behind `__CUDA_ARCH__` guards; the JIT
+compiles each source with the flags of the device it runs on), the shared
+device-helper and host-helper headers, and nothing else. `cake_jit.py`
+registers them (`MODULES`: one record per program; `KERNELS`: logical kernel
+key -> program and compile-line defines, e.g. the three quantization widths
+are one program with `-DQUANT_UNITS=1|2|4`). Both are written by the Cake
 generated-program export; nothing there is hand-written.

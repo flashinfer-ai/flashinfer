@@ -27,6 +27,11 @@ from .jit.cake_fmha import (
     load_cake_fmha_context_fp8_hd256_module,
     load_cake_fmha_compat_module,
     load_cake_fmha_decode_native_bf16_hd256_smallm_module,
+    load_cake_fmha_decode_balanced_bf16_module,
+    load_cake_fmha_decode_balanced_fp16_module,
+    load_cake_fmha_decode_balanced_fp8_module,
+    load_cake_fmha_decode_balanced_hd256_module,
+    load_cake_fmha_decode_balanced_hd64_module,
     load_cake_fmha_decode_native_bf16_module,
     load_cake_fmha_decode_native_fp16_hd512_module,
     load_cake_fmha_decode_native_fp16_nhd_module,
@@ -429,6 +434,13 @@ class CakeFmhaDecodeRoute:
     use_scale_ptr: bool
     retain_kv_l2: bool
     component: Literal[
+        "decode_balanced_bf16",
+        "decode_balanced_fp16",
+        "decode_balanced_fp8",
+        "decode_balanced_bf16q",
+        "decode_balanced_fp16q",
+        "decode_balanced_bf16_hd64",
+        "decode_balanced_bf16_hd256",
         "decode_native_bf16",
         "decode_native_bf16_hd256_smallm",
         "decode_native_fp16_hd512",
@@ -485,6 +497,25 @@ _PRODUCT_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
     ),
     "ctx_fp8_hnd_hd128_hgpack_48b5_v1": ("context_fp8",),
     "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": ("context_nvfp4",),
+    "decode_balanced_bf16_v1": (
+        "decode_balanced_bf16",
+        "decode_balanced_bf16_mtp_n32",
+        "decode_balanced_bf16_mtp_n64",
+    ),
+    "decode_balanced_fp16_v1": (
+        "decode_balanced_fp16",
+        "decode_balanced_fp16_mtp_n32",
+        "decode_balanced_fp16_mtp_n64",
+    ),
+    "decode_balanced_fp8_v1": ("decode_balanced_fp8",),
+    "decode_balanced_bf16q_v1": ("decode_balanced_bf16q",),
+    "decode_balanced_fp16q_v1": ("decode_balanced_fp16q",),
+    "decode_balanced_bf16_hd64_v1": ("decode_balanced_bf16_hd64",),
+    "decode_balanced_bf16_hd256_v1": (
+        "decode_balanced_bf16_hd256_p16",
+        "decode_balanced_bf16_hd256_p32",
+        "decode_balanced_bf16_hd256_p64",
+    ),
     "decode_native_bf16_v1_bece": ("decode_native_bf16",),
     "decode_native_bf16_hd256_smallm_v1": (
         "decode_native_bf16_hd256_smallm_n32_p16",
@@ -519,6 +550,19 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "context_fp8_hd256",
         "context_hd256_support",
         "context_nvfp4",
+        "decode_balanced_bf16",
+        "decode_balanced_bf16_mtp_n32",
+        "decode_balanced_bf16_mtp_n64",
+        "decode_balanced_fp16",
+        "decode_balanced_fp16_mtp_n32",
+        "decode_balanced_fp16_mtp_n64",
+        "decode_balanced_fp8",
+        "decode_balanced_bf16q",
+        "decode_balanced_fp16q",
+        "decode_balanced_bf16_hd64",
+        "decode_balanced_bf16_hd256_p16",
+        "decode_balanced_bf16_hd256_p32",
+        "decode_balanced_bf16_hd256_p64",
         "decode_native_bf16",
         "decode_native_bf16_hd256_smallm_n32_p16",
         "decode_native_bf16_hd256_smallm_n32_p32",
@@ -541,6 +585,13 @@ def _route_components(
 ) -> tuple[str, ...]:
     if isinstance(route, CakeFmhaDecodeRoute):
         route_name = {
+            "decode_balanced_bf16": "decode_balanced_bf16_v1",
+            "decode_balanced_fp16": "decode_balanced_fp16_v1",
+            "decode_balanced_fp8": "decode_balanced_fp8_v1",
+            "decode_balanced_bf16q": "decode_balanced_bf16q_v1",
+            "decode_balanced_fp16q": "decode_balanced_fp16q_v1",
+            "decode_balanced_bf16_hd64": "decode_balanced_bf16_hd64_v1",
+            "decode_balanced_bf16_hd256": "decode_balanced_bf16_hd256_v1",
             "decode_native_bf16": "decode_native_bf16_v1_bece",
             "decode_native_bf16_hd256_smallm": "decode_native_bf16_hd256_smallm_v1",
             "decode_native_fp16_hd512": "decode_native_fp16_hd512_v1_66b1",
@@ -628,6 +679,178 @@ def _smallm_sm_count(device: torch.device) -> int:
     if device.type != "cuda":
         return _SMALLM_MIN_SUPPORTED_SM_COUNT
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+# On-device load-balanced split-KV decode (Cake routes ``decode_balanced_bf16_v1``
+# and ``decode_balanced_fp16_v1``).  The band is host metadata only: the caller's
+# KV length bound (``max_seq_len``) and the number of (request, KV head) work
+# tiles, per dtype and query-length class.  BF16: for ``q_len == 1`` the static
+# grid-stride route keeps every tile whole below the band; the packed MTP tiles
+# (``q_len`` 3..8) take the balanced kernel at every shape (1.6-11.8x faster
+# than the static route on every measured shape, B200 + GB300).  FP16 (HND,
+# page 16, GQA-8) has no other optimized Cake route -- the previous contract was
+# the compat fallback -- so its band admits every shape.  The round-2 families
+# (E4M3 cache with E4M3 / BF16 / FP16 query, BF16 head_dim 64, BF16 head_dim
+# 256 outside the small-M route) likewise admit every shape: their incumbents
+# were the quantized full-block routes, the compat kernel, or nothing.  Values
+# mirror the Cake dispatcher's per-arch ``ROUTE_BAND`` and were set from paired
+# same-input cold-L2 CUPTI measurements on B200 / GB300.
+CAKE_FMHA_BALANCED_ROUTE_BAND: dict[str, dict[str, dict[str, tuple[int, int]]]] = {
+    "sm100a": {
+        "bf16": {"q1": (32768, 9), "mtp": (1, 1)},
+        "fp16": {"q1": (1, 1), "mtp": (1, 1)},
+        "fp8": {"q1": (1, 1), "mtp": (1, 1)},
+        "bf16q": {"q1": (1, 1), "mtp": (1, 1)},
+        "fp16q": {"q1": (1, 1), "mtp": (1, 1)},
+        "bf16_hd64": {"q1": (1, 1), "mtp": (1, 1)},
+        "bf16_hd256": {"q1": (1, 1), "mtp": (1, 1)},
+    },  # (min KV length bound, min work tiles)
+    "sm103a": {
+        "bf16": {"q1": (32768, 9), "mtp": (1, 1)},
+        "fp16": {"q1": (1, 1), "mtp": (1, 1)},
+        "fp8": {"q1": (1, 1), "mtp": (1, 1)},
+        "bf16q": {"q1": (1, 1), "mtp": (1, 1)},
+        "fp16q": {"q1": (1, 1), "mtp": (1, 1)},
+        "bf16_hd64": {"q1": (1, 1), "mtp": (1, 1)},
+        "bf16_hd256": {"q1": (1, 1), "mtp": (1, 1)},
+    },
+}
+CAKE_FMHA_BALANCED_MAX_REQUESTS = 1024
+CAKE_FMHA_BALANCED_MTP_Q_LENS = (3, 4, 5, 6, 7, 8)
+# head_dim 256: every query row of a request is its own work tile (no packed
+# MTP tile), uniform q_len 1..8.
+CAKE_FMHA_BALANCED_HD256_MAX_Q_LEN = 8
+CAKE_FMHA_BALANCED_HD64_MAX_GROUP = 16
+_BALANCED_MAX_BALANCE_FACTOR = 8
+_BALANCED_ROW_PARTIAL_O_PER_SLOT = 8 * 128
+_BALANCED_ROW_STATS_PER_SLOT = 16
+_BALANCED_MTP_PARTIAL_O_PER_SLOT = 64 * 128
+_BALANCED_MTP_STATS_PER_SLOT = 128
+_BALANCED_HD64_PARTIAL_O_PER_SLOT = 16 * 64  # 16-row tile x head_dim 64
+_BALANCED_HD64_STATS_PER_SLOT = 32  # max[16] then sum[16]
+_BALANCED_HD256_PARTIAL_O_PER_SLOT = 8 * 256  # 8-row tile x head_dim 256
+_BALANCED_HD256_STATS_PER_SLOT = 16  # max[8] then sum[8]
+
+
+def _balanced_workspace_bounds(sm_count: int) -> tuple[int, int]:
+    """``(max_split_items, max_split_tiles)`` of the persistent balanced grid."""
+
+    return (
+        2 * _BALANCED_MAX_BALANCE_FACTOR * sm_count,
+        _BALANCED_MAX_BALANCE_FACTOR * sm_count,
+    )
+
+
+def _balanced_slot_words(q_len: int, head_dim: int) -> tuple[int, int]:
+    """``(partial O floats, statistics floats)`` per split item of one balanced kernel family."""
+
+    if head_dim == 64:
+        return _BALANCED_HD64_PARTIAL_O_PER_SLOT, _BALANCED_HD64_STATS_PER_SLOT
+    if head_dim == 256:
+        return _BALANCED_HD256_PARTIAL_O_PER_SLOT, _BALANCED_HD256_STATS_PER_SLOT
+    if head_dim != 128:
+        raise ValueError(
+            f"balanced decode serves head_dim 64, 128 or 256, got {head_dim}"
+        )
+    if q_len == 1:
+        return _BALANCED_ROW_PARTIAL_O_PER_SLOT, _BALANCED_ROW_STATS_PER_SLOT
+    return _BALANCED_MTP_PARTIAL_O_PER_SLOT, _BALANCED_MTP_STATS_PER_SLOT
+
+
+def _balanced_counters_per_tile(q_len: int, head_dim: int) -> int:
+    """Counter words per split tile: four for the packed head_dim-128 MTP tile, else one."""
+
+    return 4 if (head_dim == 128 and q_len != 1) else 1
+
+
+def _balanced_q_len_supported(q_len: int, head_dim: int) -> bool:
+    """Query lengths a balanced kernel family serves (host metadata only)."""
+
+    if head_dim == 128:
+        return q_len == 1 or q_len in CAKE_FMHA_BALANCED_MTP_Q_LENS
+    if head_dim == 256:
+        return 1 <= q_len <= CAKE_FMHA_BALANCED_HD256_MAX_Q_LEN
+    return q_len == 1
+
+
+def cake_fmha_balanced_counter_bytes(
+    sm_count: int, q_len: int = 8, head_dim: int = 128
+) -> int:
+    """Zero-initialized counter bytes the balanced route needs.
+
+    Tile counters (one word per split tile for the row kernels; four for the
+    packed head_dim-128 MTP kernel: arrivals, the two reduce-queue words and the
+    two-chunk published flag) are followed by the four 16-byte-aligned queue
+    counters.  The kernel resets every counter it touched before it exits, so a
+    buffer zeroed once at allocation can be reused across launches (the
+    trtllm-gen ``multi_ctas_kv_counter_buffer`` contract).  The default
+    arguments size the largest family.
+    """
+
+    _, max_split_tiles = _balanced_workspace_bounds(sm_count)
+    tile_bytes = max_split_tiles * _balanced_counters_per_tile(q_len, head_dim) * 4
+    return (tile_bytes + 15) // 16 * 16 + 4 * 4
+
+
+def cake_fmha_balanced_workspace_bytes(
+    sm_count: int, q_len: int, head_dim: int = 128
+) -> int:
+    """Partial-output/statistics bytes carved from ``workspace_buffer``.
+
+    Per split item one FP32 partial tile (8 x 128 for the head_dim-128 row
+    kernels and the E4M3-cache kernels, 64 x 128 for the packed MTP kernel,
+    16 x 64 for head_dim 64, 8 x 256 for head_dim 256) and one statistics slot
+    (row maxima then row sums), plus the reserved slot that receives the
+    device planner's plan facts (chunk pairs, total items).
+    """
+
+    max_split_items, _ = _balanced_workspace_bounds(sm_count)
+    partial_o, stats = _balanced_slot_words(q_len, head_dim)
+    partial_o_bytes = max_split_items * partial_o * 4
+    stats_offset = (partial_o_bytes + 255) // 256 * 256
+    return stats_offset + (max_split_items + 1) * stats * 4
+
+
+def _balanced_route_supported(
+    target: CakeFmhaTarget,
+    *,
+    dtype: str,
+    batch_size: int,
+    q_len: int,
+    num_kv_heads: int,
+    max_seq_len: int,
+    sm_count: int,
+    workspace_buffer: torch.Tensor,
+    counter_buffer: torch.Tensor | None,
+    head_dim: int = 128,
+) -> bool:
+    """Host-only admission of the on-device load-balanced decode routes.
+
+    ``dtype`` names the band family (``bf16`` / ``fp16`` for head_dim 128,
+    ``fp8`` / ``bf16q`` / ``fp16q`` for the E4M3 cache, ``bf16_hd64`` and
+    ``bf16_hd256``); ``head_dim`` selects the workspace geometry.
+    """
+
+    if not _balanced_q_len_supported(q_len, head_dim):
+        return False
+    if batch_size > CAKE_FMHA_BALANCED_MAX_REQUESTS:
+        return False
+    arch_band = CAKE_FMHA_BALANCED_ROUTE_BAND.get(target, {}).get(dtype)
+    if arch_band is None:
+        return False
+    min_kv_len, min_work_tiles = arch_band["q1" if q_len == 1 else "mtp"]
+    if max_seq_len < min_kv_len or batch_size * num_kv_heads < min_work_tiles:
+        return False
+    if not workspace_buffer.is_contiguous():
+        return False
+    workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+    if workspace_bytes < cake_fmha_balanced_workspace_bytes(sm_count, q_len, head_dim):
+        return False
+    if counter_buffer is not None:
+        counter_bytes = counter_buffer.numel() * counter_buffer.element_size()
+        if counter_bytes < cake_fmha_balanced_counter_bytes(sm_count, q_len, head_dim):
+            return False
+    return True
 
 
 def _smallm_tile_rows(packed_rows: int) -> int | None:
@@ -984,6 +1207,7 @@ def select_cake_fmha_decode_route(
     skip_softmax_threshold_scale_factor: float | None,
     enable_block_sparse_attention: bool,
     lse: torch.Tensor | None = None,
+    multi_ctas_kv_counter_buffer: torch.Tensor | None = None,
 ) -> CakeFmhaDecodeRoute | None:
     """Select an exact product decode route without broadening its contract."""
 
@@ -1027,7 +1251,10 @@ def select_cake_fmha_decode_route(
         return None
     if num_q_heads <= 0 or num_kv_heads <= 0 or num_q_heads % num_kv_heads:
         return None
-    if not 1 <= num_q_heads // num_kv_heads <= 8:
+    # The balanced head_dim-64 route serves 1..16 query heads per KV head (its
+    # 16-row query tile); every other decode route serves 1..8.
+    max_group = CAKE_FMHA_BALANCED_HD64_MAX_GROUP if int(query.shape[2]) == 64 else 8
+    if not 1 <= num_q_heads // num_kv_heads <= max_group:
         return None
     if block_tables.dtype not in (torch.int32, torch.uint32):
         return None
@@ -1114,6 +1341,41 @@ def select_cake_fmha_decode_route(
         )
         if (
             query.is_contiguous()
+            and query.shape[2] == 64
+            and key_cache.shape[2:] == (16, 64)
+            and kv_layout == "HND"
+            and uses_shared_paged_kv_idx
+            and q_len == 1
+            and 1 <= group <= CAKE_FMHA_BALANCED_HD64_MAX_GROUP
+            and sinks is None
+            and window_left < 0
+            and lse is None
+            and not isinstance(bmm1_scale, torch.Tensor)
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+            and _tma_paged_kv_strides_supported(key_cache)
+            and _tma_paged_kv_strides_supported(value_cache)
+            and _balanced_route_supported(
+                _cake_fmha_target(device),
+                dtype="bf16_hd64",
+                batch_size=batch_size,
+                q_len=q_len,
+                num_kv_heads=num_kv_heads,
+                max_seq_len=max_seq_len,
+                sm_count=smallm_sm_count,
+                workspace_buffer=workspace_buffer,
+                counter_buffer=multi_ctas_kv_counter_buffer,
+                head_dim=64,
+            )
+        ):
+            # head_dim 64 (Q16Kv128 ForGen body, 1..16 query heads per KV head)
+            # on the on-device balanced scheduler; no other product route
+            # serves head_dim 64.
+            return route("decode_balanced_bf16_hd64", selected_page_size=16)
+        if (
+            query.is_contiguous()
             and query.shape[2] == 256
             and smallm_rows is not None
             and page_size in (16, 32, 64)
@@ -1156,6 +1418,75 @@ def select_cake_fmha_decode_route(
             return candidate if cake_fmha_route_is_optimized(candidate) else None
         if (
             query.is_contiguous()
+            and query.shape[2] == 256
+            and key_cache.shape[3] == 256
+            and page_size in (16, 32, 64)
+            and kv_layout == "HND"
+            and uses_shared_paged_kv_idx
+            and 1 <= q_len <= CAKE_FMHA_BALANCED_HD256_MAX_Q_LEN
+            and 1 <= group <= 8
+            and max_seq_len >= q_len
+            and sinks is None
+            and window_left < 0
+            and lse is None
+            and not isinstance(bmm1_scale, torch.Tensor)
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+            and _tma_paged_kv_strides_supported(key_cache)
+            and _tma_paged_kv_strides_supported(value_cache)
+            and _balanced_route_supported(
+                _cake_fmha_target(device),
+                dtype="bf16_hd256",
+                batch_size=batch_size,
+                q_len=q_len,
+                num_kv_heads=num_kv_heads,
+                max_seq_len=max_seq_len,
+                sm_count=smallm_sm_count,
+                workspace_buffer=workspace_buffer,
+                counter_buffer=multi_ctas_kv_counter_buffer,
+                head_dim=256,
+            )
+        ):
+            # head_dim 256 outside the small-M route's packed tiles: every
+            # query row is its own tile (uniform q_len 1..8) on the on-device
+            # balanced scheduler, one program per page size (16 / 32 / 64).
+            return route("decode_balanced_bf16_hd256")
+        if (
+            query.is_contiguous()
+            and query.shape[2] == 128
+            and key_cache.shape[2:] == (16, 128)
+            and kv_layout == "HND"
+            and uses_shared_paged_kv_idx
+            and group == 8
+            and sinks is None
+            and window_left < 0
+            and lse is None
+            and not isinstance(bmm1_scale, torch.Tensor)
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+            and _tma_paged_kv_strides_supported(key_cache)
+            and _tma_paged_kv_strides_supported(value_cache)
+            and _balanced_route_supported(
+                _cake_fmha_target(device),
+                dtype="bf16",
+                batch_size=batch_size,
+                q_len=q_len,
+                num_kv_heads=num_kv_heads,
+                max_seq_len=max_seq_len,
+                sm_count=smallm_sm_count,
+                workspace_buffer=workspace_buffer,
+                counter_buffer=multi_ctas_kv_counter_buffer,
+            )
+        ):
+            # Long-context / ragged decode: the on-device balanced scheduler
+            # splits long requests into chunks and merges them on device.
+            return route("decode_balanced_bf16", selected_page_size=16)
+        if (
+            query.is_contiguous()
             and query.shape[2] == 128
             and key_cache.shape[2:] == (16, 128)
             and kv_layout == "HND"
@@ -1181,6 +1512,38 @@ def select_cake_fmha_decode_route(
         return None
 
     if dtypes == (torch.float16,) * 4:
+        if (
+            query.is_contiguous()
+            and query.shape[2] == 128
+            and key_cache.shape[2:] == (16, 128)
+            and kv_layout == "HND"
+            and uses_shared_paged_kv_idx
+            and num_q_heads // num_kv_heads == 8
+            and sinks is None
+            and window_left < 0
+            and lse is None
+            and not isinstance(bmm1_scale, torch.Tensor)
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+            and _tma_paged_kv_strides_supported(key_cache)
+            and _tma_paged_kv_strides_supported(value_cache)
+            and _balanced_route_supported(
+                _cake_fmha_target(device),
+                dtype="fp16",
+                batch_size=batch_size,
+                q_len=q_len,
+                num_kv_heads=num_kv_heads,
+                max_seq_len=max_seq_len,
+                sm_count=_smallm_sm_count(device),
+                workspace_buffer=workspace_buffer,
+                counter_buffer=multi_ctas_kv_counter_buffer,
+            )
+        ):
+            # Long-context / ragged FP16 decode: the same on-device balanced
+            # scheduler and physical schedule, traced with FP16 Q/K/V/O.
+            return route("decode_balanced_fp16", selected_page_size=16)
         if (
             query.shape[2] == 128
             and key_cache.shape[2:] == (32, 128)
@@ -1237,6 +1600,63 @@ def select_cake_fmha_decode_route(
         and window_left == -1
         and skip_softmax_threshold_scale_factor in (None, 0.0)
     )
+    # E4M3 cache on the on-device balanced scheduler (E4M3, BF16 or FP16 query
+    # with the output in the query dtype; HND, page 16, GQA-8, q_len 1).  Host
+    # scales only: ``bmm1_scale = q_scale * k_scale / sqrt(128)`` becomes the
+    # kernel's log2 softmax scale and ``bmm2_scale = v_scale / o_scale`` its
+    # output scale; device-tensor scales stay on the quantized routes / compat
+    # (a per-launch host read would break graph-replay safety).
+    balanced_fp8_kv_component = {
+        (torch.float8_e4m3fn,) * 4: "decode_balanced_fp8",
+        (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            torch.bfloat16,
+        ): "decode_balanced_bf16q",
+        (
+            torch.float16,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            torch.float16,
+        ): "decode_balanced_fp16q",
+    }.get(dtypes)
+    if (
+        balanced_fp8_kv_component is not None
+        and q_len == 1
+        and query.shape[2] == 128
+        and key_cache.shape[2:] == (16, 128)
+        and kv_layout == "HND"
+        and uses_shared_paged_kv_idx
+        and num_q_heads // num_kv_heads == 8
+        and no_block_scales
+        and quant_extensions_absent
+        and (o_scale is None or float(o_scale) == 1.0)
+        and not isinstance(bmm1_scale, torch.Tensor)
+        and not isinstance(bmm2_scale, torch.Tensor)
+        and float(bmm1_scale) > 0.0
+        and float(bmm2_scale) > 0.0
+        and query.is_contiguous()
+        and query.data_ptr() % 16 == 0
+        and key_cache.data_ptr() % 16 == 0
+        and value_cache.data_ptr() % 16 == 0
+        and out.data_ptr() % 16 == 0
+        and _tma_paged_kv_strides_supported(key_cache)
+        and _tma_paged_kv_strides_supported(value_cache)
+        and _balanced_route_supported(
+            _cake_fmha_target(device),
+            dtype=balanced_fp8_kv_component.removeprefix("decode_balanced_"),
+            batch_size=batch_size,
+            q_len=q_len,
+            num_kv_heads=num_kv_heads,
+            max_seq_len=max_seq_len,
+            sm_count=_smallm_sm_count(device),
+            workspace_buffer=workspace_buffer,
+            counter_buffer=multi_ctas_kv_counter_buffer,
+        )
+    ):
+        return route(balanced_fp8_kv_component, selected_page_size=16)
+
     if (
         dtypes == (torch.float8_e4m3fn,) * 4
         and q_len == 1
@@ -1375,6 +1795,13 @@ def _resolve_cake_fmha_decode_module(
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA decode route target does not match the device")
     loader = {
+        "decode_balanced_bf16": load_cake_fmha_decode_balanced_bf16_module,
+        "decode_balanced_fp16": load_cake_fmha_decode_balanced_fp16_module,
+        "decode_balanced_fp8": load_cake_fmha_decode_balanced_fp8_module,
+        "decode_balanced_bf16q": load_cake_fmha_decode_balanced_fp8_module,
+        "decode_balanced_fp16q": load_cake_fmha_decode_balanced_fp8_module,
+        "decode_balanced_bf16_hd64": load_cake_fmha_decode_balanced_hd64_module,
+        "decode_balanced_bf16_hd256": load_cake_fmha_decode_balanced_hd256_module,
         "decode_native_bf16": load_cake_fmha_decode_native_bf16_module,
         "decode_native_bf16_hd256_smallm": load_cake_fmha_decode_native_bf16_hd256_smallm_module,
         "decode_native_fp16_hd512": load_cake_fmha_decode_native_fp16_hd512_module,
@@ -1394,6 +1821,20 @@ def _resolve_cake_fmha_decode_module(
         route.num_q_heads,
         route.num_kv_heads,
     )
+    if route.component in ("decode_balanced_bf16", "decode_balanced_fp16"):
+        return loader(route.target, route.q_len), True
+    if route.component in (
+        "decode_balanced_fp8",
+        "decode_balanced_bf16q",
+        "decode_balanced_fp16q",
+    ):
+        return loader(
+            route.target, route.component.removeprefix("decode_balanced_")
+        ), True
+    if route.component == "decode_balanced_bf16_hd64":
+        return loader(route.target), True
+    if route.component == "decode_balanced_bf16_hd256":
+        return loader(route.target, route.page_size), True
     if route.component == "decode_native_bf16_hd256_smallm":
         group = route.num_q_heads // route.num_kv_heads
         return (
