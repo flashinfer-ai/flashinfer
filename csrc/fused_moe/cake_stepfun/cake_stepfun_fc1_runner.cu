@@ -23,7 +23,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
@@ -53,6 +56,37 @@ generated::TensorLayout denseLayout(void const* data, std::initializer_list<int6
   }
   layout.elements = stride;
   return layout;
+}
+
+// Diagnostic operand dump (CAKE_STEPFUN_FC1_DUMP_DIR=<dir>): after the FC1 launch the runner synchronizes the
+// stream and writes every device operand the kernel received as raw bytes (<name>.bin) plus index.json with the
+// kernel symbol, launch geometry, scalar parameters and the byte size / element type / shape of each file. Debug
+// only: it serializes the stream and copies the operands to the host on every launch.
+struct DumpEntry {
+  std::string name, ctype, shape;
+  const void* ptr;
+  size_t bytes;
+};
+
+inline void dumpBytes(std::string const& dir, DumpEntry const& e, FILE* index, bool& first) {
+  std::vector<unsigned char> host(e.bytes);
+  cudaError_t rc = cudaSuccess;
+  if (e.ptr != nullptr && e.bytes > 0) rc = cudaMemcpy(host.data(), e.ptr, e.bytes, cudaMemcpyDeviceToHost);
+  std::string const path = dir + "/" + e.name + ".bin";
+  if (FILE* f = std::fopen(path.c_str(), "wb")) {
+    if (e.ptr != nullptr && rc == cudaSuccess) std::fwrite(host.data(), 1, host.size(), f);
+    std::fclose(f);
+  }
+  std::fprintf(index, "%s\n  {\"param\": \"%s\", \"file\": \"%s.bin\", \"ctype\": \"%s\", \"shape\": %s, \"bytes\": %zu, \"null\": %s, \"copy_rc\": %d}",
+               first ? "" : ",", e.name.c_str(), e.name.c_str(), e.ctype.c_str(), e.shape.c_str(), e.bytes,
+               e.ptr == nullptr ? "true" : "false", static_cast<int>(rc));
+  first = false;
+}
+
+inline std::string shapeOf(generated::TensorLayout const& l) {
+  std::string s = "[";
+  for (int i = 0; i < l.rank; ++i) s += (i ? ", " : "") + std::to_string(l.dimensions[i]);
+  return s + "]";
 }
 
 // Routing tail for kernels that do not bound the tiles they acquire through cluster launch control
@@ -457,6 +491,63 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   cudaError_t const launched = spec.submit(&config, args);
   FLASHINFER_CHECK(launched == cudaSuccess, "Cake StepFun FC1 launch failed for ", spec.symbol,
                    " grid=(", gridM, ",", gridN, ") : ", cudaGetErrorString(launched));
+
+  char const* const dumpDir = std::getenv("CAKE_STEPFUN_FC1_DUMP_DIR");  // re-read: drivers switch it per launch
+  if (dumpDir != nullptr && dumpDir[0] != '\0') {
+    cudaError_t const synced = cudaStreamSynchronize(stream);
+    std::string const dir(dumpDir);
+    FILE* index = std::fopen((dir + "/index.json").c_str(), "w");
+    FLASHINFER_CHECK(index != nullptr, "Cake StepFun FC1 dump: cannot write ", dir, "/index.json");
+    bool const bf16 = mFamily == generated::kFc1Bf16;
+    size_t const elem = bf16 ? 2 : 1;  // every other family stores 1 byte per operand element
+    size_t const sfcBytes = mFamily == generated::kFc1Nvfp4 ? static_cast<size_t>(maxPaddedTokens) * I / 16
+                            : mFamily == generated::kFc1MxFp8 ? static_cast<size_t>(maxPaddedTokens) * I / 32
+                            : mFamily == generated::kFc1Nvfp4PerToken ? static_cast<size_t>(T) * sizeof(float)
+                                                                       : 0;
+    std::fprintf(index,
+                 "{\"kernel_symbol\": \"%s\", \"family\": %d, \"tile_n\": %d, \"grid\": [%d, %d, 1], "
+                 "\"block\": [%u, %u, %u], \"cluster\": [%u, %u, %u], \"cluster_attribute\": %s, "
+                 "\"dynamic_smem_bytes\": %zu, \"pdl\": %s, \"pad_routing_tail_launched\": %s, "
+                 "\"bounds_acquired_tiles\": %s, \"M_out\": %d, \"K\": %d, \"grid_m\": %d, \"grid_n\": %d, "
+                 "\"K_tiles\": %d, \"num_experts\": %lld, \"num_tokens\": %lld, \"top_k\": %d, "
+                 "\"max_padded_tokens\": %lld, \"sync_rc\": %d, \"operands\": [",
+                 spec.symbol, mFamily, spec.tile_n, gridM, gridN, spec.block[0], spec.block[1], spec.block[2],
+                 spec.cluster[0], spec.cluster[1], spec.cluster[2], spec.cluster_attribute ? "true" : "false",
+                 spec.dynamic_smem_bytes, fc1Pdl ? "true" : "false",
+                 (!spec.bounds_acquired_tiles && mPadRoutingTail) ? "true" : "false",
+                 spec.bounds_acquired_tiles ? "true" : "false", args.M_out, args.K, args.grid_m, args.grid_n,
+                 args.K_tiles, static_cast<long long>(E), static_cast<long long>(T), topK,
+                 static_cast<long long>(maxPaddedTokens), static_cast<int>(synced));
+    bool first = true;
+    auto dense = [&](char const* name, generated::TensorLayout const& l, char const* ctype) {
+      dumpBytes(dir, DumpEntry{name, ctype, shapeOf(l), l.data, static_cast<size_t>(l.elements) * elem}, index,
+                first);
+    };
+    dense("A", weightLayout, bf16 ? "bf16" : "uint8");
+    if (weightScaleLayout.data != nullptr) dense("SFA", weightScaleLayout, "uint8");
+    dense("B", activationLayout, bf16 ? "bf16" : "uint8");
+    if (activationScaleLayout.data != nullptr) dense("SFB", activationScaleLayout, "uint8");
+    dense("C", outputLayout, (bf16 || mFamily == generated::kFc1Nvfp4PerToken) ? "bf16" : "uint8");
+    dumpBytes(dir, DumpEntry{"SFC", mFamily == generated::kFc1Nvfp4PerToken ? "float32" : "uint8",
+                             "[" + std::to_string(sfcBytes / (mFamily == generated::kFc1Nvfp4PerToken ? 4 : 1)) + "]",
+                             args.SFC_ptr, sfcBytes}, index, first);
+    dumpBytes(dir, DumpEntry{"route_map", "int32", "[" + std::to_string(maxPaddedTokens) + "]", args.route_map,
+                             static_cast<size_t>(maxPaddedTokens) * sizeof(int32_t)}, index, first);
+    dumpBytes(dir, DumpEntry{"tile_expert", "int32", "[" + std::to_string(gridN) + "]", args.tile_expert,
+                             static_cast<size_t>(gridN) * sizeof(int32_t)}, index, first);
+    dumpBytes(dir, DumpEntry{"tile_mn_limit", "int32", "[" + std::to_string(gridN) + "]", args.tile_mn_limit,
+                             static_cast<size_t>(gridN) * sizeof(int32_t)}, index, first);
+    dumpBytes(dir, DumpEntry{"num_non_exiting_ctas", "int32", "[1]", args.total_tiles, sizeof(int32_t)}, index,
+              first);
+    dumpBytes(dir, DumpEntry{"clamp_limit", "float32", "[" + std::to_string(E) + "]", args.clamp_limit,
+                             static_cast<size_t>(E) * sizeof(float)}, index, first);
+    dumpBytes(dir, DumpEntry{"scale_c", "float32", "[" + std::to_string(E) + "]", args.scale_c,
+                             args.scale_c ? static_cast<size_t>(E) * sizeof(float) : 0}, index, first);
+    dumpBytes(dir, DumpEntry{"scale_gate", "float32", "[" + std::to_string(E) + "]", args.scale_gate,
+                             args.scale_gate ? static_cast<size_t>(E) * sizeof(float) : 0}, index, first);
+    std::fprintf(index, "\n]}\n");
+    std::fclose(index);
+  }
 }
 
 }  // namespace cake_stepfun
