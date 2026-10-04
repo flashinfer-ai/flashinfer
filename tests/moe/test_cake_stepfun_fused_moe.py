@@ -534,6 +534,24 @@ def test_config_is_explicit_exact_sm100_sm103_and_stepfun_only():
 
 
 @pytest.mark.parametrize("precision", list(PRECISIONS))
+def test_fused_shared_experts_follow_the_native_family(precision):
+    """bf16 / per-tensor fp8 reject S > 0 like their trtllm-gen runners; nvfp4 / mxfp8 accept it."""
+    spec = PRECISIONS[precision]
+    runner = CakeStepFunRunner(
+        _config(num_tokens=8, quant=spec.quant, num_fused_shared_experts=1),
+        torch.device("cpu"),
+    )
+    assert type(runner) is spec.runner_cls
+    assert type(runner).supports_fused_shared_experts is spec.fused_shared_experts
+    assert spec.native_runner.supports_fused_shared_experts is spec.fused_shared_experts
+    if spec.fused_shared_experts:
+        runner._assert_shared_experts_supported()
+    else:
+        with pytest.raises(NotImplementedError, match="fused shared experts"):
+            runner.check_support()
+
+
+@pytest.mark.parametrize("precision", list(PRECISIONS))
 def test_runner_rejects_non_stepfun_activations(precision):
     runner = CakeStepFunRunner(
         _config(num_tokens=8, quant=PRECISIONS[precision].quant, activation=SwiGLU()),

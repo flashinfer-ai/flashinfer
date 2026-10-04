@@ -6872,6 +6872,9 @@ class CakeStepFunNvfp4Runner(CakeStepFunRunner, TrtllmFp4RoutedRunner):
     ] = {
         (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLUStep,),
     }
+    # Shared-expert support follows the native family this runner wraps (the
+    # aggregate on CakeStepFunRunner is for MoELayer backend filtering only).
+    supports_fused_shared_experts = TrtllmFp4RoutedRunner.supports_fused_shared_experts
 
 
 class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
@@ -6881,6 +6884,7 @@ class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
         (QuantFormat.BF16, QuantFormat.BF16),
     )
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLUStep,)
+    supports_fused_shared_experts = TrtllmBf16RoutedRunner.supports_fused_shared_experts
 
 
 class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner):
@@ -6890,6 +6894,7 @@ class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner)
         (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
     )
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (SwiGLUStep,)
+    supports_fused_shared_experts = TrtllmFp8PerTensorRunner.supports_fused_shared_experts
 
 
 class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
@@ -6903,6 +6908,7 @@ class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
     ] = {
         (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLUStep,),
     }
+    supports_fused_shared_experts = TrtllmFp8BlockRunner.supports_fused_shared_experts
 
 
 _CAKE_STEPFUN_RUNNERS: tuple[type[CakeStepFunRunner], ...] = (
