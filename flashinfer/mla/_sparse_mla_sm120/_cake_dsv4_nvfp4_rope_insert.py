@@ -359,6 +359,7 @@ def cake_dsv4_nvfp4_rope_quantize_insert(
     *,
     q_head_padded: int = 0,
     apply_q_rope: bool = True,
+    q_inplace: bool = False,
 ) -> torch.Tensor:
     r"""Rotate ``q``, then rotate, quantize and insert ``kv`` into the DeepSeek-V4 NVFP4 cache.
 
@@ -406,13 +407,22 @@ def cake_dsv4_nvfp4_rope_quantize_insert(
     apply_q_rope : bool
         Rotate the live query heads (default). ``False`` copies them unchanged
         (padded heads are still zero-filled).
+    q_inplace : bool
+        Rotate the 64 RoPE dims of ``q`` in place and return ``q`` itself
+        (no padded copy; the NoPE dims are neither read nor written). Requires
+        ``q_head_padded`` to be ``0`` or ``num_heads`` (no head padding). This
+        is the fast path for serving geometries whose local head count is
+        already a supported padded count (every power-of-two tensor-parallel
+        split of DeepSeek-V4). With ``apply_q_rope=False`` only the cache is
+        written and ``q`` is returned untouched.
 
     Returns
     -------
     torch.Tensor
         ``q_out`` -- a new BF16 ``[num_tokens, q_head_padded, 512]`` tensor
-        (``torch.empty``, fully written). The cache is updated in place.
-        ``num_tokens == 0`` returns the empty tensor without a launch.
+        (``torch.empty``, fully written), or ``q`` itself with ``q_inplace``.
+        The cache is updated in place. ``num_tokens == 0`` returns the empty
+        tensor (or ``q``) without a launch.
     """
     num_tokens = _check_q(q)
     _check_kv(kv, num_tokens)
@@ -430,6 +440,25 @@ def cake_dsv4_nvfp4_rope_quantize_insert(
     )
     num_heads = int(q.shape[1])
     q_head_padded = int(q_head_padded)
+    if q_inplace:
+        if q_head_padded not in (0, num_heads):
+            raise ValueError(
+                "q_inplace needs q_head_padded == 0 or == num_heads (no head padding), "
+                f"got q_head_padded={q_head_padded} for {num_heads} heads"
+            )
+        if num_heads not in _Q_HEAD_PADDED_CHOICES:
+            raise ValueError(
+                f"q_inplace needs a head count in {_Q_HEAD_PADDED_CHOICES}, got {num_heads}"
+            )
+        if num_tokens == 0:
+            return q
+        module = get_cake_dsv4_nvfp4_rope_insert_module()
+        if not apply_q_rope:
+            if num_insert:
+                module.kv(kv, cache, slot_mapping, positions, cos_sin_cache, 1)
+            return q
+        module.qkv(q, q, kv, cache, slot_mapping, positions, cos_sin_cache, True)
+        return q
     if q_head_padded == 0:
         q_out = torch.empty(
             (num_tokens, 0, _HEAD_DIM), dtype=torch.bfloat16, device=q.device

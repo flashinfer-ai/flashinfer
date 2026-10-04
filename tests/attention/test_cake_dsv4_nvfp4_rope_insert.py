@@ -527,6 +527,83 @@ def test_qkv_insert_matches_reference(
         assert bool((q_out[:, num_heads:] == 0).all())
 
 
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_heads", [8, 16])
+def test_qkv_insert_inplace_matches_reference(
+    slot_dtype: torch.dtype, num_heads: int
+) -> None:
+    """``q_inplace=True`` rotates q's rope dims in place (returned object is q), NoPE bits untouched, cache == reference."""
+
+    _require_sm120()
+    generator = torch.Generator(device="cuda").manual_seed(20261011 + num_heads)
+    num_tokens, num_insert, page_size = 41, 33, 32
+    q, kv, positions = _inputs(num_tokens, num_heads, generator)
+    q_orig = q.clone()
+    cos_sin = _cos_sin_cache()
+    got, want = _Cache(4, page_size), _Cache(4, page_size)
+    slots = _slot_mapping(
+        got.total_slots,
+        num_insert,
+        slot_dtype,
+        negatives=1,
+        out_of_range=1,
+        generator=generator,
+    )
+    for q_head_padded in (0, num_heads):
+        q.copy_(q_orig)
+        got.storage.fill_(_CANARY)
+        out = cake_dsv4_nvfp4_rope_quantize_insert(
+            q,
+            kv,
+            got.view,
+            slots,
+            positions,
+            cos_sin,
+            q_head_padded=q_head_padded,
+            q_inplace=True,
+        )
+        torch.cuda.synchronize()
+        assert out is q
+        _assert_q_out(q, _reference_q_out(q_orig, positions, cos_sin, num_heads))
+        assert torch.equal(
+            q[..., :_D_NOPE].view(torch.int16), q_orig[..., :_D_NOPE].view(torch.int16)
+        )
+    _reference_append(want.view, kv, slots, positions, cos_sin)
+    torch.cuda.synchronize()
+    _assert_same_cache(got, want)
+    # No head padding possible in place; unsupported head counts are rejected before any launch.
+    with pytest.raises(ValueError):
+        cake_dsv4_nvfp4_rope_quantize_insert(
+            q,
+            kv,
+            got.view,
+            slots,
+            positions,
+            cos_sin,
+            q_head_padded=2 * num_heads,
+            q_inplace=True,
+        )
+    with pytest.raises(ValueError):
+        cake_dsv4_nvfp4_rope_quantize_insert(
+            q[:, : num_heads - 1].contiguous(),
+            kv,
+            got.view,
+            slots,
+            positions,
+            cos_sin,
+            q_inplace=True,
+        )
+    # apply_q_rope=False in place: q untouched, cache written exactly as the KV entry.
+    q.copy_(q_orig)
+    got.storage.fill_(_CANARY)
+    out = cake_dsv4_nvfp4_rope_quantize_insert(
+        q, kv, got.view, slots, positions, cos_sin, apply_q_rope=False, q_inplace=True
+    )
+    torch.cuda.synchronize()
+    assert out is q and torch.equal(q.view(torch.int16), q_orig.view(torch.int16))
+    _assert_same_cache(got, want)
+
+
 def test_qkv_insert_without_q_rope() -> None:
     """``apply_q_rope=False`` copies the live heads bitwise; the cache is still rotated and quantized."""
 
