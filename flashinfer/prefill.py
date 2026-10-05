@@ -2750,7 +2750,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         if max_sequence_kv is not None:
             self._max_kv_len = max_sequence_kv
-        else:
+        # Non-cuDNN planners still consume host page metadata even when the
+        # caller supplies a maximum. Keep cuDNN's device-length fast path.
+        if max_sequence_kv is None or self._backend != "cudnn":
             paged_kv_indptr_host = paged_kv_indptr.to("cpu")
             paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
             if seq_lens is None:
@@ -2767,7 +2769,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._kv_lens_buffer[:required_size].copy_(
                 kv_lens_arr_host, non_blocking=non_blocking
             )
-            self._max_kv_len = kv_lens_arr_host.max().item()
+            if max_sequence_kv is None:
+                self._max_kv_len = kv_lens_arr_host.max().item()
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
