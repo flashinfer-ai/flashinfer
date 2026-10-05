@@ -3867,7 +3867,7 @@ def _caller_buffers(
     lengths[:2] = torch.tensor([3, 0])
     offsets = torch.randint(0, 1 << 20, (rows,), device="cuda", generator=g).int()
     args = (torch.randn(rows, width, device="cuda", generator=g), offsets, lengths, k)
-    size = flashinfer.top_k_ragged_transform_workspace_size(
+    size = flashinfer.topk._ragged_transform_workspace_size(
         rows, width, k, torch.float32, dev, backend=backend, use_row_starts=row_starts
     )
     bufs = dict(
@@ -3940,7 +3940,7 @@ def test_caller_buffers_are_checked(set_topk_algo, monkeypatch):
     with pytest.raises(NotImplementedError, match="clusters"):
         flashinfer.top_k_ragged_transform(*args, **modes, out=out, workspace=ws)
     with pytest.raises(NotImplementedError, match="clusters"):
-        flashinfer.top_k_ragged_transform_workspace_size(
+        flashinfer.topk._ragged_transform_workspace_size(
             8, 4096, 256, torch.float32, out.device, backend="clusters"
         )
 

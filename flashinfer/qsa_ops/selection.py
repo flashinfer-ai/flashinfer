@@ -29,7 +29,7 @@ from ..topk import (
     TopKTieBreak,
     resolve_ragged_transform_backend,
     top_k_ragged_transform,
-    top_k_ragged_transform_workspace_size,
+    _ragged_transform_workspace_size,
 )
 from ..utils import round_up
 
@@ -210,7 +210,7 @@ class QSASelection:
         )
 
     def _measure_topk_workspace(self) -> int:
-        return top_k_ragged_transform_workspace_size(
+        return _ragged_transform_workspace_size(
             self.rows_per_chunk,
             self.max_columns,
             self.block_topk,

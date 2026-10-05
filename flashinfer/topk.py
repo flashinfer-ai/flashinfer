@@ -1485,10 +1485,10 @@ def top_k_ragged_transform(
     out : Optional[torch.Tensor], optional
         int32 ``(num_rows, k)`` to write into instead of allocating one.
     workspace : Optional[torch.Tensor], optional
-        Scratch of at least :func:`top_k_ragged_transform_workspace_size` bytes
-        for ``backend``: uint8, contiguous, :data:`WORKSPACE_ALIGNMENT`-aligned,
-        zeroed when allocated and used by one call at a time. Replaces the
-        per-device cached buffer.
+        Scratch for ``backend`` instead of the per-device cached buffer: the
+        radix row states (1 MiB) or what ``cub_topk_ragged_transform_workspace_size``
+        reports; uint8, contiguous, :data:`WORKSPACE_ALIGNMENT`-aligned, zeroed
+        when allocated and used by one call at a time.
     backend : Optional[str], optional
         ``"cub"`` or ``"radix"`` as :func:`resolve_ragged_transform_backend`
         returned, so a run uses the backend its buffers were sized for instead
@@ -1620,8 +1620,7 @@ _CLUSTERS_OWNS_ITS_BUFFERS = (
 )
 
 
-@flashinfer_api
-def top_k_ragged_transform_workspace_size(
+def _ragged_transform_workspace_size(
     num_rows: int,
     max_len: int,
     k: int,
@@ -1632,37 +1631,8 @@ def top_k_ragged_transform_workspace_size(
     tie_break: int = TopKTieBreak.NONE,
     use_row_starts: bool = False,
 ) -> int:
-    r"""Bytes of scratch :func:`top_k_ragged_transform` needs on ``backend`` here.
-
-    Answered from the geometry alone, launching and allocating nothing, so a
-    workspace can be sized before there are scores to put in it. Zero the
-    buffer when it is allocated: the radix backend reads its counters before
-    writing them and leaves them fit to reuse.
-
-    Parameters
-    ----------
-    num_rows, max_len : int
-        The shape of the scores the run will be given, ``(num_rows, max_len)``.
-    k : int
-        How many indices the run selects per row.
-    dtype : torch.dtype
-        The scores' dtype.
-    device : torch.device
-        The device the run will be on.
-    backend : str
-        ``"cub"`` or ``"radix"``, as :func:`resolve_ragged_transform_backend`
-        returned for this geometry; pass the same value to the run so it uses
-        the backend it was sized for. ``"clusters"`` takes no caller buffers.
-    tie_break : int
-        The tie-break mode the run will use; it changes the CUB size.
-    use_row_starts : bool
-        Whether the run will be given ``row_starts``.
-
-    Returns
-    -------
-    int
-        The workspace size in bytes.
-    """
+    """Bytes of scratch top_k_ragged_transform needs on ``backend`` for this geometry,
+    answered without a scores tensor so a caller can size an arena before it exists."""
     if backend == "radix":
         return _RADIX_ROW_STATES_BYTES
     if backend != "cub":

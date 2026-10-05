@@ -344,9 +344,6 @@ from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
 from .topk import top_k_ragged_transform as top_k_ragged_transform
-from .topk import (
-    top_k_ragged_transform_workspace_size as top_k_ragged_transform_workspace_size,
-)
 from .topk import TopKTieBreak as TopKTieBreak
 from .topk_varlen.topk_varlen import top_k_varlen as top_k_varlen
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
