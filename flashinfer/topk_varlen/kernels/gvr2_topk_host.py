@@ -2033,6 +2033,7 @@ def run_varlen(
                 workspace=workspace,
                 top_k=top_k,
                 row_starts=row_starts,
+                absolute_indices=absolute_indices,
             )
     if logits.dtype is not torch.float32:
         raise RuntimeError(
