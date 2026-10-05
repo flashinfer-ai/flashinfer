@@ -717,10 +717,6 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p64(CakeFmhaTensorMap const
                     float _exp2_0 = approx_exp2(softmax_scale_log2 * (row_max - new_max));
                     acc_scale = _exp2_0;
                 }
-                if (quarter == 0) {
-                    smem_scale[sm_stage * 64 + my_col] = acc_scale;
-                }
-                mbarrier_arrive(corr_scale_addr);
                 float safe_max = ((new_max == -CAKE_FMHA_INF) ? 0.0f : new_max);
                 float p_vals[32];
                 float lsum = 0.0f;
@@ -735,6 +731,14 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p64(CakeFmhaTensorMap const
                 row_max = new_max;
                 mbarrier_wait(p_empty_addr, _phase_p_empty_0);
                 _phase_p_empty_0 ^= 1;
+                // Publish the rescale factor only after PV(n-1) retired: PV(n-1)
+                // needs the correction warps' p_full arrival for n-1, so softmax can
+                // never complete two corr_scale phases ahead of a correction wait
+                // (mbarrier parity would alias and deadlock the CTA).
+                if (quarter == 0) {
+                    smem_scale[sm_stage * 64 + my_col] = acc_scale;
+                }
+                mbarrier_arrive(corr_scale_addr);
                 int k_run = 0;
                 unsigned int regs_p[4];
                 #pragma unroll
