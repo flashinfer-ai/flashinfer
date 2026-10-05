@@ -160,8 +160,8 @@ def _validate_decode_quant_bf16q_specialization(
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
     if not 1 <= num_q_heads // num_kv_heads <= 8:
         raise ValueError("decode-quant BF16Q requires a head-group ratio in [1, 8]")
-    if page_size not in (16, 32, 64):
-        raise ValueError("decode-quant BF16Q requires page_size 16, 32, or 64")
+    if page_size not in (16, 32):
+        raise ValueError("decode-quant BF16Q requires page_size 16 or 32")
     return {"PAGE_SIZE": page_size}
 
 
@@ -185,8 +185,8 @@ def _validate_decode_quant_fp8_specialization(
         raise ValueError("num_q_heads and num_kv_heads must be positive")
     if num_q_heads != 8 * num_kv_heads:
         raise ValueError("decode-quant FP8 requires a head-group ratio of 8")
-    if page_size not in (16, 32, 64):
-        raise ValueError("decode-quant FP8 requires page_size 16, 32, or 64")
+    if page_size not in (16, 32):
+        raise ValueError("decode-quant FP8 requires page_size 16 or 32")
     return {"FULL_BLOCKS": int(full_blocks), "PAGE_SIZE": page_size}
 
 
