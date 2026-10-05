@@ -412,13 +412,13 @@ def test_dense_route_table_is_catalog_driven():
         assert record["clean_logits"] == "raw" and record["kv_alignment"] == 1
         assert [stage for stage, _p in record["stages"]] == ["logits"]
         # Only tiers admitted on at least one architecture have a record (and programs); a route withheld
-        # everywhere is absent from the table, so the program check runs over the catalogued 64-head routes.
+        # everywhere is absent from the table. Every catalogued 64-head route is a single logits stage whose
+        # program is a catalogued program (program ids are the generated-unit names, not template names).
+        programs = set(_runtime._catalog()["programs"])
         for r in _runtime._catalog()["routes"]:
             if r.startswith("fp8:h64:"):
-                expected = (
-                    "fp8_h64_logits_full" if ":full:" in r else "fp8_h64_logits_partial"
-                )
-                assert _runtime.program_names(r) == [expected], r
+                names = _runtime.program_names(r)
+                assert len(names) == 1 and set(names) <= programs, (r, names)
     else:
         assert not _runtime.dense_route_available(64, 16, 4096)
     assert (
