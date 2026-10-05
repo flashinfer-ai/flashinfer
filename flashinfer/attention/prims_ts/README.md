@@ -5,6 +5,9 @@ kernels for NVIDIA Blackwell GPUs. Scheduling, tile selection, and split-KV
 reduction are implementation details; the public interfaces expose attention
 and cache semantics without tuning knobs.
 
+The task-scheduled kernels support CuTe DSL 4.7 and 4.8. Internal task calls
+adapt to the installed API's resource-context signature.
+
 Public entry points marked with `@flashinfer_experimental_api` warn once on
 first use and provide no compatibility guarantee. Calling an API is the opt-in;
 no environment variable is required. Existing API logging and `fi_trace`
