@@ -853,6 +853,15 @@ def test_epilogue_rules():
             dict(a_mn=False, b_mn=True, epi="tma", slots=1, batch_group=1),
             "dense_proj_gemm_kn_n256_tma1_bf",
         ),
+        # round 13 (W4): the fp32 v8 register stores with L1::no_allocate.L2::evict_first (``_ef`` right after ``_v8``)
+        (
+            dict(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True),
+            "dense_proj_gemm_kn_n256_f32_v8_ef",
+        ),
+        (
+            dict(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True, stages=9),
+            "dense_proj_gemm_kn_n256_f32_v8_ef_s9",
+        ),
     ],
 )
 def test_instance_symbols(kwargs, symbol):
@@ -864,7 +873,7 @@ def test_round13_w3_knobs():
     # shrinks the B stage (160 columns: 3 x 32-column panels = 12 KiB instead of 2 x 64-column = 16 KiB) and the
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
-    assert len(key) == 21 and key[18] == 64 and key[19] is False and key[20] == 0
+    assert len(key) == 22 and key[18] == 64 and key[19] is False and key[20] == 0 and key[21] is False
     assert instance_key(a_mn=False, b_mn=False, b_swz=64)[18] == 128
     assert b_stage_bytes(True, 160, 64) == 3 * 64 * 64 and b_stage_bytes(True, 160, 128) == 2 * 64 * 128
     assert default_stages(0, 256, 160, True, 64) >= default_stages(0, 256, 160, True, 128)
@@ -885,6 +894,13 @@ def test_round13_batch_group_knob():
         instance_key(a_mn=False, b_mn=True, batch_group=-1)
 
 
+def test_round13_store_ef_knob():
+    # field 21 of the 22-field key: the hint exists only on the fp32 v8 register store form
+    assert instance_key(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True)[21] is True
+    assert instance_key(a_mn=False, b_mn=True, out_f32=True, store_ef=True)[21] is False
+    assert instance_key(a_mn=False, b_mn=True, store_ef=True)[21] is False
+
+
 def test_sk_exact_plan_mirrors_cake():
     # 24 tail tiles on 106 pairs, 96 K blocks: 3 parts of 32 steps -> 72 units, one segment each; a 2-part split of 3 K
     # blocks is refused (part under SK_MIN_ITERS), as is a split whose last part would be empty
@@ -901,7 +917,7 @@ def test_round13_knob_normalisation():
     # the 20-field key carries park / ovl / htail at fields 15 / 16 / 17; ovl is a 256-row x 256-column tall-tile
     # knob (narrower or shorter tiles raise), htail needs the 256-row family, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 21 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 22 and key[15] is False and key[16] is True and key[17] is True
     assert instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15] is False
     with pytest.raises(ValueError):
         instance_key(a_mn=False, b_mn=False, cta_rows=256, block_n=192, ovl=True)
@@ -1109,8 +1125,8 @@ def test_instance_key_rejects_bad_configurations():
         instance_key(a_mn=False, b_mn=False, pf=17)
     key = instance_key(a_mn=False, b_mn=False)
     # 20 fields since round 13 (the raster group width and the TMA L2 promotion left the key for the launch
-    # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group
-    assert len(key) == 21 and key[11:] == (
+    # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef
+    assert len(key) == 22 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -1121,6 +1137,7 @@ def test_instance_key_rejects_bad_configurations():
         128,
         False,
         0,
+        False,
     )
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)
