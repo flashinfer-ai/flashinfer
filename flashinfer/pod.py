@@ -724,10 +724,6 @@ class PODWithPagedKVCacheWrapper:
 
         return (out_p, out_d)
 
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass
-
 
 class BatchPODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
@@ -1352,7 +1348,3 @@ class BatchPODWithPagedKVCacheWrapper:
             out_d *= v_scale
 
         return ((out_p, out_d), (lse_p, lse_d)) if return_lse else (out_p, out_d)
-
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass

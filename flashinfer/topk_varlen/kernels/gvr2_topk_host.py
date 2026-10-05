@@ -27,7 +27,8 @@ explicit ``--gpu-arch``; ``route()`` adds two register-kernel rungs in the
 4K < n <= 8K band (VPT=2 for b <= sms, BLK=512 for sms < b <= 2*sms) and sizes its
 register band by the device SM count ``sms`` instead of the hard-coded 148
 (see the inline note; DKG #61); ``run_varlen`` accepts ``pre_idx=None`` and runs
-hint-free on a cached ``arange(k)`` anchor (``_hint_free_pre_idx``).
+the hint-free compiled engines (TRT-LLM #18410: identity sample, no hint loads;
+``_varlen_launcher(..., hint_free=True)``).
 FlashInfer's ``top_k_varlen(backend="gvr_2")``
 calls ``run_varlen`` below; the batch-uniform ``run``/``run_ws`` entries are
 kept for parity tests and benchmarking. Keep future diffs against upstream
@@ -179,7 +180,8 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
     is sized by ``sms`` (the device SM count; upstream hard-codes 148) — the
     ``wide`` one-wave test, QC/CURE and the one-wave cutoff of the BLK=512
     rung — and the 4K < n <= 8K band has two extra rungs (wide VPT=2, and
-    sms < b <= 2*sms BLK=512). The streaming-path constants keep upstream's
+    BLK=512 for sms < b <= 2*sms, extended to 4*sms for n >= 6144 and to
+    1024 rows for K = 2048). The streaming-path constants keep upstream's
     148 on every part."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
@@ -322,11 +324,19 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
     #     6144-8192 x 320-400 cells where the slab lost to sglang by up to
     #     22%) but loses for the lower half (n=4160, b=512: -13%), so the
     #     slab keeps that.
+    #   * K = 2048 up to 1024 rows, the whole band: the BLK=512 register
+    #     kernel beats the slab by 15-39% in every measured cell (uniform and
+    #     mixed lengths, n in {4160, 6144, 8192}, b in [600, 1024]) on B200,
+    #     148-SM B300 and Rubin (2026-09 same-node A/Bs). TRT-LLM #18410 ships
+    #     this as an SM103-only exception; it holds on SM100 and SM107 too.
+    #     For K <= 1024 the same extension wins 20-40% on mixed lengths but
+    #     loses 5-26% on uniform full-length rows at n=4160 and n=8192, so
+    #     those keep the rule above.
     # Reported upstream for adoption as DKG issue #61.
     if n4 <= 2048:
         if wide:
             return _reg(1024, 2, 1, 2 * NB)
-        if b <= 2 * sms or (b <= 4 * sms and n4 >= 1536):
+        if b <= 2 * sms or (b <= 4 * sms and n4 >= 1536) or (k == 2048 and b <= 1024):
             return _reg(512, 4, 2, NB)
     if n4 <= 4096 and wide:
         return _reg(1024, 4, 1, 2 * NB)
@@ -829,13 +839,19 @@ def _gate_first_call(raw):
         return gated
 
 
-def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
+def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
-    the in-tree runner's pick_tuning(graph_capture=...) discipline."""
+    the in-tree runner's pick_tuning(graph_capture=...) discipline.
+
+    ``hint_free`` selects the engines with the hint-gather sites compiled out
+    (upstream PR NVIDIA/TensorRT-LLM#18410): the register families bracket on
+    the first k row values they already hold, the streaming families run on the
+    sample alone. Part of the cache key (distinct compiled objects)."""
     sms = _sm_count()
-    key = (num_rows, npad, k, n_env, next_n, cr, _arch_token(), sms)
+    hint_free = bool(hint_free)
+    key = (num_rows, npad, k, n_env, next_n, cr, hint_free, _arch_token(), sms)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -860,7 +876,11 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     if plan_free["kernel"] == "reg_clus":
         fn = _gate_first_call(
             dev.get_compiled__regclus(
-                tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+                tuple(plan_free["tpl"]),
+                varlen=True,
+                next_n=next_n,
+                cr_shift=cr_shift,
+                hint_free=hint_free,
             )
         )
         lc = ("reg_clus", fn, n_kernel)
@@ -876,7 +896,11 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     if plan_free["kernel"] in ("reg", "regimg"):
         fn = _gate_first_call(
             dev.get_compiled__reg(
-                tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+                tuple(plan_free["tpl"]),
+                varlen=True,
+                next_n=next_n,
+                cr_shift=cr_shift,
+                hint_free=hint_free,
             )
         )
         rt_f = plan_free["rt"]
@@ -904,6 +928,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
                 varlen=True,
                 next_n=next_n,
                 cr_shift=cr_shift,
+                hint_free=hint_free,
             )
         )
         lc = (
@@ -921,7 +946,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = _gate_first_call(
-        dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const))
+        dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=hint_free)
     )
     big = num_rows * r_const <= 148
     aim_base = (
@@ -1131,11 +1156,10 @@ def _reset_for_tests() -> None:
 
 def release_cached_resources(device=None) -> int:
     """FlashInfer-local: release the lazily created per-device caches — every
-    default workspace slab (one per (device, stream), 20,973,568 B each) and
-    every hint-free anchor table (current and superseded) — for ``device``
-    (default: the current device; an int, a ``torch.device`` or a device
-    string, CUDA only). Synchronizes the device, then drops the references
-    under both cache locks; the memory returns to the torch caching
+    default workspace slab (one per (device, stream), 20,973,568 B each) —
+    for ``device`` (default: the current device; an int, a ``torch.device`` or
+    a device string, CUDA only). Synchronizes the device, then drops the
+    references under the cache lock; the memory returns to the torch caching
     allocator (``torch.cuda.empty_cache()`` hands it back to the driver).
     Returns the number of bytes released.
 
@@ -1150,10 +1174,10 @@ def release_cached_resources(device=None) -> int:
     paths that create objects (a creation either completes before the clear
     or starts after it; nothing is left half-published).
 
-    INVALIDATION: a CUDA graph captured against a released slab or table
-    replays on freed memory. Callers release only when no such graph will be
-    replayed again, and re-capture after a fresh eager warm-up on the
-    capturing stream (the same rule as the first capture)."""
+    INVALIDATION: a CUDA graph captured against a released slab replays on
+    freed memory. Callers release only when no such graph will be replayed
+    again, and re-capture after a fresh eager warm-up on the capturing stream
+    (the same rule as the first capture)."""
     if device is None:
         d = torch.cuda.current_device()
     else:
@@ -1164,21 +1188,10 @@ def release_cached_resources(device=None) -> int:
             )
         d = dev.index if dev.index is not None else torch.cuda.current_device()
     freed = 0
-    with _mu, _HINT_FREE_LOCK:  # lock order: _mu -> _HINT_FREE_LOCK (never nested elsewhere)
+    with _mu:
         torch.cuda.synchronize(d)
         for key in [k for k in _ws_keep if k[0] == d]:
             freed += _ws_keep.pop(key).numel() * 4
-        for key in [k for k in _HINT_FREE if k[0] == d]:
-            freed += _HINT_FREE.pop(key).numel() * 4
-        # partition by device index — never tensor equality (`in`/`remove`
-        # would compare tensor contents and raise across devices or shapes)
-        keep = []
-        for t in _HINT_FREE_KEEP:
-            if t.device.index == d:
-                freed += t.numel() * 4
-            else:
-                keep.append(t)
-        _HINT_FREE_KEEP[:] = keep
     return freed
 
 
@@ -1224,54 +1237,6 @@ builder in _build_launcher; only the main family takes the workspace.
 # shape key (b, n, npad, k) -> (fn, args tuple of python ints, needs_ws)
 _LAUNCH_CACHE = {}
 _DUMMY_KV = {}
-# hint-free entry: (device index, k) -> int32[cap, k] table whose every row
-# is arange(k). Superseded tables are kept alive (captured graphs may still
-# address them). Growth is serialized by _HINT_FREE_LOCK (locked re-check,
-# capacity only grows) and the producing stream is synchronized before a
-# table is published, so any thread/stream that sees the pointer sees a
-# complete table.
-_HINT_FREE = {}
-_HINT_FREE_KEEP = []
-_HINT_FREE_LOCK = threading.Lock()
-
-
-def _hint_free_pre_idx(batch, k, device):
-    """FlashInfer-local: the ``pre_idx`` stand-in for hint-free ``run_varlen``.
-
-    The kernels consume the hint only as a sampling anchor — the block-wide
-    (min, max) of ``logits[pre_idx[j]]`` — and never for exactness, so ANY k
-    distinct in-range indices are a valid hint; ``arange(k)`` is the cheapest
-    (rows shorter than k take the in-kernel identity path before the anchor
-    matters, and columns < k always lie inside the row's storage). One table
-    per (device, k), grown by doubling and reused as a contiguous row-prefix
-    view (16-byte aligned: k is a multiple of 512), so the hot path performs
-    no allocation and CUDA-graph replays see a stable address. Growth is
-    refused under capture — run one eager call (or ``warmup_varlen``) at the
-    largest batch first, like every other launcher resource.
-    """
-    key = (device.index if device.index is not None else torch.cuda.current_device(), k)
-    t = _HINT_FREE.get(key)  # hot path: one (GIL-atomic) load
-    if t is not None and t.shape[0] >= batch:
-        return t[:batch]
-    if _is_capturing():
-        raise RuntimeError(
-            f"hint-free gvr_2: no pre_idx table for batch={batch}, k={k} on "
-            f"{device}; run one eager call (or warmup_varlen) at this batch "
-            "before CUDA-graph capture"
-        )
-    with _HINT_FREE_LOCK:  # slow path: locked re-check, monotonic capacity
-        t = _HINT_FREE.get(key)
-        if t is not None and t.shape[0] >= batch:
-            return t[:batch]
-        cap = max(batch, 64 if t is None else 2 * t.shape[0])
-        new = torch.arange(k, dtype=_I32, device=device).unsqueeze(0).expand(cap, k).contiguous()
-        # the fill ran on the caller's stream; make it complete before any
-        # other stream/thread can see the pointer (eager-only, rare: doubling)
-        torch.cuda.current_stream(device).synchronize()
-        if t is not None:
-            _HINT_FREE_KEEP.append(t)
-        _HINT_FREE[key] = new
-        return new[:batch]
 
 
 def _dummy_kv(dev_index, device):
@@ -1565,11 +1530,12 @@ def run_varlen(
 ) -> None:
     """Production-contract varlen entry (per-row device kv_lens).
 
-    HINT-FREE (FlashInfer-local): ``pre_idx=None`` runs with the cached
-    ``arange(k)`` stand-in of ``_hint_free_pre_idx`` and then REQUIRES
-    ``top_k`` (normally ``k = pre_idx.shape[1]``). Exact like the hinted
-    call; only the sampling anchor is weaker. When both are given they must
-    agree.
+    HINT-FREE: ``pre_idx=None`` runs the hint-free compiled engines (identity
+    sample in place of the hint, no hint loads; TRT-LLM #18410) and then
+    REQUIRES ``top_k`` (normally ``k = pre_idx.shape[1]``). Exact like the
+    hinted call; only the sampling anchor is weaker. When both are given they
+    must agree. Hint mode is a warm-up dimension: hinted and hint-free
+    launchers are distinct compiled objects (``warmup_varlen`` compiles both).
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -1646,23 +1612,27 @@ def run_varlen(
     batch = num_rows // nn
     if kv_lens.shape[0] != batch:
         raise RuntimeError(f"kv_lens length {kv_lens.shape[0]} != num_rows/next_n = {batch}")
-    if pre_idx is None:
+    # Hint-free (pre_idx=None): the in-kernel engines are compiled with the
+    # identity sample (row positions 0..k-1, computed in registers) in place
+    # of the hint loads (upstream PR NVIDIA/TensorRT-LLM#18410, refined per
+    # family in the device module), so the pre_idx ABI slot is never read and
+    # ``k`` comes from ``top_k``. The reference engine below builds the same
+    # identity hint as a tensor.
+    hint_free = pre_idx is None
+    if hint_free:
         if top_k is None:
             raise RuntimeError("run_varlen: top_k is required when pre_idx is None (hint-free)")
-        pre_idx = _hint_free_pre_idx(batch, _index(top_k), logits.device)
+        k = _index(top_k)
+        if k < 1:
+            raise RuntimeError(f"top_k must be >= 1, got {k}")
     else:
         if top_k is not None and len(pre_idx.shape) == 2 and pre_idx.shape[1] != _index(top_k):
             raise RuntimeError(f"top_k={top_k} != pre_idx.shape[1]={pre_idx.shape[1]}")
-        if len(pre_idx.shape) == 2 and not _is_capturing():
-            # hint mode is NOT a warm-up dimension: a hinted eager call at this
-            # geometry also sizes the hint-free anchor table, so a later
-            # hint-free capture of the same geometry finds it (dict hit once
-            # sized; allocation only on growth)
-            _hint_free_pre_idx(batch, pre_idx.shape[1], logits.device)
-    if len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch:
-        raise RuntimeError(
-            f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
-        )
+        if len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch:
+            raise RuntimeError(
+                f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
+            )
+        k = pre_idx.shape[1]
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
         raise RuntimeError(f"device index out of range: {d}")
@@ -1684,20 +1654,25 @@ def run_varlen(
         # batch-dim check is CRITICAL: the kernel grid comes from
         # logits.shape[0], so a short indices/values tensor would be written
         # out of bounds).
-        if not (logits.is_cuda and pre_idx.is_cuda and indices.is_cuda):
+        if not (logits.is_cuda and indices.is_cuda and (hint_free or pre_idx.is_cuda)):
             raise RuntimeError("all tensors must be CUDA")
-        if logits.dtype is not _F32 or pre_idx.dtype is not _I32 or indices.dtype is not _I32:
+        if (
+            logits.dtype is not _F32
+            or indices.dtype is not _I32
+            or (not hint_free and pre_idx.dtype is not _I32)
+        ):
             raise RuntimeError("logits must be float32; pre_idx/indices int32")
         if len(indices.shape) != 2 or indices.shape[0] != num_rows:
             raise RuntimeError(
                 f"indices must be [num_rows={num_rows}, >=k], got {tuple(indices.shape)}"
             )
-        k = pre_idx.shape[1]
         if indices.shape[1] < k:
             raise RuntimeError(f"indices width {indices.shape[1]} < k={k}")
-        if not (pre_idx.is_contiguous() and indices.is_contiguous() and kv_lens.is_contiguous()):
-            raise RuntimeError("pre_idx/indices/kv_lens must be contiguous")
-        if (pre_idx.data_ptr() | indices.data_ptr()) & 15:
+        if not (indices.is_contiguous() and kv_lens.is_contiguous()):
+            raise RuntimeError("indices/kv_lens must be contiguous")
+        if not hint_free and not pre_idx.is_contiguous():
+            raise RuntimeError("pre_idx must be contiguous")
+        if (indices.data_ptr() | (0 if hint_free else pre_idx.data_ptr())) & 15:
             # the compiled fakes declare assumed_align=16 for pre_idx/indices
             # (FlashInfer-local check; the DSL used to refuse at conversion)
             raise RuntimeError(
@@ -1759,7 +1734,7 @@ def run_varlen(
             # R increment (bounded plans, bounded _VARLEN_CACHE)
             n_env = 1 << max(n_env - 1, 1).bit_length()
         n_env = min(max(n_env, 1), npad)
-        key = (num_rows, npad, k, n_env, nn, cr, _arch_token(), _sm_count())
+        key = (num_rows, npad, k, n_env, nn, cr, hint_free, _arch_token(), _sm_count())
         lc = _VARLEN_CACHE.get(key)
         if lc is None:
             if _is_capturing():
@@ -1767,30 +1742,33 @@ def run_varlen(
                     "varlen launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr)
+            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, hint_free)
         idx = indices
         if idx.shape[1] != k:
             idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
         vals = values
         if vals is not None and vals.shape[1] != k:
             vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
+        # hint-free engines never read the pre_idx ABI slot: pass the output
+        # buffer (int32, 16-byte aligned) to satisfy the compiled fake
+        pre_arg = idx if hint_free else pre_idx
         if lc[0] == "reg_clus":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_envelope)
-            lc[1](lg, pre_idx, kv_lens, idx, lc[2])
+            lc[1](lg, pre_arg, kv_lens, idx, lc[2])
         elif lc[0] == "reg":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, CMP, QC, smem)
-            lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
+            lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
         elif lc[0] == "clus":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_env, npad, k,
             #                SCAP, CMP, dead DYN x5)
-            lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
+            lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
         else:
             _, fn, pre, tail = lc
             if ws is None:
                 ws = _ws_hot.get(_ws_key(d))
                 if ws is None:
                     ws = default_workspace(logits)  # raises under capture
-            fn(lg, pre_idx, idx, ws, *pre, kv_lens, *tail)
+            fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
         if vals is not None:
             idx64 = idx.to(torch.int64)
             vals.copy_(lg.gather(1, idx64.clamp_min(0)))
@@ -1806,7 +1784,15 @@ def run_varlen(
         )
     # match the engine's flat-packed output convention for wider-than-k
     # buffers (pack ONCE from the tensor base, then slice per row)
-    k = pre_idx.shape[1]
+    if hint_free:
+        # the batch-uniform kernels read a hint: the identity sample, the same
+        # positions the hint-free engines compute in registers
+        pre_idx = (
+            torch.arange(k, dtype=_I32, device=logits.device)
+            .unsqueeze(0)
+            .expand(batch, k)
+            .contiguous()
+        )
     idx = indices
     if len(idx.shape) != 2 or idx.shape[0] != num_rows:
         raise RuntimeError(
@@ -1874,7 +1860,8 @@ def warmup_varlen(
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
-    One tiny real launch per requested ``num_rows`` (compile keys do not
+    One tiny real launch per requested ``num_rows`` and hint mode (hinted and
+    hint-free engines are distinct compiled objects; compile keys do not
     depend on tensor contents). Uses the current CUDA device. The done-key
     is recorded only after every launch succeeds, so a failed or interrupted
     warmup is retried on the next call instead of short-circuiting to an
@@ -1901,12 +1888,9 @@ def warmup_varlen(
     # rows) even when CUDA-graph batch lists reach thousands of rows.
     n_env_c = max(1, int(max_seq_len) // int(compress_ratio))
     npad_c = (n_env_c + 63) // 64 * 64 if row_stride is None else int(row_stride)
-    # hint-free callers capture with the arange table: size it for the
-    # largest requested batch now (growth is refused under capture), and
     # create THIS stream's default workspace slab (the band launches below may
     # all land on register/cluster plans while a requested row count routes
-    # to the slab-using `main` family; both are refused under capture)
-    _hint_free_pre_idx(req_rows[-1] // nn, int(top_k), torch.device("cuda", dev))
+    # to the slab-using `main` family; refused under capture)
     default_workspace(torch.empty(0, dtype=torch.uint8, device=torch.device("cuda", dev)))
     seen_keys = set()
     rows_list = []
@@ -1956,26 +1940,32 @@ def warmup_varlen(
         # already-warmed engine — otherwise a CUDA-graph capture at that row
         # count misses the launcher cache.
         for r in req_rows:
-            _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio))
+            for hf in (False, True):
+                _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf)
         return
     rows_max = rows_list[-1]
     # one allocation at the largest geometry; smaller row counts run on
-    # contiguous prefix views (compile keys depend on shapes only)
+    # contiguous prefix views (compile keys depend on shapes only). Both the
+    # hinted and the hint-free engines are compiled: they are distinct
+    # compiled objects and a serving stack may use either (``auto`` picks
+    # hint-free whenever the caller passes no previous-step indices).
     logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
     kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
     pre_idx = torch.zeros((rows_max // nn, int(top_k)), dtype=torch.int32, device=dev)
     out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
     for rows in rows_list:
         batch = rows // nn
-        run_varlen(
-            logits[:rows],
-            pre_idx[:batch],
-            kv_lens[:batch],
-            out[:rows],
-            next_n=nn,
-            compress_ratio=int(compress_ratio),
-            max_seq_len=int(max_seq_len),
-        )
+        for hint in (pre_idx[:batch], None):
+            run_varlen(
+                logits[:rows],
+                hint,
+                kv_lens[:batch],
+                out[:rows],
+                next_n=nn,
+                compress_ratio=int(compress_ratio),
+                max_seq_len=int(max_seq_len),
+                top_k=int(top_k),
+            )
     del logits, kv_lens, pre_idx, out
     torch.cuda.synchronize()
     # band launches compiled every ENGINE; now populate the per-row-count
@@ -1983,6 +1973,7 @@ def warmup_varlen(
     # work, zero allocation/launch — engines hit the compile cache), so a
     # CUDA-graph capture at any requested geometry finds its key immediately.
     for r in req_rows:
-        _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio))
+        for hf in (False, True):
+            _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf)
     with _VARLEN_WARMUP_LOCK:
         _VARLEN_WARMUP_DONE.add(key)

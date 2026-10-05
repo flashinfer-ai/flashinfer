@@ -13,34 +13,49 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Compute-capability 10.0/10.3 backend for Minimax Sparse Attention.
+Compute-capability 10.0/10.3 backend for MiniMax Sparse Attention.
+
+The Cake-generated programs behind this module are registered in
+``flashinfer.jit.blackwell_msa``: ``ROUTES`` maps a logical route
+(``<route key>:<stage>``) to the program that serves it on each target and
+``MODULES`` carries the program's physical argument order.  This module owns
+the public semantics only -- argument validation, route selection from the
+inputs, the host-side plan of the long-prefill route and the CUDA-graph
+workspace contract.  There are no environment switches and no shape-exact
+routes: every TopK16 call on a supported device is served by the route its
+inputs select.  Compute capability 10.7 is admitted for the packed-NVFP4
+paged-KV routes only.
 """
 
 from __future__ import annotations
 
+import functools
 import math
-import os
 import threading
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional, cast
+from typing import Any, Optional, Tuple
 
 import torch
+import tvm_ffi
 
-from ..utils import get_compute_capability
-
-if TYPE_CHECKING:
-    from ..jit.blackwell_msa import BlackwellMSATarget, BlackwellMSAVariant
+from ..jit.blackwell_msa import (
+    MODULES,
+    BlackwellMSATarget,
+    load_blackwell_msa_module,
+    route_program,
+)
+from ..utils import get_compute_capability, get_device_sm_count
 
 _BLOCK_SIZE = 128
 _HEAD_DIM = 128
-_TOPK_SELECT = 16
-_ATTENTION_TOPK = 16
-_SUPPORTED_ATTENTION_TOPK = {4, 8, 16, 32}
-_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
+_TOPK = 16
+# Compute capability 10.7 (Rubin) is admitted for the packed-NVFP4 paged-KV
+# routes only; the dense SM100/SM103 programs are not qualified there and
+# ``_program`` rejects them explicitly.
+_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3), (10, 7)}
 _M128_Q_TILE = 256
-_M128_GQA8_Q_TILE = 32
-_M128_GQA16_Q_TILE = 16
-_M64_GQA16_Q_TILE = 8
+_GQA8_Q_TILE = 32
+_GQA16_Q_TILE = 16
 _UNIFORM_FP8_EVEN_WAVE_GRID = 128
 
 _LONG_PARTIAL_SEGMENT_COUNT = 4
@@ -52,6 +67,13 @@ _LONG_QSPLIT_SINGLE_SHIFT = 28
 
 _MODE_DECODE_ONLY = 1
 _SPLIT_ADAPTIVE = 0
+
+_DTYPE_NAMES = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float8_e4m3fn: "float8_e4m3fn",
+}
+_GRID_AXES = {"grid_x": 0, "grid_y": 1, "grid_z": 2}
 
 
 class MSASparseAttentionWorkspace:
@@ -78,7 +100,6 @@ class MSASparseAttentionWorkspace:
         self._lock = threading.Lock()
         self._buffers: dict[str, torch.Tensor] = {}
         self._long_prefill_state: dict = {}
-        self._reverse_prefill_states: dict[str, dict] = {}
         self._warmed_launches: set[tuple] = set()
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
@@ -86,12 +107,10 @@ class MSASparseAttentionWorkspace:
 
 _topk_warmed_devices: set[tuple[int, str]] = set()
 _topk_warmed_devices_lock = threading.Lock()
-_eager_decode_dummies: dict[tuple[int, int, torch.dtype], torch.Tensor] = {}
-_eager_decode_dummies_lock = threading.Lock()
+_eager_dummies: dict[tuple, torch.Tensor] = {}
+_eager_dummies_lock = threading.Lock()
 _implicit_long_prefill_states: dict[tuple, dict] = {}
 _implicit_long_prefill_states_lock = threading.Lock()
-_implicit_reverse_prefill_states: dict[str, dict] = {}
-_implicit_reverse_prefill_states_lock = threading.Lock()
 
 
 def is_blackwell_msa_device(device: torch.device | str) -> bool:
@@ -104,73 +123,107 @@ def is_blackwell_msa_device(device: torch.device | str) -> bool:
     )
 
 
-def _cuda_version_at_least(version: str) -> bool:
+# ---------------------------------------------------------------------------
+# Device facts and program launch
+# ---------------------------------------------------------------------------
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+@functools.cache
+def _device_facts(device_index: int) -> tuple[BlackwellMSATarget, int]:
+    """``(target, multiprocessor count)`` of one device, resolved once."""
+
     from ..jit.cpp_ext import is_cuda_version_at_least
 
-    return is_cuda_version_at_least(version)
-
-
-def _select_target(device: torch.device) -> "BlackwellMSATarget":
+    device = torch.device("cuda", device_index)
     compute_capability = get_compute_capability(device)
     if compute_capability not in _SUPPORTED_COMPUTE_CAPABILITIES:
         raise RuntimeError(
             "the SM100/SM103 MSA backend requires compute capability 10.0 or 10.3; "
             f"got {compute_capability[0]}.{compute_capability[1]}"
         )
-    if compute_capability == (10, 3):
-        if _cuda_version_at_least("12.9"):
-            return "sm103a"
-        raise RuntimeError("MSA on compute capability 10.3 requires CUDA 12.9 or newer")
-    if _cuda_version_at_least("12.8"):
-        return "sm100a"
-    raise RuntimeError("MSA on compute capability 10.0 requires CUDA 12.8 or newer")
-
-
-def _get_module(variant: "BlackwellMSAVariant", target: "BlackwellMSATarget"):
-    from ..jit.blackwell_msa import get_blackwell_msa_module
-
-    return get_blackwell_msa_module(variant, target)
-
-
-def _stream_ptr(device: torch.device) -> int:
-    return int(torch.cuda.current_stream(device).cuda_stream)
-
-
-def _decode_tma_dummy(
-    *,
-    device: torch.device,
-    stream_ptr: int,
-    dtype: torch.dtype,
-    workspace: Optional[MSASparseAttentionWorkspace],
-) -> torch.Tensor:
-    if workspace is not None:
-        return _workspace_buffer(
-            workspace,
-            f"decode_tma_dummy_{dtype}",
-            (128, 2, _HEAD_DIM),
-            dtype=dtype,
-            device=device,
-        )
-    device_index = (
-        device.index if device.index is not None else torch.cuda.current_device()
-    )
-    key = (device_index, stream_ptr, dtype)
-    with _eager_decode_dummies_lock:
-        tensor = _eager_decode_dummies.get(key)
-        if tensor is None:
-            tensor = torch.empty(
-                (128, 2, _HEAD_DIM),
-                dtype=dtype,
-                device=device,
+    if compute_capability == (10, 7):
+        target: BlackwellMSATarget = "sm107a"  # type: ignore[assignment]
+    elif compute_capability == (10, 3):
+        if not is_cuda_version_at_least("12.9"):
+            raise RuntimeError(
+                "MSA on compute capability 10.3 requires CUDA 12.9 or newer"
             )
-            _eager_decode_dummies[key] = tensor
-    return tensor
+        target = "sm103a"
+    else:
+        if not is_cuda_version_at_least("12.8"):
+            raise RuntimeError(
+                "MSA on compute capability 10.0 requires CUDA 12.8 or newer"
+            )
+        target = "sm100a"
+    num_sms = int(get_device_sm_count(device))
+    return target, num_sms
+
+
+def _select_target(device: torch.device) -> BlackwellMSATarget:
+    return _device_facts(_device_index(device))[0]
+
+
+def _num_sms(device: torch.device) -> int:
+    return _device_facts(_device_index(device))[1]
+
+
+class _Program:
+    """One loaded program: its FFI entry and physical argument order."""
+
+    __slots__ = ("entry", "plan", "name")
+
+    def __init__(
+        self, name: str, entry: Any, plan: tuple[tuple[str, str], ...]
+    ) -> None:
+        self.name = name
+        self.entry = entry
+        self.plan = plan
+
+    def launch(self, grid: tuple[int, int, int], **arguments: Any) -> None:
+        """Launch on the current torch stream with the generated argument order."""
+
+        values = []
+        for kind, name in self.plan:
+            if kind == "grid":
+                values.append(int(grid[_GRID_AXES[name]]))
+            else:
+                values.append(arguments[name])
+        with tvm_ffi.use_torch_stream():
+            self.entry(*values)
+
+
+@functools.cache
+def _program(route: str, target: BlackwellMSATarget) -> _Program:
+    if target == "sm107a":
+        raise RuntimeError(
+            "the dense SM100/SM103 MSA backend is not qualified on compute "
+            "capability 10.7 (Rubin); only the packed-NVFP4 paged-KV routes are "
+            "enabled there"
+        )
+    name = route_program(route, target)
+    record = MODULES[name]
+    module = load_blackwell_msa_module(name, target)
+    plan = tuple((str(kind), str(argument)) for kind, argument in record["arg_plan"])
+    return _Program(name, getattr(module, record["ffi_entry"]), plan)
+
+
+# ---------------------------------------------------------------------------
+# Workspace and launch contract
+# ---------------------------------------------------------------------------
 
 
 def _normalize_device(device: torch.device) -> torch.device:
     if device.index is None:
         return torch.device("cuda", torch.cuda.current_device())
     return device
+
+
+def _stream_ptr(device: torch.device) -> int:
+    return int(torch.cuda.current_stream(device).cuda_stream)
 
 
 def _bind_workspace(
@@ -208,29 +261,46 @@ def _workspace_buffer(
     *,
     dtype: torch.dtype,
     device: torch.device,
-    zero: bool = False,
 ) -> torch.Tensor:
     if workspace is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    tensor = workspace._buffers.get(name)
+    valid = (
+        tensor is not None
+        and tensor.device == device
+        and tensor.dtype == dtype
+        and tuple(tensor.shape) == shape
+        and tensor.is_contiguous()
+    )
+    if not valid:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"MSASparseAttentionWorkspace buffer {name!r} is not warmed "
+                f"for shape {shape} and dtype {dtype}"
+            )
         tensor = torch.empty(shape, dtype=dtype, device=device)
-    else:
-        tensor = workspace._buffers.get(name)
-        valid = (
-            tensor is not None
-            and tensor.device == device
-            and tensor.dtype == dtype
-            and tuple(tensor.shape) == shape
-            and tensor.is_contiguous()
-        )
-        if not valid:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"MSASparseAttentionWorkspace buffer {name!r} is not warmed "
-                    f"for shape {shape} and dtype {dtype}"
-                )
+        workspace._buffers[name] = tensor
+    return tensor
+
+
+def _eager_dummy(
+    workspace: Optional[MSASparseAttentionWorkspace],
+    name: str,
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """A never-dereferenced descriptor carrier, allocated once per device."""
+
+    if workspace is not None:
+        return _workspace_buffer(workspace, name, shape, dtype=dtype, device=device)
+    key = (_device_index(device), name, shape, dtype)
+    with _eager_dummies_lock:
+        tensor = _eager_dummies.get(key)
+        if tensor is None:
             tensor = torch.empty(shape, dtype=dtype, device=device)
-            workspace._buffers[name] = tensor
-    if zero:
-        tensor.zero_()
+            _eager_dummies[key] = tensor
     return tensor
 
 
@@ -245,14 +315,14 @@ def _tensor_signature(tensor: torch.Tensor) -> tuple:
 
 def _launch_signature(
     *,
-    variant: str,
+    route: str,
     target: str,
     tensors: tuple[torch.Tensor, ...],
     scalars: tuple,
     grid: tuple[int, int, int],
 ) -> tuple:
     return (
-        variant,
+        route,
         target,
         tuple(_tensor_signature(tensor) for tensor in tensors),
         scalars,
@@ -276,7 +346,7 @@ def _check_warmed_launch(
 
 def _record_successful_launch(
     workspace: Optional[MSASparseAttentionWorkspace],
-    signature: tuple,
+    signature: Optional[tuple],
     *,
     capturing: bool,
 ) -> None:
@@ -284,8 +354,47 @@ def _record_successful_launch(
         return
     if capturing:
         workspace._captured = True
-    else:
+    elif signature is not None:
         workspace._warmed_launches.add(signature)
+
+
+def _signature_tensors(arguments: dict[str, Any]) -> tuple[torch.Tensor, ...]:
+    return tuple(
+        value for value in arguments.values() if isinstance(value, torch.Tensor)
+    )
+
+
+def _signature_scalars(arguments: dict[str, Any]) -> tuple:
+    return tuple(
+        value for value in arguments.values() if not isinstance(value, torch.Tensor)
+    )
+
+
+def _enter_workspace(
+    workspace: Optional[MSASparseAttentionWorkspace],
+    *,
+    device: torch.device,
+    capturing: bool,
+):
+    if capturing and workspace is None:
+        raise RuntimeError(
+            "CUDA graph capture of MSA on compute capability 10.0/10.3/10.7 "
+            "requires an explicit MSASparseAttentionWorkspace warmed with the "
+            "exact tensors and capture stream"
+        )
+    if workspace is not None and not isinstance(workspace, MSASparseAttentionWorkspace):
+        raise TypeError("workspace must be an MSASparseAttentionWorkspace")
+    if workspace is None:
+        return nullcontext()
+    _bind_workspace(
+        workspace, device=device, stream_ptr=_stream_ptr(device), capturing=capturing
+    )
+    return workspace._lock
+
+
+# ---------------------------------------------------------------------------
+# Argument validation and layout
+# ---------------------------------------------------------------------------
 
 
 def _require_cuda_i32(
@@ -308,12 +417,14 @@ def _require_cuda_i32(
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                f"{name} must already be contiguous CUDA int32 on {device} "
-                "during graph capture"
+                f"{name} must already be contiguous CUDA int32 on {device} during graph capture"
             )
         value = value.to(
-            device=device, dtype=torch.int32, non_blocking=True
-        ).contiguous()
+            device=device,
+            dtype=torch.int32,
+            non_blocking=True,
+            memory_format=torch.contiguous_format,
+        )
     if value.ndim != 1:
         raise ValueError(f"{name} must be one-dimensional")
     if length is not None and value.numel() != length:
@@ -331,19 +442,12 @@ def _explicit_q_offsets(
 ) -> torch.Tensor:
     if isinstance(q_offset, int):
         offsets = _workspace_buffer(
-            workspace,
-            name,
-            (batch_size,),
-            dtype=torch.int32,
-            device=device,
+            workspace, name, (batch_size,), dtype=torch.int32, device=device
         )
         offsets.fill_(q_offset)
         return offsets
     return _require_cuda_i32(
-        q_offset,
-        device=device,
-        name="q_offset",
-        length=batch_size,
+        q_offset, device=device, name="q_offset", length=batch_size
     )
 
 
@@ -375,14 +479,23 @@ def _validate_scale_arguments(
     k_global_scale,
     v_global_scale,
     allow_uniform_fp8: bool,
+    nvfp4_decline_reason: Optional[str] = None,
 ) -> tuple[float, float]:
     if k.dtype == torch.uint8:
+        if nvfp4_decline_reason:
+            raise NotImplementedError(
+                "NVFP4 K/V MSA on compute capability 10.0/10.3/10.7 declined this "
+                f"call: {nvfp4_decline_reason}. NVFP4 K/V IS supported on this "
+                "architecture -- this shape is not, and there is no other "
+                "implementation of this operation over an NVFP4 cache, so the "
+                "call cannot be served at any speed."
+            )
         raise NotImplementedError(
-            "NVFP4 K/V is not supported by MSA on compute capability 10.0/10.3"
+            "NVFP4 K/V is not supported by MSA on compute capability 10.0/10.3/10.7"
         )
     if k_scale is not None or v_scale is not None:
         raise NotImplementedError(
-            "tensor K/V scales are not supported by MSA on compute capability 10.0/10.3"
+            "tensor K/V scales are not supported by MSA on compute capability 10.0/10.3/10.7"
         )
     uniform_fp8 = q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
     if (k_global_scale is not None or v_global_scale is not None) and not (
@@ -403,7 +516,7 @@ def _validate_attention_tensors(
 ) -> tuple[int, int, int, int]:
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise ValueError("q must be a CUDA tensor")
-    if q.dtype not in (torch.bfloat16, torch.float16, torch.float8_e4m3fn):
+    if q.dtype not in _DTYPE_NAMES:
         raise ValueError(f"q must be bf16/fp16/fp8, got {q.dtype}")
     if q.ndim != 3 or q.shape[2] != _HEAD_DIM:
         raise ValueError(f"q must have shape (total_q, num_q_heads, {_HEAD_DIM})")
@@ -424,19 +537,16 @@ def _validate_attention_tensors(
     if not k.is_contiguous() or not v.is_contiguous():
         if k.ndim == 4:
             raise ValueError(
-                "MSA on compute capability 10.0/10.3 does not directly support "
+                "MSA on compute capability 10.0/10.3/10.7 does not directly support "
                 "K/V views split from a packed paged cache; pass separate "
                 "contiguous K and V tensors (implicit copies are not performed)"
             )
         raise ValueError("k/v must be contiguous")
-    fp8_kv = k.dtype == torch.float8_e4m3fn
-    if fp8_kv:
+    if k.dtype == torch.float8_e4m3fn:
         if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise NotImplementedError(
-                "FP8 K/V with FP16 Q is not supported on compute capability 10.0/10.3"
+                "FP8 K/V with FP16 Q is not supported on compute capability 10.0/10.3/10.7"
             )
-        if q.dtype == torch.float8_e4m3fn and v.dtype != torch.float8_e4m3fn:
-            raise ValueError("FP8 Q requires uniform FP8 K/V")
     elif k.dtype != q.dtype:
         raise ValueError("dense k/v dtype must match q; FP8 K/V requires BF16 Q")
     num_kv_heads = int(k.shape[1])
@@ -455,14 +565,10 @@ def _validate_attention_tensors(
         or not q2k_indices.is_contiguous()
     ):
         raise ValueError(
-            "q2k_indices must be contiguous CUDA int32 with shape "
-            "(num_kv_heads, total_q, topk)"
+            "q2k_indices must be contiguous CUDA int32 with shape (num_kv_heads, total_q, topk)"
         )
-    topk = int(q2k_indices.shape[2])
-    if topk not in _SUPPORTED_ATTENTION_TOPK:
-        raise ValueError(
-            "Blackwell MSA sparse attention requires topk in {4, 8, 16, 32}"
-        )
+    if int(q2k_indices.shape[2]) != _TOPK:
+        raise ValueError("Blackwell MSA sparse attention requires topk=16")
     return total_q, num_q_heads, num_kv_heads, group_size
 
 
@@ -477,6 +583,8 @@ def _prepare_layout(
     prefill: bool,
     workspace: Optional[MSASparseAttentionWorkspace],
 ) -> tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """``(paged, cu_k, kv_lens, page_table, max_pages)`` of one call."""
+
     paged = page_table is not None
     if paged:
         if seqused_k is None:
@@ -494,21 +602,15 @@ def _prepare_layout(
             or not page_table.is_contiguous()
         ):
             raise ValueError(
-                "page_table must be contiguous CUDA int32 with shape "
-                "(batch_size, max_pages)"
+                "page_table must be contiguous CUDA int32 with shape (batch_size, max_pages)"
             )
         kv_lens = _require_cuda_i32(
-            seqused_k,
-            device=q.device,
-            name="seqused_k",
-            length=batch_size,
+            seqused_k, device=q.device, name="seqused_k", length=batch_size
         )
         if cu_seqlens_k is None:
             cu_k = (
                 _cumulative_kv_lengths(
-                    kv_lens,
-                    workspace=workspace,
-                    name="prefill_cu_seqlens_k",
+                    kv_lens, workspace=workspace, name="prefill_cu_seqlens_k"
                 )
                 if prefill
                 else kv_lens
@@ -527,15 +629,17 @@ def _prepare_layout(
     if cu_seqlens_k is None:
         raise ValueError("flat K/V requires cu_seqlens_k")
     cu_k = _require_cuda_i32(
-        cu_seqlens_k,
-        device=q.device,
-        name="cu_seqlens_k",
-        length=batch_size + 1,
+        cu_seqlens_k, device=q.device, name="cu_seqlens_k", length=batch_size + 1
     )
     return False, cu_k, cu_k, q.reshape(-1).view(torch.int32), 0
 
 
-def _prefill_variant(
+# ---------------------------------------------------------------------------
+# Route selection (mirrors the Cake production dispatcher)
+# ---------------------------------------------------------------------------
+
+
+def _prefill_route(
     *,
     q_dtype: torch.dtype,
     k_dtype: torch.dtype,
@@ -543,43 +647,36 @@ def _prefill_variant(
     folded_gqa_group: int,
     causal: bool,
     max_pages: int,
-) -> "BlackwellMSAVariant":
+) -> str:
     layout = "paged" if paged else "flat"
-    if folded_gqa_group == 8:
-        return f"prefill_union_bf16_gqa8_{layout}"  # type: ignore[return-value]
-    if folded_gqa_group == 16:
-        if paged:
-            suffix = (
-                "causal_mask64"
-                if causal and max_pages <= 64
-                else "causal_large"
-                if causal
-                else "noncausal"
-            )
-            return f"prefill_union_bf16_gqa16_paged_{suffix}"  # type: ignore[return-value]
-        return f"prefill_union_bf16_gqa16_{layout}"  # type: ignore[return-value]
-    if k_dtype == torch.float8_e4m3fn:
-        return f"prefill_union_bf16_query_fp8_kv_{layout}"  # type: ignore[return-value]
-    dtype_name = "fp16" if q_dtype == torch.float16 else "bf16"
-    return f"prefill_union_{dtype_name}_{layout}"  # type: ignore[return-value]
+    causal_retrace = paged and folded_gqa_group == 16 and causal
+    variant = (
+        "causal_mask64"
+        if causal_retrace and max_pages <= 64
+        else "causal_large"
+        if causal_retrace
+        else "any"
+    )
+    return (
+        f"prefill_union:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}:"
+        f"gqa{folded_gqa_group}:{variant}"
+    )
 
 
-def _decode_variant(
-    *,
-    q_dtype: torch.dtype,
-    k_dtype: torch.dtype,
-    paged: bool,
-) -> "BlackwellMSAVariant":
+def _decode_route(*, q_dtype: torch.dtype, k_dtype: torch.dtype, paged: bool) -> str:
     layout = "paged" if paged else "flat"
-    if k_dtype == torch.float8_e4m3fn:
-        return f"decode_m16_bf16_query_fp8_kv_{layout}"  # type: ignore[return-value]
-    dtype_name = "fp16" if q_dtype == torch.float16 else "bf16"
-    return f"decode_m16_{dtype_name}_{layout}"  # type: ignore[return-value]
+    return f"decode_m16:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}"
 
 
-def _exact_non16_decode_variant(
+def _long_prefill_route(*, paged: bool, group_size: int, direct_group: bool) -> str:
+    layout = "paged" if paged else "flat"
+    return f"long_bf16_reverse:{layout}:gqa{group_size}" + (
+        ":direct_group" if direct_group else ""
+    )
+
+
+def _fp8_q1_schedule(
     *,
-    requested_schedule: str,
     capturing: bool,
     paged: bool,
     force_fused: Optional[bool],
@@ -592,146 +689,11 @@ def _exact_non16_decode_variant(
     seqlen_q: int,
     num_q_heads: int,
     num_kv_heads: int,
-    topk: int,
-    k_outer_dim: int,
-    max_pages: int,
-) -> Optional["BlackwellMSAVariant"]:
-    """Select one of the two exact eager non-TopK16 decode routes."""
-
-    common = (
-        requested_schedule == ""
-        and not capturing
-        and paged
-        and force_fused is True
-        and causal
-        and q_offset_is_none
-        and q_dtype == torch.bfloat16
-        and k_dtype == torch.bfloat16
-    )
-    if not common:
-        return None
-    if (
-        topk == 32
-        and batch_size == 64
-        and total_q == 512
-        and seqlen_q == 8
-        and num_q_heads == 64
-        and num_kv_heads == 4
-        and k_outer_dim == 32768
-        and max_pages == 512
-    ):
-        return "decode_m16_bf16_paged_topk32"
-    if (
-        topk == 4
-        and batch_size == 2
-        and total_q == 2
-        and seqlen_q == 1
-        and num_q_heads == 8
-        and num_kv_heads == 1
-        and k_outer_dim == 6
-        and max_pages == 3
-    ):
-        return "decode_m16_bf16_paged_topk4_exact512"
-    return None
-
-
-def _is_exact_fp8_topk8_qagg_prefill(
-    *,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q2k_indices: torch.Tensor,
-    cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
-    paged: bool,
-    batch_size: int,
-    causal: bool,
-    q_offset_is_none: bool,
-    softmax_scale: Optional[float],
-    return_temperature_lse: bool,
-    lse_temperature_scale: float,
-    requested_schedule: str,
-    capturing: bool,
-) -> bool:
-    return bool(
-        not capturing
-        and requested_schedule == ""
-        and not paged
-        and batch_size == 3
-        and q.dtype == torch.bfloat16
-        and tuple(q.shape) == (3072, 32, _HEAD_DIM)
-        and k.dtype == v.dtype == torch.float8_e4m3fn
-        and tuple(k.shape) == tuple(v.shape) == (24576, 2, _HEAD_DIM)
-        and tuple(q2k_indices.shape) == (2, 3072, 8)
-        and tuple(cu_q.shape) == tuple(cu_k.shape) == (4,)
-        and causal
-        and q_offset_is_none
-        and softmax_scale is None
-        and return_temperature_lse
-        and lse_temperature_scale == 1.0
-    )
-
-
-def _is_exact_bf16_topk4_qload4_prefill(
-    *,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q2k_indices: torch.Tensor,
-    cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
-    page_table: torch.Tensor,
-    kv_lens: torch.Tensor,
-    paged: bool,
-    batch_size: int,
-    causal: bool,
-    q_offset_is_none: bool,
-    softmax_scale: Optional[float],
-    return_temperature_lse: bool,
-    lse_temperature_scale: float,
-    requested_schedule: str,
-) -> bool:
-    return bool(
-        requested_schedule == ""
-        and paged
-        and batch_size == 3
-        and q.dtype == k.dtype == v.dtype == torch.bfloat16
-        and tuple(q.shape) == (12288, 8, _HEAD_DIM)
-        and tuple(k.shape) == tuple(v.shape) == (192, 2, _BLOCK_SIZE, _HEAD_DIM)
-        and tuple(q2k_indices.shape) == (2, 12288, 4)
-        and tuple(cu_q.shape) == tuple(cu_k.shape) == (4,)
-        and tuple(page_table.shape) == (3, 64)
-        and tuple(kv_lens.shape) == (3,)
-        and causal
-        and q_offset_is_none
-        and softmax_scale is None
-        and (not return_temperature_lse or lse_temperature_scale == 1.0)
-    )
-
-
-def _resolve_fp8_q1_schedule(
-    *,
-    requested: str,
-    capturing: bool,
-    paged: bool,
-    force_fused: Optional[bool],
-    causal: bool,
-    q_offset_is_none: bool,
-    q_dtype: torch.dtype,
-    k_dtype: torch.dtype,
-    batch_size: int,
-    total_q: int,
-    seqlen_q: int,
-    num_q_heads: int,
-    num_kv_heads: int,
-    topk: int,
     k_outer_dim: int,
     max_pages: int,
 ) -> str:
-    """Select only the two default FP8-KV Q1 serving specializations."""
+    """The two FP8-KV Q1 serving specializations, selected from the inputs."""
 
-    if requested:
-        return requested
     common = (
         not capturing
         and force_fused is True
@@ -743,13 +705,12 @@ def _resolve_fp8_q1_schedule(
         and seqlen_q == 1
         and num_q_heads == 64
         and num_kv_heads == 4
-        and topk == _ATTENTION_TOPK
     )
     if not common:
         return ""
     if paged and batch_size == 128 and k_outer_dim == 4096 and max_pages == 32:
         return "q1_paged_xform2"
-    if not paged and batch_size == 32 and k_outer_dim == 262144:
+    if not paged and batch_size == 32 and k_outer_dim == 262144 and max_pages == 0:
         return "q1_flat_xform2"
     return ""
 
@@ -772,9 +733,8 @@ def _uniform_fp8_decode_grid(
     return physical_grid
 
 
-def _should_use_long_prefill(
+def _use_long_prefill(
     *,
-    requested_schedule: str,
     batch_size: int,
     total_q: int,
     paged: bool,
@@ -790,8 +750,7 @@ def _should_use_long_prefill(
     lse_temperature_scale: float,
 ) -> bool:
     return bool(
-        requested_schedule != "m64"
-        and batch_size == 1
+        batch_size == 1
         and total_q >= 8192
         and (
             (
@@ -808,6 +767,11 @@ def _should_use_long_prefill(
         and q_offset_is_none
         and (not return_temperature_lse or lse_temperature_scale == 1.0)
     )
+
+
+# ---------------------------------------------------------------------------
+# Long prefill: host-side work plan over the selected blocks
+# ---------------------------------------------------------------------------
 
 
 def _long_plan_signature(
@@ -865,8 +829,10 @@ def _build_long_prefill_plan(
     group_size: int,
     paged: bool,
 ) -> dict:
+    """One exact single-request CSR of selected blocks plus the CTA work list."""
+
     num_kv_heads, total_q, topk = (int(value) for value in q2k_indices.shape)
-    if topk != _ATTENTION_TOPK:
+    if topk != _TOPK:
         raise ValueError("long prefill requires topk=16")
     if group_size not in {8, 16} or (not paged and group_size != 16):
         raise ValueError("long prefill requires paged GQA8/GQA16 or flat GQA16")
@@ -894,10 +860,12 @@ def _build_long_prefill_plan(
     qsplit = torch.full(
         (num_kv_heads, nnz_per_head), -1, dtype=torch.int32, device=q2k_indices.device
     )
-    split_counts_by_head = ((q2k_indices >= 0) & (q2k_indices < total_rows)).sum(
+    # [total_q, num_kv_heads] (the reducer's layout) straight from the reduction: no transpose copy.
+    by_query = q2k_indices.transpose(0, 1)
+    split_counts = ((by_query >= 0) & (by_query < total_rows)).sum(
         dim=2, dtype=torch.int32
     )
-    counts_host: list[list[int]] = []
+    counts_by_head: list[torch.Tensor] = []
     for head in range(num_kv_heads):
         flat = q2k_indices[head].reshape(-1)
         valid = (flat >= 0) & (flat < total_rows)
@@ -907,7 +875,7 @@ def _build_long_prefill_plan(
             torch.int32
         )
         row_ptr[head, 1:] = torch.cumsum(counts, dim=0, dtype=torch.int32)
-        counts_host.append([int(value) for value in counts.cpu().tolist()])
+        counts_by_head.append(counts)
         order = torch.argsort(blocks, stable=True)
         sorted_positions = positions.index_select(0, order)
         q_indices = torch.div(sorted_positions, topk, rounding_mode="floor")
@@ -915,11 +883,14 @@ def _build_long_prefill_plan(
         packed = q_indices.to(torch.int32) | (
             slots.to(torch.int32) << _LONG_QSPLIT_SLOT_SHIFT
         )
-        packed |= (split_counts_by_head[head].index_select(0, q_indices) == 1).to(
+        packed |= (split_counts[:, head].index_select(0, q_indices) == 1).to(
             torch.int32
         ) << _LONG_QSPLIT_SINGLE_SHIFT
         qsplit[head, : packed.numel()] = packed
 
+    # The host decomposes the per-row counts into the CTA work list: one device-to-host
+    # transfer for all heads (the plan is rebuilt only when the selection changes).
+    counts_host = torch.stack(counts_by_head).cpu().tolist()
     work: list[tuple[int, tuple[int, int, int, int, int, int]]] = []
     for head, counts in enumerate(counts_host):
         for kv_block, row_count in enumerate(counts):
@@ -943,7 +914,7 @@ def _build_long_prefill_plan(
     work.sort(key=lambda item: item[0], reverse=True)
     metadata = torch.tensor(
         [entry for _group, entry in work], dtype=torch.int32, device=q2k_indices.device
-    ).contiguous()
+    )
     counts_by_group = [0] * 129
     for group_count, _entry in work:
         counts_by_group[group_count] += 1
@@ -954,9 +925,9 @@ def _build_long_prefill_plan(
         end_by_group[group_count] = running
     return {
         "scheduler_metadata": metadata,
-        "row_ptr": row_ptr.contiguous(),
-        "qsplit": qsplit.contiguous(),
-        "split_counts": split_counts_by_head.transpose(0, 1).contiguous(),
+        "k2q_row_ptr": row_ptr,
+        "k2q_qsplit_indices": qsplit,
+        "split_counts": split_counts,
         "group_segment_ends": tuple(
             end_by_group[value] for value in _LONG_GROUP_BOUNDARIES
         ),
@@ -966,7 +937,7 @@ def _build_long_prefill_plan(
     }
 
 
-def _get_long_prefill_state(
+def _long_prefill_state(
     *,
     workspace: Optional[MSASparseAttentionWorkspace],
     q2k_indices: torch.Tensor,
@@ -1007,9 +978,9 @@ def _get_long_prefill_state(
     return state
 
 
-def _run_long_prefill_modules(
+def _run_long_prefill(
     *,
-    target: "BlackwellMSATarget",
+    target: BlackwellMSATarget,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1029,15 +1000,14 @@ def _run_long_prefill_modules(
     lse_temperature_scale: float,
     return_softmax_lse: bool,
     return_temperature_lse: bool,
-    stream_ptr: int,
     workspace: Optional[MSASparseAttentionWorkspace],
     capturing: bool,
 ) -> None:
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
     num_kv_heads = int(k.shape[1])
     total_k = max_pages * _BLOCK_SIZE if paged else int(k.shape[0])
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    state = _get_long_prefill_state(
+    num_sms = _num_sms(q.device)
+    state = _long_prefill_state(
         workspace=workspace,
         q2k_indices=q2k_indices,
         total_k=total_k,
@@ -1049,21 +1019,20 @@ def _run_long_prefill_modules(
     partial_o = _long_state_tensor(
         state,
         "partial_o",
-        (_ATTENTION_TOPK, total_q, num_q_heads, _HEAD_DIM),
+        (_TOPK, total_q, num_q_heads, _HEAD_DIM),
         dtype=torch.uint8,
         device=q.device,
     )
-    scale_shape: tuple[int, ...]
     if paged:
-        scale_shape = (
-            _ATTENTION_TOPK,
+        scale_shape: tuple[int, ...] = (
+            _TOPK,
             total_q,
             num_q_heads,
             _LONG_PARTIAL_SEGMENT_COUNT,
         )
         scale_dtype = torch.bfloat16
     else:
-        scale_shape = (2, _ATTENTION_TOPK, total_q, num_q_heads)
+        scale_shape = (2, _TOPK, total_q, num_q_heads)
         scale_dtype = torch.float32
     partial_scale = _long_state_tensor(
         state, "partial_scale", scale_shape, dtype=scale_dtype, device=q.device
@@ -1071,7 +1040,7 @@ def _run_long_prefill_modules(
     partial_lse = _long_state_tensor(
         state,
         "partial_lse",
-        (_ATTENTION_TOPK, total_q, num_q_heads),
+        (_TOPK, total_q, num_q_heads),
         dtype=torch.float32,
         device=q.device,
     )
@@ -1080,584 +1049,348 @@ def _run_long_prefill_modules(
         partial_temperature_lse = _long_state_tensor(
             state,
             "partial_temperature_lse",
-            (_ATTENTION_TOPK, total_q, num_q_heads),
+            (_TOPK, total_q, num_q_heads),
             dtype=torch.float32,
             device=q.device,
         )
-    arch_suffix = "sm103" if target == "sm103a" else "sm100"
-    if paged:
-        direct = target == "sm100a" and group_size == 16 and max_pages == 8192
-        forward_variant = cast(
-            "BlackwellMSAVariant",
-            (
-                "long_prefill_paged_bf16_gqa16_direct_group_sm100"
-                if direct
-                else f"long_prefill_paged_bf16_gqa{group_size}_{arch_suffix}"
-            ),
-        )
-        reduce_variant = cast(
-            "BlackwellMSAVariant", f"long_prefill_reduce_paged_bf16_gqa{group_size}"
-        )
-    else:
-        forward_variant = cast(
-            "BlackwellMSAVariant", f"long_prefill_flat_bf16_gqa16_{arch_suffix}"
-        )
-        reduce_variant = "long_prefill_reduce_flat_bf16_gqa16"
+    direct_group = (
+        target == "sm100a" and paged and group_size == 16 and max_pages == 8192
+    )
+    route = _long_prefill_route(
+        paged=paged, group_size=group_size, direct_group=direct_group
+    )
     forward_grid = (int(plan["work_count"]), 1, 1)
-    reduce_grid = ((total_q * num_q_heads + 31) // 32, 1, 1)
-    page_table_arg = page_table if paged else q2k_indices.reshape(-1)
-    forward_tensors = (
-        q,
-        k,
-        v,
-        plan["scheduler_metadata"],
-        plan["row_ptr"],
-        plan["qsplit"],
-        partial_o,
-        partial_scale,
-        partial_lse,
-        partial_temperature_lse,
-        out,
-        cu_q,
-        cu_k,
-        q_offsets,
-        kv_lens,
-        page_table_arg,
+    forward = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "scheduler_metadata": plan["scheduler_metadata"],
+        "k2q_row_ptr": plan["k2q_row_ptr"],
+        "k2q_qsplit_indices": plan["k2q_qsplit_indices"],
+        "partial_o": partial_o,
+        "partial_scale": partial_scale,
+        "partial_lse": partial_lse,
+        "partial_temperature_lse": partial_temperature_lse,
+        "out": out,
+        "cu_seqlens_q": cu_q,
+        "cu_seqlens_k": cu_k,
+        "q_offsets": q_offsets,
+        "kv_lens": kv_lens,
+        "page_table": page_table if paged else q2k_indices.reshape(-1),
+        "total_q": total_q,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "total_rows": int(plan["total_rows"]),
+        "nnz_per_head": int(plan["nnz_per_head"]),
+        "work_capacity": int(plan["work_count"]),
+        "num_work_items": int(plan["work_count"]),
+        "topk": _TOPK,
+        "max_pages": max_pages if paged else 0,
+        "causal": 1,
+        "derive_q_offset": 1,
+        "softmax_scale_log2": softmax_scale_log2,
+        "lse_temperature_scale": lse_temperature_scale,
+        "return_temperature_lse": int(return_temperature_lse),
+    }
+    forward.update(
+        {
+            f"q_group_segment_end_{group_count}": int(value)
+            for group_count, value in zip(
+                _LONG_GROUP_BOUNDARIES, plan["group_segment_ends"], strict=True
+            )
+        }
     )
-    forward_scalars = (
-        *plan["group_segment_ends"],
-        total_q,
-        num_q_heads,
-        num_kv_heads,
-        int(plan["total_rows"]),
-        int(plan["nnz_per_head"]),
-        int(plan["work_count"]),
-        int(plan["work_count"]),
-        _ATTENTION_TOPK,
-        max_pages if paged else 0,
-        1,
-        1,
-        softmax_scale_log2,
-        lse_temperature_scale,
-        int(return_temperature_lse),
-    )
-    reduce_tensors = (
-        partial_o,
-        partial_scale,
-        partial_lse,
-        partial_temperature_lse,
-        plan["split_counts"],
-        out,
-        lse,
-        temperature_lse,
-    )
-    reduce_scalars = (
-        total_q,
-        num_q_heads,
-        num_kv_heads,
-        group_size,
-        _ATTENTION_TOPK,
-        int(return_softmax_lse or return_temperature_lse),
-        int(return_temperature_lse),
-    )
+    combine_grid = ((total_q * num_q_heads + 31) // 32, 1, 1)
+    combine = {
+        "partial_o": partial_o,
+        "partial_scale": partial_scale,
+        "partial_lse": partial_lse,
+        "partial_temperature_lse": partial_temperature_lse,
+        "split_counts": plan["split_counts"],
+        "out": out,
+        "lse": lse,
+        "temperature_lse": temperature_lse,
+        "total_q": total_q,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "qhead_per_kv": group_size,
+        "topk": _TOPK,
+        "return_softmax_lse": int(return_softmax_lse or return_temperature_lse),
+        "return_temperature_lse": int(return_temperature_lse),
+    }
     signature = _launch_signature(
-        variant=f"{forward_variant}+{reduce_variant}",
+        route=route,
         target=target,
-        tensors=(*forward_tensors, *reduce_tensors),
-        scalars=(*forward_scalars, *reduce_scalars),
+        tensors=(*_signature_tensors(forward), *_signature_tensors(combine)),
+        scalars=(
+            *_signature_scalars(forward),
+            *_signature_scalars(combine),
+            combine_grid,
+        ),
         grid=forward_grid,
     )
     _check_warmed_launch(workspace, signature, capturing=capturing)
-    _get_module(forward_variant, target).run(
-        *forward_tensors, *forward_scalars, *forward_grid, stream_ptr
-    )
-    _get_module(reduce_variant, target).run(
-        *reduce_tensors, *reduce_scalars, *reduce_grid, stream_ptr
-    )
+    _program(f"{route}:main", target).launch(forward_grid, **forward)
+    _program(f"{route}:reduce", target).launch(combine_grid, **combine)
     _record_successful_launch(workspace, signature, capturing=capturing)
 
 
-def _reverse_prefill_state(
-    workspace: Optional[MSASparseAttentionWorkspace], route: str
-) -> dict:
-    states = (
-        workspace._reverse_prefill_states
-        if workspace is not None
-        else _implicit_reverse_prefill_states
-    )
-    return states.setdefault(route, {})
+# ---------------------------------------------------------------------------
+# Single-launch routes
+# ---------------------------------------------------------------------------
 
 
-def _run_exact_fp8_topk8_qagg_prefill(
+def _launch_route(
+    route: str,
     *,
-    target: "BlackwellMSATarget",
+    target: BlackwellMSATarget,
+    grid: tuple[int, int, int],
+    arguments: dict[str, Any],
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+) -> None:
+    signature = _launch_signature(
+        route=route,
+        target=target,
+        tensors=_signature_tensors(arguments),
+        scalars=_signature_scalars(arguments),
+        grid=grid,
+    )
+    _check_warmed_launch(workspace, signature, capturing=capturing)
+    _program(f"{route}:main", target).launch(grid, **arguments)
+    _record_successful_launch(workspace, signature, capturing=capturing)
+
+
+def _run_prefill(
+    *,
+    target: BlackwellMSATarget,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    temperature_lse: torch.Tensor,
     q2k_indices: torch.Tensor,
     cu_q: torch.Tensor,
     cu_k: torch.Tensor,
-    stream_ptr: int,
-    workspace: Optional[MSASparseAttentionWorkspace],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Launch the exact eager TopK8 producer/reducer pair."""
-
-    from ._blackwell_sm100_reverse_plan import prepare_fp8_topk8_qagg_plan
-
-    route = "fp8_topk8_qagg_pdl"
-    context = (
-        nullcontext()
-        if workspace is not None
-        else _implicit_reverse_prefill_states_lock
-    )
-    with context:
-        state = _reverse_prefill_state(workspace, route)
-        try:
-            plan = prepare_fp8_topk8_qagg_plan(
-                q2k_indices,
-                cu_q,
-                cu_k,
-                sm_count=torch.cuda.get_device_properties(
-                    q.device
-                ).multi_processor_count,
-                stream_id=stream_ptr,
-                state=state,
-            )
-            geometry = plan["geometry"]
-            completion_counts = _long_state_tensor(
-                state,
-                "completion_counts",
-                (384,),
-                dtype=torch.uint32,
-                device=q.device,
-            )
-            if "launches_completed" not in state:
-                completion_counts.zero_()
-                state["launches_completed"] = 0
-            launches_completed = int(state["launches_completed"])
-            if launches_completed >= (1 << 32) - 1:
-                state.clear()
-                raise OverflowError(
-                    "TopK8 qagg generation exhausted; the plan was invalidated"
-                )
-            generation = launches_completed + 1
-            out = _long_state_tensor(
-                state,
-                "out",
-                (3072, 32, _HEAD_DIM),
-                dtype=torch.bfloat16,
-                device=q.device,
-            )
-            lse = _long_state_tensor(
-                state,
-                "lse",
-                (3072, 32),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            temperature_lse = _long_state_tensor(
-                state,
-                "temperature_lse",
-                (3072, 32),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            partial_o = _long_state_tensor(
-                state,
-                "partial_o",
-                (8, 3072, 32, _HEAD_DIM),
-                dtype=torch.float8_e4m3fn,
-                device=q.device,
-            )
-            partial_lse = _long_state_tensor(
-                state,
-                "partial_lse",
-                (8, 3072, 32),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            partial_temperature_lse = _long_state_tensor(
-                state,
-                "partial_temperature_lse",
-                (8, 3072, 32),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            i32_dummy = _long_state_tensor(
-                state,
-                "i32_dummy",
-                (1,),
-                dtype=torch.int32,
-                device=q.device,
-            )
-            if "i32_dummy_initialized" not in state:
-                i32_dummy.zero_()
-                state["i32_dummy_initialized"] = True
-            producer_variant: BlackwellMSAVariant = (
-                "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl"
-            )
-            reducer_variant: BlackwellMSAVariant = (
-                "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce"
-            )
-            producer_tensors = (
-                q,
-                k.view(torch.uint8),
-                v.view(torch.uint8),
-                plan["scheduler_metadata"],
-                plan["k2q_row_ptr"],
-                plan["k2q_qsplit_indices"],
-                partial_o,
-                partial_lse,
-                partial_temperature_lse,
-                completion_counts,
-                cu_q,
-                cu_k,
-                i32_dummy,
-                i32_dummy,
-                i32_dummy,
-            )
-            producer_scalars = (
-                3072,
-                32,
-                2,
-                int(geometry.total_rows),
-                3072 * 8,
-                int(geometry.schedule_capacity),
-                int(geometry.work_count),
-                8,
-                0,
-                1,
-                1,
-                (_HEAD_DIM**-0.5) / math.log(2.0),
-                1.0,
-                0,
-            )
-            reducer_tensors = (
-                partial_o,
-                partial_lse,
-                partial_temperature_lse,
-                plan["split_counts"],
-                plan["q_order"],
-                plan["contributor_work_ids"],
-                completion_counts,
-                out,
-                lse,
-                temperature_lse,
-            )
-            reducer_scalars = (
-                3072,
-                32,
-                2,
-                16,
-                8,
-                generation,
-                1,
-                1,
-            )
-            _get_module(producer_variant, target).run(
-                *producer_tensors,
-                *producer_scalars,
-                384,
-                1,
-                1,
-                stream_ptr,
-            )
-            _get_module(reducer_variant, target).run(
-                *reducer_tensors,
-                *reducer_scalars,
-                3072,
-                1,
-                1,
-                stream_ptr,
-            )
-            state["launches_completed"] = generation
-            return out, lse, temperature_lse
-        except BaseException:
-            state.clear()
-            raise
-
-
-def _exact_topk4_launch_parts(
-    *,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
+    q_offsets: torch.Tensor,
     kv_lens: torch.Tensor,
     page_table: torch.Tensor,
+    paged: bool,
+    folded_gqa_group: int,
+    batch_size: int,
+    max_pages: int,
+    causal: bool,
+    derive_q_offset: bool,
+    softmax_scale_log2: float,
+    lse_temperature_scale: float,
     return_softmax_lse: bool,
     return_temperature_lse: bool,
-    state: dict,
-) -> tuple[
-    tuple,
-    tuple,
-    tuple[int, int, int],
-    tuple,
-    tuple,
-    tuple[int, int, int],
-    tuple,
-]:
-    plan = state
-    geometry = plan["geometry"]
-    out = _long_state_tensor(
-        state,
-        "out",
-        (12288, 8, _HEAD_DIM),
-        dtype=torch.bfloat16,
-        device=q.device,
-    )
-    lse = _long_state_tensor(
-        state,
-        "lse",
-        (12288, 8),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    temperature_lse = _long_state_tensor(
-        state,
-        "temperature_lse",
-        (12288, 8),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    partial_o = _long_state_tensor(
-        state,
-        "partial_o",
-        (4, 12288, 8, _HEAD_DIM),
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+) -> None:
+    total_q, num_q_heads, _ = (int(value) for value in q.shape)
+    num_kv_heads = int(k.shape[1])
+    fp8_kv = k.dtype == torch.float8_e4m3fn
+    # The union program also serves packed-NVFP4 K/V in its own route; the
+    # dense routes bind a never-read scale carrier.
+    scale_dummy = _eager_dummy(
+        workspace,
+        "prefill_scale_dummy",
+        (1, 1, _BLOCK_SIZE, _HEAD_DIM // 16),
         dtype=torch.uint8,
         device=q.device,
     )
-    partial_scale = _long_state_tensor(
-        state,
-        "partial_scale",
-        (4, 12288, 8, 4),
-        dtype=torch.float32,
-        device=q.device,
+    q_tile = (
+        _GQA8_Q_TILE
+        if folded_gqa_group == 8
+        else _GQA16_Q_TILE
+        if folded_gqa_group == 16
+        else _M128_Q_TILE
     )
-    partial_lse = _long_state_tensor(
-        state,
-        "partial_lse",
-        (4, 12288, 8),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    partial_temperature_lse = _long_state_tensor(
-        state,
-        "partial_temperature_lse",
-        (4, 12288, 8),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    producer_tensors = (
-        q,
-        k,
-        v,
-        plan["scheduler_metadata"],
-        plan["k2q_row_ptr"],
-        plan["k2q_qsplit_indices"],
-        partial_o,
-        partial_scale,
-        partial_lse,
-        partial_temperature_lse,
-        cu_q,
-        cu_k,
-        cu_k,
-        kv_lens,
-        page_table,
-    )
-    producer_scalars = (
-        *plan["group_segment_ends"],
-        12288,
-        8,
-        2,
-        int(geometry.total_rows),
-        12288 * 4,
-        int(geometry.schedule_capacity),
-        int(geometry.work_count),
-        4,
-        64,
+    grid = (
+        (total_q + q_tile - 1) // q_tile + batch_size - 1,
+        num_kv_heads if folded_gqa_group else num_q_heads,
         1,
-        1,
-        (_HEAD_DIM**-0.5) / math.log(2.0),
-        1.0,
-        int(return_temperature_lse),
     )
-    reducer_tensors = (
-        partial_o,
-        partial_scale,
-        partial_lse,
-        partial_temperature_lse,
-        plan["split_counts"],
-        out,
-        lse,
-        temperature_lse,
+    arguments = {
+        "q": q,
+        "k": k.view(torch.uint8) if fp8_kv else k,
+        "k_scale": scale_dummy,
+        "v": v.view(torch.uint8) if fp8_kv else v,
+        "v_scale": scale_dummy,
+        "out": out,
+        "lse": lse,
+        "temperature_lse": temperature_lse,
+        "q2k_indices": q2k_indices,
+        "cu_seqlens_q": cu_q,
+        "cu_seqlens_k": cu_k,
+        "q_offsets": q_offsets,
+        "kv_lens": kv_lens,
+        "page_table": page_table,
+        "total_q": total_q,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "topk": _TOPK,
+        "batch_size": batch_size,
+        "uniform_q_len": 0,
+        "max_pages": max_pages,
+        "causal": int(causal),
+        "derive_q_offset": int(derive_q_offset),
+        "softmax_scale_log2": softmax_scale_log2,
+        "k_global_scale": 1.0,
+        "v_global_scale": 1.0,
+        "lse_temperature_scale": lse_temperature_scale,
+        "return_softmax_lse": int(return_softmax_lse or return_temperature_lse),
+        "return_temperature_lse": int(return_temperature_lse),
+    }
+    route = _prefill_route(
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        paged=paged,
+        folded_gqa_group=folded_gqa_group,
+        causal=causal,
+        max_pages=max_pages,
     )
-    reducer_scalars = (
-        12288,
-        8,
-        2,
-        4,
-        4,
-        int(return_softmax_lse or return_temperature_lse),
-        int(return_temperature_lse),
-    )
-    return (
-        producer_tensors,
-        producer_scalars,
-        (int(geometry.work_count), 1, 1),
-        reducer_tensors,
-        reducer_scalars,
-        (3072, 1, 1),
-        (out, lse, temperature_lse),
+    _launch_route(
+        route,
+        target=target,
+        grid=grid,
+        arguments=arguments,
+        workspace=workspace,
+        capturing=capturing,
     )
 
 
-def _enqueue_exact_topk4_pair(
+def _run_decode_m16(
     *,
-    target: "BlackwellMSATarget",
-    parts: tuple,
-    stream_ptr: int,
-) -> None:
-    (
-        producer_tensors,
-        producer_scalars,
-        producer_grid,
-        reducer_tensors,
-        reducer_scalars,
-        reducer_grid,
-        _outputs,
-    ) = parts
-    producer_variant: BlackwellMSAVariant = "reverse_prefill_bf16_paged_topk4_qload4"
-    reducer_variant: BlackwellMSAVariant = (
-        "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce"
-    )
-    _get_module(producer_variant, target).run(
-        *producer_tensors,
-        *producer_scalars,
-        *producer_grid,
-        stream_ptr,
-    )
-    _get_module(reducer_variant, target).run(
-        *reducer_tensors,
-        *reducer_scalars,
-        *reducer_grid,
-        stream_ptr,
-    )
-
-
-def _run_exact_bf16_topk4_qload4_prefill(
-    *,
-    target: "BlackwellMSATarget",
+    target: BlackwellMSATarget,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
     q2k_indices: torch.Tensor,
-    cu_q: torch.Tensor,
     cu_k: torch.Tensor,
+    q_offsets: torch.Tensor,
     kv_lens: torch.Tensor,
     page_table: torch.Tensor,
-    return_softmax_lse: bool,
-    return_temperature_lse: bool,
-    stream_ptr: int,
+    paged: bool,
+    max_pages: int,
+    seqlen_q: int,
+    softmax_scale_log2: float,
+    causal: bool,
+    derive_q_offset: bool,
     workspace: Optional[MSASparseAttentionWorkspace],
     capturing: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Launch or replay the exact paged TopK4 producer/reducer pair."""
+) -> None:
+    """The direct persistent M16 decode: one wave strides over (query, KV head) tickets."""
 
-    from ._blackwell_sm100_reverse_plan import prepare_bf16_paged_topk4_plan
-
-    route = "bf16_paged_topk4_qload4"
-    context = (
-        nullcontext()
-        if workspace is not None
-        else _implicit_reverse_prefill_states_lock
+    fp8 = k.dtype == torch.float8_e4m3fn
+    total_q, num_q_heads, _ = (int(value) for value in q.shape)
+    num_kv_heads = int(k.shape[1])
+    i32_dummy = q2k_indices.reshape(-1)
+    f32_dummy = lse.reshape(-1)
+    if fp8:
+        q_prefill_dummy = _eager_dummy(
+            workspace,
+            "decode_q_prefill_dummy",
+            (128, 2, _HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        k_pair_dummy = q_prefill_dummy.reshape(2, 1, 128, _HEAD_DIM)
+        v_pair_dummy = k_pair_dummy
+        k_launch = k.view(torch.uint8)
+        v_launch = v.view(torch.uint8)
+    else:
+        # Pure decode never dereferences the prefill-pair descriptors; bind
+        # the largest 64-token-aligned prefix of K/V as their carrier.
+        q_prefill_dummy = k.reshape(-1, 1, _HEAD_DIM)
+        pair_tokens = int(q_prefill_dummy.shape[0]) // 64 * 64
+        k_pair_dummy = q_prefill_dummy[:pair_tokens].reshape(-1, 1, 64, _HEAD_DIM)
+        v_pair_dummy = v.reshape(-1, 1, _HEAD_DIM)[:pair_tokens].reshape(
+            -1, 1, 64, _HEAD_DIM
+        )
+        k_launch = k
+        v_launch = v
+    scale_dummy = _eager_dummy(
+        workspace,
+        "decode_scale_dummy",
+        (1, 1, 128, 8),
+        dtype=torch.uint8,
+        device=q.device,
     )
-    with context:
-        state = _reverse_prefill_state(workspace, route)
-        try:
-            prepare_bf16_paged_topk4_plan(
-                q2k_indices,
-                cu_q,
-                cu_k,
-                page_table,
-                kv_lens,
-                sm_count=torch.cuda.get_device_properties(
-                    q.device
-                ).multi_processor_count,
-                stream_id=stream_ptr,
-                state=state,
-            )
-            parts = _exact_topk4_launch_parts(
-                q=q,
-                k=k,
-                v=v,
-                cu_q=cu_q,
-                cu_k=cu_k,
-                kv_lens=kv_lens,
-                page_table=page_table,
-                return_softmax_lse=return_softmax_lse,
-                return_temperature_lse=return_temperature_lse,
-                state=state,
-            )
-            outputs = parts[-1]
-            producer_tensors, producer_scalars, producer_grid = parts[:3]
-            reducer_tensors, reducer_scalars, reducer_grid = parts[3:6]
-            signature = _launch_signature(
-                variant="reverse_prefill_bf16_paged_topk4_qload4_graph",
-                target=target,
-                tensors=(*producer_tensors, *reducer_tensors),
-                scalars=(*producer_scalars, *reducer_scalars),
-                grid=producer_grid,
-            )
-            _check_warmed_launch(workspace, signature, capturing=capturing)
-            if capturing:
-                _enqueue_exact_topk4_pair(
-                    target=target, parts=parts, stream_ptr=stream_ptr
-                )
-            else:
-                graph_state = state.get("graph_state")
-                graph_signature = (
-                    signature,
-                    reducer_grid,
-                    tuple(_tensor_signature(tensor) for tensor in outputs),
-                )
-                if (
-                    not isinstance(graph_state, dict)
-                    or graph_state.get("signature") != graph_signature
-                ):
-                    _enqueue_exact_topk4_pair(
-                        target=target, parts=parts, stream_ptr=stream_ptr
-                    )
-                    current_stream = torch.cuda.current_stream(q.device)
-                    capture_stream = torch.cuda.Stream(device=q.device)
-                    capture_stream.wait_stream(current_stream)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, stream=capture_stream):
-                        _enqueue_exact_topk4_pair(
-                            target=target,
-                            parts=parts,
-                            stream_ptr=int(capture_stream.cuda_stream),
-                        )
-                    graph_state = {
-                        "signature": graph_signature,
-                        "graph": graph,
-                        "capture_stream": capture_stream,
-                        "keepalive": parts,
-                    }
-                    state["graph_state"] = graph_state
-                graph_state["graph"].replay()
-            _record_successful_launch(workspace, signature, capturing=capturing)
-            return outputs
-        except BaseException:
-            state.clear()
-            raise
+    status = _workspace_buffer(
+        workspace, "decode_status", (2,), dtype=torch.int32, device=q.device
+    )
+    total_tasks = total_q * num_kv_heads
+    physical_ctas = min(total_tasks, _num_sms(q.device))
+    grid = (physical_ctas, 1, 1)
+    arguments = {
+        "Q": q,
+        "Q_prefill": q_prefill_dummy,
+        "Q_prefill_raw": q_prefill_dummy,
+        "K": k_launch,
+        "K_scale": scale_dummy,
+        "K_prefill_pair": k_pair_dummy,
+        "V": v_launch,
+        "V_scale": scale_dummy,
+        "V_prefill_pair": v_pair_dummy,
+        "KV": q.reshape(-1, _HEAD_DIM),
+        "O": out,
+        "partial_O": f32_dummy,
+        "partial_M": f32_dummy,
+        "partial_D": f32_dummy,
+        "split_completion": i32_dummy,
+        "msa_lse": lse,
+        "kv_indices": page_table if paged else i32_dummy,
+        "qo_indptr": i32_dummy,
+        "kv_indptr": cu_k,
+        "kv_len_arr": kv_lens,
+        "task_kind": q2k_indices,
+        "task_request": q_offsets,
+        "task_kv_head": kv_lens,
+        "task_q_tile": i32_dummy,
+        "task_split": i32_dummy,
+        "task_kv_tile_begin": i32_dummy,
+        "task_kv_tile_end": i32_dummy,
+        "task_qo_begin": i32_dummy,
+        "task_qo_end": i32_dummy,
+        "task_page_begin": i32_dummy,
+        "task_page_end": i32_dummy,
+        "status": status,
+        "num_requests": total_q,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "max_kv_tiles": _TOPK,
+        "max_splits": 1,
+        "max_task_claims": (total_tasks + physical_ctas - 1) // physical_ctas - 1,
+        "softmax_scale_log2": softmax_scale_log2,
+        "k_global_scale": 1.0,
+        "v_global_scale": 1.0,
+        "attention_mode": _MODE_DECODE_ONLY,
+        "is_causal": int(causal),
+        "derive_q_offset": int(derive_q_offset),
+        "record_tasks": seqlen_q,
+        "msa_max_pages": max_pages,
+        "msa_split_policy": _SPLIT_ADAPTIVE,
+    }
+    route = _decode_route(q_dtype=q.dtype, k_dtype=k.dtype, paged=paged)
+    _launch_route(
+        route,
+        target=target,
+        grid=grid,
+        arguments=arguments,
+        workspace=workspace,
+        capturing=capturing,
+    )
 
 
-def _run_fp8_direct_module(
+def _run_fp8_direct(
     *,
-    schedule: str,
-    target: "BlackwellMSATarget",
+    route: str,
+    target: BlackwellMSATarget,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1673,316 +1406,347 @@ def _run_fp8_direct_module(
     seqlen_q: int,
     softmax_scale_log2: float,
     output_scale: float,
-    stream_ptr: int,
     workspace: Optional[MSASparseAttentionWorkspace],
     capturing: bool,
 ) -> None:
-    variants = {
-        "q1_exact": f"decode_q1_bf16_query_fp8_kv_exact_{'paged' if paged else 'flat'}",
-        "q1_flat_xform2": "decode_q1_bf16_query_fp8_kv_xform2_flat",
-        "q1_paged_xform2": "decode_q1_bf16_query_fp8_kv_xform2_paged",
-        "paged_uniform_fp8": "decode_uniform_fp8_qkv_paged",
+    """One direct FP8-MMA decode program (BF16-Q xform2 or uniform FP8 Q/K/V)."""
+
+    uniform = route == "decode_uniform_fp8:paged"
+    total_q, num_q_heads, _ = (int(value) for value in q.shape)
+    num_kv_heads = int(k.shape[1])
+    arguments: dict[str, Any] = {
+        "Q": q.view(torch.uint8) if uniform else q,
+        "K": k.view(torch.uint8),
+        "V": v.view(torch.uint8),
+        "O": out,
+        "msa_lse": lse,
+        "kv_indices": page_table if paged else q2k_indices.reshape(-1),
+        "kv_indptr": cu_k,
+        "task_kind": q2k_indices,
+        "task_request": q_offsets,
+        "task_kv_head": kv_lens,
+        "softmax_scale_log2": softmax_scale_log2,
+        "msa_max_pages": max_pages,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
     }
-    variant = cast("BlackwellMSAVariant", variants[schedule])
-    q_launch = q.view(torch.uint8) if schedule == "paged_uniform_fp8" else q
-    page_table_arg = page_table if paged else q2k_indices.reshape(-1)
-    tensors = (
-        q_launch,
-        k.view(torch.uint8),
-        v.view(torch.uint8),
-        out,
-        lse,
-        page_table_arg,
-        cu_k,
-        q2k_indices,
-        q_offsets,
-        kv_lens,
-    )
-    scalars: tuple[int | float, ...]
-    if schedule == "paged_uniform_fp8":
-        scalars = (
-            int(q.shape[0]),
-            seqlen_q,
-            int(q.shape[1]),
-            int(k.shape[1]),
-            softmax_scale_log2,
-            output_scale,
-            max_pages,
+    if uniform:
+        total_work_items = total_q * num_kv_heads
+        arguments.update(
+            total_q=total_q,
+            seqlen_q=seqlen_q,
+            output_scale=output_scale,
+            K_scale=k.view(torch.uint8),
+            V_scale=v.view(torch.uint8),
+            partial_O=lse.reshape(-1),
+            partial_M=lse.reshape(-1),
+            partial_D=lse.reshape(-1),
+            split_completion=q2k_indices.reshape(-1),
         )
-        total_work_items = int(q.shape[0]) * int(k.shape[1])
         grid = (
             _uniform_fp8_decode_grid(
                 total_work_items=total_work_items,
-                num_sms=torch.cuda.get_device_properties(
-                    q.device
-                ).multi_processor_count,
+                num_sms=_num_sms(q.device),
                 seqlen_q=seqlen_q,
             ),
             1,
             1,
         )
     else:
-        scalars = (int(q.shape[0]),)
-        if schedule == "q1_paged_xform2":
-            scalars += (int(q.shape[1]), int(k.shape[1]))
-        scalars += (softmax_scale_log2, max_pages)
-        grid = (int(q.shape[0]), int(k.shape[1]), 1)
-    signature = _launch_signature(
-        variant=variant, target=target, tensors=tensors, scalars=scalars, grid=grid
+        arguments["num_requests"] = total_q
+        grid = (total_q, num_kv_heads, 1)
+    _launch_route(
+        route,
+        target=target,
+        grid=grid,
+        arguments=arguments,
+        workspace=workspace,
+        capturing=capturing,
     )
-    _check_warmed_launch(workspace, signature, capturing=capturing)
-    _get_module(variant, target).run(*tensors, *scalars, *grid, stream_ptr)
-    _record_successful_launch(workspace, signature, capturing=capturing)
 
 
-def _run_prefill_module(
-    *,
-    variant: "BlackwellMSAVariant",
-    target: "BlackwellMSATarget",
+# ---------------------------------------------------------------------------
+# Packed-NVFP4 paged-KV hand-offs
+# ---------------------------------------------------------------------------
+
+
+def _try_nvfp4_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    temperature_lse: torch.Tensor,
     q2k_indices: torch.Tensor,
-    cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
-    q_offsets: torch.Tensor,
-    kv_lens: torch.Tensor,
-    page_table: torch.Tensor,
-    total_q: int,
-    num_q_heads: int,
-    num_kv_heads: int,
-    topk: int,
-    batch_size: int,
-    uniform_q_len: int,
-    max_pages: int,
+    cu_seqlens_q: torch.Tensor,
+    *,
+    cu_seqlens_k,
     causal: bool,
-    derive_q_offset: bool,
-    softmax_scale_log2: float,
-    lse_temperature_scale: float,
+    softmax_scale,
+    page_table,
+    seqused_k,
     return_softmax_lse: bool,
     return_temperature_lse: bool,
-    grid: tuple[int, int, int],
-    stream_ptr: int,
+    lse_temperature_scale: float,
+    k_scale,
+    v_scale,
+    k_global_scale,
+    v_global_scale,
+    q_offset,
     workspace: Optional[MSASparseAttentionWorkspace],
-    capturing: bool,
-) -> None:
-    k_launch = k.view(torch.uint8) if k.dtype == torch.float8_e4m3fn else k
-    v_launch = v.view(torch.uint8) if v.dtype == torch.float8_e4m3fn else v
-    tensors = (
-        q,
-        k_launch,
-        v_launch,
-        out,
-        lse,
-        temperature_lse,
-        q2k_indices,
-        cu_q,
-        cu_k,
-        q_offsets,
-        kv_lens,
+) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+    """Serve NVFP4 paged K/V prefill, or decline with a reason.
+
+    Returns ``(output, None)`` when the route served the call and
+    ``(None, reason)`` when it did not; the caller falls through on the
+    latter and carries ``reason`` into the error it raises if nothing else
+    can serve the call either.
+    """
+
+    from . import _nvfp4_prefill_sm100 as nvfp4
+
+    reason = nvfp4.check_surface(
+        q=q,
+        k=k,
+        v=v,
+        q2k_indices=q2k_indices,
+        cu_seqlens_q=cu_seqlens_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cu_seqlens_k=cu_seqlens_k,
+        causal=causal,
+        return_softmax_lse=return_softmax_lse,
+        return_temperature_lse=return_temperature_lse,
+        lse_temperature_scale=lse_temperature_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        q_offset=q_offset,
     )
-    common_scalars = (
-        total_q,
-        num_q_heads,
-        num_kv_heads,
-        topk,
-        batch_size,
-        uniform_q_len,
-        int(causal),
-        int(derive_q_offset),
-        softmax_scale_log2,
-        lse_temperature_scale,
-        int(return_softmax_lse or return_temperature_lse),
-        int(return_temperature_lse),
-    )
-    if variant == "prefill_m64_bf16_gqa16_flat":
+    if reason is not None:
+        return None, reason
+    k_scale = nvfp4.as_scale_bytes(k_scale)
+    v_scale = nvfp4.as_scale_bytes(v_scale)
+
+    total_q = int(q.shape[0])
+    batch_size = int(cu_seqlens_q.shape[0]) - 1
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing:
+        # A serving engine's profile run precedes graph capture; this keeps
+        # every build out of a capture region.
+        nvfp4.warm(q.device)
+    with _enter_workspace(workspace, device=q.device, capturing=capturing):
+        scale = _HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
+        if not math.isfinite(scale):
+            raise ValueError("softmax_scale must be finite")
+        out = _workspace_buffer(
+            workspace,
+            "prefill_nvfp4_out",
+            tuple(q.shape),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        tiles = -(-total_q // 8) + batch_size
         signature = _launch_signature(
-            variant=variant,
-            target=target,
-            tensors=tensors,
-            scalars=common_scalars,
-            grid=grid,
+            route="prefill_nvfp4_kv_paged",
+            target=_select_target(q.device),
+            tensors=(
+                q,
+                k,
+                v,
+                k_scale,
+                v_scale,
+                q2k_indices,
+                cu_seqlens_q,
+                page_table,
+                seqused_k,
+                out,
+            ),
+            scalars=(
+                scale,
+                float(k_global_scale),
+                float(v_global_scale),
+                total_q,
+                batch_size,
+                int(page_table.shape[1]),
+            ),
+            grid=(tiles, int(k.shape[1]), 1),
         )
         _check_warmed_launch(workspace, signature, capturing=capturing)
-        _get_module(variant, target).run(
-            *tensors,
-            *common_scalars,
-            *grid,
-            stream_ptr,
+        nvfp4.run(
+            q=q,
+            k=k,
+            v=v,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            q2k_indices=q2k_indices,
+            cu_seqlens_q=cu_seqlens_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            out=out,
+            softmax_scale=scale,
+            k_global_scale=float(k_global_scale),
+            v_global_scale=float(v_global_scale),
         )
-    else:
-        paged_tensors = (*tensors, page_table)
-        scalars = (
-            total_q,
-            num_q_heads,
-            num_kv_heads,
-            topk,
-            batch_size,
-            uniform_q_len,
-            max_pages,
-            int(causal),
-            int(derive_q_offset),
-            softmax_scale_log2,
-            lse_temperature_scale,
-            int(return_softmax_lse or return_temperature_lse),
-            int(return_temperature_lse),
-        )
-        signature = _launch_signature(
-            variant=variant,
-            target=target,
-            tensors=paged_tensors,
-            scalars=scalars,
-            grid=grid,
-        )
-        _check_warmed_launch(workspace, signature, capturing=capturing)
-        _get_module(variant, target).run(
-            *paged_tensors,
-            *scalars,
-            *grid,
-            stream_ptr,
-        )
-    _record_successful_launch(workspace, signature, capturing=capturing)
+        _record_successful_launch(workspace, signature, capturing=capturing)
+    return out, None
 
 
-def _run_decode_module(
-    *,
-    variant: "BlackwellMSAVariant",
-    target: "BlackwellMSATarget",
+def _try_nvfp4_decode(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: torch.Tensor,
-    lse: torch.Tensor,
     q2k_indices: torch.Tensor,
-    cu_q: torch.Tensor,
-    cu_k: torch.Tensor,
-    q_offsets: torch.Tensor,
-    kv_lens: torch.Tensor,
-    page_table: torch.Tensor,
-    topk: int,
-    max_pages: int,
+    *,
+    page_table,
+    seqused_k,
+    cu_seqlens_k,
     seqlen_q: int,
-    softmax_scale_log2: float,
     causal: bool,
-    paged: bool,
-    derive_q_offset: bool,
+    softmax_scale,
+    return_softmax_lse: bool,
+    k_scale,
+    v_scale,
+    k_global_scale,
+    v_global_scale,
+    q_offset,
+    force_fused,
     workspace: Optional[MSASparseAttentionWorkspace],
-    capturing: bool,
-    stream_ptr: int,
-) -> None:
-    fp8 = k.dtype == torch.float8_e4m3fn
-    i32_dummy = q2k_indices.reshape(-1)
-    f32_dummy = lse.reshape(-1)
-    if fp8:
-        q_prefill_dummy = _decode_tma_dummy(
-            device=q.device,
-            stream_ptr=stream_ptr,
-            dtype=torch.bfloat16,
-            workspace=workspace,
-        )
-        k_pair_dummy = q_prefill_dummy.reshape(2, 1, 128, _HEAD_DIM)
-        v_pair_dummy = k_pair_dummy
-        k_launch = k.view(torch.uint8)
-        v_launch = v.view(torch.uint8)
-    else:
-        q_prefill_dummy = k.reshape(-1, 1, _HEAD_DIM)
-        pair_tokens = int(q_prefill_dummy.shape[0]) // 64 * 64
-        k_pair_dummy = q_prefill_dummy[:pair_tokens].reshape(-1, 1, 64, _HEAD_DIM)
-        v_pair_dummy = v.reshape(-1, 1, _HEAD_DIM)[:pair_tokens].reshape(
-            -1, 1, 64, _HEAD_DIM
-        )
-        k_launch = k
-        v_launch = v
-    page_table_arg = page_table if paged else i32_dummy
-    total_q, num_q_heads, _ = q.shape
-    num_kv_heads = k.shape[1]
+    out: Optional[torch.Tensor] = None,
+) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+    """Serve NVFP4 paged K/V decode, or decline with a reason.
 
-    total_tasks = int(total_q) * int(num_kv_heads)
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    physical_ctas = min(total_tasks, num_sms)
-    grid = (physical_ctas, 1, 1)
-    qo_indptr = cu_q
-    partial_o = f32_dummy
-    partial_m = f32_dummy
-    partial_d = f32_dummy
-    split_completion = i32_dummy
-    status = _workspace_buffer(
-        workspace,
-        "decode_status",
-        (2,),
-        dtype=torch.int32,
-        device=q.device,
-    )
-    max_splits = 1
-    max_task_claims = (total_tasks + physical_ctas - 1) // physical_ctas - 1
-    attention_mode = _MODE_DECODE_ONLY
-    split_policy = _SPLIT_ADAPTIVE
+    ``out``, when the caller supplies one, is the kernel's destination.
+    """
 
-    tensors = (
-        q,
-        q_prefill_dummy,
-        q_prefill_dummy,
-        k_launch,
-        k_pair_dummy,
-        v_launch,
-        v_pair_dummy,
-        q.reshape(-1, _HEAD_DIM),
-        out,
-        partial_o,
-        partial_m,
-        partial_d,
-        split_completion,
-        lse,
-        page_table_arg,
-        qo_indptr,
-        cu_k,
-        kv_lens,
-        q2k_indices,
-        q_offsets,
-        kv_lens,
-        i32_dummy,
-        i32_dummy,
-        i32_dummy,
-        i32_dummy,
-        i32_dummy,
-        i32_dummy,
-        i32_dummy,
-        i32_dummy,
-        status,
+    from . import _nvfp4_decode_sm100 as nvfp4
+
+    reason = nvfp4.check_surface(
+        q=q,
+        k=k,
+        v=v,
+        q2k_indices=q2k_indices,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cu_seqlens_k=cu_seqlens_k,
+        seqlen_q=seqlen_q,
+        causal=causal,
+        return_softmax_lse=return_softmax_lse,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        q_offset=q_offset,
+        force_fused=force_fused,
     )
-    scalars = (
-        int(total_q),
-        int(num_q_heads),
-        int(num_kv_heads),
-        topk,
-        max_splits,
-        max_task_claims,
-        softmax_scale_log2,
-        attention_mode,
-        int(causal),
-        int(derive_q_offset),
-        seqlen_q,
-        max_pages,
-        split_policy,
-    )
-    signature = _launch_signature(
-        variant=variant,
-        target=target,
-        tensors=tensors,
-        scalars=scalars,
-        grid=grid,
-    )
-    _check_warmed_launch(workspace, signature, capturing=capturing)
-    _get_module(variant, target).run(
-        *tensors,
-        *scalars,
-        *grid,
-        stream_ptr,
-    )
-    _record_successful_launch(workspace, signature, capturing=capturing)
+    if reason is not None:
+        return None, reason
+    k_scale = nvfp4.as_scale_bytes(k_scale)
+    v_scale = nvfp4.as_scale_bytes(v_scale)
+
+    total_q = int(q.shape[0])
+    capturing = torch.cuda.is_current_stream_capturing()
+    if capturing and workspace is None and nvfp4.capture_requires_workspace():
+        raise RuntimeError(
+            "CUDA graph capture of MSA on compute capability 10.0/10.3/10.7 "
+            "requires an explicit MSASparseAttentionWorkspace warmed with the "
+            "exact tensors and capture stream"
+        )
+    if workspace is not None and not isinstance(workspace, MSASparseAttentionWorkspace):
+        raise TypeError("workspace must be an MSASparseAttentionWorkspace")
+    if not capturing:
+        nvfp4.warm(q.device)
+    context = workspace._lock if workspace is not None else nullcontext()
+    with context:
+        if workspace is not None:
+            _bind_workspace(
+                workspace,
+                device=q.device,
+                stream_ptr=_stream_ptr(q.device),
+                capturing=capturing,
+            )
+        scale = _HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
+        if not math.isfinite(scale):
+            raise ValueError("softmax_scale must be finite")
+        out = _decode_output(out, q=q, dtype=torch.bfloat16, workspace=workspace)
+        num_kv_heads = int(k.shape[1])
+        signature = None
+        if workspace is not None:
+            signature = _launch_signature(
+                route="decode_nvfp4_kv_paged",
+                target=_select_target(q.device),
+                tensors=(
+                    q,
+                    k,
+                    v,
+                    k_scale,
+                    v_scale,
+                    q2k_indices,
+                    page_table,
+                    seqused_k,
+                    out,
+                ),
+                scalars=(
+                    scale,
+                    float(k_global_scale),
+                    float(v_global_scale),
+                    total_q,
+                    int(seqlen_q),
+                    bool(causal),
+                    int(page_table.shape[1]),
+                ),
+                grid=(total_q, num_kv_heads, 1),
+            )
+            _check_warmed_launch(workspace, signature, capturing=capturing)
+        nvfp4.run(
+            q=q,
+            k=k,
+            v=v,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            q2k_indices=q2k_indices,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            out=out,
+            seqlen_q=int(seqlen_q),
+            causal=bool(causal),
+            softmax_scale=scale,
+            k_global_scale=float(k_global_scale),
+            v_global_scale=float(v_global_scale),
+        )
+        _record_successful_launch(workspace, signature, capturing=capturing)
+    return out, None
+
+
+def _decode_output(
+    out: Optional[torch.Tensor],
+    *,
+    q: torch.Tensor,
+    dtype: torch.dtype,
+    workspace: Optional[MSASparseAttentionWorkspace],
+) -> torch.Tensor:
+    """The caller's ``out`` (validated) or the route's own output buffer."""
+
+    if out is None:
+        return _workspace_buffer(
+            workspace, "decode_out", tuple(q.shape), dtype=dtype, device=q.device
+        )
+    if not isinstance(out, torch.Tensor):
+        raise TypeError("out must be a torch.Tensor")
+    if out.device != q.device:
+        raise ValueError("out must be on the same device as q")
+    if out.dtype != dtype:
+        raise ValueError(f"out must be {dtype}, got {out.dtype}")
+    if tuple(out.shape) != tuple(q.shape):
+        raise ValueError(
+            f"out must have q's shape {tuple(q.shape)}, got {tuple(out.shape)}"
+        )
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
 
 
 def blackwell_msa_sparse_attention(
@@ -2008,6 +1772,29 @@ def blackwell_msa_sparse_attention(
 ):
     """Run sparse prefill on compute capability 10.0 or 10.3."""
 
+    specialized, nvfp4_decline_reason = _try_nvfp4_prefill(
+        q,
+        k,
+        v,
+        q2k_indices,
+        cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        return_softmax_lse=return_softmax_lse,
+        return_temperature_lse=return_temperature_lse,
+        lse_temperature_scale=lse_temperature_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        q_offset=q_offset,
+        workspace=workspace,
+    )
+    if specialized is not None:
+        return specialized
     _validate_scale_arguments(
         q=q,
         k=k,
@@ -2017,6 +1804,7 @@ def blackwell_msa_sparse_attention(
         k_global_scale=k_global_scale,
         v_global_scale=v_global_scale,
         allow_uniform_fp8=False,
+        nvfp4_decline_reason=nvfp4_decline_reason,
     )
     total_q, num_q_heads, num_kv_heads, group_size = _validate_attention_tensors(
         q, k, v, q2k_indices
@@ -2026,29 +1814,8 @@ def blackwell_msa_sparse_attention(
             "uniform FP8 Q/K/V is supported only by sparse decode"
         )
     capturing = torch.cuda.is_current_stream_capturing()
-    if capturing and workspace is None:
-        raise RuntimeError(
-            "CUDA graph capture of MSA on compute capability 10.0/10.3 "
-            "requires an explicit MSASparseAttentionWorkspace warmed with the "
-            "exact tensors and capture stream"
-        )
-    if workspace is not None and not isinstance(workspace, MSASparseAttentionWorkspace):
-        raise TypeError("workspace must be an MSASparseAttentionWorkspace")
-    stream_ptr = _stream_ptr(q.device)
-    context = workspace._lock if workspace is not None else nullcontext()
-    with context:
-        if workspace is not None:
-            _bind_workspace(
-                workspace,
-                device=q.device,
-                stream_ptr=stream_ptr,
-                capturing=capturing,
-            )
-        cu_q = _require_cuda_i32(
-            cu_seqlens_q,
-            device=q.device,
-            name="cu_seqlens_q",
-        )
+    with _enter_workspace(workspace, device=q.device, capturing=capturing):
+        cu_q = _require_cuda_i32(cu_seqlens_q, device=q.device, name="cu_seqlens_q")
         batch_size = cu_q.numel() - 1
         if batch_size <= 0:
             raise ValueError("cu_seqlens_q must contain at least two entries")
@@ -2081,101 +1848,8 @@ def blackwell_msa_sparse_attention(
         if not math.isfinite(temperature_scale) or temperature_scale <= 0:
             raise ValueError("lse_temperature_scale must be positive and finite")
         target = _select_target(q.device)
-        requested_prefill_schedule = os.environ.get(
-            "FLASHINFER_MSA_PREFILL_SCHEDULE", ""
-        )
-        if requested_prefill_schedule not in {"", "m64"}:
-            raise ValueError("FLASHINFER_MSA_PREFILL_SCHEDULE must be empty or 'm64'")
-        use_topk8_qagg = _is_exact_fp8_topk8_qagg_prefill(
-            q=q,
-            k=k,
-            v=v,
-            q2k_indices=q2k_indices,
-            cu_q=cu_q,
-            cu_k=cu_k,
-            paged=paged,
-            batch_size=batch_size,
-            causal=causal,
-            q_offset_is_none=q_offset is None,
-            softmax_scale=softmax_scale,
-            return_temperature_lse=return_temperature_lse,
-            lse_temperature_scale=temperature_scale,
-            requested_schedule=requested_prefill_schedule,
-            capturing=capturing,
-        )
-        use_topk4_qload4 = _is_exact_bf16_topk4_qload4_prefill(
-            q=q,
-            k=k,
-            v=v,
-            q2k_indices=q2k_indices,
-            cu_q=cu_q,
-            cu_k=cu_k,
-            page_table=page_table_arg,
-            kv_lens=kv_lens,
-            paged=paged,
-            batch_size=batch_size,
-            causal=causal,
-            q_offset_is_none=q_offset is None,
-            softmax_scale=softmax_scale,
-            return_temperature_lse=return_temperature_lse,
-            lse_temperature_scale=temperature_scale,
-            requested_schedule=requested_prefill_schedule,
-        )
-        topk = int(q2k_indices.shape[2])
-        if topk != _ATTENTION_TOPK and not (use_topk8_qagg or use_topk4_qload4):
-            raise ValueError(
-                "non-TopK16 Blackwell MSA attention is restricted to exact routes"
-            )
-        if use_topk8_qagg:
-            exact_out, exact_lse, exact_temperature_lse = (
-                _run_exact_fp8_topk8_qagg_prefill(
-                    target=target,
-                    q=q,
-                    k=k,
-                    v=v,
-                    q2k_indices=q2k_indices,
-                    cu_q=cu_q,
-                    cu_k=cu_k,
-                    stream_ptr=stream_ptr,
-                    workspace=workspace,
-                )
-            )
-            if return_temperature_lse:
-                return exact_out, exact_lse, exact_temperature_lse
-            if return_softmax_lse:
-                return exact_out, exact_lse
-            return exact_out
-        if use_topk4_qload4:
-            exact_out, exact_lse, exact_temperature_lse = (
-                _run_exact_bf16_topk4_qload4_prefill(
-                    target=target,
-                    q=q,
-                    k=k,
-                    v=v,
-                    q2k_indices=q2k_indices,
-                    cu_q=cu_q,
-                    cu_k=cu_k,
-                    kv_lens=kv_lens,
-                    page_table=page_table_arg,
-                    return_softmax_lse=return_softmax_lse,
-                    return_temperature_lse=return_temperature_lse,
-                    stream_ptr=stream_ptr,
-                    workspace=workspace,
-                    capturing=capturing,
-                )
-            )
-            if return_temperature_lse:
-                return exact_out, exact_lse, exact_temperature_lse
-            if return_softmax_lse:
-                return exact_out, exact_lse
-            return exact_out
-
         out = _workspace_buffer(
-            workspace,
-            "prefill_out",
-            tuple(q.shape),
-            dtype=q.dtype,
-            device=q.device,
+            workspace, "prefill_out", tuple(q.shape), dtype=q.dtype, device=q.device
         )
         lse = _workspace_buffer(
             workspace,
@@ -2191,97 +1865,7 @@ def blackwell_msa_sparse_attention(
             dtype=torch.float32,
             device=q.device,
         )
-        if _should_use_long_prefill(
-            requested_schedule=requested_prefill_schedule,
-            batch_size=batch_size,
-            total_q=total_q,
-            paged=paged,
-            group_size=group_size,
-            max_pages=max_pages,
-            k_outer_dim=int(k.shape[0]),
-            q_dtype=q.dtype,
-            k_dtype=k.dtype,
-            v_dtype=v.dtype,
-            causal=causal,
-            q_offset_is_none=q_offset is None,
-            return_temperature_lse=return_temperature_lse,
-            lse_temperature_scale=temperature_scale,
-        ):
-            _run_long_prefill_modules(
-                target=target,
-                q=q,
-                k=k,
-                v=v,
-                out=out,
-                lse=lse,
-                temperature_lse=temperature_lse,
-                q2k_indices=q2k_indices,
-                cu_q=cu_q,
-                cu_k=cu_k,
-                q_offsets=q_offsets,
-                kv_lens=kv_lens,
-                page_table=page_table_arg,
-                paged=paged,
-                group_size=group_size,
-                max_pages=max_pages,
-                softmax_scale_log2=scale / math.log(2.0),
-                lse_temperature_scale=temperature_scale,
-                return_softmax_lse=return_softmax_lse,
-                return_temperature_lse=return_temperature_lse,
-                stream_ptr=stream_ptr,
-                workspace=workspace,
-                capturing=capturing,
-            )
-            if return_temperature_lse:
-                return out, lse, temperature_lse
-            if return_softmax_lse:
-                return out, lse
-            return out
-        folded_gqa_group = (
-            group_size
-            if group_size in {8, 16}
-            and q.dtype == torch.bfloat16
-            and k.dtype == torch.bfloat16
-            else 0
-        )
-        max_kv_len = 0
-        if requested_prefill_schedule == "m64" and not paged:
-            max_kv_len = (
-                int(k.shape[0])
-                if batch_size == 1
-                else int((cu_k[1:] - cu_k[:-1]).max().item())
-            )
-        use_m64_exact_union = (
-            requested_prefill_schedule == "m64"
-            and folded_gqa_group == 16
-            and not paged
-            and not capturing
-            and max_kv_len <= 64 * _BLOCK_SIZE
-        )
-        if use_m64_exact_union:
-            variant: BlackwellMSAVariant = "prefill_m64_bf16_gqa16_flat"
-            q_tile = _M64_GQA16_Q_TILE
-        else:
-            variant = _prefill_variant(
-                q_dtype=q.dtype,
-                k_dtype=k.dtype,
-                paged=paged,
-                folded_gqa_group=folded_gqa_group,
-                causal=causal,
-                max_pages=max_pages,
-            )
-            q_tile = (
-                _M128_GQA8_Q_TILE
-                if folded_gqa_group == 8
-                else (_M128_GQA16_Q_TILE if folded_gqa_group == 16 else _M128_Q_TILE)
-            )
-        grid = (
-            (total_q + q_tile - 1) // q_tile + batch_size - 1,
-            num_kv_heads if folded_gqa_group else num_q_heads,
-            1,
-        )
-        _run_prefill_module(
-            variant=variant,
+        common = dict(
             target=target,
             q=q,
             k=k,
@@ -2295,24 +1879,46 @@ def blackwell_msa_sparse_attention(
             q_offsets=q_offsets,
             kv_lens=kv_lens,
             page_table=page_table_arg,
-            total_q=total_q,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            topk=int(q2k_indices.shape[2]),
-            batch_size=batch_size,
-            uniform_q_len=0,
+            paged=paged,
             max_pages=max_pages,
-            causal=causal,
-            derive_q_offset=derive_q_offset,
             softmax_scale_log2=scale / math.log(2.0),
             lse_temperature_scale=temperature_scale,
             return_softmax_lse=return_softmax_lse,
             return_temperature_lse=return_temperature_lse,
-            grid=grid,
-            stream_ptr=stream_ptr,
             workspace=workspace,
             capturing=capturing,
         )
+        if _use_long_prefill(
+            batch_size=batch_size,
+            total_q=total_q,
+            paged=paged,
+            group_size=group_size,
+            max_pages=max_pages,
+            k_outer_dim=int(k.shape[0]),
+            q_dtype=q.dtype,
+            k_dtype=k.dtype,
+            v_dtype=v.dtype,
+            causal=causal,
+            q_offset_is_none=derive_q_offset,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=temperature_scale,
+        ):
+            _run_long_prefill(group_size=group_size, **common)
+        else:
+            folded_gqa_group = (
+                group_size
+                if group_size in {8, 16}
+                and q.dtype == torch.bfloat16
+                and k.dtype == torch.bfloat16
+                else 0
+            )
+            _run_prefill(
+                folded_gqa_group=folded_gqa_group,
+                batch_size=batch_size,
+                causal=causal,
+                derive_q_offset=derive_q_offset,
+                **common,
+            )
     if return_temperature_lse:
         return out, lse, temperature_lse
     if return_softmax_lse:
@@ -2341,10 +1947,38 @@ def blackwell_msa_sparse_decode_attention(
     partial_dtype: Optional[torch.dtype] = None,
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
+    out: Optional[torch.Tensor] = None,
 ):
-    """Run sparse decode on compute capability 10.0 or 10.3."""
+    """Run sparse decode on compute capability 10.0 or 10.3.
+
+    ``out``, when given, is the destination of every route and the returned
+    tensor; the routes never copy into it.
+    """
 
     del partial_dtype
+    specialized, nvfp4_decline_reason = _try_nvfp4_decode(
+        q,
+        k,
+        v,
+        q2k_indices,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cu_seqlens_k=cu_seqlens_k,
+        seqlen_q=seqlen_q,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        return_softmax_lse=return_softmax_lse,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        q_offset=q_offset,
+        force_fused=force_fused,
+        workspace=workspace,
+        out=out,
+    )
+    if specialized is not None:
+        return specialized
     k_global_multiplier, output_scale = _validate_scale_arguments(
         q=q,
         k=k,
@@ -2354,6 +1988,7 @@ def blackwell_msa_sparse_decode_attention(
         k_global_scale=k_global_scale,
         v_global_scale=v_global_scale,
         allow_uniform_fp8=True,
+        nvfp4_decline_reason=nvfp4_decline_reason,
     )
     total_q, num_q_heads, num_kv_heads, _ = _validate_attention_tensors(
         q, k, v, q2k_indices
@@ -2364,24 +1999,7 @@ def blackwell_msa_sparse_decode_attention(
         raise ValueError("force_fused must be True, False, or None")
     batch_size = total_q // seqlen_q
     capturing = torch.cuda.is_current_stream_capturing()
-    if capturing and workspace is None:
-        raise RuntimeError(
-            "CUDA graph capture of MSA on compute capability 10.0/10.3 "
-            "requires an explicit MSASparseAttentionWorkspace warmed with the "
-            "exact tensors and capture stream"
-        )
-    if workspace is not None and not isinstance(workspace, MSASparseAttentionWorkspace):
-        raise TypeError("workspace must be an MSASparseAttentionWorkspace")
-    stream_ptr = _stream_ptr(q.device)
-    context = workspace._lock if workspace is not None else nullcontext()
-    with context:
-        if workspace is not None:
-            _bind_workspace(
-                workspace,
-                device=q.device,
-                stream_ptr=stream_ptr,
-                capturing=capturing,
-            )
+    with _enter_workspace(workspace, device=q.device, capturing=capturing):
         paged, cu_k, kv_lens, page_table_arg, max_pages = _prepare_layout(
             q=q,
             k=k,
@@ -2392,18 +2010,18 @@ def blackwell_msa_sparse_decode_attention(
             prefill=False,
             workspace=workspace,
         )
-        cu_q = q2k_indices.reshape(-1)
         derive_q_offset = q_offset is None
-        if derive_q_offset:
-            q_offsets = cu_k
-        else:
-            q_offsets = _explicit_q_offsets(
+        q_offsets = (
+            cu_k
+            if derive_q_offset
+            else _explicit_q_offsets(
                 q_offset,
                 batch_size=batch_size,
                 device=q.device,
                 workspace=workspace,
                 name="decode_explicit_q_offsets",
             )
+        )
         scale = _HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
         scale *= k_global_multiplier
         if not math.isfinite(scale):
@@ -2411,48 +2029,12 @@ def blackwell_msa_sparse_decode_attention(
         if not math.isfinite(output_scale):
             raise ValueError("v_global_scale must be finite")
         target = _select_target(q.device)
-        requested_schedule = os.environ.get("FLASHINFER_MSA_FP8_Q1_SCHEDULE", "")
-        valid_schedules = {
-            "",
-            "batch_attention",
-            "q1_exact",
-            "q1_flat_xform2",
-            "q1_paged_xform2",
-            "paged_uniform_fp8",
-        }
-        if requested_schedule not in valid_schedules:
-            raise ValueError(
-                "FLASHINFER_MSA_FP8_Q1_SCHEDULE must be batch_attention, "
-                "q1_exact, q1_flat_xform2, q1_paged_xform2, or paged_uniform_fp8"
-            )
-        non16_variant = _exact_non16_decode_variant(
-            requested_schedule=requested_schedule,
-            capturing=capturing,
-            paged=paged,
-            force_fused=force_fused,
-            causal=causal,
-            q_offset_is_none=q_offset is None,
-            q_dtype=q.dtype,
-            k_dtype=k.dtype,
-            batch_size=batch_size,
-            total_q=total_q,
-            seqlen_q=seqlen_q,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            topk=int(q2k_indices.shape[2]),
-            k_outer_dim=int(k.shape[0]),
-            max_pages=max_pages,
-        )
-        if int(q2k_indices.shape[2]) != _ATTENTION_TOPK and non16_variant is None:
-            raise ValueError(
-                "non-TopK16 Blackwell MSA attention is restricted to exact routes"
-            )
-        out = _workspace_buffer(
-            workspace,
-            "decode_out",
-            tuple(q.shape),
-            dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
-            device=q.device,
+        uniform_fp8 = q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+        out = _decode_output(
+            out,
+            q=q,
+            dtype=torch.bfloat16 if uniform_fp8 else q.dtype,
+            workspace=workspace,
         )
         lse = _workspace_buffer(
             workspace,
@@ -2461,155 +2043,7 @@ def blackwell_msa_sparse_decode_attention(
             dtype=torch.float32,
             device=q.device,
         )
-        if non16_variant is not None:
-            _run_decode_module(
-                variant=non16_variant,
-                target=target,
-                q=q,
-                k=k,
-                v=v,
-                out=out,
-                lse=lse,
-                q2k_indices=q2k_indices,
-                cu_q=cu_q,
-                cu_k=cu_k,
-                q_offsets=q_offsets,
-                kv_lens=kv_lens,
-                page_table=page_table_arg,
-                topk=int(q2k_indices.shape[2]),
-                max_pages=max_pages,
-                seqlen_q=seqlen_q,
-                softmax_scale_log2=scale / math.log(2.0),
-                causal=causal,
-                paged=paged,
-                derive_q_offset=derive_q_offset,
-                workspace=workspace,
-                capturing=capturing,
-                stream_ptr=stream_ptr,
-            )
-            return (out, lse) if return_softmax_lse else out
-        uniform_fp8 = q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
-        uniform_fp8_direct = (
-            paged
-            and force_fused is True
-            and causal
-            and q_offset is None
-            and uniform_fp8
-            and 1 <= seqlen_q <= 32
-            and int(q2k_indices.shape[2]) == _ATTENTION_TOPK
-        )
-        if uniform_fp8:
-            if requested_schedule not in {"", "paged_uniform_fp8"}:
-                raise ValueError("uniform FP8 Q/K/V decode requires paged_uniform_fp8")
-            if not uniform_fp8_direct:
-                raise ValueError(
-                    "uniform FP8 Q/K/V requires paged causal Q1-Q32/topk16, "
-                    "force_fused=True, and no explicit q_offset"
-                )
-            fp8_schedule = "paged_uniform_fp8"
-        else:
-            fp8_schedule = _resolve_fp8_q1_schedule(
-                requested=(
-                    ""
-                    if requested_schedule == "batch_attention"
-                    else requested_schedule
-                ),
-                capturing=capturing,
-                paged=paged,
-                force_fused=force_fused,
-                causal=causal,
-                q_offset_is_none=q_offset is None,
-                q_dtype=q.dtype,
-                k_dtype=k.dtype,
-                batch_size=batch_size,
-                total_q=total_q,
-                seqlen_q=seqlen_q,
-                num_q_heads=num_q_heads,
-                num_kv_heads=num_kv_heads,
-                topk=int(q2k_indices.shape[2]),
-                k_outer_dim=int(k.shape[0]),
-                max_pages=max_pages,
-            )
-        if fp8_schedule in {"q1_exact", "q1_flat_xform2", "q1_paged_xform2"}:
-            common = (
-                not capturing
-                and seqlen_q == 1
-                and force_fused is True
-                and q.dtype == torch.bfloat16
-                and k.dtype == torch.float8_e4m3fn
-                and num_q_heads == 64
-                and causal
-                and q_offset is None
-            )
-            if fp8_schedule == "q1_exact":
-                expected_batch = 128 if paged else 32
-                expected_outer = expected_batch * (32 if paged else 4096)
-                valid_direct_shape = (
-                    common
-                    and batch_size == expected_batch
-                    and total_q == expected_batch
-                    and num_kv_heads == 8
-                    and int(k.shape[0]) == expected_outer
-                    and (not paged or max_pages == 32)
-                )
-            elif fp8_schedule == "q1_flat_xform2":
-                valid_direct_shape = (
-                    common
-                    and not paged
-                    and batch_size == total_q == 32
-                    and num_kv_heads == 4
-                    and int(k.shape[0]) == 32 * 8192
-                )
-            else:
-                valid_direct_shape = (
-                    common
-                    and paged
-                    and batch_size == total_q == 128
-                    and num_kv_heads == 4
-                    and int(k.shape[0]) == 128 * 32
-                    and max_pages == 32
-                )
-            if not valid_direct_shape:
-                raise ValueError(
-                    f"{fp8_schedule} is restricted to its frozen serving shape; "
-                    "causal, force_fused=True, no explicit q_offset, and eager execution are required"
-                )
-        if fp8_schedule in {
-            "q1_exact",
-            "q1_flat_xform2",
-            "q1_paged_xform2",
-            "paged_uniform_fp8",
-        }:
-            _run_fp8_direct_module(
-                schedule=fp8_schedule,
-                target=target,
-                q=q,
-                k=k,
-                v=v,
-                out=out,
-                lse=lse,
-                q2k_indices=q2k_indices,
-                cu_k=cu_k,
-                q_offsets=q_offsets,
-                kv_lens=kv_lens,
-                page_table=page_table_arg,
-                paged=paged,
-                max_pages=max_pages,
-                seqlen_q=seqlen_q,
-                softmax_scale_log2=scale / math.log(2.0),
-                output_scale=output_scale,
-                stream_ptr=stream_ptr,
-                workspace=workspace,
-                capturing=capturing,
-            )
-            return (out, lse) if return_softmax_lse else out
-        variant = _decode_variant(
-            q_dtype=q.dtype,
-            k_dtype=k.dtype,
-            paged=paged,
-        )
-        _run_decode_module(
-            variant=variant,
+        common = dict(
             target=target,
             q=q,
             k=k,
@@ -2617,22 +2051,59 @@ def blackwell_msa_sparse_decode_attention(
             out=out,
             lse=lse,
             q2k_indices=q2k_indices,
-            cu_q=cu_q,
             cu_k=cu_k,
             q_offsets=q_offsets,
             kv_lens=kv_lens,
             page_table=page_table_arg,
-            topk=int(q2k_indices.shape[2]),
-            max_pages=max_pages,
-            seqlen_q=seqlen_q,
-            softmax_scale_log2=scale / math.log(2.0),
-            causal=causal,
             paged=paged,
-            derive_q_offset=derive_q_offset,
+            max_pages=max_pages,
+            seqlen_q=int(seqlen_q),
+            softmax_scale_log2=scale / math.log(2.0),
             workspace=workspace,
             capturing=capturing,
-            stream_ptr=stream_ptr,
         )
+        if uniform_fp8:
+            if not (
+                paged
+                and force_fused is True
+                and causal
+                and derive_q_offset
+                and 1 <= seqlen_q <= 32
+            ):
+                raise ValueError(
+                    "uniform FP8 Q/K/V requires paged causal Q1-Q32/topk16, "
+                    "force_fused=True, and no explicit q_offset"
+                )
+            _run_fp8_direct(
+                route="decode_uniform_fp8:paged", output_scale=output_scale, **common
+            )
+        else:
+            schedule = _fp8_q1_schedule(
+                capturing=capturing,
+                paged=paged,
+                force_fused=force_fused,
+                causal=causal,
+                q_offset_is_none=derive_q_offset,
+                q_dtype=q.dtype,
+                k_dtype=k.dtype,
+                batch_size=batch_size,
+                total_q=total_q,
+                seqlen_q=int(seqlen_q),
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                k_outer_dim=int(k.shape[0]),
+                max_pages=max_pages,
+            )
+            if schedule:
+                _run_fp8_direct(
+                    route=f"decode_fp8_q1:{schedule}",
+                    output_scale=output_scale,
+                    **common,
+                )
+            else:
+                _run_decode_m16(
+                    causal=causal, derive_q_offset=derive_q_offset, **common
+                )
     return (out, lse) if return_softmax_lse else out
 
 
@@ -2644,7 +2115,7 @@ def blackwell_msa_topk_select(
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
 ) -> torch.Tensor:
-    """Select exact top-16 block indices on compute capability 10.0/10.3."""
+    """Select exact top-16 block indices on compute capability 10.0/10.3/10.7."""
 
     if not isinstance(max_score, torch.Tensor) or not max_score.is_cuda:
         raise ValueError("max_score must be a CUDA tensor")
@@ -2652,11 +2123,10 @@ def blackwell_msa_topk_select(
         raise ValueError(f"max_score must be float32, got {max_score.dtype}")
     if max_score.ndim != 3 or not max_score.is_contiguous():
         raise ValueError(
-            "max_score must be contiguous with shape "
-            "(num_q_heads, max_k_tiles, total_q)"
+            "max_score must be contiguous with shape (num_q_heads, max_k_tiles, total_q)"
         )
-    if topk != _TOPK_SELECT:
-        raise ValueError(f"topk must be {_TOPK_SELECT}, got {topk}")
+    if topk != _TOPK:
+        raise ValueError(f"topk must be {_TOPK}, got {topk}")
     num_heads, max_k_tiles, total_q = (int(value) for value in max_score.shape)
     if min(num_heads, max_k_tiles, total_q) <= 0:
         raise ValueError("max_score dimensions must be positive")
@@ -2668,16 +2138,11 @@ def blackwell_msa_topk_select(
         raise ValueError("force_begin_blocks and force_end_blocks must be non-negative")
     if forced > topk or forced > valid:
         raise ValueError(
-            "force_begin_blocks + force_end_blocks must not exceed topk or "
-            "num_valid_pages"
+            "force_begin_blocks + force_end_blocks must not exceed topk or num_valid_pages"
         )
     expected_shape = (total_q, num_heads, topk)
     if output is None:
-        output = torch.empty(
-            expected_shape,
-            dtype=torch.int32,
-            device=max_score.device,
-        )
+        output = torch.empty(expected_shape, dtype=torch.int32, device=max_score.device)
     elif (
         output.device != max_score.device
         or output.dtype != torch.int32
@@ -2688,34 +2153,24 @@ def blackwell_msa_topk_select(
             f"output must be contiguous CUDA int32 with shape {expected_shape}"
         )
     target = _select_target(max_score.device)
-    device_index = (
-        max_score.device.index
-        if max_score.device.index is not None
-        else torch.cuda.current_device()
-    )
-    warm_key = (device_index, target)
+    warm_key = (_device_index(max_score.device), target)
     capturing = torch.cuda.is_current_stream_capturing()
     with _topk_warmed_devices_lock:
         warmed = warm_key in _topk_warmed_devices
     if capturing and not warmed:
         raise RuntimeError(
-            "msa_topk_select must be invoked eagerly on this device before "
-            "CUDA graph capture"
+            "msa_topk_select must be invoked eagerly on this device before CUDA graph capture"
         )
-    stream_ptr = _stream_ptr(max_score.device)
-    _get_module("topk", target).run(
-        max_score,
-        output,
-        num_heads,
-        max_k_tiles,
-        total_q,
-        valid,
-        int(force_begin_blocks),
-        int(force_end_blocks),
-        total_q * num_heads,
-        1,
-        1,
-        stream_ptr,
+    _program("topk_select:main", target).launch(
+        (total_q * num_heads, 1, 1),
+        max_score=max_score,
+        output=output,
+        num_heads=num_heads,
+        max_k_tiles=max_k_tiles,
+        total_q=total_q,
+        num_valid_pages=valid,
+        force_begin_blocks=int(force_begin_blocks),
+        force_end_blocks=int(force_end_blocks),
     )
     if not capturing:
         with _topk_warmed_devices_lock:

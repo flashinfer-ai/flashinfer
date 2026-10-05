@@ -991,6 +991,7 @@ def autotune(
     if cache is not None:
         with tuner._lock:
             tuner._file_configs.clear()
+            tuner._file_config_policies.clear()
             tuner._namespaced_records.clear()
             tuner._dirty_namespaces.clear()
             tuner._logged_file_hits.clear()
@@ -1143,9 +1144,9 @@ def set_autotune_process_group(
     ``skip_ops`` (a skipped op returns before the tactic loop, doing zero
     reduces); and ``profiling_cache`` / loaded ``autotune(cache=...)`` at entry
     (a cache hit skips that profile's reduce) -- so set the group from the first
-    ``choose_one`` with identical (ideally empty) starting caches. Residual: a
-    per-rank OOM *outside* ``_profile_single_kernel`` (input synthesis /
-    ``do_preparation``) can still early-return and desync.
+    ``choose_one`` with identical (ideally empty) starting caches. Input
+    synthesis and ``do_preparation`` OOMs are reduced across the group before
+    tactic profiling, giving every rank the same fallback decision.
 
     Example::
 
@@ -1163,6 +1164,20 @@ def set_autotune_process_group(
 def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
     """Return the process group previously passed to ``set_autotune_process_group``."""
     return _tune_process_group
+
+
+def _sync_oom_across_tune_group(local_oom: bool) -> bool:
+    """Return whether any rank in the tuning group observed an OOM."""
+    if _tune_process_group is None:
+        return local_oom
+
+    import torch.distributed as dist
+
+    backend = str(dist.get_backend(_tune_process_group)).lower()
+    device = "cuda" if backend == "nccl" else "cpu"
+    oom_flag = torch.tensor([int(local_oom)], dtype=torch.int32, device=device)
+    dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX, group=_tune_process_group)
+    return bool(oom_flag.item())
 
 
 @dataclass(frozen=True)
@@ -1564,6 +1579,7 @@ class AutoTuner:
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: dict[str, tuple[str, Any]] = {}
+        self._file_config_policies: dict[str, tuple[Any, ...]] = {}
         # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache).
         # Design doc: docs/design_docs/autotuner_v2.md §2.1 -- process-lifetime
         # attach is forced by both consumers serving OUTSIDE any context; a
@@ -1966,8 +1982,8 @@ class AutoTuner:
                         continue
                     return True, r_id, tactic, stored_profile
 
-            # Persisted v1 entries do not record per-entry replay/L2 policy,
-            # so a non-default policy requests fresh profiling while tuning.
+            # Managed and bundled entries without per-entry replay/L2 policy
+            # require fresh profiling for a non-default policy while tuning.
             use_file_config = not (
                 self.is_tuning_mode and requested_policy != default_policy
             )
@@ -1975,10 +1991,16 @@ class AutoTuner:
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
             #    serving path never builds a file_key string here.
-            if use_file_config and self._file_configs:
+            if self._file_configs:
                 for r_id, cache_key in runner_keys:
                     file_key = cache_key.file_key
                     if file_key in self._file_configs:
+                        if (
+                            self.is_tuning_mode
+                            and self._file_config_policies.get(file_key, default_policy)
+                            != requested_policy
+                        ):
+                            continue
                         runner_name, tactic = self._file_configs[file_key]
                         if runner_name != runners[r_id].__class__.__name__:
                             continue
@@ -2308,6 +2330,8 @@ class AutoTuner:
 
             pbar = None
             for _step, p in enumerate(profiles):
+                tensors = None
+                prepared_input_batches = None
                 try:
                     # Check the cache before synthesizing profile inputs.
                     # `_prepare_input_tensors` launches a GPU kernel per
@@ -2335,24 +2359,42 @@ class AutoTuner:
                         inputs=inputs,
                     )
                     if not is_cache_hit:
-                        # Active capture is safe for skipped operations and warm cache hits, but
-                        # input synthesis or profiling would mutate the caller's outer graph.
-                        if torch.cuda.is_current_stream_capturing():
-                            raise RuntimeError(
-                                "AutoTuner profiling cannot begin during an active outer CUDA Graph capture"
+                        input_preparation_oom = False
+                        try:
+                            # Active capture is safe for skipped operations and warm cache hits, but
+                            # input synthesis or profiling would mutate the caller's outer graph.
+                            if torch.cuda.is_current_stream_capturing():
+                                raise RuntimeError(
+                                    "AutoTuner profiling cannot begin during an active outer CUDA Graph capture"
+                                )
+                            # Synthesize inputs only on the profiling path.
+                            tensors = self._prepare_input_tensors(p, inputs)
+                            # Apply the optional inputs_pre_hook to inject a
+                            # deterministic / realistic distribution before
+                            # the per-tactic profile loop.
+                            if tuning_config.inputs_pre_hook is not None:
+                                tensors = list(tuning_config.inputs_pre_hook(tensors))
+                            prepared_input_batches = (
+                                self._prepare_input_tensors_with_batches(
+                                    tensors, tuning_config
+                                )
                             )
-                        # Synthesize inputs only on the profiling path.
-                        tensors = self._prepare_input_tensors(p, inputs)
-                        # Apply the optional inputs_pre_hook to inject a
-                        # deterministic / realistic distribution before
-                        # the per-tactic profile loop.
-                        if tuning_config.inputs_pre_hook is not None:
-                            tensors = list(tuning_config.inputs_pre_hook(tensors))
-                        prepared_input_batches = (
-                            self._prepare_input_tensors_with_batches(
-                                tensors, tuning_config
+                        except (torch.cuda.OutOfMemoryError, MemoryError):
+                            input_preparation_oom = True
+                            tensors = None
+                            prepared_input_batches = None
+
+                        if _sync_oom_across_tune_group(input_preparation_oom):
+                            tensors = None
+                            prepared_input_batches = None
+                            torch.cuda.empty_cache()
+                            logger.warning(
+                                "[Autotuner]: OOM detected, falling back to default tactic"
                             )
-                        )
+                            return runners[0], -1
+
+                        assert tensors is not None
+                        assert prepared_input_batches is not None
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
@@ -2366,27 +2408,47 @@ class AutoTuner:
                         runner_id, tactic = None, None
                         skipped_count = 0
                         for r_id, r in enumerate(runners):
-                            valid_tactics = r.get_valid_tactics(tensors, p)
-                            valid_tactics = self._blocklist.filter(
-                                custom_op, r, valid_tactics
-                            )
-                            if r_id == 0 and race_default and -1 not in valid_tactics:
-                                valid_tactics = [-1, *valid_tactics]
-                            runner_arg_names = runner_arg_names_map[r]
-                            if (
-                                "do_preparation" in runner_arg_names
-                                and len(valid_tactics) > 0
-                            ):
-                                handled = r.precompile_tactics(
-                                    tensors, valid_tactics, p, **kwargs
+                            runner_preparation_oom = False
+                            try:
+                                valid_tactics = r.get_valid_tactics(tensors, p)
+                                valid_tactics = self._blocklist.filter(
+                                    custom_op, r, valid_tactics
                                 )
-                                if not handled:
-                                    r(
-                                        tensors,
-                                        tactic=-1,
-                                        do_preparation=True,
-                                        **kwargs,
+                                if (
+                                    r_id == 0
+                                    and race_default
+                                    and -1 not in valid_tactics
+                                ):
+                                    valid_tactics = [-1, *valid_tactics]
+                                runner_arg_names = runner_arg_names_map[r]
+                                if (
+                                    "do_preparation" in runner_arg_names
+                                    and len(valid_tactics) > 0
+                                ):
+                                    handled = r.precompile_tactics(
+                                        tensors, valid_tactics, p, **kwargs
                                     )
+                                    if not handled:
+                                        r(
+                                            tensors,
+                                            tactic=-1,
+                                            do_preparation=True,
+                                            **kwargs,
+                                        )
+                            except (torch.cuda.OutOfMemoryError, MemoryError):
+                                runner_preparation_oom = True
+                                tensors = None
+                                prepared_input_batches = None
+
+                            if _sync_oom_across_tune_group(runner_preparation_oom):
+                                tensors = None
+                                prepared_input_batches = None
+                                torch.cuda.empty_cache()
+                                logger.warning(
+                                    "[Autotuner]: OOM detected, falling back to default tactic"
+                                )
+                                return runners[0], -1
+
                             for tac in valid_tactics:
                                 try:
                                     time_measured = self._profile_single_kernel(
@@ -2397,7 +2459,7 @@ class AutoTuner:
                                         input_tensor_batches=prepared_input_batches,
                                         **kwargs,
                                     )
-                                except torch.cuda.OutOfMemoryError:
+                                except (torch.cuda.OutOfMemoryError, MemoryError):
                                     # Distributed autotuning: the per-tactic
                                     # all-reduce must run the same number of
                                     # times on every rank. Bubbling OOM up to
@@ -2507,7 +2569,7 @@ class AutoTuner:
                                 f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
                             )
 
-                except torch.cuda.OutOfMemoryError:
+                except (torch.cuda.OutOfMemoryError, MemoryError):
                     torch.cuda.empty_cache()
                     logger.warning(
                         "[Autotuner]: OOM detected, falling back to default tactic"
@@ -2606,17 +2668,43 @@ class AutoTuner:
             if cached_ranking is not None:
                 return list(cached_ranking[:k])
 
-            tensors = self._prepare_input_tensors(profile, inputs)
-            if tuning_config.inputs_pre_hook is not None:
-                tensors = list(tuning_config.inputs_pre_hook(tensors))
+            tensors = None
+            input_preparation_oom = False
+            try:
+                tensors = self._prepare_input_tensors(profile, inputs)
+                if tuning_config.inputs_pre_hook is not None:
+                    tensors = list(tuning_config.inputs_pre_hook(tensors))
+            except (torch.cuda.OutOfMemoryError, MemoryError):
+                if _tune_process_group is None:
+                    raise
+                input_preparation_oom = True
+                tensors = None
 
-            valid_tactics = runner.get_valid_tactics(tensors, profile)
-            valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
+            # Ranking can run inside another runner's get_valid_tactics().
+            # Every rank must leave preparation before nested timing reduces.
+            if _sync_oom_across_tune_group(input_preparation_oom):
+                tensors = None
+                raise MemoryError("OOM during tactic-ranking input preparation")
+
+            assert tensors is not None
+            runner_preparation_oom = False
+            try:
+                valid_tactics = runner.get_valid_tactics(tensors, profile)
+                valid_tactics = self._blocklist.filter(custom_op, runner, valid_tactics)
+                if valid_tactics and "do_preparation" in runner_arg_names:
+                    runner(tensors, tactic=-1, do_preparation=True, **kwargs)
+            except (torch.cuda.OutOfMemoryError, MemoryError):
+                if _tune_process_group is None:
+                    raise
+                runner_preparation_oom = True
+                tensors = None
+
+            if _sync_oom_across_tune_group(runner_preparation_oom):
+                tensors = None
+                raise MemoryError("OOM during tactic-ranking runner preparation")
+
             if not valid_tactics:
                 return [-1]
-
-            if "do_preparation" in runner_arg_names:
-                runner(tensors, tactic=-1, do_preparation=True, **kwargs)
 
             scored: list[tuple[float, Any]] = []
             for tac in valid_tactics:
@@ -2646,6 +2734,9 @@ class AutoTuner:
             # Populate the choose_one cache with the winner so stage lookups
             # remain consistent between rank_tactics and choose_one.
             self.profiling_cache[cache_key] = (ranked[0], profile)
+            self._profiling_cache_policies[cache_key] = self._profiling_policy(
+                tuning_config
+            )
             self._ranked_tactics_cache[cache_key] = tuple(ranked)
             self._dirty = True
             self._dirty_seq += 1
@@ -3368,7 +3459,10 @@ class AutoTuner:
         When configs were previously loaded via ``load_configs()``, those
         entries are included in the output as well (with in-memory profiling
         results taking priority for overlapping keys). This ensures the saved
-        file is always a complete, self-contained config.
+        file is always a complete, self-contained config. Entries include their
+        replay/L2 measurement policy when known, so tuning can reuse results
+        measured under the same policy. Legacy entries without provenance are
+        treated as hot-L2 measurements.
 
         If a file already exists at ``path``, its ``_metadata`` decides how
         the save proceeds:
@@ -3413,6 +3507,8 @@ class AutoTuner:
             # Include previously loaded file configs as a base
             for file_key, (runner_name, tactic) in self._file_configs.items():
                 configs[file_key] = [runner_name, _tactic_to_json(tactic)]
+                if file_key in self._file_config_policies:
+                    configs[file_key].append(self._file_config_policies[file_key])
 
             num_previous = len(configs)
 
@@ -3427,6 +3523,8 @@ class AutoTuner:
                 # Store runner class name (not positional index) for robustness
                 tactic_json = _tactic_to_json(tactic)
                 configs[file_key] = [cache_key.runner_class_name, tactic_json]
+                if cache_key in self._profiling_cache_policies:
+                    configs[file_key].append(self._profiling_cache_policies[cache_key])
 
         current_meta = _collect_metadata()
 
@@ -3680,6 +3778,11 @@ class AutoTuner:
                     skipped_legacy_cudnn_tactics += 1
                     continue
                 self._file_configs[key] = (runner_name, tactic)
+                # Older records contain only runner and tactic. Do not inherit
+                # provenance from a previously loaded record for the same key.
+                self._file_config_policies.pop(key, None)
+                if len(value) > 2:
+                    self._file_config_policies[key] = tuple(value[2])
 
         if skipped_legacy_cudnn_tactics:
             logger.warning(
@@ -3834,6 +3937,7 @@ class AutoTuner:
             self._ranked_tactics_cache.clear()
             self._profiling_cache_policies.clear()
             self._file_configs.clear()
+            self._file_config_policies.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()
             self._observed_cache_generations.clear()

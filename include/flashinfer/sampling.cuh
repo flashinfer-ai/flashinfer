@@ -98,10 +98,10 @@ constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
 // On SM107 (Rubin), ptxas can allocate >64 regs/thread for these 1024-thread
 // sampling kernels, which exceeds the 65536-register SM budget and fails with
-// "too many resources requested for launch" (internal MR !611 / feat_sm107).
+// "too many resources requested for launch".
 // Gate __launch_bounds__ to native sm_107* compiles only so other arches keep
-// unconstrained register allocation (avoids the B300/H100 spill regression in
-// NVBug 6517769). When SM107 is mapped to sm_100f at JIT time, this gate is
+// unconstrained register allocation (avoids a B300/H100 register-spill
+// regression). When SM107 is mapped to sm_100f at JIT time, this gate is
 // inactive; that path inherits sm_100 register counts which already fit.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1070)
 #define FLASHINFER_SAMPLING_LAUNCH_BOUNDS(block_threads) __launch_bounds__(block_threads)
@@ -743,12 +743,13 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromLogitsKernel(
     DType* logits, IdType* output, IdType* indices, uint32_t d, uint64_t* seed_arr,
-    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
+    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride,
+    uint32_t offset_stride) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
@@ -792,13 +793,14 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromProbKernel(
     DType* probs, IdType* output, bool* valid, IdType* indices, uint32_t d, uint64_t* seed_arr,
-    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
+    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride,
+    uint32_t offset_stride) {
   curandStatePhilox4_32_10_t state;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curand_init(philox_seed, bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
@@ -857,13 +859,13 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFromProbKernel(
     DType* probs, IdType* output, bool* valid, IdType* indices, IdType* top_k_arr,
     uint32_t top_k_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
-    uint64_t offset_val) {
+    uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -989,13 +991,14 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPSamplingFromProbKernel(
     DType* probs, IdType* output, bool* valid, IdType* indices, float* top_p_arr, float top_p_val,
-    uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
+    uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
+    uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -1115,12 +1118,13 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFromProbKernel(
     DType* probs, float* min_p_arr, IdType* output, bool* valid, IdType* indices, float min_p_val,
-    uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val) {
+    uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
+    uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
   curandStatePhilox4_32_10_t state;
@@ -1210,13 +1214,13 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
     DType* probs, IdType* top_k_arr, float* top_p_arr, IdType* output, bool* valid, IdType* indices,
     IdType top_k_val, float top_p_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-    uint64_t* offset_arr, uint64_t offset_val) {
+    uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -1480,18 +1484,22 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
   return cudaSuccess;
 }
 
+// RNG strides are 0 for broadcast tensors and 1 for per-output-row tensors.
+// Default to broadcast to preserve existing C++ callers.
 template <typename T, typename IdType>
 cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint32_t batch_size,
                                uint32_t d, bool deterministic, uint64_t* seed_arr,
                                uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
-                               cudaStream_t stream = 0) {
+                               cudaStream_t stream = 0, uint32_t seed_stride = 0,
+                               uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&logits, &output, &indices, &d, &seed_arr, &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&logits,   &output,     &indices,    &d,           &seed_arr,
+                    &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
     const uint32_t smem_size = sizeof(
         typename BlockReduce<DataAndIndex<T, IdType>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
 
@@ -1510,15 +1518,16 @@ template <typename T, typename IdType>
 cudaError_t SamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
                              uint32_t batch_size, uint32_t d, bool deterministic,
                              uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
-                             uint64_t offset_val, cudaStream_t stream = 0) {
+                             uint64_t offset_val, cudaStream_t stream = 0, uint32_t seed_stride = 0,
+                             uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,    &output,   &valid,      &indices,   &d,
-                    &seed_arr, &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,      &output,     &valid,       &indices,      &d, &seed_arr, &seed_val,
+                    &offset_arr, &offset_val, &seed_stride, &offset_stride};
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
     DISPATCH_ALIGNED_VEC_SIZE(
@@ -1536,8 +1545,8 @@ template <typename T, typename IdType>
 cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
                                  T* top_k_arr, uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
-                                 uint64_t* offset_arr, uint64_t offset_val,
-                                 cudaStream_t stream = 0) {
+                                 uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
+                                 uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1545,8 +1554,8 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* 
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output,   &valid,    &indices,    &top_k_arr, &top_k_val,
-                    &d,     &seed_arr, &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,    &output,   &valid,      &indices,    &top_k_arr,   &top_k_val,    &d,
+                    &seed_arr, &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1565,8 +1574,8 @@ template <typename T, typename IdType>
 cudaError_t TopPSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* indices,
                                  T* top_p_arr, uint32_t batch_size, T top_p_val, uint32_t d,
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
-                                 uint64_t* offset_arr, uint64_t offset_val,
-                                 cudaStream_t stream = 0) {
+                                 uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
+                                 uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1574,8 +1583,8 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* 
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output,   &valid,    &indices,    &top_p_arr, &top_p_val,
-                    &d,     &seed_arr, &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,    &output,   &valid,      &indices,    &top_p_arr,   &top_p_val,    &d,
+                    &seed_arr, &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1594,8 +1603,8 @@ template <typename T, typename IdType>
 cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, bool* valid,
                                  IdType* indices, uint32_t batch_size, float min_p_val, uint32_t d,
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
-                                 uint64_t* offset_arr, uint64_t offset_val,
-                                 cudaStream_t stream = 0) {
+                                 uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
+                                 uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1603,8 +1612,9 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, bool* v
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &min_p_arr, &output,   &valid,      &indices,   &min_p_val,
-                    &d,     &seed_arr,  &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,      &min_p_arr,   &output,       &valid,    &indices,
+                    &min_p_val,  &d,           &seed_arr,     &seed_val, &offset_arr,
+                    &offset_val, &seed_stride, &offset_stride};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1624,7 +1634,8 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
                                      bool* valid, IdType* indices, uint32_t batch_size,
                                      IdType top_k_val, T top_p_val, uint32_t d, bool deterministic,
                                      uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
-                                     uint64_t offset_val, cudaStream_t stream = 0) {
+                                     uint64_t offset_val, cudaStream_t stream = 0,
+                                     uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1632,9 +1643,9 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,    &top_k_arr,  &top_p_arr, &output, &valid,
-                    &indices,  &top_k_val,  &top_p_val, &d,      &seed_arr,
-                    &seed_val, &offset_arr, &offset_val};
+    void* args[] = {&probs,    &top_k_arr,  &top_p_arr,  &output,      &valid,
+                    &indices,  &top_k_val,  &top_p_val,  &d,           &seed_arr,
+                    &seed_val, &offset_arr, &offset_val, &seed_stride, &offset_stride};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1878,13 +1889,13 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     DType* draft_probs, IdType* draft_token_ids, DType* target_probs, IdType* output_token_ids,
     IdType* output_accepted_token_num, IdType* output_emitted_draft_token_num,
     uint32_t num_speculative_tokens, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
-    uint64_t* offset_arr, uint64_t offset_val) {
+    uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
 
   // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
 
   curandStatePhilox4_32_10_t curand_state;
   curand_init(philox_seed, bx, philox_offset, &curand_state);
@@ -2016,7 +2027,8 @@ cudaError_t ChainSpeculativeSampling(
     DType* draft_probs, IdType* draft_token_ids, DType* target_probs, IdType* output_token_ids,
     IdType* output_accepted_token_num, IdType* output_emitted_draft_token_num, uint32_t batch_size,
     uint32_t num_speculative_tokens, uint32_t d, bool deterministic, uint64_t* seed_arr,
-    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0) {
+    uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
+    uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -2035,7 +2047,9 @@ cudaError_t ChainSpeculativeSampling(
                     &seed_arr,
                     &seed_val,
                     &offset_arr,
-                    &offset_val};
+                    &offset_val,
+                    &seed_stride,
+                    &offset_stride};
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
           auto kernel = ChainSpeculativeSampling<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,

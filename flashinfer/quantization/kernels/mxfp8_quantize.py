@@ -96,6 +96,46 @@ SF_LAYOUT_8x4 = 1
 SF_LAYOUT_LINEAR = 2
 
 
+# SM107 128x4 tile kernel (see MXFP8QuantizeTile128x4Kernel): 4-column groups
+# per tile, threads per CTA, and persistent CTAs per SM.
+_TILE128X4_COL_GROUPS = 1
+_TILE128X4_THREADS = 256
+_TILE128X4_BLOCKS_PER_SM = 4
+
+
+def _use_sm107_tile128x4(m: int, k: int, elt_bytes: int) -> bool:
+    """Route SM107 128x4 inputs to the tile kernel.
+
+    Cold-L2 sweeps across input dtypes: the tile kernel wins (1.04-1.38x) once
+    a row is at least 8 KiB and the input at least 16 MiB, or a 4 KiB row and a
+    64 MiB input; below that the row kernel's full-row streaming has better
+    DRAM locality than 256 B row segments (e.g. FP8 4096x4096 or BF16
+    8192x2048 lose ~5%). K must also span at least 64 SF columns of tiles
+    (K >= 2048 elements): FP32 16384x1024 meets the byte thresholds but loses.
+    """
+    if m < 1024 or k < 2048:
+        return False
+    row_bytes = k * elt_bytes
+    total = m * row_bytes
+    if row_bytes >= 8 << 10:
+        return total >= 16 << 20
+    return row_bytes >= 4 << 10 and total >= 64 << 20
+
+
+def _use_sm107_small_blocks(m: int, k: int, is_float32: bool = False) -> bool:
+    # 256-thread CTAs with a full column loop beat the default (up to 1024
+    # threads, one row per CTA) once rows are wide. Cold-L2 sweeps on Rubin:
+    # K > 16384 gains 1.2-1.5x for every input dtype, including power-of-two
+    # widths; 8192 < K <= 12288 gains 1.05-1.15x for FP16/BF16 only (FP32 is
+    # neutral there); K = 14336/16384 and K <= 8192 favor the default. Short
+    # batches (M < 1536) keep the default.
+    if m < 1536:
+        return False
+    if k > 16384:
+        return True
+    return not is_float32 and 8192 < k <= 12288
+
+
 def _compute_optimal_warps(K: int, sf_blocks_per_warp: int = SF_BLOCKS_PER_WARP) -> int:
     """
     Compute optimal WARPS_PER_BLOCK for 100% thread utilization.
@@ -390,7 +430,7 @@ class MXFP8QuantizeSwizzledKernel:
     For MXFP8, each SF block (32 elements) is processed by _threads_per_sf
     threads (2 or 4), so threads_per_row = num_sf_blocks_per_row * _threads_per_sf.
 
-    This kernel is M-agnostic: compiled once per (K, dtype, pdl, use_2t)
+    This kernel is M-agnostic: compiled once per (K, dtype, pdl, use_2t, small_blocks)
     combination. M-dependent values (M, padded_M) are passed at runtime.
     """
 
@@ -401,6 +441,7 @@ class MXFP8QuantizeSwizzledKernel:
         enable_pdl: bool = False,
         use_2t_per_sf: bool = True,
         sf_layout: int = SF_LAYOUT_128x4,
+        small_blocks: bool = False,
     ):
         self.is_bfloat16 = dtype == cutlass.BFloat16
         self.is_float32 = dtype == cutlass.Float32
@@ -409,6 +450,7 @@ class MXFP8QuantizeSwizzledKernel:
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
+        self.small_blocks = small_blocks
 
         if use_2t_per_sf:
             self._elts_per_thread = ELTS_PER_THREAD
@@ -424,7 +466,9 @@ class MXFP8QuantizeSwizzledKernel:
         self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
 
         # Compute optimal warps for 100% thread utilization
-        self.warps_per_block = _compute_optimal_warps(K, self._sf_blocks_per_warp)
+        self.warps_per_block = (
+            8 if small_blocks else _compute_optimal_warps(K, self._sf_blocks_per_warp)
+        )
 
         # Multi-row processing constants (compile-time)
         threads_per_block = self.warps_per_block * WARP_SIZE
@@ -468,8 +512,12 @@ class MXFP8QuantizeSwizzledKernel:
         self.kernel(mInput, mOutput, mScales, M, padded_M).launch(
             grid=[num_blocks, 1, 1],
             block=[threads_per_block, 1, 1],
-            max_number_threads=[_MAX_THREADS_PER_BLOCK, 1, 1],
-            min_blocks_per_mp=_BLOCKS_PER_SM,
+            max_number_threads=[
+                256 if self.small_blocks else _MAX_THREADS_PER_BLOCK,
+                1,
+                1,
+            ],
+            min_blocks_per_mp=1 if self.small_blocks else _BLOCKS_PER_SM,
             smem=0,
             stream=stream,
             use_pdl=self.enable_pdl,
@@ -951,6 +999,254 @@ def _get_compiled_kernel_mxfp8_linear(
     return compiled_kernel, kernel_obj.SF_BLOCKS_PER_TB
 
 
+# =============================================================================
+# CuTe-DSL Kernel Class for the 128x4 Swizzled Layout — Tile Iteration (SM107)
+# =============================================================================
+
+
+class MXFP8QuantizeTile128x4Kernel:
+    """
+    MXFP8 quantization for the 128x4 scale layout, one 128-row x (4*G)-SF-column
+    tile per CTA iteration.
+
+    Why a tile kernel: in the row-based kernel a warp owns one row, so its
+    1-byte scale stores land in 8 different 128 B lines per 32 SF blocks (4 B
+    per line at a 512 B stride) -- as many L2 requests as the 1 KB of input it
+    reads. A 128-row tile's scales are one contiguous 512*G B block in this
+    layout, so they are staged in shared memory and written back with a few
+    full-line stores. Loads stay coalesced: 2 lanes per SF block (16 elements
+    each), 8*G lanes per row segment, 32/(8*G) rows per warp instruction.
+
+    Rows are padded to 128 by the host; padding rows and padding scale columns
+    get zero scales. Loads are clamped rather than predicated so the 2-lane
+    max-reduce shuffle never diverges; only stores are predicated.
+    """
+
+    def __init__(
+        self,
+        dtype: cutlass.Numeric,
+        K: int,
+        enable_pdl: bool = False,
+        col_groups: int = 2,
+    ):
+        self.is_bfloat16 = dtype == cutlass.BFloat16
+        self.is_float32 = dtype == cutlass.Float32
+        self.enable_pdl = enable_pdl
+        self.K = K
+        assert K % SF_VEC_SIZE == 0
+        self.num_sf_blocks_per_row = K // SF_VEC_SIZE
+        self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
+        self.col_groups = col_groups
+        self.sf_cols_per_tile = 4 * col_groups
+        self.lanes_per_row = THREADS_PER_SF * self.sf_cols_per_tile
+        assert WARP_SIZE % self.lanes_per_row == 0, "tile must fit a warp"
+        self.rows_per_warp = WARP_SIZE // self.lanes_per_row
+        self.threads = _TILE128X4_THREADS
+        self.warps = self.threads // WARP_SIZE
+        self.rows_per_pass = self.warps * self.rows_per_warp
+        assert ROW_TILE_SIZE % self.rows_per_pass == 0
+        self.passes = ROW_TILE_SIZE // self.rows_per_pass
+        self.scale_tile_bytes = ROW_TILE_SIZE * self.sf_cols_per_tile
+        assert self.scale_tile_bytes % self.threads == 0
+        self.col_tiles = (
+            self.num_sf_blocks_per_row + self.sf_cols_per_tile - 1
+        ) // self.sf_cols_per_tile
+
+    @cute.jit
+    def __call__(
+        self,
+        mInput: cute.Tensor,
+        mOutput: cute.Tensor,
+        mScales: cute.Tensor,
+        M: Int32,
+        padded_M: Int32,
+        num_blocks: Int32,
+        stream,
+    ):
+        self.kernel(mInput, mOutput, mScales, M, padded_M).launch(
+            grid=[num_blocks, 1, 1],
+            block=[self.threads, 1, 1],
+            max_number_threads=[self.threads, 1, 1],
+            min_blocks_per_mp=_TILE128X4_BLOCKS_PER_SM,
+            smem=self.scale_tile_bytes,
+            stream=stream,
+            use_pdl=self.enable_pdl,
+        )
+
+    @cute.jit
+    def _quantize_16(self, row_input, elem_idx: Int32):
+        """Load this lane's 16 elements, reduce the SF-block max with the
+        partner lane, and return (scale_ue8m0, fp8_lo, fp8_hi)."""
+        if cutlass.const_expr(self.is_float32):
+            v0, v1, v2, v3, v4, v5, v6, v7 = ld_global_v8_u32(
+                get_ptr_as_int64(row_input, elem_idx)
+            )
+            v8, v9, v10, v11, v12, v13, v14, v15 = ld_global_v8_u32(
+                get_ptr_as_int64(row_input, elem_idx + Int32(8))
+            )
+            local_max = fmax_f32(
+                float_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7),
+                float_max_abs_8(v8, v9, v10, v11, v12, v13, v14, v15),
+            )
+        else:
+            v0, v1, v2, v3 = ld_global_v4_u32(get_ptr_as_int64(row_input, elem_idx))
+            v4, v5, v6, v7 = ld_global_v4_u32(
+                get_ptr_as_int64(row_input, elem_idx + Int32(8))
+            )
+            if cutlass.const_expr(self.is_bfloat16):
+                local_max = bfloat2_hmax_reduce_to_f32(
+                    bfloat2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
+                )
+            else:
+                local_max = hmax_reduce_to_f32(
+                    half2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
+                )
+        global_max = reduce_max_2threads(local_max)
+        normalized_max = global_max * Float32(INV_FLOAT8_E4M3_MAX)
+        scale_ue8m0_u32 = float_to_ue8m0_fast(normalized_max)
+        scale_ue8m0 = scale_ue8m0_u32.to(Uint8)
+        inv_scale = ue8m0_to_inv_scale_fast(scale_ue8m0_u32)
+        if cutlass.const_expr(self.is_float32):
+            fp8_lo = floatx8_to_fp8x8_packed(v0, v1, v2, v3, v4, v5, v6, v7, inv_scale)
+            fp8_hi = floatx8_to_fp8x8_packed(
+                v8, v9, v10, v11, v12, v13, v14, v15, inv_scale
+            )
+        elif cutlass.const_expr(self.is_bfloat16):
+            fp8_lo = bfloat2x4_to_fp8x8_packed(v0, v1, v2, v3, inv_scale)
+            fp8_hi = bfloat2x4_to_fp8x8_packed(v4, v5, v6, v7, inv_scale)
+        else:
+            fp8_lo = half2x4_to_fp8x8_packed(v0, v1, v2, v3, inv_scale)
+            fp8_hi = half2x4_to_fp8x8_packed(v4, v5, v6, v7, inv_scale)
+        return scale_ue8m0, fp8_lo, fp8_hi
+
+    @cute.kernel
+    def kernel(
+        self,
+        mInput: cute.Tensor,
+        mOutput: cute.Tensor,
+        mScales: cute.Tensor,
+        M: Int32,
+        padded_M: Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_dim_x, _, _ = cute.arch.grid_dim()
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        smem = cutlass.utils.SmemAllocator()
+        s_scales = smem.allocate_tensor(
+            Uint8, cute.make_layout((self.scale_tile_bytes,)), byte_alignment=16
+        )
+
+        num_sf_blocks_per_row = Int32(self.num_sf_blocks_per_row)
+        padded_sf_cols = Int32(self.padded_sf_cols)
+        sf_cols_per_tile = self.sf_cols_per_tile
+        lanes_per_row = self.lanes_per_row
+        rows_per_warp = self.rows_per_warp
+        rows_per_pass = self.rows_per_pass
+        col_tiles = Int32(self.col_tiles)
+
+        warp = tidx // WARP_SIZE
+        lane = tidx % WARP_SIZE
+        row_in_pass = warp * rows_per_warp + lane // lanes_per_row
+        lane_in_row = lane % lanes_per_row
+        sf_col_in_tile = lane_in_row // THREADS_PER_SF
+        thread_in_sf = lane_in_row % THREADS_PER_SF
+        # smem byte for this lane's SF block, without the row term:
+        #   (r % 32) * 16 + (r // 32) * 4 + (c % 4) + (c // 4) * 512
+        col_smem_off = (sf_col_in_tile % 4) + (sf_col_in_tile // 4) * 512
+
+        num_tiles = (padded_M // ROW_TILE_SIZE) * col_tiles
+        tile = bidx
+        while tile < num_tiles:
+            row_tile = tile // col_tiles
+            col_tile = tile % col_tiles
+            row0 = row_tile * ROW_TILE_SIZE
+            sf_col0 = col_tile * sf_cols_per_tile
+            sf_col = sf_col0 + sf_col_in_tile
+            col_valid = sf_col < num_sf_blocks_per_row
+            # Clamp for the unconditional load; stores are predicated.
+            sf_col_load = cutlass.min(sf_col, num_sf_blocks_per_row - 1)
+            elem_idx = sf_col_load * SF_VEC_SIZE + thread_in_sf * ELTS_PER_THREAD
+
+            p = Int32(0)
+            while p < self.passes:
+                local_r = p * rows_per_pass + row_in_pass
+                r = row0 + local_r
+                row_valid = r < M
+                r_load = cutlass.min(r, M - 1)
+                row_input = mInput[r_load, None]
+                scale_ue8m0, fp8_lo, fp8_hi = self._quantize_16(row_input, elem_idx)
+                if row_valid and col_valid:
+                    row_output = mOutput[r, None]
+                    st_global_u64(get_ptr_as_int64(row_output, elem_idx), fp8_lo)
+                    st_global_u64(
+                        get_ptr_as_int64(row_output, elem_idx + Int32(8)), fp8_hi
+                    )
+                else:
+                    scale_ue8m0 = Uint8(0)
+                if thread_in_sf == Int32(0):
+                    s_off = (local_r % 32) * 16 + (local_r // 32) * 4 + col_smem_off
+                    s_scales[s_off] = scale_ue8m0
+                p = p + 1
+
+            cute.arch.barrier()
+            # The tile's scales are contiguous from base; skip column groups past
+            # padded_sf_cols (only a straddling last tile when col_groups > 1).
+            base = compute_sf_index_swizzled_128x4_gpu(row0, sf_col0, padded_sf_cols)
+            b = tidx
+            while b < self.scale_tile_bytes:
+                group_col0 = sf_col0 + (b // 512) * 4
+                if group_col0 < padded_sf_cols:
+                    mScales[base + b] = s_scales[b]
+                b = b + self.threads
+            cute.arch.barrier()
+            tile = tile + grid_dim_x
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+@functools.cache
+def _get_compiled_kernel_mxfp8_tile128x4(
+    dtype_key: str,
+    K: int,
+    enable_pdl: bool = False,
+    col_groups: int = 2,
+) -> Tuple[Callable, int]:
+    """Get or compile the SM107 128x4 tile kernel. Returns (kernel, col_tiles)."""
+    cutlass_dtype = _CUTLASS_DTYPE_MAP[dtype_key]
+    kernel_obj = MXFP8QuantizeTile128x4Kernel(
+        cutlass_dtype, K, enable_pdl, col_groups=col_groups
+    )
+    sym_m = cute.sym_int()
+    input_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype, (sym_m, K), stride_order=(1, 0), assumed_align=16
+    )
+    output_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_m, K), stride_order=(1, 0), assumed_align=16
+    )
+    sym_scale_size = cute.sym_int()
+    scales_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_scale_size,), assumed_align=16
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    compiled_kernel = cute.compile(
+        kernel_obj,
+        input_fake,
+        output_fake,
+        scales_fake,
+        Int32(1),  # Dummy M
+        Int32(128),  # Dummy padded_M
+        Int32(1),  # Dummy num_blocks
+        stream_fake,
+        options="--enable-tvm-ffi",
+    )
+    return compiled_kernel, kernel_obj.col_tiles
+
+
 @functools.cache
 def _get_compiled_kernel_mxfp8_swizzled(
     dtype_key: str,
@@ -958,11 +1254,12 @@ def _get_compiled_kernel_mxfp8_swizzled(
     enable_pdl: bool = False,
     use_2t_per_sf: bool = True,
     sf_layout: int = SF_LAYOUT_128x4,
+    small_blocks: bool = False,
 ) -> Tuple[Callable, int]:
     """
     Get or compile SWIZZLED layout kernel with TVM-FFI.
 
-    Cached by (K, dtype, pdl, use_2t, sf_layout) - M-agnostic,
+    Cached by (K, dtype, pdl, use_2t, sf_layout, small_blocks) - M-agnostic,
     device-independent compilation.
 
     Returns:
@@ -971,7 +1268,12 @@ def _get_compiled_kernel_mxfp8_swizzled(
     """
     cutlass_dtype = _CUTLASS_DTYPE_MAP[dtype_key]
     kernel_obj = MXFP8QuantizeSwizzledKernel(
-        cutlass_dtype, K, enable_pdl, use_2t_per_sf, sf_layout=sf_layout
+        cutlass_dtype,
+        K,
+        enable_pdl,
+        use_2t_per_sf,
+        sf_layout=sf_layout,
+        small_blocks=small_blocks,
     )
 
     # Use symbolic M for dynamic batch sizes
@@ -1050,7 +1352,7 @@ def mxfp8_quantize_cute_dsl(
         ``float8_e4m3fn`` and ``scale_tensor`` is the UE8M0 scale-factor
         tensor (``uint8``).
     """
-    from ...utils import device_support_pdl
+    from ...utils import device_support_pdl, get_compute_capability
 
     assert input.dtype in (torch.float16, torch.bfloat16, torch.float32), (
         f"Input dtype must be float16, bfloat16, or float32, got {input.dtype}"
@@ -1096,7 +1398,33 @@ def mxfp8_quantize_cute_dsl(
     dtype_key = _TORCH_DTYPE_KEY[input.dtype]
 
     # Cached device-specific target grid for grid size computation
-    target_grid = get_num_sm(input.device) * _BLOCKS_PER_SM
+    is_sm107 = get_compute_capability(input.device) == (10, 7)
+    small_blocks = (
+        is_sm107
+        and is_sf_swizzled_layout
+        and _use_sm107_small_blocks(m, padded_k, input.dtype == torch.float32)
+    )
+    blocks_per_sm = _BLOCKS_PER_SM
+    if (
+        m * padded_k >= 1 << 20
+        and (
+            not is_sf_swizzled_layout
+            or is_sf_8x4_layout
+            or m >= 1024
+            or m * padded_k >= 1 << 23
+        )
+        and is_sm107
+        and not small_blocks
+        # FP32 linear is neutral-to-slightly-worse with a lower cap
+        # (0.96-1.02x in cold-L2 sweeps); leave it at the default.
+        and not (not is_sf_swizzled_layout and input.dtype == torch.float32)
+    ):
+        # The swizzled kernel uses up to 1024 threads per CTA. On Rubin,
+        # one persistent CTA per SM avoids extra waves; linear uses two.
+        # Keep the original cap for medium 128x4 inputs: cold-L2 sweeps
+        # show a crossover regression before 1024 rows / 8M elements.
+        blocks_per_sm = 1 if is_sf_swizzled_layout else 2
+    target_grid = get_num_sm(input.device) * blocks_per_sm
 
     # Compute M-dependent values outside the cached kernel
     num_sf_blocks_per_row = padded_k // SF_VEC_SIZE
@@ -1115,11 +1443,33 @@ def mxfp8_quantize_cute_dsl(
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
         scale_output_size = padded_m * padded_sf_cols
 
-        kernel_fn, rows_per_block = _get_compiled_kernel_mxfp8_swizzled(
-            dtype_key, padded_k, enable_pdl, use_2t, sf_layout
+        use_tile = (
+            is_sm107
+            and not is_sf_8x4_layout
+            and _use_sm107_tile128x4(m, padded_k, input.element_size())
         )
+        if use_tile:
+            # SM107 only: 128-row tiles with shared-memory-staged scales.
+            kernel_fn, col_tiles = _get_compiled_kernel_mxfp8_tile128x4(
+                dtype_key, padded_k, enable_pdl, _TILE128X4_COL_GROUPS
+            )
+            num_blocks = min(
+                (padded_m // ROW_TILE_SIZE) * col_tiles,
+                get_num_sm(input.device) * _TILE128X4_BLOCKS_PER_SM,
+            )
+        else:
+            kernel_fn, rows_per_block = _get_compiled_kernel_mxfp8_swizzled(
+                dtype_key,
+                padded_k,
+                enable_pdl,
+                use_2t,
+                sf_layout,
+                small_blocks,
+            )
 
-        num_blocks = min((padded_m + rows_per_block - 1) // rows_per_block, target_grid)
+            num_blocks = min(
+                (padded_m + rows_per_block - 1) // rows_per_block, target_grid
+            )
 
         fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
         scale_output = torch.empty(

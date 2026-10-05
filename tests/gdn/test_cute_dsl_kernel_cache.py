@@ -112,6 +112,7 @@ def test_make_kernel_name_caps_length_without_collision():
 # ---------------------------------------------------------------------------
 
 NONTRANSPOSE_BASELINE = {
+    "target_key": (0, "sm100a"),
     "use_small_batch": True,
     "T": 1,
     "H": 16,
@@ -124,6 +125,7 @@ NONTRANSPOSE_BASELINE = {
 }
 
 PRETRANSPOSE_BASELINE = {
+    "target_key": (0, "sm100a"),
     "T": 1,
     "H": 16,
     "HV": 32,
@@ -140,6 +142,7 @@ PRETRANSPOSE_BASELINE = {
 
 MTP_BASELINE = {
     "variant": "warp",
+    "target_key": (0, "sm100a"),
     "T": 2,
     "H": 16,
     "HV": 32,
@@ -161,6 +164,7 @@ MTP_BASELINE = {
 }
 
 PREFILL_BASELINE = {
+    "target_key": (0, "sm100a"),
     "io_dtype_str": "torch.bfloat16",
     "state_dtype_str": "torch.float32",
     "HQ": 32,
@@ -204,6 +208,7 @@ BF16_STATE_BASELINES = {
         False,  # per_token_pool_scatter
         False,  # per_token_pool_scatter_flat
         (torch.float32, torch.float32, torch.int32),  # _dtype_key
+        (0, "sm100a"),  # compile target
     ),
     "wide_vec_t1": (
         "v3_mtp_bf16_tiled_dynB",
@@ -224,6 +229,7 @@ BF16_STATE_BASELINES = {
         True,
         True,
         (torch.float32, torch.float32, torch.int32),
+        (0, "sm100a"),  # compile target
     ),
     "mtp_ilp4": (
         "mtp_bf16_dynB",
@@ -249,6 +255,7 @@ BF16_STATE_BASELINES = {
         False,  # per_token_pool_scatter
         False,  # per_token_pool_scatter_flat
         (torch.float32, torch.float32, torch.int32),
+        (0, "sm100a"),  # compile target
     ),
 }
 
@@ -294,6 +301,7 @@ def test_kernel_name_signature_covers_getter_params(getter, name_fn):
 @pytest.mark.parametrize(
     "param,alternate",
     [
+        ("target_key", (0, "sm90a")),
         ("use_small_batch", False),
         ("T", 2),
         ("H", 32),
@@ -317,6 +325,7 @@ def test_nontranspose_name_varies_with_every_argument(param, alternate):
 @pytest.mark.parametrize(
     "param,alternate",
     [
+        ("target_key", (0, "sm90a")),
         ("T", 2),
         ("H", 32),
         ("HV", 64),
@@ -344,6 +353,7 @@ def test_pretranspose_name_varies_with_every_argument(param, alternate):
     "param,alternate",
     [
         ("variant", "inline"),
+        ("target_key", (0, "sm90a")),
         ("T", 3),
         ("H", 32),
         ("HV", 64),
@@ -389,6 +399,7 @@ def test_mtp_name_varies_with_every_argument(param, alternate):
         ("initial_state_inner_strides", (16384, 128, 1)),
         ("output_state_inner_strides", (16384, 128, 1)),
         ("num_sm", 132),
+        ("target_key", (0, "sm90a")),
     ],
 )
 def test_prefill_name_varies_with_every_argument(param, alternate):
@@ -424,12 +435,53 @@ def _perturb(value):
 def test_bf16_state_name_varies_with_every_key_component(variant):
     key = BF16_STATE_BASELINES[variant]
     baseline = _bf16_state_kernel_name(variant, key)
-    for i in range(len(key)):
+    # The last component is the compile target, whose device index intentionally
+    # does not name an artifact (see test_kernel_names_ignore_the_device_index).
+    assert key[-1] == (0, "sm100a"), (
+        f"the skipped component is no longer the compile target: {key[-1]!r}"
+    )
+    for i in range(len(key) - 1):
         perturbed = key[:i] + (_perturb(key[i]),) + key[i + 1 :]
         assert _bf16_state_kernel_name(variant, perturbed) != baseline, (
             f"_bf16_state_kernel_name ignores cache_key[{i}] = {key[i]!r} "
             f"for variant {variant!r}"
         )
+    other_arch = key[:-1] + ((key[-1][0], "sm90a"),)
+    assert _bf16_state_kernel_name(variant, other_arch) != baseline, (
+        f"_bf16_state_kernel_name ignores the target arch for variant {variant!r}"
+    )
+
+
+def test_kernel_names_ignore_the_device_index():
+    """Two devices of one arch must share an artifact, not fragment the cache.
+
+    The device index is in the in-process key to separate the device-resident
+    defaults an entry holds; the exported ``.o`` depends only on the arch.
+    """
+    named = {
+        "nontranspose": (_nontranspose_kernel_name, NONTRANSPOSE_BASELINE),
+        "pretranspose": (_pretranspose_kernel_name, PRETRANSPOSE_BASELINE),
+        "mtp": (_mtp_kernel_name, MTP_BASELINE),
+        "prefill": (_prefill_kernel_name, PREFILL_BASELINE),
+    }
+    for label, (name_fn, baseline) in named.items():
+        device_index, arch = baseline["target_key"]
+        same_arch = {**baseline, "target_key": (device_index + 1, arch)}
+        other_arch = {**baseline, "target_key": (device_index, "sm90a")}
+        assert name_fn(**same_arch) == name_fn(**baseline), (
+            f"{label}: the device index must not name an artifact"
+        )
+        assert name_fn(**other_arch) != name_fn(**baseline), (
+            f"{label}: the target arch must name an artifact"
+        )
+
+    variant, key = "wide_vec", BF16_STATE_BASELINES["wide_vec"]
+    device_index, arch = key[-1]
+    assert _bf16_state_kernel_name(
+        variant, key[:-1] + ((device_index + 1, arch),)
+    ) == _bf16_state_kernel_name(variant, key), (
+        "bf16_state: the device index must not name an artifact"
+    )
 
 
 def test_bf16_state_name_distinguishes_variants():

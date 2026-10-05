@@ -1,0 +1,370 @@
+{
+  "arch": "sm_120a",
+  "bytes_per_token": 384,
+  "compress_ratios": [
+    1,
+    2
+  ],
+  "data_bytes_per_token": 352,
+  "entries": {
+    "kv": "cake_dsv4_nvfp4_rope_insert_kv",
+    "qkv": "cake_dsv4_nvfp4_rope_insert_qkv"
+  },
+  "family": "cake_dsv4_nvfp4_rope_insert",
+  "generated_at": "2026-10-04T04:37:03Z",
+  "generator": "sm120-dsv4-nvfp4-rope-insert-flashinfer-export",
+  "grid": "ceil(num_tokens * slots_per_token / warps_per_cta) CTAs; slots_per_token = q_head_padded + 1 (copy form), q_head_padded / 8 (in-place form, slot 0 also inserts the KV row), 1 (kv entry)",
+  "head_dim": 512,
+  "header": "cake_dsv4_nvfp4_rope_insert_kernels.h",
+  "identity": "1da663e2b21836efc19d4b11d5a68d413fdb7e8b698f6db59e8f48048c0613b9",
+  "identity_scope": "sha256 over sorted (file name, file text without the provenance header)",
+  "kernel_commit": "67117e3900a111237b3198980a1e98f16013ba8d",
+  "kernel_params": [
+    "q",
+    "kv",
+    "cache",
+    "slot_mapping_i64",
+    "slot_mapping_i32",
+    "positions",
+    "cos_sin",
+    "q_out",
+    "num_tokens",
+    "num_tokens_insert",
+    "num_heads_q",
+    "page_size",
+    "page_stride_bytes",
+    "total_slots"
+  ],
+  "kernel_tree_modified": false,
+  "nope_dim": 448,
+  "num_scale_groups": 28,
+  "num_variants": 34,
+  "q_head_padded_choices": [
+    8,
+    16,
+    32,
+    64,
+    128
+  ],
+  "rope_dim": 64,
+  "scale_bytes_per_token": 32,
+  "slot_dtypes": [
+    "int32",
+    "int64"
+  ],
+  "sources": [
+    "cake_dsv4_nvfp4_rope_insert_kernel.cu",
+    "cake_dsv4_nvfp4_rope_insert_binding.cu"
+  ],
+  "threads": 256,
+  "tree_commit": "b8f7de96b91ed70690f6e9584c8dfcbafd7a230e",
+  "variants": [
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 8,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p8_s64"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 8,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p8_noqrope_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 8,
+      "q_inplace": true,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p8_inplace_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 16,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p16_s64"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 16,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p16_noqrope_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 16,
+      "q_inplace": true,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p16_inplace_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 32,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p32_s64"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 32,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p32_noqrope_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 32,
+      "q_inplace": true,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p32_inplace_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 64,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p64_s64"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 64,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p64_noqrope_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 64,
+      "q_inplace": true,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p64_inplace_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 128,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p128_s64"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 128,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p128_noqrope_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 128,
+      "q_inplace": true,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p128_inplace_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "kv",
+      "q_head_padded": 0,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_kv_r1_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 2,
+      "form": "kv",
+      "q_head_padded": 0,
+      "q_inplace": false,
+      "slot_dtype": "int64",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_kv_r2_s64"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 8,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p8_s32"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 8,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p8_noqrope_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 8,
+      "q_inplace": true,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p8_inplace_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 16,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p16_s32"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 16,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p16_noqrope_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 16,
+      "q_inplace": true,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p16_inplace_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 32,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p32_s32"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 32,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p32_noqrope_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 32,
+      "q_inplace": true,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p32_inplace_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 64,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p64_s32"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 64,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p64_noqrope_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 64,
+      "q_inplace": true,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p64_inplace_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 128,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p128_s32"
+    },
+    {
+      "apply_q_rope": false,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 128,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p128_noqrope_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "qkv",
+      "q_head_padded": 128,
+      "q_inplace": true,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_qkv_p128_inplace_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 1,
+      "form": "kv",
+      "q_head_padded": 0,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_kv_r1_s32"
+    },
+    {
+      "apply_q_rope": true,
+      "compress_ratio": 2,
+      "form": "kv",
+      "q_head_padded": 0,
+      "q_inplace": false,
+      "slot_dtype": "int32",
+      "symbol": "flashinfer_sm120_dsv4_nvfp4_rope_insert_kv_r2_s32"
+    }
+  ],
+  "warps_per_cta": 8
+}

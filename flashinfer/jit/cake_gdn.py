@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Checksum-verified JIT loader for the source-only Cake GDN backend."""
+"""JIT loader for the source-only Cake GDN backend.
+
+Every variant in ``csrc/gdn/cake/manifest.json`` names one kernel source, the
+compile-time ``defines`` that specialize it, and one TVM-FFI host shim.  The
+kernel is compiled to a cubin with ``nvcc`` and embedded into the host shim.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -34,7 +40,7 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "388df1483226190eb171433c947b2b045f00579af61c2e1f0e48c16513672c93"
+_DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -112,41 +118,10 @@ def _source_dir() -> Path:
 @functools.cache
 def _manifest() -> dict[str, Any]:
     path = _source_dir() / "manifest.json"
-    observed_digest = _sha256(path)
-    if observed_digest != _MANIFEST_SHA256:
-        raise RuntimeError(
-            f"Cake GDN manifest drift at {path}: "
-            f"expected {_MANIFEST_SHA256}, got {observed_digest}"
-        )
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    observed = (
-        manifest.get("schema"),
-        manifest.get("source_only"),
-        manifest.get("binary_artifacts"),
-        manifest.get("contract_row_count"),
-        manifest.get("architecture_row_count"),
-        manifest.get("admitted_architecture_rows"),
-        manifest.get("fail_closed_architecture_rows"),
-        manifest.get("variant_count"),
-        len(manifest.get("variants", [])),
-        manifest.get("scope", {}).get("explicit_backend_policy"),
-    )
-    expected = (
-        _EXPORT_SCHEMA,
-        True,
-        False,
-        1779,
-        3558,
-        3504,
-        54,
-        104,
-        104,
-        "one listed GDN non-CP variant or fail closed; no external fallback",
-    )
-    if observed != expected:
+    if manifest.get("schema") != _EXPORT_SCHEMA:
         raise RuntimeError(
-            "Cake GDN manifest does not match the frozen support contract: "
-            f"expected {expected!r}, got {observed!r}"
+            f"unexpected Cake GDN manifest schema at {path}: {manifest.get('schema')!r}"
         )
     return manifest
 
@@ -167,6 +142,15 @@ def _cuda_record(record: dict[str, Any], arch: CakeGDNArch) -> dict[str, Any]:
     return outputs[0]
 
 
+def _cubin_path(source: Path, *, arch: CakeGDNArch, digest: str) -> Path:
+    return (
+        jit_env.FLASHINFER_JIT_DIR
+        / "cake_gdn"
+        / arch
+        / f"{source.stem}-{digest[:16]}.cubin"
+    )
+
+
 def _compile_cubin(
     source: Path,
     *,
@@ -176,9 +160,9 @@ def _compile_cubin(
     include_paths: tuple[Path, ...],
     nvcc: Path,
 ) -> bytes:
-    cache_dir = jit_env.FLASHINFER_JIT_DIR / "cake_gdn" / arch
+    cubin = _cubin_path(source, arch=arch, digest=digest)
+    cache_dir = cubin.parent
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cubin = cache_dir / f"{source.stem}-{digest[:16]}.cubin"
     lock = FileLock(f"{cubin}.lock", thread_local=False)
     with lock:
         if not cubin.exists():
@@ -220,46 +204,49 @@ def _compile_cubin(
     return cubin.read_bytes()
 
 
+def _define_flags(record: dict[str, Any]) -> tuple[str, ...]:
+    """``-D`` flags for the variant's compile-time specialization."""
+
+    flags = []
+    for key, value in record.get("defines", {}).items():
+        if not _DEFINE_NAME.match(key):
+            raise RuntimeError(f"invalid Cake GDN define name {key!r}")
+        flags.append(f"-D{key}={value}")
+    return tuple(flags)
+
+
+def _compile_options(record: dict[str, Any]) -> tuple[str, ...]:
+    options = tuple(record.get("compile_options", ()))
+    unsupported_options = set(options) - {"--use_fast_math"}
+    if unsupported_options:
+        raise RuntimeError(
+            f"unsupported Cake GDN compile options: {sorted(unsupported_options)!r}"
+        )
+    return options + _define_flags(record)
+
+
 @functools.cache
-def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
-    """Compile and load one checksum-verified Cake GDN host entrypoint."""
+def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
+    """Compile one Cake GDN kernel variant for ``arch`` and return its cubin path."""
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
         raise CakeGDNUnsupportedError(f"unsupported Cake GDN architecture: {arch!r}")
     record = _kernel_record(name)
     cuda = _cuda_record(record, arch)
-    host = record["host_binding"]
     root = _source_dir()
     cuda_path = root / cuda["path"]
-    host_path = root / host["path"]
     headers = _manifest().get("cuda_headers", [])
-    sources = [
-        (cuda_path, cuda["sha256"]),
-        (host_path, host["sha256"]),
-        *((root / header["path"], header["sha256"]) for header in headers),
-    ]
-    for path, expected in sources:
-        observed = _sha256(path)
-        if observed != expected:
-            raise RuntimeError(
-                f"Cake GDN source drift at {path}: expected {expected}, got {observed}"
-            )
-    compile_options = tuple(record.get("compile_options", ()))
-    unsupported_options = set(compile_options) - {"--use_fast_math"}
-    if unsupported_options:
-        raise RuntimeError(
-            f"unsupported Cake GDN compile options: {sorted(unsupported_options)!r}"
-        )
+    compile_options = _compile_options(record)
     nvcc, nvcc_version = _nvcc_identity()
     compile_digest = _compile_cache_digest(
         arch=arch,
-        cuda_sha256=cuda["sha256"],
-        header_sha256s=tuple(header["sha256"] for header in headers),
+        cuda_sha256=_sha256(cuda_path),
+        header_sha256s=tuple(_sha256(root / header["path"]) for header in headers),
         compile_options=compile_options,
         nvcc=nvcc,
         nvcc_version=nvcc_version,
     )
-    cubin = _compile_cubin(
+    _compile_cubin(
         cuda_path,
         arch=arch,
         digest=compile_digest,
@@ -269,15 +256,28 @@ def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
         ),
         nvcc=nvcc,
     )
+    return _cubin_path(cuda_path, arch=arch, digest=compile_digest)
+
+
+@functools.cache
+def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
+    """Compile and load one Cake GDN host entrypoint."""
+
+    cubin = compile_cake_gdn_cubin(name, arch)
+    record = _kernel_record(name)
+    host = record["host_binding"]
+    root = _source_dir()
+    host_path = root / host["path"]
     module_digest = hashlib.sha256(
-        f"{compile_digest}\0{host['sha256']}".encode()
+        f"{cubin.stem}\0{_sha256(host_path)}".encode()
     ).hexdigest()
     module = cpp.load_inline(
         f"flashinfer_cake_gdn_{name}_{arch}_{module_digest[:12]}",
         cpp_sources=host_path.read_text(encoding="utf-8"),
-        embed_cubin={host["module_ident"]: cubin},
+        embed_cubin={host["module_ident"]: cubin.read_bytes()},
         extra_include_paths=[
             str(Path(get_cuda_path()) / "include"),
+            str(root / "host"),
             str(root.parent),
             str(root.parents[1]),
             str(root.parents[2] / "include"),
@@ -359,7 +359,7 @@ def _variant_for(
     return matches[0]
 
 
-@functools.cache
+@functools.lru_cache(maxsize=4096)
 def select_cake_gdn_prefill_variant(
     *,
     arch: CakeGDNArch,
@@ -532,7 +532,7 @@ def select_cake_gdn_prefill_variant(
     )
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def select_cake_gdn_decode_variant(
     *,
     arch: CakeGDNArch,
@@ -594,6 +594,28 @@ def select_cake_gdn_decode_variant(
             (8, 4, 4, 8, True, True, True, 4),
             (8, 2, 16, 64, True, False, False, 0),
             (8, 4, 16, 64, True, False, True, 5),
+            (1, 7, 8, 16, True, True, True, 7),
+            (2, 7, 8, 16, True, True, True, 7),
+            (3, 7, 8, 16, True, True, True, 7),
+            (4, 7, 8, 16, True, True, True, 7),
+            (5, 7, 8, 16, True, True, True, 7),
+            (6, 7, 8, 16, True, True, True, 7),
+            (7, 7, 8, 16, True, True, True, 7),
+            (8, 7, 8, 16, True, True, True, 7),
+            (1, 8, 8, 16, True, True, True, 8),
+            (1, 7, 16, 32, True, True, True, 7),
+            # SGLang hands the verify step contiguous [B, T, H, K] views; the
+            # STRIDED_INPUTS=1 variants above serve them through runtime strides.
+            (1, 7, 8, 16, False, True, True, 7),
+            (2, 7, 8, 16, False, True, True, 7),
+            (3, 7, 8, 16, False, True, True, 7),
+            (4, 7, 8, 16, False, True, True, 7),
+            (5, 7, 8, 16, False, True, True, 7),
+            (6, 7, 8, 16, False, True, True, 7),
+            (7, 7, 8, 16, False, True, True, 7),
+            (8, 7, 8, 16, False, True, True, 7),
+            (1, 8, 8, 16, False, True, True, 8),
+            (1, 7, 16, 32, False, True, True, 7),
         }
         key = (
             batch_size,
@@ -612,6 +634,27 @@ def select_cake_gdn_decode_variant(
         ):
             raise CakeGDNUnsupportedError(
                 "BF16 decode is limited to the exact promoted indexed/verify rows"
+            )
+        if num_q_heads == 8 and num_v_heads == 16 and batch_size <= 4:
+            # Qwen3.5-35B-A3B TP=2 per-rank verify (speculative_num_draft_tokens=7
+            # verifies T=7; T=8 is the adjacent window): B<=4 runs the full-warp
+            # tile-v16 kernel with T_STEPS specialized, B>=5 falls through to wide32.
+            record = _variant_for(
+                domain="decode",
+                schedule_attr="gdn_decode_pretranspose_t4_bf16state_tile16",
+                specializations={
+                    "H": num_q_heads,
+                    "HV": num_v_heads,
+                    "INTERMEDIATE_BATCH_STRIDE": cache_steps * num_v_heads * 128 * 128,
+                    "INTERMEDIATE_TOKEN_STRIDE": num_v_heads * 128 * 128,
+                    "SCALE": scale,
+                    "STRIDED_INPUTS": 1,
+                    "T_STEPS": seq_len,
+                },
+            )
+            return CakeGDNRoute(
+                f"flashinfer.gdn_decode.indexed_bf16_verify_t{seq_len}.tile16_fullwarp",
+                record["name"],
             )
         if num_q_heads == 4 and num_v_heads == 8:
             if seq_len == 1:
@@ -662,7 +705,9 @@ def select_cake_gdn_decode_variant(
                     num_v_heads * 128 * 128 if cache_intermediate_states else 128 * 128
                 ),
                 "SCALE": scale,
-                "STRIDED_INPUTS": int(strided_inputs),
+                # The T>=7 wide32 variants exist only as STRIDED_INPUTS=1 and take
+                # their strides at runtime, so contiguous callers use them too.
+                "STRIDED_INPUTS": int(strided_inputs or seq_len >= 7),
                 "TILE_V_WIDE": tile_v,
                 "T_STEPS": seq_len,
                 "UPDATE_STATE": int(update_state),
@@ -777,6 +822,7 @@ __all__ = [
     "CakeGDNRoute",
     "CakeGDNUnsupportedError",
     "arch_for_compute_capability",
+    "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
     "select_cake_gdn_decode_variant",
     "select_cake_gdn_prefill_variant",

@@ -132,8 +132,14 @@ def test_shim_config_validation():
 
     with pytest.raises(ValueError, match="kind"):
         pkg.MegaMoEHopperFp8Config(**{**base, "kind": "mxfp8_e4m3"})
-    with pytest.raises(ValueError, match="1-CTA-only"):
-        pkg.MegaMoEHopperFp8Config(**{**base, "cluster_shape_mnk": (2, 1, 1)})
+    with pytest.raises(ValueError, match="cluster_shape_mnk"):
+        # CGA k must stay 1; (m, n) beyond 2x2 is rejected.
+        pkg.MegaMoEHopperFp8Config(**{**base, "cluster_shape_mnk": (1, 1, 2)})
+    with pytest.raises(ValueError, match="cluster_shape_mnk"):
+        pkg.MegaMoEHopperFp8Config(**{**base, "cluster_shape_mnk": (4, 1, 1)})
+    # Multi-CTA CGA shapes are supported since the CGA drop.
+    cga = pkg.MegaMoEHopperFp8Config(**{**base, "cluster_shape_mnk": (2, 2, 1)})
+    assert cga.cluster_shape_mnk == (2, 2, 1)
     with pytest.raises(ValueError, match="native"):
         # M=128 is a swap-AB geometry; native requires M=64.
         pkg.MegaMoEHopperFp8Config(**{**base, "mma_tiler_mnk": (128, 128, 128)})
@@ -141,10 +147,23 @@ def test_shim_config_validation():
         pkg.MegaMoEHopperFp8Config(
             **{**base, "swap_ab": True, "mma_tiler_mnk": (64, 128, 128)}
         )
-    with pytest.raises(ValueError, match="cannot both"):
+    # All six token-back x reduce mode combinations are supported since the
+    # combine-surface alignment drop; ikr + dispatch push no longer raises.
+    six = pkg.MegaMoEHopperFp8Config(
+        **{**base, "in_kernel_fc2_reduce": True, "token_back_by_dispatch": True}
+    )
+    assert six.resolved_token_back_mode == "reuse_dispatch_warps"
+    with pytest.raises(ValueError, match="token_back_mode"):
+        pkg.MegaMoEHopperFp8Config(**{**base, "token_back_mode": "bogus"})
+    # Ping-pong geometry constraints.
+    with pytest.raises(ValueError, match="ping-pong"):
         pkg.MegaMoEHopperFp8Config(
-            **{**base, "in_kernel_fc2_reduce": True, "token_back_by_dispatch": True}
+            **{**base, "pingpong": True, "mma_tiler_mnk": (64, 256, 128)}
         )
+    pp = pkg.MegaMoEHopperFp8Config(
+        **{**base, "pingpong": True, "mma_tiler_mnk": (64, 128, 128)}
+    )
+    assert pp.pingpong
     with pytest.raises(ValueError, match="blockwise"):
         pkg.MegaMoEHopperFp8Config(
             **{**base, "fp8_scale_mode": "blockwise", "hidden": 1088}
