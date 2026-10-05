@@ -288,49 +288,60 @@ class TestSplitLayerRouting:
         layer.destroy()
 
 
-class _FakeMoeAlltoAll:
-    instances: list = []
-    workspace_args: tuple = ()
+class _FakeCakeOps:
+    """Records the ``moe_a2a_*`` ops CakeAlltoAll calls; dispatch returns zeros."""
 
-    def __init__(self, mapping, **kwargs):
-        self.kwargs = kwargs
-        self.ep_size = mapping.moe_ep_size
-        self.eplb_gathered_stats = None
+    def __init__(self) -> None:
         self.calls: dict = {}
-        _FakeMoeAlltoAll.instances.append(self)
 
-    def dispatch(self, token_selected_experts, input_payloads, rt, **kwargs):
-        self.calls["dispatch"] = (input_payloads, rt, kwargs)
-        return [
-            torch.zeros(self.ep_size, rt, *p.shape[1:], dtype=p.dtype)
-            for p in input_payloads
-        ]
+    def workspace_size_per_rank(self, *args, **kwargs):
+        self.calls["workspace_size"] = (args, kwargs)
+        return 1 << 12
 
-    def get_combine_payload_tensor_in_workspace(self, rt, hidden, dtype):
-        buf = torch.zeros(self.ep_size, rt, hidden, dtype=dtype)
-        self.calls["buffer"] = buf
-        return buf
+    def dispatch(self, topk_ids, payloads, workspace, metainfo, rt, *args, **kwargs):
+        self.calls["dispatch"] = (payloads, rt, args, kwargs)
+        ep_size = workspace.shape[0]
+        recv = [torch.zeros(ep_size, rt, *p.shape[1:], dtype=p.dtype) for p in payloads]
+        return recv, 0, None
 
-    def combine(self, payload, rt, **kwargs):
-        self.calls["combine"] = (payload, rt, kwargs)
-        return torch.zeros(2, payload.shape[-1])
+    def sanitize(self, expert_ids, workspace, metainfo, ep_rank, invalid_id, **kwargs):
+        self.calls["sanitize"] = (expert_ids, invalid_id, kwargs)
+
+    def combine(self, payload, local_num_tokens, *args, **kwargs):
+        self.calls["combine"] = (payload, local_num_tokens, args, kwargs)
+        return torch.zeros(local_num_tokens, payload.shape[-1])
 
 
 @pytest.fixture
 def fake_cake(monkeypatch):
+    import flashinfer.comm.mnnvl as mnnvl
     import flashinfer.comm.trtllm_moe_alltoall as a2a
     from flashinfer.comm.mapping import Mapping
     from flashinfer.moe_ep.backends.split.comm.cake import communication as cake
 
-    def workspace_size_per_rank(*args, **kwargs):
-        _FakeMoeAlltoAll.workspace_args = args
-        return 1 << 20
-
-    _FakeMoeAlltoAll.instances = []
-    monkeypatch.setattr(a2a, "MoeAlltoAll", _FakeMoeAlltoAll)
+    ops = _FakeCakeOps()
     monkeypatch.setattr(
-        a2a, "moe_a2a_get_workspace_size_per_rank", workspace_size_per_rank
+        a2a, "moe_a2a_get_workspace_size_per_rank", ops.workspace_size_per_rank
     )
+    monkeypatch.setattr(a2a, "moe_a2a_dispatch", ops.dispatch)
+    monkeypatch.setattr(a2a, "moe_a2a_sanitize_expert_ids", ops.sanitize)
+    monkeypatch.setattr(a2a, "moe_a2a_combine", ops.combine)
+    monkeypatch.setattr(mnnvl.MnnvlMemory, "initialize", staticmethod(lambda: None))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+
+    def acquire(self, mapping, workspace_size_per_rank):
+        ops.calls["acquire"] = workspace_size_per_rank
+        return {
+            "workspace": torch.zeros(
+                self.ep_size, workspace_size_per_rank, dtype=torch.uint8
+            ),
+            "metainfo": torch.zeros(1, dtype=torch.int64),
+            "views": {},
+            "refcount": 1,
+            "key": None,
+        }
+
+    monkeypatch.setattr(CakeAlltoAll, "_acquire_workspace", acquire)
     monkeypatch.setattr(
         cake,
         "mnnvl_mapping_and_config",
@@ -347,6 +358,7 @@ def fake_cake(monkeypatch):
     monkeypatch.setattr(
         CakeAlltoAll, "is_platform_supported", classmethod(lambda cls: True)
     )
+    return ops
 
 
 def test_cake_sizes_dispatch_by_format(fake_cake) -> None:
@@ -355,8 +367,9 @@ def test_cake_sizes_dispatch_by_format(fake_cake) -> None:
         _params(hidden_size=64, dispatch_format=QuantFormat.NVFP4),
         "cake",
     )
-    assert _FakeMoeAlltoAll.instances[-1].kwargs["backend"] == "cake"
-    _, _, dispatch_bytes, combine_bytes, _ = _FakeMoeAlltoAll.workspace_args
+    args, kwargs = fake_cake.calls["workspace_size"]
+    assert kwargs["backend"] == "cake"
+    _, _, dispatch_bytes, combine_bytes, _ = args
     # NVFP4 values and scales, then int32 ids and FP32 weights for top_k=2.
     assert dispatch_bytes == 32 + 4 + 2 * 4 * 2
     assert combine_bytes == 64 * 2
@@ -369,9 +382,6 @@ def test_cake_payload_plumbing(fake_cake) -> None:
         CakeAlltoAllConfig(use_low_precision_combine=True),
     )
     assert isinstance(comm, CakeAlltoAll)
-    a2a = _FakeMoeAlltoAll.instances[-1]
-    assert a2a.kwargs["backend"] == "cake"
-    assert a2a.kwargs["max_num_tokens"] == 3
 
     hidden = torch.ones(2, 8, dtype=torch.bfloat16)
     scale = torch.ones(2, 1, dtype=torch.uint8)
@@ -381,7 +391,7 @@ def test_cake_payload_plumbing(fake_cake) -> None:
         hidden, ids, weights, hidden_states_scale=scale, max_tokens_per_rank=2
     )
 
-    payloads, rt, kwargs = a2a.calls["dispatch"]
+    payloads, rt, _, kwargs = fake_cake.calls["dispatch"]
     assert rt == 2
     assert [p.dtype for p in payloads] == [
         torch.bfloat16,
@@ -389,8 +399,10 @@ def test_cake_payload_plumbing(fake_cake) -> None:
         torch.int32,
         torch.float32,
     ]
-    assert kwargs["expert_id_payload_index"] == 2
-    assert kwargs["invalid_token_expert_id"] == -1
+    assert kwargs["backend"] == "cake"
+    sanitized_ids, invalid_id, kwargs = fake_cake.calls["sanitize"]
+    assert sanitized_ids.dtype == torch.int32 and sanitized_ids.shape == (2, 2, 2)
+    assert invalid_id == -1 and kwargs["backend"] == "cake"
     assert result.tokens_per_rank == 2
     assert result.hidden_states.shape == (4, 8)
     assert result.hidden_states_scale.shape == (4, 1)
@@ -400,17 +412,27 @@ def test_cake_payload_plumbing(fake_cake) -> None:
     buffer = comm.get_combine_input_buffer(torch.bfloat16)
     assert buffer.shape == (4, 8)
     comm.combine(buffer)
-    payload, rt, kwargs = a2a.calls["combine"]
-    assert payload.shape == (2, 2, 8)
-    assert kwargs["payload_in_workspace"] is True
-    assert kwargs["use_low_precision"] is True
+    payload, local_num_tokens, args, kwargs = fake_cake.calls["combine"]
+    assert payload.shape == (2, 2, 8) and local_num_tokens == 2
+    # Positional payload_in_workspace follows the combine payload offset.
+    assert args[-1] is True
+    assert kwargs["use_low_precision"] is True and kwargs["backend"] == "cake"
 
     comm.dispatch(hidden, ids, weights)
     comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
-    assert a2a.calls["combine"][2]["payload_in_workspace"] is False
+    assert fake_cake.calls["combine"][2][-1] is False
 
     with pytest.raises(ValueError, match="max_tokens_per_rank"):
         comm.dispatch(hidden, ids, weights, max_tokens_per_rank=4)
+    with pytest.raises(ValueError, match="enable_rank_mask"):
+        comm.dispatch(hidden, ids, weights, active_rank_mask=torch.ones(4))
+    with pytest.raises(RuntimeError, match="before dispatch"):
+        comm.combine(torch.zeros(6, 8, dtype=torch.bfloat16))
+
+    comm.destroy()
+    comm.destroy()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        comm.dispatch(hidden, ids, weights)
 
 
 def test_cake_needs_compute_capability_10_0_or_10_3(monkeypatch) -> None:
@@ -666,34 +688,29 @@ def test_nvlink_two_sided_marks_padding_rows_invalid(monkeypatch) -> None:
         communication as two_sided,
     )
 
-    calls: dict = {}
+    calls: dict = {"comm": []}
 
-    class _FakeMnnvlMoe:
-        @staticmethod
-        def get_moe_workspaces(mapping, config):
-            return "workspace"
+    def moe_prepare(*args):
+        calls["prepare"] = args
+        recv_ids = torch.tensor([[1, 3], [4, 4], [4, 4]], dtype=torch.int32)
+        indices = [torch.zeros(1, dtype=torch.int32) for _ in range(5)]
+        return (recv_ids, torch.ones(3, 2), *indices, None)
 
-        @staticmethod
-        def get_moe_prepare_workspace(mapping, config):
-            return "prepare_workspace"
+    def moe_comm(x, send_cumsum, send_indices, output, *args):
+        calls["comm"].append((x, output, args))
+        output.fill_(1.0)
 
-        @staticmethod
-        def mnnvl_moe_alltoallv_prepare_without_allgather(*args):
-            calls["prepare"] = args
-            recv_ids = torch.tensor([[1, 3], [4, 4], [4, 4]], dtype=torch.int32)
-            return "info", recv_ids, torch.ones(3, 2), None
-
-        @staticmethod
-        def mnnvl_moe_alltoallv(x, info, workspace, rank, size):
-            return torch.zeros(3, x.shape[1], dtype=x.dtype)
-
-        @staticmethod
-        def mnnvl_moe_alltoallv_combine(x, info, workspace, **kwargs):
-            calls["combine"] = kwargs
-            return torch.full((kwargs["token_count"], x.shape[1]), 2.0)
-
-    monkeypatch.setattr(two_sided_ops, "MnnvlMoe", _FakeMnnvlMoe)
+    monkeypatch.setattr(two_sided_ops, "moe_prepare", moe_prepare)
+    monkeypatch.setattr(two_sided_ops, "moe_comm", moe_comm)
     monkeypatch.setattr(mnnvl.MnnvlMemory, "initialize", staticmethod(lambda: None))
+    monkeypatch.setattr(
+        NVLinkTwoSidedAlltoAll,
+        "_acquire_workspaces",
+        lambda self, mapping: {
+            "workspace": "workspace",
+            "prepare_workspace": "prepare_workspace",
+        },
+    )
     monkeypatch.setattr(
         two_sided,
         "mnnvl_mapping_and_config",
@@ -714,12 +731,22 @@ def test_nvlink_two_sided_marks_padding_rows_invalid(monkeypatch) -> None:
     prepare_args = calls["prepare"]
     assert prepare_args[0].dtype == torch.int32
     assert prepare_args[1].dtype == torch.float32
+    assert prepare_args[3] == "prepare_workspace"
     assert result.topk_ids.tolist() == [[1, 3], [-1, -1], [-1, -1]]
+    # Hidden states arrive in ep_size * tokens_per_rank rows.
+    _, recv_hidden, args = calls["comm"][-1]
+    assert recv_hidden.shape == (3, 8) and args[2] == "workspace"
 
     out = torch.empty(1, 8)
     assert comm.combine(torch.ones(3, 8), output=out) is out
-    assert calls["combine"]["token_count"] == 1
+    # One row per top-k slot of the single local token, summed over the slots.
+    _, per_slot, _ = calls["comm"][-1]
+    assert per_slot.shape == (2, 8)
     torch.testing.assert_close(out, torch.full((1, 8), 2.0))
+
+    comm.destroy()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        comm.dispatch(torch.ones(1, 8), torch.tensor([[1, 3]]))
 
     with pytest.raises(ValueError, match="divisible by 4"):
         create_communication(
