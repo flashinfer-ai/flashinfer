@@ -50,6 +50,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_B_STRIDE 49152
 #define SMEM_TOTAL 196704
 #define THREADS 384
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -155,7 +156,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
 kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned int shape_n, unsigned int shape_k, float clamp_limit, const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap W, long long* __restrict__ offsets, __nv_bfloat16* __restrict__ D)
 {
     const int tid = threadIdx.x;
@@ -370,12 +371,17 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
         uint32_t warp_group_idx = static_cast<uint32_t>(tid) / 128u;
         unsigned int math_wg_idx = make_warp_uniform(warp_group_idx);
         float accum[128] = {0};
-        float outv[4] = {0};
+        unsigned int pk[4] = {0};
         unsigned int it_c = 0;
         unsigned int tile_base_c = 0;
         unsigned int warp_in_wg = (unsigned int)warp % 4;
         unsigned int lane_row = lane / 4;
         unsigned int lane_col = lane % 4 * 2;
+        unsigned int q_lane = lane % 4;
+        unsigned int m_odd = -(q_lane & 1);
+        unsigned int m_even = m_odd ^ 4294967295u;
+        unsigned int m_hi = -(q_lane >> 1 & 1);
+        unsigned int m_lo = m_hi ^ 4294967295u;
         for (unsigned int e_c = 0; e_c < num_experts; e_c++) {
             unsigned int row0_c = (unsigned int)offsets[e_c];
             unsigned int row1_c = (unsigned int)offsets[e_c + 1];
@@ -834,7 +840,7 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
                 }
                 unsigned int row_lo = m0_c + math_wg_idx * 64 + warp_in_wg * 16 + lane_row;
                 unsigned int row_hi = row_lo + 8;
-                unsigned int col_o = n0_c / 2 + lane_col;
+                unsigned int col_v = n0_c / 2 + q_lane * 8;
                 float _max_2 = max_noftz(accum[0], clamp_lo);
                 float _min_0 = fminf(_max_2, clamp_limit);
                 float _max_3 = max_noftz(accum[1], clamp_lo);
@@ -847,131 +853,115 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
                 float _rcp_0 = approx_rcp(_exp2_0 + 1.0f);
                 float _exp2_1 = approx_exp2(_min_1 * -1.4426950408889634f);
                 float _rcp_1 = approx_rcp(_exp2_1 + 1.0f);
-                outv[0] = _min_0 * _rcp_0 * _min_2;
-                outv[1] = _min_1 * _rcp_1 * _min_3;
-                float _max_6 = max_noftz(accum[2], clamp_lo);
+                __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(_min_0 * _rcp_0 * _min_2, _min_1 * _rcp_1 * _min_3));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_0)[0];
+                float _max_6 = max_noftz(accum[4], clamp_lo);
                 float _min_4 = fminf(_max_6, clamp_limit);
-                float _max_7 = max_noftz(accum[3], clamp_lo);
+                float _max_7 = max_noftz(accum[5], clamp_lo);
                 float _min_5 = fminf(_max_7, clamp_limit);
-                float _max_8 = max_noftz(accum[18], clamp_lo);
+                float _max_8 = max_noftz(accum[20], clamp_lo);
                 float _min_6 = fminf(_max_8, clamp_limit);
-                float _max_9 = max_noftz(accum[19], clamp_lo);
+                float _max_9 = max_noftz(accum[21], clamp_lo);
                 float _min_7 = fminf(_max_9, clamp_limit);
                 float _exp2_2 = approx_exp2(_min_4 * -1.4426950408889634f);
                 float _rcp_2 = approx_rcp(_exp2_2 + 1.0f);
                 float _exp2_3 = approx_exp2(_min_5 * -1.4426950408889634f);
                 float _rcp_3 = approx_rcp(_exp2_3 + 1.0f);
-                outv[2] = _min_4 * _rcp_2 * _min_6;
-                outv[3] = _min_5 * _rcp_3 * _min_7;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_0 = n0_c / 2 + 8 + lane_col;
-                float _max_10 = max_noftz(accum[4], clamp_lo);
+                __nv_bfloat162 _bf16x2_1 = __float22bfloat162_rn(make_float2(_min_4 * _rcp_2 * _min_6, _min_5 * _rcp_3 * _min_7));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_1)[0];
+                float _max_10 = max_noftz(accum[8], clamp_lo);
                 float _min_8 = fminf(_max_10, clamp_limit);
-                float _max_11 = max_noftz(accum[5], clamp_lo);
+                float _max_11 = max_noftz(accum[9], clamp_lo);
                 float _min_9 = fminf(_max_11, clamp_limit);
-                float _max_12 = max_noftz(accum[20], clamp_lo);
+                float _max_12 = max_noftz(accum[24], clamp_lo);
                 float _min_10 = fminf(_max_12, clamp_limit);
-                float _max_13 = max_noftz(accum[21], clamp_lo);
+                float _max_13 = max_noftz(accum[25], clamp_lo);
                 float _min_11 = fminf(_max_13, clamp_limit);
                 float _exp2_4 = approx_exp2(_min_8 * -1.4426950408889634f);
                 float _rcp_4 = approx_rcp(_exp2_4 + 1.0f);
                 float _exp2_5 = approx_exp2(_min_9 * -1.4426950408889634f);
                 float _rcp_5 = approx_rcp(_exp2_5 + 1.0f);
-                outv[0] = _min_8 * _rcp_4 * _min_10;
-                outv[1] = _min_9 * _rcp_5 * _min_11;
-                float _max_14 = max_noftz(accum[6], clamp_lo);
+                __nv_bfloat162 _bf16x2_2 = __float22bfloat162_rn(make_float2(_min_8 * _rcp_4 * _min_10, _min_9 * _rcp_5 * _min_11));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_2)[0];
+                float _max_14 = max_noftz(accum[12], clamp_lo);
                 float _min_12 = fminf(_max_14, clamp_limit);
-                float _max_15 = max_noftz(accum[7], clamp_lo);
+                float _max_15 = max_noftz(accum[13], clamp_lo);
                 float _min_13 = fminf(_max_15, clamp_limit);
-                float _max_16 = max_noftz(accum[22], clamp_lo);
+                float _max_16 = max_noftz(accum[28], clamp_lo);
                 float _min_14 = fminf(_max_16, clamp_limit);
-                float _max_17 = max_noftz(accum[23], clamp_lo);
+                float _max_17 = max_noftz(accum[29], clamp_lo);
                 float _min_15 = fminf(_max_17, clamp_limit);
                 float _exp2_6 = approx_exp2(_min_12 * -1.4426950408889634f);
                 float _rcp_6 = approx_rcp(_exp2_6 + 1.0f);
                 float _exp2_7 = approx_exp2(_min_13 * -1.4426950408889634f);
                 float _rcp_7 = approx_rcp(_exp2_7 + 1.0f);
-                outv[2] = _min_12 * _rcp_6 * _min_14;
-                outv[3] = _min_13 * _rcp_7 * _min_15;
+                __nv_bfloat162 _bf16x2_3 = __float22bfloat162_rn(make_float2(_min_12 * _rcp_6 * _min_14, _min_13 * _rcp_7 * _min_15));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_3)[0];
+                unsigned int x0 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, x0, 1);
+                unsigned int y0 = _shfl_xor_0;
+                unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, x1, 1);
+                unsigned int y1 = _shfl_xor_1;
+                pk[0] = y0 & m_odd | pk[0] & m_even;
+                pk[1] = y0 & m_even | pk[1] & m_odd;
+                pk[2] = y1 & m_odd | pk[2] & m_even;
+                pk[3] = y1 & m_even | pk[3] & m_odd;
+                unsigned int x2 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, x2, 2);
+                unsigned int y2 = _shfl_xor_2;
+                unsigned int _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, x3, 2);
+                unsigned int y3 = _shfl_xor_3;
+                pk[0] = y2 & m_hi | pk[0] & m_lo;
+                pk[2] = y2 & m_lo | pk[2] & m_hi;
+                pk[1] = y3 & m_hi | pk[1] & m_lo;
+                pk[3] = y3 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_0)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_v))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_0)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_1 = n0_c / 2 + 16 + lane_col;
-                float _max_18 = max_noftz(accum[8], clamp_lo);
+                float _max_18 = max_noftz(accum[2], clamp_lo);
                 float _min_16 = fminf(_max_18, clamp_limit);
-                float _max_19 = max_noftz(accum[9], clamp_lo);
+                float _max_19 = max_noftz(accum[3], clamp_lo);
                 float _min_17 = fminf(_max_19, clamp_limit);
-                float _max_20 = max_noftz(accum[24], clamp_lo);
+                float _max_20 = max_noftz(accum[18], clamp_lo);
                 float _min_18 = fminf(_max_20, clamp_limit);
-                float _max_21 = max_noftz(accum[25], clamp_lo);
+                float _max_21 = max_noftz(accum[19], clamp_lo);
                 float _min_19 = fminf(_max_21, clamp_limit);
                 float _exp2_8 = approx_exp2(_min_16 * -1.4426950408889634f);
                 float _rcp_8 = approx_rcp(_exp2_8 + 1.0f);
                 float _exp2_9 = approx_exp2(_min_17 * -1.4426950408889634f);
                 float _rcp_9 = approx_rcp(_exp2_9 + 1.0f);
-                outv[0] = _min_16 * _rcp_8 * _min_18;
-                outv[1] = _min_17 * _rcp_9 * _min_19;
-                float _max_22 = max_noftz(accum[10], clamp_lo);
+                __nv_bfloat162 _bf16x2_4 = __float22bfloat162_rn(make_float2(_min_16 * _rcp_8 * _min_18, _min_17 * _rcp_9 * _min_19));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_4)[0];
+                float _max_22 = max_noftz(accum[6], clamp_lo);
                 float _min_20 = fminf(_max_22, clamp_limit);
-                float _max_23 = max_noftz(accum[11], clamp_lo);
+                float _max_23 = max_noftz(accum[7], clamp_lo);
                 float _min_21 = fminf(_max_23, clamp_limit);
-                float _max_24 = max_noftz(accum[26], clamp_lo);
+                float _max_24 = max_noftz(accum[22], clamp_lo);
                 float _min_22 = fminf(_max_24, clamp_limit);
-                float _max_25 = max_noftz(accum[27], clamp_lo);
+                float _max_25 = max_noftz(accum[23], clamp_lo);
                 float _min_23 = fminf(_max_25, clamp_limit);
                 float _exp2_10 = approx_exp2(_min_20 * -1.4426950408889634f);
                 float _rcp_10 = approx_rcp(_exp2_10 + 1.0f);
                 float _exp2_11 = approx_exp2(_min_21 * -1.4426950408889634f);
                 float _rcp_11 = approx_rcp(_exp2_11 + 1.0f);
-                outv[2] = _min_20 * _rcp_10 * _min_22;
-                outv[3] = _min_21 * _rcp_11 * _min_23;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_1)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_1)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_2 = n0_c / 2 + 24 + lane_col;
-                float _max_26 = max_noftz(accum[12], clamp_lo);
+                __nv_bfloat162 _bf16x2_5 = __float22bfloat162_rn(make_float2(_min_20 * _rcp_10 * _min_22, _min_21 * _rcp_11 * _min_23));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_5)[0];
+                float _max_26 = max_noftz(accum[10], clamp_lo);
                 float _min_24 = fminf(_max_26, clamp_limit);
-                float _max_27 = max_noftz(accum[13], clamp_lo);
+                float _max_27 = max_noftz(accum[11], clamp_lo);
                 float _min_25 = fminf(_max_27, clamp_limit);
-                float _max_28 = max_noftz(accum[28], clamp_lo);
+                float _max_28 = max_noftz(accum[26], clamp_lo);
                 float _min_26 = fminf(_max_28, clamp_limit);
-                float _max_29 = max_noftz(accum[29], clamp_lo);
+                float _max_29 = max_noftz(accum[27], clamp_lo);
                 float _min_27 = fminf(_max_29, clamp_limit);
                 float _exp2_12 = approx_exp2(_min_24 * -1.4426950408889634f);
                 float _rcp_12 = approx_rcp(_exp2_12 + 1.0f);
                 float _exp2_13 = approx_exp2(_min_25 * -1.4426950408889634f);
                 float _rcp_13 = approx_rcp(_exp2_13 + 1.0f);
-                outv[0] = _min_24 * _rcp_12 * _min_26;
-                outv[1] = _min_25 * _rcp_13 * _min_27;
+                __nv_bfloat162 _bf16x2_6 = __float22bfloat162_rn(make_float2(_min_24 * _rcp_12 * _min_26, _min_25 * _rcp_13 * _min_27));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_6)[0];
                 float _max_30 = max_noftz(accum[14], clamp_lo);
                 float _min_28 = fminf(_max_30, clamp_limit);
                 float _max_31 = max_noftz(accum[15], clamp_lo);
@@ -984,21 +974,32 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
                 float _rcp_14 = approx_rcp(_exp2_14 + 1.0f);
                 float _exp2_15 = approx_exp2(_min_29 * -1.4426950408889634f);
                 float _rcp_15 = approx_rcp(_exp2_15 + 1.0f);
-                outv[2] = _min_28 * _rcp_14 * _min_30;
-                outv[3] = _min_29 * _rcp_15 * _min_31;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_2)))[0]) = _pk;
-                    }
-                }
+                __nv_bfloat162 _bf16x2_7 = __float22bfloat162_rn(make_float2(_min_28 * _rcp_14 * _min_30, _min_29 * _rcp_15 * _min_31));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_7)[0];
+                unsigned int x0_0 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_1 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, x0_0, 1);
+                unsigned int y0_2 = _shfl_xor_4;
+                unsigned int _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, x1_1, 1);
+                unsigned int y1_3 = _shfl_xor_5;
+                pk[0] = y0_2 & m_odd | pk[0] & m_even;
+                pk[1] = y0_2 & m_even | pk[1] & m_odd;
+                pk[2] = y1_3 & m_odd | pk[2] & m_even;
+                pk[3] = y1_3 & m_even | pk[3] & m_odd;
+                unsigned int x2_4 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_5 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, x2_4, 2);
+                unsigned int y2_6 = _shfl_xor_6;
+                unsigned int _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, x3_5, 2);
+                unsigned int y3_7 = _shfl_xor_7;
+                pk[0] = y2_6 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_6 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_7 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_7 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_2)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_v))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_o_3 = n0_c / 2 + 32 + lane_col;
+                unsigned int col_v_8 = n0_c / 2 + (4 + q_lane) * 8;
                 float _max_34 = max_noftz(accum[32], clamp_lo);
                 float _min_32 = fminf(_max_34, clamp_limit);
                 float _max_35 = max_noftz(accum[33], clamp_lo);
@@ -1011,131 +1012,115 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
                 float _rcp_16 = approx_rcp(_exp2_16 + 1.0f);
                 float _exp2_17 = approx_exp2(_min_33 * -1.4426950408889634f);
                 float _rcp_17 = approx_rcp(_exp2_17 + 1.0f);
-                outv[0] = _min_32 * _rcp_16 * _min_34;
-                outv[1] = _min_33 * _rcp_17 * _min_35;
-                float _max_38 = max_noftz(accum[34], clamp_lo);
+                __nv_bfloat162 _bf16x2_8 = __float22bfloat162_rn(make_float2(_min_32 * _rcp_16 * _min_34, _min_33 * _rcp_17 * _min_35));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_8)[0];
+                float _max_38 = max_noftz(accum[36], clamp_lo);
                 float _min_36 = fminf(_max_38, clamp_limit);
-                float _max_39 = max_noftz(accum[35], clamp_lo);
+                float _max_39 = max_noftz(accum[37], clamp_lo);
                 float _min_37 = fminf(_max_39, clamp_limit);
-                float _max_40 = max_noftz(accum[50], clamp_lo);
+                float _max_40 = max_noftz(accum[52], clamp_lo);
                 float _min_38 = fminf(_max_40, clamp_limit);
-                float _max_41 = max_noftz(accum[51], clamp_lo);
+                float _max_41 = max_noftz(accum[53], clamp_lo);
                 float _min_39 = fminf(_max_41, clamp_limit);
                 float _exp2_18 = approx_exp2(_min_36 * -1.4426950408889634f);
                 float _rcp_18 = approx_rcp(_exp2_18 + 1.0f);
                 float _exp2_19 = approx_exp2(_min_37 * -1.4426950408889634f);
                 float _rcp_19 = approx_rcp(_exp2_19 + 1.0f);
-                outv[2] = _min_36 * _rcp_18 * _min_38;
-                outv[3] = _min_37 * _rcp_19 * _min_39;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_3)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_3)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_4 = n0_c / 2 + 40 + lane_col;
-                float _max_42 = max_noftz(accum[36], clamp_lo);
+                __nv_bfloat162 _bf16x2_9 = __float22bfloat162_rn(make_float2(_min_36 * _rcp_18 * _min_38, _min_37 * _rcp_19 * _min_39));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_9)[0];
+                float _max_42 = max_noftz(accum[40], clamp_lo);
                 float _min_40 = fminf(_max_42, clamp_limit);
-                float _max_43 = max_noftz(accum[37], clamp_lo);
+                float _max_43 = max_noftz(accum[41], clamp_lo);
                 float _min_41 = fminf(_max_43, clamp_limit);
-                float _max_44 = max_noftz(accum[52], clamp_lo);
+                float _max_44 = max_noftz(accum[56], clamp_lo);
                 float _min_42 = fminf(_max_44, clamp_limit);
-                float _max_45 = max_noftz(accum[53], clamp_lo);
+                float _max_45 = max_noftz(accum[57], clamp_lo);
                 float _min_43 = fminf(_max_45, clamp_limit);
                 float _exp2_20 = approx_exp2(_min_40 * -1.4426950408889634f);
                 float _rcp_20 = approx_rcp(_exp2_20 + 1.0f);
                 float _exp2_21 = approx_exp2(_min_41 * -1.4426950408889634f);
                 float _rcp_21 = approx_rcp(_exp2_21 + 1.0f);
-                outv[0] = _min_40 * _rcp_20 * _min_42;
-                outv[1] = _min_41 * _rcp_21 * _min_43;
-                float _max_46 = max_noftz(accum[38], clamp_lo);
+                __nv_bfloat162 _bf16x2_10 = __float22bfloat162_rn(make_float2(_min_40 * _rcp_20 * _min_42, _min_41 * _rcp_21 * _min_43));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_10)[0];
+                float _max_46 = max_noftz(accum[44], clamp_lo);
                 float _min_44 = fminf(_max_46, clamp_limit);
-                float _max_47 = max_noftz(accum[39], clamp_lo);
+                float _max_47 = max_noftz(accum[45], clamp_lo);
                 float _min_45 = fminf(_max_47, clamp_limit);
-                float _max_48 = max_noftz(accum[54], clamp_lo);
+                float _max_48 = max_noftz(accum[60], clamp_lo);
                 float _min_46 = fminf(_max_48, clamp_limit);
-                float _max_49 = max_noftz(accum[55], clamp_lo);
+                float _max_49 = max_noftz(accum[61], clamp_lo);
                 float _min_47 = fminf(_max_49, clamp_limit);
                 float _exp2_22 = approx_exp2(_min_44 * -1.4426950408889634f);
                 float _rcp_22 = approx_rcp(_exp2_22 + 1.0f);
                 float _exp2_23 = approx_exp2(_min_45 * -1.4426950408889634f);
                 float _rcp_23 = approx_rcp(_exp2_23 + 1.0f);
-                outv[2] = _min_44 * _rcp_22 * _min_46;
-                outv[3] = _min_45 * _rcp_23 * _min_47;
+                __nv_bfloat162 _bf16x2_11 = __float22bfloat162_rn(make_float2(_min_44 * _rcp_22 * _min_46, _min_45 * _rcp_23 * _min_47));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_11)[0];
+                unsigned int x0_9 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_10 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, x0_9, 1);
+                unsigned int y0_11 = _shfl_xor_8;
+                unsigned int _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, x1_10, 1);
+                unsigned int y1_12 = _shfl_xor_9;
+                pk[0] = y0_11 & m_odd | pk[0] & m_even;
+                pk[1] = y0_11 & m_even | pk[1] & m_odd;
+                pk[2] = y1_12 & m_odd | pk[2] & m_even;
+                pk[3] = y1_12 & m_even | pk[3] & m_odd;
+                unsigned int x2_13 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_14 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, x2_13, 2);
+                unsigned int y2_15 = _shfl_xor_10;
+                unsigned int _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, x3_14, 2);
+                unsigned int y3_16 = _shfl_xor_11;
+                pk[0] = y2_15 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_15 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_16 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_16 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_4)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_v_8))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_4)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_5 = n0_c / 2 + 48 + lane_col;
-                float _max_50 = max_noftz(accum[40], clamp_lo);
+                float _max_50 = max_noftz(accum[34], clamp_lo);
                 float _min_48 = fminf(_max_50, clamp_limit);
-                float _max_51 = max_noftz(accum[41], clamp_lo);
+                float _max_51 = max_noftz(accum[35], clamp_lo);
                 float _min_49 = fminf(_max_51, clamp_limit);
-                float _max_52 = max_noftz(accum[56], clamp_lo);
+                float _max_52 = max_noftz(accum[50], clamp_lo);
                 float _min_50 = fminf(_max_52, clamp_limit);
-                float _max_53 = max_noftz(accum[57], clamp_lo);
+                float _max_53 = max_noftz(accum[51], clamp_lo);
                 float _min_51 = fminf(_max_53, clamp_limit);
                 float _exp2_24 = approx_exp2(_min_48 * -1.4426950408889634f);
                 float _rcp_24 = approx_rcp(_exp2_24 + 1.0f);
                 float _exp2_25 = approx_exp2(_min_49 * -1.4426950408889634f);
                 float _rcp_25 = approx_rcp(_exp2_25 + 1.0f);
-                outv[0] = _min_48 * _rcp_24 * _min_50;
-                outv[1] = _min_49 * _rcp_25 * _min_51;
-                float _max_54 = max_noftz(accum[42], clamp_lo);
+                __nv_bfloat162 _bf16x2_12 = __float22bfloat162_rn(make_float2(_min_48 * _rcp_24 * _min_50, _min_49 * _rcp_25 * _min_51));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_12)[0];
+                float _max_54 = max_noftz(accum[38], clamp_lo);
                 float _min_52 = fminf(_max_54, clamp_limit);
-                float _max_55 = max_noftz(accum[43], clamp_lo);
+                float _max_55 = max_noftz(accum[39], clamp_lo);
                 float _min_53 = fminf(_max_55, clamp_limit);
-                float _max_56 = max_noftz(accum[58], clamp_lo);
+                float _max_56 = max_noftz(accum[54], clamp_lo);
                 float _min_54 = fminf(_max_56, clamp_limit);
-                float _max_57 = max_noftz(accum[59], clamp_lo);
+                float _max_57 = max_noftz(accum[55], clamp_lo);
                 float _min_55 = fminf(_max_57, clamp_limit);
                 float _exp2_26 = approx_exp2(_min_52 * -1.4426950408889634f);
                 float _rcp_26 = approx_rcp(_exp2_26 + 1.0f);
                 float _exp2_27 = approx_exp2(_min_53 * -1.4426950408889634f);
                 float _rcp_27 = approx_rcp(_exp2_27 + 1.0f);
-                outv[2] = _min_52 * _rcp_26 * _min_54;
-                outv[3] = _min_53 * _rcp_27 * _min_55;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_5)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_5)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_6 = n0_c / 2 + 56 + lane_col;
-                float _max_58 = max_noftz(accum[44], clamp_lo);
+                __nv_bfloat162 _bf16x2_13 = __float22bfloat162_rn(make_float2(_min_52 * _rcp_26 * _min_54, _min_53 * _rcp_27 * _min_55));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_13)[0];
+                float _max_58 = max_noftz(accum[42], clamp_lo);
                 float _min_56 = fminf(_max_58, clamp_limit);
-                float _max_59 = max_noftz(accum[45], clamp_lo);
+                float _max_59 = max_noftz(accum[43], clamp_lo);
                 float _min_57 = fminf(_max_59, clamp_limit);
-                float _max_60 = max_noftz(accum[60], clamp_lo);
+                float _max_60 = max_noftz(accum[58], clamp_lo);
                 float _min_58 = fminf(_max_60, clamp_limit);
-                float _max_61 = max_noftz(accum[61], clamp_lo);
+                float _max_61 = max_noftz(accum[59], clamp_lo);
                 float _min_59 = fminf(_max_61, clamp_limit);
                 float _exp2_28 = approx_exp2(_min_56 * -1.4426950408889634f);
                 float _rcp_28 = approx_rcp(_exp2_28 + 1.0f);
                 float _exp2_29 = approx_exp2(_min_57 * -1.4426950408889634f);
                 float _rcp_29 = approx_rcp(_exp2_29 + 1.0f);
-                outv[0] = _min_56 * _rcp_28 * _min_58;
-                outv[1] = _min_57 * _rcp_29 * _min_59;
+                __nv_bfloat162 _bf16x2_14 = __float22bfloat162_rn(make_float2(_min_56 * _rcp_28 * _min_58, _min_57 * _rcp_29 * _min_59));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_14)[0];
                 float _max_62 = max_noftz(accum[46], clamp_lo);
                 float _min_60 = fminf(_max_62, clamp_limit);
                 float _max_63 = max_noftz(accum[47], clamp_lo);
@@ -1148,21 +1133,32 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
                 float _rcp_30 = approx_rcp(_exp2_30 + 1.0f);
                 float _exp2_31 = approx_exp2(_min_61 * -1.4426950408889634f);
                 float _rcp_31 = approx_rcp(_exp2_31 + 1.0f);
-                outv[2] = _min_60 * _rcp_30 * _min_62;
-                outv[3] = _min_61 * _rcp_31 * _min_63;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_6)))[0]) = _pk;
-                    }
-                }
+                __nv_bfloat162 _bf16x2_15 = __float22bfloat162_rn(make_float2(_min_60 * _rcp_30 * _min_62, _min_61 * _rcp_31 * _min_63));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_15)[0];
+                unsigned int x0_17 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_18 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, x0_17, 1);
+                unsigned int y0_19 = _shfl_xor_12;
+                unsigned int _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, x1_18, 1);
+                unsigned int y1_20 = _shfl_xor_13;
+                pk[0] = y0_19 & m_odd | pk[0] & m_even;
+                pk[1] = y0_19 & m_even | pk[1] & m_odd;
+                pk[2] = y1_20 & m_odd | pk[2] & m_even;
+                pk[3] = y1_20 & m_even | pk[3] & m_odd;
+                unsigned int x2_21 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_22 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, x2_21, 2);
+                unsigned int y2_23 = _shfl_xor_14;
+                unsigned int _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, x3_22, 2);
+                unsigned int y3_24 = _shfl_xor_15;
+                pk[0] = y2_23 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_23 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_24 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_24 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_6)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_v_8))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_o_7 = n0_c / 2 + 64 + lane_col;
+                unsigned int col_v_25 = n0_c / 2 + (8 + q_lane) * 8;
                 float _max_66 = max_noftz(accum[64], clamp_lo);
                 float _min_64 = fminf(_max_66, clamp_limit);
                 float _max_67 = max_noftz(accum[65], clamp_lo);
@@ -1175,131 +1171,115 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
                 float _rcp_32 = approx_rcp(_exp2_32 + 1.0f);
                 float _exp2_33 = approx_exp2(_min_65 * -1.4426950408889634f);
                 float _rcp_33 = approx_rcp(_exp2_33 + 1.0f);
-                outv[0] = _min_64 * _rcp_32 * _min_66;
-                outv[1] = _min_65 * _rcp_33 * _min_67;
-                float _max_70 = max_noftz(accum[66], clamp_lo);
+                __nv_bfloat162 _bf16x2_16 = __float22bfloat162_rn(make_float2(_min_64 * _rcp_32 * _min_66, _min_65 * _rcp_33 * _min_67));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_16)[0];
+                float _max_70 = max_noftz(accum[68], clamp_lo);
                 float _min_68 = fminf(_max_70, clamp_limit);
-                float _max_71 = max_noftz(accum[67], clamp_lo);
+                float _max_71 = max_noftz(accum[69], clamp_lo);
                 float _min_69 = fminf(_max_71, clamp_limit);
-                float _max_72 = max_noftz(accum[82], clamp_lo);
+                float _max_72 = max_noftz(accum[84], clamp_lo);
                 float _min_70 = fminf(_max_72, clamp_limit);
-                float _max_73 = max_noftz(accum[83], clamp_lo);
+                float _max_73 = max_noftz(accum[85], clamp_lo);
                 float _min_71 = fminf(_max_73, clamp_limit);
                 float _exp2_34 = approx_exp2(_min_68 * -1.4426950408889634f);
                 float _rcp_34 = approx_rcp(_exp2_34 + 1.0f);
                 float _exp2_35 = approx_exp2(_min_69 * -1.4426950408889634f);
                 float _rcp_35 = approx_rcp(_exp2_35 + 1.0f);
-                outv[2] = _min_68 * _rcp_34 * _min_70;
-                outv[3] = _min_69 * _rcp_35 * _min_71;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_7)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_7)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_8 = n0_c / 2 + 72 + lane_col;
-                float _max_74 = max_noftz(accum[68], clamp_lo);
+                __nv_bfloat162 _bf16x2_17 = __float22bfloat162_rn(make_float2(_min_68 * _rcp_34 * _min_70, _min_69 * _rcp_35 * _min_71));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_17)[0];
+                float _max_74 = max_noftz(accum[72], clamp_lo);
                 float _min_72 = fminf(_max_74, clamp_limit);
-                float _max_75 = max_noftz(accum[69], clamp_lo);
+                float _max_75 = max_noftz(accum[73], clamp_lo);
                 float _min_73 = fminf(_max_75, clamp_limit);
-                float _max_76 = max_noftz(accum[84], clamp_lo);
+                float _max_76 = max_noftz(accum[88], clamp_lo);
                 float _min_74 = fminf(_max_76, clamp_limit);
-                float _max_77 = max_noftz(accum[85], clamp_lo);
+                float _max_77 = max_noftz(accum[89], clamp_lo);
                 float _min_75 = fminf(_max_77, clamp_limit);
                 float _exp2_36 = approx_exp2(_min_72 * -1.4426950408889634f);
                 float _rcp_36 = approx_rcp(_exp2_36 + 1.0f);
                 float _exp2_37 = approx_exp2(_min_73 * -1.4426950408889634f);
                 float _rcp_37 = approx_rcp(_exp2_37 + 1.0f);
-                outv[0] = _min_72 * _rcp_36 * _min_74;
-                outv[1] = _min_73 * _rcp_37 * _min_75;
-                float _max_78 = max_noftz(accum[70], clamp_lo);
+                __nv_bfloat162 _bf16x2_18 = __float22bfloat162_rn(make_float2(_min_72 * _rcp_36 * _min_74, _min_73 * _rcp_37 * _min_75));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_18)[0];
+                float _max_78 = max_noftz(accum[76], clamp_lo);
                 float _min_76 = fminf(_max_78, clamp_limit);
-                float _max_79 = max_noftz(accum[71], clamp_lo);
+                float _max_79 = max_noftz(accum[77], clamp_lo);
                 float _min_77 = fminf(_max_79, clamp_limit);
-                float _max_80 = max_noftz(accum[86], clamp_lo);
+                float _max_80 = max_noftz(accum[92], clamp_lo);
                 float _min_78 = fminf(_max_80, clamp_limit);
-                float _max_81 = max_noftz(accum[87], clamp_lo);
+                float _max_81 = max_noftz(accum[93], clamp_lo);
                 float _min_79 = fminf(_max_81, clamp_limit);
                 float _exp2_38 = approx_exp2(_min_76 * -1.4426950408889634f);
                 float _rcp_38 = approx_rcp(_exp2_38 + 1.0f);
                 float _exp2_39 = approx_exp2(_min_77 * -1.4426950408889634f);
                 float _rcp_39 = approx_rcp(_exp2_39 + 1.0f);
-                outv[2] = _min_76 * _rcp_38 * _min_78;
-                outv[3] = _min_77 * _rcp_39 * _min_79;
+                __nv_bfloat162 _bf16x2_19 = __float22bfloat162_rn(make_float2(_min_76 * _rcp_38 * _min_78, _min_77 * _rcp_39 * _min_79));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_19)[0];
+                unsigned int x0_26 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_27 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, x0_26, 1);
+                unsigned int y0_28 = _shfl_xor_16;
+                unsigned int _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, x1_27, 1);
+                unsigned int y1_29 = _shfl_xor_17;
+                pk[0] = y0_28 & m_odd | pk[0] & m_even;
+                pk[1] = y0_28 & m_even | pk[1] & m_odd;
+                pk[2] = y1_29 & m_odd | pk[2] & m_even;
+                pk[3] = y1_29 & m_even | pk[3] & m_odd;
+                unsigned int x2_30 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_31 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, x2_30, 2);
+                unsigned int y2_32 = _shfl_xor_18;
+                unsigned int _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, x3_31, 2);
+                unsigned int y3_33 = _shfl_xor_19;
+                pk[0] = y2_32 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_32 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_33 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_33 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_8)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_v_25))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_8)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_9 = n0_c / 2 + 80 + lane_col;
-                float _max_82 = max_noftz(accum[72], clamp_lo);
+                float _max_82 = max_noftz(accum[66], clamp_lo);
                 float _min_80 = fminf(_max_82, clamp_limit);
-                float _max_83 = max_noftz(accum[73], clamp_lo);
+                float _max_83 = max_noftz(accum[67], clamp_lo);
                 float _min_81 = fminf(_max_83, clamp_limit);
-                float _max_84 = max_noftz(accum[88], clamp_lo);
+                float _max_84 = max_noftz(accum[82], clamp_lo);
                 float _min_82 = fminf(_max_84, clamp_limit);
-                float _max_85 = max_noftz(accum[89], clamp_lo);
+                float _max_85 = max_noftz(accum[83], clamp_lo);
                 float _min_83 = fminf(_max_85, clamp_limit);
                 float _exp2_40 = approx_exp2(_min_80 * -1.4426950408889634f);
                 float _rcp_40 = approx_rcp(_exp2_40 + 1.0f);
                 float _exp2_41 = approx_exp2(_min_81 * -1.4426950408889634f);
                 float _rcp_41 = approx_rcp(_exp2_41 + 1.0f);
-                outv[0] = _min_80 * _rcp_40 * _min_82;
-                outv[1] = _min_81 * _rcp_41 * _min_83;
-                float _max_86 = max_noftz(accum[74], clamp_lo);
+                __nv_bfloat162 _bf16x2_20 = __float22bfloat162_rn(make_float2(_min_80 * _rcp_40 * _min_82, _min_81 * _rcp_41 * _min_83));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_20)[0];
+                float _max_86 = max_noftz(accum[70], clamp_lo);
                 float _min_84 = fminf(_max_86, clamp_limit);
-                float _max_87 = max_noftz(accum[75], clamp_lo);
+                float _max_87 = max_noftz(accum[71], clamp_lo);
                 float _min_85 = fminf(_max_87, clamp_limit);
-                float _max_88 = max_noftz(accum[90], clamp_lo);
+                float _max_88 = max_noftz(accum[86], clamp_lo);
                 float _min_86 = fminf(_max_88, clamp_limit);
-                float _max_89 = max_noftz(accum[91], clamp_lo);
+                float _max_89 = max_noftz(accum[87], clamp_lo);
                 float _min_87 = fminf(_max_89, clamp_limit);
                 float _exp2_42 = approx_exp2(_min_84 * -1.4426950408889634f);
                 float _rcp_42 = approx_rcp(_exp2_42 + 1.0f);
                 float _exp2_43 = approx_exp2(_min_85 * -1.4426950408889634f);
                 float _rcp_43 = approx_rcp(_exp2_43 + 1.0f);
-                outv[2] = _min_84 * _rcp_42 * _min_86;
-                outv[3] = _min_85 * _rcp_43 * _min_87;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_9)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_9)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_10 = n0_c / 2 + 88 + lane_col;
-                float _max_90 = max_noftz(accum[76], clamp_lo);
+                __nv_bfloat162 _bf16x2_21 = __float22bfloat162_rn(make_float2(_min_84 * _rcp_42 * _min_86, _min_85 * _rcp_43 * _min_87));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_21)[0];
+                float _max_90 = max_noftz(accum[74], clamp_lo);
                 float _min_88 = fminf(_max_90, clamp_limit);
-                float _max_91 = max_noftz(accum[77], clamp_lo);
+                float _max_91 = max_noftz(accum[75], clamp_lo);
                 float _min_89 = fminf(_max_91, clamp_limit);
-                float _max_92 = max_noftz(accum[92], clamp_lo);
+                float _max_92 = max_noftz(accum[90], clamp_lo);
                 float _min_90 = fminf(_max_92, clamp_limit);
-                float _max_93 = max_noftz(accum[93], clamp_lo);
+                float _max_93 = max_noftz(accum[91], clamp_lo);
                 float _min_91 = fminf(_max_93, clamp_limit);
                 float _exp2_44 = approx_exp2(_min_88 * -1.4426950408889634f);
                 float _rcp_44 = approx_rcp(_exp2_44 + 1.0f);
                 float _exp2_45 = approx_exp2(_min_89 * -1.4426950408889634f);
                 float _rcp_45 = approx_rcp(_exp2_45 + 1.0f);
-                outv[0] = _min_88 * _rcp_44 * _min_90;
-                outv[1] = _min_89 * _rcp_45 * _min_91;
+                __nv_bfloat162 _bf16x2_22 = __float22bfloat162_rn(make_float2(_min_88 * _rcp_44 * _min_90, _min_89 * _rcp_45 * _min_91));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_22)[0];
                 float _max_94 = max_noftz(accum[78], clamp_lo);
                 float _min_92 = fminf(_max_94, clamp_limit);
                 float _max_95 = max_noftz(accum[79], clamp_lo);
@@ -1312,21 +1292,32 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
                 float _rcp_46 = approx_rcp(_exp2_46 + 1.0f);
                 float _exp2_47 = approx_exp2(_min_93 * -1.4426950408889634f);
                 float _rcp_47 = approx_rcp(_exp2_47 + 1.0f);
-                outv[2] = _min_92 * _rcp_46 * _min_94;
-                outv[3] = _min_93 * _rcp_47 * _min_95;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_10)))[0]) = _pk;
-                    }
-                }
+                __nv_bfloat162 _bf16x2_23 = __float22bfloat162_rn(make_float2(_min_92 * _rcp_46 * _min_94, _min_93 * _rcp_47 * _min_95));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_23)[0];
+                unsigned int x0_34 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_35 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, x0_34, 1);
+                unsigned int y0_36 = _shfl_xor_20;
+                unsigned int _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, x1_35, 1);
+                unsigned int y1_37 = _shfl_xor_21;
+                pk[0] = y0_36 & m_odd | pk[0] & m_even;
+                pk[1] = y0_36 & m_even | pk[1] & m_odd;
+                pk[2] = y1_37 & m_odd | pk[2] & m_even;
+                pk[3] = y1_37 & m_even | pk[3] & m_odd;
+                unsigned int x2_38 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_39 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, x2_38, 2);
+                unsigned int y2_40 = _shfl_xor_22;
+                unsigned int _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, x3_39, 2);
+                unsigned int y3_41 = _shfl_xor_23;
+                pk[0] = y2_40 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_40 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_41 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_41 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_10)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_v_25))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_o_11 = n0_c / 2 + 96 + lane_col;
+                unsigned int col_v_42 = n0_c / 2 + (12 + q_lane) * 8;
                 float _max_98 = max_noftz(accum[96], clamp_lo);
                 float _min_96 = fminf(_max_98, clamp_limit);
                 float _max_99 = max_noftz(accum[97], clamp_lo);
@@ -1339,131 +1330,115 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
                 float _rcp_48 = approx_rcp(_exp2_48 + 1.0f);
                 float _exp2_49 = approx_exp2(_min_97 * -1.4426950408889634f);
                 float _rcp_49 = approx_rcp(_exp2_49 + 1.0f);
-                outv[0] = _min_96 * _rcp_48 * _min_98;
-                outv[1] = _min_97 * _rcp_49 * _min_99;
-                float _max_102 = max_noftz(accum[98], clamp_lo);
+                __nv_bfloat162 _bf16x2_24 = __float22bfloat162_rn(make_float2(_min_96 * _rcp_48 * _min_98, _min_97 * _rcp_49 * _min_99));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_24)[0];
+                float _max_102 = max_noftz(accum[100], clamp_lo);
                 float _min_100 = fminf(_max_102, clamp_limit);
-                float _max_103 = max_noftz(accum[99], clamp_lo);
+                float _max_103 = max_noftz(accum[101], clamp_lo);
                 float _min_101 = fminf(_max_103, clamp_limit);
-                float _max_104 = max_noftz(accum[114], clamp_lo);
+                float _max_104 = max_noftz(accum[116], clamp_lo);
                 float _min_102 = fminf(_max_104, clamp_limit);
-                float _max_105 = max_noftz(accum[115], clamp_lo);
+                float _max_105 = max_noftz(accum[117], clamp_lo);
                 float _min_103 = fminf(_max_105, clamp_limit);
                 float _exp2_50 = approx_exp2(_min_100 * -1.4426950408889634f);
                 float _rcp_50 = approx_rcp(_exp2_50 + 1.0f);
                 float _exp2_51 = approx_exp2(_min_101 * -1.4426950408889634f);
                 float _rcp_51 = approx_rcp(_exp2_51 + 1.0f);
-                outv[2] = _min_100 * _rcp_50 * _min_102;
-                outv[3] = _min_101 * _rcp_51 * _min_103;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_11)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_11)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_12 = n0_c / 2 + 104 + lane_col;
-                float _max_106 = max_noftz(accum[100], clamp_lo);
+                __nv_bfloat162 _bf16x2_25 = __float22bfloat162_rn(make_float2(_min_100 * _rcp_50 * _min_102, _min_101 * _rcp_51 * _min_103));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_25)[0];
+                float _max_106 = max_noftz(accum[104], clamp_lo);
                 float _min_104 = fminf(_max_106, clamp_limit);
-                float _max_107 = max_noftz(accum[101], clamp_lo);
+                float _max_107 = max_noftz(accum[105], clamp_lo);
                 float _min_105 = fminf(_max_107, clamp_limit);
-                float _max_108 = max_noftz(accum[116], clamp_lo);
+                float _max_108 = max_noftz(accum[120], clamp_lo);
                 float _min_106 = fminf(_max_108, clamp_limit);
-                float _max_109 = max_noftz(accum[117], clamp_lo);
+                float _max_109 = max_noftz(accum[121], clamp_lo);
                 float _min_107 = fminf(_max_109, clamp_limit);
                 float _exp2_52 = approx_exp2(_min_104 * -1.4426950408889634f);
                 float _rcp_52 = approx_rcp(_exp2_52 + 1.0f);
                 float _exp2_53 = approx_exp2(_min_105 * -1.4426950408889634f);
                 float _rcp_53 = approx_rcp(_exp2_53 + 1.0f);
-                outv[0] = _min_104 * _rcp_52 * _min_106;
-                outv[1] = _min_105 * _rcp_53 * _min_107;
-                float _max_110 = max_noftz(accum[102], clamp_lo);
+                __nv_bfloat162 _bf16x2_26 = __float22bfloat162_rn(make_float2(_min_104 * _rcp_52 * _min_106, _min_105 * _rcp_53 * _min_107));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_26)[0];
+                float _max_110 = max_noftz(accum[108], clamp_lo);
                 float _min_108 = fminf(_max_110, clamp_limit);
-                float _max_111 = max_noftz(accum[103], clamp_lo);
+                float _max_111 = max_noftz(accum[109], clamp_lo);
                 float _min_109 = fminf(_max_111, clamp_limit);
-                float _max_112 = max_noftz(accum[118], clamp_lo);
+                float _max_112 = max_noftz(accum[124], clamp_lo);
                 float _min_110 = fminf(_max_112, clamp_limit);
-                float _max_113 = max_noftz(accum[119], clamp_lo);
+                float _max_113 = max_noftz(accum[125], clamp_lo);
                 float _min_111 = fminf(_max_113, clamp_limit);
                 float _exp2_54 = approx_exp2(_min_108 * -1.4426950408889634f);
                 float _rcp_54 = approx_rcp(_exp2_54 + 1.0f);
                 float _exp2_55 = approx_exp2(_min_109 * -1.4426950408889634f);
                 float _rcp_55 = approx_rcp(_exp2_55 + 1.0f);
-                outv[2] = _min_108 * _rcp_54 * _min_110;
-                outv[3] = _min_109 * _rcp_55 * _min_111;
+                __nv_bfloat162 _bf16x2_27 = __float22bfloat162_rn(make_float2(_min_108 * _rcp_54 * _min_110, _min_109 * _rcp_55 * _min_111));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_27)[0];
+                unsigned int x0_43 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_44 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, x0_43, 1);
+                unsigned int y0_45 = _shfl_xor_24;
+                unsigned int _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, x1_44, 1);
+                unsigned int y1_46 = _shfl_xor_25;
+                pk[0] = y0_45 & m_odd | pk[0] & m_even;
+                pk[1] = y0_45 & m_even | pk[1] & m_odd;
+                pk[2] = y1_46 & m_odd | pk[2] & m_even;
+                pk[3] = y1_46 & m_even | pk[3] & m_odd;
+                unsigned int x2_47 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_48 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, x2_47, 2);
+                unsigned int y2_49 = _shfl_xor_26;
+                unsigned int _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, x3_48, 2);
+                unsigned int y3_50 = _shfl_xor_27;
+                pk[0] = y2_49 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_49 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_50 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_50 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_12)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_v_42))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_12)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_13 = n0_c / 2 + 112 + lane_col;
-                float _max_114 = max_noftz(accum[104], clamp_lo);
+                float _max_114 = max_noftz(accum[98], clamp_lo);
                 float _min_112 = fminf(_max_114, clamp_limit);
-                float _max_115 = max_noftz(accum[105], clamp_lo);
+                float _max_115 = max_noftz(accum[99], clamp_lo);
                 float _min_113 = fminf(_max_115, clamp_limit);
-                float _max_116 = max_noftz(accum[120], clamp_lo);
+                float _max_116 = max_noftz(accum[114], clamp_lo);
                 float _min_114 = fminf(_max_116, clamp_limit);
-                float _max_117 = max_noftz(accum[121], clamp_lo);
+                float _max_117 = max_noftz(accum[115], clamp_lo);
                 float _min_115 = fminf(_max_117, clamp_limit);
                 float _exp2_56 = approx_exp2(_min_112 * -1.4426950408889634f);
                 float _rcp_56 = approx_rcp(_exp2_56 + 1.0f);
                 float _exp2_57 = approx_exp2(_min_113 * -1.4426950408889634f);
                 float _rcp_57 = approx_rcp(_exp2_57 + 1.0f);
-                outv[0] = _min_112 * _rcp_56 * _min_114;
-                outv[1] = _min_113 * _rcp_57 * _min_115;
-                float _max_118 = max_noftz(accum[106], clamp_lo);
+                __nv_bfloat162 _bf16x2_28 = __float22bfloat162_rn(make_float2(_min_112 * _rcp_56 * _min_114, _min_113 * _rcp_57 * _min_115));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_28)[0];
+                float _max_118 = max_noftz(accum[102], clamp_lo);
                 float _min_116 = fminf(_max_118, clamp_limit);
-                float _max_119 = max_noftz(accum[107], clamp_lo);
+                float _max_119 = max_noftz(accum[103], clamp_lo);
                 float _min_117 = fminf(_max_119, clamp_limit);
-                float _max_120 = max_noftz(accum[122], clamp_lo);
+                float _max_120 = max_noftz(accum[118], clamp_lo);
                 float _min_118 = fminf(_max_120, clamp_limit);
-                float _max_121 = max_noftz(accum[123], clamp_lo);
+                float _max_121 = max_noftz(accum[119], clamp_lo);
                 float _min_119 = fminf(_max_121, clamp_limit);
                 float _exp2_58 = approx_exp2(_min_116 * -1.4426950408889634f);
                 float _rcp_58 = approx_rcp(_exp2_58 + 1.0f);
                 float _exp2_59 = approx_exp2(_min_117 * -1.4426950408889634f);
                 float _rcp_59 = approx_rcp(_exp2_59 + 1.0f);
-                outv[2] = _min_116 * _rcp_58 * _min_118;
-                outv[3] = _min_117 * _rcp_59 * _min_119;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_13)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_13)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_o_14 = n0_c / 2 + 120 + lane_col;
-                float _max_122 = max_noftz(accum[108], clamp_lo);
+                __nv_bfloat162 _bf16x2_29 = __float22bfloat162_rn(make_float2(_min_116 * _rcp_58 * _min_118, _min_117 * _rcp_59 * _min_119));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_29)[0];
+                float _max_122 = max_noftz(accum[106], clamp_lo);
                 float _min_120 = fminf(_max_122, clamp_limit);
-                float _max_123 = max_noftz(accum[109], clamp_lo);
+                float _max_123 = max_noftz(accum[107], clamp_lo);
                 float _min_121 = fminf(_max_123, clamp_limit);
-                float _max_124 = max_noftz(accum[124], clamp_lo);
+                float _max_124 = max_noftz(accum[122], clamp_lo);
                 float _min_122 = fminf(_max_124, clamp_limit);
-                float _max_125 = max_noftz(accum[125], clamp_lo);
+                float _max_125 = max_noftz(accum[123], clamp_lo);
                 float _min_123 = fminf(_max_125, clamp_limit);
                 float _exp2_60 = approx_exp2(_min_120 * -1.4426950408889634f);
                 float _rcp_60 = approx_rcp(_exp2_60 + 1.0f);
                 float _exp2_61 = approx_exp2(_min_121 * -1.4426950408889634f);
                 float _rcp_61 = approx_rcp(_exp2_61 + 1.0f);
-                outv[0] = _min_120 * _rcp_60 * _min_122;
-                outv[1] = _min_121 * _rcp_61 * _min_123;
+                __nv_bfloat162 _bf16x2_30 = __float22bfloat162_rn(make_float2(_min_120 * _rcp_60 * _min_122, _min_121 * _rcp_61 * _min_123));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_30)[0];
                 float _max_126 = max_noftz(accum[110], clamp_lo);
                 float _min_124 = fminf(_max_126, clamp_limit);
                 float _max_127 = max_noftz(accum[111], clamp_lo);
@@ -1476,19 +1451,30 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp(unsigned int num_experts, unsigned
                 float _rcp_62 = approx_rcp(_exp2_62 + 1.0f);
                 float _exp2_63 = approx_exp2(_min_125 * -1.4426950408889634f);
                 float _rcp_63 = approx_rcp(_exp2_63 + 1.0f);
-                outv[2] = _min_124 * _rcp_62 * _min_126;
-                outv[3] = _min_125 * _rcp_63 * _min_127;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[0 + 0], outv[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_o_14)))[0]) = _pk;
-                    }
-                }
+                __nv_bfloat162 _bf16x2_31 = __float22bfloat162_rn(make_float2(_min_124 * _rcp_62 * _min_126, _min_125 * _rcp_63 * _min_127));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_31)[0];
+                unsigned int x0_51 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_52 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, x0_51, 1);
+                unsigned int y0_53 = _shfl_xor_28;
+                unsigned int _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, x1_52, 1);
+                unsigned int y1_54 = _shfl_xor_29;
+                pk[0] = y0_53 & m_odd | pk[0] & m_even;
+                pk[1] = y0_53 & m_even | pk[1] & m_odd;
+                pk[2] = y1_54 & m_odd | pk[2] & m_even;
+                pk[3] = y1_54 & m_even | pk[3] & m_odd;
+                unsigned int x2_55 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_56 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, x2_55, 2);
+                unsigned int y2_57 = _shfl_xor_30;
+                unsigned int _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, x3_56, 2);
+                unsigned int y3_58 = _shfl_xor_31;
+                pk[0] = y2_57 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_57 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_58 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_58 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(outv[2 + 0], outv[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_o_14)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_v_42))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
             }
             tile_base_c = tile_base_c + n_tiles_e_c;

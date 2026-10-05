@@ -36,13 +36,18 @@ from .cake_gemm import (
     validate_grouped_gemm_geometry,
 )
 from .cake_jit import (
+    gen_sm90_cake_bf16_combine_prereduced_module,
     gen_sm90_cake_bf16_combine_tail_module,
+    gen_sm90_cake_bf16_combine_tail_prereduced_module,
     gen_sm90_cake_bf16_compact_module,
     gen_sm90_cake_bf16_dispatch_module,
 )
 from .cake_weights import GATE_UP_GROUP, Sm90CakeBf16Weights
 
 __all__ = [
+    "COMBINE_WIRES",
+    "COMBINE_WIRE_PER_SHAPE_MAX_TOKENS",
+    "COMBINE_WIRE_ENV",
     "FUSED_COMBINE_TAIL_ENV",
     "FUSED_DISPATCH_ENV",
     "FUSED_DISPATCH_MAX_ROUTES",
@@ -65,6 +70,31 @@ FUSED_COMBINE_TAIL_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL"
 FUSED_DISPATCH_ENV = "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH"
 FUSED_DISPATCH_MAX_TOKENS = 128
 FUSED_DISPATCH_MAX_ROUTES = 1024
+# Combine wire format (NOT interoperable: every rank of a pipe must agree, checked
+# at construction).  "prereduced": the expert rank pre-reduces the routes of a
+# token that landed on it in fp32 (ascending k), rounds once to bf16 and sends
+# one row per (token, source rank); the owner sums the <= ep_size rows in
+# ascending rank order.  "per_route": one bf16(y_k * w_k) row per route, summed
+# over k by the owner.  Both deterministic; outputs differ by rounding only.
+COMBINE_WIRE_ENV = "FLASHINFER_SM90_CAKE_BF16_COMBINE_WIRE"
+COMBINE_WIRE_PREREDUCED = "prereduced"
+# "prereduced_hilo": as "prereduced", but a group of >= 2 routes carries its fp32
+# partial as two bf16 rows (hi + residual) so no group partial is rounded to bf16;
+# single-route groups are bf16(w * y) exactly as the per-route wire.
+COMBINE_WIRE_PREREDUCED_HILO = "prereduced_hilo"
+COMBINE_WIRE_PER_ROUTE = "per_route"
+COMBINE_WIRES = (
+    COMBINE_WIRE_PREREDUCED,
+    COMBINE_WIRE_PREREDUCED_HILO,
+    COMBINE_WIRE_PER_ROUTE,
+)
+_PREREDUCED_WIRES = (COMBINE_WIRE_PREREDUCED, COMBINE_WIRE_PREREDUCED_HILO)
+# Per-shape default (combine_wire=None, environment unset): rounds whose token
+# capacity is at or below this bound run the per-route wire (R0 numerics; the
+# pre-reduced grouping is not repaid at the protocol's fixed-cost floor), larger
+# capacities run the pre-reduced wire.  The capacity is a pipe-creation constant
+# identical on every rank, so the selection is rank-consistent by construction.
+COMBINE_WIRE_PER_SHAPE_MAX_TOKENS = 8
 
 
 def _env_flag(name: str) -> bool:
@@ -78,6 +108,23 @@ def _fused_combine_tail_default() -> bool:
 
 def _fused_dispatch_default() -> bool:
     return _env_flag(FUSED_DISPATCH_ENV)
+
+
+def _combine_wire_default(token_capacity: int) -> str:
+    """Default combine wire: the environment override when set, otherwise the
+    per-shape default (``per_route`` when ``token_capacity`` is at or below
+    ``COMBINE_WIRE_PER_SHAPE_MAX_TOKENS``, ``prereduced`` above)."""
+    raw = os.environ.get(COMBINE_WIRE_ENV)
+    if raw is not None:
+        value = raw.strip().lower()
+        if value not in COMBINE_WIRES:
+            raise ValueError(
+                f"{COMBINE_WIRE_ENV} must be one of {COMBINE_WIRES}, got {value!r}"
+            )
+        return value
+    if int(token_capacity) <= COMBINE_WIRE_PER_SHAPE_MAX_TOKENS:
+        return COMBINE_WIRE_PER_ROUTE
+    return COMBINE_WIRE_PREREDUCED
 
 
 class _RunnerState(Enum):
@@ -97,15 +144,31 @@ class Sm90CakeBf16MoERunner:
     vendored count / reserve / store_publish kernels otherwise) | ``wait_prefix``
     -> ``compact_bf16`` (gather inbox rows expert-major) -> FC1 (Cake WGMMA,
     fused SwiGLU, bf16 intermediate) -> FC2 (Cake WGMMA, bf16 out) ->
-    ``combine`` (bf16 wire, fp32 route-weight multiply) -> ``combine_tail`` (one
-    kernel: wait for every source, fp32 sum over the unmasked top-k slots, bf16
-    output, ack).
+    ``combine`` -> ``combine_tail``.
 
-    ``fused_combine_tail=False`` (default from ``FUSED_COMBINE_TAIL_ENV``) runs
-    the vendored ``wait_combine`` -> ``reduce`` -> ``ack`` kernels with the
-    per-round combine-inbox fill instead; ``fused_dispatch=False`` (default
-    from ``FUSED_DISPATCH_ENV``) always runs the vendored dispatch kernels.
-    Every combination is bit-identical and a peer rank may use any of them.
+    Combine wire (``combine_wire``; ``None`` = ``COMBINE_WIRE_ENV`` when set,
+    otherwise the per-shape default: ``per_route`` for a token capacity at or
+    below ``COMBINE_WIRE_PER_SHAPE_MAX_TOKENS``, ``prereduced`` above):
+
+    * ``"prereduced"``: ``combine`` groups the received rows by (owner, token),
+      pre-reduces each group in fp32 (``fmaf`` in ascending route order), rounds
+      once to bf16 and pushes one row per (token, source rank) into the owner's
+      inbox slot ``k_min`` of the group; ``combine_tail`` (one kernel) waits for
+      every source, sums the group rows in ascending source-rank order in fp32,
+      rounds once and acks.  Requires the fused tail.
+    * ``"per_route"``: the vendored ``combine_publish`` (one
+      ``bf16(fp32(y_k) * w_k)`` row per route) and either the fused tail (fp32
+      sum over the unmasked top-k slots in route order) or, with
+      ``fused_combine_tail=False``, the vendored ``wait_combine`` -> ``reduce``
+      -> ``ack`` kernels with the per-round combine-inbox fill.
+
+    Every rank of a pipe must use the same ``combine_wire`` (verified with an
+    allgather at construction).  Both wires are deterministic; the two outputs
+    differ by rounding only (per_route rounds every route and the sum,
+    prereduced rounds each group partial and the sum).  Within one wire the
+    fused / vendored kernel choices (``fused_combine_tail``, ``fused_dispatch``,
+    default from ``FUSED_COMBINE_TAIL_ENV`` / ``FUSED_DISPATCH_ENV``) are
+    bit-identical and a peer rank may use any of them.
 
     Precision contract: bf16 operands into both GEMMs, fp32 accumulation, bf16
     intermediate, bf16 dispatch payload and combine wire, bf16 output.  No FP8
@@ -122,6 +185,7 @@ class Sm90CakeBf16MoERunner:
         clamp: float | None = None,
         fused_combine_tail: bool | None = None,
         fused_dispatch: bool | None = None,
+        combine_wire: str | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -144,6 +208,21 @@ class Sm90CakeBf16MoERunner:
             if fused_dispatch is None
             else bool(fused_dispatch)
         )
+        wire = (
+            _combine_wire_default(pipe.token_capacity)
+            if combine_wire is None
+            else str(combine_wire)
+        )
+        if wire not in COMBINE_WIRES:
+            raise ValueError(
+                f"combine_wire must be one of {COMBINE_WIRES}, got {combine_wire!r}"
+            )
+        if wire in _PREREDUCED_WIRES and not self._fused_tail:
+            raise ValueError(
+                "combine_wire='prereduced' requires the fused combine tail "
+                f"(fused_combine_tail=True / {FUSED_COMBINE_TAIL_ENV}=1)"
+            )
+        self._combine_wire = wire
         self.weights: Sm90CakeBf16Weights | None = None
 
         def _local_init():
@@ -176,13 +255,36 @@ class Sm90CakeBf16MoERunner:
 
         _run_guarded_phase(pipe._comm, pipe.rank, "weights+buffers", _local_init)
 
+        def _wire_handshake():
+            # the combine wire is a cross-rank contract (slot keying + reduce order)
+            wires = list(pipe._comm.allgather(self._combine_wire))
+            if any(w != self._combine_wire for w in wires):
+                raise ValueError(
+                    "sm90_bf16_bf16_bf16_push_cake: combine_wire must match on every EP rank; "
+                    f"got {wires}"
+                )
+            return None
+
+        _run_guarded_phase(
+            pipe._comm, pipe.rank, "cake-bf16-combine-wire", _wire_handshake
+        )
+
         def _jit():
             self.compact_module = gen_sm90_cake_bf16_compact_module().build_and_load()
-            self.tail_module = (
-                gen_sm90_cake_bf16_combine_tail_module().build_and_load()
-                if self._fused_tail
-                else None
-            )
+            if self._combine_wire in _PREREDUCED_WIRES:
+                self.publish_module = (
+                    gen_sm90_cake_bf16_combine_prereduced_module().build_and_load()
+                )
+                self.tail_module = (
+                    gen_sm90_cake_bf16_combine_tail_prereduced_module().build_and_load()
+                )
+            else:
+                self.publish_module = None
+                self.tail_module = (
+                    gen_sm90_cake_bf16_combine_tail_module().build_and_load()
+                    if self._fused_tail
+                    else None
+                )
             self.dispatch_module = (
                 gen_sm90_cake_bf16_dispatch_module().build_and_load()
                 if self._fused_dispatch
@@ -202,6 +304,11 @@ class Sm90CakeBf16MoERunner:
     def fused_dispatch(self) -> bool:
         """True when small dedup rounds dispatch through the single cooperative kernel."""
         return self._fused_dispatch
+
+    @property
+    def combine_wire(self) -> str:
+        """``"prereduced"`` or ``"per_route"`` (see the class docstring)."""
+        return self._combine_wire
 
     def _use_fused_dispatch(self, num_tokens: int) -> bool:
         pipe = self.pipe
@@ -241,6 +348,25 @@ class Sm90CakeBf16MoERunner:
         self._tail_blocks_done = torch.zeros(1, dtype=torch.int32, device=dv)
         # fused dispatch: per-destination meta / payload bases shared across blocks
         self._dispatch_bases = torch.zeros(2 * pipe.ep, dtype=torch.int32, device=dv)
+        if self._combine_wire in _PREREDUCED_WIRES:
+            # (owner rank, token) group worklist of the pre-reduced publish
+            nslots = pipe.ep * pipe.token_capacity
+            self._grp_cnt = torch.zeros(nslots, dtype=torch.int32, device=dv)
+            self._grp_rows = torch.zeros(nslots * pipe.K, dtype=torch.int32, device=dv)
+            self._grp_list = torch.zeros(nslots, dtype=torch.int32, device=dv)
+            self._n_groups = torch.zeros(1, dtype=torch.int32, device=dv)
+            self._groups_per_src = torch.zeros(pipe.ep, dtype=torch.int32, device=dv)
+            # grid-completion counter of the pre-reduced publish (its last block resets
+            # the worklist scratch for the next round: no per-round memsets)
+            self._pub_blocks_done = torch.zeros(1, dtype=torch.int32, device=dv)
+            pipe._cdone_local.zero_()  # the publish kernel keeps it zeroed from here on
+        else:  # per-route wire: compact builds no worklist; placeholders for the binding
+            self._grp_cnt = self._grp_rows = self._grp_list = torch.zeros(
+                1, dtype=torch.int32, device=dv
+            )
+            self._n_groups = self._groups_per_src = torch.zeros(
+                1, dtype=torch.int32, device=dv
+            )
 
     def bind_weights(self, weights: Sm90CakeBf16Weights) -> None:
         """Swap the expert weights between rounds (same geometry, same device)."""
@@ -395,9 +521,13 @@ class Sm90CakeBf16MoERunner:
             and self._round_stream_id != stream_id
             and not self._round_event.query()
         ):
-            raise RuntimeError(
-                "cannot start a round on a different stream while the previous round is still executing"
-            )
+            # The previous round was issued on another stream and may still be
+            # running: order this round after it on the device.  The pipe runs
+            # one round at a time; this edge enforces it without requiring the
+            # host to have synchronised (a warm-up loop that hops streams, as the
+            # graph-capture recipes do, would otherwise fail spuriously).  Inside
+            # a capture the caller must have joined the streams beforehand.
+            stream.wait_event(self._round_event)
         nv = self.record_stages
         try:
             with _record_stage("begin_round", nv):
@@ -473,14 +603,54 @@ class Sm90CakeBf16MoERunner:
                         pipe._seg_out_base,
                         pipe._m_dev,
                         pipe._next_row,
+                        self._grp_cnt,
+                        self._grp_rows,
+                        self._grp_list,
+                        self._n_groups,
+                        self._groups_per_src,
+                        pipe._round,
+                        1 if self._combine_wire in _PREREDUCED_WIRES else 0,
                     )
                 with _record_stage("fc1", nv):
                     self.gemm.fc1(self.a1, weights.w13, pipe._offsets, self.h2)
                 with _record_stage("fc2", nv):
                     self.gemm.fc2(self.h2, weights.w2, pipe._offsets, self.y)
-                with _record_stage("combine", nv):
-                    pipe.proto_combine(self.y, self.meta)
-                if self._fused_tail:
+                if self._combine_wire in _PREREDUCED_WIRES:
+                    split = (
+                        1 if self._combine_wire == COMBINE_WIRE_PREREDUCED_HILO else 0
+                    )
+                    with _record_stage("combine", nv):
+                        self.publish_module.sm90_cake_combine_prereduced_bf16(
+                            self.y,
+                            self.meta,
+                            *pipe._layout_args(),
+                            pipe._m_dev,
+                            self._grp_cnt,
+                            self._grp_rows,
+                            self._grp_list,
+                            self._n_groups,
+                            self._groups_per_src,
+                            pipe._cdone_local,
+                            pipe._round,
+                            self._pub_blocks_done,
+                            split,
+                        )
+                    with _record_stage("combine_tail", nv):
+                        self.tail_module.sm90_cake_combine_tail_prereduced_bf16(
+                            output,
+                            topk_ids,
+                            *pipe._layout_args(),
+                            pipe._round,
+                            pipe._lc,
+                            pipe._done,
+                            self._tail_blocks_done,
+                            num_tokens,
+                            split,
+                        )
+                    pipe._round_open = False  # the fused tail performed the ack
+                elif self._fused_tail:
+                    with _record_stage("combine", nv):
+                        pipe.proto_combine(self.y, self.meta)
                     with _record_stage("combine_tail", nv):
                         self.tail_module.sm90_cake_combine_tail_bf16(
                             output,
@@ -494,6 +664,8 @@ class Sm90CakeBf16MoERunner:
                         )
                     pipe._round_open = False  # the fused tail performed the ack
                 else:
+                    with _record_stage("combine", nv):
+                        pipe.proto_combine(self.y, self.meta)
                     with _record_stage("wait_combine", nv):
                         pipe.proto_wait_combine()
                     with _record_stage("reduce", nv):

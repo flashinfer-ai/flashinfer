@@ -50,6 +50,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_B_STRIDE 49152
 #define SMEM_TOTAL 196704
 #define THREADS 384
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -134,7 +135,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
 kernel_cake_sm90_bf16_megamoe_fc2(unsigned int num_experts, unsigned int shape_n, unsigned int shape_k, float clamp_limit, const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap W, long long* __restrict__ offsets, __nv_bfloat16* __restrict__ D)
 {
     const int tid = threadIdx.x;
@@ -348,12 +349,17 @@ kernel_cake_sm90_bf16_megamoe_fc2(unsigned int num_experts, unsigned int shape_n
         uint32_t warp_group_idx = static_cast<uint32_t>(tid) / 128u;
         unsigned int math_wg_idx = make_warp_uniform(warp_group_idx);
         float accum[128] = {0};
-        float outv[4] = {0};
+        unsigned int pk[4] = {0};
         unsigned int it_c = 0;
         unsigned int tile_base_c = 0;
         unsigned int warp_in_wg = (unsigned int)warp % 4;
         unsigned int lane_row = lane / 4;
         unsigned int lane_col = lane % 4 * 2;
+        unsigned int q_lane = lane % 4;
+        unsigned int m_odd = -(q_lane & 1);
+        unsigned int m_even = m_odd ^ 4294967295u;
+        unsigned int m_hi = -(q_lane >> 1 & 1);
+        unsigned int m_lo = m_hi ^ 4294967295u;
         for (unsigned int e_c = 0; e_c < num_experts; e_c++) {
             unsigned int row0_c = (unsigned int)offsets[e_c];
             unsigned int row1_c = (unsigned int)offsets[e_c + 1];
@@ -812,421 +818,509 @@ kernel_cake_sm90_bf16_megamoe_fc2(unsigned int num_experts, unsigned int shape_n
                 }
                 unsigned int row_lo = m0_c + math_wg_idx * 64 + warp_in_wg * 16 + lane_row;
                 unsigned int row_hi = row_lo + 8;
-                unsigned int col_d = n0_c + lane_col;
+                unsigned int col_d = n0_c + q_lane * 8;
+                __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(accum[0], accum[1]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_0)[0];
+                __nv_bfloat162 _bf16x2_1 = __float22bfloat162_rn(make_float2(accum[4], accum[5]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_1)[0];
+                __nv_bfloat162 _bf16x2_2 = __float22bfloat162_rn(make_float2(accum[8], accum[9]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_2)[0];
+                __nv_bfloat162 _bf16x2_3 = __float22bfloat162_rn(make_float2(accum[12], accum[13]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_3)[0];
+                unsigned int x0 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, x0, 1);
+                unsigned int y0 = _shfl_xor_0;
+                unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, x1, 1);
+                unsigned int y1 = _shfl_xor_1;
+                pk[0] = y0 & m_odd | pk[0] & m_even;
+                pk[1] = y0 & m_even | pk[1] & m_odd;
+                pk[2] = y1 & m_odd | pk[2] & m_even;
+                pk[3] = y1 & m_even | pk[3] & m_odd;
+                unsigned int x2 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, x2, 2);
+                unsigned int y2 = _shfl_xor_2;
+                unsigned int _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, x3, 2);
+                unsigned int y3 = _shfl_xor_3;
+                pk[0] = y2 & m_hi | pk[0] & m_lo;
+                pk[2] = y2 & m_lo | pk[2] & m_hi;
+                pk[1] = y3 & m_hi | pk[1] & m_lo;
+                pk[3] = y3 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[0 + 0], accum[0 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_d))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
+                __nv_bfloat162 _bf16x2_4 = __float22bfloat162_rn(make_float2(accum[2], accum[3]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_4)[0];
+                __nv_bfloat162 _bf16x2_5 = __float22bfloat162_rn(make_float2(accum[6], accum[7]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_5)[0];
+                __nv_bfloat162 _bf16x2_6 = __float22bfloat162_rn(make_float2(accum[10], accum[11]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_6)[0];
+                __nv_bfloat162 _bf16x2_7 = __float22bfloat162_rn(make_float2(accum[14], accum[15]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_7)[0];
+                unsigned int x0_0 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_1 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, x0_0, 1);
+                unsigned int y0_2 = _shfl_xor_4;
+                unsigned int _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, x1_1, 1);
+                unsigned int y1_3 = _shfl_xor_5;
+                pk[0] = y0_2 & m_odd | pk[0] & m_even;
+                pk[1] = y0_2 & m_even | pk[1] & m_odd;
+                pk[2] = y1_3 & m_odd | pk[2] & m_even;
+                pk[3] = y1_3 & m_even | pk[3] & m_odd;
+                unsigned int x2_4 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_5 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, x2_4, 2);
+                unsigned int y2_6 = _shfl_xor_6;
+                unsigned int _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, x3_5, 2);
+                unsigned int y3_7 = _shfl_xor_7;
+                pk[0] = y2_6 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_6 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_7 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_7 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[2 + 0], accum[2 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_d))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_d_0 = n0_c + 8 + lane_col;
+                unsigned int col_d_8 = n0_c + (4 + q_lane) * 8;
+                __nv_bfloat162 _bf16x2_8 = __float22bfloat162_rn(make_float2(accum[16], accum[17]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_8)[0];
+                __nv_bfloat162 _bf16x2_9 = __float22bfloat162_rn(make_float2(accum[20], accum[21]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_9)[0];
+                __nv_bfloat162 _bf16x2_10 = __float22bfloat162_rn(make_float2(accum[24], accum[25]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_10)[0];
+                __nv_bfloat162 _bf16x2_11 = __float22bfloat162_rn(make_float2(accum[28], accum[29]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_11)[0];
+                unsigned int x0_9 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_10 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, x0_9, 1);
+                unsigned int y0_11 = _shfl_xor_8;
+                unsigned int _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, x1_10, 1);
+                unsigned int y1_12 = _shfl_xor_9;
+                pk[0] = y0_11 & m_odd | pk[0] & m_even;
+                pk[1] = y0_11 & m_even | pk[1] & m_odd;
+                pk[2] = y1_12 & m_odd | pk[2] & m_even;
+                pk[3] = y1_12 & m_even | pk[3] & m_odd;
+                unsigned int x2_13 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_14 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, x2_13, 2);
+                unsigned int y2_15 = _shfl_xor_10;
+                unsigned int _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, x3_14, 2);
+                unsigned int y3_16 = _shfl_xor_11;
+                pk[0] = y2_15 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_15 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_16 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_16 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[4 + 0], accum[4 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_0)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_d_8))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
+                __nv_bfloat162 _bf16x2_12 = __float22bfloat162_rn(make_float2(accum[18], accum[19]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_12)[0];
+                __nv_bfloat162 _bf16x2_13 = __float22bfloat162_rn(make_float2(accum[22], accum[23]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_13)[0];
+                __nv_bfloat162 _bf16x2_14 = __float22bfloat162_rn(make_float2(accum[26], accum[27]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_14)[0];
+                __nv_bfloat162 _bf16x2_15 = __float22bfloat162_rn(make_float2(accum[30], accum[31]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_15)[0];
+                unsigned int x0_17 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_18 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, x0_17, 1);
+                unsigned int y0_19 = _shfl_xor_12;
+                unsigned int _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, x1_18, 1);
+                unsigned int y1_20 = _shfl_xor_13;
+                pk[0] = y0_19 & m_odd | pk[0] & m_even;
+                pk[1] = y0_19 & m_even | pk[1] & m_odd;
+                pk[2] = y1_20 & m_odd | pk[2] & m_even;
+                pk[3] = y1_20 & m_even | pk[3] & m_odd;
+                unsigned int x2_21 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_22 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, x2_21, 2);
+                unsigned int y2_23 = _shfl_xor_14;
+                unsigned int _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, x3_22, 2);
+                unsigned int y3_24 = _shfl_xor_15;
+                pk[0] = y2_23 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_23 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_24 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_24 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[6 + 0], accum[6 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_0)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_d_8))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_d_1 = n0_c + 16 + lane_col;
+                unsigned int col_d_25 = n0_c + (8 + q_lane) * 8;
+                __nv_bfloat162 _bf16x2_16 = __float22bfloat162_rn(make_float2(accum[32], accum[33]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_16)[0];
+                __nv_bfloat162 _bf16x2_17 = __float22bfloat162_rn(make_float2(accum[36], accum[37]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_17)[0];
+                __nv_bfloat162 _bf16x2_18 = __float22bfloat162_rn(make_float2(accum[40], accum[41]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_18)[0];
+                __nv_bfloat162 _bf16x2_19 = __float22bfloat162_rn(make_float2(accum[44], accum[45]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_19)[0];
+                unsigned int x0_26 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_27 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, x0_26, 1);
+                unsigned int y0_28 = _shfl_xor_16;
+                unsigned int _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, x1_27, 1);
+                unsigned int y1_29 = _shfl_xor_17;
+                pk[0] = y0_28 & m_odd | pk[0] & m_even;
+                pk[1] = y0_28 & m_even | pk[1] & m_odd;
+                pk[2] = y1_29 & m_odd | pk[2] & m_even;
+                pk[3] = y1_29 & m_even | pk[3] & m_odd;
+                unsigned int x2_30 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_31 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, x2_30, 2);
+                unsigned int y2_32 = _shfl_xor_18;
+                unsigned int _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, x3_31, 2);
+                unsigned int y3_33 = _shfl_xor_19;
+                pk[0] = y2_32 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_32 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_33 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_33 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[8 + 0], accum[8 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_1)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_d_25))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
+                __nv_bfloat162 _bf16x2_20 = __float22bfloat162_rn(make_float2(accum[34], accum[35]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_20)[0];
+                __nv_bfloat162 _bf16x2_21 = __float22bfloat162_rn(make_float2(accum[38], accum[39]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_21)[0];
+                __nv_bfloat162 _bf16x2_22 = __float22bfloat162_rn(make_float2(accum[42], accum[43]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_22)[0];
+                __nv_bfloat162 _bf16x2_23 = __float22bfloat162_rn(make_float2(accum[46], accum[47]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_23)[0];
+                unsigned int x0_34 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_35 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, x0_34, 1);
+                unsigned int y0_36 = _shfl_xor_20;
+                unsigned int _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, x1_35, 1);
+                unsigned int y1_37 = _shfl_xor_21;
+                pk[0] = y0_36 & m_odd | pk[0] & m_even;
+                pk[1] = y0_36 & m_even | pk[1] & m_odd;
+                pk[2] = y1_37 & m_odd | pk[2] & m_even;
+                pk[3] = y1_37 & m_even | pk[3] & m_odd;
+                unsigned int x2_38 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_39 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, x2_38, 2);
+                unsigned int y2_40 = _shfl_xor_22;
+                unsigned int _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, x3_39, 2);
+                unsigned int y3_41 = _shfl_xor_23;
+                pk[0] = y2_40 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_40 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_41 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_41 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[10 + 0], accum[10 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_1)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_d_25))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_d_2 = n0_c + 24 + lane_col;
+                unsigned int col_d_42 = n0_c + (12 + q_lane) * 8;
+                __nv_bfloat162 _bf16x2_24 = __float22bfloat162_rn(make_float2(accum[48], accum[49]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_24)[0];
+                __nv_bfloat162 _bf16x2_25 = __float22bfloat162_rn(make_float2(accum[52], accum[53]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_25)[0];
+                __nv_bfloat162 _bf16x2_26 = __float22bfloat162_rn(make_float2(accum[56], accum[57]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_26)[0];
+                __nv_bfloat162 _bf16x2_27 = __float22bfloat162_rn(make_float2(accum[60], accum[61]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_27)[0];
+                unsigned int x0_43 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_44 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, x0_43, 1);
+                unsigned int y0_45 = _shfl_xor_24;
+                unsigned int _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, x1_44, 1);
+                unsigned int y1_46 = _shfl_xor_25;
+                pk[0] = y0_45 & m_odd | pk[0] & m_even;
+                pk[1] = y0_45 & m_even | pk[1] & m_odd;
+                pk[2] = y1_46 & m_odd | pk[2] & m_even;
+                pk[3] = y1_46 & m_even | pk[3] & m_odd;
+                unsigned int x2_47 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_48 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, x2_47, 2);
+                unsigned int y2_49 = _shfl_xor_26;
+                unsigned int _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, x3_48, 2);
+                unsigned int y3_50 = _shfl_xor_27;
+                pk[0] = y2_49 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_49 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_50 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_50 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[12 + 0], accum[12 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_2)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_d_42))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
+                __nv_bfloat162 _bf16x2_28 = __float22bfloat162_rn(make_float2(accum[50], accum[51]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_28)[0];
+                __nv_bfloat162 _bf16x2_29 = __float22bfloat162_rn(make_float2(accum[54], accum[55]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_29)[0];
+                __nv_bfloat162 _bf16x2_30 = __float22bfloat162_rn(make_float2(accum[58], accum[59]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_30)[0];
+                __nv_bfloat162 _bf16x2_31 = __float22bfloat162_rn(make_float2(accum[62], accum[63]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_31)[0];
+                unsigned int x0_51 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_52 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, x0_51, 1);
+                unsigned int y0_53 = _shfl_xor_28;
+                unsigned int _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, x1_52, 1);
+                unsigned int y1_54 = _shfl_xor_29;
+                pk[0] = y0_53 & m_odd | pk[0] & m_even;
+                pk[1] = y0_53 & m_even | pk[1] & m_odd;
+                pk[2] = y1_54 & m_odd | pk[2] & m_even;
+                pk[3] = y1_54 & m_even | pk[3] & m_odd;
+                unsigned int x2_55 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_56 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, x2_55, 2);
+                unsigned int y2_57 = _shfl_xor_30;
+                unsigned int _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, x3_56, 2);
+                unsigned int y3_58 = _shfl_xor_31;
+                pk[0] = y2_57 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_57 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_58 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_58 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[14 + 0], accum[14 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_2)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_d_42))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_d_3 = n0_c + 32 + lane_col;
+                unsigned int col_d_59 = n0_c + (16 + q_lane) * 8;
+                __nv_bfloat162 _bf16x2_32 = __float22bfloat162_rn(make_float2(accum[64], accum[65]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_32)[0];
+                __nv_bfloat162 _bf16x2_33 = __float22bfloat162_rn(make_float2(accum[68], accum[69]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_33)[0];
+                __nv_bfloat162 _bf16x2_34 = __float22bfloat162_rn(make_float2(accum[72], accum[73]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_34)[0];
+                __nv_bfloat162 _bf16x2_35 = __float22bfloat162_rn(make_float2(accum[76], accum[77]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_35)[0];
+                unsigned int x0_60 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_61 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_32 = __shfl_xor_sync(0xFFFFFFFF, x0_60, 1);
+                unsigned int y0_62 = _shfl_xor_32;
+                unsigned int _shfl_xor_33 = __shfl_xor_sync(0xFFFFFFFF, x1_61, 1);
+                unsigned int y1_63 = _shfl_xor_33;
+                pk[0] = y0_62 & m_odd | pk[0] & m_even;
+                pk[1] = y0_62 & m_even | pk[1] & m_odd;
+                pk[2] = y1_63 & m_odd | pk[2] & m_even;
+                pk[3] = y1_63 & m_even | pk[3] & m_odd;
+                unsigned int x2_64 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_65 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_34 = __shfl_xor_sync(0xFFFFFFFF, x2_64, 2);
+                unsigned int y2_66 = _shfl_xor_34;
+                unsigned int _shfl_xor_35 = __shfl_xor_sync(0xFFFFFFFF, x3_65, 2);
+                unsigned int y3_67 = _shfl_xor_35;
+                pk[0] = y2_66 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_66 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_67 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_67 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[16 + 0], accum[16 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_3)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_d_59))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
+                __nv_bfloat162 _bf16x2_36 = __float22bfloat162_rn(make_float2(accum[66], accum[67]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_36)[0];
+                __nv_bfloat162 _bf16x2_37 = __float22bfloat162_rn(make_float2(accum[70], accum[71]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_37)[0];
+                __nv_bfloat162 _bf16x2_38 = __float22bfloat162_rn(make_float2(accum[74], accum[75]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_38)[0];
+                __nv_bfloat162 _bf16x2_39 = __float22bfloat162_rn(make_float2(accum[78], accum[79]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_39)[0];
+                unsigned int x0_68 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_69 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_36 = __shfl_xor_sync(0xFFFFFFFF, x0_68, 1);
+                unsigned int y0_70 = _shfl_xor_36;
+                unsigned int _shfl_xor_37 = __shfl_xor_sync(0xFFFFFFFF, x1_69, 1);
+                unsigned int y1_71 = _shfl_xor_37;
+                pk[0] = y0_70 & m_odd | pk[0] & m_even;
+                pk[1] = y0_70 & m_even | pk[1] & m_odd;
+                pk[2] = y1_71 & m_odd | pk[2] & m_even;
+                pk[3] = y1_71 & m_even | pk[3] & m_odd;
+                unsigned int x2_72 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_73 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_38 = __shfl_xor_sync(0xFFFFFFFF, x2_72, 2);
+                unsigned int y2_74 = _shfl_xor_38;
+                unsigned int _shfl_xor_39 = __shfl_xor_sync(0xFFFFFFFF, x3_73, 2);
+                unsigned int y3_75 = _shfl_xor_39;
+                pk[0] = y2_74 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_74 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_75 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_75 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[18 + 0], accum[18 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_3)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_d_59))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_d_4 = n0_c + 40 + lane_col;
+                unsigned int col_d_76 = n0_c + (20 + q_lane) * 8;
+                __nv_bfloat162 _bf16x2_40 = __float22bfloat162_rn(make_float2(accum[80], accum[81]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_40)[0];
+                __nv_bfloat162 _bf16x2_41 = __float22bfloat162_rn(make_float2(accum[84], accum[85]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_41)[0];
+                __nv_bfloat162 _bf16x2_42 = __float22bfloat162_rn(make_float2(accum[88], accum[89]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_42)[0];
+                __nv_bfloat162 _bf16x2_43 = __float22bfloat162_rn(make_float2(accum[92], accum[93]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_43)[0];
+                unsigned int x0_77 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_78 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_40 = __shfl_xor_sync(0xFFFFFFFF, x0_77, 1);
+                unsigned int y0_79 = _shfl_xor_40;
+                unsigned int _shfl_xor_41 = __shfl_xor_sync(0xFFFFFFFF, x1_78, 1);
+                unsigned int y1_80 = _shfl_xor_41;
+                pk[0] = y0_79 & m_odd | pk[0] & m_even;
+                pk[1] = y0_79 & m_even | pk[1] & m_odd;
+                pk[2] = y1_80 & m_odd | pk[2] & m_even;
+                pk[3] = y1_80 & m_even | pk[3] & m_odd;
+                unsigned int x2_81 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_82 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_42 = __shfl_xor_sync(0xFFFFFFFF, x2_81, 2);
+                unsigned int y2_83 = _shfl_xor_42;
+                unsigned int _shfl_xor_43 = __shfl_xor_sync(0xFFFFFFFF, x3_82, 2);
+                unsigned int y3_84 = _shfl_xor_43;
+                pk[0] = y2_83 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_83 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_84 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_84 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[20 + 0], accum[20 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_4)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_d_76))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
+                __nv_bfloat162 _bf16x2_44 = __float22bfloat162_rn(make_float2(accum[82], accum[83]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_44)[0];
+                __nv_bfloat162 _bf16x2_45 = __float22bfloat162_rn(make_float2(accum[86], accum[87]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_45)[0];
+                __nv_bfloat162 _bf16x2_46 = __float22bfloat162_rn(make_float2(accum[90], accum[91]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_46)[0];
+                __nv_bfloat162 _bf16x2_47 = __float22bfloat162_rn(make_float2(accum[94], accum[95]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_47)[0];
+                unsigned int x0_85 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_86 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_44 = __shfl_xor_sync(0xFFFFFFFF, x0_85, 1);
+                unsigned int y0_87 = _shfl_xor_44;
+                unsigned int _shfl_xor_45 = __shfl_xor_sync(0xFFFFFFFF, x1_86, 1);
+                unsigned int y1_88 = _shfl_xor_45;
+                pk[0] = y0_87 & m_odd | pk[0] & m_even;
+                pk[1] = y0_87 & m_even | pk[1] & m_odd;
+                pk[2] = y1_88 & m_odd | pk[2] & m_even;
+                pk[3] = y1_88 & m_even | pk[3] & m_odd;
+                unsigned int x2_89 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_90 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_46 = __shfl_xor_sync(0xFFFFFFFF, x2_89, 2);
+                unsigned int y2_91 = _shfl_xor_46;
+                unsigned int _shfl_xor_47 = __shfl_xor_sync(0xFFFFFFFF, x3_90, 2);
+                unsigned int y3_92 = _shfl_xor_47;
+                pk[0] = y2_91 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_91 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_92 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_92 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[22 + 0], accum[22 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_4)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_d_76))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_d_5 = n0_c + 48 + lane_col;
+                unsigned int col_d_93 = n0_c + (24 + q_lane) * 8;
+                __nv_bfloat162 _bf16x2_48 = __float22bfloat162_rn(make_float2(accum[96], accum[97]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_48)[0];
+                __nv_bfloat162 _bf16x2_49 = __float22bfloat162_rn(make_float2(accum[100], accum[101]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_49)[0];
+                __nv_bfloat162 _bf16x2_50 = __float22bfloat162_rn(make_float2(accum[104], accum[105]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_50)[0];
+                __nv_bfloat162 _bf16x2_51 = __float22bfloat162_rn(make_float2(accum[108], accum[109]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_51)[0];
+                unsigned int x0_94 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_95 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_48 = __shfl_xor_sync(0xFFFFFFFF, x0_94, 1);
+                unsigned int y0_96 = _shfl_xor_48;
+                unsigned int _shfl_xor_49 = __shfl_xor_sync(0xFFFFFFFF, x1_95, 1);
+                unsigned int y1_97 = _shfl_xor_49;
+                pk[0] = y0_96 & m_odd | pk[0] & m_even;
+                pk[1] = y0_96 & m_even | pk[1] & m_odd;
+                pk[2] = y1_97 & m_odd | pk[2] & m_even;
+                pk[3] = y1_97 & m_even | pk[3] & m_odd;
+                unsigned int x2_98 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_99 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_50 = __shfl_xor_sync(0xFFFFFFFF, x2_98, 2);
+                unsigned int y2_100 = _shfl_xor_50;
+                unsigned int _shfl_xor_51 = __shfl_xor_sync(0xFFFFFFFF, x3_99, 2);
+                unsigned int y3_101 = _shfl_xor_51;
+                pk[0] = y2_100 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_100 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_101 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_101 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[24 + 0], accum[24 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_5)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_d_93))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
+                __nv_bfloat162 _bf16x2_52 = __float22bfloat162_rn(make_float2(accum[98], accum[99]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_52)[0];
+                __nv_bfloat162 _bf16x2_53 = __float22bfloat162_rn(make_float2(accum[102], accum[103]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_53)[0];
+                __nv_bfloat162 _bf16x2_54 = __float22bfloat162_rn(make_float2(accum[106], accum[107]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_54)[0];
+                __nv_bfloat162 _bf16x2_55 = __float22bfloat162_rn(make_float2(accum[110], accum[111]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_55)[0];
+                unsigned int x0_102 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_103 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_52 = __shfl_xor_sync(0xFFFFFFFF, x0_102, 1);
+                unsigned int y0_104 = _shfl_xor_52;
+                unsigned int _shfl_xor_53 = __shfl_xor_sync(0xFFFFFFFF, x1_103, 1);
+                unsigned int y1_105 = _shfl_xor_53;
+                pk[0] = y0_104 & m_odd | pk[0] & m_even;
+                pk[1] = y0_104 & m_even | pk[1] & m_odd;
+                pk[2] = y1_105 & m_odd | pk[2] & m_even;
+                pk[3] = y1_105 & m_even | pk[3] & m_odd;
+                unsigned int x2_106 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_107 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_54 = __shfl_xor_sync(0xFFFFFFFF, x2_106, 2);
+                unsigned int y2_108 = _shfl_xor_54;
+                unsigned int _shfl_xor_55 = __shfl_xor_sync(0xFFFFFFFF, x3_107, 2);
+                unsigned int y3_109 = _shfl_xor_55;
+                pk[0] = y2_108 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_108 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_109 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_109 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[26 + 0], accum[26 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_5)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_d_93))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
-                unsigned int col_d_6 = n0_c + 56 + lane_col;
+                unsigned int col_d_110 = n0_c + (28 + q_lane) * 8;
+                __nv_bfloat162 _bf16x2_56 = __float22bfloat162_rn(make_float2(accum[112], accum[113]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_56)[0];
+                __nv_bfloat162 _bf16x2_57 = __float22bfloat162_rn(make_float2(accum[116], accum[117]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_57)[0];
+                __nv_bfloat162 _bf16x2_58 = __float22bfloat162_rn(make_float2(accum[120], accum[121]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_58)[0];
+                __nv_bfloat162 _bf16x2_59 = __float22bfloat162_rn(make_float2(accum[124], accum[125]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_59)[0];
+                unsigned int x0_111 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_112 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_56 = __shfl_xor_sync(0xFFFFFFFF, x0_111, 1);
+                unsigned int y0_113 = _shfl_xor_56;
+                unsigned int _shfl_xor_57 = __shfl_xor_sync(0xFFFFFFFF, x1_112, 1);
+                unsigned int y1_114 = _shfl_xor_57;
+                pk[0] = y0_113 & m_odd | pk[0] & m_even;
+                pk[1] = y0_113 & m_even | pk[1] & m_odd;
+                pk[2] = y1_114 & m_odd | pk[2] & m_even;
+                pk[3] = y1_114 & m_even | pk[3] & m_odd;
+                unsigned int x2_115 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_116 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_58 = __shfl_xor_sync(0xFFFFFFFF, x2_115, 2);
+                unsigned int y2_117 = _shfl_xor_58;
+                unsigned int _shfl_xor_59 = __shfl_xor_sync(0xFFFFFFFF, x3_116, 2);
+                unsigned int y3_118 = _shfl_xor_59;
+                pk[0] = y2_117 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_117 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_118 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_118 & m_lo | pk[3] & m_hi;
                 if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[28 + 0], accum[28 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_6)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_lo * n_out + col_d_110))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
+                __nv_bfloat162 _bf16x2_60 = __float22bfloat162_rn(make_float2(accum[114], accum[115]));
+                pk[0] = reinterpret_cast<unsigned int*>(&_bf16x2_60)[0];
+                __nv_bfloat162 _bf16x2_61 = __float22bfloat162_rn(make_float2(accum[118], accum[119]));
+                pk[1] = reinterpret_cast<unsigned int*>(&_bf16x2_61)[0];
+                __nv_bfloat162 _bf16x2_62 = __float22bfloat162_rn(make_float2(accum[122], accum[123]));
+                pk[2] = reinterpret_cast<unsigned int*>(&_bf16x2_62)[0];
+                __nv_bfloat162 _bf16x2_63 = __float22bfloat162_rn(make_float2(accum[126], accum[127]));
+                pk[3] = reinterpret_cast<unsigned int*>(&_bf16x2_63)[0];
+                unsigned int x0_119 = pk[1] & m_even | pk[0] & m_odd;
+                unsigned int x1_120 = pk[3] & m_even | pk[2] & m_odd;
+                unsigned int _shfl_xor_60 = __shfl_xor_sync(0xFFFFFFFF, x0_119, 1);
+                unsigned int y0_121 = _shfl_xor_60;
+                unsigned int _shfl_xor_61 = __shfl_xor_sync(0xFFFFFFFF, x1_120, 1);
+                unsigned int y1_122 = _shfl_xor_61;
+                pk[0] = y0_121 & m_odd | pk[0] & m_even;
+                pk[1] = y0_121 & m_even | pk[1] & m_odd;
+                pk[2] = y1_122 & m_odd | pk[2] & m_even;
+                pk[3] = y1_122 & m_even | pk[3] & m_odd;
+                unsigned int x2_123 = pk[2] & m_lo | pk[0] & m_hi;
+                unsigned int x3_124 = pk[3] & m_lo | pk[1] & m_hi;
+                unsigned int _shfl_xor_62 = __shfl_xor_sync(0xFFFFFFFF, x2_123, 2);
+                unsigned int y2_125 = _shfl_xor_62;
+                unsigned int _shfl_xor_63 = __shfl_xor_sync(0xFFFFFFFF, x3_124, 2);
+                unsigned int y3_126 = _shfl_xor_63;
+                pk[0] = y2_125 & m_hi | pk[0] & m_lo;
+                pk[2] = y2_125 & m_lo | pk[2] & m_hi;
+                pk[1] = y3_126 & m_hi | pk[1] & m_lo;
+                pk[3] = y3_126 & m_lo | pk[3] & m_hi;
                 if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[30 + 0], accum[30 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_6)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_7 = n0_c + 64 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[32 + 0], accum[32 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_7)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[34 + 0], accum[34 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_7)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_8 = n0_c + 72 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[36 + 0], accum[36 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_8)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[38 + 0], accum[38 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_8)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_9 = n0_c + 80 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[40 + 0], accum[40 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_9)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[42 + 0], accum[42 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_9)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_10 = n0_c + 88 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[44 + 0], accum[44 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_10)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[46 + 0], accum[46 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_10)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_11 = n0_c + 96 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[48 + 0], accum[48 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_11)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[50 + 0], accum[50 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_11)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_12 = n0_c + 104 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[52 + 0], accum[52 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_12)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[54 + 0], accum[54 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_12)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_13 = n0_c + 112 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[56 + 0], accum[56 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_13)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[58 + 0], accum[58 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_13)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_14 = n0_c + 120 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[60 + 0], accum[60 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_14)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[62 + 0], accum[62 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_14)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_15 = n0_c + 128 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[64 + 0], accum[64 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_15)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[66 + 0], accum[66 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_15)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_16 = n0_c + 136 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[68 + 0], accum[68 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_16)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[70 + 0], accum[70 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_16)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_17 = n0_c + 144 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[72 + 0], accum[72 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_17)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[74 + 0], accum[74 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_17)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_18 = n0_c + 152 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[76 + 0], accum[76 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_18)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[78 + 0], accum[78 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_18)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_19 = n0_c + 160 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[80 + 0], accum[80 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_19)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[82 + 0], accum[82 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_19)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_20 = n0_c + 168 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[84 + 0], accum[84 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_20)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[86 + 0], accum[86 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_20)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_21 = n0_c + 176 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[88 + 0], accum[88 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_21)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[90 + 0], accum[90 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_21)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_22 = n0_c + 184 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[92 + 0], accum[92 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_22)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[94 + 0], accum[94 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_22)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_23 = n0_c + 192 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[96 + 0], accum[96 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_23)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[98 + 0], accum[98 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_23)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_24 = n0_c + 200 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[100 + 0], accum[100 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_24)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[102 + 0], accum[102 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_24)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_25 = n0_c + 208 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[104 + 0], accum[104 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_25)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[106 + 0], accum[106 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_25)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_26 = n0_c + 216 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[108 + 0], accum[108 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_26)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[110 + 0], accum[110 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_26)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_27 = n0_c + 224 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[112 + 0], accum[112 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_27)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[114 + 0], accum[114 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_27)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_28 = n0_c + 232 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[116 + 0], accum[116 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_28)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[118 + 0], accum[118 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_28)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_29 = n0_c + 240 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[120 + 0], accum[120 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_29)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[122 + 0], accum[122 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_29)))[0]) = _pk;
-                    }
-                }
-                unsigned int col_d_30 = n0_c + 248 + lane_col;
-                if (row_lo < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[124 + 0], accum[124 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_lo * n_out + col_d_30)))[0]) = _pk;
-                    }
-                }
-                if (row_hi < row_lim_c) {
-                    {
-                        __nv_bfloat162 _pk = __floats2bfloat162_rn(accum[126 + 0], accum[126 + 1]);
-                        *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(D + (row_hi * n_out + col_d_30)))[0]) = _pk;
-                    }
+                    reinterpret_cast<int4*>(D + (row_hi * n_out + col_d_110))[0] = reinterpret_cast<int4*>(pk)[0];
                 }
             }
             tile_base_c = tile_base_c + n_tiles_e_c;
