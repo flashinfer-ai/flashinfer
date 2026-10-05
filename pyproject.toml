@@ -27,19 +27,14 @@ license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda"]
 [project.optional-dependencies]
 # Static SM103a KDA PTX uses ISA 9.2 and embedded-cubin TVM FFI shims.
 ptx = ["nvidia-cuda-nvcc>=13.2", "apache-tvm-ffi>=0.1.12,<0.2"]
-# Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
-cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
-cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
+# Keep the CUTLASS DSL floors in sync with ci/cuda-versions.json.
+# NVSHMEM requires a matching CUDA major and has no Python 3.14 wheels.
+cu12 = ["nvidia-cutlass-dsl>=4.7.0a0", "nvshmem4py-cu12>=0.3.1; sys_platform == 'linux' and python_version < '3.14'"]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0", "nvshmem4py-cu13>=0.3.1; sys_platform == 'linux' and python_version < '3.14'"]
 # Native Rubin MegaMoE uses APIs absent from the general CUDA-extra floor.
 sm107 = ["nvidia-cutlass-dsl[cu13]>=4.8.0.dev0", "nvshmem4py-cu13>=0.3.1", "torch>=2.8"]
-# DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
-# working. The moe_ep runtime deps (cuda-python, nccl-extensions) are now part of the
-# BASE dependencies (requirements.txt) and the NIXL-EP submodule build runs by
-# default (best-effort) on `pip install .` — see the moe_ep section at the top
-# of build_backend.py. libnccl comes from torch's own nvidia-nccl-cu13 pin;
-# the >=2.30.7 B200 floor is enforced at runtime (moe_ep/core/validation/
-# common.py) and upgraded --no-deps by the build hook on source installs. Opt
-# out of the native build with BUILD_NVEP=0 (or BUILD_NIXL_EP=0 / BUILD_NCCL_EP=0).
+# Deprecated alias; EP transport dependencies are in requirements.txt.
+# NIXL-EP builds best-effort by default; set BUILD_NIXL_EP=0 to skip it.
 nvep = []
 
 [project.scripts]
