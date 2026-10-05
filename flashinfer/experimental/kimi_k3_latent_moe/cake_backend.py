@@ -50,8 +50,8 @@ from typing import Any, Callable, Optional
 import torch
 import tvm_ffi
 
+from . import cake_jit
 from .cake_jit import (
-    KERNELS,
     MODULES,
     kernel_module_name,
     load_cake_kimi_k3_latent_moe_module,
@@ -115,6 +115,22 @@ FRONT_KD2_MIN_STAGES = {1: 4, 2: 6}
 TL_SLOTS = 16
 TL_MAX_GRID = 512
 DECODE_THREADS = 192
+#: Staggered cold fill of the staged-rows instance without the descriptor prefetch (the TP8 N_PAD 16 tail decode
+#: instance): the TMA warp waits for ring stage 0 to land before issuing stage 2 (symbol suffix ``_st2``).
+TAIL_ROWS_STAGGER = 2
+
+
+def _cached_plan(fn):
+    """Memoise a pure host plan (integer / boolean arguments); callers receive their own copy."""
+    cached = functools.lru_cache(maxsize=None)(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return dict(cached(*args, **kwargs))
+
+    wrapper.cache_clear = cached.cache_clear
+    return wrapper
+
 
 # Exact keyword set of the decode program's ``run`` entry (argument plan of the
 # generated binding); ``grid`` is expanded to ``grid_x/y/z``.
@@ -247,6 +263,7 @@ def choose_config(
     )
 
 
+@_cached_plan
 def decode_front_plan(
     num_tokens: int, i_local: int, sm_count: int = SM_COUNT
 ) -> dict[str, Any]:
@@ -298,12 +315,14 @@ def decode_front_plan(
         timeline=False,
         gate_pro=GATE_PRO,
         tmap_prefetch=True,
+        stagger=0,
         wait_warps=False,
         land_alias=bool(land_alias),
         tiles=tiles,
     )
 
 
+@_cached_plan
 def decode_tail_plan(
     num_tokens: int,
     i_local: int,
@@ -400,6 +419,9 @@ def decode_tail_plan(
         timeline=False,
         gate_pro=GATE_PRO,
         tmap_prefetch=not (use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD),
+        stagger=TAIL_ROWS_STAGGER
+        if (use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD)
+        else 0,
         wait_warps=bool(use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD),
         land_alias=bool(land_alias),
         tiles=tiles,
@@ -415,12 +437,14 @@ def decode_symbol(plan: dict[str, Any]) -> str:
     gate = f"_g{plan['gate_pro']}" if (fused and plan["issue_gate"]) else ""
     smem_b1 = "_sb" if plan["smem_b1"] else ""
     rows = "_rs" if (plan["smem_b1"] and plan["rows_smem"]) else ""
+    stagger = f"_st{int(plan['stagger'])}" if plan["stagger"] else ""
     return (
         f"kimi_k3_latent_moe_decode_g{plan['grid']}_n{plan['n_pad']}_r{plan['stages']}_d{plan['kdepth']}"
         f"_p{1 if plan['pdl'] else 0}_w{1 if plan['packed'] else 0}"
         f"_t{plan['r_tiles']}_{plan['l_tiles']}_{plan['s_tiles']}_k{plan['k1_chunks']}_{plan['k2_chunks']}"
         f"_o{plan['out_l_ld']}{'_so' if plan['stream_only'] else ''}_c{plan['cluster']}{'_f' if fused else ''}"
         f"{probe}{gate}{smem_b1}{rows}{'_tl' if plan['timeline'] else ''}{'' if plan['tmap_prefetch'] else '_np'}"
+        f"{stagger}"
         f"{'_ww' if plan['wait_warps'] else ''}{'_la' if plan['land_alias'] else ''}"
     )
 
@@ -589,6 +613,7 @@ def front_kernel_key(i_local: int, evict_first: bool = False) -> str:
     return f"front:i{int(i_local)}" + ("e1" if evict_first else "")
 
 
+@_cached_plan
 def prefill_front_plan(
     M: int, i_local: int, sm_count: int = SM_COUNT
 ) -> dict[str, Any]:
@@ -764,6 +789,7 @@ def use_fused_norm(M: int, gemm_ctas: int, sm_count: int, k2_iters: int) -> bool
     return fused_norm_fits(M, gemm_ctas, sm_count) and k2_iters >= FUSED_MIN_K2_ITERS
 
 
+@_cached_plan
 def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, Any]:
     """Host plan of the prefill tail chain (norm launch + persistent GEMM) for ``M`` tokens."""
     k_up = k_up_for_tp(tp)
@@ -852,8 +878,21 @@ def required_kernel_keys(sm_count: int = SM_COUNT) -> tuple[str, ...]:
     return tuple(keys)
 
 
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+@functools.cache
+def _device_facts(index: int) -> tuple[tuple[int, int], int]:
+    """``(compute capability, SM count)`` of ``cuda:index``, queried once per process."""
+    properties = torch.cuda.get_device_properties(index)
+    return (int(properties.major), int(properties.minor)), int(
+        properties.multi_processor_count
+    )
+
+
 def _device_arch(device: torch.device) -> str:
-    capability = torch.cuda.get_device_capability(device)
+    capability, _ = _device_facts(_device_index(device))
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
     if arch is None:
         raise ValueError(
@@ -864,11 +903,13 @@ def _device_arch(device: torch.device) -> str:
 
 
 def _check_sm_count(device: torch.device) -> int:
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    count = int(torch.cuda.get_device_properties(index).multi_processor_count)
+    """The decode grids and the stream-K plans are compiled for ``SM_COUNT`` SMs (the plan is part of
+    the kernel symbol); a device with another count has no registered instance."""
+    index = _device_index(device)
+    _, count = _device_facts(index)
     if count != SM_COUNT:
-        raise RuntimeError(
-            f"the generated programs were planned for {SM_COUNT} SMs; device {index} has {count}"
+        raise NotImplementedError(
+            f"the generated programs are planned for {SM_COUNT} SMs; device {index} has {count}"
         )
     return index
 
@@ -880,19 +921,19 @@ def generated_program_available(
     num_tokens: Optional[int] = None,
 ) -> bool:
     """True when this checkout registers the programs for ``device`` (optionally: one exact route)."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
-    if arch is None or not MODULES:
+    capability, count = _device_facts(_device_index(device))
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
+    if arch is None or not MODULES or count != SM_COUNT:
         return False
-    table = KERNELS.get(arch, {})
     if stage is None and tp is None and num_tokens is None:
-        return set(required_kernel_keys()) <= set(table)
+        return cake_jit.route_available(arch, required_kernel_keys())
     if stage is None or tp is None or num_tokens is None:
         raise ValueError("pass stage, tp and num_tokens together or none of them")
     try:
         keys = route_kernel_keys(stage, int(tp), int(num_tokens))
     except ValueError:
         return False
-    return all(key in table for key in keys)
+    return cake_jit.route_available(arch, keys)
 
 
 # ---------------------------------------------------------------------------
@@ -972,8 +1013,11 @@ def _front_workspace(
 # ---------------------------------------------------------------------------
 
 
-def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any], tuple]:
-    """Order ``kwargs`` by the generated argument plan of ``module_name`` and load its entry."""
+def _bind(
+    arch: str, key: str, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple]:
+    """Order ``kwargs`` by the argument plan of the program serving ``key`` and load its entry."""
+    module_name = kernel_module_name(arch, key)
     record = MODULES[module_name]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
     arguments = []
@@ -987,7 +1031,7 @@ def _bind(module_name: str, kwargs: dict[str, Any]) -> tuple[Callable[..., Any],
                 f"generated module {module_name!r} expects argument {name!r} ({kind}); "
                 f"host binding provides {sorted(kwargs)}"
             )
-    module = load_cake_kimi_k3_latent_moe_module(module_name)
+    module = load_cake_kimi_k3_latent_moe_module(arch, key)
     return getattr(module, record["ffi_entry"]), tuple(arguments)
 
 
@@ -1151,7 +1195,7 @@ def prepare_kimi_k3_latent_moe_front(
             )
             assert tuple(kwargs) == DECODE_KWARGS
             module = kernel_module_name(arch, key)
-            entry, arguments = _bind(module, kwargs)
+            entry, arguments = _bind(arch, key, kwargs)
             launches = (_Launch("front_decode", key, module, kwargs, entry, arguments),)
             route = "decode"
         else:
@@ -1181,7 +1225,7 @@ def prepare_kimi_k3_latent_moe_front(
             )
             assert tuple(kwargs) == FRONT_KWARGS
             module = kernel_module_name(arch, key)
-            entry, arguments = _bind(module, kwargs)
+            entry, arguments = _bind(arch, key, kwargs)
             launches = (_Launch("front_gemm", key, module, kwargs, entry, arguments),)
             route = "prefill"
     return KimiK3LatentMoeRunner(
@@ -1288,7 +1332,7 @@ def prepare_kimi_k3_latent_moe_tail(
             )
             assert tuple(kwargs) == DECODE_KWARGS
             module = kernel_module_name(arch, key)
-            entry, arguments = _bind(module, kwargs)
+            entry, arguments = _bind(arch, key, kwargs)
             launches = (
                 _Launch("tail_decode_fused", key, module, kwargs, entry, arguments),
             )
@@ -1336,7 +1380,7 @@ def prepare_kimi_k3_latent_moe_tail(
             )
             assert tuple(gemm_kwargs) == TAIL_GEMM_KWARGS
             gemm_module = kernel_module_name(arch, gemm_key)
-            gemm_entry, gemm_arguments = _bind(gemm_module, gemm_kwargs)
+            gemm_entry, gemm_arguments = _bind(arch, gemm_key, gemm_kwargs)
             gemm_launch = _Launch(
                 "tail_gemm",
                 gemm_key,
@@ -1362,7 +1406,7 @@ def prepare_kimi_k3_latent_moe_tail(
                 )
                 assert tuple(norm_kwargs) == NORM_KWARGS
                 norm_module = kernel_module_name(arch, norm_key)
-                norm_entry, norm_arguments = _bind(norm_module, norm_kwargs)
+                norm_entry, norm_arguments = _bind(arch, norm_key, norm_kwargs)
                 launches = (
                     _Launch(
                         "tail_norm",
@@ -1416,6 +1460,7 @@ __all__ = [
     "ROW_TOKENS",
     "SHARED_INTERMEDIATE",
     "SM_COUNT",
+    "TAIL_ROWS_STAGGER",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "SUPPORTED_TP",
     "KimiK3LatentMoeRunner",
