@@ -15,6 +15,8 @@ BF16 GEMM
 
     mm_bf16
     bmm_bf16
+    prepare_bf16_swiglu_weight
+    mm_bf16_swiglu
 
 FP4 GEMM
 --------
