@@ -902,6 +902,7 @@ def test_cake_fmha_balanced_launch_adapters_pass_descriptors_by_value(
     assert adapter.count("CUtensorMap const& p_") == 3
     assert "CakeFmhaTensorMap" not in adapter
     assert "TmaDeviceSlot" not in adapter
+    assert "RecordTmaDeviceSlotUses" not in adapter
     assert "cuMemAlloc" not in adapter
 
 
@@ -925,22 +926,6 @@ def test_cake_fmha_balanced_launch_adapters_pass_descriptors_by_value(
         ),
         (
             "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}",),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}",),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_fp8_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}", "{k_slot, v_slot}"),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_hd64_jit_binding.cu",
-            ("{q_slot, k_slot, v_slot}",),
-        ),
-        (
-            "jit/cake_fmha_decode_balanced_hd256_jit_binding.cu",
             ("{q_slot, k_slot, v_slot}",),
         ),
         (
