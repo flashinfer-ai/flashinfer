@@ -666,9 +666,27 @@ def cake_rmsnorm(
 ):
     """Autograd-enabled fused BF16 RMSNorm (optionally with a fused residual add).
 
-    Returns ``y`` (BF16 ``[T, H]``) or ``(y, h_new)`` when ``residual`` is
-    given.  The backward launches the fused ``dx`` + deterministic ``dw``
-    kernel(s) of :func:`cake_rmsnorm_train_backward`.
+    Parameters
+    ----------
+    x : torch.Tensor
+        BF16 ``[T, H]`` input on a supported CUDA device.
+    w : torch.Tensor
+        BF16 ``[H]`` RMSNorm weight.
+    eps : float
+        Variance epsilon evaluated in FP32 by the kernel.
+    residual : torch.Tensor, optional
+        BF16 ``[T, H]`` update added to ``x`` before normalization.  When
+        provided, the normalized input ``h_new`` is returned with the output.
+    deterministic : bool
+        Whether to use the deterministic fixed-order weight-gradient reduction.
+        Only ``True`` is supported; ``False`` is rejected during backward.
+
+    Returns
+    -------
+    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        BF16 ``y`` with shape ``[T, H]``, or ``(y, h_new)`` when ``residual``
+        is given.  Backward launches the fused ``dx`` and deterministic ``dw``
+        kernels of :func:`cake_rmsnorm_train_backward`.
     """
 
     return CakeRMSNormFunction.apply(x, w, eps, residual, deterministic)

@@ -694,6 +694,37 @@ def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
     assert tactic == 1
 
 
+def test_rank_tactics_reranks_when_profiling_policy_changes(monkeypatch):
+    """A shortlist measured under one replay/L2 policy must not be served for
+    another; the cache key alone does not distinguish them."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    hot = TuningConfig()
+    cold = TuningConfig(use_cold_l2_cache=True)
+    profile_calls = []
+    times = {"hot": {0: 5.0, 1: 1.0, 2: 3.0}, "cold": {0: 1.0, 1: 5.0, 2: 3.0}}
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        profile_calls.append(tactic)
+        return times["cold" if tuning_config.use_cold_l2_cache else "hot"][tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        assert tuner.rank_tactics("dummy_rank", [runner], hot, inputs, k=2) == [1, 2]
+        assert tuner.rank_tactics("dummy_rank", [runner], cold, inputs, k=2) == [0, 2]
+        # Same policy again is served from the shortlist cache.
+        assert tuner.rank_tactics("dummy_rank", [runner], cold, inputs, k=3) == [
+            0,
+            2,
+            1,
+        ]
+
+    assert profile_calls == [0, 1, 2, 0, 1, 2]
+
+
 def test_rank_tactics_records_winner_policy(monkeypatch):
     """A ranked winner must carry the policy it was measured under, so
     save_configs cannot persist a stale policy from an earlier choose_one."""
