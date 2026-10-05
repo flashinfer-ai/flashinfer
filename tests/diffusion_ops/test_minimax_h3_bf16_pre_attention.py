@@ -14,6 +14,7 @@
 
 import inspect
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.diffusion_ops import minimax_h3_bf16_pre_attention
+from flashinfer.diffusion_ops import minimax_h3 as minimax_h3_module
 from flashinfer.diffusion_ops.minimax_h3 import _validate_input_contract
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.cake_minimax_h3_bf16_pre_attention import (
@@ -36,7 +38,11 @@ HEAD_DIM = 128
 QKV_KINDS = 3
 QKV_WIDTH = NUM_HEADS * QKV_KINDS * HEAD_DIM
 ROPE_DIM = 96
+# Production default table row count; the operator accepts any rows >= 1.
 ADALN_ROWS = 9
+# Engine modulation projection: tables are column chunks of a [rows, 6 * 5376] buffer.
+ENGINE_TABLE_CHUNKS = 6
+ENGINE_TABLE_ROWS = [3, 6, 12]
 EPS = 1.0e-5
 
 CENTER_SHAPES = [
@@ -99,33 +105,53 @@ _SOURCE = (
     / "cake_minimax_h3_bf16_pre_attention_sm103a.cu"
 )
 _CUDA_DEVICE = torch.device("cuda")
-_HAS_SM103A_RUNTIME = (
+_HAS_BLACKWELL_RUNTIME = (
     _SOURCE.is_file()
     and torch.cuda.is_available()
-    and get_compute_capability(_CUDA_DEVICE) == (10, 3)
+    and get_compute_capability(_CUDA_DEVICE) in {(10, 0), (10, 3)}
     and is_sm100f_supported(_CUDA_DEVICE)
 )
 _RUN_FULL = os.environ.get("FLASHINFER_RUN_FULL_MINIMAX_H3_TESTS", "0") == "1"
 
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA device"
+)
+requires_blackwell = pytest.mark.skipif(
+    not _HAS_BLACKWELL_RUNTIME,
+    reason="requires the frozen CUDA source and an SM100a or SM103a GPU",
+)
 
-def _make_meta_case(m: int = 129, p: int = 8):
+
+def _meta(shape, dtype=torch.bfloat16):
+    return torch.empty(shape, dtype=dtype, device="meta")
+
+
+def _make_empty_case(m: int = 129, p: int = 8, device: str = "meta"):
+    """Uninitialised operands of the contract shapes (validation-only cases)."""
+
     def tensor(shape, dtype=torch.bfloat16):
-        return torch.empty(shape, dtype=dtype, device="meta")
+        return torch.empty(shape, dtype=dtype, device=device)
 
     return {
         "x": tensor((m, HIDDEN)),
         "x_norm_weight": tensor((HIDDEN,)),
         "adaln_scale": tensor((ADALN_ROWS, HIDDEN)),
         "adaln_shift": tensor((ADALN_ROWS, HIDDEN)),
-        "adaln_index": tensor((m,), torch.int32),
+        "adaln_index": tensor((m,), torch.int64),
         "qkv_weight": tensor((QKV_WIDTH, HIDDEN)),
         "q_norm_weight": tensor((HEAD_DIM,)),
         "k_norm_weight": tensor((HEAD_DIM,)),
         "rope_cos_sin": tensor((m, ROPE_DIM)),
+        "rope_positions": None,
         "out": tensor((p, m, NUM_HEADS // p, QKV_KINDS, HEAD_DIM)),
         "ulysses_degree": p,
         "eps": EPS,
+        "qk_eps": None,
     }
+
+
+def _make_meta_case(m: int = 129, p: int = 8):
+    return _make_empty_case(m, p, device="meta")
 
 
 def _validate(case):
@@ -139,16 +165,36 @@ def _validate(case):
         case["q_norm_weight"],
         case["k_norm_weight"],
         case["rope_cos_sin"],
+        case["rope_positions"],
         case["out"],
         ulysses_degree=case["ulysses_degree"],
         eps=case["eps"],
+        qk_eps=case["qk_eps"],
     )
+
+
+def _engine_tables(rows: int, *, device, fill=None):
+    """``(adaln_shift, adaln_scale)`` as column chunks 0 and 1 of a ``[rows, 6 * 5376]``
+    modulation projection (row stride ``6 * 5376`` elements), never copied."""
+    proj = torch.empty(
+        (rows, ENGINE_TABLE_CHUNKS * HIDDEN), dtype=torch.bfloat16, device=device
+    )
+    if fill is not None:
+        fill(proj)
+    shift = proj[:, 0:HIDDEN]
+    scale = proj[:, HIDDEN : 2 * HIDDEN]
+    assert scale.stride() == (ENGINE_TABLE_CHUNKS * HIDDEN, 1)
+    assert not scale.is_contiguous()
+    return shift, scale
 
 
 def test_public_signature_requires_destination():
     signature = inspect.signature(minimax_h3_bf16_pre_attention)
     assert signature.parameters["out"].default is inspect.Parameter.empty
     assert signature.parameters["eps"].default == EPS
+    assert signature.parameters["qk_eps"].default is None
+    assert signature.parameters["rope_positions"].default is None
+    assert signature.parameters["rope_positions"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_fi_trace_contract():
@@ -157,6 +203,8 @@ def test_fi_trace_contract():
     assert definition["op_type"] == "minimax_h3_bf16_pre_attention"
     assert definition["axes"]["num_tokens"]["type"] == "var"
     assert definition["axes"]["hidden_size"]["value"] == HIDDEN
+    assert definition["axes"]["adaln_rows"]["type"] == "var"
+    assert definition["axes"]["rope_cache_rows"]["type"] == "var"
     assert definition["axes"]["ulysses_degree"]["type"] == "var"
     assert definition["axes"]["heads_per_destination"]["type"] == "var"
     assert "num_heads" not in definition["axes"]
@@ -164,6 +212,8 @@ def test_fi_trace_contract():
         "qkv_width == ulysses_degree * heads_per_destination * qkv_kinds * head_dim"
         in definition["constraints"]
     )
+    assert definition["inputs"]["rope_positions"]["optional"] is True
+    assert definition["inputs"]["qk_eps"]["optional"] is True
     expected_shape = [
         "ulysses_degree",
         "num_tokens",
@@ -198,17 +248,27 @@ def test_jit_source_resolution_supports_package_and_source_tree(monkeypatch, tmp
 
 def test_frozen_source_contains_index_and_tmem_safety_guards():
     source = _SOURCE.read_text(encoding="utf-8")
-    assert "table_row >= 0 && table_row < 9" in source
+    # The int64 AdaLN index is range-checked against the runtime row count
+    # before any table address is formed (out-of-range -> zero activation
+    # row); neither bound is a literal.
+    assert re.search(
+        r"table_index >= 0(LL)? && table_index < \(?\s*\(?long long\)?\s*\)?\(?adaln_rows\)?",
+        source,
+    )
+    # TMEM ownership protocol of the GEMM (same surface as the fc1 / out_proj stages).
     assert "tcgen05.fence::after_thread_sync;" in source
     assert "tcgen05.wait::ld.sync.aligned;" in source
-    assert "tcgen05.fence::before_thread_sync;" in source
 
 
-def test_frozen_source_uses_launch_parameter_tensor_map():
+def test_frozen_source_uses_launch_parameter_tensor_maps():
     source = _SOURCE.read_text(encoding="utf-8")
+    assert "__grid_constant__ CUtensorMap activation" in source
     assert "__grid_constant__ CUtensorMap qkv_weight" in source
     assert "cuMemAlloc" not in source
     assert "qkv_weight tensor-map cache" not in source
+    # Two launches: the plain norm/AdaLN kernel and the cluster-launched GEMM.
+    assert "cudaLaunchKernelEx" in source
+    assert "TensorView workspace" in source
 
 
 @pytest.mark.parametrize("p", [1, 2, 4, 8])
@@ -216,45 +276,65 @@ def test_valid_meta_contract(p):
     _validate(_make_meta_case(p=p))
 
 
+@pytest.mark.parametrize("rows", ENGINE_TABLE_ROWS)
+def test_valid_meta_contract_engine_tables(rows):
+    case = _make_meta_case()
+    case["adaln_shift"], case["adaln_scale"] = _engine_tables(rows, device="meta")
+    _validate(case)
+
+
+def test_valid_meta_contract_rope_cache_and_positions():
+    m = 129
+    case = _make_meta_case(m=m)
+    # Identity positions: the cache may be longer than M.
+    case["rope_cos_sin"] = _meta((4 * m + 3, ROPE_DIM))
+    _validate(case)
+    # Explicit positions: the cache may be shorter than M.
+    case["rope_cos_sin"] = _meta((1, ROPE_DIM))
+    case["rope_positions"] = _meta((m,), torch.int64)
+    _validate(case)
+    # Distinct Q/K epsilon and an arbitrary input epsilon are runtime values.
+    case["eps"] = 1.0e-6
+    case["qk_eps"] = 1.0e-3
+    _validate(case)
+
+
 @pytest.mark.parametrize(
     "field,replacement,match",
     [
+        ("x", _meta((129, HIDDEN - 1)), "x must have shape"),
+        ("adaln_scale", _meta((HIDDEN,)), "adaln_scale shape"),
+        ("adaln_scale", _meta((0, HIDDEN)), "adaln_scale shape"),
         (
-            "x",
-            torch.empty((129, HIDDEN - 1), dtype=torch.bfloat16, device="meta"),
-            "x must have shape",
+            "adaln_scale",
+            _meta((ADALN_ROWS, HIDDEN), torch.float16),
+            "adaln_scale dtype",
         ),
         (
             "adaln_scale",
-            torch.empty((ADALN_ROWS - 1, HIDDEN), dtype=torch.bfloat16, device="meta"),
-            "adaln_scale shape",
+            _meta((HIDDEN, 3)).t(),
+            "adaln_scale must have a unit last stride",
         ),
+        ("adaln_shift", _meta((3, HIDDEN + 4))[:, :HIDDEN], "adaln_shift row pitch"),
+        ("adaln_index", _meta((129,), torch.int32), "adaln_index dtype"),
         (
             "adaln_index",
-            torch.empty((129,), dtype=torch.int64, device="meta"),
-            "adaln_index dtype",
+            _meta((129, 2), torch.int64)[:, 0],
+            "adaln_index must be contiguous",
         ),
-        (
-            "qkv_weight",
-            torch.empty((HIDDEN, QKV_WIDTH), dtype=torch.bfloat16, device="meta").t(),
-            "qkv_weight must be contiguous",
-        ),
-        (
-            "rope_cos_sin",
-            torch.empty((129, HEAD_DIM), dtype=torch.bfloat16, device="meta"),
-            "rope_cos_sin shape",
-        ),
+        ("qkv_weight", _meta((HIDDEN, QKV_WIDTH)).t(), "qkv_weight must be contiguous"),
+        ("rope_cos_sin", _meta((129, HEAD_DIM)), "rope_cos_sin shape"),
+        ("rope_cos_sin", _meta((0, ROPE_DIM)), "rope_cos_sin shape"),
+        ("rope_cos_sin", _meta((128, ROPE_DIM)), "rope_positions=None"),
+        ("rope_positions", _meta((129,), torch.int32), "rope_positions dtype"),
+        ("rope_positions", _meta((128,), torch.int64), "rope_positions shape"),
         (
             "out",
-            torch.empty(
-                (8, 129, 7, QKV_KINDS, HEAD_DIM - 1),
-                dtype=torch.bfloat16,
-                device="meta",
-            ),
+            _meta((8, 129, 7, QKV_KINDS, HEAD_DIM - 1)),
             "out shape",
         ),
         ("ulysses_degree", 3, "ulysses_degree"),
-        ("eps", 1.0e-6, "eps must be"),
+        ("eps", "not-a-number", "could not convert"),
     ],
 )
 def test_invalid_meta_contract(field, replacement, match):
@@ -264,33 +344,36 @@ def test_invalid_meta_contract(field, replacement, match):
         _validate(case)
 
 
-def _make_adaln_index(m: int, profile: str, *, device, generator):
-    rows = torch.arange(m, dtype=torch.int64, device=device)
+@requires_cuda
+def test_rejects_misaligned_table_base():
+    case = _make_empty_case(m=129, device="cuda")
+    storage = torch.empty(ADALN_ROWS * HIDDEN + 8, dtype=torch.bfloat16, device="cuda")
+    # An 8-byte offset into a 16-byte aligned allocation.
+    case["adaln_scale"] = storage[4 : 4 + ADALN_ROWS * HIDDEN].view(ADALN_ROWS, HIDDEN)
+    assert case["adaln_scale"].data_ptr() % 16 == 8
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        _validate(case)
+
+
+def _make_adaln_index(m: int, profile: str, *, device, generator, rows=ADALN_ROWS):
+    positions = torch.arange(m, dtype=torch.int64, device=device)
     if profile == "production_segments":
-        return (
-            torch.div(rows * ADALN_ROWS, m, rounding_mode="floor")
-            .clamp_max(8)
-            .to(torch.int32)
-        )
+        return torch.div(positions * rows, m, rounding_mode="floor").clamp_max(rows - 1)
     if profile == "boundary_segments":
-        return (
-            torch.div(rows, 127, rounding_mode="floor")
-            .remainder(ADALN_ROWS)
-            .to(torch.int32)
-        )
+        return torch.div(positions, 127, rounding_mode="floor").remainder(rows)
     if profile == "all_same":
-        return torch.full((m,), 8, dtype=torch.int32, device=device)
+        return torch.full((m,), rows - 1, dtype=torch.int64, device=device)
     return torch.randint(
-        0, ADALN_ROWS, (m,), dtype=torch.int32, device=device, generator=generator
+        0, rows, (m,), dtype=torch.int64, device=device, generator=generator
     )
 
 
-def _make_rope_cache(m: int, *, device):
-    rows = torch.arange(m, dtype=torch.float32, device=device)
+def _make_rope_cache(rows: int, *, device):
+    positions = torch.arange(rows, dtype=torch.float32, device=device)
     axes = (
-        torch.div(rows, 4096, rounding_mode="floor"),
-        torch.div(rows, 64, rounding_mode="floor").remainder(64),
-        rows.remainder(64),
+        torch.div(positions, 4096, rounding_mode="floor"),
+        torch.div(positions, 64, rounding_mode="floor").remainder(64),
+        positions.remainder(64),
     )
     inv_freq = torch.pow(
         torch.tensor(10000.0, dtype=torch.float32, device=device),
@@ -300,11 +383,11 @@ def _make_rope_cache(m: int, *, device):
     return torch.cat((phase.cos(), phase.sin()), dim=-1).to(torch.bfloat16).contiguous()
 
 
-def _apply_rope(x, rope_cos_sin):
+def _apply_rope(x, rope_rows):
     rotary = x[..., :ROPE_DIM].float()
     tail = x[..., ROPE_DIM:]
-    cos_half = rope_cos_sin[:, :48].float()
-    sin_half = rope_cos_sin[:, 48:].float()
+    cos_half = rope_rows[:, :48].float()
+    sin_half = rope_rows[:, 48:].float()
     cos = torch.cat((cos_half, cos_half), dim=-1)[:, None, :]
     sin = torch.cat((sin_half, sin_half), dim=-1)[:, None, :]
     rotated_half = torch.cat((-rotary[..., 48:], rotary[..., :48]), dim=-1)
@@ -312,13 +395,27 @@ def _apply_rope(x, rope_cos_sin):
     return torch.cat((rotated, tail), dim=-1)
 
 
+def _rope_rows(case):
+    """Per-token RoPE rows: ``cache[positions]`` with positions clamped to the cache, or the
+    first ``M`` cache rows for the identity."""
+    cache = case["rope_cos_sin"]
+    positions = case.get("rope_positions")
+    m = case["x"].shape[0]
+    if positions is None:
+        return cache[:m]
+    return cache.index_select(0, positions.clamp(0, cache.shape[0] - 1))
+
+
 def _reference(case):
-    norm = F.rms_norm(case["x"], (HIDDEN,), case["x_norm_weight"], eps=EPS).to(
+    eps = float(case["eps"])
+    qk_eps = eps if case.get("qk_eps") is None else float(case["qk_eps"])
+    rows = case["adaln_scale"].shape[0]
+    norm = F.rms_norm(case["x"], (HIDDEN,), case["x_norm_weight"], eps=eps).to(
         torch.bfloat16
     )
     index = case["adaln_index"].long()
-    valid_index = (index >= 0) & (index < ADALN_ROWS)
-    safe_index = index.clamp(0, ADALN_ROWS - 1)
+    valid_index = (index >= 0) & (index < rows)
+    safe_index = index.clamp(0, rows - 1)
     scale = case["adaln_scale"].index_select(0, safe_index)
     shift = case["adaln_shift"].index_select(0, safe_index)
     adaln = torch.addcmul(shift, norm, (scale + 1.0).to(torch.bfloat16)).to(
@@ -326,15 +423,20 @@ def _reference(case):
     )
     adaln = torch.where(valid_index[:, None], adaln, torch.zeros_like(adaln))
     qkv = F.linear(adaln, case["qkv_weight"]).to(torch.bfloat16)
-    grouped = qkv.view(case["x"].shape[0], NUM_HEADS, QKV_KINDS, HEAD_DIM)
-    q = F.rms_norm(grouped[:, :, 0, :], (HEAD_DIM,), case["q_norm_weight"], eps=EPS).to(
-        torch.bfloat16
+    # Engine-resident weight rows are [qkv_kind, head, head_dim]: the projection
+    # columns are [q_all | k_all | v_all].
+    grouped = qkv.view(case["x"].shape[0], QKV_KINDS, NUM_HEADS, HEAD_DIM).transpose(
+        1, 2
     )
-    k = F.rms_norm(grouped[:, :, 1, :], (HEAD_DIM,), case["k_norm_weight"], eps=EPS).to(
-        torch.bfloat16
-    )
-    q = _apply_rope(q, case["rope_cos_sin"])
-    k = _apply_rope(k, case["rope_cos_sin"])
+    q = F.rms_norm(
+        grouped[:, :, 0, :], (HEAD_DIM,), case["q_norm_weight"], eps=qk_eps
+    ).to(torch.bfloat16)
+    k = F.rms_norm(
+        grouped[:, :, 1, :], (HEAD_DIM,), case["k_norm_weight"], eps=qk_eps
+    ).to(torch.bfloat16)
+    rope_rows = _rope_rows(case)
+    q = _apply_rope(q, rope_rows)
+    k = _apply_rope(k, rope_rows)
     fused = torch.stack((q, k, grouped[:, :, 2, :]), dim=2)
     p = case["ulysses_degree"]
     return (
@@ -344,7 +446,14 @@ def _reference(case):
     )
 
 
-def _make_cuda_case(m: int, p: int, profile: str):
+def _make_cuda_case(
+    m: int,
+    p: int,
+    profile: str,
+    *,
+    adaln_rows: int = ADALN_ROWS,
+    table_layout: str = "contract",
+):
     device = torch.device("cuda")
     generator = torch.Generator(device=device)
     generator.manual_seed(4532 + m + p)
@@ -357,18 +466,29 @@ def _make_cuda_case(m: int, p: int, profile: str):
         out = torch.empty(shape, dtype=torch.bfloat16, device=device)
         return out.uniform_(low, high, generator=generator)
 
+    if table_layout == "contract":
+        adaln_scale = uniform((adaln_rows, HIDDEN), -0.05, 0.05)
+        adaln_shift = uniform((adaln_rows, HIDDEN), -0.05, 0.05)
+    else:
+        adaln_shift, adaln_scale = _engine_tables(
+            adaln_rows,
+            device=device,
+            fill=lambda proj: proj.uniform_(-0.05, 0.05, generator=generator),
+        )
+
     return {
         "x": normal((m, HIDDEN), 0.5),
         "x_norm_weight": uniform((HIDDEN,), 0.9, 1.1),
-        "adaln_scale": uniform((ADALN_ROWS, HIDDEN), -0.05, 0.05),
-        "adaln_shift": uniform((ADALN_ROWS, HIDDEN), -0.05, 0.05),
+        "adaln_scale": adaln_scale,
+        "adaln_shift": adaln_shift,
         "adaln_index": _make_adaln_index(
-            m, profile, device=device, generator=generator
+            m, profile, device=device, generator=generator, rows=adaln_rows
         ),
         "qkv_weight": normal((QKV_WIDTH, HIDDEN), 0.01),
         "q_norm_weight": uniform((HEAD_DIM,), 0.9, 1.1),
         "k_norm_weight": uniform((HEAD_DIM,), 0.9, 1.1),
         "rope_cos_sin": _make_rope_cache(m, device=device),
+        "rope_positions": None,
         "out": torch.empty(
             (p, m, NUM_HEADS // p, QKV_KINDS, HEAD_DIM),
             dtype=torch.bfloat16,
@@ -376,11 +496,11 @@ def _make_cuda_case(m: int, p: int, profile: str):
         ),
         "ulysses_degree": p,
         "eps": EPS,
+        "qk_eps": None,
     }
 
 
-def _run_correctness_shape(m: int, p: int, profile: str):
-    case = _make_cuda_case(m, p, profile)
+def _run_case(case):
     expected = _reference(case)
     actual = minimax_h3_bf16_pre_attention(**case)
     assert actual.data_ptr() == case["out"].data_ptr()
@@ -391,39 +511,114 @@ def _run_correctness_shape(m: int, p: int, profile: str):
         atol=0.01,
         rtol=0.01,
     )
+    return actual, expected
 
 
-@pytest.mark.skipif(
-    not _HAS_SM103A_RUNTIME,
-    reason="requires the frozen SM103a CUDA source and an SM103a GPU",
-)
+def _run_correctness_shape(m: int, p: int, profile: str):
+    _run_case(_make_cuda_case(m, p, profile))
+
+
+@requires_blackwell
 @pytest.mark.parametrize("m,p,profile", SMOKE_SHAPES)
-def test_sm103a_smoke_correctness(m, p, profile):
+def test_blackwell_smoke_correctness(m, p, profile):
     _run_correctness_shape(m, p, profile)
 
 
-@pytest.mark.skipif(
-    not _HAS_SM103A_RUNTIME,
-    reason="requires the frozen SM103a CUDA source and an SM103a GPU",
-)
-def test_sm103a_invalid_adaln_indices_produce_zero_rows():
-    case = _make_cuda_case(6, 8, "all_same")
-    case["adaln_index"] = torch.tensor(
-        [0, -1, 8, 9, -(2**31), 2**31 - 1], dtype=torch.int32, device="cuda"
+@requires_blackwell
+@pytest.mark.parametrize("rows", ENGINE_TABLE_ROWS)
+@pytest.mark.parametrize("m,p", [(129, 8), (4824, 8)])
+def test_blackwell_engine_layout_tables(rows, m, p):
+    case = _make_cuda_case(
+        m, p, "production_segments", adaln_rows=rows, table_layout="engine"
     )
-    expected = _reference(case)
-    actual = minimax_h3_bf16_pre_attention(**case)
-    torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
-    assert not torch.count_nonzero(actual[:, [1, 3, 4, 5]])
+    assert case["adaln_scale"].stride(0) == ENGINE_TABLE_CHUNKS * HIDDEN
+    _run_case(case)
+    # The strided views were passed through, not copied.
+    assert case["adaln_scale"].stride(0) == ENGINE_TABLE_CHUNKS * HIDDEN
+    assert not case["adaln_scale"].is_contiguous()
 
 
-@pytest.mark.skipif(
-    not _HAS_SM103A_RUNTIME,
-    reason="requires the frozen SM103a CUDA source and an SM103a GPU",
-)
-def test_sm103a_cuda_graph_capture():
+@requires_blackwell
+@pytest.mark.parametrize("rows", [3, ADALN_ROWS])
+def test_blackwell_invalid_adaln_indices_produce_zero_rows(rows):
+    int64 = torch.iinfo(torch.int64)
+    values = [0, -1, rows, rows + 1, -(2**40), 2**40, int64.min, int64.max]
+    case = _make_cuda_case(len(values), 8, "all_same", adaln_rows=rows)
+    case["adaln_index"] = torch.tensor(values, dtype=torch.int64, device="cuda")
+    actual, _ = _run_case(case)
+    assert not torch.count_nonzero(actual[:, 1:])
+    assert torch.count_nonzero(actual[:, 0])
+
+
+@requires_blackwell
+def test_blackwell_rope_cache_with_positions():
+    m, p = 129, 8
+    case = _make_cuda_case(m, p, "production_segments")
+    cache_rows = 2 * m + 7
+    case["rope_cos_sin"] = _make_rope_cache(cache_rows, device="cuda")
+    case["rope_positions"] = (
+        torch.arange(m, dtype=torch.int64, device="cuda") * 7 + 3
+    ).remainder(cache_rows)
+    _run_case(case)
+    # A different gather must change the rotated columns (the test is sensitive).
+    other = dict(case)
+    other["rope_positions"] = case["rope_positions"].flip(0)
+    assert not torch.allclose(
+        _reference(other)[:, :, :, 0, :ROPE_DIM],
+        _reference(case)[:, :, :, 0, :ROPE_DIM],
+        atol=0.01,
+        rtol=0.01,
+    )
+
+
+@requires_blackwell
+def test_blackwell_rope_positions_out_of_range_are_clamped():
+    m, p = 64, 8
+    case = _make_cuda_case(m, p, "production_segments")
+    cache_rows = 40
+    case["rope_cos_sin"] = _make_rope_cache(cache_rows, device="cuda")
+    positions = torch.arange(m, dtype=torch.int64, device="cuda")
+    positions[0] = -5
+    positions[1] = cache_rows + 9
+    positions[2] = -(2**40)
+    positions[3] = 2**40
+    case["rope_positions"] = positions
+    _run_case(case)  # the reference clamps to [0, S)
+
+
+@requires_blackwell
+def test_blackwell_identity_positions_use_longer_cache_and_are_cached():
+    m, p = 129, 8
+    case = _make_cuda_case(m, p, "production_segments")
+    case["rope_cos_sin"] = _make_rope_cache(3 * m, device="cuda")
+    case["rope_positions"] = None
+    _run_case(case)
+    key = (m, torch.device("cuda").index or torch.cuda.current_device())
+    cached = minimax_h3_module._IDENTITY_ROPE_POSITIONS[key]
+    assert torch.equal(cached, torch.arange(m, dtype=torch.int64, device="cuda"))
+    _run_case(case)
+    assert minimax_h3_module._IDENTITY_ROPE_POSITIONS[key] is cached
+
+
+@requires_blackwell
+def test_blackwell_distinct_input_and_qk_eps():
+    case = _make_cuda_case(129, 8, "production_segments")
+    case["eps"] = 1.0e-2
+    case["qk_eps"] = 5.0e-2
+    _run_case(case)
+    # Swapping the two epsilons must be visible within the tolerance.
+    swapped = dict(case)
+    swapped["eps"], swapped["qk_eps"] = case["qk_eps"], case["eps"]
+    assert not torch.allclose(
+        _reference(swapped), _reference(case), atol=0.01, rtol=0.01
+    )
+
+
+@requires_blackwell
+def test_blackwell_cuda_graph_capture():
     case = _make_cuda_case(128, 8, "production_segments")
     expected = _reference(case)
+    # Warm-up populates the identity-positions cache before capture.
     minimax_h3_bf16_pre_attention(**case)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -435,9 +630,36 @@ def test_sm103a_cuda_graph_capture():
 
 
 @pytest.mark.skipif(
-    not (_HAS_SM103A_RUNTIME and _RUN_FULL),
+    not (_HAS_BLACKWELL_RUNTIME and _RUN_FULL),
     reason="set FLASHINFER_RUN_FULL_MINIMAX_H3_TESTS=1 to run the 44-shape suite",
 )
 @pytest.mark.parametrize("m,p,profile", FULL_CORRECTNESS_SHAPES)
-def test_sm103a_full_correctness(m, p, profile):
+def test_blackwell_full_correctness(m, p, profile):
     _run_correctness_shape(m, p, profile)
+
+
+@requires_blackwell
+def test_blackwell_explicit_workspace_matches_and_is_overwritten():
+    case = _make_cuda_case(129, 8, "production_segments")
+    expected = _reference(case)
+    workspace = torch.full(
+        (129, HIDDEN), float("nan"), dtype=torch.bfloat16, device=_CUDA_DEVICE
+    )
+    actual = minimax_h3_bf16_pre_attention(**case, workspace=workspace)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+    assert torch.isfinite(workspace.float()).all()
+
+
+def test_workspace_contract_rejects_wrong_shape_and_dtype():
+    case = _make_meta_case(m=129, p=8)
+    with pytest.raises(ValueError, match="workspace shape"):
+        minimax_h3_bf16_pre_attention(
+            **case,
+            workspace=torch.empty((128, HIDDEN), dtype=torch.bfloat16, device="meta"),
+        )
+    with pytest.raises(ValueError, match="workspace dtype"):
+        minimax_h3_bf16_pre_attention(
+            **case,
+            workspace=torch.empty((129, HIDDEN), dtype=torch.float16, device="meta"),
+        )

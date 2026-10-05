@@ -550,23 +550,32 @@ class MnnvlMemory:  # type: ignore[no-redef]
     @staticmethod
     def support_nvlink(need_all_up: bool = True):
         dev_id = torch.cuda.current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
-        link_count = pynvml.NVML_NVLINK_MAX_LINKS
-        active_links = 0
-        available_links = 0
-        for link_idx in range(link_count):
-            try:
-                if pynvml.nvmlDeviceGetNvLinkCapability(
-                    handle, link_idx, pynvml.NVML_NVLINK_CAP_P2P_SUPPORTED
+        # NVML initialization is reference-counted, so this pair is safe
+        # whether or not the caller has already initialized NVML.
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+            link_count = pynvml.NVML_NVLINK_MAX_LINKS
+            active_links = 0
+            available_links = 0
+            for link_idx in range(link_count):
+                try:
+                    if pynvml.nvmlDeviceGetNvLinkCapability(
+                        handle, link_idx, pynvml.NVML_NVLINK_CAP_P2P_SUPPORTED
+                    ):
+                        is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
+                        available_links += 1
+                        if is_active:
+                            active_links += 1
+                except (
+                    pynvml.NVMLError_NotSupported,
+                    pynvml.NVMLError_InvalidArgument,
                 ):
-                    is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
-                    available_links += 1
-                    if is_active:
-                        active_links += 1
-            except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
-                # Link indices beyond the device's link count raise
-                # InvalidArgument on some platforms (e.g. B200).
-                continue
+                    # Link indices beyond the device's link count raise
+                    # InvalidArgument on some platforms (e.g. B200).
+                    continue
+        finally:
+            pynvml.nvmlShutdown()
         return (
             active_links == available_links and available_links > 0
             if need_all_up
@@ -600,8 +609,8 @@ def is_mnnvl_fabric_supported(device_idx: int) -> bool:
         pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric_info))
         return (
             fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
-            and fabric_info.clusterUuid
-            and fabric_info.clusterUuid[0] != 0
+            # A binary UUID may start with zero; only an all-zero UUID is absent.
+            and any(fabric_info.clusterUuid)
         )
     finally:
         pynvml.nvmlShutdown()

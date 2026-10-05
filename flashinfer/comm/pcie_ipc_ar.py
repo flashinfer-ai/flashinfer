@@ -29,6 +29,8 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.comm import pcie_ipc_all_reduce_trace
 from ..jit.comm import gen_pcie_ipc_comm_module
 from ..utils import register_custom_op
+from .pcie_ipc_collectives._constants import AR_MAX_BLOCKS, PACK_BYTES
+from .pcie_ipc_collectives._lifecycle import bind_stream, joint_check, release_workspace
 from .cuda_ipc import create_shared_buffer, free_shared_buffer
 from .pcie_ipc_policy import IpcLaunchConfig, get_pcie_ipc_launch_config
 from .pcie_ipc_topology import resolve_pcie_ipc_profile
@@ -101,6 +103,8 @@ def get_pcie_ipc_comm_module():
         init=init,
         dispose=dispose,
         all_reduce=all_reduce,
+        memop_supported=module.pcie_ipc_memop_supported,
+        set_memop_enabled=module.pcie_ipc_set_memop_enabled,
     )
 
 
@@ -182,7 +186,7 @@ class PcieIpcAllReduceWorkspace:
         group: ProcessGroup,
         max_numel: int,
         dtype: torch.dtype = torch.bfloat16,
-        max_blocks: int = 128,
+        max_blocks: int = AR_MAX_BLOCKS,
         profile: Optional[str] = None,
         tune_batches: Optional[Sequence[int]] = None,
         tune_cache: Optional[str] = None,
@@ -204,6 +208,7 @@ class PcieIpcAllReduceWorkspace:
         self.max_numel = max_numel
         self.max_blocks = max_blocks
         self.profile = ""
+        self.memop_supported = False
         self.profile_reason = ""
         # Resolved launch configurations, keyed exactly. Consulted before any
         # AutoTuner call because even a pure cache lookup there takes a global
@@ -234,7 +239,7 @@ class PcieIpcAllReduceWorkspace:
             error = f"dtype {dtype} unsupported; expected one of {_SUPPORTED_DTYPES}"
         else:
             self.elem_size = torch.empty((), dtype=dtype).element_size()
-            pack_elems = 16 // self.elem_size
+            pack_elems = PACK_BYTES // self.elem_size
             if max_numel <= 0 or max_numel % pack_elems != 0:
                 # The kernels address the scratch in 16-byte packs, so a
                 # capacity that is not a whole number of packs is rejected by
@@ -270,6 +275,7 @@ class PcieIpcAllReduceWorkspace:
             self.profile = decision.profile
             self.profile_reason = decision.reason
             module = get_pcie_ipc_comm_module()
+            local_memop_supported = bool(module.memop_supported())
             nbytes = module.workspace_size(
                 self.world_size, max_numel, self.elem_size, max_blocks
             )
@@ -277,7 +283,16 @@ class PcieIpcAllReduceWorkspace:
             nbytes = 0
             self._joint_check({"error": f"{type(e).__name__}: {e}"}, "preparing")
             raise  # unreachable: _joint_check raises on every rank
-        self._joint_check({"error": None}, "preparing")
+        # Carry eligibility in the existing preparation exchange. Mixed groups
+        # agree on the original protocol without adding a collective to it.
+        prepared = self._joint_check(
+            {"error": None, "memop_supported": local_memop_supported},
+            "preparing",
+            require_identical=False,
+        )
+        self.memop_supported = self.world_size in (4, 8) and all(
+            entry["memop_supported"] for entry in prepared
+        )
 
         # --- stage 3: allocate and share, then bind --------------------------
         # NOTE: create_shared_buffer() runs its own all_gather_object and
@@ -290,6 +305,8 @@ class PcieIpcAllReduceWorkspace:
             self._handle = module.init(
                 self._ipc_ptrs, self.rank, max_numel, self.elem_size, max_blocks
             )
+            if self.memop_supported:
+                module.set_memop_enabled(self._handle, True)
             # init() zeroes this rank's slab; no peer may push into it until
             # every rank has done so.
             torch.cuda.synchronize(self.device)
@@ -315,30 +332,24 @@ class PcieIpcAllReduceWorkspace:
             raise
         dist.barrier(group=group)
 
-    def _joint_check(self, local: dict, what: str) -> None:
+    def _joint_check(
+        self, local: dict, what: str, *, require_identical: bool = True
+    ) -> List[dict]:
         """Gather per-rank outcomes and fail the whole group, or none of it.
 
         Raises the same error on every rank, so the caller can rely on all
-        ranks taking the same branch afterwards.
+        ranks taking the same branch afterwards. Capability outcomes may differ
+        when require_identical is false; callers receive the successful entries
+        and choose one protocol for the whole group.
         """
-        gathered: List[Optional[dict]] = [None] * self.world_size
-        dist.all_gather_object(gathered, local, group=self.group)
-        entries = [g for g in gathered if g is not None]
-
-        failed = {i: g["error"] for i, g in enumerate(entries) if g.get("error")}
-        if failed:
-            raise ValueError(f"pcie ipc workspace failed while {what}: {failed}")
-
-        mismatched = {
-            key: [g[key] for g in entries]
-            for key in local
-            if key != "error" and len({repr(g[key]) for g in entries}) > 1
-        }
-        if mismatched:
-            raise ValueError(
-                "every rank must build the workspace with identical arguments, "
-                f"but these differ across the group: {mismatched}"
-            )
+        return joint_check(
+            self.group,
+            self.world_size,
+            local,
+            what,
+            collective_name="pcie ipc workspace",
+            require_identical=require_identical,
+        )
 
     @property
     def handle(self) -> int:
@@ -363,19 +374,7 @@ class PcieIpcAllReduceWorkspace:
         on the same workspace is still unsupported and cannot be checked from
         here.
         """
-        if torch.cuda.is_current_stream_capturing():
-            return
-        current = torch.cuda.current_stream(self.device)
-        if self._stream is None:
-            self._stream = current
-        elif current != self._stream:
-            raise RuntimeError(
-                "this workspace is already bound to "
-                f"{self._stream}, but all_reduce was called on {current}. "
-                "One workspace serves one stream: its epoch and arrival "
-                "counters assume the calls sharing it are totally ordered. "
-                "Build a second workspace for the second stream."
-            )
+        self._stream = bind_stream(self.device, self._stream, "all_reduce")
 
     def rebind_stream(self) -> None:
         """Allow the next call to come from a different stream.
@@ -466,7 +465,11 @@ class PcieIpcAllReduceWorkspace:
         # Settled against the loaded keys, where the answer is known, rather
         # than inferred from a miss later.
         self._tuned_configs_loaded = exists and cache_covers_workspace(
-            self.world_size, self.profile, self.max_blocks, self.max_numel
+            self.world_size,
+            self.profile,
+            self.max_blocks,
+            self.max_numel,
+            self.memop_supported,
         )
         self._joint_check(
             {
@@ -1086,19 +1089,11 @@ class PcieIpcAllReduceWorkspace:
         Collective: every rank must call this, and the peer unmapping is
         separated from the free by a barrier inside ``free_shared_buffer``.
         """
-        if self._handle is not None:
-            # all_reduce() launches asynchronously, so a collective may still be
-            # running or spinning on this slab. free_shared_buffer() unmaps the
-            # peers, and unmapping memory a live kernel is still touching is a
-            # use-after-free -- wait for the device before tearing anything
-            # down. This is the conservative choice; a stream-scoped wait would
-            # need the workspace to track every stream it has been used on.
-            torch.cuda.synchronize(self.device)
-            get_pcie_ipc_comm_module().dispose(self._handle)
-            self._handle = None
-        if self._ipc_ptrs is not None:
-            free_shared_buffer(self._ipc_ptrs, group=self.group)
-            self._ipc_ptrs = None
+        release_workspace(
+            self,
+            dispose=lambda handle: get_pcie_ipc_comm_module().dispose(handle),
+            free=free_shared_buffer,
+        )
         if self._tune_group is not None:
             dist.destroy_process_group(self._tune_group)
             self._tune_group = None

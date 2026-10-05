@@ -15,6 +15,7 @@ except ImportError:
 
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
+    alphamoe_nvfp4_aligned_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
@@ -23,6 +24,7 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.tllm_enums import RoutingMethodType, is_gated_activation
 from flashinfer import fp4_quantize, mxfp8_quantize
+from flashinfer.tllm_enums import SfLayout
 from flashinfer.testing.utils import (
     bench_gpu_time,
 )
@@ -100,6 +102,8 @@ def run_moe_test(args):
         return testCuteDslBf16Moe(args)
     elif args.routine == "b12x_fused_moe":
         return testB12xFusedMoe(args)
+    elif args.routine == "alphamoe_nvfp4_aligned_moe":
+        return testAlphaMoeNvfp4AlignedMoe(args)
     elif args.routine == "bgmv_moe":
         return testBgmvMoe(args)
     elif args.routine == "unified_nvfp4_moe":
@@ -148,6 +152,13 @@ def parse_moe_args(line, parser):
         required=False,
         default=2.5,
         help="Scaling factor for routing.",
+    )
+    parser.add_argument(
+        "--block_m",
+        type=int,
+        required=False,
+        default=8,
+        help="Aligned routing-plan block size (AlphaMoE only; default: 8).",
     )
     parser.add_argument(
         "--local_expert_offset",
@@ -611,13 +622,15 @@ def testTrtllmFp4BlockScaleMoe(args):
         hidden_states_fp4 = hidden_states.to(torch.bfloat16)
         hidden_states_scale_linear_fp4 = None
     elif fp4_mode == "mxfp4_mxfp8":
-        if num_tokens % 128 != 0:
-            raise ValueError(
-                f"mxfp4_mxfp8 mode requires num_tokens to be a multiple of 128 "
-                f"(got {num_tokens}) because mxfp8_quantize with swizzled scale "
-                f"layout pads rows to 128-element boundaries."
-            )
-        hs_quant, hs_scale = mxfp8_quantize(hidden_states, True)
+        # The trtllm-gen routed GEMM requires the LINEAR activation SF layout
+        # ("Tokens need use SF linear layout when being routed"), so quantize
+        # non-swizzled.  This used to pass is_sf_swizzled_layout=True and work
+        # around the resulting shape error by demanding num_tokens % 128 == 0 --
+        # but that is exactly the regime where the swizzled buffer's numel
+        # coincides with the linear one, so the kernel silently read swizzled
+        # bytes as linear and produced wrong numbers instead of throwing.
+        # Linear pads no rows, so the alignment restriction is unnecessary too.
+        hs_quant, hs_scale = mxfp8_quantize(hidden_states, False)
         hidden_states_fp4 = hs_quant
         hidden_states_scale_linear_fp4 = hs_scale.view(torch.float8_e4m3fn).reshape(
             num_tokens, -1
@@ -649,18 +662,26 @@ def testTrtllmFp4BlockScaleMoe(args):
         )
 
     # Prepare weights for kernel (packed uint8 format, scale as float8_e4m3fn)
+    # fp4_quantize pads the scale tensor on both dims; the data tensor is unpadded.
+    def _sf_outer(dim):
+        return (dim + 127) // 128 * 128
+
+    def _sf_inner(dim):
+        n = dim // sf_vec_size
+        return (n + 3) // 4 * 4
+
     gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(torch.uint8).reshape(
         num_experts, 2 * intermediate_size, hidden_size // 2
     )
     gemm1_weights_scale = gemm1_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // sf_vec_size
+        num_experts, _sf_outer(2 * intermediate_size), _sf_inner(hidden_size)
     )
 
     gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(torch.uint8).reshape(
         num_experts, hidden_size, intermediate_size // 2
     )
     gemm2_weights_scale = gemm2_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, hidden_size, intermediate_size // sf_vec_size
+        num_experts, _sf_outer(hidden_size), _sf_inner(intermediate_size)
     )
 
     gemm1_bias = None
@@ -722,6 +743,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             do_finalize=True,
             enable_pdl=args.enable_pdl,
             **_activation_kwarg(trtllm_fp4_block_scale_moe, activation_type),
+            hidden_states_scale_layout=SfLayout.layout_linear,
         )
 
     backend = "trtllm"
@@ -1376,6 +1398,443 @@ def _create_nvfp4_moe_test_data(
     }
 
 
+_ALPHAMOE_SF_VEC = 16
+_ALPHAMOE_INTERMEDIATE_TILE = 128
+_ALPHAMOE_E2M1_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+
+def _make_alphamoe_tight_plan(
+    topk_ids: torch.Tensor,
+    *,
+    block_m: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the tight aligned plan used by the originating Cake benchmark."""
+
+    flat_ids = topk_ids.reshape(-1).to(device="cpu", dtype=torch.int64)
+    sentinel = int(flat_ids.numel())
+    sorted_positions: list[int] = []
+    block_experts: list[int] = []
+    for expert in range(num_experts):
+        positions = torch.nonzero(flat_ids == expert, as_tuple=False).flatten().tolist()
+        if not positions:
+            continue
+        padded = ((len(positions) + block_m - 1) // block_m) * block_m
+        sorted_positions.extend(positions)
+        sorted_positions.extend([sentinel] * (padded - len(positions)))
+        block_experts.extend([expert] * (padded // block_m))
+    device = topk_ids.device
+    return (
+        torch.tensor(sorted_positions, dtype=torch.int32, device=device),
+        torch.tensor(block_experts, dtype=torch.int32, device=device),
+        torch.tensor([len(sorted_positions)], dtype=torch.int32, device=device),
+    )
+
+
+def _random_alphamoe_nvfp4(
+    leading_shape: tuple[int, ...],
+    columns: int,
+    *,
+    generator: torch.Generator,
+    device: torch.device,
+    min_scale_exp: float,
+    max_scale_exp: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    packed = torch.randint(
+        0,
+        256,
+        (*leading_shape, columns // 2),
+        dtype=torch.uint8,
+        device=device,
+        generator=generator,
+    )
+    scale_exp = torch.rand(
+        (*leading_shape, columns // _ALPHAMOE_SF_VEC),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    scales = torch.exp2(min_scale_exp + scale_exp * (max_scale_exp - min_scale_exp)).to(
+        torch.float8_e4m3fn
+    )
+    return packed, scales.contiguous()
+
+
+def _make_alphamoe_nvfp4_data(
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    block_m: int,
+    routed_scaling_factor: float,
+    device: torch.device,
+    seed: int,
+) -> dict:
+    gemm1_out_size = 2 * intermediate_size
+    generator = torch.Generator(device=device).manual_seed(seed)
+    x, x_scale = _random_alphamoe_nvfp4(
+        (num_tokens,),
+        hidden_size,
+        generator=generator,
+        device=device,
+        min_scale_exp=-3.0,
+        max_scale_exp=-2.0,
+    )
+    w1, w1_scale = _random_alphamoe_nvfp4(
+        (num_experts, gemm1_out_size),
+        hidden_size,
+        generator=generator,
+        device=device,
+        min_scale_exp=-5.0,
+        max_scale_exp=-4.0,
+    )
+    w2, w2_scale = _random_alphamoe_nvfp4(
+        (num_experts, hidden_size),
+        intermediate_size,
+        generator=generator,
+        device=device,
+        min_scale_exp=-5.0,
+        max_scale_exp=-4.0,
+    )
+    routing_scores = torch.randn(
+        (num_tokens, num_experts),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    topk_ids = torch.topk(routing_scores, top_k, dim=-1).indices.to(torch.int32)
+    topk_weights = torch.softmax(
+        torch.randn(
+            (num_tokens, top_k),
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        ),
+        dim=-1,
+    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = _make_alphamoe_tight_plan(
+        topk_ids,
+        block_m=block_m,
+        num_experts=num_experts,
+    )
+    return {
+        "M": num_tokens,
+        "N": gemm1_out_size,
+        "K": hidden_size,
+        "E": num_experts,
+        "top_k": top_k,
+        "block_m": block_m,
+        "scaling_factor": routed_scaling_factor,
+        "x": x,
+        "x_scale": x_scale,
+        "w1": w1,
+        "w1_scale": w1_scale,
+        "w2": w2,
+        "w2_scale": w2_scale,
+        "output1_scale_gate_scalar": torch.ones(
+            num_experts, dtype=torch.float32, device=device
+        ),
+        "output1_scale_scalar": torch.ones(
+            num_experts, dtype=torch.float32, device=device
+        ),
+        "output2_scale_scalar": torch.ones(
+            num_experts, dtype=torch.float32, device=device
+        ),
+        "sorted_token_ids": sorted_token_ids,
+        "expert_ids": expert_ids,
+        "num_tokens_post_padded": num_tokens_post_padded,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+        "out": torch.zeros(
+            (num_tokens, hidden_size), dtype=torch.bfloat16, device=device
+        ),
+    }
+
+
+def _decode_alphamoe_nvfp4(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    columns: int,
+) -> torch.Tensor:
+    codes = torch.empty(
+        (*packed.shape[:-1], columns), dtype=torch.uint8, device=packed.device
+    )
+    codes[..., 0::2] = packed & 0x0F
+    codes[..., 1::2] = (packed >> 4) & 0x0F
+    lut = torch.tensor(_ALPHAMOE_E2M1_VALUES, dtype=torch.float32, device=packed.device)
+    return (
+        lut[codes.to(torch.int64)]
+        * scale.float().repeat_interleave(_ALPHAMOE_SF_VEC, dim=-1)[..., :columns]
+    )
+
+
+def _quantize_alphamoe_nvfp4_intermediate(values: torch.Tensor) -> torch.Tensor:
+    rows, columns = values.shape
+    blocks = values.reshape(rows, columns // _ALPHAMOE_SF_VEC, _ALPHAMOE_SF_VEC)
+    scale = (blocks.abs().amax(dim=-1) * (1.0 / 6.0)).to(torch.float8_e4m3fn).float()
+    normalized = (
+        blocks / torch.where(scale == 0, torch.ones_like(scale), scale)[..., None]
+    )
+    levels = torch.tensor(
+        (
+            -6.0,
+            -4.0,
+            -3.0,
+            -2.0,
+            -1.5,
+            -1.0,
+            -0.5,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+        ),
+        dtype=torch.float32,
+        device=values.device,
+    )
+    nearest = (normalized[..., None] - levels).abs().argmin(dim=-1)
+    return (levels[nearest] * scale[..., None]).reshape(rows, columns)
+
+
+def _alphamoe_nvfp4_reference(data: dict) -> torch.Tensor:
+    """Independent source-ordered oracle for ``--refcheck``."""
+
+    m, n, k = data["M"], data["N"], data["K"]
+    top_k = data["top_k"]
+    intermediate = n // 2
+    x = _decode_alphamoe_nvfp4(data["x"], data["x_scale"], columns=k)
+    pair_expert = torch.full((m * top_k,), -1, dtype=torch.int64, device=x.device)
+    extent = int(data["num_tokens_post_padded"].item())
+    sorted_ids = data["sorted_token_ids"][:extent].to(torch.int64)
+    for block in range(data["expert_ids"].numel()):
+        pairs = sorted_ids[block * data["block_m"] : (block + 1) * data["block_m"]]
+        valid = pairs < m * top_k
+        pair_expert[pairs[valid]] = data["expert_ids"][block].to(torch.int64)
+
+    output = torch.zeros((m, k), dtype=torch.bfloat16, device=x.device)
+    flat_weights = data["topk_weights"].reshape(-1).float()
+    for expert in range(data["E"]):
+        pairs = torch.nonzero(pair_expert == expert, as_tuple=False).flatten()
+        if pairs.numel() == 0:
+            continue
+        tokens = torch.div(pairs, top_k, rounding_mode="floor")
+        w1 = _decode_alphamoe_nvfp4(
+            data["w1"][expert], data["w1_scale"][expert], columns=k
+        )
+        gate_up = torch.zeros((tokens.numel(), n), dtype=torch.float32, device=x.device)
+        for base in range(0, k, 64):
+            gate_up += x[tokens, base : base + 64] @ w1[:, base : base + 64].transpose(
+                0, 1
+            )
+        gate, up = gate_up[:, :intermediate], gate_up[:, intermediate:]
+        activated = _quantize_alphamoe_nvfp4_intermediate(
+            torch.nn.functional.silu(gate) * up
+        )
+        w2 = _decode_alphamoe_nvfp4(
+            data["w2"][expert], data["w2_scale"][expert], columns=intermediate
+        )
+        for base in range(0, intermediate, _ALPHAMOE_INTERMEDIATE_TILE):
+            down = torch.zeros(
+                (tokens.numel(), k), dtype=torch.float32, device=x.device
+            )
+            for subbase in range(base, base + _ALPHAMOE_INTERMEDIATE_TILE, 64):
+                down += activated[:, subbase : subbase + 64] @ w2[
+                    :, subbase : subbase + 64
+                ].transpose(0, 1)
+            down *= flat_weights[pairs, None] * data["scaling_factor"]
+            routed = down.to(torch.bfloat16)
+            output[tokens] = (output[tokens].float() + routed.float()).to(
+                torch.bfloat16
+            )
+    return output
+
+
+def testAlphaMoeNvfp4AlignedMoe(args):
+    """Benchmark the frozen SM100/SM103 AlphaMoE NVFP4 megakernel."""
+
+    if args.verbose >= 1:
+        print("[INFO] Running testAlphaMoeNvfp4AlignedMoe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+    warn_if_pdl_unsupported(args, args.routine)
+    device = get_device(args)
+    backends = filter_backends_by_compute_capability(["alphamoe"], args.routine, device)
+    if not backends:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
+
+    num_tokens = args.num_tokens
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    num_experts = args.num_experts
+    top_k = args.top_k
+    block_m = args.block_m
+    if args.input_dtype != "nvfp4" or args.weight_dtype != "nvfp4":
+        raise ValueError(
+            "alphamoe_nvfp4_aligned_moe requires --input_dtype nvfp4 "
+            "and --weight_dtype nvfp4"
+        )
+    if args.activation_type != ActivationType.Swiglu:
+        raise ValueError("alphamoe_nvfp4_aligned_moe supports only Swiglu")
+    if args.local_expert_offset != 0 or (
+        args.local_num_experts is not None and args.local_num_experts != num_experts
+    ):
+        raise ValueError("alphamoe_nvfp4_aligned_moe does not shard experts")
+    if hidden_size < 256 or hidden_size % 256:
+        raise ValueError("hidden_size must be at least 256 and divisible by 256")
+    if intermediate_size < 128 or intermediate_size % 128:
+        raise ValueError("intermediate_size must be at least 128 and divisible by 128")
+    if not 1 <= top_k <= num_experts:
+        raise ValueError("top_k must be in [1, num_experts]")
+    if block_m < 8 or block_m % 8:
+        raise ValueError("block_m must be at least 8 and divisible by 8")
+
+    data = _make_alphamoe_nvfp4_data(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        block_m=block_m,
+        routed_scaling_factor=args.routed_scaling_factor,
+        device=device,
+        seed=args.random_seed,
+    )
+    input_args = (
+        data["x"],
+        data["x_scale"],
+        data["w1"],
+        data["w1_scale"],
+        data["w2"],
+        data["w2_scale"],
+        data["output1_scale_gate_scalar"],
+        data["output1_scale_scalar"],
+        data["output2_scale_scalar"],
+        data["sorted_token_ids"],
+        data["expert_ids"],
+        data["num_tokens_post_padded"],
+        data["topk_weights"],
+        data["out"],
+    )
+
+    def run_alphamoe(*tensors):
+        (*kernel_inputs, out) = tensors
+        result = alphamoe_nvfp4_aligned_moe(
+            *kernel_inputs,
+            out,
+            top_k,
+            block_m,
+            args.routed_scaling_factor,
+        )
+        if result is not None:
+            raise RuntimeError("AlphaMoE preallocated-output API must return None")
+        return out
+
+    if args.refcheck:
+        expected = _alphamoe_nvfp4_reference(data)
+        data["out"].zero_()
+        actual = run_alphamoe(*input_args).clone()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.1)
+
+    # The operation is an accumulator. Initialize once, outside CUPTI's
+    # per-iteration activity window, so the reported latency contains only the
+    # frozen megakernel rather than an additional memset launch.
+    data["out"].zero_()
+    times = bench_gpu_time(
+        fn=run_alphamoe,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=not args.no_cuda_graph,
+        cold_l2_cache=True,
+        input_args=input_args,
+    )
+    median_time = np.median(times)
+    std_time = np.std(times)
+    tflops = calculate_moe_tflops(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        is_gated=True,
+    )
+    active_experts = int(data["topk_ids"].unique().numel())
+    tb_per_sec = calculate_moe_kernel_bandwidth(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        top_k,
+        median_time,
+        torch.bfloat16,
+        torch.bfloat16,
+        input_format="nvfp4",
+        weight_format="nvfp4",
+        routing_logits_dtype=None,
+        active_experts=active_experts,
+        verbose=args.verbose,
+        is_gated=True,
+    )
+    print_perf_metrics("alphamoe", median_time, std_time, tflops, tb_per_sec)
+
+    result_rows = []
+    if args.output_path is not None:
+        row = defaultdict(str)
+        row.update(
+            routine=args.routine,
+            median_time=median_time,
+            std_time=std_time,
+            tflops=tflops,
+            tb_per_sec=tb_per_sec,
+            backend="alphamoe",
+            resolved_backend="alphamoe",
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            block_m=block_m,
+            routed_scaling_factor=args.routed_scaling_factor,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routing_method="prealigned",
+            input_dtype="nvfp4",
+            weight_dtype="nvfp4",
+            activation_type=ActivationType.Swiglu.name,
+            fp4_mode="nvfp4",
+            cold_l2_cache=True,
+        )
+        result_rows.append(row)
+    return result_rows
+
+
 def testCuteDslFp4BlockScaleMoe(args):
     """
     Test cute_dsl_fp4_block_scale_moe (CuTe DSL NVFP4 MoE on SM100/SM103).
@@ -1647,11 +2106,13 @@ def testCuteDslBf16Moe(args):
     ``cute_dsl_fused_moe_bf16``).
 
     This test:
-    1. Creates bf16/fp16 weights ([gate; up] w13 repacked to the kernel's
-       32-column up/gate interleave) and pre-routed top-k ids/scales
+    1. Creates bf16/fp16 weights (gated activations: [gate; up] w13 repacked
+       to the kernel's 32-column up/gate interleave; ReLU2: a single [E, I, H]
+       projection) and pre-routed top-k ids/scales
     2. Runs MoE via CuteDslBf16MoEWrapper (or cute_dsl_fused_moe_bf16 when
-       ``--use_functional_api`` is set). SwiGLU only. ``--autotune`` runs the
-       AutoTuner pass, compiling each candidate specialization as it is profiled.
+       ``--use_functional_api`` is set). ``--activation-type`` selects Swiglu
+       (default), GegluTanh or Relu2. ``--autotune`` runs the AutoTuner pass,
+       compiling each candidate specialization as it is profiled.
     3. Measures performance metrics (TFLOPS, TB/sec)
 
     Pass per-rank ``--hidden_size`` / ``--intermediate_size`` for TP shapes
@@ -1698,11 +2159,16 @@ def testCuteDslBf16Moe(args):
         return res
 
     activation_type = args.activation_type
-    if activation_type != ActivationType.Swiglu:
+    if activation_type not in (
+        ActivationType.Swiglu,
+        ActivationType.GegluTanh,
+        ActivationType.Relu2,
+    ):
         raise ValueError(
-            f"cute_dsl_fused_moe_bf16 only supports Swiglu activation, "
-            f"got {activation_type.name}."
+            "cute_dsl_fused_moe_bf16 supports Swiglu, GegluTanh and Relu2 "
+            f"activations, got {activation_type.name}."
         )
+    is_gated = is_gated_activation(activation_type)
 
     if args.verbose >= 1:
         print(
@@ -1713,19 +2179,19 @@ def testCuteDslBf16Moe(args):
 
     torch.manual_seed(args.random_seed)
     x = torch.randn(num_tokens, hidden_size, dtype=input_dtype, device=device) / 10
-    # [gate; up]-concatenated w13 (vLLM layout), repacked to the kernel's
-    # 32-column up/gate interleave.
-    w_gate_up = (
+    # Gated: [gate; up]-concatenated w13 (vLLM layout), repacked to the kernel's
+    # 32-column up/gate interleave. Non-gated (Relu2): one [E, I, H] projection.
+    w1_model = (
         torch.randn(
             local_num_experts,
-            2 * intermediate_size,
+            (2 if is_gated else 1) * intermediate_size,
             hidden_size,
             dtype=input_dtype,
             device=device,
         )
         / 10
     )
-    w1 = interleave_up_gate_sm90(w_gate_up)
+    w1 = interleave_up_gate_sm90(w1_model) if is_gated else w1_model
     w2 = (
         torch.randn(
             local_num_experts,
@@ -1746,7 +2212,10 @@ def testCuteDslBf16Moe(args):
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] x.shape = {x.shape}")
-        print(f"[VVERBOSE] w1.shape = {w1.shape} (interleaved)")
+        print(
+            f"[VVERBOSE] w1.shape = {w1.shape} "
+            f"({'interleaved' if is_gated else 'non-gated'})"
+        )
         print(f"[VVERBOSE] w2.shape = {w2.shape}")
 
     moe_output = torch.empty(num_tokens, hidden_size, dtype=input_dtype, device=device)
@@ -1766,6 +2235,7 @@ def testCuteDslBf16Moe(args):
             local_expert_offset=local_expert_offset,
             moe_output=moe_output,
             enable_pdl=args.enable_pdl,
+            **_activation_kwarg(cute_dsl_fused_moe_bf16, activation_type),
         )
     else:
         moe = CuteDslBf16MoEWrapper(
@@ -1776,6 +2246,7 @@ def testCuteDslBf16Moe(args):
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
             enable_pdl=args.enable_pdl,
+            **_activation_kwarg(CuteDslBf16MoEWrapper.__init__, activation_type),
         )
 
         def runner(x, ids, scales, w1, w2):
@@ -1794,7 +2265,7 @@ def testCuteDslBf16Moe(args):
 
     if args.refcheck:
         out = run_cute_dsl_bf16_moe(*input_args).float()
-        gate, up = w_gate_up[:, :intermediate_size], w_gate_up[:, intermediate_size:]
+        w1_ref = w1_model.float()
         ref = torch.zeros(num_tokens, hidden_size, device=device)
         for slot in range(top_k):
             e_global = token_selected_experts[:, slot].long()
@@ -1802,9 +2273,18 @@ def testCuteDslBf16Moe(args):
             local = e_global - local_expert_offset
             mask = (local >= 0) & (local < local_num_experts)
             e = local.clamp(0, local_num_experts - 1)
-            g = torch.einsum("th,tih->ti", x.float(), gate.float()[e])
-            u = torch.einsum("th,tih->ti", x.float(), up.float()[e])
-            act = torch.nn.functional.silu(g) * u
+            # Model layout: gated w1 rows are [gate; up], non-gated rows are h.
+            h = torch.einsum("th,tih->ti", x.float(), w1_ref[e])
+            if activation_type == ActivationType.Swiglu:
+                g, u = h[:, :intermediate_size], h[:, intermediate_size:]
+                act = torch.nn.functional.silu(g) * u
+            elif activation_type == ActivationType.GegluTanh:
+                g, u = h[:, :intermediate_size], h[:, intermediate_size:]
+                act = torch.nn.functional.gelu(g, approximate="tanh") * u
+            elif activation_type == ActivationType.Relu2:
+                act = torch.relu(h) ** 2
+            else:
+                raise ValueError(f"unsupported activation_type {activation_type}")
             contrib = torch.einsum("ti,thi->th", act, w2.float()[e])
             ref += torch.where(mask.unsqueeze(1), scale * contrib, 0.0)
         max_err = (out - ref).abs().max().item()
@@ -1854,7 +2334,7 @@ def testCuteDslBf16Moe(args):
         num_experts,
         top_k,
         median_time,
-        is_gated=True,
+        is_gated=is_gated,
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -1870,7 +2350,7 @@ def testCuteDslBf16Moe(args):
         routing_logits_dtype=None,
         active_experts=num_active_experts,
         verbose=args.verbose,
-        is_gated=True,
+        is_gated=is_gated,
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -2711,7 +3191,7 @@ def testUnifiedNvfp4Moe(args):
         MoELayer,
         MoEWeightPack,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         SwiGLU,
         RoutingConfig,
         TrtllmFp4Config,
@@ -2865,7 +3345,7 @@ def testUnifiedNvfp4Moe(args):
             topk_group=args.topk_group,
             routed_scaling_factor=args.routed_scaling_factor,
         ),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_expert_offset=local_expert_offset,

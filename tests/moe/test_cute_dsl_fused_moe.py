@@ -64,8 +64,9 @@ def _skip_sm107_unimplemented_moe_features(request):
     """Skip parameterizations the SM107 (Rubin) CuTe DSL MoE kernels do not implement.
 
     ``fused_moe/cute_dsl/rubin/`` holds a narrower specialisation of the
-    Blackwell kernels rather than a port of them: the gather kernel hardcodes
-    SwiGLU and exposes no ``activation_type``, its wrapper has no
+    Blackwell kernels rather than a port of them: the gather kernel implements
+    SwiGLU (including its SiTU variant) and Relu2 but not GeGLU-tanh or custom
+    SwiGLU alpha/beta/limit constants, its wrapper has no
     ``a_per_token_scale_ptr``, and the finalize kernel implements no unfused
     path. The wrappers raise ``NotImplementedError`` for these cases, which is
     correct behaviour -- but on Rubin it reports as a test failure on every CI
@@ -97,7 +98,7 @@ def _skip_sm107_unimplemented_moe_features(request):
         pytest.skip("SM107 finalize kernel implements only the fused path")
 
     if params.get("activation_type") == ActivationType.GegluTanh:
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
     # test_geglu_tanh_accuracy sets the activation in its body rather than via a
     # parameter, so it has to be matched by identity. Match the function exactly
@@ -105,7 +106,7 @@ def _skip_sm107_unimplemented_moe_features(request):
     # prefix but only exercises normalize_cute_dsl_moe_activation_type, touches no
     # kernel, and passes on SM107 -- a substring match silently dropped it.
     if request.node.function.__name__ == "test_geglu_tanh_accuracy":
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
     if (
         request.node.function.__name__
@@ -249,7 +250,12 @@ def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
     [
         (ActivationType.Swiglu, None, 1.0, "requires situ_beta"),
         (ActivationType.Swiglu, 0.0, None, "positive and finite"),
-        (ActivationType.GegluTanh, 1.0, None, "require ActivationType.Swiglu"),
+        (
+            ActivationType.GegluTanh,
+            1.0,
+            None,
+            "require ActivationType.Swiglu",
+        ),
     ],
 )
 def test_invalid_situ_config(activation_type, situ_beta, situ_linear_beta, error: str):
@@ -284,6 +290,70 @@ def test_situ_changes_autotuner_cache_key(quant_mode: str):
     runners = [swiglu_runner, situ_runner, situ_beta_runner, situ_linear_runner]
     assert len({hash(runner) for runner in runners}) == len(runners)
     assert len({runner.get_cache_key_extras([]) for runner in runners}) == len(runners)
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("k", [128, 256, 384, 512])
+@pytest.mark.parametrize("num_tokens", [1, 17])
+@pytest.mark.parametrize("tile_m", [128, 256])
+def test_gather_gemm_k_tail(k, num_tokens, tile_m):
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Requires Blackwell SM100 or SM103")
+
+    from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion,
+    )
+
+    device = "cuda"
+    n = 256
+    # Two FP4 ones per byte. An extra row keeps the old kernel's tail reads
+    # inside allocated storage, so a failure cannot poison the CUDA context.
+    a_storage = torch.full(
+        (num_tokens + 1, k // 2), 0x22, dtype=torch.uint8, device=device
+    )
+    a = a_storage[:num_tokens]
+    # E4M3 1.0 = 0x38; 0x7f is NaN. Reading the extra scale row must not
+    # contaminate the last real row, even though the weight K tail is zero.
+    scale_storage = torch.full(
+        (num_tokens + 1, k // 16), 0x7F, dtype=torch.uint8, device=device
+    )
+    a_scale = scale_storage[:num_tokens]
+    a_scale.fill_(0x38)
+    b = torch.full((1, n, k // 2), 0x22, dtype=torch.uint8, device=device)
+    b_scale = torch.full(
+        (32, 4, n // 128, 4, k // 64, 1), 0x38, dtype=torch.uint8, device=device
+    )
+    mapping = torch.full((tile_m,), -1, dtype=torch.int32, device=device)
+    mapping[:num_tokens] = torch.arange(num_tokens - 1, -1, -1, device=device)
+
+    output, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+        a=a,
+        b=b,
+        a_scale=a_scale,
+        b_scale=b_scale,
+        alpha=torch.full((1,), 1.0 / k, device=device),
+        tile_idx_to_expert_idx=torch.zeros(1, dtype=torch.int32, device=device),
+        tile_idx_to_mn_limit=torch.tensor(
+            [num_tokens], dtype=torch.int32, device=device
+        ),
+        token_id_mapping=mapping,
+        num_non_exiting_tiles=torch.ones(1, dtype=torch.int32, device=device),
+        topk=1,
+        c_dtype="bfloat16",
+        mma_tiler_mn=(tile_m, 128),
+        cluster_shape_mn=(tile_m // 128, 1),
+        enable_pdl=False,
+    )
+    # Both projections are dot(ones, ones) / K = 1, hence SwiGLU = sigmoid(1).
+    expected = torch.full_like(
+        output[:num_tokens], torch.sigmoid(torch.tensor(1.0)).item()
+    )
+    torch.testing.assert_close(output[:num_tokens], expected, rtol=0, atol=0)
 
 
 # =============================================================================
@@ -681,6 +751,47 @@ class TestInputsHelperContract:
             "token_selected_experts tensors. The seeded "
             "torch.random.fork_rng + manual_seed pattern in "
             "generate_token_selected_experts is broken."
+        )
+
+
+# =============================================================================
+# Test: routing PDL forwarding (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("enable_pdl", [False, True], ids=["pdl-off", "pdl-on"])
+def test_moe_core_forwards_enable_pdl(monkeypatch, enable_pdl):
+    from flashinfer.fused_moe.cute_dsl import fused_moe
+
+    class RoutingReached(Exception):
+        pass
+
+    def check_routing_pdl(**kwargs):
+        assert kwargs["enable_pdl"] is enable_pdl
+        # Stop before routing or GEMM kernels execute; only test flag forwarding.
+        raise RoutingReached
+
+    monkeypatch.setattr(fused_moe, "moe_sort", check_routing_pdl)
+
+    with pytest.raises(RoutingReached):
+        fused_moe._moe_core_impl(
+            x=torch.empty((2, 8), dtype=torch.uint8),
+            x_sf=torch.empty((2, 1), dtype=torch.uint8),
+            token_selected_experts=torch.zeros((2, 1), dtype=torch.int32),
+            token_final_scales=torch.ones((2, 1), dtype=torch.float32),
+            w1_weight=torch.empty((1, 32, 8), dtype=torch.uint8),
+            w1_weight_sf=torch.empty((1, 32, 1), dtype=torch.uint8),
+            w1_alpha=torch.ones(1, dtype=torch.float32),
+            fc2_input_scale=torch.ones(1, dtype=torch.float32),
+            w2_weight=torch.empty((1, 16, 8), dtype=torch.uint8),
+            w2_weight_sf=torch.empty((1, 16, 1), dtype=torch.uint8),
+            w2_alpha=torch.ones(1, dtype=torch.float32),
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            use_async_memset=False,
+            enable_pdl=enable_pdl,
         )
 
 
@@ -1411,19 +1522,28 @@ class TestCuteDslMoeW4A16:
             ),
         ],
     )
+    @pytest.mark.parametrize(
+        "half_tile_tail", [False, True], ids=["tail1", "tail-half-plus1"]
+    )
+    @pytest.mark.parametrize("top_k", [2, 3])
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     def test_route_tile_boundary_accuracy(
         self,
         route_tile: int,
         gemm1_tactic: tuple,
         gemm2_tactic: tuple,
+        half_tile_tail: bool,
+        top_k: int,
+        use_fused_finalize: bool,
     ):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             launch_w4a16_moe,
         )
         from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
 
-        num_tokens, hidden_size, intermediate_size = route_tile + 1, 256, 512
-        num_experts, top_k = 8, 2
+        num_tokens = route_tile + (route_tile // 2 + 1 if half_tile_tail else 1)
+        hidden_size, intermediate_size = 256, 512
+        num_experts = 8
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -1432,7 +1552,7 @@ class TestCuteDslMoeW4A16:
             num_local_experts=num_experts,
             top_k=top_k,
         )
-        # Give two experts one full route tile and one boundary tile each.
+        # Give each selected expert one full route tile and one boundary tile.
         tensors["token_selected_experts"][:] = torch.arange(
             top_k, device=tensors["token_selected_experts"].device
         )
@@ -1456,7 +1576,7 @@ class TestCuteDslMoeW4A16:
             moe_output=torch.empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
             ),
-            use_fused_finalize=False,
+            use_fused_finalize=use_fused_finalize,
             enable_pdl=False,
             activation_type=ActivationType.Swiglu,
             tactic=tactic,
@@ -1600,15 +1720,20 @@ class TestCuteDslFusedMoeFunctional:
         )
 
     @pytest.mark.parametrize(
-        "quant_mode, use_per_token_activation",
-        _MOE_QUANT_MODE_CASES,
+        "quant_mode,use_per_token_activation,use_fused_finalize,hidden_sizes",
+        [
+            pytest.param("w4a4", False, True, (256, 384), id="w4a4-per-tensor"),
+            pytest.param("w4a4", True, True, (256, 384), id="w4a4-per-token"),
+            pytest.param("w4a16", False, False, (256, 384, 256), id="w4a16-ordinary"),
+            pytest.param("w4a16", False, True, (256, 384, 256), id="w4a16-fused"),
+        ],
     )
-    @pytest.mark.parametrize("hidden_size", [256, 384])
     def test_finalize_handles_cluster_padding_and_partial_tiles(
         self,
         quant_mode: str,
         use_per_token_activation: bool,
-        hidden_size: int,
+        use_fused_finalize: bool,
+        hidden_sizes: tuple[int, ...],
         monkeypatch: pytest.MonkeyPatch,
     ):
         from flashinfer.autotuner import AutoTuner
@@ -1624,8 +1749,8 @@ class TestCuteDslFusedMoeFunctional:
                 ((256, 256), (2, 2), False),
             )
         elif quant_mode == "w4a16":
-            # W4A16 clusters 128-wide M CTAs in pairs, so hidden=384 leaves a
-            # padding peer.
+            # The same cache sees a full cluster, a padding peer, then a full
+            # cluster again. Keep route tails in both finalize modes.
             tail_config = (
                 ((256, 128, 256), (2, 1), True),
                 ((256, 128, 256), (2, 1), True),
@@ -1639,17 +1764,18 @@ class TestCuteDslFusedMoeFunctional:
             return runners[0], tail_config
 
         monkeypatch.setattr(AutoTuner, "choose_one", choose_tail_config)
-        self._run_numerical_accuracy(
-            activation_type=ActivationType.Relu2,
-            num_tokens=128,
-            top_k=2,
-            hidden_size=hidden_size,
-            intermediate_size=512,
-            num_experts=8,
-            quant_mode=quant_mode,
-            use_per_token_activation=use_per_token_activation,
-            use_fused_finalize=True,
-        )
+        for hidden_size in hidden_sizes:
+            self._run_numerical_accuracy(
+                activation_type=ActivationType.Relu2,
+                num_tokens=128,
+                top_k=2,
+                hidden_size=hidden_size,
+                intermediate_size=512,
+                num_experts=8,
+                quant_mode=quant_mode,
+                use_per_token_activation=use_per_token_activation,
+                use_fused_finalize=use_fused_finalize,
+            )
 
     def _run_numerical_accuracy(
         self,
@@ -1664,12 +1790,6 @@ class TestCuteDslFusedMoeFunctional:
         use_fused_finalize: bool,
     ):
         from flashinfer import cute_dsl_fused_moe
-
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_local_experts = num_experts
@@ -1820,12 +1940,6 @@ class TestCuteDslFusedMoeFunctional:
         situ_linear_beta: float | None,
     ):
         """Accuracy test for SiTU with optional smooth up-branch clamping."""
-        if is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels do not implement SiTU; the "
-                "gather kernel is SwiGLU-only and silently ignores situ_beta/"
-                "situ_linear_beta"
-            )
         from flashinfer import cute_dsl_fused_moe
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
@@ -2324,12 +2438,6 @@ class TestCuteDslMoEWrapper:
         """Test wrapper API with autotune context."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
-
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
@@ -3446,7 +3554,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
         mxfp8_quantize,
     )
     from flashinfer.autotuner import AutoTuner
-    from flashinfer.fused_moe import CuteDslConfig, QuantVariant
+    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat
 
     torch.manual_seed(20260827)
     device = torch.device("cuda")
@@ -3488,7 +3596,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
     view = CuteDslConfig.prepare_weights(
         w1,
         w2,
-        variant=QuantVariant.MXFP4,
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,

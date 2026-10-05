@@ -27,6 +27,7 @@ Three APIs are provided:
 - gated_delta_rule_mtp: Multi-token processing (T > 1) for speculative decoding
 """
 
+import os
 from typing import Literal, Optional, Tuple
 
 import torch
@@ -117,11 +118,30 @@ except (ImportError, RuntimeError):
 TILE_V = 8  # pretranspose tile size
 
 
+# Per-call device-side slot validation for the Cake GDN decode adapters. Each
+# ``torch._assert_async`` chain below expands to five elementwise kernels, a
+# device-to-device copy and a ~10 us ``_assert_async_cuda_kernel``; the two
+# calls per decode add ~40 us of GPU time (and ~0.4 ms of eager launch span)
+# around a 5 us kernel, which made every ``backend="cake_gdn"`` decode row slower
+# than the CuTe path through the public API even under CUDA-graph replay. The
+# CuTe decode kernels trust caller-provided slots, so the Cake adapters now do
+# the same by default; set ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`` to restore
+# the asynchronous fail-closed check (used by the invalid-slot tests).
+_CAKE_GDN_VALIDATE_SLOTS = (
+    os.environ.get("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", "0") == "1"
+)
+
+
 def _cake_gdn_assert_state_slots(
     indices: torch.Tensor, pool_size: int, *, name: str, allow_minus_one: bool
 ) -> None:
-    """Validate CUDA-resident state slots without a host synchronization."""
+    """Validate CUDA-resident state slots without a host synchronization.
 
+    Only active when ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``; see the note above.
+    """
+
+    if not _CAKE_GDN_VALIDATE_SLOTS:
+        return
     in_pool = (indices >= 0) & (indices < pool_size)
     valid = ((indices == -1) | in_pool) if allow_minus_one else in_pool
     torch._assert_async(
@@ -318,7 +338,7 @@ def _run_cake_gdn_decode_pretranspose(
         state_heads = batch_size * num_v_heads
         tile_v = (
             16
-            if q.shape[2] == 4 and num_v_heads == 8
+            if route.route_id.endswith(".tile16_fullwarp")
             else 128
             if state_heads >= 1024
             else 64
@@ -1166,11 +1186,11 @@ def gated_delta_rule_mtp(
         If ``True``, the initial state is not updated.  Currently defaults
         to ``True``; pass this argument explicitly to silence the
         deprecation warning - the default will change to ``False`` in
-        FlashInfer 0.7.0.
+        FlashInfer 0.8.0.
 
         .. deprecated::
             The implicit default of ``True`` is deprecated and will change
-            to ``False`` in version 0.7.0.  Pass
+            to ``False`` in version 0.8.0.  Pass
             ``disable_state_update=True`` or ``disable_state_update=False``
             explicitly to silence the warning.
     use_qk_l2norm : bool
@@ -1201,7 +1221,7 @@ def gated_delta_rule_mtp(
         logger.warning_once(
             "gated_delta_rule_mtp(): the 'disable_state_update' parameter currently "
             "defaults to True, but this default will change to False in FlashInfer "
-            "0.7.0. Please pass disable_state_update=True or "
+            "0.8.0. Please pass disable_state_update=True or "
             "disable_state_update=False explicitly to suppress this warning."
         )
         disable_state_update = True
