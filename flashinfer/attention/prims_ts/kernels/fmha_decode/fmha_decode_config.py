@@ -584,7 +584,8 @@ class FmhaDecodeConfig:
     # ------------------------------------------------------------------
     # Problem shape
     # ------------------------------------------------------------------
-    # Per-head embedding dimension D. Supported profiles use 64, 128, or 256.
+    # Per-head embedding dimension D. Generic profiles use 64, 128, or 256;
+    # dense paged FP8-Q/NVFP4-KV additionally supports staged H512.
     headdim: int = 128
     # Number of KV tiles in the launch (= ceil(seq_len_kv / tile_size_kv)).
     # Populated by the launcher once seq_len_kv is known.
@@ -1012,15 +1013,11 @@ class FmhaDecodeConfig:
 
     @property
     def smem_kv_sf_bytes_per_token(self) -> int:
-        """SMEM bytes for one staged K or V of a token."""
+        """SMEM bytes for one complete K or V scale row of a token."""
         if self.use_nvfp4_kv:
-            sf_bytes_per_token = self.head_dim_kv_stage // 16
-            if self.num_head_dim_stages_kv > 1:
-                # A split head-dimension stage cannot fold scale bytes from
-                # adjacent tokens because its slice is not contiguous in the
-                # source tensor. Keep its inner box at TMA's 16-byte minimum.
-                sf_bytes_per_token = max(sf_bytes_per_token, 16)
-            return sf_bytes_per_token
+            # The SF tensor map copies the complete D/16-byte row even when
+            # packed K/V is processed in 128-column head-dimension stages.
+            return self.headdim // 16
         return 0
 
     @property
@@ -1283,8 +1280,11 @@ class FmhaDecodeConfig:
             and (
                 self.out_dtype in (Float16, Float8E4M3FN)
                 or (
-                    self.uses_q_token_kv_block_sparse_page_route
-                    and self.out_dtype == BFloat16
+                    self.out_dtype == BFloat16
+                    and (
+                        self.use_nvfp4_kv
+                        or self.uses_q_token_kv_block_sparse_page_route
+                    )
                 )
             )
         )
@@ -4632,6 +4632,16 @@ def _validate_profile_support(
     cfg.validate_boolean_fields()
     cfg.validate_dtypes()
     _validate_mixed_kv_dtype_profile(cfg)
+    if headdim == 512 and not (
+        cfg.q_dtype == Float8E4M3FN
+        and cfg.use_nvfp4_kv
+        and cfg.use_paged_kv
+        and not cfg.use_block_sparse
+    ):
+        raise ValueError(
+            "PrimTS head_dim=512 is currently supported only for dense paged "
+            "FP8-E4M3 Q with NVFP4 K/V"
+        )
     if cfg.o_stages != cfg.num_insts_kv:
         raise ValueError("fmha_decode requires o_stages == num_insts_kv")
     _validate_kv256_static_config(cfg)
@@ -4849,19 +4859,18 @@ def _validate_profile_support(
             raise ValueError(
                 "fmha_decode keepsMmaAb requires numHeadsQPerKv == tile_size_q"
             )
-        fp8_q_token_kv_block_sparse_bf16_output = (
-            cfg.out_dtype == BFloat16
-            and use_groups_tokens_heads_q
-            and is_q_token_kv_block_sparse_grouped_keeps
+        fp8_q_bf16_output = (
+            cfg.out_dtype == BFloat16 and is_q_token_kv_block_sparse_grouped_keeps
         )
         if (
             cfg.q_dtype == Float8E4M3FN
             and cfg.out_dtype not in (Float16, Float8E4M3FN)
-            and not fp8_q_token_kv_block_sparse_bf16_output
+            and not fp8_q_bf16_output
             and not cfg.use_sage_attention
         ):
             raise ValueError(
-                "fmha_decode keepsMmaAb fp8 qkv path supports fp16 or fp8 output"
+                "fmha_decode keepsMmaAb FP8 Q supports BF16 output only "
+                "with the qualified QToken-KV block-sparse route"
             )
         use_split_kv = split_kv_mode != "disabled" or cfg.use_split_kv
         if use_split_kv:
@@ -4940,15 +4949,16 @@ def _validate_profile_support(
     # Keep the ungrouped one-token-per-CTA control available at the same tile Q
     # as grouped profiles so explicit ungrouped launches retain the MMA shape.
     effective_head_dim_stage = cfg.head_dim_per_stage_kv
-    if headdim == 256:
+    if headdim in (256, 512):
         if effective_head_dim_stage != 128:
             raise ValueError(
-                "fmha_decode SwapsMmaAb headDim=256 requires head_dim_per_stage_kv=128"
+                f"fmha_decode SwapsMmaAb headDim={headdim} requires "
+                "head_dim_per_stage_kv=128"
             )
     elif effective_head_dim_stage != 0:
         raise ValueError(
             "split head_dim_per_stage_kv SwapsMmaAb profiles are enabled only "
-            "for headDim=256"
+            "for headDim=256 or 512"
         )
     if cfg.use_cluster_smem_reduction:
         # Single source of truth for structural eligibility plus dtype and
@@ -4959,7 +4969,7 @@ def _validate_profile_support(
                 "{64,128,256}, TileSizeQ in {8,16,32}, "
                 "either ungrouped single-token or complete-token grouped Q, "
                 "at least two split CTAs, "
-                "and fp16/bf16 or fp8 qkv with fp16/fp8 output"
+                "and fp16/bf16 or fp8 qkv with fp16/bf16/fp8 output"
             )
         cluster_reason = cluster_smem_reduction_unsupported_reason(
             max_splits_kv=cfg.max_splits_kv,
@@ -4994,10 +5004,10 @@ def _validate_profile_support(
         )
     if tile_size_q and tile_size_q not in (8, 16, 32):
         raise ValueError("fmha_decode SwapsMmaAb supports tile_size_q in {8,16,32}")
-    if headdim not in (64, 128, 256):
+    if headdim not in (64, 128, 256, 512):
         raise ValueError(
             "fmha_decode SwapsMmaAb supports headDim in "
-            "{64,128,256}. headDim=256 uses the staged profile with "
+            "{64,128,256,512}. headDim=256/512 use the staged profile with "
             "head_dim_per_stage_kv=128."
         )
     # Validate constraints imposed by mixed precision KV.
