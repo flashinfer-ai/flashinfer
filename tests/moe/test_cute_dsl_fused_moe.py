@@ -356,6 +356,58 @@ def test_gather_gemm_k_tail(k, num_tokens, tile_m):
     torch.testing.assert_close(output[:num_tokens], expected, rtol=0, atol=0)
 
 
+@cute_dsl_available
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("arch", ["blackwell", "rubin"])
+def test_tuner_checks_gemm2_output_dtype(monkeypatch, output_dtype, arch):
+    from flashinfer.cute_dsl.utils import (
+        is_rubin_cute_dsl_available,
+        torch_to_cutlass_dtype,
+    )
+    from flashinfer.fused_moe.cute_dsl import tuner
+
+    if arch == "rubin":
+        if not is_rubin_cute_dsl_available():
+            pytest.skip("Rubin requires CuTe DSL 4.8")
+        from flashinfer.fused_moe.cute_dsl.rubin import (
+            Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel as kernel,
+        )
+
+        tactic = tuner.DEFAULT_RUBIN_MOE_TACTIC
+        dtype_arg = "c_dtype"
+    else:
+        from flashinfer.fused_moe.cute_dsl.blackwell import (
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel as kernel,
+        )
+
+        tactic = tuner.DEFAULT_BLACKWELL_MOE_TACTIC
+        dtype_arg = "out_dtype"
+
+    can_implement = kernel.can_implement
+    checked_dtypes = []
+
+    def check_output_dtype(**kwargs):
+        checked_dtypes.append(kwargs[dtype_arg])
+        return can_implement(**kwargs)
+
+    monkeypatch.setattr(kernel, "can_implement", check_output_dtype)
+    monkeypatch.setattr(tuner, "_get_arch_tactics", lambda: [tactic])
+    inputs = [None] * 11
+    inputs[0] = torch.empty((128, 128), dtype=torch.uint8)
+    inputs[3] = torch.ones((128, 1), dtype=torch.float32)
+    inputs[4] = torch.empty((1, 512, 128), dtype=torch.uint8)
+    inputs[8] = torch.empty((1, 256, 128), dtype=torch.uint8)
+    runner = tuner.CuteDslFusedMoERunner(
+        forward_impl=lambda **kwargs: None,
+        num_experts=1,
+        top_k=1,
+        num_local_experts=1,
+        output_dtype=output_dtype,
+    )
+    assert runner.get_valid_tactics(inputs, profile=None) == [tactic]
+    assert checked_dtypes == [torch_to_cutlass_dtype(output_dtype)]
+
+
 def test_localized_runner_uses_shard_shapes_and_separate_cache_key():
     from flashinfer.fused_moe.cute_dsl.tuner import (
         CuteDslFusedMoERunner,

@@ -750,6 +750,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         Supports both Blackwell and Rubin architectures.
         """
         import cutlass
+        from ...cute_dsl.utils import torch_to_cutlass_dtype
         from .moe_utils import get_max_num_permuted_tokens
 
         x = inputs[0]
@@ -781,7 +782,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 return []
         else:
             gemm1_c_dtype = cutlass.Float8E4M3FN if is_mxfp8 else cutlass.Float4E2M1FN
-        gemm2_out_dtype = cutlass.BFloat16
+        gemm2_out_dtype = torch_to_cutlass_dtype(self.output_dtype)
 
         all_tactics = ALL_W4A8_MOE_TACTICS if is_mxfp8 else _get_arch_tactics()
 
