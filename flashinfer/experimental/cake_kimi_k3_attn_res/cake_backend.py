@@ -116,7 +116,7 @@ _SM100_HELD_CONSUMED_RELEASE_CELLS = frozenset({(4096, 5)})
 # Round r4 (direction 2): sm_100a bands just above the grid that keep the release held (K -> last M).
 _SM100_HELD_CONSUMED_RELEASE_MAX_M = {2: 768, 3: 384, 4: 255, 5: 192, 6: 192, 7: 255}
 # Round r4 (direction 2): sm_103a bands that release early (K -> first M).
-_SM103_EARLY_CONSUMED_RELEASE_MIN_M = {6: 384, 7: 256, 8: 257}
+_SM103_EARLY_CONSUMED_RELEASE_MIN_M = {5: 384, 6: 384, 7: 256, 8: 257}
 _WRITE_HELD_CONSUMED_RELEASE_MIN_M = {"sm_100a": {4: 1024}, "sm_103a": {4: 1024}}
 # K = 0 TMA route: grid multiple of the SM count on the promoted mid-M cells.
 _K0_TMA_GRID_MULTIPLIER_M = {
