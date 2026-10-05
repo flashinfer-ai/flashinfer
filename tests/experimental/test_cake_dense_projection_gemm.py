@@ -236,9 +236,9 @@ EXPECTED_TEMPLATES = {
     },
     ('kv_a', 'dgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_kn_n256_q_s6',
-        (1001, 212): 'dense_proj_gemm_kn_n256_q',
+        (1001, 212): 'dense_proj_gemm_kn_n256_q_pd1',
         (2049, 148): 'dense_proj_gemm_kn_n256_q_s6',
-        (2049, 212): 'dense_proj_gemm_kn_n256_q',
+        (2049, 212): 'dense_proj_gemm_kn_n256_q_pd1',
     },
     ('kv_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
     ('kv_a', 'wgrad', 'bf16'): {
@@ -369,7 +369,7 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_nn_n160_m256_bz64_f32',
     },
     ('indexer_k', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n128',
-    ('indexer_k', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n128_m256_tma1',
+    ('indexer_k', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_tma2_pd2',
     ('indexer_k', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n128_f32_tma1',
     ('indexer_k', 'wgrad', 'bf16'): {
         (1001, 148): 'dense_proj_gemm_nn_n128_m64_t',
@@ -384,7 +384,7 @@ EXPECTED_TEMPLATES = {
         (2049, 212): 'dense_proj_gemm_nn_n128_m64_f32_t_skx',
     },
     ('indexer_hw', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n128',
-    ('indexer_hw', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_tma2',
+    ('indexer_hw', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_tma2_pd2',
     ('indexer_hw', 'dgrad', 'f32'): {
         (1001, 148): 'dense_proj_gemm_kn_n128_f32_tma2',
         (1001, 212): 'dense_proj_gemm_kn_n128_f32_tma1',
@@ -409,9 +409,9 @@ MLA_TEMPLATES = {
         (33, 148): 'dense_proj_gemm_nk_n128_t',
         (33, 212): 'dense_proj_gemm_nk_n128_t',
         (1001, 148): 'dense_proj_gemm_kn_n256_tma1',
-        (1001, 212): 'dense_proj_gemm_kn_n256_tma1_bg8',
+        (1001, 212): 'dense_proj_gemm_kn_n256_tma1_bg8_sol',
         (2049, 148): 'dense_proj_gemm_kn_n256_tma1',
-        (2049, 212): 'dense_proj_gemm_kn_n256_tma1_bg8',
+        (2049, 212): 'dense_proj_gemm_kn_n256_tma1_bg8_sol',
     },
     ('qabs', 'dgrad'): {
         (33, 148): 'dense_proj_gemm_kk_n128_t',
@@ -467,7 +467,6 @@ EXPORTED_TEMPLATES = frozenset(
         'dense_proj_gemm_kk_n256_q',
         'dense_proj_gemm_kn_n128_f32_tma1',
         'dense_proj_gemm_kn_n128_f32_tma2',
-        'dense_proj_gemm_kn_n128_m256_tma1',
         'dense_proj_gemm_kn_n256',
         'dense_proj_gemm_kn_n256_f32_tma1',
         'dense_proj_gemm_kn_n256_f32_v8',
@@ -477,11 +476,12 @@ EXPORTED_TEMPLATES = frozenset(
         'dense_proj_gemm_kn_n256_m256_f32_v8_ef_ov_ht',
         'dense_proj_gemm_kn_n256_m256_ov_ht',
         'dense_proj_gemm_kn_n256_m256_tma1_bg4',
-        'dense_proj_gemm_kn_n256_q',
+        'dense_proj_gemm_kn_n256_q_pd1',
         'dense_proj_gemm_kn_n256_q_s6',
         'dense_proj_gemm_kn_n256_tma1',
         'dense_proj_gemm_kn_n256_tma1_bg8',
-        'dense_proj_gemm_kn_n256_tma2',
+        'dense_proj_gemm_kn_n256_tma1_bg8_sol',
+        'dense_proj_gemm_kn_n256_tma2_pd2',
         'dense_proj_gemm_nk_n256_t',
         'dense_proj_gemm_nn_n128_f32_t',
         'dense_proj_gemm_nn_n128_hen_f32_t_skx',
@@ -498,8 +498,8 @@ EXPORTED_TEMPLATES = frozenset(
         'dense_proj_gemm_nn_n192',
         'dense_proj_gemm_nn_n192_bz64_hee_f32_t',
         'dense_proj_gemm_nn_n192_bz64_hee_t',
-        'dense_proj_gemm_nn_n192_hee_f32_t',
-        'dense_proj_gemm_nn_n192_hee_t',
+        'dense_proj_gemm_nn_n192_hee_f32_t_tma1',
+        'dense_proj_gemm_nn_n192_hee_t_tma1',
         'dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1',
         'dense_proj_gemm_nn_n192_m256_t_tma1',
         'dense_proj_gemm_nn_n256',
@@ -1136,10 +1136,15 @@ def test_round15_store_hint_knob():
     # field 22 of the 25-field key (round 15, Cake W3): the L2 eviction policy of the TMA-store epilogue's bulk
     # tensor stores (symbol ``_so<f|l|n>``); the register epilogues carry no operand, so the field is forced to
     # "none" there (one key per register-epilogue instance) and an unknown policy raises
-    key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last")
+    key = instance_key(
+        a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last"
+    )
     assert len(key) == 25 and key[22] == "evict_last"
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma1_sol"
-    assert instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22] == "none"
+    assert (
+        instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22]
+        == "none"
+    )
     assert instance_key(a_mn=False, b_mn=True)[22] == "none"
     with pytest.raises(ValueError, match="store_hint"):
         instance_key(
@@ -1149,12 +1154,24 @@ def test_round15_store_hint_knob():
     # evict_last stores; sm_100a keeps the round-13 plan without the operand
     v = _views("mla", "qabs", "fwd", "bf16", 1001)
     r200, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False
+        v["A"],
+        v["B"],
+        v["out"],
+        sm_count=212,
+        l2_bytes=L2_BYTES,
+        arch="sm_107a",
+        _fallback=False,
     )
     assert r200.store_hint == "evict_last" and r200.batch_group == 8
     assert r200.template == "dense_proj_gemm_kn_n256_tma1_bg8_sol"
     b200, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False
+        v["A"],
+        v["B"],
+        v["out"],
+        sm_count=148,
+        l2_bytes=L2_BYTES,
+        arch="sm_100a",
+        _fallback=False,
     )
     assert b200.store_hint == "none" and "_so" not in b200.template
 
@@ -1167,9 +1184,12 @@ def test_round15_pd_sh_knobs():
     assert len(key) == 25 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
     assert instance_key(a_mn=False, b_mn=True)[23:] == (0, 0)
-    assert instance_symbol(
-        instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
-    ) == "dense_proj_gemm_kn_n256_tma2_pd2_sh1000"
+    assert (
+        instance_symbol(
+            instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
+        )
+        == "dense_proj_gemm_kn_n256_tma2_pd2_sh1000"
+    )
     with pytest.raises(ValueError, match="pd must be one of"):
         instance_key(a_mn=False, b_mn=True, pd=4)
     with pytest.raises(ValueError, match="pd needs cta_rows=128"):
@@ -1182,12 +1202,25 @@ def test_round15_pd_sh_knobs():
     # TMA-store family with the cross-tile pipelined drain; a caller-forced tall tile drops the family knob
     v = _views("proj", "indexer_k", "dgrad", "bf16", 1001)
     r200, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False
+        v["A"],
+        v["B"],
+        v["out"],
+        sm_count=212,
+        l2_bytes=L2_BYTES,
+        arch="sm_107a",
+        _fallback=False,
     )
     assert r200.pd == 2 and r200.slots == 2 and r200.cta_rows == 128
     assert r200.template == "dense_proj_gemm_kn_n256_tma2_pd2"
     tall, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False, cta_rows=256
+        v["A"],
+        v["B"],
+        v["out"],
+        sm_count=212,
+        l2_bytes=L2_BYTES,
+        arch="sm_107a",
+        _fallback=False,
+        cta_rows=256,
     )
     assert tall.pd == 0 and "_pd" not in tall.template
 
