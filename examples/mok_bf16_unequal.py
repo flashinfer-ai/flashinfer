@@ -58,7 +58,7 @@ def main():
                 for a in global_weights
             ),
         )
-        gate = dict(max_absolute_error=0.01, relative_l1_error=0.01)
+        gate = dict(atol=1e-2, rtol=1e-2)
         cases = []
         for counts in ([0, 1, 255, 513], [0, 513, 769, 8193], [0, 0, 0, 0]):
             config, workspace = create_mok_bf16_workspace(

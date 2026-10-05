@@ -268,14 +268,8 @@ def _check_fused_training():
                         if norm
                         else (0.0 if delta.sum().item() == 0 else float("inf"))
                     )
-                    assert maximum <= 0.01 and relative <= 0.01, (
-                        empty,
-                        hidden,
-                        intermediate,
-                        macro,
-                        index,
-                        maximum,
-                        relative,
+                    torch.testing.assert_close(
+                        value.float(), expected.float(), atol=1e-2, rtol=1e-2
                     )
                     previous = worst.setdefault(
                         index, dict(max_abs=0.0, relative_l1=0.0)

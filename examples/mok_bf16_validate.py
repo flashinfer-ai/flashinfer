@@ -275,7 +275,7 @@ def run(args):
     assert workspace.initial_source_counts == tuple(counts)
     check_peer_access(workspace, rank, ep)
     weights = make_weights(rank, ep, args.hidden, args.intermediate, device)
-    gate = dict(max_absolute_error=0.5, relative_l1_error=0.01)
+    gate = dict(atol=1e-2, rtol=1e-2)
     data = make_data(counts, args.hidden, args.routing, 0, device)
     first = TrainingIteration(
         config,
@@ -291,7 +291,6 @@ def run(args):
         actual = iteration.run()
         torch.cuda.synchronize()
         errors = error_report(actual, expected, gate)
-        assert all(e["pass"] for e in errors.values()), errors
         routes = audit_routes(iteration, source, lengths, rank, ep)
         assert actual[0].shape == actual[1].shape == (lengths[rank], args.hidden)
         assert actual[2].shape == (lengths[rank], 8)
@@ -302,7 +301,11 @@ def run(args):
         reports.append(dict(label=label, errors=errors, routes=routes, hashes=hashes))
         (rank_dir / "checks.json").write_text(json.dumps(reports, indent=2) + "\n")
         if rank == 0:
-            print(f"{args.layout}/{args.routing}: {label} all nine PASS", flush=True)
+            passed = all(e["pass"] for e in errors.values())
+            print(
+                f"{args.layout}/{args.routing}: {label} all nine pass={passed}",
+                flush=True,
+            )
         return hashes
 
     if args.sanitizer_smoke:
@@ -413,8 +416,9 @@ def run(args):
         Path(__file__).resolve().parents[1] / "flashinfer/experimental/cake_mok_bf16"
     )
     source_registry = json.loads((package / "sources.json").read_text())
+    passed = all(e["pass"] for row in reports for e in row["errors"].values())
     record = dict(
-        status="PASS",
+        status="PASS" if passed else "FAIL",
         rank=rank,
         ep=ep,
         layout=args.layout,
@@ -438,7 +442,7 @@ def run(args):
     )
     (rank_dir / "summary.json").write_text(json.dumps(record, indent=2) + "\n")
     ranks = [None] * ep
-    dist.all_gather_object(ranks, dict(rank=rank, status="PASS"))
+    dist.all_gather_object(ranks, dict(rank=rank, status=record["status"]))
     if rank == 0:
         record["ranks"] = ranks
         record["reports"] = [
@@ -458,11 +462,19 @@ def run(args):
         (args.output / "summary.json").write_text(json.dumps(record, indent=2) + "\n")
         print(
             json.dumps(
-                dict(status="PASS", ep=ep, layout=args.layout, routing=args.routing)
+                dict(
+                    status=record["status"],
+                    ep=ep,
+                    layout=args.layout,
+                    routing=args.routing,
+                )
             ),
             flush=True,
         )
     dist.destroy_process_group()
+    assert passed, (
+        "Elementwise atol=1e-2 / rtol=1e-2 failed; inspect per-rank checks.json"
+    )
 
 
 if __name__ == "__main__":

@@ -152,13 +152,17 @@ workload exit alone does not establish sanitizer acceptance: inspect every
 rank's tool report.
 
 
-The exported runtime has passed all seven full-shape rows at EP16 and EP64,
-including all nine output/gradient tensors on every rank and the reuse checks
-above. Nonempty rows pass maximum absolute error <=0.5 and global relative L1
-<=0.01 against the independent BF16-rounding reference; the observed worst
-values are 0.0625 and 0.003320751. Separate full-shape FP32-reference diagnostics
-are retained as diagnostics, not the acceptance reference. Distributed API
-and capacity/ownership tests pass two tests per rank at both scales.
+Numerical acceptance now requires every element of all nine output/gradient
+tensors on every rank to satisfy
+`abs(actual - reference) <= 1e-2 + 1e-2 * abs(reference)`, with finite values.
+Maximum absolute error and global relative L1 remain diagnostics only.
+The driver records mismatch counts and worst normalized errors per rank and
+globally, and preserves failed reports before returning a failing exit status.
+
+The previous seven-row EP16/EP64 qualification used an aggregate-error gate;
+it does not establish a pass under the elementwise criterion. Requalification
+with `atol=1e-2, rtol=1e-2` is pending. The independent BF16-rounding reference
+is unchanged; FP32-reference runs remain separate diagnostics.
 
 Full-shape memcheck passes all six nonempty shape/routing pairs at each scale.
 Full-shape synccheck passes those six pairs at EP16; EP64 requires

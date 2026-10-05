@@ -85,12 +85,18 @@ def reference(global_data, weights, *, fp32=False, source_counts=None):
 
 
 def error_report(actual, expected, gate):
+    """Apply elementwise atol/rtol on every rank; retain aggregate diagnostics."""
+    atol, rtol = float(gate["atol"]), float(gate["rtol"])
+    if not (0 < atol < float("inf") and 0 <= rtol < float("inf")):
+        raise ValueError("Require finite atol > 0 and rtol >= 0")
     reports = {}
     for name, a, b in zip(RESULT_NAMES, actual, expected, strict=True):
         assert a.shape == b.shape, (name, a.shape, b.shape)
-        # Chunk reductions so full expert weight gradients do not require
-        # simultaneous FP32 copies of entire owning-rank weight tensors.
-        stats = torch.zeros(4, dtype=torch.float64, device=a.device)
+        # First three fields use MAX; the remaining five use SUM across ranks.
+        # Chunking bounds temporary storage for full expert weight gradients.
+        stats = torch.zeros(8, dtype=torch.float64, device=a.device)
+        worst = torch.zeros(4, dtype=torch.float64, device=a.device)
+        offset = 0
         for aa, bb in zip(
             a.flatten().split(1048576), b.flatten().split(1048576), strict=True
         ):
@@ -98,34 +104,77 @@ def error_report(actual, expected, gate):
                 continue
             af, bf = aa.float(), bb.float()
             diff = (af - bf).abs()
-            stats[0] = torch.maximum(stats[0], diff.max().double())
-            stats[1] += diff.double().sum()
-            stats[2] += bf.abs().double().sum()
-            stats[3] += (~torch.isfinite(af)).sum() + (~torch.isfinite(bf)).sum()
+            allowed = atol + rtol * bf.abs()
+            finite = torch.isfinite(af) & torch.isfinite(bf)
+            mismatch = (~finite) | (diff > allowed)
+            ratio = torch.nan_to_num(
+                diff / allowed, nan=float("inf"), posinf=float("inf")
+            )
+            peak, index = ratio.max(dim=0)
+            example = torch.stack(
+                (
+                    index.double() + offset,
+                    af[index].double(),
+                    bf[index].double(),
+                    allowed[index].double(),
+                )
+            )
+            worst = torch.where(peak > stats[1], example, worst)
+            stats[0] = torch.maximum(
+                stats[0], torch.nan_to_num(diff, nan=float("inf")).max().double()
+            )
+            stats[1] = torch.maximum(stats[1], peak.double())
+            stats[2] = torch.maximum(
+                stats[2],
+                torch.nan_to_num(diff - allowed, nan=float("inf")).max().double(),
+            )
+            stats[3] += diff.double().sum()
+            stats[4] += bf.abs().double().sum()
+            stats[5] += (~torch.isfinite(af)).sum() + (~torch.isfinite(bf)).sum()
+            stats[6] += mismatch.sum()
+            stats[7] += aa.numel()
+            offset += aa.numel()
         local = stats.tolist()
-        dist.all_reduce(stats[:1], op=dist.ReduceOp.MAX)
-        dist.all_reduce(stats[1:], op=dist.ReduceOp.SUM)
-        maximum, error, norm, nonfinite = stats.tolist()
+        local_worst = worst.tolist()
+        dist.all_reduce(stats[:3], op=dist.ReduceOp.MAX)
+        dist.all_reduce(stats[3:], op=dist.ReduceOp.SUM)
+        maximum, ratio, excess, error, norm, nonfinite, mismatched, elements = (
+            stats.tolist()
+        )
         relative = error / norm if norm else (0.0 if error == 0 else float("inf"))
         local_relative = (
-            local[1] / local[2]
-            if local[2]
-            else (0.0 if local[1] == 0 else float("inf"))
+            local[3] / local[4]
+            if local[4]
+            else (0.0 if local[3] == 0 else float("inf"))
         )
         reports[name] = {
             "shape": list(a.shape),
             "actual_dtype": str(a.dtype),
+            "atol": atol,
+            "rtol": rtol,
             "rank_max_absolute": local[0],
-            "rank_abs_error_sum": local[1],
-            "rank_reference_l1": local[2],
+            "rank_max_error_ratio": local[1],
+            "rank_max_tolerance_excess": local[2],
+            "rank_abs_error_sum": local[3],
+            "rank_reference_l1": local[4],
             "rank_relative_l1": local_relative,
-            "rank_nonfinite": local[3],
+            "rank_nonfinite": int(local[5]),
+            "rank_mismatched": int(local[6]),
+            "rank_elements": int(local[7]),
+            "rank_worst_error": {
+                "flat_index": int(local_worst[0]),
+                "actual": local_worst[1],
+                "reference": local_worst[2],
+                "allowed_error": local_worst[3],
+            },
             "global_max_absolute": maximum,
             "global_relative_l1": relative,
-            "global_nonfinite": nonfinite,
-            "pass": nonfinite == 0
-            and maximum <= gate["max_absolute_error"]
-            and relative <= gate["relative_l1_error"],
+            "global_max_error_ratio": ratio,
+            "global_max_tolerance_excess": excess,
+            "global_nonfinite": int(nonfinite),
+            "global_mismatched": int(mismatched),
+            "global_elements": int(elements),
+            "pass": nonfinite == 0 and mismatched == 0,
         }
     return reports
 
@@ -234,7 +283,7 @@ def main():
     topk, local_experts = (2, 4) if ep in (1, 4) else (8, 256 // ep)
     total_experts = ep * local_experts
     functional = prepare_mok_bf16(ep_size=ep, local_experts=local_experts, topk=topk)
-    gate = dict(max_absolute_error=0.01, relative_l1_error=0.01)
+    gate = dict(atol=1e-2, rtol=1e-2)
     cases = []
     for hidden, intermediate in ((256, 256), (512, 512)):
         config, workspace = create_mok_bf16_workspace(
