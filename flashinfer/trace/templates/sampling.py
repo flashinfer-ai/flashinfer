@@ -891,32 +891,6 @@ top_k_ragged_transform_trace = TraceTemplate(
 )
 
 
-prepared_top_k_ragged_transform_run_trace = TraceTemplate(
-    op_type="sampling",
-    name_prefix="prepared_top_k_ragged_transform",
-    description=(
-        "PreparedTopKRaggedTransform.run(): top_k_ragged_transform with the "
-        "backend fixed when the transform is prepared and the output and "
-        "workspace supplied by the caller."
-    ),
-    axes={
-        "num_rows": Var(),
-        "max_len": Var(description="Padded row length of `input`."),
-        "k": Const(abbrev="k"),
-    },
-    inputs={
-        "input": Tensor(["num_rows", "max_len"]),
-        "offsets": Tensor(["num_rows"], dtype="int32"),
-        "lengths": Tensor(["num_rows"], dtype="int32"),
-        "out": Tensor(["num_rows", "k"], dtype="int32"),
-    },
-    outputs={
-        "indices": Tensor(["num_rows", "k"], dtype="int32"),
-    },
-    tags=["status:verified", "sparse"],
-)
-
-
 @torch.no_grad()
 # ── DeepSeek-V3 fused expert routing (top-k) ─────────────────────────────────
 

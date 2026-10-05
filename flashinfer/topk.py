@@ -26,7 +26,6 @@ from .api_logging import flashinfer_api
 from .jit.topk import gen_topk_module
 from .trace.templates.sampling import (
     top_k_page_table_transform_trace_dispatch,
-    prepared_top_k_ragged_transform_run_trace,
     top_k_ragged_transform_trace,
 )
 from .utils import (
@@ -1428,6 +1427,10 @@ def top_k_ragged_transform(
     tie_break: int = TopKTieBreak.NONE,
     dsa_graph_safe: bool = False,
     row_starts: Optional[torch.Tensor] = None,
+    *,
+    out: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+    backend: Optional[str] = None,
 ) -> torch.Tensor:
     r"""Fused Top-K selection + Ragged Index Transform for sparse attention.
 
@@ -1479,6 +1482,17 @@ def top_k_ragged_transform(
         Top-k is computed over ``[row_starts[i], row_starts[i] + lengths[i])`` for row ``i``.
         Output indices remain ``local_topk + offsets[i]`` where ``local_topk`` is relative to
         ``row_starts[i]``. Default is None (equivalent to all zeros).
+    out : Optional[torch.Tensor], optional
+        int32 ``(num_rows, k)`` to write into instead of allocating one.
+    workspace : Optional[torch.Tensor], optional
+        Scratch of at least :func:`top_k_ragged_transform_workspace_size` bytes
+        for ``backend``: uint8, contiguous, :data:`WORKSPACE_ALIGNMENT`-aligned,
+        zeroed when allocated and used by one call at a time. Replaces the
+        per-device cached buffer.
+    backend : Optional[str], optional
+        ``"cub"`` or ``"radix"`` as :func:`resolve_ragged_transform_backend`
+        returned, so a run uses the backend its buffers were sized for instead
+        of resolving one per call. ``"clusters"`` cannot take caller buffers.
 
 
     Returns
@@ -1512,71 +1526,81 @@ def top_k_ragged_transform(
     """
     device = input.device
     num_rows = input.size(0)
-
-    backend = resolve_ragged_transform_backend(
-        num_rows=num_rows,
-        max_len=input.size(1),
-        k=k,
-        dtype=input.dtype,
-        device=device,
-        deterministic=deterministic,
-        tie_break=tie_break,
-        dsa_graph_safe=dsa_graph_safe,
-        use_row_starts=row_starts is not None,
-    )
-
+    if backend is None:
+        backend = resolve_ragged_transform_backend(
+            num_rows=num_rows,
+            max_len=input.size(1),
+            k=k,
+            dtype=input.dtype,
+            device=device,
+            deterministic=deterministic,
+            tie_break=tie_break,
+            dsa_graph_safe=dsa_graph_safe,
+            use_row_starts=row_starts is not None,
+        )
+    if backend == "clusters":
+        if out is not None or workspace is not None:
+            raise NotImplementedError(_CLUSTERS_OWNS_ITS_BUFFERS)
+        return topk_clusters_ragged_transform(input, lengths, offsets, k)
+    topk_module = get_topk_module()
+    if out is None:
+        out = torch.empty(num_rows, k, dtype=torch.int32, device=device)
+    elif (
+        tuple(out.shape) != (num_rows, k)
+        or out.dtype != torch.int32
+        or out.device != device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"out must be contiguous int32 ({num_rows}, {k}) on {device}, got "
+            f"{tuple(out.shape)} {out.dtype} on {out.device}"
+        )
     if backend == "cub":
-        topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
         # so repeated calls (including under CUDA graph capture) reuse a stable
         # allocation.
-        workspace_bytes = topk_module.cub_topk_ragged_transform_workspace_size(
+        needed = topk_module.cub_topk_ragged_transform_workspace_size(
             input, lengths, k, int(tie_break), row_starts is not None
         )
-        workspace_buffer: torch.Tensor = _get_cache_buf(
-            f"cub_topk_workspace_{device}", workspace_bytes, device
+        if workspace is None:
+            workspace = _get_cache_buf(f"cub_topk_workspace_{device}", needed, device)
+    else:
+        needed = _RADIX_ROW_STATES_BYTES
+        if workspace is None:
+            # Allocate row_states buffer for multi-CTA path
+            workspace = _get_cache_buf(
+                f"radix_topk_row_states_{device}", needed, device, zero_init=True
+            )
+    if (
+        workspace.dtype != torch.uint8
+        or workspace.device != device
+        or not workspace.is_contiguous()
+        or workspace.numel() < needed
+        or workspace.data_ptr() % WORKSPACE_ALIGNMENT
+    ):
+        raise ValueError(
+            f"workspace needs {needed} bytes of contiguous uint8 on {device}, "
+            f"{WORKSPACE_ALIGNMENT}-byte aligned; got {workspace.numel()} "
+            f"{workspace.dtype} on {workspace.device}"
         )
-        output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)
+    if backend == "cub":
         topk_module.cub_topk_ragged_transform(
+            input, out, offsets, lengths, workspace, k, int(tie_break), row_starts
+        )
+    else:
+        topk_module.radix_topk_ragged_transform(
             input,
-            output_indices,
+            out,
             offsets,
             lengths,
-            workspace_buffer,
+            workspace,
             k,
-            int(tie_break),
-            row_starts,
+            deterministic,
+            tie_break,
+            dsa_graph_safe,
+            row_starts=row_starts,
         )
-        return output_indices
-
-    if backend == "clusters":
-        return topk_clusters_ragged_transform(input, lengths, offsets, k)
-
-    # Allocate row_states buffer for multi-CTA path
-    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
-        f"radix_topk_row_states_{device}",
-        1024 * 1024,  # 1MB
-        device,
-        zero_init=True,
-    )
-
-    # Allocate output
-    output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)
-
-    get_topk_module().radix_topk_ragged_transform(
-        input,
-        output_indices,
-        offsets,
-        lengths,
-        row_states_buffer,
-        k,
-        deterministic,
-        tie_break,
-        dsa_graph_safe,
-        row_starts=row_starts,
-    )
-
-    return output_indices
+    return out
 
 
 _RADIX_ROW_STATES_BYTES = 1024 * 1024
@@ -1589,246 +1613,45 @@ _CUB_DTYPE_CODES = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
 #: and what the CUB backend's own allocations want, so one number serves both
 #: and composes with the attention wrappers' arenas.
 WORKSPACE_ALIGNMENT = 16
+_CLUSTERS_OWNS_ITS_BUFFERS = (
+    "the clusters top-k backend allocates its own output and scratch, so it "
+    "cannot run from caller buffers; ask for deterministic ordering or a "
+    "tie-break, or set FLASHINFER_TOPK_ALGO, to select another backend"
+)
 
 
-class PreparedTopKRaggedTransform:
-    r"""A top-k transform with its backend fixed and its scratch handed over.
+@flashinfer_api
+def top_k_ragged_transform_workspace_size(
+    num_rows: int,
+    max_len: int,
+    k: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    *,
+    backend: str,
+    tie_break: int = TopKTieBreak.NONE,
+    use_row_starts: bool = False,
+) -> int:
+    r"""Bytes of scratch :func:`top_k_ragged_transform` needs on ``backend`` here.
 
-    :func:`top_k_ragged_transform` picks a backend per call and reaches for a
-    device-wide cache for the scratch that backend needs. That is the right
-    shape for a caller making one call; it is the wrong one for a caller who
-    holds several of these at once -- they would share one cached buffer -- or
-    who runs inside a CUDA graph, where an allocation made during capture stays
-    in the graph's private pool for the life of the process.
-
-    This fixes the backend once, says how many bytes it needs, and then runs
-    without allocating: the output and the scratch are the caller's.
-
-    Examples
-    --------
-    >>> import torch
-    >>> import flashinfer
-    >>> prepared = flashinfer.PreparedTopKRaggedTransform(
-    ...     num_rows=8, max_len=4096, k=256, dtype=torch.float32,
-    ...     device=torch.device("cuda"), deterministic=True,
-    ... )
-    >>> scores = torch.randn(8, 4096, device="cuda")
-    >>> lengths = torch.full((8,), 4096, device="cuda", dtype=torch.int32)
-    >>> offsets = torch.zeros(8, device="cuda", dtype=torch.int32)
-    >>> workspace = torch.zeros(
-    ...     prepared.workspace_size(), dtype=torch.uint8, device="cuda"
-    ... )
-    >>> out = torch.empty(8, 256, dtype=torch.int32, device="cuda")
-    >>> _ = prepared.run(scores, offsets, lengths, out=out, workspace=workspace)
+    Answered from the geometry alone, launching and allocating nothing, so a
+    workspace can be sized before there are scores to put in it. ``backend`` is
+    what :func:`resolve_ragged_transform_backend` returned for the same
+    geometry; pass the same value to the run so it uses the backend it was
+    sized for. Zero the buffer when it is allocated: the radix backend reads its
+    counters before writing them and leaves them fit to reuse.
     """
-
-    @flashinfer_api
-    def __init__(
-        self,
-        *,
-        num_rows: int,
-        max_len: int,
-        k: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        deterministic: bool = False,
-        tie_break: int = TopKTieBreak.NONE,
-        dsa_graph_safe: bool = False,
-        use_row_starts: bool = False,
-    ) -> None:
-        """Resolve the backend for this shape.
-
-        Parameters
-        ----------
-        num_rows, max_len : int
-            The shape of the scores this will be given.
-        k : int
-            How many indices to select per row.
-        dtype : torch.dtype
-            The scores' dtype.
-        device : torch.device
-            Where they live.
-        deterministic : bool
-            Whether repeated runs have to order their output the same way.
-        tie_break : int
-            Which boundary element wins when scores are equal. See
-            :func:`top_k_ragged_transform`.
-        dsa_graph_safe : bool
-            Whether the backend has to be one that runs under graph capture.
-        use_row_starts : bool
-            Whether ``run`` will be given per-row start indices.
-        """
-        self.num_rows = num_rows
-        self.max_len = max_len
-        self.k = k
-        self.dtype = dtype
-        # "cuda" and "cuda:0" name the same device but do not compare equal, and
-        # the checks below compare. Resolve the index once, here.
-        device = torch.device(device)
-        if device.type == "cuda" and device.index is None:
-            device = torch.device("cuda", torch.cuda.current_device())
-        self.device = device
-        self.deterministic = deterministic
-        self.tie_break = tie_break
-        self.dsa_graph_safe = dsa_graph_safe
-        self.use_row_starts = use_row_starts
-
-        backend = resolve_ragged_transform_backend(
-            num_rows=num_rows,
-            max_len=max_len,
-            k=k,
-            dtype=dtype,
-            device=device,
-            deterministic=deterministic,
-            tie_break=tie_break,
-            dsa_graph_safe=dsa_graph_safe,
-            use_row_starts=use_row_starts,
+    if backend == "radix":
+        return _RADIX_ROW_STATES_BYTES
+    if backend != "cub":
+        raise NotImplementedError(_CLUSTERS_OWNS_ITS_BUFFERS)
+    code = _CUB_DTYPE_CODES.get(dtype)
+    if code is None:
+        raise ValueError(f"the CUB backend does not serve {dtype}")
+    device = torch.device(device)
+    index = torch.cuda.current_device() if device.index is None else device.index
+    return int(
+        get_topk_module().cub_topk_ragged_transform_workspace_size_for(
+            num_rows, max_len, code, index, k, int(tie_break), use_row_starts
         )
-        if backend == "clusters":
-            raise NotImplementedError(
-                "the clusters top-k backend allocates its own output and "
-                "overflow buffer, so it cannot serve a prepared transform; ask "
-                "for deterministic ordering or a tie-break, or set "
-                "FLASHINFER_TOPK_ALGO, to select another backend"
-            )
-        self.backend = backend
-        self._module = get_topk_module()
-
-    @flashinfer_api
-    def workspace_size(self) -> int:
-        """Bytes of scratch :meth:`run` needs, for the backend already chosen.
-
-        Answered from what this transform was prepared for -- the shape, the
-        dtype and the device. Nothing is launched and nothing is allocated: a
-        caller sizing a workspace does not yet have anything to put in it, so
-        it should not have to build a score buffer to ask. The radix backend
-        keeps a fixed per-row state; CUB is asked through its own descriptor
-        query.
-        """
-        if self.backend != "cub":
-            return _RADIX_ROW_STATES_BYTES
-        code = _CUB_DTYPE_CODES.get(self.dtype)
-        if code is None:
-            raise ValueError(f"the CUB backend does not serve {self.dtype}")
-        return int(
-            self._module.cub_topk_ragged_transform_workspace_size_for(
-                self.num_rows,
-                self.max_len,
-                code,
-                self.device.index or 0,
-                self.k,
-                int(self.tie_break),
-                self.use_row_starts,
-            )
-        )
-
-    def _check(self, tensor, name, shape, dtype):
-        """Shape, dtype, device and layout, all of which the kernel assumes."""
-        if shape is not None and tuple(tensor.shape) != shape:
-            raise ValueError(
-                f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
-            )
-        if tensor.dtype != dtype:
-            raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
-        if tensor.device != self.device:
-            raise ValueError(f"{name} must be on {self.device}, got {tensor.device}")
-        if not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-
-    @flashinfer_api(trace=prepared_top_k_ragged_transform_run_trace)
-    def run(
-        self,
-        input: torch.Tensor,
-        offsets: torch.Tensor,
-        lengths: torch.Tensor,
-        *,
-        out: torch.Tensor,
-        workspace: torch.Tensor,
-        row_starts: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Select into ``out`` using ``workspace``, allocating nothing.
-
-        ``workspace`` has to be at least :meth:`workspace_size` bytes of uint8
-        on this transform's device, contiguous, and aligned to
-        :data:`WORKSPACE_ALIGNMENT`. It belongs to this transform for as long as
-        the call runs: it is scratch, not state, but two runs sharing one buffer
-        cannot overlap.
-
-        **Zero it when it is allocated.** The radix backend reads its counters
-        before it writes them on the first round, and it leaves them fit to
-        reuse afterwards -- so once, at provisioning, not per call. A caller
-        that cannot promise a zeroed buffer (one handing out slices of an
-        arena, say) clears the region itself before each call.
-
-        Parameters
-        ----------
-        input, offsets, lengths, row_starts : torch.Tensor
-            As for :func:`top_k_ragged_transform`, in the prepared shape.
-        out : torch.Tensor
-            int32 ``(num_rows, k)``, written in place.
-        workspace : torch.Tensor
-            The scratch described above.
-
-        Returns
-        -------
-        torch.Tensor
-            ``out``.
-        """
-        # The backend was chosen for one shape, one dtype and one device; a
-        # call that differs in any of them would run a kernel picked for
-        # something else.
-        self._check(input, "input", (self.num_rows, self.max_len), self.dtype)
-        self._check(offsets, "offsets", (self.num_rows,), torch.int32)
-        self._check(lengths, "lengths", (self.num_rows,), torch.int32)
-        self._check(out, "out", (self.num_rows, self.k), torch.int32)
-        self._check(workspace, "workspace", None, torch.uint8)
-        if (row_starts is not None) != self.use_row_starts:
-            raise ValueError(
-                "row_starts has to be given exactly when the transform was "
-                "prepared for it"
-            )
-        if row_starts is not None:
-            self._check(row_starts, "row_starts", (self.num_rows,), torch.int32)
-
-        needed = self.workspace_size()
-        if workspace.numel() < needed:
-            raise ValueError(
-                f"workspace needs {needed} bytes for the {self.backend} backend, "
-                f"got {workspace.numel()}"
-            )
-        # The buffer is handed to the kernel as a struct of 4-byte fields, and
-        # a slice of a larger arena is the expected way to provide it, so the
-        # start has to be aligned. WORKSPACE_ALIGNMENT is what a caller cutting
-        # slices should round to.
-        if workspace.data_ptr() % WORKSPACE_ALIGNMENT:
-            raise ValueError(
-                f"workspace must be {WORKSPACE_ALIGNMENT}-byte aligned, got "
-                f"data_ptr % {WORKSPACE_ALIGNMENT} = "
-                f"{workspace.data_ptr() % WORKSPACE_ALIGNMENT}"
-            )
-
-        if self.backend == "cub":
-            self._module.cub_topk_ragged_transform(
-                input,
-                out,
-                offsets,
-                lengths,
-                workspace,
-                self.k,
-                int(self.tie_break),
-                row_starts,
-            )
-        else:
-            self._module.radix_topk_ragged_transform(
-                input,
-                out,
-                offsets,
-                lengths,
-                workspace,
-                self.k,
-                self.deterministic,
-                self.tie_break,
-                self.dsa_graph_safe,
-                row_starts=row_starts,
-            )
-        return out
+    )
