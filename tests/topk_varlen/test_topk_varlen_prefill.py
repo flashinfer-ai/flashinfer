@@ -801,3 +801,35 @@ def test_prefill_absolute_indices_validation():
     # decode mode has no window frame to shift: refused on every backend
     with pytest.raises(ValueError, match="absolute_indices"):
         flashinfer.top_k_varlen(lg, le, k, absolute_indices=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_prefill_absolute_indices_on_non_current_device():
+    """logits on a device that is not the current one: the host re-enters
+    itself under that device and must forward every windowed kwarg, so the
+    absolute frame survives (it was silently dropped before)."""
+    other = torch.device("cuda:1")
+    major, minor = get_compute_capability(other)
+    if not flashinfer.top_k_varlen.is_backend_supported("gvr_2", major * 10 + minor):
+        pytest.skip("gvr_2 unsupported on cuda:1")
+    torch.cuda.set_device(0)
+    top_k, R, L = 512, 2, 1500
+    rows = R * L
+    gen = torch.Generator(device=other).manual_seed(5)
+    lg = torch.randn((rows, R * L), generator=gen, dtype=torch.float32, device=other)
+    rs = torch.tensor(
+        [(r * L) for r in range(R) for _ in range(L)], dtype=torch.int32, device=other
+    )
+    le = torch.tensor(
+        [i + 1 for _ in range(R) for i in range(L)], dtype=torch.int32, device=other
+    )
+    out_abs, _ = flashinfer.top_k_varlen(
+        lg, le, top_k, row_starts=rs, absolute_indices=True, backend="gvr_2"
+    )
+    out_loc, _ = flashinfer.top_k_varlen(lg, le, top_k, row_starts=rs, backend="gvr_2")
+    torch.cuda.synchronize(other)
+    assert torch.cuda.current_device() == 0
+    _check_windowed(lg, out_loc, rs, le, top_k)
+    assert _same_rows(
+        out_abs, torch.where(out_loc >= 0, out_loc + rs.unsqueeze(1), out_loc)
+    )
