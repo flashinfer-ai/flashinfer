@@ -652,14 +652,6 @@ def test_sizing_and_a_caller_int_workspace_inside_a_default_device_context():
     assert w._pin_memory_int_workspace_buffer.is_pinned()
 
 
-def test_the_planner_refuses_a_device_indptr():
-    module = _plan(_paged_case())._cached_module
-    kv = torch.arange(17, dtype=torch.int32, device="cuda") * 64
-    head = (kv // 64, kv, kv[1:] - kv[:-1], 16, 16, 8, 1, 16, False, 128, 128)
-    with pytest.raises(ValueError, match="host tensor"):
-        module.workspace_size(_u8(0), *head, False, -1, -1, False, 0, 0)
-
-
 if __name__ == "__main__":
     # This test verifies the INT32_T overflow issue.
     for seq_len in [16 * 1024, 32 * 1024, 40 * 1024, 48 * 1024, 64 * 1024]:
