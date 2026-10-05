@@ -121,7 +121,8 @@ CAKE_BGMV_MOE_GROUPED_MIN_ROUTES_PER_BIN = 4
 CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS = 12288
 CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS_R8 = 6144
 CAKE_BGMV_MOE_GROUPED_R8_SMALL_WEIGHT_ELEMS = 16384
-CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_R8_SMALL = 8192  # lever 24c: rank-8 weights below 16384 elements group from this many routes
+# lever 24c: rank-8 weights below 16384 elements group from this many routes
+CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_R8_SMALL = 8192
 # Lever 27: bin-ordered dispatch of the per-route shrink (SM90 only).  A single-CTA
 # prologue kernel sorts the routes by their (LoRA, expert) bin so the CTAs that
 # stream the same LoRA-A rows run back to back and the second and later readers
