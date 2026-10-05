@@ -453,8 +453,8 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
           gemm1BiasType, usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
       mGemm2(Gemm2Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
-                           tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
-                           usePerChannelScalingGemm2)) {
+                         tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
+                         usePerChannelScalingGemm2)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
   auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 
@@ -760,14 +760,14 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 #ifdef CAKE_STEPFUN_FULL
     // The Cake requantization kernel writes the block-scale layout the selected Cake FC2 kernel
     // reads for its activation operand.
-    cake_stepfun::requant::run(
-        args.num_tokens * totalExpertsPerToken, args.intermediate_size,
-        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), recipe.globalScaleInv(),
-        static_cast<float>(recipe.e4m3Max), workspace.expanded_idx_to_permuted_idx,
-        reinterpret_cast<uint8_t*>(workspace.activation_output),
-        reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
-        reinterpret_cast<float*>(workspace.token_scales_fc2), mGemm2.sfLayoutA(config.gemm2Config),
-        stream, enable_pdl);
+    cake_stepfun::requant::run(args.num_tokens * totalExpertsPerToken, args.intermediate_size,
+                               reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output),
+                               recipe.globalScaleInv(), static_cast<float>(recipe.e4m3Max),
+                               workspace.expanded_idx_to_permuted_idx,
+                               reinterpret_cast<uint8_t*>(workspace.activation_output),
+                               reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
+                               reinterpret_cast<float*>(workspace.token_scales_fc2),
+                               mGemm2.sfLayoutA(config.gemm2Config), stream, enable_pdl);
 #else
     auto const sfLayoutB = mGemm2.mRunner.getSfLayoutB(config.gemm2Config);
     auto sfLayout = QuantizationSFLayout::LINEAR;

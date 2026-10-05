@@ -18,11 +18,12 @@
 // Kernel ABI of the Cake StepFun fused-MoE stages other than FC1 (routing, FC2, the NVFP4 per-token
 // requantization and finalize). The generated launch manifest
 // (generated/cake_stepfun_generated_manifest.cuh) declares the exported kernels and renders, for
-// every stage it covers, one `Submit_<i>` thunk per kernel that unpacks the stage's `*Args` structure
-// below into the kernel's parameter list, plus a per-architecture table of `*KernelSpec` entries. The
-// hand-written stage runners (cake_stepfun_stages.cu) consume only these structures and tables, so
-// the host code is independent of a unit's parameter order and of whether an operand arrives as a TMA
-// descriptor or as a pointer. README.md in this directory states the contract in prose.
+// every stage it covers, one `Submit_<i>` thunk per kernel that unpacks the stage's `*Args`
+// structure below into the kernel's parameter list, plus a per-architecture table of `*KernelSpec`
+// entries. The hand-written stage runners (cake_stepfun_stages.cu) consume only these structures
+// and tables, so the host code is independent of a unit's parameter order and of whether an operand
+// arrives as a TMA descriptor or as a pointer. README.md in this directory states the contract in
+// prose.
 //
 // The FC1 stage keeps its own `Fc1Args` / `Fc1KernelSpec` inside the generated manifest.
 
@@ -39,21 +40,23 @@ namespace flashinfer::cake_stepfun::generated {
 
 // Block-scale layout of a block-scaled operand, as the trtllm-gen kernels name them.
 enum class SfLayout : int {
-  kNone = 0,     // operand is not block-scaled
-  kLinear = 1,   // row-major [rows, cols / vec]
-  kR8c4 = 2,     // 8x4 swizzled blocks
-  kR128c4 = 3,   // 128x4 swizzled blocks
+  kNone = 0,    // operand is not block-scaled
+  kLinear = 1,  // row-major [rows, cols / vec]
+  kR8c4 = 2,    // 8x4 swizzled blocks
+  kR128c4 = 3,  // 128x4 swizzled blocks
 };
 
 // ------------------------------------------------------------------------------------------------
 // Routing (Renormalize top-k over the routing logits; writes every table the GEMM stages consume).
 // ------------------------------------------------------------------------------------------------
 struct RoutingArgs {
-  const void* routing_logits;   // [num_tokens, num_experts], dtype per RoutingKernelSpec::logits_dtype
-  int* topk_packed;             // [num_tokens, top_k] packed (bf16 score, int16 expert) as the native kernel writes
-  void* topk_weights;           // [num_tokens, top_k] bf16 expert weights
-  int* expert_count_histogram;  // max(2 * num_experts, 512) int32 scratch
-  int* total_num_padded_tokens; // [1]
+  const void*
+      routing_logits;  // [num_tokens, num_experts], dtype per RoutingKernelSpec::logits_dtype
+  int* topk_packed;    // [num_tokens, top_k] packed (bf16 score, int16 expert) as the native kernel
+                       // writes
+  void* topk_weights;  // [num_tokens, top_k] bf16 expert weights
+  int* expert_count_histogram;        // max(2 * num_experts, 512) int32 scratch
+  int* total_num_padded_tokens;       // [1]
   int* expanded_idx_to_permuted_idx;  // [num_tokens * top_k], -1 when the expert is not local
   int* permuted_idx_to_token_idx;     // [max_padded_tokens + 1], -1 in padded slots
   int* cta_idx_xy_to_batch_idx;       // [max_num_ctas] local expert per CTA tile
@@ -66,13 +69,14 @@ struct RoutingArgs {
   int local_expert_offset;
   int local_num_experts;
   int tile_tokens_dim;
-  int max_num_ctas;             // Routing::getMaxNumCtasInBatchDim(num_tokens, top_k, num_experts, tile_tokens_dim)
+  int max_num_ctas;  // Routing::getMaxNumCtasInBatchDim(num_tokens, top_k, num_experts,
+                     // tile_tokens_dim)
 };
 
 // How the host derives the launch grid of a routing kernel from the problem.
 enum class RoutingGrid : int {
-  kFixed = 0,          // grid = RoutingKernelSpec::grid (a fixed CTA count, e.g. the cluster kernel)
-  kTokenBlocks = 1,    // grid.x = ceil(num_tokens / RoutingKernelSpec::tokens_per_cta)
+  kFixed = 0,        // grid = RoutingKernelSpec::grid (a fixed CTA count, e.g. the cluster kernel)
+  kTokenBlocks = 1,  // grid.x = ceil(num_tokens / RoutingKernelSpec::tokens_per_cta)
 };
 
 using RoutingSubmitFn = cudaError_t (*)(const cudaLaunchConfig_t*, const RoutingArgs&);
@@ -81,8 +85,8 @@ struct RoutingKernelSpec {
   const char* symbol;
   // Logits dtype the kernel reads: 0 = float32, 1 = bfloat16.
   int logits_dtype;
-  // Token range the kernel variant serves ([min_tokens, max_tokens]; the host picks the first match),
-  // mirroring the native dispatcher's per-token-count kernel selection.
+  // Token range the kernel variant serves ([min_tokens, max_tokens]; the host picks the first
+  // match), mirroring the native dispatcher's per-token-count kernel selection.
   int min_tokens;
   int max_tokens;
   RoutingGrid grid_rule;
@@ -103,23 +107,24 @@ struct RoutingKernelSpec {
 // ------------------------------------------------------------------------------------------------
 // FC2 (grouped GEMM over the permuted FC1 output, bf16 output in permuted order).
 // ------------------------------------------------------------------------------------------------
-// FC2 kernel families (A = permuted activations, B = expert weights, as the trtllm-gen GEMM2 names them).
+// FC2 kernel families (A = permuted activations, B = expert weights, as the trtllm-gen GEMM2 names
+// them).
 enum Fc2Family : int {
-  kFc2Bf16 = 0,            // bf16 activations x bf16 weights (BlockMajorK)
-  kFc2Fp8PerTensor = 1,    // E4m3 x E4m3, per-expert output scale
-  kFc2MxFp8 = 2,           // MxE4m3 x MxE4m3 with UE8M0 block scales
-  kFc2Nvfp4 = 3,           // E2m1 x E2m1, activation block scales from the FC1 epilogue
-  kFc2Nvfp4PerToken = 4,   // E2m1 x E2m1 on the requantized FC1 output + fp32 per-token scales
+  kFc2Bf16 = 0,           // bf16 activations x bf16 weights (BlockMajorK)
+  kFc2Fp8PerTensor = 1,   // E4m3 x E4m3, per-expert output scale
+  kFc2MxFp8 = 2,          // MxE4m3 x MxE4m3 with UE8M0 block scales
+  kFc2Nvfp4 = 3,          // E2m1 x E2m1, activation block scales from the FC1 epilogue
+  kFc2Nvfp4PerToken = 4,  // E2m1 x E2m1 on the requantized FC1 output + fp32 per-token scales
 };
 
 // Complete FC2 launch arguments. Tensor-map and pointer members of one operand coexist because
 // kernels take either form; the manifest's Submit thunk passes the one the kernel declares.
 struct Fc2Args {
-  CUtensorMap A;          // expert weights
-  CUtensorMap B_map;      // permuted activations
-  CUtensorMap SFA;        // weight block scales
-  CUtensorMap SFB_map;    // activation block scales
-  CUtensorMap C_map;      // output
+  CUtensorMap A;        // expert weights
+  CUtensorMap B_map;    // permuted activations
+  CUtensorMap SFA;      // weight block scales
+  CUtensorMap SFB_map;  // activation block scales
+  CUtensorMap C_map;    // output
   void* B_ptr;
   void* SFB_ptr;
   void* C_ptr;
@@ -167,15 +172,15 @@ struct Fc2KernelSpec {
 // NVFP4 per-token requantization of the bf16 FC1 output (kFc1Nvfp4PerToken -> kFc2Nvfp4PerToken).
 // ------------------------------------------------------------------------------------------------
 struct RequantArgs {
-  const __nv_bfloat16* input;              // [max_padded_tokens, inner_dim] bf16 FC1 output
-  const int* expanded_idx_to_permuted_idx; // [num_expanded]
-  uint8_t* output;                         // [max_padded_tokens, inner_dim / 2] packed E2m1
-  uint8_t* output_scale;                   // E4m3 block scales in RequantKernelSpec::sf_layout
-  float* per_token_scale;                  // fp32 [max_padded_tokens]
-  float global_scale_inv;                  // recipe global scale inverse
-  float e4m3_max;                          // recipe E4M3 maximum (448 or the 4/6 variant)
-  int num_expanded;                        // num_tokens * top_k
-  int inner_dim;                           // intermediate size
+  const __nv_bfloat16* input;               // [max_padded_tokens, inner_dim] bf16 FC1 output
+  const int* expanded_idx_to_permuted_idx;  // [num_expanded]
+  uint8_t* output;                          // [max_padded_tokens, inner_dim / 2] packed E2m1
+  uint8_t* output_scale;                    // E4m3 block scales in RequantKernelSpec::sf_layout
+  float* per_token_scale;                   // fp32 [max_padded_tokens]
+  float global_scale_inv;                   // recipe global scale inverse
+  float e4m3_max;                           // recipe E4M3 maximum (448 or the 4/6 variant)
+  int num_expanded;                         // num_tokens * top_k
+  int inner_dim;                            // intermediate size
 };
 
 using RequantSubmitFn = cudaError_t (*)(const cudaLaunchConfig_t*, const RequantArgs&);
@@ -186,7 +191,7 @@ struct RequantKernelSpec {
   // E4M3 maximum the unit is specialized on (448, or 256 for the 4/6 recipe); the host selects the
   // kernel whose value matches the recipe of the forward.
   int e4m3_max;
-  int rows_per_cta;      // grid.x = ceil(num_expanded / rows_per_cta)
+  int rows_per_cta;  // grid.x = ceil(num_expanded / rows_per_cta)
   uint32_t block[3];
   size_t dynamic_smem_bytes;
   ConfigureFn configure;
@@ -197,11 +202,11 @@ struct RequantKernelSpec {
 // Finalize (unpermute + top-k weighted sum, bf16 in / bf16 expert weights / bf16 out).
 // ------------------------------------------------------------------------------------------------
 struct FinalizeArgs {
-  const __nv_bfloat16* input;              // [max_padded_tokens, hidden_dim_padded]
-  const __nv_bfloat16* expert_weights;     // [num_tokens, top_k]
-  __nv_bfloat16* output;                   // [num_tokens, hidden_dim]
-  const int* expanded_idx_to_permuted_idx; // [num_tokens * top_k], -1 = skip
-  const int* total_num_padded_tokens;      // [1]
+  const __nv_bfloat16* input;               // [max_padded_tokens, hidden_dim_padded]
+  const __nv_bfloat16* expert_weights;      // [num_tokens, top_k]
+  __nv_bfloat16* output;                    // [num_tokens, hidden_dim]
+  const int* expanded_idx_to_permuted_idx;  // [num_tokens * top_k], -1 = skip
+  const int* total_num_padded_tokens;       // [1]
   int hidden_dim;
   int hidden_dim_padded;
   int num_tokens;
@@ -211,8 +216,8 @@ struct FinalizeArgs {
 
 // The two native finalize kernels and their launch geometry.
 enum class FinalizeVariant : int {
-  kScalar = 0,   // grid (ceil(hidden_dim / 256), min(8192, num_tokens)), one element per thread
-  kVector = 1,   // grid (num_tokens), 128-bit loads, smem-staged indices and weights
+  kScalar = 0,  // grid (ceil(hidden_dim / 256), min(8192, num_tokens)), one element per thread
+  kVector = 1,  // grid (num_tokens), 128-bit loads, smem-staged indices and weights
 };
 
 using FinalizeSubmitFn = cudaError_t (*)(const cudaLaunchConfig_t*, const FinalizeArgs&);
@@ -220,7 +225,7 @@ using FinalizeSubmitFn = cudaError_t (*)(const cudaLaunchConfig_t*, const Finali
 struct FinalizeKernelSpec {
   const char* symbol;
   FinalizeVariant variant;
-  int max_top_k;         // kVector: largest top_k the unit supports; kScalar: 0 (unbounded)
+  int max_top_k;  // kVector: largest top_k the unit supports; kScalar: 0 (unbounded)
   uint32_t block[3];
   size_t dynamic_smem_bytes;
   ConfigureFn configure;

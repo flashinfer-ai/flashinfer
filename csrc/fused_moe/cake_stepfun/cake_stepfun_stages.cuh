@@ -135,8 +135,7 @@ namespace requant {
 void run(int32_t numExpanded, int32_t innerDim, __nv_bfloat16 const* input, float globalScaleInv,
          float e4m3Max, int32_t const* expandedIdxToPermutedIdx, uint8_t* output,
          uint8_t* outputScale, float* perTokenScaleOut,
-         flashinfer::cake_stepfun::generated::SfLayout layout, cudaStream_t stream,
-         bool enablePdl);
+         flashinfer::cake_stepfun::generated::SfLayout layout, cudaStream_t stream, bool enablePdl);
 }  // namespace requant
 
 namespace finalize {

@@ -15,15 +15,15 @@
  */
 #pragma once
 
-// Benign routing tail for GEMM units that do not bound the tiles they acquire through cluster launch
-// control by num_non_exiting_ctas (KernelSpec::bounds_acquired_tiles == false). The routing stage
-// writes cta_idx_xy_to_batch_idx / cta_idx_xy_to_mn_limit for the first *numNonExitingCtas CTAs and
-// permuted_idx_to_token_idx for their token slots only; a running CTA of such a unit processes every
-// cancelled CTA it acquires, so the entries in [*numNonExitingCtas, gridN) must describe a benign
-// tile: expert 0, zero valid rows (mn_limit = tile * tileN) and padded token slots (-1). The kernel
-// runs in-stream between routing and the GEMM with the GEMM's programmatic-dependent-launch
-// attribute; it waits for routing before reading the count and releases the GEMM once the tail is
-// written. Shared by the FC1 and FC2 runners.
+// Benign routing tail for GEMM units that do not bound the tiles they acquire through cluster
+// launch control by num_non_exiting_ctas (KernelSpec::bounds_acquired_tiles == false). The routing
+// stage writes cta_idx_xy_to_batch_idx / cta_idx_xy_to_mn_limit for the first *numNonExitingCtas
+// CTAs and permuted_idx_to_token_idx for their token slots only; a running CTA of such a unit
+// processes every cancelled CTA it acquires, so the entries in [*numNonExitingCtas, gridN) must
+// describe a benign tile: expert 0, zero valid rows (mn_limit = tile * tileN) and padded token
+// slots (-1). The kernel runs in-stream between routing and the GEMM with the GEMM's
+// programmatic-dependent-launch attribute; it waits for routing before reading the count and
+// releases the GEMM once the tail is written. Shared by the FC1 and FC2 runners.
 
 #include <cuda_runtime.h>
 

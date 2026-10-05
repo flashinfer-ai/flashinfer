@@ -206,8 +206,8 @@ size_t Fc1Runner::getWorkspaceSizeInBytes(int32_t, int32_t, int32_t, int32_t, in
   return 0;
 }
 
-int32_t Fc1Runner::getDefaultValidConfigIndex(int32_t, int32_t hiddenSize,
-                                              int32_t intermediateSize, int32_t, int32_t) const {
+int32_t Fc1Runner::getDefaultValidConfigIndex(int32_t, int32_t hiddenSize, int32_t intermediateSize,
+                                              int32_t, int32_t) const {
   for (int32_t index : mKernels) {
     if (shapeSupported(index, hiddenSize, intermediateSize)) {
       return index;
@@ -466,8 +466,7 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
         spec.symbol, mFamily, spec.tile_n, gridM, gridN, spec.block[0], spec.block[1],
         spec.block[2], spec.cluster[0], spec.cluster[1], spec.cluster[2],
         spec.cluster_attribute ? "true" : "false", spec.dynamic_smem_bytes,
-        fc1Pdl ? "true" : "false",
-        padTail ? "true" : "false",
+        fc1Pdl ? "true" : "false", padTail ? "true" : "false",
         spec.bounds_acquired_tiles ? "true" : "false", args.M_out, args.K, args.grid_m, args.grid_n,
         args.K_tiles, static_cast<long long>(E), static_cast<long long>(T), topK,
         static_cast<long long>(maxPaddedTokens), static_cast<int>(synced));

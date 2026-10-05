@@ -143,20 +143,17 @@ bool routingWritesBenignTail() {
   return generated::kRoutingKernelCount > 0;
 }
 
-void RoutingRunner::run(void* routingLogits, void* routingBias, int32_t numTokens,
-                        int32_t numExperts, int32_t topK, int32_t numFusedSharedExpert,
-                        int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset,
-                        int32_t localNumExperts, float routedScalingFactor,
-                        int32_t* routingExpertIndexes, int32_t* expertCountHistogram,
-                        int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx,
-                        int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx,
-                        int32_t* expertIds, void* expertWeights, int32_t* numTokensPerExpert,
-                        int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
-                        int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
-                        bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-                        Routing::RoutingMethodType routingMethodType, cudaStream_t stream,
-                        btg::Dtype dtypeLogits, bool normTopkProb, int16_t* routing_replay_out,
-                        bool enable_pdl) {
+void RoutingRunner::run(
+    void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
+    int32_t numFusedSharedExpert, int32_t nGroup, int32_t topkGroup, int32_t localExpertOffset,
+    int32_t localNumExperts, float routedScalingFactor, int32_t* routingExpertIndexes,
+    int32_t* expertCountHistogram, int32_t* permutedIdxSize, int32_t* expandedIdxToPermutedIdx,
+    int32_t* permutedIdxToExpandedIdx, int32_t* permutedIdxToTokenIdx, int32_t* expertIds,
+    void* expertWeights, int32_t* numTokensPerExpert, int32_t* ctaIdxXyToBatchIdx,
+    int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt,
+    btg::Dtype dtypeBias, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
+    Routing::RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
+    bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
   (void)routingBias;
   (void)dtypeBias;
   (void)dtypeElt;
@@ -214,8 +211,7 @@ void RoutingRunner::run(void* routingLogits, void* routingBias, int32_t numToken
   args.local_expert_offset = localExpertOffset;
   args.local_num_experts = localNumExperts;
   args.tile_tokens_dim = mTileTokensDim;
-  args.max_num_ctas =
-      Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  args.max_num_ctas = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
   static std::vector<bool> configured(generated::kRoutingKernelCount, false);
   configureSmem(*spec, configured, static_cast<size_t>(spec - generated::kRoutingKernels),
@@ -227,9 +223,9 @@ void RoutingRunner::run(void* routingLogits, void* routingBias, int32_t numToken
   } else {
     FLASHINFER_CHECK(spec->tokens_per_cta > 0, "Cake StepFun routing kernel ", spec->symbol,
                      " declares no tokens_per_cta");
-    config.gridDim = dim3(
-        static_cast<unsigned>((numTokens + spec->tokens_per_cta - 1) / spec->tokens_per_cta), 1u,
-        1u);
+    config.gridDim =
+        dim3(static_cast<unsigned>((numTokens + spec->tokens_per_cta - 1) / spec->tokens_per_cta),
+             1u, 1u);
   }
   config.blockDim = dim3(spec->block[0], spec->block[1], spec->block[2]);
   config.dynamicSmemBytes = spec->dynamic_smem_bytes;
@@ -291,8 +287,8 @@ size_t Fc2Runner::getWorkspaceSizeInBytes(int32_t, int32_t, int32_t, int32_t, in
   return 0;
 }
 
-int32_t Fc2Runner::getDefaultValidConfigIndex(int32_t, int32_t hiddenSize,
-                                              int32_t intermediateSize, int32_t, int32_t) const {
+int32_t Fc2Runner::getDefaultValidConfigIndex(int32_t, int32_t hiddenSize, int32_t intermediateSize,
+                                              int32_t, int32_t) const {
   for (int32_t index : mKernels) {
     if (shapeSupported(index, hiddenSize, intermediateSize)) return index;
   }
@@ -324,8 +320,8 @@ generated::SfLayout Fc2Runner::sfLayoutA(int32_t configIndex) const {
 void Fc2Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
                     void* weightScale, void* perTokenScales, void* perChannelScales,
                     float* outputScalesScalar, float* ptrBias, void* output, void* outputScale,
-                    int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
-                    int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
+                    int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
+                    int32_t numTokens, int32_t* ptrNumNonExitingCtas,
                     int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                     int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device,
                     cudaStream_t stream, int32_t configIndex, bool enable_pdl,
@@ -495,8 +491,10 @@ void run(int32_t numExpanded, int32_t innerDim, __nv_bfloat16 const* input, floa
   }
   FLASHINFER_CHECK(spec != nullptr,
                    "No Cake StepFun requantization kernel writes block-scale layout ",
-                   static_cast<int>(layout), " (the layout the selected FC2 kernel reads) for the "
-                   "NVFP4 recipe with e4m3_max=", e4m3MaxInt);
+                   static_cast<int>(layout),
+                   " (the layout the selected FC2 kernel reads) for the "
+                   "NVFP4 recipe with e4m3_max=",
+                   e4m3MaxInt);
   FLASHINFER_CHECK(spec->rows_per_cta > 0, "Cake StepFun requantization kernel ", spec->symbol,
                    " declares no rows_per_cta");
   generated::RequantArgs args{};
@@ -524,7 +522,8 @@ void run(int32_t numExpanded, int32_t innerDim, __nv_bfloat16 const* input, floa
   config.numAttrs = enablePdl ? 1u : 0u;
   cudaError_t const launched = spec->submit(&config, args);
   FLASHINFER_CHECK(launched == cudaSuccess, "Cake StepFun requantization launch failed for ",
-                   spec->symbol, " num_expanded=", numExpanded, " : ", cudaGetErrorString(launched));
+                   spec->symbol, " num_expanded=", numExpanded, " : ",
+                   cudaGetErrorString(launched));
 }
 
 }  // namespace requant
@@ -537,8 +536,9 @@ namespace finalize {
 
 void run(moe::dev::finalize::Data const& data, cudaStream_t stream) {
   FLASHINFER_CHECK(!data.mUseDeepSeekFp8, "Cake StepFun finalize does not serve DeepSeek FP8");
-  FLASHINFER_CHECK(data.mDtypeElt == btg::Dtype::Bfloat16 && data.mDtypeExpW == btg::Dtype::Bfloat16,
-                   "Cake StepFun finalize reads bf16 FC2 output and bf16 expert weights");
+  FLASHINFER_CHECK(
+      data.mDtypeElt == btg::Dtype::Bfloat16 && data.mDtypeExpW == btg::Dtype::Bfloat16,
+      "Cake StepFun finalize reads bf16 FC2 output and bf16 expert weights");
   FLASHINFER_CHECK(data.inDqSfsPtr == nullptr && data.outDqSfsPtr == nullptr,
                    "Cake StepFun finalize consumes no dequantization scales");
   FLASHINFER_CHECK(data.expertWeightsPtr != nullptr,
@@ -562,11 +562,12 @@ void run(moe::dev::finalize::Data const& data, cudaStream_t stream) {
                    variant == generated::FinalizeVariant::kScalar ? "scalar" : "vector",
                    " (hidden_dim=", data.hiddenDim, ", num_tokens=", data.numTokens, ")");
   FLASHINFER_CHECK(spec->max_top_k <= 0 || data.topK <= spec->max_top_k,
-                   "Cake StepFun finalize kernel ", spec->symbol, " supports top_k <= ",
-                   spec->max_top_k, ", got ", data.topK);
+                   "Cake StepFun finalize kernel ", spec->symbol,
+                   " supports top_k <= ", spec->max_top_k, ", got ", data.topK);
   FLASHINFER_CHECK(variant == generated::FinalizeVariant::kScalar || data.hiddenDim % 8 == 0,
                    "Cake StepFun vector finalize needs an output row width that is a whole number "
-                   "of 16-byte chunks, got hidden_dim=", data.hiddenDim);
+                   "of 16-byte chunks, got hidden_dim=",
+                   data.hiddenDim);
 
   generated::FinalizeArgs args{};
   args.input = static_cast<__nv_bfloat16 const*>(data.inPtr);
@@ -584,10 +585,10 @@ void run(moe::dev::finalize::Data const& data, cudaStream_t stream) {
   configureSmem(*spec, configured, static_cast<size_t>(spec - generated::kFinalizeKernels),
                 "finalize");
   cudaLaunchConfig_t config{};
-  config.gridDim = variant == generated::FinalizeVariant::kScalar
-                       ? dim3(static_cast<unsigned>(numBlocksX), static_cast<unsigned>(numBlocksY),
-                              1u)
-                       : dim3(static_cast<unsigned>(data.numTokens), 1u, 1u);
+  config.gridDim =
+      variant == generated::FinalizeVariant::kScalar
+          ? dim3(static_cast<unsigned>(numBlocksX), static_cast<unsigned>(numBlocksY), 1u)
+          : dim3(static_cast<unsigned>(data.numTokens), 1u, 1u);
   config.blockDim = dim3(spec->block[0], spec->block[1], spec->block[2]);
   config.dynamicSmemBytes = spec->dynamic_smem_bytes;
   config.stream = stream;

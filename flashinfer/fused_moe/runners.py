@@ -6924,10 +6924,7 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} requires the per-expert gemm1_clamp_limit "
                 "produced by CakeStepFunConfig.prepare_weights in the 'cake_stepfun' view."
             )
-        if (
-            self.full_path
-            and act.routing_input_mode is not RoutingInputMode.FromLogits
-        ):
+        if self.full_path and act.routing_input_mode is not RoutingInputMode.FromLogits:
             raise NotImplementedError(
                 f"{type(self).__name__} on the full Cake path routes from logits "
                 "(RoutingInputMode.FromLogits) only, got "

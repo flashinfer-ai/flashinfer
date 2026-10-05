@@ -544,7 +544,9 @@ def _limits(mode: str, num_fused_shared_experts: int = 0) -> torch.Tensor:
     return torch.tensor(values, device="cuda", dtype=torch.float32)
 
 
-def _routing_logits(num_tokens: int, regime: str, seed: int = ROUTING_SEED) -> torch.Tensor:
+def _routing_logits(
+    num_tokens: int, regime: str, seed: int = ROUTING_SEED
+) -> torch.Tensor:
     """Routing logits of a load regime.
 
     ``uniform``: i.i.d. normal logits (balanced expert loads). ``ragged``: token ``t`` prefers
@@ -557,7 +559,9 @@ def _routing_logits(num_tokens: int, regime: str, seed: int = ROUTING_SEED) -> t
     if regime == "uniform":
         return base.to(torch.bfloat16)
     centers = (
-        torch.arange(num_tokens, device="cuda", dtype=torch.float32) * NUM_EXPERTS / num_tokens
+        torch.arange(num_tokens, device="cuda", dtype=torch.float32)
+        * NUM_EXPERTS
+        / num_tokens
     )
     centers = (centers * centers / NUM_EXPERTS).floor()
     experts = torch.arange(NUM_EXPERTS, device="cuda", dtype=torch.float32)
@@ -1134,7 +1138,9 @@ def test_module_build_matches_the_resolved_variant():
     assert bool(moe_op.cake_stepfun_full_path()) is runner.full_path
     stages = [str(stage) for stage in moe_op.cake_stepfun_stages()]
     expected = (
-        ["routing", "fc1", "requant", "fc2", "finalize"] if runner.full_path else ["fc1"]
+        ["routing", "fc1", "requant", "fc2", "finalize"]
+        if runner.full_path
+        else ["fc1"]
     )
     assert stages == expected
 
@@ -1144,7 +1150,9 @@ def test_module_build_matches_the_resolved_variant():
 # ---------------------------------------------------------------------------------------------
 
 
-def _full_path_case(cache_permute_indices, precision, num_tokens, limit_mode, regime, input_set):
+def _full_path_case(
+    cache_permute_indices, precision, num_tokens, limit_mode, regime, input_set
+):
     return _build_case(
         cache_permute_indices,
         precision=precision,
@@ -1189,7 +1197,9 @@ def test_full_path_matches_native_pipeline(
             output = _forward(cake, cake_packed, cake_kwargs, tactic)
             check_accuracy(case.reference, output.float(), **case.tolerances)
             candidates = native_outputs.get(tactic[0], [])
-            assert candidates, f"no native tactic of tile {tactic[0]} to compare against"
+            assert candidates, (
+                f"no native tactic of tile {tactic[0]} to compare against"
+            )
             if bitwise:
                 matches = [nt for nt, nout in candidates if torch.equal(output, nout)]
                 closest = min(
@@ -1239,9 +1249,7 @@ def _staged_routing(moe_op, case, tile: int, num_tokens: int, logits: torch.Tens
         True,
         None,
     )
-    tensors = [
-        t if isinstance(t, torch.Tensor) else torch.from_dlpack(t) for t in out
-    ]
+    tensors = [t if isinstance(t, torch.Tensor) else torch.from_dlpack(t) for t in out]
     torch.cuda.synchronize()
     (
         expert_weights,
@@ -1288,23 +1296,41 @@ def _assert_routing_tables_match(ours, theirs, num_tokens: int, context: str) ->
         ours["expanded_idx_to_permuted_idx"],
         theirs["expanded_idx_to_permuted_idx"],
     )
-    p2t_ours, p2t_theirs = ours["permuted_idx_to_token_idx"], theirs["permuted_idx_to_token_idx"]
+    p2t_ours, p2t_theirs = (
+        ours["permuted_idx_to_token_idx"],
+        theirs["permuted_idx_to_token_idx"],
+    )
     if num_tokens <= 16:
-        assert torch.equal(e2p_ours, e2p_theirs), f"{context}: expanded_idx_to_permuted_idx differs"
-        assert torch.equal(p2t_ours, p2t_theirs), f"{context}: permuted_idx_to_token_idx differs"
+        assert torch.equal(e2p_ours, e2p_theirs), (
+            f"{context}: expanded_idx_to_permuted_idx differs"
+        )
+        assert torch.equal(p2t_ours, p2t_theirs), (
+            f"{context}: permuted_idx_to_token_idx differs"
+        )
         return
-    assert torch.equal(e2p_ours < 0, e2p_theirs < 0), f"{context}: locality mask differs"
+    assert torch.equal(e2p_ours < 0, e2p_theirs < 0), (
+        f"{context}: locality mask differs"
+    )
     assert torch.equal(p2t_ours < 0, p2t_theirs < 0), f"{context}: padding mask differs"
     tile = ours["tile"]
-    for label, e2p, p2t in (("ours", e2p_ours, p2t_ours), ("native", e2p_theirs, p2t_theirs)):
+    for label, e2p, p2t in (
+        ("ours", e2p_ours, p2t_ours),
+        ("native", e2p_theirs, p2t_theirs),
+    ):
         valid = (e2p >= 0).nonzero().flatten()
         slots = e2p[valid].long()
         assert torch.equal(p2t[slots], (valid // TOP_K).to(p2t.dtype)), (
             f"{context}: {label} permutation maps are inconsistent"
         )
-        assert slots.unique().numel() == slots.numel(), f"{context}: {label} slots collide"
-    experts_ours = ours["cta_idx_xy_to_batch_idx"][e2p_ours[e2p_ours >= 0].long() // tile]
-    experts_theirs = theirs["cta_idx_xy_to_batch_idx"][e2p_theirs[e2p_theirs >= 0].long() // tile]
+        assert slots.unique().numel() == slots.numel(), (
+            f"{context}: {label} slots collide"
+        )
+    experts_ours = ours["cta_idx_xy_to_batch_idx"][
+        e2p_ours[e2p_ours >= 0].long() // tile
+    ]
+    experts_theirs = theirs["cta_idx_xy_to_batch_idx"][
+        e2p_theirs[e2p_theirs >= 0].long() // tile
+    ]
     assert torch.equal(experts_ours, experts_theirs), (
         f"{context}: (token, k) -> expert assignment differs"
     )
@@ -1312,7 +1338,9 @@ def _assert_routing_tables_match(ours, theirs, num_tokens: int, context: str) ->
 
 @pytest.mark.parametrize("regime", ROUTING_REGIMES)
 @pytest.mark.parametrize("num_tokens", TOKENS)
-def test_full_path_routing_tables_match_native(num_tokens, regime, cache_permute_indices):
+def test_full_path_routing_tables_match_native(
+    num_tokens, regime, cache_permute_indices
+):
     """The Cake router writes the trtllm-gen routing tables byte for byte (every exported tile)."""
     from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
 
@@ -1320,7 +1348,11 @@ def test_full_path_routing_tables_match_native(num_tokens, regime, cache_permute
     limits = torch.full((NUM_EXPERTS,), 7.0, device="cuda", dtype=torch.float32)
     logits = _routing_logits(num_tokens, regime)
     case = _build_case(
-        cache_permute_indices, precision="bf16", num_tokens=num_tokens, limits=limits, logits=logits
+        cache_permute_indices,
+        precision="bf16",
+        num_tokens=num_tokens,
+        limits=limits,
+        logits=logits,
     )
     _, cake, _, _, _ = _cake_runner(case, device)
     native_op = get_trtllm_moe_sm100_module().moe_op
@@ -1328,7 +1360,9 @@ def test_full_path_routing_tables_match_native(num_tokens, regime, cache_permute
     for tile in tiles:
         ours = _staged_routing(cake._module.moe_op, case, tile, num_tokens, logits)
         theirs = _staged_routing(native_op, case, tile, num_tokens, logits)
-        _assert_routing_tables_match(ours, theirs, num_tokens, f"T={num_tokens} {regime} tile {tile}")
+        _assert_routing_tables_match(
+            ours, theirs, num_tokens, f"T={num_tokens} {regime} tile {tile}"
+        )
 
 
 @pytest.mark.parametrize("num_tokens", [8, 512])
@@ -1396,7 +1430,11 @@ def test_full_path_finalize_matches_native_kernel(num_tokens, cache_permute_indi
     limits = torch.full((NUM_EXPERTS,), 7.0, device="cuda", dtype=torch.float32)
     logits = _routing_logits(num_tokens, "ragged")
     case = _build_case(
-        cache_permute_indices, precision="bf16", num_tokens=num_tokens, limits=limits, logits=logits
+        cache_permute_indices,
+        precision="bf16",
+        num_tokens=num_tokens,
+        limits=limits,
+        logits=logits,
     )
     _, cake, _, _, _ = _cake_runner(case, device)
     native_op = get_trtllm_moe_sm100_module().moe_op
@@ -1412,7 +1450,9 @@ def test_full_path_finalize_matches_native_kernel(num_tokens, cache_permute_indi
     gemm2_output = torch.randn(
         max_padded, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
     )
-    ours = torch.full((num_tokens, HIDDEN_SIZE), float("nan"), device=device, dtype=torch.bfloat16)
+    ours = torch.full(
+        (num_tokens, HIDDEN_SIZE), float("nan"), device=device, dtype=torch.bfloat16
+    )
     theirs = ours.clone()
     cake._module.moe_op.cake_stepfun_finalize(
         gemm2_output,
@@ -1458,7 +1498,11 @@ def test_full_path_requant_matches_native_kernel(num_tokens, cache_permute_indic
     limits = torch.full((NUM_EXPERTS,), 7.0, device="cuda", dtype=torch.float32)
     logits = _routing_logits(num_tokens, "ragged")
     case = _build_case(
-        cache_permute_indices, precision="bf16", num_tokens=num_tokens, limits=limits, logits=logits
+        cache_permute_indices,
+        precision="bf16",
+        num_tokens=num_tokens,
+        limits=limits,
+        logits=logits,
     )
     _, cake, _, _, _ = _cake_runner(case, device)
     moe_op = cake._module.moe_op
@@ -1471,7 +1515,9 @@ def test_full_path_requant_matches_native_kernel(num_tokens, cache_permute_indic
     }
     checked = 0
     for tile in sorted(int(t) for t in moe_op.cake_stepfun_fc2_tiles("nvfp4_bf16tok")):
-        layout = str(moe_op.cake_stepfun_fc2_activation_sf_layout("nvfp4_bf16tok", tile))
+        layout = str(
+            moe_op.cake_stepfun_fc2_activation_sf_layout("nvfp4_bf16tok", tile)
+        )
         tables = _staged_routing(native_op, case, tile, num_tokens, logits)
         expanded = tables["expanded_idx_to_permuted_idx"]
         max_padded = int(tables["total_num_padded_tokens"].item())
@@ -1491,11 +1537,15 @@ def test_full_path_requant_matches_native_kernel(num_tokens, cache_permute_indic
         )
         torch.cuda.synchronize()
         valid = expanded[expanded >= 0].long()
-        assert torch.equal(out[valid], ref_out[valid]), f"tile {tile} {layout}: fp4 rows differ"
+        assert torch.equal(out[valid], ref_out[valid]), (
+            f"tile {tile} {layout}: fp4 rows differ"
+        )
         assert torch.equal(token_scale[valid], ref_token[valid]), (
             f"tile {tile} {layout}: per-token scales differ"
         )
-        assert torch.equal(out_scale, ref_scale), f"tile {tile} {layout}: block scales differ"
+        assert torch.equal(out_scale, ref_scale), (
+            f"tile {tile} {layout}: block scales differ"
+        )
         checked += 1
     assert checked
 

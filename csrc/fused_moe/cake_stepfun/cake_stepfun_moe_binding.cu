@@ -336,7 +336,8 @@ Array<int64_t> cake_stepfun_fc2_tiles(String const& family) {
   return tiles;
 }
 
-/** Block-scale layout the Cake FC2 kernel of ``family`` / ``tile_tokens_dim`` reads for its activations. */
+/** Block-scale layout the Cake FC2 kernel of ``family`` / ``tile_tokens_dim`` reads for its
+ * activations. */
 String cake_stepfun_fc2_activation_sf_layout(String const& family, int64_t tile_tokens_dim) {
   FamilySpec const& spec = familySpec(family);
   for (size_t index = 0; index < generated::kFc2KernelCount; ++index) {
@@ -370,8 +371,7 @@ void cake_stepfun_fc2(String const& family, TensorView const& gemm2_input,
                       TensorView const& cta_idx_xy_to_mn_limit,
                       TensorView const& num_non_exiting_ctas,
                       TensorView const& total_num_padded_tokens, TensorView const& gemm2_output,
-                      int64_t num_tokens, int64_t top_k, int64_t tile_tokens_dim,
-                      bool enable_pdl) {
+                      int64_t num_tokens, int64_t top_k, int64_t tile_tokens_dim, bool enable_pdl) {
   FamilySpec const& spec = familySpec(family);
   DLDevice const device = gemm2_input.device();
   TVM_FFI_ICHECK(device.device_type == kDLCUDA)
@@ -389,8 +389,8 @@ void cake_stepfun_fc2(String const& family, TensorView const& gemm2_input,
     checkDtype(*array, "routing arrays", dl_int32);
   }
   if (gemm2_input_scale.has_value()) {
-    checkTensor(gemm2_input_scale.value(), "gemm2_input_scale",
-                gemm2_input_scale.value().ndim(), device);
+    checkTensor(gemm2_input_scale.value(), "gemm2_input_scale", gemm2_input_scale.value().ndim(),
+                device);
   }
   if (gemm2_weights_scale.has_value()) {
     checkTensor(gemm2_weights_scale.value(), "gemm2_weights_scale",
@@ -427,8 +427,7 @@ void cake_stepfun_fc2(String const& family, TensorView const& gemm2_input,
   }
 
   tgm::cake_stepfun::Fc2Runner runner(spec.dtypeAct, spec.dtypeWeights, btg::Dtype::Bfloat16,
-                                      /*useDeepSeekFp8=*/false,
-                                      static_cast<int>(tile_tokens_dim),
+                                      /*useDeepSeekFp8=*/false, static_cast<int>(tile_tokens_dim),
                                       /*useShuffledMatrix=*/true, spec.weightLayout,
                                       /*usePerTokenScaling=*/spec.perToken,
                                       /*usePerChannelScaling=*/false);

@@ -220,9 +220,7 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
         declared[stage] = mapping or {}
 
     stages: dict[CakeStepFunTarget, set[str]] = {t: set() for t in _TARGET_FLAGS}
-    device_sources: dict[CakeStepFunTarget, list[Path]] = {
-        t: [] for t in _TARGET_FLAGS
-    }
+    device_sources: dict[CakeStepFunTarget, list[Path]] = {t: [] for t in _TARGET_FLAGS}
     compile_flags: dict[CakeStepFunTarget, dict[Path, list[str]]] = {
         t: {} for t in _TARGET_FLAGS
     }
@@ -266,7 +264,7 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
             raise ValueError(
                 f"Cake StepFun inventory has no fc1 kernels for target {target}"
             )
-        for stage, key in _TILED_STAGES.items():
+        for stage in _TILED_STAGES:
             if stage not in stages[target]:
                 continue
             for family, spec in declared[stage].items():
