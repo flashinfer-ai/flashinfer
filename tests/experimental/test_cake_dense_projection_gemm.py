@@ -514,6 +514,11 @@ def _expected(table, key, T, sm_count):
 ARCH_OF_SM = {148: "sm_100a", 212: "sm_107a"}
 
 
+def _transposed_template(template: str) -> bool:
+    """``_t`` (transposed register epilogue) or ``_t_tma1`` / ``_t_tma2`` (round-14 transposed TMA-store epilogue)."""
+    return template.endswith("_t") or template.endswith(("_t_tma1", "_t_tma2"))
+
+
 def _rule_of(plan, sm_count):
     """The measured per-row rule the planner applied to ``plan`` (empty when the row has none or the
     registry fallback dropped it)."""
@@ -1801,8 +1806,9 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
                 (row, op, T, sm_count),
                 ARCH_OF_SM[sm_count],
             )
-            # the swapped plans (weight gradients; the tiny-T forward / input gradient) store transposed
-            assert plan.transposed_out == plan.template.endswith("_t")
+            # the swapped plans (weight gradients; the tiny-T forward / input gradient) store transposed: the register
+            # epilogue's ``_t`` templates or, since round 14, the transposed TMA-store epilogue's ``_t_tma<slots>`` ones
+            assert plan.transposed_out == _transposed_template(plan.template)
             rule = _rule_of(plan, sm_count)
             mirrored = not plan.knob_fallback
             assert not mirrored or plan.hints == tuple(
