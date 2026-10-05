@@ -17,6 +17,8 @@ limitations under the License.
 import functools
 import hashlib
 import json
+import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -25,22 +27,54 @@ from .core import JitSpec, gen_jit_spec, logger, sm100a_nvcc_flags, sm103a_nvcc_
 from .fused_moe import trtllm_gen_fused_moe_build_inputs
 
 CakeStepFunTarget = Literal["sm_100a", "sm_103a"]
+CakeStepFunStage = Literal["routing", "fc1", "requant", "fc2", "finalize"]
+
+#: Pipeline stages of the fused-MoE forward, in execution order. ``fc1`` is mandatory
+#: (it is the module's reason to exist); the other four form the full Cake path.
+CAKE_STEPFUN_STAGES: tuple[CakeStepFunStage, ...] = (
+    "routing",
+    "fc1",
+    "requant",
+    "fc2",
+    "finalize",
+)
+#: Environment switch of the full path: ``auto`` (default: full path when the
+#: inventory covers every stage for the target), ``1`` (require it) or ``0``
+#: (FC1-only module over the trtllm-gen routing, GEMM2 and finalize kernels).
+CAKE_STEPFUN_FULL_PATH_ENV = "FLASHINFER_CAKE_STEPFUN_FULL_PATH"
 
 _TARGET_FLAGS: dict[CakeStepFunTarget, list[str]] = {
     "sm_100a": sm100a_nvcc_flags,
     "sm_103a": sm103a_nvcc_flags,
 }
 _TARGET_MINOR: dict[CakeStepFunTarget, int] = {"sm_100a": 0, "sm_103a": 3}
-_MODULE_URI: dict[CakeStepFunTarget, str] = {
-    "sm_100a": "fused_moe_cake_stepfun_sm100",
-    "sm_103a": "fused_moe_cake_stepfun_sm103",
+_MODULE_URI: dict[tuple[CakeStepFunTarget, bool], str] = {
+    ("sm_100a", False): "fused_moe_cake_stepfun_sm100",
+    ("sm_103a", False): "fused_moe_cake_stepfun_sm103",
+    ("sm_100a", True): "fused_moe_cake_stepfun_full_sm100",
+    ("sm_103a", True): "fused_moe_cake_stepfun_full_sm103",
 }
 _INVENTORY = "cake_stepfun_inventory.json"
-_INVENTORY_SCHEMA = "flashinfer.cake_stepfun.inventory.v2"
+_INVENTORY_SCHEMA = "flashinfer.cake_stepfun.inventory.v3"
 _MANIFEST = "cake_stepfun_generated_manifest.cuh"
-_RUNNER_SOURCE = "cake_stepfun_fc1_runner.cu"
-_RUNNER_HEADER = "cake_stepfun_fc1_runner.cuh"
+_FC1_SOURCE = "cake_stepfun_fc1_runner.cu"
+_FC1_HEADER = "cake_stepfun_fc1_runner.cuh"
+_TAIL_HEADER = "cake_stepfun_routing_tail.cuh"
+_STAGES_SOURCE = "cake_stepfun_stages.cu"
+_STAGES_HEADER = "cake_stepfun_stages.cuh"
+_ABI_HEADER = "cake_stepfun_abi.cuh"
 _BINDING_SOURCE = "cake_stepfun_moe_binding.cu"
+# Generated-manifest kernel table every stage must define when the inventory lists it.
+_STAGE_TABLE: dict[str, str] = {
+    "routing": "kRoutingKernels",
+    "fc1": "kFc1Kernels",
+    "requant": "kRequantKernels",
+    "fc2": "kFc2Kernels",
+    "finalize": "kFinalizeKernels",
+}
+# Stages whose records are (family, tile) pairs declared in a families mapping.
+_TILED_STAGES: dict[str, str] = {"fc1": "families", "fc2": "fc2_families"}
+_HASHED_KEYS = ("kernels", "families", "fc2_families", "files")
 
 
 def _get_cake_stepfun_csrc_dir() -> Path:
@@ -60,16 +94,82 @@ def _get_cake_stepfun_csrc_dir() -> Path:
     )
 
 
-def _load_inventory(
-    csrc_dir: Path, target: CakeStepFunTarget
-) -> tuple[list[Path], dict[Path, list[str]]]:
-    """Validate the generated inventory and return the exact-architecture device units."""
+@dataclass(frozen=True)
+class CakeStepFunInventory:
+    """Validated view of the generated inventory (all targets)."""
+
+    path: Path
+    repo_root: Path
+    manifest: Path
+    #: Per target: the stages that have at least one exported kernel.
+    stages: dict[CakeStepFunTarget, frozenset[str]]
+    #: Per target: device translation units and their extra compile flags.
+    device_sources: dict[CakeStepFunTarget, list[Path]]
+    compile_flags: dict[CakeStepFunTarget, dict[Path, list[str]]]
+
+    def missing_stages(self, target: CakeStepFunTarget) -> tuple[str, ...]:
+        present = self.stages.get(target, frozenset())
+        return tuple(stage for stage in CAKE_STEPFUN_STAGES if stage not in present)
+
+
+def _validate_tiled_record(
+    kernel: dict, index: int, stage: str, declared: dict, seen: set
+) -> None:
+    family = kernel.get("family")
+    tile = kernel.get("tile_n")
+    if (
+        family not in declared
+        or not isinstance(tile, int)
+        or tile not in declared[family].get("tiles", ())
+    ):
+        raise ValueError(
+            f"Cake StepFun inventory kernels[{index}] ({stage}) family or tile is "
+            f"not declared in {_TILED_STAGES[stage]}"
+        )
+    key = (kernel["arch"], stage, family, tile)
+    if key in seen:
+        raise ValueError(
+            f"Cake StepFun inventory kernels[{index}] duplicates ({stage}, {family}, "
+            f"tile {tile}) for {kernel['arch']}"
+        )
+    seen.add(key)
+
+
+def _validate_variant_record(kernel: dict, index: int, stage: str, seen: set) -> None:
+    variant = kernel.get("variant")
+    if not isinstance(variant, str) or not variant:
+        raise ValueError(
+            f"Cake StepFun inventory kernels[{index}] ({stage}) needs a non-empty variant"
+        )
+    key = (kernel["arch"], stage, variant)
+    if key in seen:
+        raise ValueError(
+            f"Cake StepFun inventory kernels[{index}] duplicates ({stage}, {variant}) "
+            f"for {kernel['arch']}"
+        )
+    seen.add(key)
+
+
+@functools.cache
+def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInventory:
+    """Read and validate the generated inventory.
+
+    The inventory (schema ``flashinfer.cake_stepfun.inventory.v3``) lists every
+    exported device translation unit with its ``stage`` (one of
+    :data:`CAKE_STEPFUN_STAGES`), ``arch``, ``device`` path, ``compile_flags`` and
+    launch metadata. ``fc1`` / ``fc2`` records are ``(family, tile_n)`` pairs declared
+    in ``families`` / ``fc2_families``; ``routing``, ``requant`` and ``finalize``
+    records carry a unique ``variant``. ``program_hash`` seals ``kernels``,
+    ``families``, ``fc2_families`` and the per-file ``files`` digests, and the
+    generated manifest header must define the kernel table of every listed stage.
+    """
+    csrc_dir = _get_cake_stepfun_csrc_dir() if csrc_dir is None else csrc_dir
     generated_dir = csrc_dir / "generated"
     inventory_path = generated_dir / _INVENTORY
     if not inventory_path.is_file():
         raise FileNotFoundError(
             f"Cake StepFun generated inventory was not found at {inventory_path}; "
-            "install the generated StepFun FC1 kernel inventory"
+            "install the generated StepFun kernel inventory"
         )
     try:
         inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
@@ -88,11 +188,7 @@ def _load_inventory(
         or not files
     ):
         raise ValueError("Cake StepFun inventory kernels and files must be non-empty")
-    program = {
-        key: inventory[key]
-        for key in ("kernels", "families", "files")
-        if key in inventory
-    }
+    program = {key: inventory[key] for key in _HASHED_KEYS if key in inventory}
     program_bytes = (
         json.dumps(program, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
@@ -112,94 +208,197 @@ def _load_inventory(
         raise ValueError(
             "Cake StepFun inventory must list the generated manifest header"
         )
-    families = inventory.get("families")
-    if not isinstance(families, dict) or not families:
-        raise ValueError("Cake StepFun inventory families must be a non-empty mapping")
-    device_sources: list[Path] = []
-    compile_flags: dict[Path, list[str]] = {}
-    seen: set[tuple[str, int]] = set()
+    declared: dict[str, dict] = {}
+    for stage, key in _TILED_STAGES.items():
+        mapping = inventory.get(key)
+        if stage == "fc1" and (not isinstance(mapping, dict) or not mapping):
+            raise ValueError(
+                "Cake StepFun inventory families must be a non-empty mapping"
+            )
+        if mapping is not None and not isinstance(mapping, dict):
+            raise ValueError(f"Cake StepFun inventory {key} must be a mapping")
+        declared[stage] = mapping or {}
+
+    stages: dict[CakeStepFunTarget, set[str]] = {t: set() for t in _TARGET_FLAGS}
+    device_sources: dict[CakeStepFunTarget, list[Path]] = {
+        t: [] for t in _TARGET_FLAGS
+    }
+    compile_flags: dict[CakeStepFunTarget, dict[Path, list[str]]] = {
+        t: {} for t in _TARGET_FLAGS
+    }
+    seen: set = set()
     for index, kernel in enumerate(kernels):
         if not isinstance(kernel, dict) or kernel.get("arch") not in _TARGET_FLAGS:
             raise ValueError(f"Cake StepFun inventory kernels[{index}] is invalid")
+        stage = kernel.get("stage")
+        if stage not in CAKE_STEPFUN_STAGES:
+            raise ValueError(
+                f"Cake StepFun inventory kernels[{index}] stage must be one of "
+                f"{CAKE_STEPFUN_STAGES}, got {stage!r}"
+            )
         device = kernel.get("device")
         flags = kernel.get("compile_flags")
+        symbol = kernel.get("kernel_symbol")
         if (
             device not in files
             or not isinstance(flags, list)
             or not all(isinstance(f, str) and f for f in flags)
+            or not isinstance(symbol, str)
+            or not symbol
         ):
             raise ValueError(
-                f"Cake StepFun inventory kernels[{index}] device or compile_flags are invalid"
+                f"Cake StepFun inventory kernels[{index}] device, compile_flags or "
+                "kernel_symbol are invalid"
             )
-        if kernel["arch"] != target:
-            continue
-        family = kernel.get("family")
-        tile = kernel.get("tile_n")
-        if (
-            family not in families
-            or not isinstance(tile, int)
-            or tile not in families[family].get("tiles", ())
-        ):
-            raise ValueError(
-                f"Cake StepFun inventory kernels[{index}] family or tile is invalid"
-            )
-        if (family, tile) in seen:
-            raise ValueError(
-                f"Cake StepFun inventory kernels[{index}] duplicates ({family}, tile {tile})"
-            )
-        seen.add((family, tile))
+        if stage in _TILED_STAGES:
+            _validate_tiled_record(kernel, index, stage, declared[stage], seen)
+        else:
+            _validate_variant_record(kernel, index, stage, seen)
+        target: CakeStepFunTarget = kernel["arch"]
+        stages[target].add(stage)
         source = (repo_root / device).resolve()
-        device_sources.append(source)
-        compile_flags[source] = list(flags)
-    for family, spec in families.items():
-        missing = sorted(
-            set(spec.get("tiles", ())) - {tile for fam, tile in seen if fam == family}
-        )
-        if missing:
+        device_sources[target].append(source)
+        compile_flags[target][source] = list(flags)
+    for target in _TARGET_FLAGS:
+        if not device_sources[target]:
+            continue
+        if "fc1" not in stages[target]:
             raise ValueError(
-                f"Cake StepFun inventory lacks {family} tiles {missing} for target {target}"
+                f"Cake StepFun inventory has no fc1 kernels for target {target}"
             )
-    if not device_sources:
-        raise ValueError(f"Cake StepFun inventory has no kernels for target {target}")
-    return device_sources, compile_flags
+        for stage, key in _TILED_STAGES.items():
+            if stage not in stages[target]:
+                continue
+            for family, spec in declared[stage].items():
+                missing = sorted(
+                    tile
+                    for tile in spec.get("tiles", ())
+                    if (target, stage, family, tile) not in seen
+                )
+                if missing:
+                    raise ValueError(
+                        f"Cake StepFun inventory lacks {stage} {family} tiles {missing} "
+                        f"for target {target}"
+                    )
+    manifest = (repo_root / manifest_relative).resolve()
+    manifest_text = manifest.read_text(encoding="utf-8")
+    for stage in CAKE_STEPFUN_STAGES:
+        if any(stage in present for present in stages.values()):
+            table = _STAGE_TABLE[stage]
+            if table not in manifest_text:
+                raise ValueError(
+                    f"Cake StepFun inventory lists {stage} kernels but the generated "
+                    f"manifest {manifest_relative} defines no {table} table"
+                )
+    return CakeStepFunInventory(
+        path=inventory_path,
+        repo_root=repo_root,
+        manifest=manifest,
+        stages={t: frozenset(s) for t, s in stages.items()},
+        device_sources=device_sources,
+        compile_flags=compile_flags,
+    )
 
 
-def get_cake_stepfun_fused_moe_uri(target: CakeStepFunTarget) -> str:
-    """Return the exact-architecture Cake StepFun fused-MoE JIT module key."""
+def _require_target(target: CakeStepFunTarget) -> None:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake StepFun target: {target}")
-    return _MODULE_URI[target]
+
+
+def cake_stepfun_stages(target: CakeStepFunTarget) -> frozenset[str]:
+    """Return the pipeline stages with an exported Cake kernel for ``target``."""
+    _require_target(target)
+    return load_cake_stepfun_inventory().stages[target]
+
+
+def cake_stepfun_missing_stages(target: CakeStepFunTarget) -> tuple[str, ...]:
+    """Return the stages (in pipeline order) the inventory does not cover for ``target``."""
+    _require_target(target)
+    return load_cake_stepfun_inventory().missing_stages(target)
+
+
+def resolve_cake_stepfun_full_path(
+    target: CakeStepFunTarget, full_path: bool | None = None
+) -> bool:
+    """Decide whether the module for ``target`` runs the full Cake path.
+
+    ``full_path=None`` consults :data:`CAKE_STEPFUN_FULL_PATH_ENV` (``auto`` by
+    default: full path exactly when the inventory covers every stage). Requesting
+    the full path (``True`` or ``1``) with a stage missing raises ``ValueError``
+    naming the missing stages; ``False`` / ``0`` selects the FC1-only module.
+    """
+    _require_target(target)
+    if full_path is None:
+        setting = os.environ.get(CAKE_STEPFUN_FULL_PATH_ENV, "auto").strip().lower()
+        if setting in ("", "auto"):
+            full_path = None
+        elif setting in ("1", "true", "on"):
+            full_path = True
+        elif setting in ("0", "false", "off"):
+            full_path = False
+        else:
+            raise ValueError(
+                f"{CAKE_STEPFUN_FULL_PATH_ENV} must be auto, 0 or 1, got {setting!r}"
+            )
+    missing = cake_stepfun_missing_stages(target)
+    if full_path is None:
+        return not missing
+    if full_path and missing:
+        raise ValueError(
+            "Cake StepFun full path requested but the generated inventory has no "
+            f"{', '.join(missing)} kernel(s) for {target}; export the missing stage(s) "
+            f"or select the FC1-only module ({CAKE_STEPFUN_FULL_PATH_ENV}=0)"
+        )
+    return bool(full_path)
+
+
+def get_cake_stepfun_fused_moe_uri(
+    target: CakeStepFunTarget, full_path: bool = False
+) -> str:
+    """Return the exact-architecture Cake StepFun fused-MoE JIT module key."""
+    _require_target(target)
+    return _MODULE_URI[(target, bool(full_path))]
 
 
 @functools.cache
-def gen_cake_stepfun_fused_moe_module(target: CakeStepFunTarget) -> JitSpec:
-    """Generate the exact-architecture Cake StepFun fused-MoE module.
-
-    The module is the trtllm-gen fused-MoE host pipeline (routing, GEMM2, finalize
-    and the batched-GEMM runner over the published cubins) compiled with
-    ``-DCAKE_STEPFUN_FC1``, which replaces the GEMM1 stage by the exported Cake
-    StepFun FC1 kernels of ``csrc/fused_moe/cake_stepfun/``. It exports the same
-    TVM-FFI operations as ``fused_moe_trtllm_sm100`` under its own module name plus
-    the standalone FC1 entry points ``cake_stepfun_fc1_families``,
-    ``cake_stepfun_fc1_tiles`` and ``cake_stepfun_fc1``.
-    """
-    uri = get_cake_stepfun_fused_moe_uri(target)
+def _gen_module(target: CakeStepFunTarget, full_path: bool) -> JitSpec:
+    uri = get_cake_stepfun_fused_moe_uri(target, full_path)
     csrc_dir = _get_cake_stepfun_csrc_dir()
-    device_sources, device_flags = _load_inventory(csrc_dir, target)
-    for source in (
-        csrc_dir / _RUNNER_SOURCE,
-        csrc_dir / _RUNNER_HEADER,
+    inventory = load_cake_stepfun_inventory(csrc_dir)
+    device_sources = inventory.device_sources[target]
+    device_flags = inventory.compile_flags[target]
+    if not device_sources:
+        raise ValueError(f"Cake StepFun inventory has no kernels for target {target}")
+    required = [
+        csrc_dir / _FC1_SOURCE,
+        csrc_dir / _FC1_HEADER,
+        csrc_dir / _TAIL_HEADER,
         csrc_dir / _BINDING_SOURCE,
         csrc_dir / "generated" / _MANIFEST,
-    ):
+    ]
+    host_sources = [csrc_dir / _FC1_SOURCE, csrc_dir / _BINDING_SOURCE]
+    if full_path:
+        missing = inventory.missing_stages(target)
+        if missing:
+            raise ValueError(
+                f"Cake StepFun full path for {target} lacks stage(s): {', '.join(missing)}"
+            )
+        required += [
+            csrc_dir / _STAGES_SOURCE,
+            csrc_dir / _STAGES_HEADER,
+            csrc_dir / _ABI_HEADER,
+        ]
+        host_sources.append(csrc_dir / _STAGES_SOURCE)
+    for source in required:
         if not source.is_file():
             raise FileNotFoundError(f"Cake StepFun source not found: {source}")
     target_flags = [
         *_TARGET_FLAGS[target],
         "-DCAKE_STEPFUN_FC1",
+        *(["-DCAKE_STEPFUN_FULL"] if full_path else []),
         f"-DFLASHINFER_CAKE_STEPFUN_TARGET_MINOR={_TARGET_MINOR[target]}",
-        # This module defines the trtllm-gen fused-MoE host symbols with a GEMM1
-        # runner of a different layout than the public module. Hide every host
+        # This module defines the trtllm-gen fused-MoE host symbols with stage
+        # runners of a different layout than the public module. Hide every host
         # symbol so the two libraries never bind to each other's definitions
         # (the TVM-FFI entry points and the cubin-loader hooks declare default
         # visibility explicitly).
@@ -211,24 +410,52 @@ def gen_cake_stepfun_fused_moe_module(target: CakeStepFunTarget) -> JitSpec:
     )
     spec = gen_jit_spec(
         uri,
-        [
-            *sources,
-            csrc_dir / _RUNNER_SOURCE,
-            csrc_dir / _BINDING_SOURCE,
-            *device_sources,
-        ],
+        [*sources, *host_sources, *device_sources],
         extra_cuda_cflags=cflags,
         extra_cuda_cflags_by_source={
             source: [*target_flags, *flags] for source, flags in device_flags.items()
         },
         extra_include_paths=[*include_paths, csrc_dir],
     )
-    logger.info(f"Generated Cake StepFun fused-MoE {target} JIT spec: {spec.name}")
+    logger.info(
+        f"Generated Cake StepFun fused-MoE {target} JIT spec: {spec.name} "
+        f"(stages: {', '.join(s for s in CAKE_STEPFUN_STAGES if s in inventory.stages[target])}; "
+        f"full path: {full_path})"
+    )
     return spec
 
 
+def gen_cake_stepfun_fused_moe_module(
+    target: CakeStepFunTarget, full_path: bool | None = None
+) -> JitSpec:
+    """Generate the exact-architecture Cake StepFun fused-MoE module.
+
+    The module is the trtllm-gen fused-MoE host pipeline compiled with
+    ``-DCAKE_STEPFUN_FC1``, which replaces the GEMM1 stage by the exported Cake
+    StepFun FC1 kernels of ``csrc/fused_moe/cake_stepfun/``. When the generated
+    inventory covers every stage of :data:`CAKE_STEPFUN_STAGES` for ``target`` (or
+    ``full_path`` requests it, see :func:`resolve_cake_stepfun_full_path`), the
+    module is also compiled with ``-DCAKE_STEPFUN_FULL`` and the routing, GEMM2,
+    NVFP4 per-token requantization and finalize stages run exported Cake kernels
+    as well. Both variants export the TVM-FFI operations of
+    ``fused_moe_trtllm_sm100`` under their own module names plus the standalone
+    Cake entry points (``cake_stepfun_fc1_families``, ``cake_stepfun_fc1_tiles``,
+    ``cake_stepfun_fc1``, ``cake_stepfun_stages``, ``cake_stepfun_full_path`` and,
+    on the full path, the per-stage operations).
+    """
+    return _gen_module(target, resolve_cake_stepfun_full_path(target, full_path))
+
+
 __all__ = [
+    "CAKE_STEPFUN_FULL_PATH_ENV",
+    "CAKE_STEPFUN_STAGES",
+    "CakeStepFunInventory",
+    "CakeStepFunStage",
     "CakeStepFunTarget",
+    "cake_stepfun_missing_stages",
+    "cake_stepfun_stages",
     "gen_cake_stepfun_fused_moe_module",
     "get_cake_stepfun_fused_moe_uri",
+    "load_cake_stepfun_inventory",
+    "resolve_cake_stepfun_full_path",
 ]

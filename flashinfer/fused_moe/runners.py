@@ -6799,11 +6799,14 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
     configured quantization: :class:`CakeStepFunNvfp4Runner` (NVFP4, also with
     ``per_token_scale``), :class:`CakeStepFunBf16Runner`,
     :class:`CakeStepFunFp8PerTensorRunner` and :class:`CakeStepFunMxfp8Runner`.
-    Each mirrors the corresponding ``Trtllm*Runner`` (input packing, routing,
-    GEMM2, finalize) but loads the exact-architecture ``fused_moe_cake_stepfun_*``
+    Each mirrors the corresponding ``Trtllm*Runner`` (input packing, launch
+    contract) but loads the exact-architecture ``fused_moe_cake_stepfun_*``
     module whose GEMM1 stage launches the exported Cake StepFun kernels for the
-    tile sizes they cover. A tactic is the FC1 tile (``tile_N``) x the GEMM
-    configuration index.
+    tile sizes they cover; on the full Cake path (``fused_moe_cake_stepfun_full_*``,
+    see :attr:`full_path`) routing, GEMM2, the NVFP4 per-token requantization and
+    finalize are Cake kernels too. A tactic is the FC1 tile (``tile_N``) x the
+    GEMM configuration index; tiles without an exported kernel have no tactic
+    and ``tactic=-1`` resolves to :meth:`default_tactic`.
 
     The weight view must come from :meth:`CakeStepFunConfig.prepare_weights`:
     the Cake kernels read the per-expert ``gemm1_clamp_limit`` and have no
@@ -6851,8 +6854,35 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
             return any(r.supports_quant(quant) for r in _CAKE_STEPFUN_RUNNERS)
         return super().supports_quant(quant)
 
+    @property
+    def target(self) -> str:
+        """Exact JIT target of this runner's device (``sm_100a`` or ``sm_103a``)."""
+        from ..utils import get_compute_capability
+
+        major, minor = get_compute_capability(self.device)
+        return f"sm_{major}{minor}a"
+
+    @property
+    def full_path(self) -> bool:
+        """True when the module runs every stage on Cake kernels.
+
+        Resolved once per runner from the generated inventory and
+        ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` (see
+        :func:`flashinfer.jit.cake_stepfun_moe.resolve_cake_stepfun_full_path`);
+        ``False`` selects the FC1-only module over the trtllm-gen routing, GEMM2
+        and finalize kernels.
+        """
+        resolved = getattr(self, "_cake_full_path", None)
+        if resolved is None:
+            from ..jit.cake_stepfun_moe import resolve_cake_stepfun_full_path
+
+            resolved = resolve_cake_stepfun_full_path(self.target)
+            self._cake_full_path = resolved
+        return resolved
+
     def _check_support(self) -> None:
         super()._check_support()
+        from ..tllm_enums import RoutingMethodType
         from ..utils import get_compute_capability
 
         compute_capability = get_compute_capability(self.device)
@@ -6861,13 +6891,28 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} supports exact SM100 and SM103 only, "
                 f"got SM{compute_capability[0]}{compute_capability[1]}."
             )
+        if self.full_path:
+            # The Cake routing stage serves Renormalize (top-k then softmax) from
+            # logits with routed experts only; nothing falls back to the native
+            # router.
+            routing = self.config.routing
+            if routing.method != RoutingMethodType.Renormalize:
+                raise NotImplementedError(
+                    f"{type(self).__name__} on the full Cake path routes with "
+                    "RoutingMethodType.Renormalize only, got "
+                    f"{routing.method!r}."
+                )
+            if self.config.experts.num_fused_shared_experts:
+                raise NotImplementedError(
+                    f"{type(self).__name__} on the full Cake path does not support "
+                    "fused shared experts (num_fused_shared_experts="
+                    f"{self.config.experts.num_fused_shared_experts})."
+                )
 
     def _build(self) -> None:
-        from ..utils import get_compute_capability
         from .core import get_cake_stepfun_moe_module
 
-        major, minor = get_compute_capability(self.device)
-        self._module = get_cake_stepfun_moe_module(f"sm_{major}{minor}a")
+        self._module = get_cake_stepfun_moe_module(self.target, self.full_path)
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -6879,11 +6924,49 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} requires the per-expert gemm1_clamp_limit "
                 "produced by CakeStepFunConfig.prepare_weights in the 'cake_stepfun' view."
             )
+        if (
+            self.full_path
+            and act.routing_input_mode is not RoutingInputMode.FromLogits
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} on the full Cake path routes from logits "
+                "(RoutingInputMode.FromLogits) only, got "
+                f"routing_input_mode={act.routing_input_mode!r}."
+            )
         return super().pack_inputs(act, weights)
 
+    def default_tactic(self, inputs: List[torch.Tensor]) -> Any:
+        """Tactic ``forward`` runs for ``tactic=-1``.
+
+        The native default policy (smallest FC1 tile of the token-count window,
+        first GEMM configuration) restricted to the tiles with exported Cake
+        kernels; the Cake backend has no native fallback for the other tiles.
+        """
+        tactics = self.get_valid_tactics(inputs, None)
+        if not tactics:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no exported Cake kernel for any FC1 tile "
+                "candidate of this token count; export the tile or change "
+                "tune_max_num_tokens."
+            )
+        return min(tactics, key=lambda tactic: int(tactic[0]))
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        if tactic == -1:
+            tactic = self.default_tactic(inputs)
+        return super().forward(
+            inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
+        )
+
     def _cache_key_extras(self) -> tuple:
-        # The runner name keeps the per-family tactic spaces apart.
-        return (type(self).__name__,) + super()._cache_key_extras()
+        # The runner name and the module variant keep the tactic spaces apart.
+        return (type(self).__name__, self.full_path) + super()._cache_key_extras()
 
 
 class CakeStepFunNvfp4Runner(CakeStepFunRunner, TrtllmFp4RoutedRunner):

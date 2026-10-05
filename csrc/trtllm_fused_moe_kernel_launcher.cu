@@ -41,6 +41,15 @@
 namespace flashinfer {
 
 namespace btg = batchedGemm::trtllm::gen;
+
+// Routing stage of the fused-MoE launchers: the trtllm-gen router, or the exported Cake StepFun
+// routing kernels when the module is built with -DCAKE_STEPFUN_FULL (the Cake router serves
+// RoutingMethodType::Renormalize from logits and rejects every other configuration).
+#ifdef CAKE_STEPFUN_FULL
+using RoutingRunner = tensorrt_llm::kernels::trtllmgen_moe::cake_stepfun::RoutingRunner;
+#else
+using RoutingRunner = tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner;
+#endif
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs;
 using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
@@ -1630,7 +1639,7 @@ class FusedMoeLauncher {
     prepare_routing();
 
     // Execute routing
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
     int32_t* expert_ids_param = precomputed_expert_ids();
@@ -2072,7 +2081,7 @@ class StagedMoeLauncher : public FusedMoeLauncher {
   void prepare_moe(int64_t& /*moe_tactic*/) override {}
 
   void run_routing_kernel(bool enable_pdl, bool use_routing_scales_on_input = false) {
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
     bool const has_precomputed_indices = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
     bool const has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
@@ -4438,7 +4447,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     prepare_routing();
 
     cudaStream_t routing_stream = get_stream(hidden_states.device());
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
 
     bool use_precomputed = has_precomputed(expert_indices);
     // When using pre-computed routing, pass nullptr as routing_logits to tell the
@@ -5126,7 +5135,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     prepare_routing();
 
     // Execute routing
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+    RoutingRunner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
     // Set routing kernel parameters based on mode (see RoutingInputMode enum for documentation)
@@ -6342,7 +6351,7 @@ void trtllm_moe_canonicalize_routing(
       routing_logits.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
   // Run the production router into graph-stable storage, including its native int16 replay IDs.
-  tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+  RoutingRunner routing_runner(tile_tokens_dim);
   cudaStream_t stream = get_stream(routing_logits.device());
   routing_runner.run(
       const_cast<void*>(routing_logits.data_ptr()),

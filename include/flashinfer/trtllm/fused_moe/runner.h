@@ -275,9 +275,18 @@ class Runner {
 // The header declares tensorrt_llm::kernels::trtllmgen_moe::cake_stepfun::Fc1Runner
 // over PermuteGemm1::Runner, so it is included at global scope right after it.
 #include "fused_moe/cake_stepfun/cake_stepfun_fc1_runner.cuh"
+#ifdef CAKE_STEPFUN_FULL
+// Full Cake path (module fused_moe_cake_stepfun_full_*): routing, FC2, the NVFP4 per-token
+// requantization and finalize are exported Cake kernels as well. The header declares the
+// cake_stepfun::RoutingRunner / Fc2Runner / requant / finalize entry points over the Routing and
+// finalize declarations above.
+#include "fused_moe/cake_stepfun/cake_stepfun_stages.cuh"
+#endif
 namespace tensorrt_llm {
 namespace kernels {
 namespace trtllmgen_moe {
+#elif defined(CAKE_STEPFUN_FULL)
+#error "CAKE_STEPFUN_FULL requires CAKE_STEPFUN_FC1 (the full Cake path includes the FC1 stage)"
 #endif
 
 namespace Gemm2 {
@@ -480,6 +489,14 @@ using Gemm1Runner = cake_stepfun::Fc1Runner;
 #else
 using Gemm1Runner = PermuteGemm1::Runner;
 #endif
+// GEMM2 stage: trtllm-gen batched GEMM, or the exported Cake StepFun FC2 kernels when the module is
+// built with -DCAKE_STEPFUN_FULL (which also routes the routing, requantization and finalize stages
+// to Cake kernels inside Runner::run and the launchers).
+#ifdef CAKE_STEPFUN_FULL
+using Gemm2Runner = cake_stepfun::Fc2Runner;
+#else
+using Gemm2Runner = Gemm2::Runner;
+#endif
 
 class Runner {
  public:
@@ -531,7 +548,7 @@ class Runner {
   bool mUsePerChannelScalingGemm1;
   bool mUsePerChannelScalingGemm2;
   Gemm1Runner mPermuteGemm1;
-  Gemm2::Runner mGemm2;
+  Gemm2Runner mGemm2;
 
   // This will be the cartesian product of the passing configs for gemm1 and gemm2
   // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2

@@ -29,9 +29,13 @@
 #include <string>
 #include <vector>
 
+#include "cake_stepfun_routing_tail.cuh"
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "generated/cake_stepfun_generated_manifest.cuh"
+#ifdef CAKE_STEPFUN_FULL
+#include "cake_stepfun_stages.cuh"
+#endif
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -94,39 +98,6 @@ inline std::string shapeOf(generated::TensorLayout const& l) {
   return s + "]";
 }
 
-// Routing tail for kernels that do not bound the tiles they acquire through cluster launch control
-// by num_non_exiting_ctas (Fc1KernelSpec::bounds_acquired_tiles == false; they take total_tiles and
-// exit only their initial CTA). trtllm-gen routing writes cta_idx_xy_to_batch_idx and
-// cta_idx_xy_to_mn_limit for the first *numNonExitingCtas CTAs and permuted_idx_to_token_idx for
-// their token slots only; a running CTA of such a kernel processes every cancelled CTA it acquires,
-// so the entries in [*numNonExitingCtas, gridN) must describe a benign tile: expert 0, zero valid
-// rows (mn_limit = tile * tileN) and padded token slots (-1). The kernel is launched in-stream
-// between routing and FC1 with the FC1's programmatic-dependent-launch attribute; it waits for
-// routing before reading the count and releases the FC1 once the tail is written.
-constexpr unsigned kRoutingTailBlocks = 4;
-constexpr unsigned kRoutingTailThreads = 256;
-
-__global__ void __launch_bounds__(kRoutingTailThreads)
-    padRoutingTailKernel(int32_t* tileExpert, int32_t* tileMnLimit, int32_t* routeMap,
-                         int32_t const* numNonExitingCtas, int32_t gridN, int32_t tileN) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
-  int32_t const first = *numNonExitingCtas;
-  int32_t const stride = static_cast<int32_t>(gridDim.x * blockDim.x);
-  int32_t const lane = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  for (int32_t tile = first + lane; tile < gridN; tile += stride) {
-    tileExpert[tile] = 0;
-    tileMnLimit[tile] = tile * tileN;
-  }
-  for (int32_t slot = first * tileN + lane; slot < gridN * tileN; slot += stride) {
-    routeMap[slot] = -1;
-  }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-#endif
-}
-
 // The generated-manifest family served by the native cubin selection arguments, or -1.
 int selectFamily(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOutput,
                  bool useDeepSeekFp8, MoE::ActivationType activationType, bool useShuffledMatrix,
@@ -176,8 +147,17 @@ char const* familyName(int family) {
     case generated::kFc1MxFp8:
       return "mxfp8";
     default:
-      return "native";
+      return "unsupported";
   }
+}
+
+std::string tileList(int family) {
+  std::string tiles;
+  for (size_t index = 0; index < generated::kFc1KernelCount; ++index) {
+    if (generated::kFc1Kernels[index].family != family) continue;
+    tiles += (tiles.empty() ? "" : ", ") + std::to_string(generated::kFc1Kernels[index].tile_n);
+  }
+  return tiles.empty() ? "none" : tiles;
 }
 
 }  // namespace
@@ -205,12 +185,6 @@ Fc1Runner::Fc1Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dt
     }
   }
   mSmemConfigured.assign(generated::kFc1KernelCount, false);
-  if (mKernels.empty()) {
-    mFamily = -1;
-    mNative.emplace(dtypeAct, dtypeWeights, dtypeOutput, useDeepSeekFp8, tileTokensDim,
-                    activationType, useShuffledMatrix, weightLayout, biasType, usePerTokenScaling,
-                    usePerChannelScaling);
-  }
 }
 
 bool Fc1Runner::shapeSupported(int32_t configIndex, int32_t hiddenSize,
@@ -227,50 +201,34 @@ bool Fc1Runner::shapeSupported(int32_t configIndex, int32_t hiddenSize,
          intermediateSize % spec.output_rows_per_cta == 0 && gridM % spec.cluster[0] == 0;
 }
 
-size_t Fc1Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize,
-                                          int32_t intermediateSize, int32_t numExperts,
-                                          int32_t numTokens, int32_t configIndex) const {
-  if (mNative) {
-    return mNative->getWorkspaceSizeInBytes(topK, hiddenSize, intermediateSize, numExperts,
-                                            numTokens, configIndex);
-  }
+size_t Fc1Runner::getWorkspaceSizeInBytes(int32_t, int32_t, int32_t, int32_t, int32_t,
+                                          int32_t) const {
   return 0;
 }
 
-int32_t Fc1Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
-                                              int32_t intermediateSize, int32_t numExperts,
-                                              int32_t numTokens) const {
-  if (mNative) {
-    return mNative->getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize, numExperts,
-                                               numTokens);
-  }
+int32_t Fc1Runner::getDefaultValidConfigIndex(int32_t, int32_t hiddenSize,
+                                              int32_t intermediateSize, int32_t, int32_t) const {
   for (int32_t index : mKernels) {
     if (shapeSupported(index, hiddenSize, intermediateSize)) {
       return index;
     }
   }
   FLASHINFER_CHECK(false, "No Cake StepFun FC1 kernel (", familyName(mFamily),
-                   ") for tile_N=", mTileTokensDim, " accepts hidden_size=", hiddenSize,
+                   ") serves tile_N=", mTileTokensDim, " at hidden_size=", hiddenSize,
                    ", intermediate_size=", intermediateSize,
-                   " (hidden_size must be a multiple of the kernel K tile and intermediate_size a "
-                   "multiple of its output rows per CTA times the cluster size).");
+                   " (exported tiles for this family: ", tileList(mFamily),
+                   "; hidden_size must be a multiple of the kernel K tile and intermediate_size a "
+                   "multiple of its output rows per CTA times the cluster size). The Cake StepFun "
+                   "backend has no native fallback: select a tactic whose tile is exported.");
   return -1;
 }
 
-bool Fc1Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
-                                   int32_t intermediateSize, int32_t numExperts,
-                                   int32_t numTokens) const {
-  if (mNative) {
-    return mNative->isValidConfigIndex(configIndex, topK, hiddenSize, intermediateSize, numExperts,
-                                       numTokens);
-  }
+bool Fc1Runner::isValidConfigIndex(int32_t configIndex, int32_t, int32_t hiddenSize,
+                                   int32_t intermediateSize, int32_t, int32_t) const {
   return shapeSupported(configIndex, hiddenSize, intermediateSize);
 }
 
 std::vector<int64_t> Fc1Runner::getPassingConfigIndices() const {
-  if (mNative) {
-    return mNative->getPassingConfigIndices();
-  }
   return std::vector<int64_t>(mKernels.begin(), mKernels.end());
 }
 
@@ -286,17 +244,8 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
                     bool useRoutingScalesOnInput, int device, cudaStream_t stream,
                     int32_t configIndex, bool enable_pdl, int32_t validHiddenSize,
                     int32_t validIntermediateSize) {
-  if (mNative) {
-    mNative->run(hiddenState, hiddenStateScale, weight, weightScale, perTokenScales,
-                 perChannelScales, outputScalesScalar, outputScalesGateScalar, ptrBias,
-                 ptrGatedActAlpha, ptrGatedActBeta, ptrClampLimit, permutedIdxToBiasRowIdx, output,
-                 outputScale, topK, hiddenSize, intermediateSize, numExperts, numTokens,
-                 permutedIdxToTokenIdx, ptrNumNonExitingCtas, ptrTotalNumPaddedTokens,
-                 ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, bmm1Workspace,
-                 useRoutingScalesOnInput, device, stream, configIndex, enable_pdl, validHiddenSize,
-                 validIntermediateSize);
-    return;
-  }
+  (void)bmm1Workspace;
+  (void)device;
   char const* const family = familyName(mFamily);
   FLASHINFER_CHECK(shapeSupported(configIndex, hiddenSize, intermediateSize),
                    "Invalid Cake StepFun FC1 config index ", configIndex, " for ", family,
@@ -456,18 +405,14 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
   pdlAttribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   pdlAttribute.val.programmaticStreamSerializationAllowed = 1;
 
-  if (!spec.bounds_acquired_tiles && mPadRoutingTail) {
-    cudaLaunchConfig_t tailConfig{};
-    tailConfig.gridDim = dim3(kRoutingTailBlocks, 1u, 1u);
-    tailConfig.blockDim = dim3(kRoutingTailThreads, 1u, 1u);
-    tailConfig.dynamicSmemBytes = 0;
-    tailConfig.stream = stream;
-    tailConfig.attrs = &pdlAttribute;
-    tailConfig.numAttrs = fc1Pdl ? 1u : 0u;
-    cudaError_t const padded = cudaLaunchKernelEx(
-        &tailConfig, padRoutingTailKernel, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
-        permutedIdxToTokenIdx, static_cast<int32_t const*>(ptrNumNonExitingCtas), gridN,
-        mTileTokensDim);
+  bool padTail = !spec.bounds_acquired_tiles && mPadRoutingTail;
+#ifdef CAKE_STEPFUN_FULL
+  if (padTail && routingWritesBenignTail()) padTail = false;
+#endif
+  if (padTail) {
+    cudaError_t const padded =
+        launchRoutingTail(ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, permutedIdxToTokenIdx,
+                          ptrNumNonExitingCtas, gridN, mTileTokensDim, fc1Pdl, stream);
     FLASHINFER_CHECK(padded == cudaSuccess, "Cake StepFun FC1 routing-tail launch failed for ",
                      spec.symbol, " grid_n=", gridN, " : ", cudaGetErrorString(padded));
   }
@@ -522,7 +467,7 @@ void Fc1Runner::run(void* hiddenState, void* hiddenStateScale, void* weight, voi
         spec.block[2], spec.cluster[0], spec.cluster[1], spec.cluster[2],
         spec.cluster_attribute ? "true" : "false", spec.dynamic_smem_bytes,
         fc1Pdl ? "true" : "false",
-        (!spec.bounds_acquired_tiles && mPadRoutingTail) ? "true" : "false",
+        padTail ? "true" : "false",
         spec.bounds_acquired_tiles ? "true" : "false", args.M_out, args.K, args.grid_m, args.grid_n,
         args.K_tiles, static_cast<long long>(E), static_cast<long long>(T), topK,
         static_cast<long long>(maxPaddedTokens), static_cast<int>(synced));

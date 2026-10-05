@@ -263,6 +263,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 8
     },
@@ -376,6 +377,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 16
     },
@@ -489,6 +491,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 32
     },
@@ -598,6 +601,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 64
     },
@@ -707,6 +711,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_nvfp4_evict_first_ear",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 256
     },
@@ -820,6 +825,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 8
     },
@@ -933,6 +939,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 16
     },
@@ -1046,6 +1053,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 32
     },
@@ -1155,6 +1163,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_bf16tok_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 64
     },
@@ -1264,6 +1273,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_bf16tok_nvfp4_evict_first_ear",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 256
     },
@@ -1345,6 +1355,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 8
     },
@@ -1426,6 +1437,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 16
     },
@@ -1507,6 +1519,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 32
     },
@@ -1588,6 +1601,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_evict_first_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 64
     },
@@ -1669,6 +1683,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n128_fc1_swiglu_step_evict_first_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 128
     },
@@ -1750,6 +1765,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_evict_first_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 256
     },
@@ -1847,6 +1863,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_static_fp8_s3_ef_l2256b_pdlstart_fold",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 8
     },
@@ -1944,6 +1961,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_static_fp8_ef_l2256b_pdlstart_fold",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 16
     },
@@ -2041,6 +2059,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_static_fp8_ef_l2256b_pdlstart_fold",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 32
     },
@@ -2138,6 +2157,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_fp8_ef_l2256b",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 64
     },
@@ -2235,6 +2255,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n128_fc1_swiglu_step_fp8_ef_l2256b",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 128
     },
@@ -2332,6 +2353,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_fp8_ef_l2256b",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 256
     },
@@ -2425,6 +2447,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_mxfp8",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_mxfp8",
       "tile_n": 8
     },
@@ -2518,6 +2541,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_mxfp8",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_mxfp8",
       "tile_n": 16
     },
@@ -2611,6 +2635,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_mxfp8",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_mxfp8",
       "tile_n": 64
     },
@@ -2704,6 +2729,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_mxfp8",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_mxfp8",
       "tile_n": 256
     },
@@ -2817,6 +2843,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 8
     },
@@ -2930,6 +2957,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 16
     },
@@ -3043,6 +3071,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 32
     },
@@ -3152,6 +3181,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 64
     },
@@ -3261,6 +3291,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_nvfp4_evict_first_ear",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4",
       "tile_n": 256
     },
@@ -3374,6 +3405,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 8
     },
@@ -3487,6 +3519,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 16
     },
@@ -3600,6 +3633,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_bf16tok_persistent_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 32
     },
@@ -3709,6 +3743,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_bf16tok_nvfp4_evict_first",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 64
     },
@@ -3818,6 +3853,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_bf16tok_nvfp4_evict_first_ear",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_nvfp4_bf16tok",
       "tile_n": 256
     },
@@ -3899,6 +3935,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 8
     },
@@ -3980,6 +4017,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 16
     },
@@ -4061,6 +4099,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 32
     },
@@ -4142,6 +4181,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_evict_first_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 64
     },
@@ -4223,6 +4263,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n128_fc1_swiglu_step_evict_first_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 128
     },
@@ -4304,6 +4345,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_evict_first_bf16",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_bf16",
       "tile_n": 256
     },
@@ -4401,6 +4443,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_static_fp8_s3_ef_l2256b_pdlstart_fold",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 8
     },
@@ -4498,6 +4541,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_static_fp8_ef_l2256b_pdlstart_fold",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 16
     },
@@ -4595,6 +4639,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n32_fc1_swiglu_step_static_fp8_ef_l2256b_pdlstart_fold",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 32
     },
@@ -4692,6 +4737,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_fp8_ef_l2256b",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 64
     },
@@ -4789,6 +4835,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n128_fc1_swiglu_step_fp8_ef_l2256b",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 128
     },
@@ -4886,6 +4933,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_fp8_ef_l2256b",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_fp8",
       "tile_n": 256
     },
@@ -4979,6 +5027,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n8_fc1_swiglu_step_mxfp8",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_mxfp8",
       "tile_n": 8
     },
@@ -5072,6 +5121,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n16_fc1_swiglu_step_mxfp8",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_mxfp8",
       "tile_n": 16
     },
@@ -5165,6 +5215,7 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n64_fc1_swiglu_step_mxfp8",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_mxfp8",
       "tile_n": 64
     },
@@ -5258,11 +5309,12 @@
         ]
       ],
       "source_symbol": "trtllm_moe_bmm_tile_n256_fc1_swiglu_step_mxfp8",
+      "stage": "fc1",
       "template": "fc1_swiglu_step_mxfp8",
       "tile_n": 256
     }
   ],
   "manifest": "csrc/fused_moe/cake_stepfun/generated/cake_stepfun_generated_manifest.cuh",
-  "program_hash": "ce8d18a7eee09a41b89ebce4dedfacf6eecf169b160fa98ae66686253aa01f0e",
-  "schema": "flashinfer.cake_stepfun.inventory.v2"
+  "program_hash": "260b8b3527aec58f3146022e16c53f0adc760cd5541ea16a9103884982af1857",
+  "schema": "flashinfer.cake_stepfun.inventory.v3"
 }

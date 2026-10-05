@@ -20,14 +20,17 @@
 // MoE::Runner when the module is compiled with -DCAKE_STEPFUN_FC1 and exposes the same surface:
 // constructor, workspace query, config-index validity, and run() over the trtllm-gen routing ABI
 // (permuted_idx_to_token_idx, cta_idx_xy_to_batch_idx, cta_idx_xy_to_mn_limit,
-// num_non_exiting_ctas). Routing, FC2, and finalize stay the native trtllm-gen kernels.
+// num_non_exiting_ctas). Routing, FC2 and finalize are the native trtllm-gen kernels unless the
+// module is also built with -DCAKE_STEPFUN_FULL (see cake_stepfun_stages.cuh).
 //
 // The exported kernels form five families selected by the constructor's dtype / layout / scaling
 // arguments exactly as the native cubin selection does: NVFP4 (E2m1 output), NVFP4 with the fp32
 // per-token activation scale (bf16 output), BF16 (BlockMajorK weights), per-tensor FP8 and MXFP8,
 // each over the tokens-per-CTA tiles the generated inventory covers. Config indices are positions
-// in the generated kernel table. (dtype, tile) pairs without an exported Cake kernel fall back to
-// the native PermuteGemm1 runner so the fused-MoE tile planner keeps its complete candidate set.
+// in the generated kernel table. A (family, tile) pair without an exported Cake kernel has no
+// valid config: tactic enumeration skips the tile and an explicit or default selection of it
+// fails with an error naming the family, the tile and the exported tiles. There is no native
+// fallback.
 //
 // This header is included from include/flashinfer/trtllm/fused_moe/runner.h after the PermuteGemm1
 // and Routing declarations it relies on.
@@ -36,7 +39,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <vector>
 
 namespace tensorrt_llm {
@@ -67,10 +69,10 @@ class Fc1Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
-  // True when this (dtype, tile) runs the exported Cake kernels (false: native fallback).
-  [[nodiscard]] bool usesCakeKernels() const { return mNative == std::nullopt; }
+  // True when an exported Cake kernel serves this (family, tile).
+  [[nodiscard]] bool hasKernels() const { return !mKernels.empty(); }
 
-  // Generated-manifest family index of this runner (-1 on the native fallback).
+  // Generated-manifest family index of this runner (-1 when the dtype combination has no family).
   [[nodiscard]] int family() const { return mFamily; }
 
   // Whether run() writes the benign routing tail before kernels that do not bound the tiles they
@@ -126,8 +128,6 @@ class Fc1Runner {
   // Dynamic shared memory opt-in done once per kernel on this runner's device.
   mutable std::vector<bool> mSmemConfigured;
   bool mPadRoutingTail{true};
-  // Native FC1 for (dtype, tile) pairs without an exported Cake kernel.
-  std::optional<PermuteGemm1::Runner> mNative;
 };
 
 }  // namespace cake_stepfun

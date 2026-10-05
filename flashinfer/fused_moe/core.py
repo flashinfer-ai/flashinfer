@@ -1741,16 +1741,21 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
 
 @functools.cache
-def get_cake_stepfun_moe_module(target: str):
+def get_cake_stepfun_moe_module(target: str, full_path: bool | None = None):
     """Load the Cake StepFun fused-MoE module for an exact ``sm_100a``/``sm_103a`` target.
 
     The module exports the trtllm-gen fused-MoE operations with the GEMM1 stage
-    served by the exported Cake StepFun FC1 kernels; the returned namespace is
-    the one :func:`get_trtllm_moe_sm100_module` returns for the public module.
+    served by the exported Cake StepFun FC1 kernels and, on the full path (see
+    :func:`flashinfer.jit.cake_stepfun_moe.resolve_cake_stepfun_full_path`), the
+    routing, GEMM2, requantization and finalize stages by Cake kernels as well.
+    The returned namespace is the one :func:`get_trtllm_moe_sm100_module` returns
+    for the public module.
     """
     from ..jit.cake_stepfun_moe import gen_cake_stepfun_fused_moe_module
 
-    return _build_trtllm_moe_namespace(gen_cake_stepfun_fused_moe_module(target))
+    return _build_trtllm_moe_namespace(
+        gen_cake_stepfun_fused_moe_module(target, full_path)
+    )
 
 
 def _build_trtllm_moe_namespace(module):

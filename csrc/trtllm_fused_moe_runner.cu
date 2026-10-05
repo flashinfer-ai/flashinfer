@@ -452,7 +452,7 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
           dtypeAct, dtypeWeights, usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
           gemm1BiasType, usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
-      mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
+      mGemm2(Gemm2Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
                            tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
                            usePerChannelScalingGemm2)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
@@ -466,8 +466,14 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
       mPassingConfigs.push_back(MoEConfig{indexGemm1, indexGemm2});
     }
   }
+#ifdef CAKE_STEPFUN_FC1
+  // A (family, tile) without an exported Cake kernel has no configs: tactic enumeration skips
+  // the tile and a default selection of it fails in getDefaultValidConfigIndex with a message
+  // that names the family, the tile and the exported tiles.
+#else
   FLASHINFER_CHECK(!mPassingConfigs.empty(),
                    "No compatible configs found for the fp8 block scale MoE runner.");
+#endif
 }
 
 Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
@@ -745,6 +751,24 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     FLASHINFER_CHECK(
         workspace.token_scales_fc2 != nullptr,
         "workspace.token_scales_fc2 must be provided When using explicit quantization.");
+    // One NVFP4RecipeSpec per launch feeds both the runtime globalScaleInv and the
+    // compile-time e4m3Max, so they cannot desync.
+    // TODO(aleozlx, #5141): thread a caller-supplied recipe code through the
+    // trtllm_fp4_block_scale_moe FFI; until then this runner resolves from the env.
+    auto const recipe =
+        tensorrt_llm::kernels::resolveNVFP4Recipe(tensorrt_llm::kernels::kNVFP44Over6FromEnv);
+#ifdef CAKE_STEPFUN_FULL
+    // The Cake requantization kernel writes the block-scale layout the selected Cake FC2 kernel
+    // reads for its activation operand.
+    cake_stepfun::requant::run(
+        args.num_tokens * totalExpertsPerToken, args.intermediate_size,
+        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), recipe.globalScaleInv(),
+        static_cast<float>(recipe.e4m3Max), workspace.expanded_idx_to_permuted_idx,
+        reinterpret_cast<uint8_t*>(workspace.activation_output),
+        reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
+        reinterpret_cast<float*>(workspace.token_scales_fc2), mGemm2.sfLayoutA(config.gemm2Config),
+        stream, enable_pdl);
+#else
     auto const sfLayoutB = mGemm2.mRunner.getSfLayoutB(config.gemm2Config);
     auto sfLayout = QuantizationSFLayout::LINEAR;
     switch (sfLayoutB) {
@@ -758,13 +782,6 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         FLASHINFER_CHECK(false, "Unsupported FC2 block scale layout ",
                          btg::sfLayoutToString(sfLayoutB));
     }
-
-    // One NVFP4RecipeSpec per launch feeds both the runtime globalScaleInv and the
-    // compile-time e4m3Max, so they cannot desync.
-    // TODO(aleozlx, #5141): thread a caller-supplied recipe code through the
-    // trtllm_fp4_block_scale_moe FFI; until then this runner resolves from the env.
-    auto const recipe =
-        tensorrt_llm::kernels::resolveNVFP4Recipe(tensorrt_llm::kernels::kNVFP44Over6FromEnv);
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         args.num_tokens * totalExpertsPerToken, args.intermediate_size,
         reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), recipe.globalScaleInv(),
@@ -772,6 +789,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
         reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, recipe, stream, enable_pdl);
+#endif
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;
@@ -794,7 +812,11 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   // Run finalize
   if (args.do_finalize) {
     // Run finalize
+#ifdef CAKE_STEPFUN_FULL
+    cake_stepfun::finalize::run(finalizeData, stream);
+#else
     moe::dev::finalize::run(finalizeData, stream);
+#endif
     sync_check_cuda_error(stream);
   }
 }
