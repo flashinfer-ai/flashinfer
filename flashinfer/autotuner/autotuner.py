@@ -1540,8 +1540,12 @@ class AutoTuner:
         ] = {}
         # Ranked shortlists are process-local. Persisted configs retain the
         # selected winner; a later tuning session rebuilds the shortlist when
-        # compound refinement needs more than one candidate.
-        self._ranked_tactics_cache: dict[ProfilingCacheKey, tuple[Any, ...]] = {}
+        # compound refinement needs more than one candidate. Each shortlist is
+        # stored with the replay/L2 policy it was measured under, because the
+        # cache key does not include that policy.
+        self._ranked_tactics_cache: dict[
+            ProfilingCacheKey, tuple[tuple[Any, ...], tuple[Any, ...]]
+        ] = {}
         # Keep measurement provenance separate from the runtime cache key.
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
@@ -2664,9 +2668,10 @@ class AutoTuner:
                 tuning_config,
                 runner.get_cache_key_extras(inputs),
             )
-            cached_ranking = self._ranked_tactics_cache.get(cache_key)
-            if cached_ranking is not None:
-                return list(cached_ranking[:k])
+            policy = self._profiling_policy(tuning_config)
+            cached = self._ranked_tactics_cache.get(cache_key)
+            if cached is not None and cached[0] == policy:
+                return list(cached[1][:k])
 
             tensors = None
             input_preparation_oom = False
@@ -2734,10 +2739,8 @@ class AutoTuner:
             # Populate the choose_one cache with the winner so stage lookups
             # remain consistent between rank_tactics and choose_one.
             self.profiling_cache[cache_key] = (ranked[0], profile)
-            self._profiling_cache_policies[cache_key] = self._profiling_policy(
-                tuning_config
-            )
-            self._ranked_tactics_cache[cache_key] = tuple(ranked)
+            self._profiling_cache_policies[cache_key] = policy
+            self._ranked_tactics_cache[cache_key] = (policy, tuple(ranked))
             self._dirty = True
             self._dirty_seq += 1
 
