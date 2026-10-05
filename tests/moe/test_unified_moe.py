@@ -956,6 +956,10 @@ class TestTypedActivationConfig:
         from flashinfer.fused_moe.prepare import _activation_param_view
 
         assert _activation_param_view(SwiGLU(), 3, torch.device("cpu")) == {}
+        assert _activation_param_view(SwiGLUStep(), 3, torch.device("cpu")) == {}
+        step = _activation_param_view(SwiGLUStep(limit=16.0), 3, torch.device("cpu"))
+        assert set(step) == {"gemm1_clamp_limit"}
+        torch.testing.assert_close(step["gemm1_clamp_limit"], torch.full((3,), 16.0))
         view = _activation_param_view(
             SwiGLU(alpha=1.7, beta=0.25, limit=6.0),
             3,
@@ -1178,7 +1182,9 @@ class TestTypedActivationConfig:
         assert SwiGLUStep().limit == 7.0
 
 
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize(
+    "activation", (SwiGLU(), SwiGLUStep(), SwiGLUStep(limit=16.0), ReLU2())
+)
 def test_trtllm_bf16_preparation_shapes_for_declared_activations(activation):
     experts, hidden, intermediate = 2, 128, 128
     rows = intermediate * (2 if activation.is_gated else 1)
@@ -1196,7 +1202,9 @@ def test_trtllm_bf16_preparation_shapes_for_declared_activations(activation):
     assert view["gemm2_weights"].numel() == experts * hidden * intermediate
 
 
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize(
+    "activation", (SwiGLU(), SwiGLUStep(), SwiGLUStep(limit=16.0), ReLU2())
+)
 def test_trtllm_fp8_per_tensor_preparation_shapes_for_declared_activations(
     activation,
 ):

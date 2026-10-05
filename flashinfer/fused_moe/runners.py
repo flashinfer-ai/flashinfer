@@ -451,6 +451,11 @@ def _validate_prepared_activation_params(
             required += ("gemm1_beta",)
         if activation.limit != default.limit:
             required += ("gemm1_clamp_limit",)
+    elif isinstance(activation, SwiGLUStep):
+        if view.get("gemm1_alpha") is not None or view.get("gemm1_beta") is not None:
+            raise ValueError(f"{runner}: SwiGLUStep consumes gemm1_clamp_limit only.")
+        if activation.limit != SwiGLUStep().limit:
+            required = ("gemm1_clamp_limit",)
     elif isinstance(activation, SiTU):
         # TRTLLM reuses gemm1_alpha/beta, whose null SiTU defaults are 1/1
         # rather than the typed 4/25. Require explicit tensors even at default.
@@ -6390,6 +6395,26 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         from .core import MoeRunnerInputs
 
         view = weights.get_view(self.backend_key)
+        _validate_prepared_activation_params(
+            view, self.config.activation, type(self).__name__
+        )
+        _validate_optional_gemm1_activation_params(
+            view,
+            self._num_local_experts,
+            act.hidden_states_q.device,
+            type(self).__name__,
+        )
+        if not isinstance(self.config.activation, SwiGLUStep):
+            unsupported = [
+                key
+                for key in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+                if view.get(key) is not None
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"{type(self).__name__} cannot consume {unsupported}; "
+                    "only SwiGLUStep accepts per-expert activation limits."
+                )
         routing = self.config.routing
         num_tokens, hidden_size = act.hidden_states_q.shape
         self._validate_tensors(act, view, hidden_size)
@@ -6461,6 +6486,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
             gemm1_weights=view["gemm1_weights"],
             output1_scales_scalar=view["output1_scales_scalar"],
             output1_scales_gate_scalar=view["output1_scales_gate_scalar"],
+            gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
             gemm2_weights=view["gemm2_weights"],
             output2_scales_scalar=view["output2_scales_scalar"],
             num_experts=routing.num_experts,
