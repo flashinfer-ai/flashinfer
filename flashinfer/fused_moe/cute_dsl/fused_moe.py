@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import warnings
 import weakref
@@ -206,6 +206,51 @@ def _moe_hidden_size(w2_weight: torch.Tensor, localized_weights: Optional[list])
             f"localized FC2 shards must have equal positive widths, got {widths}"
         )
     return sum(widths)
+
+
+def _execute_on_streams(streams: list, fn: Callable[[int], None]) -> None:
+    """Call ``fn(i)`` with ``streams[i]`` current, forking from and joining to
+    the caller stream.
+
+    Mirrors ``torch.cuda.execute_on_streams`` (proposed in PyTorch PR 199128)
+    for PyTorch builds without it. Each stream first waits for work already
+    queued on the caller stream; the caller stream then waits for every
+    callback's queued work, including work queued before a callback raised.
+    The host is never synchronized. Ordinary and green-context streams on the
+    caller's device are both supported.
+    """
+    if not streams:
+        raise ValueError("Need at least one CUDA stream to execute on")
+    caller_stream = torch.cuda.current_stream()
+    start = torch.cuda.Event()
+    start.record(caller_stream)
+    done_events = []
+    try:
+        for index, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                stream.wait_event(start)
+                try:
+                    fn(index)
+                finally:
+                    done = torch.cuda.Event()
+                    done.record(stream)
+                    done_events.append(done)
+    finally:
+        for done in done_events:
+            caller_stream.wait_event(done)
+
+
+def _resolve_stream_executor() -> Callable[[list, Callable[[int], None]], None]:
+    """Prefer PyTorch's fork/join helper; fall back to the in-repo mirror."""
+    executor = getattr(torch.cuda, "execute_on_streams", None)
+    if executor is not None:
+        return executor
+    try:
+        # Name used by earlier revisions of the PyTorch proposal.
+        from torch.cuda.green_contexts import execute_in_green_contexts
+    except ImportError:
+        return _execute_on_streams
+    return execute_in_green_contexts
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -477,14 +522,7 @@ def _moe_core_impl(
                 "locality-domain localization requires use_fused_finalize=True; the "
                 "deterministic path's moe_unpermute reduction is not split-aware."
             )
-        try:
-            from torch.cuda.green_contexts import execute_in_green_contexts
-        except ImportError as exc:
-            raise RuntimeError(
-                "Localized MoE requires a PyTorch build providing "
-                "torch.cuda.green_contexts.execute_in_green_contexts. "
-                "See https://github.com/pytorch/pytorch/pull/199128 for API availability."
-            ) from exc
+        execute_on_streams = _resolve_stream_executor()
         # The generic async-memset path cannot be composed with the localized
         # fork/join. The localized path orders its optional memset stream
         # explicitly below.
@@ -618,7 +656,7 @@ def _moe_core_impl(
     )
     intermediate_per_token_scale = None
     if use_localized_path:
-        # execute_in_green_contexts forks and joins the main stream, ordering
+        # execute_on_streams forks and joins the main stream, ordering
         # both domains after moe_sort and before consumers of the shared output.
         # The join also orders buffer reuse; record_stream is unnecessary and
         # could leave allocator events referencing destroyed green streams.
@@ -671,7 +709,7 @@ def _moe_core_impl(
                 localized_memset_done.record(localized_memset_stream)
 
         try:
-            execute_in_green_contexts(localized_streams, _fc1_die)
+            execute_on_streams(localized_streams, _fc1_die)
         except BaseException:
             # Older executors skip the join when a callback raises.
             for stream in localized_streams:
@@ -800,7 +838,7 @@ def _moe_core_impl(
             )
 
         try:
-            execute_in_green_contexts(localized_streams, _fc2_die)
+            execute_on_streams(localized_streams, _fc2_die)
         except BaseException:
             for stream in localized_streams:
                 localization_main_stream.wait_stream(stream)
@@ -1630,10 +1668,11 @@ def cute_dsl_fused_moe(
                 },
             ]
     localized_streams : Optional[list]
-        One long-lived green-context CUDA stream for each locality domain.
-        Requires a PyTorch build with
-        ``torch.cuda.green_contexts.execute_in_green_contexts`` (see PyTorch
-        PR #199128); builds without this API cannot run the localized path.
+        One long-lived green-context CUDA stream for each locality domain
+        (for example ``GreenContext.Stream()``). Work is forked from and
+        joined to the caller's current stream with
+        ``torch.cuda.execute_on_streams`` when PyTorch provides it, otherwise
+        with an equivalent in-repo helper.
     localized_sm_count : Optional[int]
         Number of SMs available to each locality-domain stream, used to size
         the persistent kernel grid.

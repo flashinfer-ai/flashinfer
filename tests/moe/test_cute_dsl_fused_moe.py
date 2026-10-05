@@ -4571,8 +4571,6 @@ def test_moe_core_preserves_fc2_output_dtype(
     monkeypatch, localized, callback_arity, output_dtype, entrypoint
 ):
     from contextlib import nullcontext
-    from types import SimpleNamespace
-    import sys
 
     from flashinfer.fused_moe.cute_dsl import fused_moe as module
 
@@ -4596,13 +4594,7 @@ def test_moe_core_preserves_fc2_output_dtype(
             else:
                 fn(i, None)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "torch.cuda.green_contexts",
-        SimpleNamespace(
-            execute_in_green_contexts=execute,
-        ),
-    )
+    monkeypatch.setattr(module, "_resolve_stream_executor", lambda: execute)
     calls = []
 
     def finalize(**kwargs):
@@ -4664,47 +4656,37 @@ def test_moe_core_preserves_fc2_output_dtype(
 
 
 @cute_dsl_available
-@pytest.mark.parametrize("missing_module", [False, True])
-def test_localized_moe_reports_missing_green_context_api(monkeypatch, missing_module):
+@pytest.mark.parametrize("available", ["execute_on_streams", "legacy", "none"])
+def test_localized_stream_executor_resolution(monkeypatch, available):
+    """Stock PyTorch builds without the fork/join helper use the in-repo mirror."""
     import sys
     from types import SimpleNamespace
 
     from flashinfer.fused_moe.cute_dsl import fused_moe as module
 
+    def upstream(streams, fn):
+        pass
+
+    def legacy(streams, fn):
+        pass
+
+    if available == "execute_on_streams":
+        monkeypatch.setattr(torch.cuda, "execute_on_streams", upstream, raising=False)
+    else:
+        monkeypatch.delattr(torch.cuda, "execute_on_streams", raising=False)
     monkeypatch.setitem(
         sys.modules,
         "torch.cuda.green_contexts",
-        None if missing_module else SimpleNamespace(),
+        SimpleNamespace(execute_in_green_contexts=legacy)
+        if available == "legacy"
+        else None,
     )
-
-    def unexpected_routing(**kwargs):
-        pytest.fail("missing green-context API must fail before routing")
-
-    monkeypatch.setattr(module, "moe_sort", unexpected_routing)
-    packed = torch.empty((1, 128, 64), dtype=torch.uint8)
-    scale = torch.ones(1)
-    with pytest.raises(
-        RuntimeError, match="PyTorch build providing.*execute_in_green_contexts"
-    ):
-        module._moe_core_impl(
-            x=torch.empty((1, 64), dtype=torch.uint8),
-            x_sf=scale,
-            token_selected_experts=torch.zeros((1, 1), dtype=torch.int32),
-            token_final_scales=scale,
-            w1_weight=packed,
-            w1_weight_sf=scale,
-            w1_alpha=scale,
-            fc2_input_scale=scale,
-            w2_weight=packed,
-            w2_weight_sf=scale,
-            w2_alpha=scale,
-            num_experts=1,
-            top_k=1,
-            num_local_experts=1,
-            localized_weights=[{"w2_weight": packed}] * 2,
-            localized_streams=[object(), object()],
-            sm_count=8,
-        )
+    expected = {
+        "execute_on_streams": upstream,
+        "legacy": legacy,
+        "none": module._execute_on_streams,
+    }[available]
+    assert module._resolve_stream_executor() is expected
 
 
 @cute_dsl_available
@@ -4715,9 +4697,7 @@ def test_localized_streams_are_joined_on_failure(
     monkeypatch, failed_domain, failed_gemm, use_memset_stream
 ):
     from contextlib import nullcontext
-    from types import SimpleNamespace
     from unittest.mock import Mock, call
-    import sys
 
     from flashinfer.fused_moe.cute_dsl import fused_moe as module
 
@@ -4756,11 +4736,7 @@ def test_localized_streams_are_joined_on_failure(
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: main_stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(torch.cuda, "Event", lambda: done)
-    monkeypatch.setitem(
-        sys.modules,
-        "torch.cuda.green_contexts",
-        SimpleNamespace(execute_in_green_contexts=execute),
-    )
+    monkeypatch.setattr(module, "_resolve_stream_executor", lambda: execute)
     with pytest.raises(ValueError) as exc:
         module._moe_core_impl(
             x=torch.empty((1, 64), dtype=torch.uint8),
@@ -4817,21 +4793,6 @@ def _quantize_nvfp4_weight(w_bf16: torch.Tensor):
     )
 
 
-def _fork_join_executor(streams, fn):
-    # Same fork/join contract as execute_in_green_contexts, on ordinary
-    # streams, so the partitioned kernels run without that PyTorch API.
-    main = torch.cuda.current_stream()
-    for stream in streams:
-        stream.wait_stream(main)
-    try:
-        for i, stream in enumerate(streams):
-            with torch.cuda.stream(stream):
-                fn(i)
-    finally:
-        for stream in streams:
-            main.wait_stream(stream)
-
-
 @cute_dsl_available
 @pytest.mark.skipif(not is_sm107(), reason="localized MoE is Rubin (SM107) only")
 @pytest.mark.parametrize(
@@ -4840,8 +4801,9 @@ def _fork_join_executor(streams, fn):
 )
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("use_memset_stream", [False, True])
+@pytest.mark.parametrize("stream_kind", ["ordinary", "green_context"])
 def test_localized_moe_matches_full_width(
-    monkeypatch,
+    stream_kind,
     num_tokens,
     hidden_size,
     intermediate_size,
@@ -4857,9 +4819,6 @@ def test_localized_moe_matches_full_width(
     full-width weights handed to the localized call have released storage,
     and autotuning runs first, so neither the GEMMs nor the tuner may read them.
     """
-    import sys
-    from types import SimpleNamespace
-
     from flashinfer import autotune, cute_dsl_fused_moe
     from flashinfer.cute_dsl import is_rubin_cute_dsl_available
 
@@ -4867,14 +4826,20 @@ def test_localized_moe_matches_full_width(
 
     if not is_rubin_cute_dsl_available():
         pytest.skip("Rubin requires CuTe DSL 4.8")
-    try:
-        from torch.cuda.green_contexts import execute_in_green_contexts  # noqa: F401
-    except ImportError:
-        monkeypatch.setitem(
-            sys.modules,
-            "torch.cuda.green_contexts",
-            SimpleNamespace(execute_in_green_contexts=_fork_join_executor),
-        )
+    # No executor shim: this runs whichever fork/join helper the installed
+    # PyTorch resolves to, including the in-repo fallback on stock builds.
+    half_sms = torch.cuda.get_device_properties(0).multi_processor_count // 2
+    if stream_kind == "green_context":
+        green_contexts = pytest.importorskip("torch.cuda.green_contexts")
+        if not hasattr(green_contexts, "GreenContext"):
+            pytest.skip("PyTorch build has no GreenContext")
+        contexts = [
+            green_contexts.GreenContext.create(num_sms=half_sms, device_id=0)
+            for _ in range(2)
+        ]
+        domain_streams = [context.Stream() for context in contexts]
+    else:
+        domain_streams = [torch.cuda.Stream(), torch.cuda.Stream()]
 
     t = create_moe_tensors(
         num_tokens=num_tokens,
@@ -4932,9 +4897,8 @@ def test_localized_moe_matches_full_width(
         placeholders[name] = placeholder
     localized_kwargs = dict(
         localized_weights=shards,
-        localized_streams=[torch.cuda.Stream(), torch.cuda.Stream()],
-        localized_sm_count=torch.cuda.get_device_properties(0).multi_processor_count
-        // 2,
+        localized_streams=domain_streams,
+        localized_sm_count=half_sms,
         localized_memset_stream=torch.cuda.Stream() if use_memset_stream else None,
     )
     # Default tactic first: same per-column math as the full-width control.
