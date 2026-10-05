@@ -15,7 +15,8 @@ The input contract is:
 - `kv`: contiguous FP16 `[batch, 2, 8, capacity, 128]`, with K at index 0 and
   V at index 1
 - `sequence_lengths`: contiguous CUDA int32 `[batch]`; every value must be in
-  the inclusive range `[1, capacity]`
+  the inclusive range `[1, capacity]` whenever a launch runs. The lengths are
+  read on the device only; no API call copies them to the host.
 - `out`: optional caller-owned contiguous FP16 `[batch, 32, 128]`
 
 Capacities through 64 use a 256-thread short-prefix kernel. Larger capacities
@@ -33,9 +34,12 @@ sequence_lengths = torch.tensor([1024], dtype=torch.int32, device="cuda")
 out = sm110_gqa_decode(q, kv, sequence_lengths)
 ```
 
-The CUDA source closure is generated and SHA-256 attested by `manifest.json`.
-The JIT loader verifies every source digest before compiling the module.
-See [RESULTS.md](RESULTS.md) for SM110 correctness and cold-L2 CUPTI results.
+`jit.py` is the single registry of the package: `MODULES` lists the compiled
+programs and their sources, `ROUTES` the launch routes (module, FFI entry,
+kernel symbol, split count) and `PREPARED_ROUTES` the exact-shape defaults of
+the prepared API. The bindings are thin launchers over the shared
+`csrc/sm110_gqa_decode_launch.cuh` (TMA descriptors and the one-time dynamic
+shared memory opt-in) and FlashInfer's `tvm_ffi_utils.h` checks.
 
 This API is experimental because its tensor layout and fixed head geometry are
 serving-workload specific. Graduation requires broader workload validation,
@@ -57,9 +61,9 @@ prepared = prepare_sm110_gqa_decode(
 result = launch_sm110_gqa_decode_prepared(prepared)  # result is output
 ```
 
-Preparation validates tensor metadata, selects a manifest route and compiles
-outside Graph capture. Every length must remain in `[1, capacity]` at launch;
-GPU length values may change, but this precondition is not checked with a host
+Preparation validates tensor metadata, selects a route and compiles outside
+Graph capture. Every length must remain in `[1, capacity]` at launch; GPU
+length values may change, but this precondition is not checked with a host
 read. Unlike the convenience API, the prepared API requires caller output that
 does not alias any input storage, and finite positive `q_scale` (default 1).
 Launch uses the current PyTorch stream and returns asynchronously. Keep the
@@ -74,4 +78,5 @@ selects original long above capacity64; the specialized long routes also
 support explicit `num_splits=10`. Unsupported splits are rejected.
 
 Run `examples/experimental/sm110_gqa_decode_prepared.py --graph` for a prepared
-Graph example. Existing `sm110_gqa_decode` behavior is unchanged.
+Graph example, and `benchmarks/bench_sm110_gqa_decode.py` for the cold-L2 CUPTI
+comparison against PyTorch SDPA on an SM110 device.

@@ -1,0 +1,1491 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Generated-program backend: Kimi-K3 Stable LatentMoE front / tail projections
+(SM100 / SM103; flashinfer-ai/flashinfer#4568, tracker #4254).
+
+Per rank and layer, around the routed experts of ``nvidia/Kimi-K3-NVFP4``::
+
+    front:  logits     = FP32(x @ gate_weight.T)                     [T, 896]  router logits
+            latent     = BF16(x @ down_weight.T)                     [T, 3584] routed-expert input
+            shared_act = SiTU(x @ shared_gate.T, x @ shared_up.T)    [T, 6144 / TP]
+    tail:   y   = KimiRMSNorm(sum of the P routed partials)          [T, 3584] (caller-owned workspace)
+            out = BF16(y[:, cols] @ up_weight[:, cols].T + shared_act @ shared_down.T)   [T, 7168]
+                  (cols = this rank's 3584 / TP latent slice; TP > 1 all-reduces ``out`` outside)
+
+The host route mirrors the Cake production launcher exactly: for ``T <= 128``
+tokens one weight-streaming swapped-AB tcgen05 kernel per stage (the tail's
+KimiRMSNorm is fused into that launch), for ``T > 128`` a persistent 2-CTA
+tcgen05 GEMM per stage (the tail additionally runs a one-pass RMSNorm kernel
+first and launches its GEMM programmatic-dependent).  The decode planner
+(N padding, ring depth, cluster pairs, resident B operand, staged rows, issue
+gate) and the prefill planner (persistent pair tiles, trailing-wave stream-K,
+norm PDL trigger) are re-implemented here byte-for-byte from the Cake modules
+``kimi_k3_latent_moe_decode`` / ``kimi_k3_latent_moe_front`` /
+``kimi_k3_latent_moe_tail``; every plan names the physical generated kernel
+through a logical key resolved in ``cake_jit.KERNELS``.  Weights are read in
+the model layout (``nn.Linear`` ``[out, in]`` BF16); nothing is copied or
+packed and nothing is allocated at launch, so a prepared runner is CUDA Graph
+safe.  See ``README.md`` in this package.
+"""
+
+from __future__ import annotations
+
+import functools
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+import torch
+import tvm_ffi
+
+from . import cake_jit
+from .cake_jit import (
+    MODULES,
+    kernel_module_name,
+    load_cake_kimi_k3_latent_moe_module,
+)
+
+HIDDEN = 7168
+LATENT = 3584
+NUM_EXPERTS = 896
+SHARED_INTERMEDIATE = 6144
+RMS_EPS = 1.0e-5
+SUPPORTED_TP = (1, 8)
+SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+#: SM count the plan rules were frozen with (B200 and B300 both expose 148 SMs);
+#: ``prepare_*`` refuses a device with another count.
+SM_COUNT = 148
+#: Largest token count served by the decode (weight-streaming) kernels.
+DECODE_MAX_T = 128
+#: Token counts of the validated route set (both stages, TP 1 and 8).
+ROW_TOKENS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+
+# ---------------------------------------------------------------------------
+# Decode planner (port of the Cake decode kernel module ``kimi_k3_latent_moe_decode``)
+# ---------------------------------------------------------------------------
+
+BLOCK_ROWS = 128
+HALF_ROWS = 64
+CHUNK_K = 64
+EPI_WARPS = 4
+MAX_DYN_SMEM = 232448
+SMEM_BARRIER_RESERVE = 1024
+FLAG_BYTES = 1024
+SUPPORTED_N_PAD = (8, 16, 32, 64, 128)
+MAX_STAGES = 12
+GATE_MAX_DOWN_UNITS = 16
+GATE_PRO = 3
+SMEM_B1_MAX_TOKENS = 2 * EPI_WARPS
+SMEM_B1_MIN_STAGES = 6
+SMEM_B1_MAX_TOKENS_RS = 4 * EPI_WARPS
+SMEM_B1_MIN_STAGES_RS = 5
+# Round-7 lever 6a (Cake ``kimi_k3_latent_moe_decode._land_alias_auto``): in cluster mode the DSMEM landing zone of the
+# K-split combine aliases the drained A ring instead of owning smem, which buys the N_PAD 128 ring two more stages
+# (5 -> 7). The pair handshake it needs costs the short TP8 tail rows 1-2 %, so only the long weight streams (>= 32
+# chunk units per CTA of the pair) take it: the tail TP1 T=128 and front TP8 T=128 instances.
+LAND_ALIAS_N_PAD = 128
+LAND_ALIAS_MIN_UNITS = 32
+
+
+def land_alias_auto(n_pad: int, k_units: int) -> bool:
+    return int(n_pad) == LAND_ALIAS_N_PAD and int(k_units) // 2 >= LAND_ALIAS_MIN_UNITS
+
+
+TAIL_STAGE_TRIM_MAX_N_PAD = 8
+TAIL_STAGE_TRIM = 1
+ROWS_NO_TMAP_PREFETCH_MIN_N_PAD = 16
+# Round-7 lever 3b: the tail instance that skips the tensor-map prefetch (staged rows at N_PAD 16) defers the cluster
+# rendezvous to the epilogue warps only, so its TMA / MMA warps start the ring fill right after the CTA-local setup
+# (+2.7 / +2.1 % on B200 / B300 in two processes); every other instance waits for the whole pair before streaming.
+#: Front stage: K depth 2 while the depth-2 ring keeps this many stages per cluster mode
+#: (1 = one CTA per tile, 2 = cluster pairs); the tail keeps depth 1 (kernel module constant).
+FRONT_KD2_MIN_STAGES = {1: 4, 2: 6}
+TL_SLOTS = 16
+TL_MAX_GRID = 512
+DECODE_THREADS = 192
+#: Staggered cold fill of the staged-rows instance without the descriptor prefetch (the TP8 N_PAD 16 tail decode
+#: instance): the TMA warp waits for ring stage 0 to land before issuing stage 2 (symbol suffix ``_st2``).
+TAIL_ROWS_STAGGER = 2
+
+
+def _cached_plan(fn):
+    """Memoise a pure host plan (integer / boolean arguments); callers receive their own copy."""
+    cached = functools.lru_cache(maxsize=None)(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return dict(cached(*args, **kwargs))
+
+    wrapper.cache_clear = cached.cache_clear
+    return wrapper
+
+
+# Exact keyword set of the decode program's ``run`` entry (argument plan of the
+# generated binding); ``grid`` is expanded to ``grid_x/y/z``.
+DECODE_KWARGS = (
+    "A_R",
+    "A_L",
+    "A_S",
+    "A_2",
+    "B_1",
+    "B_2",
+    "out_r",
+    "out_l",
+    "out_s",
+    "counters",
+    "routed",
+    "norm_w",
+    "y_out",
+    "tl",
+    "num_tokens",
+    "k1_off",
+    "num_partials",
+    "eps",
+    "grid",
+)
+
+
+def n_pad_for(num_tokens: int) -> int:
+    for n in SUPPORTED_N_PAD:
+        if num_tokens <= n:
+            return n
+    raise ValueError(
+        f"the decode kernels support at most {SUPPORTED_N_PAD[-1]} tokens, got {num_tokens}"
+    )
+
+
+def plan_stages(
+    *,
+    n_pad: int,
+    kdepth: int = 1,
+    max_stages: int = MAX_STAGES,
+    cluster: int = 1,
+    extra_bytes: int = 0,
+    land_alias: bool = False,
+) -> int:
+    stage_bytes = (BLOCK_ROWS + n_pad) * CHUNK_K * 2 * kdepth
+    # Cluster mode: the DSMEM landing zone of the K-split combine owns smem unless it aliases the drained A ring
+    # (``land_alias``); single-CTA instances keep the 1 KiB flag/landing prefix.
+    red_alloc = (0 if land_alias else n_pad * BLOCK_ROWS * 4) if cluster == 2 else 1024
+    return max(
+        1,
+        min(
+            max_stages,
+            (MAX_DYN_SMEM - SMEM_BARRIER_RESERVE - FLAG_BYTES - red_alloc - extra_bytes)
+            // stage_bytes,
+        ),
+    )
+
+
+def smem_b1_max_tokens(k2_units_per_cta: int) -> int:
+    return SMEM_B1_MAX_TOKENS if k2_units_per_cta > GATE_MAX_DOWN_UNITS else EPI_WARPS
+
+
+def plan_partition(
+    *,
+    tiles: int,
+    k1_chunks: int,
+    k2_chunks: int,
+    kdepth: int,
+    sm_count: int,
+    n_pad: int = 8,
+) -> dict[str, int]:
+    """Aligned cluster pairs when ``2 * tiles`` fits one wave, else one CTA per tile."""
+    mpt = (k1_chunks + k2_chunks) // kdepth
+    cluster = 2 if (2 * tiles <= sm_count and mpt >= 2 and n_pad % 4 == 0) else 1
+    g = 2 * tiles if cluster == 2 else tiles
+    if g > sm_count:
+        raise ValueError(f"grid {g} exceeds the SM count {sm_count} (co-residency)")
+    return {"grid": g, "cluster": cluster, "mpt": mpt, "units": tiles * mpt}
+
+
+def kdepth_for(*k_chunks: int, requested: Optional[int] = None) -> int:
+    for d in (requested,) if requested else (4, 2, 1):
+        if d and all(k % d == 0 for k in k_chunks):
+            return d
+    raise ValueError(f"kdepth {requested} does not divide K segments {k_chunks}")
+
+
+def choose_config(
+    stage: str,
+    *,
+    tiles: int,
+    n_pad: int,
+    k_chunks: tuple[int, ...],
+    sm_count: int,
+    land_alias: bool = False,
+) -> tuple[int, int, int, int]:
+    """``(kdepth, grid, stages, cluster)`` of the production rule: depth 1 (ring takes all smem);
+    the front stage takes depth 2 while its ring keeps ``FRONT_KD2_MIN_STAGES[cluster]`` stages."""
+    k2 = k_chunks[1] if len(k_chunks) > 1 else 0
+    kd = kdepth_for(*k_chunks, requested=1)
+    part = plan_partition(
+        tiles=tiles,
+        k1_chunks=k_chunks[0],
+        k2_chunks=k2,
+        kdepth=kd,
+        sm_count=sm_count,
+        n_pad=n_pad,
+    )
+    if stage == "front" and all(k % 2 == 0 for k in k_chunks):
+        stages2 = plan_stages(
+            n_pad=n_pad, kdepth=2, cluster=part["cluster"], land_alias=land_alias
+        )
+        if stages2 >= FRONT_KD2_MIN_STAGES[part["cluster"]]:
+            part2 = plan_partition(
+                tiles=tiles,
+                k1_chunks=k_chunks[0],
+                k2_chunks=k2,
+                kdepth=2,
+                sm_count=sm_count,
+                n_pad=n_pad,
+            )
+            return 2, part2["grid"], stages2, part2["cluster"]
+    return (
+        kd,
+        part["grid"],
+        plan_stages(
+            n_pad=n_pad, kdepth=kd, cluster=part["cluster"], land_alias=land_alias
+        ),
+        part["cluster"],
+    )
+
+
+@_cached_plan
+def decode_front_plan(
+    num_tokens: int, i_local: int, sm_count: int = SM_COUNT
+) -> dict[str, Any]:
+    """Instance configuration of ``front_decode`` (router + latent + shared SiTU tiles, one launch)."""
+    if i_local % HALF_ROWS:
+        raise ValueError("I_LOCAL must be a multiple of 64")
+    n_pad = n_pad_for(num_tokens)
+    r_tiles, l_tiles, s_tiles = (
+        NUM_EXPERTS // BLOCK_ROWS,
+        LATENT // BLOCK_ROWS,
+        i_local // HALF_ROWS,
+    )
+    tiles = r_tiles + l_tiles + s_tiles
+    k_chunks = HIDDEN // CHUNK_K
+    land_alias = land_alias_auto(n_pad, k_chunks)
+    kdepth, grid, stages, cluster = choose_config(
+        "front",
+        tiles=tiles,
+        n_pad=n_pad,
+        k_chunks=(k_chunks,),
+        sm_count=sm_count,
+        land_alias=land_alias,
+    )
+    land_alias = land_alias and cluster == 2
+    return dict(
+        grid=grid,
+        n_pad=n_pad,
+        stages=stages,
+        r_tiles=r_tiles,
+        l_tiles=l_tiles,
+        s_tiles=s_tiles,
+        i_local=i_local,
+        k1_chunks=k_chunks,
+        k2_chunks=0,
+        out_r_ld=NUM_EXPERTS,
+        out_l_ld=LATENT,
+        out_s_ld=i_local,
+        kdepth=kdepth,
+        pdl=False,
+        packed=False,
+        pack_k1=k_chunks,
+        stream_only=False,
+        cluster=int(cluster),
+        fused=False,
+        fused_probe=0,
+        issue_gate=False,
+        smem_b1=False,
+        rows_smem=False,
+        timeline=False,
+        gate_pro=GATE_PRO,
+        tmap_prefetch=True,
+        stagger=0,
+        wait_warps=False,
+        land_alias=bool(land_alias),
+        tiles=tiles,
+    )
+
+
+@_cached_plan
+def decode_tail_plan(
+    num_tokens: int,
+    i_local: int,
+    tp: int,
+    num_partials: int = 1,
+    sm_count: int = SM_COUNT,
+) -> dict[str, Any]:
+    """Instance configuration of ``tail_decode_fused`` (port of ``_tail_plan`` with the production defaults)."""
+    n_pad = n_pad_for(num_tokens)
+    tiles = HIDDEN // BLOCK_ROWS
+    k_up = LATENT // tp
+    if k_up % CHUNK_K or i_local % CHUNK_K:
+        raise ValueError("K slices must be multiples of 64")
+    k1, k2 = k_up // CHUNK_K, i_local // CHUNK_K
+    land_alias = land_alias_auto(n_pad, k1 + k2)
+    kdepth, grid, stages, cluster = choose_config(
+        "tail",
+        tiles=tiles,
+        n_pad=n_pad,
+        k_chunks=(k1, k2),
+        sm_count=sm_count,
+        land_alias=land_alias,
+    )
+    land_alias = land_alias and cluster == 2
+    k1_macros = k1 // kdepth
+    cl_u0 = (k1_macros + 1) // 2 if cluster == 2 else k1_macros
+    bn_units = max(cl_u0, k1_macros - cl_u0) if cluster == 2 else k1_macros
+    bn_bytes = bn_units * n_pad * CHUNK_K * 2 * kdepth
+    k2_units = -(-k2 // (2 if cluster == 2 else 1))
+    rows_ok = kdepth == 1 and int(num_partials) == 1 and k2_units <= GATE_MAX_DOWN_UNITS
+    rows_bytes = (n_pad * LATENT + LATENT) * 2
+    use_bn = kdepth == 1 and num_tokens <= (
+        SMEM_B1_MAX_TOKENS_RS if rows_ok else smem_b1_max_tokens(k2_units)
+    )
+    use_rows = use_bn and rows_ok
+    gate_default = k2_units <= GATE_MAX_DOWN_UNITS and not use_rows
+    if use_bn:
+        bn_stages = plan_stages(
+            n_pad=n_pad,
+            kdepth=kdepth,
+            cluster=cluster,
+            extra_bytes=bn_bytes + (rows_bytes if use_rows else 0),
+            land_alias=land_alias,
+        )
+        if bn_stages < SMEM_B1_MIN_STAGES_RS and use_rows:
+            use_rows = False
+            use_bn = num_tokens <= smem_b1_max_tokens(k2_units)
+            gate_default = k2_units <= GATE_MAX_DOWN_UNITS
+            bn_stages = plan_stages(
+                n_pad=n_pad,
+                kdepth=kdepth,
+                cluster=cluster,
+                extra_bytes=bn_bytes,
+                land_alias=land_alias,
+            )
+        if use_bn and bn_stages < (
+            SMEM_B1_MIN_STAGES_RS if use_rows else SMEM_B1_MIN_STAGES
+        ):
+            use_bn = False
+            use_rows = False
+        elif use_bn:
+            stages = bn_stages
+    if n_pad <= TAIL_STAGE_TRIM_MAX_N_PAD:
+        stages = max(
+            stages - TAIL_STAGE_TRIM,
+            SMEM_B1_MIN_STAGES_RS
+            if use_rows
+            else (SMEM_B1_MIN_STAGES if use_bn else 2),
+        )
+    return dict(
+        grid=grid,
+        n_pad=n_pad,
+        stages=stages,
+        r_tiles=0,
+        l_tiles=tiles,
+        s_tiles=0,
+        i_local=i_local,
+        k1_chunks=k1,
+        k2_chunks=k2,
+        out_r_ld=NUM_EXPERTS,
+        out_l_ld=HIDDEN,
+        out_s_ld=i_local,
+        kdepth=kdepth,
+        pdl=False,
+        packed=False,
+        pack_k1=LATENT // CHUNK_K,
+        stream_only=False,
+        cluster=int(cluster),
+        fused=True,
+        fused_probe=0,
+        issue_gate=bool(gate_default),
+        smem_b1=bool(use_bn),
+        rows_smem=bool(use_rows),
+        timeline=False,
+        gate_pro=GATE_PRO,
+        tmap_prefetch=not (use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD),
+        stagger=TAIL_ROWS_STAGGER
+        if (use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD)
+        else 0,
+        wait_warps=bool(use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD),
+        land_alias=bool(land_alias),
+        tiles=tiles,
+        k1=k1,
+        k2=k2,
+    )
+
+
+def decode_symbol(plan: dict[str, Any]) -> str:
+    """Kernel symbol of one decode instance (``build_decode_gemm_ir`` naming rule)."""
+    fused = bool(plan["fused"])
+    probe = f"_fp{plan['fused_probe']}" if (fused and plan["fused_probe"]) else ""
+    gate = f"_g{plan['gate_pro']}" if (fused and plan["issue_gate"]) else ""
+    smem_b1 = "_sb" if plan["smem_b1"] else ""
+    rows = "_rs" if (plan["smem_b1"] and plan["rows_smem"]) else ""
+    stagger = f"_st{int(plan['stagger'])}" if plan["stagger"] else ""
+    return (
+        f"kimi_k3_latent_moe_decode_g{plan['grid']}_n{plan['n_pad']}_r{plan['stages']}_d{plan['kdepth']}"
+        f"_p{1 if plan['pdl'] else 0}_w{1 if plan['packed'] else 0}"
+        f"_t{plan['r_tiles']}_{plan['l_tiles']}_{plan['s_tiles']}_k{plan['k1_chunks']}_{plan['k2_chunks']}"
+        f"_o{plan['out_l_ld']}{'_so' if plan['stream_only'] else ''}_c{plan['cluster']}{'_f' if fused else ''}"
+        f"{probe}{gate}{smem_b1}{rows}{'_tl' if plan['timeline'] else ''}{'' if plan['tmap_prefetch'] else '_np'}"
+        f"{stagger}"
+        f"{'_ww' if plan['wait_warps'] else ''}{'_la' if plan['land_alias'] else ''}"
+    )
+
+
+def decode_kernel_key(plan: dict[str, Any]) -> str:
+    return f"decode:{decode_symbol(plan)}"
+
+
+# ---------------------------------------------------------------------------
+# Prefill planner (ports of kimi_k3_latent_moe_front / kimi_k3_latent_moe_tail)
+# ---------------------------------------------------------------------------
+
+BLOCK_M = 128
+BLOCK_N = 256
+B_HALF_N = 128
+CTA_GROUP = 2
+BLOCK_K = 64
+FRONT_R_TILES = (NUM_EXPERTS + BLOCK_N - 1) // BLOCK_N  # 4
+FRONT_L_TILES = LATENT // BLOCK_N  # 14
+TAIL_N_TILES = HIDDEN // BLOCK_N  # 28
+TAIL_EPI_WARPS = 8  # prefill tail GEMM epilogue warps (fused norm: one latent row each)
+GROUP_M = 16
+NORM_THREADS = 128
+NORM_ROWS_PER_CTA = NORM_THREADS // 32
+MAX_SEG = 4
+SK_MIN_NUM_K = 64
+SK_MIN_ITERS = 32
+SK_FIXUP_ITERS = 12
+SK_MIN_REUSE_ROWS = 8
+SK_PARTIAL_REUSE_MAX_REM_PCT = 55
+
+FRONT_KWARGS = (
+    "A",
+    "WG",
+    "WD",
+    "WS",
+    "logits",
+    "latent",
+    "shared_act",
+    "ws",
+    "counters",
+    "M",
+    "m_tiles",
+    "num_items",
+    "full_items",
+    "sk_ipc",
+    "sk_max_seg",
+    "sk_total",
+    "grid",
+)
+NORM_KWARGS = ("routed", "norm_weight", "y_out", "M", "num_partials", "eps", "grid")
+TAIL_GEMM_KWARGS = (
+    "A1",
+    "B1",
+    "A2",
+    "B2",
+    "out",
+    "out_map",
+    "ws",
+    "counters",
+    "M",
+    "m_tiles",
+    "k0_blocks",
+    "num_items",
+    "full_items",
+    "sk_ipc",
+    "sk_max_seg",
+    "sk_total",
+    "routed",
+    "norm_weight",
+    "y_out",
+    "norm_counter",
+    "num_partials",
+    "eps",
+    "grid",
+)
+
+
+def i_local_for_tp(tp: int) -> int:
+    if tp not in SUPPORTED_TP:
+        raise ValueError(f"tp must be one of {SUPPORTED_TP}, got {tp}")
+    return SHARED_INTERMEDIATE // tp
+
+
+def k_up_for_tp(tp: int) -> int:
+    if tp not in SUPPORTED_TP:
+        raise ValueError(f"tp must be one of {SUPPORTED_TP}, got {tp}")
+    return LATENT // tp
+
+
+def front_s_tiles(i_local: int) -> int:
+    if i_local % B_HALF_N:
+        raise ValueError(f"I_LOCAL must be a multiple of {B_HALF_N}, got {i_local}")
+    return i_local // B_HALF_N
+
+
+def front_n_tiles(i_local: int) -> int:
+    return FRONT_R_TILES + FRONT_L_TILES + front_s_tiles(i_local)
+
+
+def m_tiles_for(M: int) -> int:
+    tiles = (M + BLOCK_M - 1) // BLOCK_M
+    return tiles + (tiles % CTA_GROUP)
+
+
+def front_grid(m_tiles: int, i_local: int) -> int:
+    """One cluster (CTA pair) per output tile pair; CLC hands out the rest in raster order."""
+    return (m_tiles // CTA_GROUP) * front_n_tiles(i_local) * CTA_GROUP
+
+
+FRONT_BLOCK_N = 256
+FRONT_NUM_K_ITERS = HIDDEN // BLOCK_K  # 112 K iterations per 256 x 256 pair tile
+FRONT_SPLIT = 2  # trailing-wave tiles cut into two aligned K halves (round-8 rule)
+FRONT_SK_EPI_ITERS = (
+    18  # exposed stream-K epilogue of the last contributor, in K iterations
+)
+FRONT_SK_MIN_GAIN = (
+    0.04  # split only when the modelled saving is >= 4 % of the whole-tile cost
+)
+FRONT_EVICT_FIRST_MAX_PAIR_ROWS = (
+    2  # weight boxes re-read by <= 2 pair rows stream evict_first
+)
+
+
+def front_split_plan(cluster_tiles: int, sm_count: int = SM_COUNT) -> dict[str, int]:
+    """Round-8 front work plan (mirrors ``kimi_k3_latent_moe_front.front_split_plan``): the full
+    waves run whole 256 x 256 pair tiles; the trailing partial wave (``rem`` tiles) is cut into two
+    aligned K halves per tile when the halves fit one wave (``2 * rem <= resident``) and the modelled
+    saving ``(56 - FRONT_SK_EPI_ITERS) / whole cost`` reaches ``FRONT_SK_MIN_GAIN``.  Aligned halves
+    keep the pair rows of one weight column in lockstep (the column's weight boxes are fetched from
+    HBM once); every other cut lost on both GPUs.  Keys as the tail's ``split_plan``."""
+    resident = max(1, sm_count // CTA_GROUP)
+    full_waves, rem = divmod(cluster_tiles, resident)
+    whole = {
+        "num_items": cluster_tiles,
+        "full_items": cluster_tiles,
+        "sk_ipc": FRONT_NUM_K_ITERS,
+        "sk_max_seg": 1,
+        "sk_total": 0,
+        "sk_tiles": 0,
+    }
+    if rem == 0 or rem * FRONT_SPLIT > resident:
+        return whole
+    whole_cost = (full_waves + 1) * FRONT_NUM_K_ITERS
+    saving = FRONT_NUM_K_ITERS - FRONT_NUM_K_ITERS // FRONT_SPLIT - FRONT_SK_EPI_ITERS
+    if saving < FRONT_SK_MIN_GAIN * whole_cost:
+        return whole
+    return {
+        "num_items": cluster_tiles - rem + rem * FRONT_SPLIT,
+        "full_items": cluster_tiles - rem,
+        "sk_ipc": FRONT_NUM_K_ITERS // FRONT_SPLIT,
+        "sk_max_seg": FRONT_SPLIT,
+        "sk_total": rem * FRONT_NUM_K_ITERS,
+        "sk_tiles": rem,
+    }
+
+
+def front_evict_first(m_tiles: int) -> bool:
+    """Round-8 lever 13b: shapes whose weight boxes are re-read by at most two pair rows (T <= 512)
+    stream the weights with the ``evict_first`` L2 policy (a separate kernel instance)."""
+    return (m_tiles // CTA_GROUP) <= FRONT_EVICT_FIRST_MAX_PAIR_ROWS
+
+
+def front_kernel_key(i_local: int, evict_first: bool = False) -> str:
+    """``front:i<I_local>[e1]``: the ``e1`` suffix names the ``evict_first`` weight-policy instance."""
+    return f"front:i{int(i_local)}" + ("e1" if evict_first else "")
+
+
+@_cached_plan
+def prefill_front_plan(
+    M: int, i_local: int, sm_count: int = SM_COUNT
+) -> dict[str, Any]:
+    """Host plan of the prefill front GEMM (one persistent launch) for ``M`` tokens of one rank."""
+    m_tiles = m_tiles_for(M)
+    n_tiles = front_n_tiles(i_local)
+    cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
+    sk = front_split_plan(cluster_tiles, sm_count)
+    return dict(
+        M=M,
+        i_local=i_local,
+        m_tiles=m_tiles,
+        n_tiles=n_tiles,
+        cluster_tiles=cluster_tiles,
+        evict_first=bool(front_evict_first(m_tiles)),
+        grid=sk["num_items"] * CTA_GROUP,
+        **sk,
+    )
+
+
+def norm_kernel_key(early_trigger: bool) -> str:
+    return f"tail_norm:e{1 if early_trigger else 0}"
+
+
+# Ring depth of the prefill tail GEMM per row (Cake round-6 lever ledger, mirrored from
+# ``kimi_k3_latent_moe_tail.tail_gemm_config_for``): 6 stages for the TP1 rows at
+# T <= 256 (+1.0..+1.2 % in five paired samples on B200 and B300), 7 everywhere else.
+TAIL_NUM_STAGES = 7
+TAIL_RING6_TP = 1
+TAIL_RING6_MAX_T = 256
+TAIL_RING6_STAGES = 6
+# Round-7 lever 7 (Cake ``tail_gemm_config_for`` N128 rule): the TP8 T=512 row takes the 128-wide pair tile (56 column
+# tiles, 224 CTAs) with a 9-deep ring; every other row keeps the 256-wide tile.
+TAIL_N128_TP = 8
+TAIL_N128_T = 512
+TAIL_N128_BLOCK_N = 128
+TAIL_N128_STAGES = 9
+# Round-10 lever L1c (Cake ``tail_gemm_config_for`` ``FINAL_TS`` rule): every 256-wide tail GEMM instance stages the
+# CTA's final item (its last stream-K segment) through one TMA store per epilogue warp out of the drained TMA ring
+# instead of the direct pointer stores -- a separate kernel instance (key suffix ``t1``) with the same accumulator
+# values and the same round-to-nearest bf16 conversion, so ``out`` is bit-identical; every earlier item of a CTA keeps
+# the direct stores.  The instance takes the bf16 tensor map of ``out`` as one extra argument (``out_map``, bound by
+# value from the same tensor as the ``out`` pointer).  The 128-wide TP8 T=512 instance keeps the direct stores (one
+# 64-column pass per warp: the slab's fixed cost exceeds the exposed store it replaces).
+TAIL_FINAL_TS = True
+
+
+def tail_gemm_config(M: int, tp: int) -> tuple[int, int, bool]:
+    """``(num_stages, block_n, final_ts)`` of the production prefill tail GEMM instance for ``M`` tokens at ``tp``."""
+    if int(tp) == TAIL_RING6_TP and int(M) <= TAIL_RING6_MAX_T:
+        return TAIL_RING6_STAGES, BLOCK_N, TAIL_FINAL_TS
+    if int(tp) == TAIL_N128_TP and int(M) == TAIL_N128_T:
+        return TAIL_N128_STAGES, TAIL_N128_BLOCK_N, False
+    return TAIL_NUM_STAGES, BLOCK_N, TAIL_FINAL_TS
+
+
+def tail_gemm_num_stages(M: int, tp: int) -> int:
+    return tail_gemm_config(M, tp)[0]
+
+
+def tail_gemm_block_n(M: int, tp: int) -> int:
+    return tail_gemm_config(M, tp)[1]
+
+
+def tail_gemm_final_ts(M: int, tp: int) -> bool:
+    return tail_gemm_config(M, tp)[2]
+
+
+def tail_gemm_kernel_key(
+    tp: int,
+    weights_evict_first: bool,
+    fused_norm: bool = False,
+    num_stages: int = TAIL_NUM_STAGES,
+    block_n: int = BLOCK_N,
+    final_ts: bool = False,
+) -> str:
+    """``tail_gemm:tp<tp>e<evict>f<fused>[s<stages>][n<block_n>][t1]``; the ring-depth, tile-width and final-item
+    staged-store suffixes appear only for a non-default instance."""
+    key = f"tail_gemm:tp{int(tp)}e{1 if weights_evict_first else 0}f{1 if fused_norm else 0}"
+    if int(num_stages) != TAIL_NUM_STAGES:
+        key += f"s{int(num_stages)}"
+    if int(block_n) != BLOCK_N:
+        key += f"n{int(block_n)}"
+    if final_ts:
+        key += "t1"
+    return key
+
+
+def _sk_max_seg(sk_tiles: int, num_k: int, ipc: int) -> int:
+    return max(
+        ((t * num_k + num_k - 1) // ipc) - ((t * num_k) // ipc) + 1
+        for t in range(sk_tiles)
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def split_plan(
+    cluster_tiles: int, num_k: int, sm_count: int, reuse_rows: int = 1
+) -> dict[str, int]:
+    """Persistent plan: whole pair tiles for the full waves, a stream-K trailing wave when it wins."""
+    resident = max(1, sm_count // CTA_GROUP)
+    full = (cluster_tiles // resident) * resident
+    rem = cluster_tiles - full
+    waves = (cluster_tiles + resident - 1) // resident
+    best_cost = float(waves * num_k)
+    plan = {
+        "num_items": cluster_tiles,
+        "full_items": cluster_tiles,
+        "sk_ipc": num_k,
+        "sk_max_seg": 1,
+        "sk_total": 0,
+        "sk_tiles": 0,
+    }
+    partial_reuse = 1 < reuse_rows < SK_MIN_REUSE_ROWS
+    if (
+        rem == 0
+        or num_k < SK_MIN_NUM_K
+        or (
+            partial_reuse
+            and (full == 0 or rem * 100 > SK_PARTIAL_REUSE_MAX_REM_PCT * resident)
+        )
+    ):
+        return plan
+    # Partial B-tile reuse: split only the remainder wave after a full wave (never the folded last full wave).
+    for sk_tiles in (rem,) if partial_reuse else (rem, rem + resident):
+        if sk_tiles > cluster_tiles:
+            continue
+        full_i = cluster_tiles - sk_tiles
+        total = sk_tiles * num_k
+        for g in range(min(resident, total // SK_MIN_ITERS), 0, -1):
+            ipc = (total + g - 1) // g
+            g2 = (total + ipc - 1) // ipc
+            max_seg = _sk_max_seg(sk_tiles, num_k, ipc)
+            if max_seg > MAX_SEG:
+                continue
+            cost = (full_i // resident) * num_k + ipc + SK_FIXUP_ITERS * (max_seg - 1)
+            if cost < best_cost:
+                best_cost = cost
+                plan = {
+                    "num_items": full_i + g2,
+                    "full_items": full_i,
+                    "sk_ipc": ipc,
+                    "sk_max_seg": max_seg,
+                    "sk_total": total,
+                    "sk_tiles": sk_tiles,
+                }
+    return plan
+
+
+def norm_early_trigger(gemm_ctas: int, norm_ctas: int, sm_count: int) -> bool:
+    """Fire the norm's PDL trigger at kernel start when the GEMM's early launch cannot serialise items."""
+    return gemm_ctas > sm_count or gemm_ctas + norm_ctas <= sm_count
+
+
+def weights_evict_first(gemm_ctas: int, sm_count: int) -> bool:
+    """Single-wave GEMM grids load the weight boxes with the ``evict_first`` L2 policy (every CTA
+    streams its weight columns once; multi-wave grids re-read weight blocks from L2)."""
+    return gemm_ctas <= sm_count
+
+
+FUSED_MIN_K2_ITERS = 48
+
+
+def fused_norm_fits(M: int, gemm_ctas: int, sm_count: int) -> bool:
+    """Single-wave grids whose epilogue warps can own every latent row (one row per warp)."""
+    return gemm_ctas <= sm_count and TAIL_EPI_WARPS * gemm_ctas >= M
+
+
+def use_fused_norm(M: int, gemm_ctas: int, sm_count: int, k2_iters: int) -> bool:
+    """One launch (the GEMM's epilogue warps normalise the latent while the shared-expert K blocks
+    stream) when the grid is single-wave and the shared-expert window of ``k2_iters`` 64-wide K
+    blocks hides the normalisation: TP1 (96 blocks) fuses, TP8 (12 blocks) keeps the norm launch."""
+    return fused_norm_fits(M, gemm_ctas, sm_count) and k2_iters >= FUSED_MIN_K2_ITERS
+
+
+@_cached_plan
+def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, Any]:
+    """Host plan of the prefill tail chain (norm launch + persistent GEMM) for ``M`` tokens."""
+    k_up = k_up_for_tp(tp)
+    i_local = i_local_for_tp(tp)
+    norm_grid = (M + NORM_ROWS_PER_CTA - 1) // NORM_ROWS_PER_CTA
+    m_tiles = m_tiles_for(M)
+    num_stages, block_n, final_ts = tail_gemm_config(M, tp)
+    n_tiles = HIDDEN // block_n
+    cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
+    num_k = (k_up + i_local) // BLOCK_K
+    sk = split_plan(cluster_tiles, num_k, sm_count, min(GROUP_M, m_tiles) // CTA_GROUP)
+    gemm_grid = sk["num_items"] * CTA_GROUP
+    early = norm_early_trigger(gemm_grid, norm_grid, sm_count)
+    return dict(
+        M=M,
+        tp=tp,
+        k_up=k_up,
+        i_local=i_local,
+        norm_grid=norm_grid,
+        m_tiles=m_tiles,
+        cluster_tiles=cluster_tiles,
+        num_k=num_k,
+        gemm_grid=gemm_grid,
+        early_trigger=bool(early),
+        weights_evict_first=bool(weights_evict_first(gemm_grid, sm_count)),
+        fused_norm=bool(use_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)),
+        num_stages=num_stages,
+        block_n=block_n,
+        final_ts=bool(final_ts),
+        n_tiles=n_tiles,
+        **sk,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Route resolution (logical kernel keys of every stage)
+# ---------------------------------------------------------------------------
+
+
+def route_kernel_keys(
+    stage: str, tp: int, num_tokens: int, sm_count: int = SM_COUNT
+) -> tuple[str, ...]:
+    """Logical kernel keys launched by the production route of ``(stage, tp, num_tokens)``."""
+    if tp not in SUPPORTED_TP:
+        raise ValueError(f"tp must be one of {SUPPORTED_TP}, got {tp}")
+    if num_tokens < 1:
+        raise ValueError("num_tokens must be positive")
+    i_local = i_local_for_tp(tp)
+    if stage == "front":
+        if num_tokens <= DECODE_MAX_T:
+            return (
+                decode_kernel_key(decode_front_plan(num_tokens, i_local, sm_count)),
+            )
+        return (front_kernel_key(i_local, front_evict_first(m_tiles_for(num_tokens))),)
+    if stage == "tail":
+        if num_tokens <= DECODE_MAX_T:
+            return (
+                decode_kernel_key(
+                    decode_tail_plan(num_tokens, i_local, tp, 1, sm_count)
+                ),
+            )
+        plan = prefill_tail_plan(num_tokens, tp, sm_count)
+        gemm = tail_gemm_kernel_key(
+            tp,
+            plan["weights_evict_first"],
+            plan["fused_norm"],
+            plan["num_stages"],
+            plan["block_n"],
+            plan["final_ts"],
+        )
+        if plan["fused_norm"]:
+            return (gemm,)
+        return (norm_kernel_key(plan["early_trigger"]), gemm)
+    raise ValueError(f"stage must be 'front' or 'tail', got {stage!r}")
+
+
+def required_kernel_keys(sm_count: int = SM_COUNT) -> tuple[str, ...]:
+    """Every logical kernel the validated route set can select (both stages, TP 1 / 8, all row tokens)."""
+    keys: list[str] = []
+    for stage in ("front", "tail"):
+        for tp in SUPPORTED_TP:
+            for tokens in ROW_TOKENS:
+                for key in route_kernel_keys(stage, tp, tokens, sm_count):
+                    if key not in keys:
+                        keys.append(key)
+    return tuple(keys)
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+@functools.cache
+def _device_facts(index: int) -> tuple[tuple[int, int], int]:
+    """``(compute capability, SM count)`` of ``cuda:index``, queried once per process."""
+    properties = torch.cuda.get_device_properties(index)
+    return (int(properties.major), int(properties.minor)), int(
+        properties.multi_processor_count
+    )
+
+
+def _device_arch(device: torch.device) -> str:
+    capability, _ = _device_facts(_device_index(device))
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
+    if arch is None:
+        raise ValueError(
+            "the Kimi-K3 LatentMoE front/tail programs require compute capability 10.0 or 10.3 "
+            f"(got {capability[0]}.{capability[1]})"
+        )
+    return arch
+
+
+def _check_sm_count(device: torch.device) -> int:
+    """The decode grids and the stream-K plans are compiled for ``SM_COUNT`` SMs (the plan is part of
+    the kernel symbol); a device with another count has no registered instance."""
+    index = _device_index(device)
+    _, count = _device_facts(index)
+    if count != SM_COUNT:
+        raise NotImplementedError(
+            f"the generated programs are planned for {SM_COUNT} SMs; device {index} has {count}"
+        )
+    return index
+
+
+def generated_program_available(
+    device: torch.device,
+    stage: Optional[str] = None,
+    tp: Optional[int] = None,
+    num_tokens: Optional[int] = None,
+) -> bool:
+    """True when this checkout registers the programs for ``device`` (optionally: one exact route)."""
+    capability, count = _device_facts(_device_index(device))
+    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
+    if arch is None or not MODULES or count != SM_COUNT:
+        return False
+    if stage is None and tp is None and num_tokens is None:
+        return cake_jit.route_available(arch, required_kernel_keys())
+    if stage is None or tp is None or num_tokens is None:
+        raise ValueError("pass stage, tp and num_tokens together or none of them")
+    try:
+        keys = route_kernel_keys(stage, int(tp), int(num_tokens))
+    except ValueError:
+        return False
+    return cake_jit.route_available(arch, keys)
+
+
+# ---------------------------------------------------------------------------
+# Per-device scratch (the decode kernels' fixed ABI buffers)
+# ---------------------------------------------------------------------------
+
+_SCRATCH: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_TAIL_WS: dict[
+    tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
+_FRONT_WS: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(fp32 dummy, u32 arrival counters, u64 timeline buffer)`` per device.
+
+    The counters are zeroed once: the fused-norm protocol wraps them back to 0
+    on every launch (``atom.inc`` with limit GRID-1), so eager launches and
+    graph replays share one zero-initialised counter.  The timeline buffer is
+    written only by diagnostic instances (never registered here).
+    """
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    entry = _SCRATCH.get(index)
+    if entry is None:
+        dev = torch.device("cuda", index)
+        entry = (
+            torch.empty(1024, dtype=torch.float32, device=dev),
+            torch.zeros(4, dtype=torch.uint32, device=dev),
+            torch.zeros(TL_MAX_GRID * TL_SLOTS, dtype=torch.uint64, device=dev),
+        )
+        _SCRATCH[index] = entry
+    return entry
+
+
+def _tail_workspace(
+    device: torch.device, sk_tiles: int, max_seg: int, block_n: int = BLOCK_N
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stream-K fp32 partial workspace, self-resetting arrival counters and the fused-norm grid
+    semaphore (self-wrapping ``atom.inc``, never reset) per device and plan class."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, int(sk_tiles), int(max_seg), int(block_n))
+    entry = _TAIL_WS.get(key)
+    if entry is None:
+        dev = torch.device("cuda", index)
+        n = max(1, sk_tiles * max_seg * CTA_GROUP)
+        entry = (
+            torch.empty(n * BLOCK_M * block_n, dtype=torch.float32, device=dev),
+            torch.zeros(max(2, sk_tiles * CTA_GROUP), dtype=torch.int32, device=dev),
+            torch.zeros(4, dtype=torch.uint32, device=dev),
+        )
+        _TAIL_WS[key] = entry
+    return entry
+
+
+def _front_workspace(
+    device: torch.device, sk_tiles: int, max_seg: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Front stream-K fp32 partial slots (one ``128 x 256`` slot per contributor CTA) and the
+    self-resetting arrival counters per (split tile, CTA rank), per device and plan class; the
+    package owns them (nothing is reset between launches: the last contributor zeroes its counter)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    key = (index, int(sk_tiles), int(max_seg))
+    entry = _FRONT_WS.get(key)
+    if entry is None:
+        dev = torch.device("cuda", index)
+        n = max(1, sk_tiles * max_seg * CTA_GROUP)
+        entry = (
+            torch.empty(n * BLOCK_M * FRONT_BLOCK_N, dtype=torch.float32, device=dev),
+            torch.zeros(max(2, sk_tiles * CTA_GROUP), dtype=torch.int32, device=dev),
+        )
+        _FRONT_WS[key] = entry
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# Launch binding
+# ---------------------------------------------------------------------------
+
+
+def _bind(
+    arch: str, key: str, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], tuple]:
+    """Order ``kwargs`` by the argument plan of the program serving ``key`` and load its entry."""
+    module_name = kernel_module_name(arch, key)
+    record = MODULES[module_name]
+    grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
+    arguments = []
+    for kind, name in record["arg_plan"]:
+        if kind == "grid":
+            arguments.append(grid[name])
+        elif name in kwargs:
+            arguments.append(kwargs[name])
+        else:
+            raise KeyError(
+                f"generated module {module_name!r} expects argument {name!r} ({kind}); "
+                f"host binding provides {sorted(kwargs)}"
+            )
+    module = load_cake_kimi_k3_latent_moe_module(arch, key)
+    return getattr(module, record["ffi_entry"]), tuple(arguments)
+
+
+@dataclass(frozen=True)
+class _Launch:
+    stage: str
+    key: str
+    module: str
+    kwargs: dict[str, Any] = field(repr=False)
+    entry: Callable[..., Any] = field(repr=False)
+    arguments: tuple = field(repr=False)
+
+    def __call__(self) -> None:
+        self.entry(*self.arguments)
+
+
+@dataclass(frozen=True)
+class KimiK3LatentMoeRunner:
+    """The prepared launch sequence of one front or tail call.
+
+    ``launch()`` submits the bound programs in order on the current torch
+    stream with no CUDA allocation and no host synchronisation; the kernels
+    read every operand on device at launch, so the runner (or a CUDA Graph
+    capturing it) replays for new values written into the same buffers.
+    Prepare a new runner when a shape or a tensor binding changes.
+    """
+
+    stage: str
+    tp: int
+    rank: int
+    num_tokens: int
+    arch: str
+    route: str  # "decode" or "prefill"
+    plan: dict[str, Any] = field(repr=False)
+    launches: tuple[_Launch, ...] = field(repr=False)
+    outputs: tuple[torch.Tensor, ...] = field(repr=False)
+
+    @property
+    def kernel_keys(self) -> tuple[str, ...]:
+        return tuple(launch.key for launch in self.launches)
+
+    @property
+    def module_names(self) -> tuple[str, ...]:
+        return tuple(launch.module for launch in self.launches)
+
+    @property
+    def launch_count(self) -> int:
+        return len(self.launches)
+
+    def launch(self) -> tuple[torch.Tensor, ...]:
+        with tvm_ffi.use_torch_stream():
+            for launch in self.launches:
+                launch()
+        return self.outputs
+
+    __call__ = launch
+
+
+def _check(
+    t: torch.Tensor,
+    shape: tuple[int, ...],
+    name: str,
+    dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    if not isinstance(t, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tuple(t.shape) != tuple(shape) or t.dtype != dtype or not t.is_contiguous():
+        raise ValueError(
+            f"{name} must be a contiguous {dtype} tensor of shape {tuple(shape)}, got {tuple(t.shape)} {t.dtype}"
+        )
+
+
+def _same_device(tensors: dict[str, torch.Tensor]) -> torch.device:
+    devices = {t.device for t in tensors.values()}
+    if len(devices) != 1 or next(iter(devices)).type != "cuda":
+        raise ValueError(
+            f"every operand must live on one CUDA device, got {sorted(map(str, devices))}"
+        )
+    return next(iter(devices))
+
+
+# ---------------------------------------------------------------------------
+# Front
+# ---------------------------------------------------------------------------
+
+
+def prepare_kimi_k3_latent_moe_front(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    logits: torch.Tensor,
+    latent: torch.Tensor,
+    shared_act: torch.Tensor,
+) -> KimiK3LatentMoeRunner:
+    """Validate the front operands, plan the route and bind its launch(es).
+
+    ``shared_gate_up_weight`` is the rank-local ``[2 * I_local, 7168]`` concatenation of the
+    shared experts' gate rows followed by their up rows (``I_local = 6144 / TP``).  The JIT
+    module(s) are built and loaded here; prepare outside CUDA Graph capture.
+    """
+    T = int(x.shape[0]) if x.dim() == 2 else -1
+    _check(x, (T, HIDDEN), "x")
+    i_local = (
+        int(shared_gate_up_weight.shape[0]) // 2
+        if shared_gate_up_weight.dim() == 2
+        else 0
+    )
+    if i_local not in (SHARED_INTERMEDIATE // tp for tp in SUPPORTED_TP):
+        raise ValueError(
+            f"shared_gate_up_weight must have 2 * (6144 / TP) rows for TP in {SUPPORTED_TP}, "
+            f"got {tuple(shared_gate_up_weight.shape)}"
+        )
+    tp = SHARED_INTERMEDIATE // i_local
+    _check(gate_weight, (NUM_EXPERTS, HIDDEN), "gate_weight")
+    _check(down_weight, (LATENT, HIDDEN), "down_weight")
+    _check(shared_gate_up_weight, (2 * i_local, HIDDEN), "shared_gate_up_weight")
+    _check(logits, (T, NUM_EXPERTS), "logits", torch.float32)
+    _check(latent, (T, LATENT), "latent")
+    _check(shared_act, (T, i_local), "shared_act")
+    device = _same_device(
+        dict(
+            x=x,
+            gate_weight=gate_weight,
+            down_weight=down_weight,
+            shared_gate_up_weight=shared_gate_up_weight,
+            logits=logits,
+            latent=latent,
+            shared_act=shared_act,
+        )
+    )
+    arch = _device_arch(device)
+    index = _check_sm_count(device)
+    launches: tuple[_Launch, ...]
+    plan: dict[str, Any]
+    with torch.cuda.device(index):
+        if T <= DECODE_MAX_T:
+            plan = decode_front_plan(T, i_local)
+            key = decode_kernel_key(plan)
+            f32_dummy, counters, tl = _scratch(device)
+            kwargs = dict(
+                A_R=gate_weight,
+                A_L=down_weight,
+                A_S=shared_gate_up_weight,
+                A_2=down_weight,
+                B_1=x,
+                B_2=x,
+                out_r=logits,
+                out_l=latent,
+                out_s=shared_act,
+                counters=counters,
+                routed=latent,
+                norm_w=latent,
+                y_out=latent,
+                tl=tl,
+                num_tokens=T,
+                k1_off=0,
+                num_partials=0,
+                eps=0.0,
+                grid=(int(plan["grid"]), 1, 1),
+            )
+            assert tuple(kwargs) == DECODE_KWARGS
+            module = kernel_module_name(arch, key)
+            entry, arguments = _bind(arch, key, kwargs)
+            launches = (_Launch("front_decode", key, module, kwargs, entry, arguments),)
+            route = "decode"
+        else:
+            plan = prefill_front_plan(T, i_local)
+            key = front_kernel_key(i_local, plan["evict_first"])
+            ws, counters = _front_workspace(
+                device, plan["sk_tiles"], plan["sk_max_seg"]
+            )
+            kwargs = dict(
+                A=x,
+                WG=gate_weight,
+                WD=down_weight,
+                WS=shared_gate_up_weight,
+                logits=logits,
+                latent=latent,
+                shared_act=shared_act,
+                ws=ws,
+                counters=counters,
+                M=T,
+                m_tiles=int(plan["m_tiles"]),
+                num_items=int(plan["num_items"]),
+                full_items=int(plan["full_items"]),
+                sk_ipc=int(plan["sk_ipc"]),
+                sk_max_seg=int(plan["sk_max_seg"]),
+                sk_total=int(plan["sk_total"]),
+                grid=(int(plan["grid"]), 1, 1),
+            )
+            assert tuple(kwargs) == FRONT_KWARGS
+            module = kernel_module_name(arch, key)
+            entry, arguments = _bind(arch, key, kwargs)
+            launches = (_Launch("front_gemm", key, module, kwargs, entry, arguments),)
+            route = "prefill"
+    return KimiK3LatentMoeRunner(
+        "front", tp, 0, T, arch, route, plan, launches, (logits, latent, shared_act)
+    )
+
+
+def kimi_k3_latent_moe_front(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    logits: torch.Tensor,
+    latent: torch.Tensor,
+    shared_act: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Complete front operator for one rank into the caller-owned ``logits`` / ``latent`` / ``shared_act``."""
+    return prepare_kimi_k3_latent_moe_front(
+        x, gate_weight, down_weight, shared_gate_up_weight, logits, latent, shared_act
+    )()
+
+
+# ---------------------------------------------------------------------------
+# Tail
+# ---------------------------------------------------------------------------
+
+
+def prepare_kimi_k3_latent_moe_tail(
+    routed: torch.Tensor,
+    norm_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    shared_act: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    tp: int,
+    rank: int,
+    y_workspace: torch.Tensor,
+) -> KimiK3LatentMoeRunner:
+    """Validate the tail operands, plan the route and bind its launch(es).
+
+    ``routed`` is ``[P, T, 3584]`` BF16 (``P`` un-reduced routed-expert partials, summed on
+    device); ``y_workspace`` is a caller-owned BF16 ``[T, 3584]`` buffer that receives the
+    normalised latent (the GEMM's B operand).  ``up_weight`` is the full ``[7168, 3584]``
+    replicated up-projection; this rank multiplies its ``3584 / tp`` column slice.
+    ``shared_down_weight`` is the rank-local ``[7168, 6144 / tp]`` shard.
+    """
+    tp, rank = int(tp), int(rank)
+    if tp not in SUPPORTED_TP:
+        raise ValueError(f"tp must be one of {SUPPORTED_TP}, got {tp}")
+    if not 0 <= rank < tp:
+        raise ValueError(f"rank {rank} out of range for tp={tp}")
+    if not isinstance(routed, torch.Tensor) or routed.dim() != 3:
+        raise ValueError("routed must be a contiguous bf16 [P, T, 3584] tensor")
+    P, T = int(routed.shape[0]), int(routed.shape[1])
+    _check(routed, (P, T, LATENT), "routed")
+    i_local = i_local_for_tp(tp)
+    _check(norm_weight, (LATENT,), "norm_weight")
+    _check(up_weight, (HIDDEN, LATENT), "up_weight")
+    _check(shared_act, (T, i_local), "shared_act")
+    _check(shared_down_weight, (HIDDEN, i_local), "shared_down_weight")
+    _check(out, (T, HIDDEN), "out")
+    _check(y_workspace, (T, LATENT), "y_workspace")
+    device = _same_device(
+        dict(
+            routed=routed,
+            norm_weight=norm_weight,
+            up_weight=up_weight,
+            shared_act=shared_act,
+            shared_down_weight=shared_down_weight,
+            out=out,
+            y_workspace=y_workspace,
+        )
+    )
+    arch = _device_arch(device)
+    index = _check_sm_count(device)
+    launches: tuple[_Launch, ...]
+    plan: dict[str, Any]
+    with torch.cuda.device(index):
+        if T <= DECODE_MAX_T:
+            plan = decode_tail_plan(T, i_local, tp, P)
+            key = decode_kernel_key(plan)
+            f32_dummy, counters, tl = _scratch(device)
+            kwargs = dict(
+                A_R=up_weight,
+                A_L=up_weight,
+                A_S=up_weight,
+                A_2=shared_down_weight,
+                B_1=y_workspace,
+                B_2=shared_act,
+                out_r=f32_dummy,
+                out_l=out,
+                out_s=out,
+                counters=counters,
+                routed=routed,
+                norm_w=norm_weight,
+                y_out=y_workspace,
+                tl=tl,
+                num_tokens=T,
+                k1_off=rank * int(plan["k1"]),
+                num_partials=P,
+                eps=float(RMS_EPS),
+                grid=(int(plan["grid"]), 1, 1),
+            )
+            assert tuple(kwargs) == DECODE_KWARGS
+            module = kernel_module_name(arch, key)
+            entry, arguments = _bind(arch, key, kwargs)
+            launches = (
+                _Launch("tail_decode_fused", key, module, kwargs, entry, arguments),
+            )
+            route = "decode"
+        else:
+            plan = prefill_tail_plan(T, tp)
+            ws, counters, norm_counter = _tail_workspace(
+                device, plan["sk_tiles"], plan["sk_max_seg"], plan["block_n"]
+            )
+            gemm_key = tail_gemm_kernel_key(
+                tp,
+                plan["weights_evict_first"],
+                plan["fused_norm"],
+                plan["num_stages"],
+                plan["block_n"],
+                plan["final_ts"],
+            )
+            # ``out_map``: the bf16 tensor map of ``out`` for the final-item staged TMA store (``t1`` instances bind it
+            # by value from the same tensor as the ``out`` pointer; the argument plan of the 128-wide instance does not
+            # list it and ``_bind`` passes only what the generated program declares).
+            gemm_kwargs = dict(
+                A1=y_workspace,
+                B1=up_weight,
+                A2=shared_act,
+                B2=shared_down_weight,
+                out=out,
+                out_map=out,
+                ws=ws,
+                counters=counters,
+                M=T,
+                m_tiles=int(plan["m_tiles"]),
+                k0_blocks=rank * plan["k_up"] // BLOCK_K,
+                num_items=int(plan["num_items"]),
+                full_items=int(plan["full_items"]),
+                sk_ipc=int(plan["sk_ipc"]),
+                sk_max_seg=int(plan["sk_max_seg"]),
+                sk_total=int(plan["sk_total"]),
+                routed=routed,
+                norm_weight=norm_weight,
+                y_out=y_workspace,
+                norm_counter=norm_counter,
+                num_partials=P,
+                eps=float(RMS_EPS),
+                grid=(int(plan["gemm_grid"]), 1, 1),
+            )
+            assert tuple(gemm_kwargs) == TAIL_GEMM_KWARGS
+            gemm_module = kernel_module_name(arch, gemm_key)
+            gemm_entry, gemm_arguments = _bind(arch, gemm_key, gemm_kwargs)
+            gemm_launch = _Launch(
+                "tail_gemm",
+                gemm_key,
+                gemm_module,
+                gemm_kwargs,
+                gemm_entry,
+                gemm_arguments,
+            )
+            if plan["fused_norm"]:
+                # One launch: the GEMM's epilogue warps normalise the latent rows into
+                # ``y_workspace`` while its load warp streams the shared-expert K blocks.
+                launches = (gemm_launch,)
+            else:
+                norm_key = norm_kernel_key(plan["early_trigger"])
+                norm_kwargs = dict(
+                    routed=routed,
+                    norm_weight=norm_weight,
+                    y_out=y_workspace,
+                    M=T,
+                    num_partials=P,
+                    eps=float(RMS_EPS),
+                    grid=(int(plan["norm_grid"]), 1, 1),
+                )
+                assert tuple(norm_kwargs) == NORM_KWARGS
+                norm_module = kernel_module_name(arch, norm_key)
+                norm_entry, norm_arguments = _bind(arch, norm_key, norm_kwargs)
+                launches = (
+                    _Launch(
+                        "tail_norm",
+                        norm_key,
+                        norm_module,
+                        norm_kwargs,
+                        norm_entry,
+                        norm_arguments,
+                    ),
+                    gemm_launch,
+                )
+            route = "prefill"
+    return KimiK3LatentMoeRunner(
+        "tail", tp, rank, T, arch, route, plan, launches, (y_workspace, out)
+    )
+
+
+def kimi_k3_latent_moe_tail(
+    routed: torch.Tensor,
+    norm_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    shared_act: torch.Tensor,
+    shared_down_weight: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    tp: int,
+    rank: int,
+    y_workspace: torch.Tensor,
+) -> torch.Tensor:
+    """Complete tail for one rank into the caller-owned ``out`` (``y_workspace`` receives the normalised latent)."""
+    prepare_kimi_k3_latent_moe_tail(
+        routed,
+        norm_weight,
+        up_weight,
+        shared_act,
+        shared_down_weight,
+        out,
+        tp=tp,
+        rank=rank,
+        y_workspace=y_workspace,
+    )()
+    return out
+
+
+__all__ = [
+    "DECODE_MAX_T",
+    "HIDDEN",
+    "LATENT",
+    "NUM_EXPERTS",
+    "RMS_EPS",
+    "ROW_TOKENS",
+    "SHARED_INTERMEDIATE",
+    "SM_COUNT",
+    "TAIL_ROWS_STAGGER",
+    "SUPPORTED_COMPUTE_CAPABILITIES",
+    "SUPPORTED_TP",
+    "KimiK3LatentMoeRunner",
+    "decode_front_plan",
+    "decode_kernel_key",
+    "decode_symbol",
+    "decode_tail_plan",
+    "front_kernel_key",
+    "generated_program_available",
+    "i_local_for_tp",
+    "k_up_for_tp",
+    "kimi_k3_latent_moe_front",
+    "kimi_k3_latent_moe_tail",
+    "norm_kernel_key",
+    "prefill_tail_plan",
+    "prepare_kimi_k3_latent_moe_front",
+    "prepare_kimi_k3_latent_moe_tail",
+    "required_kernel_keys",
+    "route_kernel_keys",
+    "split_plan",
+    "tail_gemm_config",
+    "tail_gemm_final_ts",
+    "tail_gemm_kernel_key",
+    "use_fused_norm",
+    "fused_norm_fits",
+    "FUSED_MIN_K2_ITERS",
+    "weights_evict_first",
+]

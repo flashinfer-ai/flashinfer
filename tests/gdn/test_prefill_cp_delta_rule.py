@@ -207,7 +207,7 @@ def _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale, initial_state=N
         initial_state,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=ref_o,
         output_state=ref_state,
         use_cp=False,
@@ -614,7 +614,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
         None,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=ref_o,
         output_state=ref_state,
         use_cp=False,
@@ -719,7 +719,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
         None,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=ref_o,
         output_state=ref_state,
         use_cp=False,
@@ -928,7 +928,7 @@ def test_cp_delta_rule_e2e(
         None,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=ref_o,
         output_state=ref_state,
         use_cp=False,
@@ -953,11 +953,13 @@ def test_cp_delta_rule_e2e(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("seq_lens", [[128], [256, 64], [2048]])
+@pytest.mark.parametrize("seq_lens", [[128], [256, 64], [2048], [64, 2048, 128]])
+@pytest.mark.parametrize("pass_max_seqlen", [True, False])
 def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     qkv_factory,
     dtype,
     seq_lens,
+    pass_max_seqlen,
     seed=int(os.environ.get("SEED", "0")),
 ):
     _skip_if_cp_unsupported()
@@ -990,12 +992,22 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
         None,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         use_cp=True,
-        max_seqlen=max(seq_lens),
+        max_seqlen=max(seq_lens) if pass_max_seqlen else None,
     )
     ref_o, ref_state = chunk_gated_delta_rule(
-        q, k, v, alpha, beta, scale, None, True, cu_seqlens, True, use_cp=False
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+        use_cp=False,
     )
     torch.cuda.synchronize()
 

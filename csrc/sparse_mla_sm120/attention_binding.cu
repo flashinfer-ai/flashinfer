@@ -39,7 +39,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
                               Optional<TensorView> extra_kv_cache,
                               Optional<TensorView> extra_indices,
                               Optional<TensorView> extra_topk_length, int64_t model_type,
-                              int64_t chunks_per_block_override, bool extra_fp4) {
+                              int64_t chunks_per_block_override, bool extra_fp4, double lse_scale) {
   check_decode_tensors(q, kv_cache, indices, mid_out, mid_lse, output, out_lse, num_splits);
   check_attention_optional(q, extra_kv_cache, "extra_kv_cache");
   check_attention_optional(q, extra_indices, "extra_indices");
@@ -242,7 +242,8 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
                                           stride_extra_indices_token,
                                           stride_out_lse,
                                           page_block_size,
-                                          extra_fp4};
+                                          extra_fp4,
+                                          float(lse_scale)};
   const auto status = dispatch_decode(params, plan, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "decode-dsv4: " << cudaGetErrorString(status);
 }
@@ -255,7 +256,8 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
                                 TensorView mid_out, TensorView mid_lse, TensorView output,
                                 TensorView out_lse, int64_t num_splits, double sm_scale,
                                 Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
-                                int64_t model_type, int64_t chunks_per_block_override) {
+                                int64_t model_type, int64_t chunks_per_block_override,
+                                double lse_scale) {
   check_decode_tensors(q, kv_cache, indices, mid_out, mid_lse, output, out_lse, num_splits);
   check_attention_vector(q, topk_length, q.size(0), dl_int32, "topk_length");
   check_attention_vector(q, attn_sink, q.size(1), dl_float32, "attn_sink");
@@ -356,6 +358,7 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
   params.topk_length = topk_len_ptr;
   params.attn_sink = attn_sink_ptr;
   params.sm_scale = sm_scale;
+  params.lse_scale = lse_scale;
   params.page_stride_bytes = kv_layout.stride_kv_block;
   params.indices_stride_elems = stride_indices_token;
   params.out_lse_stride_elems = stride_out_lse;
@@ -367,7 +370,8 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
                           TensorView indices, TensorView mid, TensorView mlse, TensorView output,
                           TensorView lse, double scale, Optional<TensorView> lengths,
                           Optional<TensorView> sink, Optional<TensorView> extra_cache,
-                          Optional<TensorView> extra_indices, Optional<TensorView> extra_lengths) {
+                          Optional<TensorView> extra_indices, Optional<TensorView> extra_lengths,
+                          double lse_scale) {
   const auto& plan = execution::unpack_plan(descriptor, false);
   const auto& m = plan.metadata;
   const auto format = cache_format_info(static_cast<ModelType>(m.model));
@@ -405,6 +409,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
   p.allocated_splits = plan.chunk_capacity;
   p.chunks_per_block = plan.cpb;
   p.sm_scale = scale;
+  p.lse_scale = lse_scale;
   p.q = static_cast<const bf16*>(q.data_ptr());
   p.kv = static_cast<const uint8_t*>(cache.data_ptr());
   p.indices = static_cast<const int32_t*>(indices.data_ptr());

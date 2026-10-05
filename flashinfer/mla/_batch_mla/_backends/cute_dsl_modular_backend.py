@@ -23,10 +23,12 @@ class _BatchMLAPagedAttentionCuteDslModularBackend(
     _plan_capabilities = MLAPlanCapabilities(
         backend_name="cute-dsl-modular",
         lse_modes=frozenset({"none"}),
-        kv_layouts=frozenset({"combined"}),
+        kv_layouts=frozenset({"combined", "adjacent-split"}),
         output_scales=frozenset({"none"}),
         scale_modes=frozenset({"default", "bmm-scalar"}),
-        supports_sinks=True,
+        # The native modular reduction counts sink mass once per N warp
+        # partition. Reject until the kernel implements a single sink mass.
+        supports_sinks=False,
         requires_packed_query=True,
         requires_packed_kv_cache=True,
     )
@@ -45,6 +47,9 @@ class _BatchMLAPagedAttentionCuteDslModularBackend(
         head_dim_ckv: int,
         head_dim_kpe: int,
         resolved_is_var_seq: bool,
+        is_var_q: bool,
+        total_q: int,
+        max_seq_len: int,
         use_sinks: bool,
         enable_pdl: bool,
     ) -> tuple[Any, Any, torch.Tensor, int, int]:

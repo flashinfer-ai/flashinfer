@@ -94,7 +94,7 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
     :param acc_dtype: Accumulator dtype (Float32 for bf16 inputs).
     :param tile_shape_mn: CTA tile (M, N) over the **accumulator** (for gated
         activations N counts interleaved up+gate columns and the C output has
-        N/2 columns; non-gated C has N columns). M in {64, 128}; N % 64 == 0,
+        N/2 columns; non-gated C has N columns). M in {64, 128}; tile N % 64 == 0,
         N <= 256.
     :param topk: MoE top-k (token id = ``token_id_mapping[row] // topk``).
     :param raster_along_m: Persistent walk order.
@@ -147,6 +147,7 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         k: int,
         l: int,  # noqa: E741
         swizzle_size: int = 1,
+        gated: bool = True,
     ) -> bool:
         """Whether the kernel can run this problem with these options.
 
@@ -158,13 +159,15 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         :param m: permuted rows, a multiple of the M tile (``moe_sort`` pads
             every expert to whole tiles); (2, 1) also needs an even M-tile
             count so that every CTA pair is complete
-        :param n: B rows per expert (``2I`` for gated activations, ``I``
-            for ``Relu2``), a multiple of the N tile (the epilogue writes
-            full N tiles)
-        :param k: hidden size, a multiple of the 64-element K tile (the
-            gather loader moves whole K tiles)
+        :param n: B rows per expert: ``2I`` for gated activations, a multiple
+            of 64 so that every 32-column up/gate pair is whole; ``I`` for
+            ``Relu2``, any width with 16-byte C rows. A partial last N tile
+            is fine: TMA zero-fills the B rows past ``n`` and clips the C
+            store at the tensor's extent
+        :param k: hidden size, a multiple of 8
         :param l: local experts, at least 1
         :param swizzle_size: persistent-walk swizzle, a positive int
+        :param gated: whether ``n`` is the interleaved ``2I`` (gated) or ``I``
         """
         if (
             a_dtype.width != 16
@@ -176,8 +179,14 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
             return False
         if not isinstance(swizzle_size, int) or swizzle_size < 1:
             return False
-        tile_m, tile_n = tile_shape_mn
-        if m % tile_m != 0 or n % tile_n != 0 or k % 64 != 0 or l < 1:
+        tile_m = tile_shape_mn[0]
+        if m % tile_m != 0 or k % 8 != 0 or l < 1:
+            return False
+        # Gated N holds 32-column up/gate pairs (64 columns each); non-gated N
+        # only needs 16-byte C rows for the TMA store.
+        if gated and n % 64 != 0:
+            return False
+        if not gated and (n * c_dtype.width) % 128 != 0:
             return False
         if cluster_shape_mn == (2, 1) and (m // tile_m) % 2 != 0:
             return False
@@ -634,6 +643,10 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         gather_chunk = tidx_in_warpgroup % 8
         m_iters = self.tile_shape_mnk[0] // 16
         elems_per_chunk = 8  # 16 B of 16-bit elements
+        # A partial last K tile: chunks past K re-read the row's last in-bounds
+        # chunk (finite data) instead of running off the row; B's TMA zero-fills
+        # the same columns, so those MMA results are exactly zero.
+        k_last_chunk = cute.size(mA_mkl, mode=[1]) - elems_per_chunk
 
         a_atom_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
@@ -782,13 +795,15 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
                         # A: cp.async gather by all 128 producer threads.
                         a_pipeline.producer_acquire(a_producer_state)
                         k_base = a_producer_state.count * self.tile_shape_mnk[2]
-                        chunk_col = gather_chunk * elems_per_chunk
+                        k_col = cutlass.min(
+                            k_base + gather_chunk * elems_per_chunk, k_last_chunk
+                        )
                         for i in cutlass.range_constexpr(m_iters):
                             # Source: token row in the unpermuted activations.
                             src_off = cute.assume(
                                 token_offset[i] * mA_mkl.layout[0].stride,
                                 divby=8,
-                            ) + cute.assume(k_base + chunk_col, divby=8)
+                            ) + cute.assume(k_col, divby=8)
                             tAgA_slice = cute.make_tensor(
                                 mA_mkl.iterator + src_off,
                                 layout=cute.make_layout((elems_per_chunk,)),

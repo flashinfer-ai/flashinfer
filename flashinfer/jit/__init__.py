@@ -96,6 +96,9 @@ from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
 from .cake_megamoe_topk_reduce import (
     gen_cake_megamoe_topk_reduce_module as gen_cake_megamoe_topk_reduce_module,
 )
+from .cake_sampling import gen_cake_sampling_module as gen_cake_sampling_module
+from .cake_sampling import get_cake_sampling_uri as get_cake_sampling_uri
+from .cake_sampling import load_cake_sampling_module as load_cake_sampling_module
 from .cake_megamoe_topk_reduce import (
     get_cake_megamoe_topk_reduce_module as get_cake_megamoe_topk_reduce_module,
 )
@@ -190,16 +193,19 @@ from .nvfp4_attention_sm120 import (
 )
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
-from .blackwell_bgmv_moe import (
-    gen_blackwell_bgmv_moe_module as gen_blackwell_bgmv_moe_module,
+from .cake_bgmv_moe import (
+    gen_cake_bgmv_moe_module as gen_cake_bgmv_moe_module,
 )
-from .blackwell_bgmv_moe import (
-    load_blackwell_bgmv_moe_module as load_blackwell_bgmv_moe_module,
+from .cake_bgmv_moe import (
+    load_cake_bgmv_moe_module as load_cake_bgmv_moe_module,
 )
 from .monomoe import gen_monomoe_module as gen_monomoe_module
 from .monomoe import load_monomoe_module as load_monomoe_module
 from .fused_moe import (
     gen_alphamoe_fused_router_module as gen_alphamoe_fused_router_module,
+)
+from .fused_moe import (
+    gen_alphamoe_nvfp4_sm100_module as gen_alphamoe_nvfp4_sm100_module,
 )
 
 
