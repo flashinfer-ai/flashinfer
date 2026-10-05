@@ -267,7 +267,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_6c8cf3bc0fb0f521e478(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_head_tiles, int has_sinks)
+kernel_cake_dsv4_e970a153da9403a85eaf(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_head_tiles, int has_sinks, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -380,6 +380,32 @@ kernel_cake_dsv4_6c8cf3bc0fb0f521e478(const __grid_constant__ CUtensorMap tmap_q
             int _max_0 = ((sparse_topk_lens[query_idx] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx] + sparse_topk_lens_offset) : (0));
             int _min_0 = ((_max_0) < (sparse_topk) ? (_max_0) : (sparse_topk));
             int active_topk = _min_0;
+            int query_batch = query_idx / max_q_len;
+            int query_offset = query_idx - query_batch * max_q_len;
+            int query_length = max_q_len;
+            if (ragged_query != 0) {
+                query_batch = 0;
+                #pragma unroll 1
+                for (int batch = 0; batch < batch_size; batch++) {
+                    if (query_idx >= cum_seq_lens_q[batch + 1]) {
+                        query_batch = batch + 1;
+                    }
+                }
+                int query_begin = cum_seq_lens_q[query_batch];
+                query_length = cum_seq_lens_q[query_batch + 1] - query_begin;
+                query_offset = query_idx - query_begin;
+            }
+            int visible = seq_lens[query_batch] - query_length + query_offset + 1;
+            if (visible < 0) {
+                visible = 0;
+            }
+            if (visible > 128) {
+                visible = 128;
+            }
+            int swa_visible = visible;
+            if (active_topk > swa_visible) {
+                active_topk = swa_visible;
+            }
             const int warp_in_compute = warp;
             const int tmem_row_origin = warp_in_compute * 32;
             const int logical_row_origin = warp_in_compute * 16;

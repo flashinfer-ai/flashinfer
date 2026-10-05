@@ -323,7 +323,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_02682799d7ade068feaf(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_9d634e11225093492305(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -755,10 +755,6 @@ kernel_cake_dsv4_02682799d7ade068feaf(const __grid_constant__ CUtensorMap tmap_q
                 float row_max_val = -CAKE_INF;
                 float row_sum_val = 0.0f;
                 int sink_head = ((1) ? my_row : my_row);
-                if (has_sinks != 0 && sink_head < num_heads && split_idx_2 + bid % 2 == 0) {
-                    row_max_val = sinks[sink_head] * 1.4426950408889634f / softmax_scale_log2;
-                    row_sum_val = 1.0f;
-                }
                 #pragma unroll 1
                 for (int tile = 0; tile < (num_kv_tiles_1 - bid % 2 + 1) / 2; tile++) {
                     int pipeline_tile = softmax_tile_cursor + tile;
@@ -1246,6 +1242,18 @@ kernel_cake_dsv4_02682799d7ade068feaf(const __grid_constant__ CUtensorMap tmap_q
                         row_sum_val = _fma_3;
                     }
                 }
+                if (has_sinks != 0 && sink_head < num_heads && split_idx_2 + bid % 2 == 0 && n_half == 0) {
+                    float sink_max = sinks[sink_head] * 1.4426950408889634f / softmax_scale_log2;
+                    if (row_max_val > -CAKE_INF) {
+                        float _fma_4 = __fmaf_rn(sink_max, softmax_scale_log2, (-row_max_val) * softmax_scale_log2);
+                        float sink_delta = _fma_4;
+                        float _exp2_1 = approx_exp2(sink_delta);
+                        row_sum_val = row_sum_val + _exp2_1;
+                    } else {
+                        row_max_val = sink_max;
+                        row_sum_val = 1.0f;
+                    }
+                }
                 smem_stats_sum[stats_row] = row_sum_val;
                 smem_stats_final_max[stats_row] = row_max_val;
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -1425,10 +1433,10 @@ kernel_cake_dsv4_02682799d7ade068feaf(const __grid_constant__ CUtensorMap tmap_q
                 float wt_peer_sum = smem_merge_stats_recv[64 + my_row_1];
                 float _max_5 = max_noftz(wt_max, wt_peer_max);
                 float wt_merged_max = _max_5;
-                float _exp2_1 = approx_exp2((wt_max - wt_merged_max) * softmax_scale_log2_1);
-                float wt_s_own = ((wt_max > -CAKE_INF) ? _exp2_1 : 0.0f);
-                float _exp2_2 = approx_exp2((wt_peer_max - wt_merged_max) * softmax_scale_log2_1);
-                float wt_s_peer = ((wt_peer_max > -CAKE_INF) ? _exp2_2 : 0.0f);
+                float _exp2_2 = approx_exp2((wt_max - wt_merged_max) * softmax_scale_log2_1);
+                float wt_s_own = ((wt_max > -CAKE_INF) ? _exp2_2 : 0.0f);
+                float _exp2_3 = approx_exp2((wt_peer_max - wt_merged_max) * softmax_scale_log2_1);
+                float wt_s_peer = ((wt_peer_max > -CAKE_INF) ? _exp2_3 : 0.0f);
                 float wt_merged_sum = wt_sum * wt_s_own + wt_peer_sum * wt_s_peer;
                 float _rcp_0 = approx_rcp(wt_merged_sum);
                 float wt_inv_sum = ((wt_merged_sum > 0.0f) ? _rcp_0 : 0.0f);

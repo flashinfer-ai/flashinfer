@@ -278,7 +278,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_query_tokens, int has_sinks)
+kernel_cake_dsv4_98b6013eb28fff267149(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_query_tokens, int has_sinks, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -449,6 +449,32 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                 int active_topk = _min_2;
                 int _max_5 = (((active_topk + 128 - 1) / 128) > (1) ? ((active_topk + 128 - 1) / 128) : (1));
                 int num_loop_steps = _max_5;
+                int* swa_row = swa_indices + (query_idx * (unsigned int)swa_index_stride);
+                int* compressed_row = compressed_indices + (query_idx * (unsigned int)compressed_index_stride);
+                int window_query_idx = (int)query_idx;
+                int query_batch = window_query_idx / max_q_len;
+                int query_offset = window_query_idx - query_batch * max_q_len;
+                int query_length = max_q_len;
+                if (ragged_query != 0) {
+                    query_batch = 0;
+                    #pragma unroll 1
+                    for (int batch = 0; batch < batch_size; batch++) {
+                        if (window_query_idx >= cum_seq_lens_q[batch + 1]) {
+                            query_batch = batch + 1;
+                        }
+                    }
+                    int query_begin = cum_seq_lens_q[query_batch];
+                    query_length = cum_seq_lens_q[query_batch + 1] - query_begin;
+                    query_offset = window_query_idx - query_begin;
+                }
+                int visible = seq_lens[query_batch] - query_length + query_offset + 1;
+                if (visible < 0) {
+                    visible = 0;
+                }
+                if (visible > 128) {
+                    visible = 128;
+                }
+                int swa_visible = visible;
                 float row_max = -CAKE_INF;
                 float row_sum = 0.0f;
                 if (has_sinks != 0 && my_row < num_heads) {
@@ -462,6 +488,35 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                 }
                 #pragma unroll 1
                 for (int tile = 0; tile < num_loop_steps; tile++) {
+                    int tile_bound = active_topk;
+                    if (tile == 0) {
+                        if (swa_visible < tile_bound) {
+                            tile_bound = swa_visible;
+                        }
+                    }
+                    int group_col = tile * 128 + lane * 4;
+                    int group_rows[4];
+                    #pragma unroll
+                    for (int row_i = 0; row_i < 4; row_i++) {
+                        group_rows[row_i] = 0;
+                    }
+                    if (group_col < tile_bound) {
+                        int* group_src = ((tile == 0) ? (swa_row + group_col) : (compressed_row + (group_col - 128)));
+                        int _vec_load_0[4];
+                        {
+                            const int4* _ivptr_0 = reinterpret_cast<const int4*>(group_src + 0);
+                            int4 _ivld_0;
+                            _ivld_0 = *_ivptr_0;
+                            _vec_load_0[0 + 0] = _ivld_0.x;
+                            _vec_load_0[0 + 1] = _ivld_0.y;
+                            _vec_load_0[0 + 2] = _ivld_0.z;
+                            _vec_load_0[0 + 3] = _ivld_0.w;
+                        }
+                        #pragma unroll
+                        for (int row_i_1 = 0; row_i_1 < 4; row_i_1++) {
+                            group_rows[row_i_1] = _vec_load_0[row_i_1];
+                        }
+                    }
                     unsigned int sync_stage = global_tile & 1;
                     unsigned int sync_phase = global_tile >> 1 & 1;
                     mbarrier_wait(s_full_addr + (sync_stage) * 8, sync_phase);
@@ -479,7 +534,7 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[32])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[33])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[34])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[35])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[36])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[37])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[38])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[39])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[40])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[41])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[42])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[43])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[44])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[45])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[46])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[47])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[48])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[49])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[50])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[51])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[52])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[53])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[54])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[55])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[56])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[57])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[58])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[59])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[60])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[61])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[62])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[63]))
                         : "r"(score_addr + 32));
-                    int valid_cols = active_topk - tile * 128 - col_half * 64;
+                    int valid_cols = tile_bound - tile * 128 - col_half * 64;
                     if (valid_cols < 0) {
                         valid_cols = 0;
                     }
@@ -488,15 +543,15 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                     }
                     uint32_t _slice_lo_mask_0;
                     {
-                        int _lim_0 = valid_cols;
-                        if (_lim_0 <= 0) { _slice_lo_mask_0 = 0u; }
-                        else if (_lim_0 >= 32) { _slice_lo_mask_0 = 0xFFFFFFFFu; }
+                        int _lim_1 = valid_cols;
+                        if (_lim_1 <= 0) { _slice_lo_mask_0 = 0u; }
+                        else if (_lim_1 >= 32) { _slice_lo_mask_0 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_slice_lo_mask_0) : "r"(_lim_0));
+                                "}" : "=r"(_slice_lo_mask_0) : "r"(_lim_1));
                         }
                     }
                     if (!(_slice_lo_mask_0 & (1u << 0))) _tmem_load_0[0] = -CAKE_INF;
@@ -533,15 +588,15 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                     if (!(_slice_lo_mask_0 & (1u << 31))) _tmem_load_0[31] = -CAKE_INF;
                     uint32_t _slice_lo_mask_1;
                     {
-                        int _lim_1 = valid_cols - 32;
-                        if (_lim_1 <= 0) { _slice_lo_mask_1 = 0u; }
-                        else if (_lim_1 >= 32) { _slice_lo_mask_1 = 0xFFFFFFFFu; }
+                        int _lim_2 = valid_cols - 32;
+                        if (_lim_2 <= 0) { _slice_lo_mask_1 = 0u; }
+                        else if (_lim_2 >= 32) { _slice_lo_mask_1 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_slice_lo_mask_1) : "r"(_lim_1));
+                                "}" : "=r"(_slice_lo_mask_1) : "r"(_lim_2));
                         }
                     }
                     if (!(_slice_lo_mask_1 & (1u << 0))) _tmem_load_0[32] = -CAKE_INF;
@@ -576,10 +631,30 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                     if (!(_slice_lo_mask_1 & (1u << 29))) _tmem_load_0[61] = -CAKE_INF;
                     if (!(_slice_lo_mask_1 & (1u << 30))) _tmem_load_0[62] = -CAKE_INF;
                     if (!(_slice_lo_mask_1 & (1u << 31))) _tmem_load_0[63] = -CAKE_INF;
-                    float2 _reg_reduce_max2_2 = {-CAKE_INF, -CAKE_INF};
-                    row_max_x32_accum(&_tmem_load_0[0], _reg_reduce_max2_2);
-                    row_max_x32_accum(&_tmem_load_0[32], _reg_reduce_max2_2);
-                    float _tmem_load_0_max = row_max_reduce(_reg_reduce_max2_2);
+                    int _vote_0 = __any_sync(0xFFFFFFFF, group_rows[0] < 0 && group_col < tile_bound || group_rows[1] < 0 && tile_bound > group_col + 1 || group_rows[2] < 0 && tile_bound > group_col + 2 || group_rows[3] < 0 && tile_bound > group_col + 3);
+                    int any_negative = _vote_0;
+                    if (any_negative != 0) {
+                        int half_shift = col_half * 16;
+                        unsigned int negative_slots[4];
+                        #pragma unroll
+                        for (int row_i_2 = 0; row_i_2 < 4; row_i_2++) {
+                            unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, group_rows[row_i_2] < 0);
+                            negative_slots[row_i_2] = _vote_1 >> (unsigned int)half_shift;
+                        }
+                        #pragma unroll
+                        for (int group = 0; group < 16; group++) {
+                            #pragma unroll
+                            for (int row_i_3 = 0; row_i_3 < 4; row_i_3++) {
+                                if ((negative_slots[row_i_3] >> (unsigned int)group & 1) != 0) {
+                                    _tmem_load_0[group * 4 + row_i_3] = -CAKE_INF;
+                                }
+                            }
+                        }
+                    }
+                    float2 _reg_reduce_max2_3 = {-CAKE_INF, -CAKE_INF};
+                    row_max_x32_accum(&_tmem_load_0[0], _reg_reduce_max2_3);
+                    row_max_x32_accum(&_tmem_load_0[32], _reg_reduce_max2_3);
+                    float _tmem_load_0_max = row_max_reduce(_reg_reduce_max2_3);
                     float tile_max = _tmem_load_0_max;
                     float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, tile_max, 16);
                     float _max_6 = max_noftz(tile_max, _shfl_xor_0);
@@ -609,19 +684,19 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                     bool empty_row = new_max == -CAKE_INF;
                     float safe_max = ((empty_row) ? 0.0f : new_max);
                     float max_scaled = safe_max * softmax_scale_log2;
-                    const float2 _fma_b2_3 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_4 = {-max_scaled, -max_scaled};
+                    const float2 _fma_b2_4 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_5 = {-max_scaled, -max_scaled};
                     #pragma unroll
                     for (int _lf = 0; _lf < 32; _lf++)
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_lf], _fma_b2_3, _fma_c2_4);
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_lf], _fma_b2_4, _fma_c2_5);
                     #pragma unroll
                     for (int _le = 0; _le < 64; _le++) {
                         _tmem_load_0[_le] = approx_exp2(_tmem_load_0[_le]);
                     }
-                    float2 _reg_reduce_sum2_5 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_0[0], &_reg_reduce_sum2_5);
-                    softmax_block_sum(&_tmem_load_0[32], &_reg_reduce_sum2_5);
-                    float _tmem_load_0_sum = _reg_reduce_sum2_5.x + _reg_reduce_sum2_5.y;
+                    float2 _reg_reduce_sum2_6 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_0[0], &_reg_reduce_sum2_6);
+                    softmax_block_sum(&_tmem_load_0[32], &_reg_reduce_sum2_6);
+                    float _tmem_load_0_sum = _reg_reduce_sum2_6.x + _reg_reduce_sum2_6.y;
                     float block_sum = _tmem_load_0_sum;
                     float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, block_sum, 16);
                     block_sum = block_sum + _shfl_xor_1;
@@ -767,8 +842,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                     float acc_scale_1 = ((max_diff != 0.0f) ? _exp2_1 : 1.0f);
                     mbarrier_wait(o_full_addr, global_tile_1 - 1 & 1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _vote_0 = __any_sync(0xFFFFFFFF, acc_scale_1 < 1.0f);
-                    int any_rescale = _vote_0;
+                    int _vote_2 = __any_sync(0xFFFFFFFF, acc_scale_1 < 1.0f);
+                    int any_rescale = _vote_2;
                     if (any_rescale != 0) {
                         #pragma unroll
                         for (int v_stage = 0; v_stage < 4; v_stage++) {
@@ -1241,8 +1316,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                 if (query_idx_3 >= (unsigned int)num_query_tokens) {
                     break;
                 }
-                int* swa_row = swa_indices + (query_idx_3 * (unsigned int)swa_index_stride);
-                int* compressed_row = compressed_indices + (query_idx_3 * (unsigned int)compressed_index_stride);
+                int* swa_row_1 = swa_indices + (query_idx_3 * (unsigned int)swa_index_stride);
+                int* compressed_row_1 = compressed_indices + (query_idx_3 * (unsigned int)compressed_index_stride);
                 int _max_11 = ((sparse_topk_lens[query_idx_3] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx_3] + sparse_topk_lens_offset) : (0));
                 int _min_4 = ((_max_11) < (sparse_topk) ? (_max_11) : (sparse_topk));
                 int active_topk_3 = _min_4;
@@ -1262,8 +1337,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                         int page1 = page0 + 128;
                         int safe0 = ((page0 <= last_aligned) ? page0 : last_aligned);
                         int safe1 = ((page1 <= last_aligned) ? page1 : last_aligned);
-                        int* src0 = ((safe0 < 128) ? (swa_row + safe0) : (compressed_row + (safe0 - 128)));
-                        int* src1 = ((safe1 < 128) ? (swa_row + safe1) : (compressed_row + (safe1 - 128)));
+                        int* src0 = ((safe0 < 128) ? (swa_row_1 + safe0) : (compressed_row_1 + (safe0 - 128)));
+                        int* src1 = ((safe1 < 128) ? (swa_row_1 + safe1) : (compressed_row_1 + (safe1 - 128)));
                         asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16;"
                             :: "r"(smem_page_offsets_addr + page_stage * 1024 + (unsigned int)(lane_base * 4)), "l"(src0));
                         asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16;"
@@ -1485,8 +1560,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                             }
                         }
                         #pragma unroll
-                        for (int group = 0; group < 8; group++) {
-                            int row_offset = load_warp_rank * 4 + group * 16;
+                        for (int group_1 = 0; group_1 < 8; group_1++) {
+                            int row_offset = load_warp_rank * 4 + group_1 * 16;
                             int raw_rows[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[(0) + 3]))
@@ -1514,8 +1589,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                                 }
                             }
                             #pragma unroll
-                            for (int group_1 = 0; group_1 < 8; group_1++) {
-                                int row_offset_1 = load_warp_rank * 4 + group_1 * 16;
+                            for (int group_2 = 0; group_2 < 8; group_2++) {
+                                int row_offset_1 = load_warp_rank * 4 + group_2 * 16;
                                 int raw_rows_1[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[(0) + 3]))
@@ -1550,8 +1625,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                                 }
                             }
                             #pragma unroll
-                            for (int group_2 = 0; group_2 < 8; group_2++) {
-                                int row_offset_2 = load_warp_rank * 4 + group_2 * 16;
+                            for (int group_3 = 0; group_3 < 8; group_3++) {
+                                int row_offset_2 = load_warp_rank * 4 + group_3 * 16;
                                 int raw_rows_2[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_2[(0) + 3]))
@@ -1589,8 +1664,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                                 }
                             }
                             #pragma unroll
-                            for (int group_3 = 0; group_3 < 8; group_3++) {
-                                int row_offset_3 = load_warp_rank * 4 + group_3 * 16;
+                            for (int group_4 = 0; group_4 < 8; group_4++) {
+                                int row_offset_3 = load_warp_rank * 4 + group_4 * 16;
                                 int raw_rows_3[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_3[(0) + 3]))
@@ -1627,8 +1702,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                                 }
                             }
                             #pragma unroll
-                            for (int group_4 = 0; group_4 < 8; group_4++) {
-                                int row_offset_4 = load_warp_rank * 4 + group_4 * 16;
+                            for (int group_5 = 0; group_5 < 8; group_5++) {
+                                int row_offset_4 = load_warp_rank * 4 + group_5 * 16;
                                 int raw_rows_4[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_4[(0) + 3]))
@@ -1669,8 +1744,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                                 }
                             }
                             #pragma unroll
-                            for (int group_5 = 0; group_5 < 8; group_5++) {
-                                int row_offset_5 = load_warp_rank * 4 + group_5 * 16;
+                            for (int group_6 = 0; group_6 < 8; group_6++) {
+                                int row_offset_5 = load_warp_rank * 4 + group_6 * 16;
                                 int raw_rows_5[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_5[(0) + 3]))
@@ -1698,8 +1773,8 @@ kernel_cake_dsv4_e6bdf8b1667c0a5c8236(const __grid_constant__ CUtensorMap tmap_q
                                 }
                             }
                             #pragma unroll
-                            for (int group_6 = 0; group_6 < 8; group_6++) {
-                                int row_offset_6 = load_warp_rank * 4 + group_6 * 16;
+                            for (int group_7 = 0; group_7 < 8; group_7++) {
+                                int row_offset_6 = load_warp_rank * 4 + group_7 * 16;
                                 int raw_rows_6[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_6[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_6[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_6[(0) + 3]))

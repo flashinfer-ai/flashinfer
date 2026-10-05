@@ -303,7 +303,7 @@ __device__ __forceinline__ void tma_gather4_gmem2smem_mc_cta2(
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_d9bedcbcf0039caa1110(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_k, const __grid_constant__ CUtensorMap tmap_compressed_k, const __grid_constant__ CUtensorMap tmap_swa_v, const __grid_constant__ CUtensorMap tmap_compressed_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int num_query_tokens, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int total_work_items)
+kernel_cake_dsv4_91159fa491772fe59e81(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_k, const __grid_constant__ CUtensorMap tmap_compressed_k, const __grid_constant__ CUtensorMap tmap_swa_v, const __grid_constant__ CUtensorMap tmap_compressed_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int num_query_tokens, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -503,6 +503,33 @@ kernel_cake_dsv4_d9bedcbcf0039caa1110(const __grid_constant__ CUtensorMap tmap_q
                 int _max_4 = ((sparse_topk_lens[query_idx] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx] + sparse_topk_lens_offset) : (0));
                 int _min_0 = ((_max_4) < (sparse_topk) ? (_max_4) : (sparse_topk));
                 int active_topk = _min_0;
+                int query_batch = query_idx / max_q_len;
+                int query_offset = query_idx - query_batch * max_q_len;
+                int query_length = max_q_len;
+                if (ragged_query != 0) {
+                    query_batch = 0;
+                    #pragma unroll 1
+                    for (int batch = 0; batch < batch_size; batch++) {
+                        if (query_idx >= cum_seq_lens_q[batch + 1]) {
+                            query_batch = batch + 1;
+                        }
+                    }
+                    int query_begin = cum_seq_lens_q[query_batch];
+                    query_length = cum_seq_lens_q[query_batch + 1] - query_begin;
+                    query_offset = query_idx - query_begin;
+                }
+                int visible = seq_lens[query_batch] - query_length + query_offset + 1;
+                if (visible < 0) {
+                    visible = 0;
+                }
+                if (visible > 128) {
+                    visible = 128;
+                }
+                int swa_visible = visible;
+                int swa_active_topk = active_topk;
+                if (swa_active_topk > swa_visible) {
+                    swa_active_topk = swa_visible;
+                }
                 int num_kv_tiles = ((sparse_topk + 128 - 1) / 128 + ((0) ? 3 : 1) - 1) / ((0) ? 3 : 1);
                 int first_kv_tile = split_idx * num_kv_tiles;
                 int head_idx = cta_rank * 64 + my_row;
@@ -537,7 +564,11 @@ kernel_cake_dsv4_d9bedcbcf0039caa1110(const __grid_constant__ CUtensorMap tmap_q
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=f"(_tmem_load_0[32]), "=f"(_tmem_load_0[33]), "=f"(_tmem_load_0[34]), "=f"(_tmem_load_0[35]), "=f"(_tmem_load_0[36]), "=f"(_tmem_load_0[37]), "=f"(_tmem_load_0[38]), "=f"(_tmem_load_0[39]), "=f"(_tmem_load_0[40]), "=f"(_tmem_load_0[41]), "=f"(_tmem_load_0[42]), "=f"(_tmem_load_0[43]), "=f"(_tmem_load_0[44]), "=f"(_tmem_load_0[45]), "=f"(_tmem_load_0[46]), "=f"(_tmem_load_0[47]), "=f"(_tmem_load_0[48]), "=f"(_tmem_load_0[49]), "=f"(_tmem_load_0[50]), "=f"(_tmem_load_0[51]), "=f"(_tmem_load_0[52]), "=f"(_tmem_load_0[53]), "=f"(_tmem_load_0[54]), "=f"(_tmem_load_0[55]), "=f"(_tmem_load_0[56]), "=f"(_tmem_load_0[57]), "=f"(_tmem_load_0[58]), "=f"(_tmem_load_0[59]), "=f"(_tmem_load_0[60]), "=f"(_tmem_load_0[61]), "=f"(_tmem_load_0[62]), "=f"(_tmem_load_0[63])
                         : "r"(score_base + 32));
-                    int valid_cols = active_topk - (first_kv_tile + tile) * 128 - n_half * 64;
+                    int tile_bound = active_topk;
+                    if (first_kv_tile + tile == 0) {
+                        tile_bound = swa_active_topk;
+                    }
+                    int valid_cols = tile_bound - (first_kv_tile + tile) * 128 - n_half * 64;
                     if (valid_cols < 0) {
                         valid_cols = 0;
                     }
