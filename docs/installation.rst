@@ -31,14 +31,21 @@ The easiest way to install FlashInfer is via pip. Please note that the package c
 
     pip install flashinfer-python
 
-This installs ``nccl-extensions`` and, on Linux with Python 3.10–3.13,
-``nvshmem4py-cu13`` as base dependencies, including when FlashInfer is installed
-transitively by another package.
+For NVSHMEM-based kernels, select the extra matching PyTorch's CUDA major:
+
+.. code-block:: bash
+
+    pip install "flashinfer-python[cu12]"  # CUDA 12
+    pip install "flashinfer-python[cu13]"  # CUDA 13
+
+Downstream packages can depend on the matching extra to install ``nvshmem4py``
+transitively. ``nccl-extensions`` is already a base dependency. NVSHMEM remains
+outside the base requirements because its CUDA 12 and CUDA 13 packages have
+incompatible ``cuda-python`` requirements.
 
 .. note::
-   ``nvshmem4py-cu13`` requires ``cuda-python>=13.0,<14.0`` and conflicts with
-   CUDA 12 environments that require ``cuda-python<13``. Python 3.14 installs
-   omit NVSHMEM because no compatible wheels are available.
+   The CUDA extras install NVSHMEM on Linux with Python 3.10–3.13. NVSHMEM wheels
+   are not available for Python 3.14, so those installs omit NVSHMEM.
 
 Package Options
 """""""""""""""
