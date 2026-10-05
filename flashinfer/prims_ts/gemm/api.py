@@ -32,7 +32,7 @@ from flashinfer.utils import (
 from .config import PrimsTsGemmConfig
 from .support import nvfp4_128x4_numel as _nvfp4_128x4_numel
 from .support import validate_dense_gemm
-from .tactics import derived_ab_stages, fallback_cluster
+from .tactics import default_fp8_mma_k, derived_ab_stages, fallback_cluster
 
 _COMPILED: dict[tuple[PrimsTsGemmConfig, int, int, bool], object] = {}
 _KERNEL_MODULES: dict[PrimsTsGemmConfig, ModuleType] = {}
@@ -217,6 +217,21 @@ def _overlap_epilogue_supported(config: PrimsTsGemmConfig) -> bool:
     return False
 
 
+def _fp8_mma_k(config: PrimsTsGemmConfig) -> int:
+    if config.operand_format != "fp8_e4m3":
+        if config.fp8_mma_k is not None:
+            raise ValueError("fp8_mma_k requires FP8 operands")
+        return 32
+    mma_k = (
+        default_fp8_mma_k(config.arch) if config.fp8_mma_k is None else config.fp8_mma_k
+    )
+    if mma_k not in (32, 64):
+        raise ValueError(f"fp8_mma_k must be 32 or 64, got {mma_k}")
+    if mma_k == 64 and config.arch != 107:
+        raise ValueError("fp8_mma_k=64 requires SM107")
+    return mma_k
+
+
 def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
     module = _KERNEL_MODULES.get(config)
     if module is not None:
@@ -256,6 +271,7 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
                 "MMA-K=64 BF16 QKV/QKNorm/RoPE epilogues only"
             )
         module.use_nvfp4_tmem_overlap = config.tmem_overlap
+        module._MMA_K_BYTES = _fp8_mma_k(config)
         module._tile_k_override = config.tile_k
         if config.nvfp4_mma_k not in (64, 96):
             raise ValueError("nvfp4_mma_k must be 64 or 96")
@@ -424,6 +440,7 @@ def _compile(
                 f"tm{config.tile_m}",
                 f"tn{config.tile_n}",
                 f"tk{config.tile_k}",
+                f"mk{module._MMA_K_BYTES}",
                 f"f4mk{config.nvfp4_mma_k}",
                 f"epiw{field(config.epilogue_warps)}",
                 f"overlap{int(config.tmem_overlap)}",

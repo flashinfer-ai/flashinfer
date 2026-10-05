@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from flashinfer.gemm import fp8_linear, fp8_linear_swiglu, fp8_qkv_qknorm_rope
 from flashinfer.prims_ts.gemm import PrimsTsGemmConfig
+from flashinfer.prims_ts.gemm.api import _fp8_mma_k
 from flashinfer.utils import get_compute_capability
 
 
@@ -31,6 +32,59 @@ def test_fp8_linear_per_token_per_channel_and_bias():
     a, w, a_scale, w_scale = _fp8_problem()
     bias = torch.randn((w.shape[0],), device="cuda", dtype=torch.bfloat16)
     actual = fp8_linear(a, w, a_scale, w_scale, bias)
+    expected = (
+        F.linear(a.float(), w.float()) * a_scale[:, None] * w_scale[None, :]
+        + bias.float()
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=0.2, rtol=2e-2)
+
+
+def _linear_config(arch, operand_format="fp8_e4m3", has_bias=False, **kwargs):
+    return PrimsTsGemmConfig(
+        arch, operand_format, "bf16", "linear", has_bias, None, None, **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    "arch,operand_format,fp8_mma_k,expected",
+    [
+        (100, "fp8_e4m3", None, 32),
+        (103, "fp8_e4m3", None, 32),
+        (107, "fp8_e4m3", None, 64),
+        (107, "fp8_e4m3", 32, 32),
+        (100, "nvfp4_e2m1", None, 32),
+        (107, "nvfp4_e2m1", None, 32),
+    ],
+)
+def test_fp8_mma_k_defaults(arch, operand_format, fp8_mma_k, expected):
+    config = _linear_config(arch, operand_format, fp8_mma_k=fp8_mma_k)
+    assert _fp8_mma_k(config) == expected
+
+
+@pytest.mark.parametrize(
+    "arch,operand_format,fp8_mma_k,match",
+    [
+        (100, "fp8_e4m3", 64, "requires SM107"),
+        (103, "fp8_e4m3", 64, "requires SM107"),
+        (107, "fp8_e4m3", 128, "32 or 64"),
+        (107, "nvfp4_e2m1", 32, "requires FP8"),
+    ],
+)
+def test_fp8_mma_k_rejects_unsupported_config(arch, operand_format, fp8_mma_k, match):
+    config = _linear_config(arch, operand_format, fp8_mma_k=fp8_mma_k)
+    with pytest.raises(ValueError, match=match):
+        _fp8_mma_k(config)
+
+
+@pytest.mark.parametrize("fp8_mma_k", [32, 64])
+def test_fp8_linear_mma_k_on_sm107(fp8_mma_k):
+    _require_gemm_gpu()
+    if get_compute_capability(torch.device("cuda")) != (10, 7):
+        pytest.skip("64 B FP8 MMA K requires SM107")
+    a, w, a_scale, w_scale = _fp8_problem(m=256, n=512, k=512)
+    bias = torch.randn((w.shape[0],), device="cuda", dtype=torch.bfloat16)
+    config = _linear_config(107, has_bias=True, fp8_mma_k=fp8_mma_k)
+    actual = fp8_linear(a, w, a_scale, w_scale, bias, config=config)
     expected = (
         F.linear(a.float(), w.float()) * a_scale[:, None] * w_scale[None, :]
         + bias.float()

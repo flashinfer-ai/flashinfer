@@ -158,6 +158,8 @@ use_gated_activation = False
 # independently sizes scale tiles to a multiple of MMA instruction K.
 _K_TILE_BYTES = 128
 # Ordinary MMA instructions consume 32 B of K; SM103 NVFP4 can consume 48 B.
+# SM107 dense FP8 can consume 64 B (instruction-descriptor k_dim=1);
+# _load_kernel sets this from config.fp8_mma_k.
 _MMA_K_BYTES = 32
 nvfp4_mma_k = 64
 # Optional override for pipeline tile K in elements. None → one 128 B K-box.
@@ -249,6 +251,10 @@ def _refresh_input_dependent_config() -> None:
     nvfp4 = _is_fp4(input_dtype)
     if nvfp4 and nvfp4_mma_k == 96 and k_tile not in (256, 768):
         raise ValueError("NVFP4 MMA-K=96 supports tile_k=256 or tile_k=768")
+    if _MMA_K_BYTES not in (32, 64):
+        raise ValueError(f"MMA K must be 32 or 64 bytes, got {_MMA_K_BYTES}")
+    if _MMA_K_BYTES == 64 and not _is_fp8(input_dtype):
+        raise ValueError("64 B MMA K is only supported for dense FP8 inputs")
     if k_tile <= 0:
         raise ValueError(f"tile_k must be positive, got {k_tile}")
     split_k = nvfp4 and nvfp4_mma_k == 96 and k_tile == 256
@@ -1218,6 +1224,7 @@ class TmemCResource(MemoryResource):
                 c_dtype=cutlass.Float32,
                 n_dim=mma_inst_shape_mnk[1],
                 m_dim=mma_inst_shape_mnk[0],
+                k_dim=1 if _MMA_K_BYTES == 64 else 0,
             )
         self.tmem_raw_addr = context.tmem_ptr_i32.load()
         self.cta_rank_in_cluster = cute.arch.block_idx_in_cluster()

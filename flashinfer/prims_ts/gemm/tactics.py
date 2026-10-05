@@ -49,6 +49,11 @@ def derived_ab_stages(
     return stages
 
 
+def default_fp8_mma_k(arch: int) -> int:
+    """FP8 MMA instruction K used when ``fp8_mma_k`` is unset."""
+    return 64 if arch == 107 else 32
+
+
 def stage_candidates(derived: int) -> tuple[int, ...]:
     """Derived count plus the nearest smaller and larger known counts."""
     if derived not in _STAGE_CHOICES:

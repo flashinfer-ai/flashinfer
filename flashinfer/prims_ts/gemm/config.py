@@ -35,6 +35,9 @@ class PrimsTsGemmConfig:
     has_qkv_scale: bool = False
     # 96 selects the SM103 NVFP4 instruction; 64 retains the reference path.
     nvfp4_mma_k: int = 64
+    # Dense FP8 MMA instruction K. None picks the arch default (64 on SM107,
+    # otherwise 32); 64 requires SM107.
+    fp8_mma_k: Optional[int] = None
     # None retains the epilogue default (8 for overlap/fused, otherwise 4).
     epilogue_warps: Optional[int] = None
     tmem_overlap: bool = False
