@@ -28,7 +28,7 @@
 //   (the slab row) CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, stream, threads,
 //   smem_bytes, fused_tail,
 //                                    fused_block_tail, coarse_sample, spec_sample, slab_tail,
-//                                    coarse_push) ...
+//                                    coarse_push, leader_push) ...
 //   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, variant_flags, smem_bytes) ...
 // and then includes this header.  Every table entry is taken verbatim from manifest.json.
 #ifndef CAKE_SAMPLING_BODY_FILE
@@ -85,6 +85,8 @@ constexpr int64_t kFlagSpecSample =
     64;  // host-side build selection (speculative sample); never forwarded to the kernel
 constexpr int64_t kFlagSlabTail = 128;    // host-side build selection (slab-tail form of a sample
                                           // build); never forwarded to the kernel
+constexpr int64_t kFlagLeaderPush = 512;  // host-side build selection (leader-push exchange form of
+                                          // the default / sample builds of a multi-CTA stream)
 constexpr int64_t kFlagCoarsePush = 256;  // host-side build selection (pushed-coarse-sums form of
                                           // the default build); never forwarded to the kernel
 constexpr int32_t kTopKScalar = 1;
@@ -138,6 +140,10 @@ struct Stage1Variant {
   int32_t coarse_push;  // 1: each CTA stores its coarse histogram sums into every CTA's shared
                         // memory for the two-level select (the default build's twin taken by
                         // launch_flags bit 8 on a two-launch chain)
+  int32_t leader_push;  // 1: every CTA pushes its compacted candidate list into rank 0's receive
+                        // buffer and its length into every CTA before the single exchange barrier
+                        // (the default / sample builds' twin of a multi-CTA stream taken by
+                        // launch_flags bit 9)
 };
 
 struct Stage23Variant {
@@ -149,7 +155,7 @@ struct Stage23Variant {
 };
 
 #define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused, \
-                                   fused_block, wide, spec, slab, push)                \
+                                   fused_block, wide, spec, slab, push, leader)        \
   {reinterpret_cast<const void*>(&symbol),                                             \
    cluster,                                                                            \
    ept,                                                                                \
@@ -161,7 +167,8 @@ struct Stage23Variant {
    wide,                                                                               \
    spec,                                                                               \
    slab,                                                                               \
-   push},
+   push,                                                                               \
+   leader},
 #define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, variant_flags, smem) \
   {reinterpret_cast<const void*>(&symbol), threads, items, variant_flags, smem},
 
@@ -180,7 +187,12 @@ struct Stage23Variant {
 // (coarse_push = 1: each CTA stores its coarse histogram sums into every CTA's shared memory so
 // the two-level select reads them locally) are a second build of the default build of the
 // streaming variants with the two-level select, taken only by launch_flags bit 8 on a two-launch
-// chain -- it wins those chains on GB300 / H100 and loses them on B200.
+// chain -- it wins those chains on GB300 / H100 and loses them on B200.  The leader-push exchange
+// (leader_push = 1: the CTAs store their candidate lists straight into rank 0's receive buffer
+// and their lengths into every CTA before one exchange barrier; rank 0 gathers locally) is a
+// third build of the default and sample builds of the multi-CTA streaming variants, taken only
+// by launch_flags bit 9 -- it is exclusive with the whole-CTA tail, the slab tail and the pushed
+// coarse sums, and the host selects it per capability, ept and row length.
 inline const Stage1Variant kStage1Table[] = {
     CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
 inline const Stage23Variant kStage23Table[] = {
@@ -191,11 +203,11 @@ inline std::atomic<uint64_t> kStage23Prepared[sizeof(kStage23Table) / sizeof(Sta
 
 inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t stream,
                                        int32_t block_tail, int32_t wide, int32_t spec, int32_t slab,
-                                       int32_t push) {
+                                       int32_t push, int32_t leader) {
   for (const Stage1Variant& v : kStage1Table) {
     if (v.cluster == cluster && v.ept == ept && v.stream == stream &&
         v.fused_block_tail == block_tail && v.coarse_sample == wide && v.spec_sample == spec &&
-        v.slab_tail == slab && v.coarse_push == push)
+        v.slab_tail == slab && v.coarse_push == push && v.leader_push == leader)
       return &v;
   }
   return nullptr;
@@ -382,9 +394,15 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
          "bits 3, 4, 6 and 7";
   TVM_FFI_ICHECK(!(want_push && (launch_flags & kFlagFuseTail) != 0))
       << "launch_flags bit 8 (pushed coarse sums) is for two-launch chains (no bit 0)";
+  const int32_t want_leader = (launch_flags & kFlagLeaderPush) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_leader && (stream_variant == 0 || cluster < 2)))
+      << "the leader-push exchange build (launch_flags bit 9) exists for multi-CTA streaming "
+         "variants only";
+  TVM_FFI_ICHECK(!(want_leader && (want_block_tail || want_slab || want_push)))
+      << "launch_flags bit 9 (leader-push exchange) is exclusive with bits 3, 7 and 8";
   const Stage1Variant* v = FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
                                       static_cast<int32_t>(stream_variant), want_block_tail,
-                                      want_coarse, want_spec, want_slab, want_push);
+                                      want_coarse, want_spec, want_slab, want_push, want_leader);
   TVM_FFI_ICHECK(v != nullptr)
       << "no frozen stage-1 variant for cluster=" << cluster << " ept=" << ept
       << " stream=" << stream_variant
@@ -392,7 +410,8 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
       << (want_coarse ? " with the coarse-sample build (launch_flags bit 4)" : "")
       << (want_spec ? " with the speculative-sample build (launch_flags bit 6)" : "")
       << (want_slab ? " with the slab tail (launch_flags bit 7)" : "")
-      << (want_push ? " with the pushed coarse sums (launch_flags bit 8)" : "");
+      << (want_push ? " with the pushed coarse sums (launch_flags bit 8)" : "")
+      << (want_leader ? " with the leader-push exchange (launch_flags bit 9)" : "");
   PrepareKernel(device_id, kStage1Prepared[v - kStage1Table], v->kernel, v->smem_bytes, v->cluster);
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept

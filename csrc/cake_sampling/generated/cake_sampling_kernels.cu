@@ -30,3 +30,5 @@
 #include "cake_sampling_kernels_part6.cuh"
 #include "cake_sampling_kernels_part7.cuh"
 #include "cake_sampling_kernels_part8.cuh"
+#include "cake_sampling_kernels_part9.cuh"
+#include "cake_sampling_kernels_part10.cuh"
