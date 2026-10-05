@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -29,60 +28,57 @@ class CakeFmhaRequestOrderedDecodePlan:
     write_lse: bool
 
 
-def _request_ordered_plan_from_route(
-    route: dict[str, Any], *, batch_size: int
-) -> CakeFmhaRequestOrderedDecodePlan:
-    plan = route["build_plan"]
-    grid_x, grid_y, grid_z = (int(value) for value in plan["grid"])
-    return CakeFmhaRequestOrderedDecodePlan(
-        module_name=str(route["module_name"]),
-        batch_size=batch_size,
-        q_len=int(plan["q_len"]),
-        workspace_parts=int(plan["workspace_parts"]),
-        grid=(grid_x, grid_y, grid_z),
-        total_tiles=int(plan["total_tiles"]),
-        write_lse=bool(plan["write_lse"]),
-    )
-
-
 def _fallback_cake_fmha_request_ordered_plan(
     *, batch_size: int, q_len: int, write_lse: bool
 ) -> CakeFmhaRequestOrderedDecodePlan:
+    """The single-split persistent program for ``q_len``/``write_lse``: valid for every KV length."""
+
     if batch_size <= 0 or q_len not in (1, 6):
         raise ValueError(
             "request-ordered Cake FMHA requires a positive batch and q_len 1 or 6"
         )
-    route_slug = (
-        f"fallback_q{q_len}_ordered_s1_lse" if write_lse else f"fallback_q{q_len}"
-    )
-    matches = []
-    for route in get_cake_fmha_request_ordered_manifest()["routes"]:
-        plan = route["build_plan"]
-        if (
-            plan["route_slug"] == route_slug
-            and plan["q_len"] == q_len
-            and plan["ordered"] is True
-            and plan["num_split"] == 1
-            and plan["workspace_parts"] == 1
-            and plan["write_lse"] is write_lse
-            and not plan["segmented_clc"]
-            and not plan["static_one_tile"]
-        ):
-            matches.append(route)
-    module_names = {route["module_name"] for route in matches}
-    if len(module_names) != 1:
+    matches = [
+        module["name"]
+        for module in get_cake_fmha_request_ordered_manifest()["modules"]
+        if module["kind"] == "persistent"
+        and module["num_split"] == 1
+        and module["q_len"] == q_len
+        and module["write_lse"] is write_lse
+    ]
+    if len(matches) != 1:
         raise RuntimeError(
-            f"generated request-order fallback {route_slug!r} is not unique"
+            f"generated request-order fallback for q_len {q_len} "
+            f"(write_lse={write_lse}) is not unique"
         )
-    route = matches[0]
     return CakeFmhaRequestOrderedDecodePlan(
-        module_name=str(route["module_name"]),
+        module_name=matches[0],
         batch_size=batch_size,
         q_len=q_len,
         workspace_parts=1,
         grid=(q_len, 1, batch_size),
         total_tiles=batch_size * q_len,
         write_lse=write_lse,
+    )
+
+
+def _exact_route_lengths(route: dict[str, Any]) -> tuple[int, ...]:
+    period = tuple(int(value) for value in route["kv_lens"]["period"])
+    count = int(route["kv_lens"]["count"])
+    return (period * -(-count // len(period)))[:count]
+
+
+def _plan_from_exact_route(
+    route: dict[str, Any], *, batch_size: int
+) -> CakeFmhaRequestOrderedDecodePlan:
+    grid_x, grid_y, grid_z = (int(value) for value in route["grid"])
+    return CakeFmhaRequestOrderedDecodePlan(
+        module_name=str(route["module"]),
+        batch_size=batch_size,
+        q_len=int(route["q_len"]),
+        workspace_parts=int(route["workspace_parts"]),
+        grid=(grid_x, grid_y, grid_z),
+        total_tiles=int(route["total_tiles"]),
+        write_lse=bool(route["write_lse"]),
     )
 
 
@@ -98,7 +94,9 @@ def plan_cake_fmha_request_ordered_paged_decode(
 
     The returned plan contains no device data.  Call this before CUDA Graph
     capture, then update the contents of the device ``request_order`` tensor
-    in place between replays.
+    in place between replays.  An exact exported route (two-wave and low-Q1
+    cluster schedules, split LSE rows) is selected only for its exported
+    request lengths; everything else uses the single-split persistent program.
     """
 
     lengths = tuple(int(value) for value in kv_lens)
@@ -111,28 +109,16 @@ def plan_cake_fmha_request_ordered_paged_decode(
     if not 0 < logical_batch <= batch_size:
         raise ValueError("real_batch_size must be in [1, len(kv_lens)]")
 
-    exact = []
-    for route in get_cake_fmha_request_ordered_manifest()["routes"]:
-        args = route["args"]
-        plan = route["build_plan"]
+    for route in get_cake_fmha_request_ordered_manifest()["exact_routes"]:
         if (
-            tuple(args["q_lens"]) == (q_len,) * batch_size
-            and tuple(args["kv_lens"]) == lengths
-            and int(args["real_batch_size"]) == logical_batch
-            and args["request_order_case"] == request_order_case
-            and bool(args["provide_lse"]) is bool(write_lse)
-            and plan["ordered"] is True
+            int(route["q_len"]) == q_len
+            and int(route["kv_lens"]["count"]) == batch_size
+            and int(route["real_batch_size"]) == logical_batch
+            and route["request_order_case"] == request_order_case
+            and bool(route["write_lse"]) is bool(write_lse)
+            and _exact_route_lengths(route) == lengths
         ):
-            exact.append(route)
-    identities = {
-        (
-            route["module_name"],
-            json.dumps(route["build_plan"], sort_keys=True, separators=(",", ":")),
-        )
-        for route in exact
-    }
-    if len(identities) == 1:
-        return _request_ordered_plan_from_route(exact[0], batch_size=batch_size)
+            return _plan_from_exact_route(route, batch_size=batch_size)
     return _fallback_cake_fmha_request_ordered_plan(
         batch_size=batch_size,
         q_len=q_len,
@@ -152,17 +138,15 @@ def _is_authenticated_request_ordered_plan(
     )
     if plan == fallback:
         return True
-    for route in get_cake_fmha_request_ordered_manifest()["routes"]:
-        build_plan = route["build_plan"]
+    for route in get_cake_fmha_request_ordered_manifest()["exact_routes"]:
         if (
-            build_plan["ordered"] is True
-            and len(route["args"]["q_lens"]) == plan.batch_size
-            and route["module_name"] == plan.module_name
-            and int(build_plan["q_len"]) == plan.q_len
-            and int(build_plan["workspace_parts"]) == plan.workspace_parts
-            and tuple(int(value) for value in build_plan["grid"]) == plan.grid
-            and int(build_plan["total_tiles"]) == plan.total_tiles
-            and bool(build_plan["write_lse"]) is plan.write_lse
+            int(route["kv_lens"]["count"]) == plan.batch_size
+            and route["module"] == plan.module_name
+            and int(route["q_len"]) == plan.q_len
+            and int(route["workspace_parts"]) == plan.workspace_parts
+            and tuple(int(value) for value in route["grid"]) == plan.grid
+            and int(route["total_tiles"]) == plan.total_tiles
+            and bool(route["write_lse"]) is plan.write_lse
         ):
             return True
     return False
