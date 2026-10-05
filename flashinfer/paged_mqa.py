@@ -4,7 +4,9 @@ from .api_logging import flashinfer_experimental_api
 
 
 @flashinfer_experimental_api
-def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None, *, out=None):
+def get_paged_mqa_logits_metadata(
+    context_lens, block_kv, num_sms, indices=None, *, out=None
+):
     """DeepGEMM's ``get_paged_mqa_logits_metadata`` signature, as a placeholder (no launch).
 
     ``context_lens`` int32 ``[B, next_n]`` (two-dimensional), ``block_kv`` an
@@ -19,7 +21,9 @@ def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None,
         get_paged_mqa_logits_metadata as _get_paged_mqa_logits_metadata,
     )
 
-    return _get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=indices, out=out)
+    return _get_paged_mqa_logits_metadata(
+        context_lens, block_kv, num_sms, indices=indices, out=out
+    )
 
 
 @flashinfer_experimental_api

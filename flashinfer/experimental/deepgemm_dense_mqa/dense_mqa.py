@@ -246,7 +246,11 @@ def h64_admission(arch):
     tiers the producer measured and did not admit there (the engine keeps its stock kernel; ``reason`` says
     why), two disjoint lists. Empty / ``None`` when the catalog has no 64-head family. Host-only."""
     record = _catalog()["policy"].get("dense_admission")
-    arches = sorted(record["admitted_routes"]) if record is not None else sorted(_catalog()["arches"])
+    arches = (
+        sorted(record["admitted_routes"])
+        if record is not None
+        else sorted(_catalog()["arches"])
+    )
     if arch not in arches:
         raise ValueError(f"arch must be one of {arches}, got {arch!r}")
     if record is None:
@@ -279,7 +283,9 @@ def _admitted(route, arch):
             f"(withheld on {sorted(a for a, v in verdicts.items() if not v)}); pass arch=device_arch(device)"
         )
     if arch not in record["admitted_routes"]:
-        raise ValueError(f"arch must be one of {sorted(record['admitted_routes'])}, got {arch!r}")
+        raise ValueError(
+            f"arch must be one of {sorted(record['admitted_routes'])}, got {arch!r}"
+        )
     return verdicts.get(arch, True)
 
 
@@ -491,6 +497,7 @@ class DenseMqaPlan:
         output=None,
         metadata=None,
         sm_count=None,
+        enforce_admission=True,
     ):
         import torch
 
@@ -513,7 +520,19 @@ class DenseMqaPlan:
             )
         if keys < 1:
             raise ValueError("positive K is required")
-        if not dense_route_available(num_heads, queries, keys, precision, arch=arch):
+        available = dense_route_available(
+            num_heads, queries, keys, precision, arch=arch
+        )
+        if not available and not enforce_admission:
+            # Export validation runs every catalogued row on every architecture; the per-arch admission
+            # (policy.dense_admission) is routing policy for the engines, not a precondition of the program.
+            try:
+                available = route_name(
+                    precision, queries, keys, num_heads
+                ) in _catalog()["routes"] and (keys % kv_alignment(num_heads) == 0)
+            except ValueError:
+                available = False
+        if not available:
             try:
                 route = route_name(precision, queries, keys, num_heads)
             except ValueError:
@@ -743,7 +762,9 @@ def fp8_mqa_logits(
     keys = int(kv_values.shape[0]) if kv_values.ndim == 2 else 0
     if (
         clean_logits
-        and route_record("fp8", queries, keys, num_heads, arch=device_arch(q.device)).get("clean_logits")
+        and route_record(
+            "fp8", queries, keys, num_heads, arch=device_arch(q.device)
+        ).get("clean_logits")
         != "fused"
     ):
         raise ValueError(

@@ -90,7 +90,9 @@ def dense_route_available(num_heads, queries, keys, precision="fp8", *, arch=Non
     the Cake route; a 64-head tier the producer withheld on an architecture (``dense_admission(arch)``) is not
     served there, so the engine keeps its stock kernel.  ``arch`` (:func:`device_arch` of the device, e.g.
     ``"sm_100a"``) may be omitted only where the architectures agree on the route; otherwise ``ValueError``."""
-    from .experimental.deepgemm_dense_mqa.dense_mqa import dense_route_available as _available
+    from .experimental.deepgemm_dense_mqa.dense_mqa import (
+        dense_route_available as _available,
+    )
 
     return _available(num_heads, queries, keys, precision, arch=arch)
 

@@ -405,12 +405,20 @@ def test_dense_route_table_is_catalog_driven():
             assert _runtime.dense_route_available(64, 100_000, 7, arch=arch) == (
                 "fp8:h64:full:any" in admitted
             )
-        h64_route = next(r for r in _runtime._catalog()["routes"] if r.startswith("fp8:h64:"))
+        h64_route = next(
+            r for r in _runtime._catalog()["routes"] if r.startswith("fp8:h64:")
+        )
         record = _runtime._catalog()["routes"][h64_route]
         assert record["clean_logits"] == "raw" and record["kv_alignment"] == 1
         assert [stage for stage, _p in record["stages"]] == ["logits"]
-        assert _runtime.program_names("fp8:h64:q1") == ["fp8_h64_logits_partial"]
-        assert _runtime.program_names("fp8:h64:full:any") == ["fp8_h64_logits_full"]
+        # Only tiers admitted on at least one architecture have a record (and programs); a route withheld
+        # everywhere is absent from the table, so the program check runs over the catalogued 64-head routes.
+        for r in _runtime._catalog()["routes"]:
+            if r.startswith("fp8:h64:"):
+                expected = (
+                    "fp8_h64_logits_full" if ":full:" in r else "fp8_h64_logits_partial"
+                )
+                assert _runtime.program_names(r) == [expected], r
     else:
         assert not _runtime.dense_route_available(64, 16, 4096)
     assert (
@@ -441,7 +449,9 @@ def test_fp8_mqa_logits_one_shot(queries, keys, heads):
     _skip_unless_exported()
     arch = _runtime.device_arch(torch.device("cuda"))
     if not _runtime.dense_route_available(heads, queries, keys, arch=arch):
-        pytest.skip(f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}")
+        pytest.skip(
+            f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}"
+        )
     from flashinfer.dense_mqa import fp8_mqa_logits
 
     torch.manual_seed(3)
@@ -515,7 +525,9 @@ def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
     _skip_unless_exported()
     arch = _runtime.device_arch(torch.device("cuda"))
     if not _runtime.dense_route_available(heads, queries, keys, arch=arch):
-        pytest.skip(f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}")
+        pytest.skip(
+            f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}"
+        )
     from flashinfer.dense_mqa import fp8_mqa_logits
 
     torch.manual_seed(5)
@@ -639,7 +651,10 @@ def test_h64_admission_matches_the_catalog_table():
     verdicts, sample = {}, {}
     for arch in arches:
         admission = _runtime.h64_admission(arch)
-        admitted, withheld = set(admission["admitted_routes"]), set(admission["withheld_routes"])
+        admitted, withheld = (
+            set(admission["admitted_routes"]),
+            set(admission["withheld_routes"]),
+        )
         assert admitted <= tiers and withheld <= tiers and not admitted & withheld
         assert admitted <= set(catalog["routes"])
         assert bool(withheld) == (admission["reason"] is not None)
@@ -656,7 +671,10 @@ def test_h64_admission_matches_the_catalog_table():
             sample.setdefault(route, queries)
     for route, outcomes in verdicts.items():
         if len(outcomes) == 1:
-            assert _runtime.dense_route_available(64, sample[route], 300, arch=None) == outcomes.pop()
+            assert (
+                _runtime.dense_route_available(64, sample[route], 300, arch=None)
+                == outcomes.pop()
+            )
         else:
             with pytest.raises(ValueError, match="pass arch"):
                 _runtime.dense_route_available(64, sample[route], 300, arch=None)
@@ -681,7 +699,9 @@ def _route_point(route_name, record):
     for queries in range(1, 4200):
         if _runtime.route_name(precision, queries, keys, num_heads) == route_name:
             return queries, keys
-    raise AssertionError(f"no query count in 1..4199 selects {route_name} at K = {keys}")
+    raise AssertionError(
+        f"no query count in 1..4199 selects {route_name} at K = {keys}"
+    )
 
 
 def test_dense_bindings_cover_every_program_argument():
@@ -700,7 +720,9 @@ def test_dense_bindings_cover_every_program_argument():
         num_heads, bq = int(record["num_heads"]), int(record["block_q"])
         queries, keys = _route_point(route_name, record)
         assert any(
-            _runtime.dense_route_available(num_heads, queries, keys, precision, arch=arch)
+            _runtime.dense_route_available(
+                num_heads, queries, keys, precision, arch=arch
+            )
             for arch in catalog["arches"]
         ), (route_name, queries, keys)
         starts = torch.zeros(queries, dtype=torch.int32)
