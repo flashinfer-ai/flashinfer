@@ -280,11 +280,15 @@ class MnnvlMemory:  # type: ignore[no-redef]
 
     @staticmethod
     def _probe_fabric_supported(dev_id: int) -> bool:
-        """Return True if this rank's GPU supports FABRIC handles and is part of a fabric cluster."""
-        try:
-            return is_mnnvl_fabric_supported(dev_id)
-        except Exception:
+        """Return True if this process can allocate, export, and import FABRIC memory."""
+        result = _probe_fabric_handle(dev_id)
+        if result in (
+            cuda.CUresult.CUDA_ERROR_NOT_PERMITTED,
+            cuda.CUresult.CUDA_ERROR_NOT_SUPPORTED,
+        ):
             return False
+        checkCudaErrors((result,))
+        return True
 
     @staticmethod
     def _resolve_fabric_support(comm: CommBackend, dev_id: int) -> bool:
@@ -295,24 +299,8 @@ class MnnvlMemory:  # type: ignore[no-redef]
         if MnnvlMemory._fabric_supported is not None:
             return MnnvlMemory._fabric_supported
 
-        # Local peers can share POSIX handles without access to an IMEX channel.
-        if len(set(comm.allgather(socket.gethostname()))) == 1:
-            MnnvlMemory._fabric_supported = False
-            return False
-
-        local_supported = MnnvlMemory._probe_fabric_supported(dev_id)
-        agreed = all_ranks_agree(comm, local_supported)
-
-        if agreed != local_supported:
-            logger.warning(
-                "[MnnvlMemory] FABRIC support probe disagrees across ranks "
-                f"(local={local_supported}); falling back to "
-                f"{'FABRIC' if agreed else 'POSIX fd'} on all ranks to keep the "
-                "handle-exchange path consistent."
-            )
-
-        MnnvlMemory._fabric_supported = agreed
-        return agreed
+        MnnvlMemory._fabric_supported = _select_fabric_handles(comm, dev_id)
+        return MnnvlMemory._fabric_supported
 
     @staticmethod
     def get_allocation_prop(dev_id: int):
@@ -612,6 +600,85 @@ def is_mnnvl_fabric_supported(device_idx: int) -> bool:
         pynvml.nvmlShutdown()
 
 
+def _probe_fabric_handle(dev_id: int) -> "cuda.CUresult":
+    """Probe actual FABRIC access; device capability alone does not imply IMEX access."""
+    result, supported = cuda.cuDeviceGetAttribute(
+        cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+        dev_id,
+    )
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        return result
+    if not supported:
+        return cuda.CUresult.CUDA_ERROR_NOT_SUPPORTED
+
+    prop = cuda.CUmemAllocationProp()
+    prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = dev_id
+    prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    result, granularity = cuda.cuMemGetAllocationGranularity(
+        prop, cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
+    )
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        return result
+    result, handle = cuda.cuMemCreate(granularity, prop, 0)
+    if result != cuda.CUresult.CUDA_SUCCESS:
+        return result
+    try:
+        result, shareable = cuda.cuMemExportToShareableHandle(
+            handle, prop.requestedHandleTypes, 0
+        )
+        if result != cuda.CUresult.CUDA_SUCCESS:
+            return result
+        result, imported = cuda.cuMemImportFromShareableHandle(
+            shareable.data, prop.requestedHandleTypes
+        )
+        if result == cuda.CUresult.CUDA_SUCCESS:
+            checkCudaErrors(cuda.cuMemRelease(imported))
+        return result
+    finally:
+        checkCudaErrors(cuda.cuMemRelease(handle))
+
+
+def _select_fabric_handles(comm: CommBackend, dev_id: int) -> bool:
+    """Prefer usable FABRIC on every rank; allow POSIX fallback only on one host."""
+    try:
+        result = _probe_fabric_handle(dev_id)
+        status = result.value
+        reason = f"{result.name} ({status})"
+    except Exception as exc:
+        status = None
+        reason = str(exc)
+    # Vote even after a local failure so peers do not hang in a collective.
+    reports = comm.allgather((socket.gethostname(), status, reason))
+    expected = {
+        cuda.CUresult.CUDA_SUCCESS.value,
+        cuda.CUresult.CUDA_ERROR_NOT_PERMITTED.value,
+        cuda.CUresult.CUDA_ERROR_NOT_SUPPORTED.value,
+    }
+    failures = ", ".join(
+        f"rank {rank}: {reason}"
+        for rank, (_, status, reason) in enumerate(reports)
+        if status not in expected
+    )
+    if failures:
+        raise RuntimeError(f"FABRIC usability probe failed: {failures}")
+    if all(status == cuda.CUresult.CUDA_SUCCESS.value for _, status, _ in reports):
+        return True
+    if len({host for host, _, _ in reports}) != 1:
+        unavailable = ", ".join(
+            f"rank {rank}: {reason}"
+            for rank, (_, status, reason) in enumerate(reports)
+            if status != cuda.CUresult.CUDA_SUCCESS.value
+        )
+        raise RuntimeError(
+            "Multi-node memory sharing requires usable FABRIC handles on every rank. "
+            "Make sure that all ranks can access the same IMEX channel in "
+            f"/dev/nvidia-caps-imex-channels and the IMEX service is running. {unavailable}"
+        )
+    return False
+
+
 def is_multicast_supported(device_idx: int) -> bool:
     """Return True if the device supports NVLink multicast (cuMulticastCreate; SM90+ NVLink)."""
     try:
@@ -684,13 +751,8 @@ class HandleExchanger:
 def make_handle_exchanger(
     comm: CommBackend, rank: int, size: int, dev_id: int
 ) -> HandleExchanger:
-    """Use POSIX fds locally; FABRIC handles are needed across hosts."""
-    single_node = len(set(comm.allgather(socket.gethostname()))) == 1
-    if not single_node:
-        if not all_ranks_agree(comm, is_mnnvl_fabric_supported(dev_id)):
-            raise RuntimeError(
-                "Multi-node memory sharing requires FABRIC support on every rank."
-            )
+    """Prefer usable FABRIC handles, with a single-host POSIX fallback."""
+    if _select_fabric_handles(comm, dev_id):
         handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
     else:
         handle_type = (

@@ -54,39 +54,129 @@ def test_is_mnnvl_fabric_supported(fabric_uuid, state, supported, expected):
             shutdown.assert_not_called()
 
 
-@pytest.mark.parametrize("hosts", [["host-a", "host-a"], ["host-a", "host-b"]])
-def test_handle_exchanger_uses_posix_for_local_peers(hosts):
-    comm = Mock()
-    comm.allgather.side_effect = [hosts, [True, True]]
-    with patch.object(mnnvl, "is_mnnvl_fabric_supported", return_value=True) as probe:
-        exchanger = mnnvl.make_handle_exchanger(comm, 0, 2, 0)
-    types = mnnvl.cuda.CUmemAllocationHandleType
-    if len(set(hosts)) == 1:
-        assert exchanger.handle_type == types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        probe.assert_not_called()
-    else:
-        assert exchanger.handle_type == types.CU_MEM_HANDLE_TYPE_FABRIC
-        probe.assert_called_once_with(0)
-
-
-def test_handle_exchanger_rejects_mixed_multinode_fabric_support():
-    comm = Mock()
-    comm.allgather.side_effect = [["host-a", "host-b"], [True, False]]
-    with (
-        patch.object(mnnvl, "is_mnnvl_fabric_supported", return_value=True),
-        pytest.raises(RuntimeError, match="FABRIC support on every rank"),
-    ):
-        mnnvl.make_handle_exchanger(comm, 0, 2, 0)
-
-
-def test_mnnvl_memory_uses_posix_for_local_peers(monkeypatch):
+@pytest.mark.parametrize("entry", ["exchanger", "memory"])
+@pytest.mark.parametrize(
+    "hosts,statuses,expected",
+    [
+        (["host-a", "host-a"], [0, 0], True),
+        (["host-a", "host-b"], [0, 0], True),
+        (["host-a", "host-a"], [800, 800], False),
+        (["host-a", "host-a"], [0, 800], False),
+        (["host-a", "host-a"], [801, 801], False),
+        (["host-a", "host-b"], [0, 800], None),
+        (["host-a", "host-b"], [801, 801], None),
+    ],
+)
+def test_fabric_handle_policy(entry, hosts, statuses, expected, monkeypatch):
     monkeypatch.setattr(mnnvl.MnnvlMemory, "_fabric_supported", None)
     comm = Mock()
-    comm.allgather.return_value = ["host-a", "host-a"]
-    with patch.object(mnnvl.MnnvlMemory, "_probe_fabric_supported") as probe:
-        assert not mnnvl.MnnvlMemory._resolve_fabric_support(comm, 0)
-        prop = mnnvl.MnnvlMemory.get_allocation_prop(0)
+    comm.allgather.return_value = [
+        (host, status, mnnvl.cuda.CUresult(status).name)
+        for host, status in zip(hosts, statuses, strict=True)
+    ]
+    types = mnnvl.cuda.CUmemAllocationHandleType
+    with patch.object(
+        mnnvl, "_probe_fabric_handle", return_value=mnnvl.cuda.CUresult(statuses[0])
+    ) as probe:
+        if expected is None:
+            with pytest.raises(RuntimeError, match="same IMEX channel"):
+                if entry == "exchanger":
+                    mnnvl.make_handle_exchanger(comm, 0, 2, 0)
+                else:
+                    mnnvl.MnnvlMemory._resolve_fabric_support(comm, 0)
+            assert mnnvl.MnnvlMemory._fabric_supported is None
+        else:
+            if entry == "exchanger":
+                handle_type = mnnvl.make_handle_exchanger(comm, 0, 2, 0).handle_type
+            else:
+                assert mnnvl.MnnvlMemory._resolve_fabric_support(comm, 0) is expected
+                handle_type = mnnvl.MnnvlMemory.get_allocation_prop(
+                    0
+                ).requestedHandleTypes
+            assert handle_type == (
+                types.CU_MEM_HANDLE_TYPE_FABRIC
+                if expected
+                else types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            )
+        probe.assert_called_once_with(0)
+    comm.allgather.assert_called_once()
+
+
+@pytest.mark.parametrize("local_exception", [False, True])
+def test_fabric_policy_reports_unexpected_errors_collectively(local_exception):
+    comm = Mock()
+    comm.allgather.return_value = [
+        ("host-a", None if local_exception else 0, "driver failure"),
+        ("host-a", 2, "CUDA_ERROR_OUT_OF_MEMORY"),
+    ]
+    with (
+        patch.object(
+            mnnvl,
+            "_probe_fabric_handle",
+            side_effect=RuntimeError("driver failure") if local_exception else None,
+            return_value=mnnvl.cuda.CUresult.CUDA_SUCCESS,
+        ),
+        pytest.raises(RuntimeError, match="rank 1: CUDA_ERROR_OUT_OF_MEMORY"),
+    ):
+        mnnvl.make_handle_exchanger(comm, 0, 2, 0)
+    comm.allgather.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "failure,error,released",
+    [
+        (None, 0, [456, 123]),
+        ("cuDeviceGetAttribute", 801, []),
+        ("cuMemGetAllocationGranularity", 801, []),
+        ("cuMemCreate", 800, []),
+        ("cuMemCreate", 2, []),
+        ("cuMemExportToShareableHandle", 800, [123]),
+        ("cuMemImportFromShareableHandle", 800, [123]),
+    ],
+)
+def test_fabric_probe_releases_handles(failure, error, released, monkeypatch):
+    success = mnnvl.cuda.CUresult.CUDA_SUCCESS
+    calls = {
+        "cuDeviceGetAttribute": (success, 1),
+        "cuMemGetAllocationGranularity": (success, 65536),
+        "cuMemCreate": (success, 123),
+        "cuMemExportToShareableHandle": (success, mnnvl.cuda.CUmemFabricHandle()),
+        "cuMemImportFromShareableHandle": (success, 456),
+        "cuMemRelease": (success,),
+    }
+    mocks = {}
+    for name, result in calls.items():
+        if name == failure:
+            result = (mnnvl.cuda.CUresult(error), *result[1:])
+        mocks[name] = Mock(return_value=result)
+        monkeypatch.setattr(mnnvl.cuda, name, mocks[name])
+    assert mnnvl._probe_fabric_handle(3) == mnnvl.cuda.CUresult(error)
+    assert [call.args[0] for call in mocks["cuMemRelease"].call_args_list] == released
+    if mocks["cuMemCreate"].called:
+        size, prop, flags = mocks["cuMemCreate"].call_args.args
+        assert size == 65536
         assert prop.requestedHandleTypes == (
-            mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
         )
-        probe.assert_not_called()
+        assert prop.location.id == 3
+        assert flags == 0
+    if mocks["cuMemImportFromShareableHandle"].called:
+        mocks["cuMemImportFromShareableHandle"].assert_called_once_with(
+            calls["cuMemExportToShareableHandle"][1].data,
+            mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+        )
+
+
+def test_fabric_probe_skips_allocation_without_device_support():
+    with (
+        patch.object(
+            mnnvl.cuda,
+            "cuDeviceGetAttribute",
+            return_value=(mnnvl.cuda.CUresult.CUDA_SUCCESS, 0),
+        ),
+        patch.object(mnnvl.cuda, "cuMemCreate") as create,
+    ):
+        assert mnnvl._probe_fabric_handle(0) == (
+            mnnvl.cuda.CUresult.CUDA_ERROR_NOT_SUPPORTED
+        )
+        create.assert_not_called()
