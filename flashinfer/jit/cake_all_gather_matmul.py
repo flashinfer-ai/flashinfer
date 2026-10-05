@@ -36,82 +36,136 @@ from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 # Filled mechanically from the program bundle.
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_all_gather_matmul_0d2303b9569e9213c642": {
+    "cake_all_gather_matmul_05d590fb05d9692b74a8": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0d2303b9569e9213c642_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0d2303b9569e9213c642_binding.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_05d590fb05d9692b74a8_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_05d590fb05d9692b74a8_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_18d5d4b7d46bb61cc447": {
+    "cake_all_gather_matmul_0a7520d9a4cae8d18425": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18d5d4b7d46bb61cc447_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_18d5d4b7d46bb61cc447_binding.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0a7520d9a4cae8d18425_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_0a7520d9a4cae8d18425_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_1371696ea325f44809f3": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1371696ea325f44809f3_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_1371696ea325f44809f3_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_2e04a762811cd00a1cd5": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_2e04a762811cd00a1cd5_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [32, 1, 1],
         "dynamic_smem_bytes": 0,
     },
-    "cake_all_gather_matmul_4cd953b96b2b21f3489d": {
+    "cake_all_gather_matmul_43e256e956ee81d48de7": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_4cd953b96b2b21f3489d_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_4cd953b96b2b21f3489d_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_790c03c0287641404c2c": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_790c03c0287641404c2c_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_790c03c0287641404c2c_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_9303668b92f5f5b46f87": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_9303668b92f5f5b46f87_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_9303668b92f5f5b46f87_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "block": [192, 1, 1],
-        "dynamic_smem_bytes": 197632,
-    },
-    "cake_all_gather_matmul_932f3826fd5c3c9dcf30": {
-        "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_932f3826fd5c3c9dcf30_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_932f3826fd5c3c9dcf30_binding.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_43e256e956ee81d48de7_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [32, 1, 1],
         "dynamic_smem_bytes": 0,
     },
-    "cake_all_gather_matmul_93966f91063fc84be3c6": {
+    "cake_all_gather_matmul_567bafbe34f78949b4bf": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_93966f91063fc84be3c6_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_93966f91063fc84be3c6_binding.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_567bafbe34f78949b4bf_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_567bafbe34f78949b4bf_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
         "dynamic_smem_bytes": 197632,
     },
-    "cake_all_gather_matmul_bda23d0402c5309b99dd": {
+    "cake_all_gather_matmul_775065698a2a5e33aece": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bda23d0402c5309b99dd_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_bda23d0402c5309b99dd_binding.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_775065698a2a5e33aece_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_775065698a2a5e33aece_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_a90116586399c59ba880": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a90116586399c59ba880_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_a90116586399c59ba880_binding.cu",
         ],
         "arches": ["sm_103a"],
         "block": [128, 1, 1],
         "dynamic_smem_bytes": 0,
     },
-    "cake_all_gather_matmul_f5e5cb3d3bc68357235b": {
+    "cake_all_gather_matmul_ac7f1bb1b739b6d1f547": {
         "sources": [
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f5e5cb3d3bc68357235b_kernel.cu",
-            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f5e5cb3d3bc68357235b_binding.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ac7f1bb1b739b6d1f547_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_ac7f1bb1b739b6d1f547_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_da440c509191f6e0d261": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_da440c509191f6e0d261_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_da440c509191f6e0d261_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_e4758f4ef9810377a478": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e4758f4ef9810377a478_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e4758f4ef9810377a478_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_e8d8dfcb549a27f6f839": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e8d8dfcb549a27f6f839_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_e8d8dfcb549a27f6f839_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_f3155f0ac3f178ded967": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f3155f0ac3f178ded967_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f3155f0ac3f178ded967_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_f85d24d083dd2de99b4a": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85d24d083dd2de99b4a_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_f85d24d083dd2de99b4a_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "block": [192, 1, 1],
+        "dynamic_smem_bytes": 197632,
+    },
+    "cake_all_gather_matmul_fe8067061d4e5933b221": {
+        "sources": [
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fe8067061d4e5933b221_kernel.cu",
+            "csrc/cake_all_gather_matmul/cake_all_gather_matmul_fe8067061d4e5933b221_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "block": [192, 1, 1],
@@ -119,15 +173,21 @@ PROGRAMS: dict[str, dict[str, Any]] = {
     },
 }
 ROUTES: dict[str, str] = {
-    "barrier_p0": "cake_all_gather_matmul_932f3826fd5c3c9dcf30",
-    "barrier_p1": "cake_all_gather_matmul_18d5d4b7d46bb61cc447",
-    "fused_peer_copy": "cake_all_gather_matmul_bda23d0402c5309b99dd",
-    "main_bfloat16_ws2": "cake_all_gather_matmul_0d2303b9569e9213c642",
-    "main_bfloat16_ws4": "cake_all_gather_matmul_4cd953b96b2b21f3489d",
-    "main_bfloat16_ws8": "cake_all_gather_matmul_9303668b92f5f5b46f87",
-    "main_float16_ws2": "cake_all_gather_matmul_93966f91063fc84be3c6",
-    "main_float16_ws4": "cake_all_gather_matmul_790c03c0287641404c2c",
-    "main_float16_ws8": "cake_all_gather_matmul_f5e5cb3d3bc68357235b",
+    "barrier_p0": "cake_all_gather_matmul_43e256e956ee81d48de7",
+    "barrier_p1": "cake_all_gather_matmul_2e04a762811cd00a1cd5",
+    "fused_peer_copy": "cake_all_gather_matmul_a90116586399c59ba880",
+    "main_bfloat16_ws2_k_major": "cake_all_gather_matmul_1371696ea325f44809f3",
+    "main_bfloat16_ws2_n_major": "cake_all_gather_matmul_567bafbe34f78949b4bf",
+    "main_bfloat16_ws4_k_major": "cake_all_gather_matmul_e4758f4ef9810377a478",
+    "main_bfloat16_ws4_n_major": "cake_all_gather_matmul_775065698a2a5e33aece",
+    "main_bfloat16_ws8_k_major": "cake_all_gather_matmul_fe8067061d4e5933b221",
+    "main_bfloat16_ws8_n_major": "cake_all_gather_matmul_da440c509191f6e0d261",
+    "main_float16_ws2_k_major": "cake_all_gather_matmul_0a7520d9a4cae8d18425",
+    "main_float16_ws2_n_major": "cake_all_gather_matmul_ac7f1bb1b739b6d1f547",
+    "main_float16_ws4_k_major": "cake_all_gather_matmul_e8d8dfcb549a27f6f839",
+    "main_float16_ws4_n_major": "cake_all_gather_matmul_f85d24d083dd2de99b4a",
+    "main_float16_ws8_k_major": "cake_all_gather_matmul_05d590fb05d9692b74a8",
+    "main_float16_ws8_n_major": "cake_all_gather_matmul_f3155f0ac3f178ded967",
 }
 COMPILE_FLAGS: list[str] = ["--use_fast_math"]
 
@@ -150,6 +210,10 @@ BLOCK_N = 256
 # Rows pushed per peer chunk; the main kernel consumes chunk ``c`` of a peer
 # after the matching readiness word reaches the launch epoch.
 CHUNK_ROWS = 19 * BLOCK_M
+# Physical layouts of the logical ``[K, N]`` weight, each with its own main
+# kernel: ``n_major`` = contiguous ``[K, N]``; ``k_major`` = the ``w.t()`` view
+# of a contiguous ``[N, K]`` parameter.
+B_LAYOUTS: tuple[str, ...] = ("n_major", "k_major")
 MAIN_THREADS = 192
 # Fused SM103 peer copy: CTAs per remote peer along grid x, one peer per grid y.
 FUSED_COPY_CTAS_PER_PEER = 32
@@ -184,18 +248,80 @@ def barrier_flag_words(world_size: int) -> int:
     return BARRIER_PHASES + BARRIER_PHASES * BARRIER_BANKS * int(world_size)
 
 
-def chunk_plan(rows: int) -> tuple[int, int]:
-    """``(chunk_rows, num_chunks)`` of the push protocol for ``rows`` local rows."""
+def padded_rows(rows: int) -> int:
+    """``rows`` rounded up to the 128-row MMA tile."""
 
-    chunk_rows = min(int(rows), CHUNK_ROWS)
-    return chunk_rows, (int(rows) + chunk_rows - 1) // chunk_rows
+    return (int(rows) + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+
+
+def chunk_plan(rows: int) -> tuple[int, int, int]:
+    """``(padded_rows, chunk_rows, num_chunks)`` of the push protocol for ``rows`` local rows."""
+
+    padded = padded_rows(rows)
+    chunk_rows = min(padded, CHUNK_ROWS)
+    return padded, chunk_rows, (padded + chunk_rows - 1) // chunk_rows
 
 
 def main_grid(rows: int, n: int, *, peer_partitions: int) -> tuple[int, int, int]:
-    """Launch grid of the main kernel: one CTA per output tile of the first chunk."""
+    """Launch grid of the main kernel: one CTA per output tile of the first (padded) chunk."""
 
-    chunk_rows, _ = chunk_plan(rows)
+    _padded, chunk_rows, _num_chunks = chunk_plan(rows)
     return ((chunk_rows // BLOCK_M) * (int(n) // BLOCK_N), int(peer_partitions), 1)
+
+
+# ``grid.y`` of the narrow (N <= 2048) rows per world size, from the same-session
+# y-sweeps on 8 x B200 / 8 x B300 (lever L2 of the engine-operand work): ws8 prefers every peer
+# concurrently, ws4 and ws2 prefer two partitions.
+_NARROW_ROW_PARTITIONS = {2: 2, 4: 2, 8: 8}
+
+
+def peer_partitions(
+    *, arch: str, dtype_name: str, world_size: int, rows: int, n: int, fused: bool
+) -> int:
+    """``grid.y`` of the main kernel: CTA partitions sharing the cyclic peer traversal.
+
+    ``y = 1`` is the serial local-first traversal of the wide rows; the fused
+    SM103 TP8 packed-QKV route partitions over four; latency-bound shapes (few
+    CTAs per chunk: ``N <= 2048`` up to 8192 local rows, or one 128-row tile)
+    run every peer concurrently (``y = world_size``).
+    """
+
+    del arch, dtype_name
+    if fused:
+        return 4
+    n_tiles = n // BLOCK_N
+    m_tiles = min(padded_rows(rows), CHUNK_ROWS) // BLOCK_M
+    if m_tiles <= 1:
+        return world_size
+    if n_tiles <= 8 and rows <= 8192:
+        return _NARROW_ROW_PARTITIONS[world_size]
+    return 1
+
+
+def weight_layout(w: torch.Tensor) -> str:
+    """Classify the logical ``[K, N]`` weight view by its strides (no copy is ever made)."""
+
+    if w.ndim != 2 or int(w.shape[0]) != K:
+        raise ValueError(f"w must be a [{K}, N] view, got shape {tuple(w.shape)}")
+    n = int(w.shape[1])
+    stride_k, stride_n = (int(stride) for stride in w.stride())
+    if stride_n == 1 and stride_k == n:
+        return "n_major"
+    if stride_k == 1 and stride_n == K:
+        return "k_major"
+    raise ValueError(
+        f"w must be a contiguous [{K}, {n}] tensor or the transposed view of a "
+        f"contiguous [{n}, {K}] tensor, got strides {(stride_k, stride_n)}"
+    )
+
+
+def weight_tma_source(w: torch.Tensor, b_layout: str) -> torch.Tensor:
+    """The rank-3 tensor the main kernel's ``B`` tensor map is encoded from."""
+
+    n = int(w.shape[1])
+    if b_layout == "n_major":
+        return w.view(1, K, n)
+    return w.t().view(1, n, K)
 
 
 def uses_fused_peer_copy(
@@ -218,8 +344,8 @@ def barrier_program(phase: int) -> str:
     return ROUTES[f"barrier_p{int(phase)}"]
 
 
-def main_program(world_size: int, dtype_name: str) -> str:
-    return ROUTES[f"main_{dtype_name}_ws{int(world_size)}"]
+def main_program(world_size: int, dtype_name: str, b_layout: str) -> str:
+    return ROUTES[f"main_{dtype_name}_ws{int(world_size)}_{b_layout}"]
 
 
 def fused_peer_copy_program() -> str:
@@ -284,6 +410,7 @@ def dynamic_smem_bytes(program: str) -> int:
 
 __all__ = [
     "ARCH_FLAGS",
+    "B_LAYOUTS",
     "BARRIER_BANKS",
     "BARRIER_PHASES",
     "BLOCK_M",
@@ -309,6 +436,10 @@ __all__ = [
     "load",
     "main_grid",
     "main_program",
+    "padded_rows",
+    "peer_partitions",
     "spec",
     "uses_fused_peer_copy",
+    "weight_layout",
+    "weight_tma_source",
 ]

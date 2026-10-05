@@ -34,7 +34,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(192) void
-kernel_cake_all_gather_matmul_f5e5cb3d3bc68357235b(const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch, const __grid_constant__ CUtensorMap B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
+kernel_cake_all_gather_matmul_05d590fb05d9692b74a8(const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch, const __grid_constant__ CUtensorMap B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M, int scratch_pitch)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -122,23 +122,23 @@ kernel_cake_all_gather_matmul_f5e5cb3d3bc68357235b(const __grid_constant__ CUten
             unsigned int load_stage = 0;
             unsigned int load_phase = 1;
             #pragma unroll
-            for (int peer_pass = 0; peer_pass < 8; peer_pass++) {
+            for (int peer_pass = blockIdx.y; peer_pass < 8; peer_pass += gridDim.y) {
                 int peer = (rank - peer_pass + 8) % 8;
                 #pragma unroll 1
-                for (int chunk_idx = 0; chunk_idx < (M + ((M < 2432) ? M : 2432) - 1) / ((M < 2432) ? M : 2432); chunk_idx++) {
-                    int rows_left = M - chunk_idx * ((M < 2432) ? M : 2432);
-                    int chunk_m = ((rows_left > ((M < 2432) ? M : 2432)) ? ((M < 2432) ? M : 2432) : rows_left);
+                for (int chunk_idx = 0; chunk_idx < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432); chunk_idx++) {
+                    int rows_left = (M + 127) / 128 * 128 - chunk_idx * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432);
+                    int chunk_m = ((rows_left > (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432)) ? (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) : rows_left);
                     int chunk_tiles_m = chunk_m / 128;
-                    int active_tiles = chunk_tiles_m * (num_bids / (((M < 2432) ? M : 2432) / 128));
+                    int active_tiles = chunk_tiles_m * (num_bids / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
                     if (active_tiles > bid) {
                         int bid_m = bid % chunk_tiles_m;
                         int bid_n = bid / chunk_tiles_m;
-                        int off_m = chunk_idx * ((M < 2432) ? M : 2432) + bid_m * 128;
+                        int off_m = chunk_idx * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) + bid_m * 128;
                         int off_n = bid_n * 256;
                         if (peer_pass != 0) {
                             if (elect_sync()) {
                                 {
-                                    unsigned int* _gca_p = reinterpret_cast<unsigned int*>(ready) + (peer * ((M + ((M < 2432) ? M : 2432) - 1) / ((M < 2432) ? M : 2432)) + chunk_idx);
+                                    unsigned int* _gca_p = reinterpret_cast<unsigned int*>(ready) + (peer * (((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432)) + chunk_idx);
                                     while (true) {
                                         unsigned int _gca_v;
                                         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p));
@@ -156,12 +156,9 @@ kernel_cake_all_gather_matmul_f5e5cb3d3bc68357235b(const __grid_constant__ CUten
                                 if (peer_pass == 0) {
                                     tma_3d_gmem2smem(smem_a_addr + load_stage * 49152, (&A_local), 0, off_m, iter_k, tma_full_addr + (load_stage) * 8);
                                 } else {
-                                    tma_3d_gmem2smem(smem_a_addr + load_stage * 49152, (&A_scratch), 0, peer * M + off_m, iter_k, tma_full_addr + (load_stage) * 8);
+                                    tma_3d_gmem2smem(smem_a_addr + load_stage * 49152, (&A_scratch), 0, peer * scratch_pitch + off_m, iter_k, tma_full_addr + (load_stage) * 8);
                                 }
-                                #pragma unroll
-                                for (int b_panel = 0; b_panel < 4; b_panel++) {
-                                    tma_3d_gmem2smem(smem_b_addr + load_stage * 49152 + (unsigned int)(b_panel * 8192), (&B), off_n + b_panel * 64, off_k, 0, tma_full_addr + (load_stage) * 8);
-                                }
+                                tma_3d_gmem2smem(smem_b_addr + load_stage * 49152, (&B), 0, off_n, iter_k, tma_full_addr + (load_stage) * 8);
                                 mbarrier_arrive_expect_tx(tma_full_addr + (load_stage) * 8, 49152);
                             }
                             load_stage += 1;
@@ -183,13 +180,13 @@ kernel_cake_all_gather_matmul_f5e5cb3d3bc68357235b(const __grid_constant__ CUten
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
             #pragma unroll
-            for (int _peer_pass = 0; _peer_pass < 8; _peer_pass++) {
+            for (int _peer_pass = blockIdx.y; _peer_pass < 8; _peer_pass += gridDim.y) {
                 #pragma unroll 1
-                for (int chunk_idx_1 = 0; chunk_idx_1 < (M + ((M < 2432) ? M : 2432) - 1) / ((M < 2432) ? M : 2432); chunk_idx_1++) {
-                    int rows_left_1 = M - chunk_idx_1 * ((M < 2432) ? M : 2432);
-                    int chunk_m_1 = ((rows_left_1 > ((M < 2432) ? M : 2432)) ? ((M < 2432) ? M : 2432) : rows_left_1);
+                for (int chunk_idx_1 = 0; chunk_idx_1 < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432); chunk_idx_1++) {
+                    int rows_left_1 = (M + 127) / 128 * 128 - chunk_idx_1 * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432);
+                    int chunk_m_1 = ((rows_left_1 > (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432)) ? (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) : rows_left_1);
                     int chunk_tiles_m_1 = chunk_m_1 / 128;
-                    int active_tiles_1 = chunk_tiles_m_1 * (num_bids / (((M < 2432) ? M : 2432) / 128));
+                    int active_tiles_1 = chunk_tiles_m_1 * (num_bids / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
                     if (active_tiles_1 > bid) {
                         mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
                         #pragma unroll 1
@@ -198,27 +195,27 @@ kernel_cake_all_gather_matmul_f5e5cb3d3bc68357235b(const __grid_constant__ CUten
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((iter_k_1 == 0) ? 1 : 0);
                             int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072);
-                            int _mma_b_lo_0 = make_warp_uniform(((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072);
+                            int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072);
                             {
                                 uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
                                 uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138477584, ((init_flag) ? 0 : 1));
+                                    tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138412048, ((init_flag) ? 0 : 1));
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_0, 128U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138477584, 1);
+                                    tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138412048, 1);
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_0, 128U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138477584, 1);
+                                    tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138412048, 1);
                                 }
                                 incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                                incr_smem_desc_lo(_mma_ss_b_desc_0, 128U);
+                                incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                                 if (elect_sync()) {
-                                    tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138477584, 1);
+                                    tcgen05_mma_f16((tmem_accum + (mma_epi_stage * 256)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 138412048, 1);
                                 }
                             }
                             elect_commit(mma_done_addr + (mma_tma_stage) * 8);
@@ -241,37 +238,61 @@ kernel_cake_all_gather_matmul_f5e5cb3d3bc68357235b(const __grid_constant__ CUten
             const int epi_tid = epi_warp * 32 + lane;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
-            for (int peer_pass_1 = 0; peer_pass_1 < 8; peer_pass_1++) {
+            for (int peer_pass_1 = blockIdx.y; peer_pass_1 < 8; peer_pass_1 += gridDim.y) {
                 int peer_1 = (rank - peer_pass_1 + 8) % 8;
                 #pragma unroll 1
-                for (int chunk_idx_2 = 0; chunk_idx_2 < (M + ((M < 2432) ? M : 2432) - 1) / ((M < 2432) ? M : 2432); chunk_idx_2++) {
-                    int rows_left_2 = M - chunk_idx_2 * ((M < 2432) ? M : 2432);
-                    int chunk_m_2 = ((rows_left_2 > ((M < 2432) ? M : 2432)) ? ((M < 2432) ? M : 2432) : rows_left_2);
+                for (int chunk_idx_2 = 0; chunk_idx_2 < ((M + 127) / 128 * 128 + (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) - 1) / (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432); chunk_idx_2++) {
+                    int rows_left_2 = (M + 127) / 128 * 128 - chunk_idx_2 * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432);
+                    int chunk_m_2 = ((rows_left_2 > (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432)) ? (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) : rows_left_2);
                     int chunk_tiles_m_2 = chunk_m_2 / 128;
-                    int active_tiles_2 = chunk_tiles_m_2 * (num_bids / (((M < 2432) ? M : 2432) / 128));
+                    int active_tiles_2 = chunk_tiles_m_2 * (num_bids / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128));
                     if (active_tiles_2 > bid) {
                         int bid_m_1 = bid % chunk_tiles_m_2;
                         int bid_n_1 = bid / chunk_tiles_m_2;
-                        int off_m_1 = chunk_idx_2 * ((M < 2432) ? M : 2432) + bid_m_1 * 128;
+                        int off_m_1 = chunk_idx_2 * (((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) + bid_m_1 * 128;
                         int off_n_1 = bid_n_1 * 256;
-                        int out_m = peer_1 * M + off_m_1;
+                        int local_row = off_m_1 + epi_tid;
+                        long long out_row = (long long)(peer_1 * M + local_row);
+                        long long out_base = out_row * (long long)(num_bids / ((((M + 127) / 128 * 128 < 2432) ? (M + 127) / 128 * 128 : 2432) / 128) * 256) + (long long)off_n_1;
                         mbarrier_wait(mainloop_done_addr + (epi_stage) * 8, _phase_mainloop_done);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        #pragma unroll
-                        for (int n_chunk = 0; n_chunk < 32; n_chunk++) {
-                            int row = epi_warp * 32;
-                            int col = epi_stage * 256 + (unsigned int)(n_chunk * 8);
-                            int tmem_addr = taddr + (unsigned int)(row << 16) + (unsigned int)col;
-                            float _tmem_load_0[8];
-                            tmem_ld_x8(&_tmem_load_0[0], tmem_addr);
-                            asm volatile("tcgen05.wait::ld.sync.aligned;");
-                            uint32_t _tmem_load_0_f16[4];
+                        if (off_m_1 + 128 <= M) {
                             #pragma unroll
-                            for (int _lp = 0; _lp < 4; _lp++) {
-                                __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
-                                _tmem_load_0_f16[_lp] = *(uint32_t*)&_h2;
+                            for (int n_chunk = 0; n_chunk < 32; n_chunk++) {
+                                int row = epi_warp * 32;
+                                int col = epi_stage * 256 + (unsigned int)(n_chunk * 8);
+                                int tmem_addr = taddr + (unsigned int)(row << 16) + (unsigned int)col;
+                                float _tmem_load_0[8];
+                                tmem_ld_x8(&_tmem_load_0[0], tmem_addr);
+                                asm volatile("tcgen05.wait::ld.sync.aligned;");
+                                uint32_t _tmem_load_0_f16[4];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 4; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
+                                    _tmem_load_0_f16[_lp] = *(uint32_t*)&_h2;
+                                }
+                                reinterpret_cast<int4*>(C + (out_base + (long long)(n_chunk * 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_f16)[0];
                             }
-                            reinterpret_cast<int4*>(C + ((out_m + epi_tid) * (num_bids / (((M < 2432) ? M : 2432) / 128) * 256) + (off_n_1 + n_chunk * 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_f16)[0];
+                        }
+                        if (off_m_1 + 128 > M) {
+                            #pragma unroll
+                            for (int n_chunk_1 = 0; n_chunk_1 < 32; n_chunk_1++) {
+                                int row_1 = epi_warp * 32;
+                                int col_1 = epi_stage * 256 + (unsigned int)(n_chunk_1 * 8);
+                                int tmem_addr_1 = taddr + (unsigned int)(row_1 << 16) + (unsigned int)col_1;
+                                float _tmem_load_1[8];
+                                tmem_ld_x8(&_tmem_load_1[0], tmem_addr_1);
+                                asm volatile("tcgen05.wait::ld.sync.aligned;");
+                                uint32_t _tmem_load_1_f16[4];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 4; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
+                                    _tmem_load_1_f16[_lp] = *(uint32_t*)&_h2;
+                                }
+                                if (local_row < M) {
+                                    reinterpret_cast<int4*>(C + (out_base + (long long)(n_chunk_1 * 8)))[0] = reinterpret_cast<int4*>(_tmem_load_1_f16)[0];
+                                }
+                            }
                         }
                         if (elect_sync()) {
                             mbarrier_arrive(epilogue_done_addr + (epi_stage) * 8);
