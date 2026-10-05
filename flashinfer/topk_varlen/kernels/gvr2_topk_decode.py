@@ -1467,8 +1467,12 @@ class GvrMainKernel:
             assert self.next_n >= 1 and self.cr_shift in (0, 2) and self.r_const >= 1
         # prefill: per-row [ks, ke) window riding the kv_lens/pre_idx ABI slots,
         # base rounded down to 16B with the <=3 lead lanes masked, one CTA per
-        # row (no SPLIT); every edit is const_expr-gated so other codegen is
-        # unchanged (TRT-LLM #18702 port).
+        # row (no SPLIT); every WINDOW edit is const_expr-gated (TRT-LLM #18702
+        # port). The one change shared by every varlen compile, decode included,
+        # is the block-uniform short-row body skip (`if short == 0:` around
+        # P1..degen-B): short rows go straight to the identity epilogue instead
+        # of running the zero-work pass. Output is unchanged (that pass wrote
+        # nothing); the decode suites and ledger were re-run on it.
         self.prefill = bool(prefill)
         # windowed output frame: window-local (column - ks) by default, or the
         # absolute logits column (the flattened-KV slot the DSA indexer's
@@ -3184,9 +3188,9 @@ class GvrMainKernel:
 
         # ---- varlen short-row epilogue (production heuristicTopKDecode
         # convention): every valid position is in the top-K — emit identity
-        # indices and pad the tail with -1.  The body above ran as a
-        # zero-work pass for these rows (n = 0, TGT = INT_MAX) so nothing
-        # was written; only part 0 of a SPLIT row emits.
+        # indices and pad the tail with -1.  The body above is skipped for
+        # these rows (block-uniform `short`, so its barriers stay converged)
+        # and nothing was written; only part 0 of a SPLIT row emits.
         if cutlass.const_expr(self.varlen):
             if short != cutlass.Int32(0):
                 if part == cutlass.Int32(0):
@@ -3285,7 +3289,9 @@ def get_compiled(
     ``prefill`` selects the per-row [ks, ke) window mode (TRT-LLM #18702). It
     shares the varlen tuple (next_n=1, cr_shift=0) but has a distinct prologue,
     so it is part of the cache key and the persist name; the compile retypes
-    the pre_idx ABI slot to a 1-D align-4 fake (it carries row_ends)."""
+    the pre_idx ABI slot to a 1-D align-4 fake (it carries row_starts; the
+    kv_lens slot carries the window lengths and ke = ks + len is formed on
+    device)."""
     prefill_abs = bool(prefill_abs) and bool(prefill)
     key = (
         tuple(tpl),
@@ -3332,7 +3338,7 @@ def get_compiled(
         cutlass.Float32, (r0, c0), stride_order=(1, 0), assumed_align=16
     )
     if prefill:
-        # pre_idx slot carries row_ends [rows] int32 (4B-aligned slices).
+        # pre_idx slot carries row_starts [rows] int32 (4B-aligned per-slab slices).
         pre_fake = _crt.make_fake_compact_tensor(
             cutlass.Int32, (r1,), stride_order=(0,), assumed_align=4
         )
