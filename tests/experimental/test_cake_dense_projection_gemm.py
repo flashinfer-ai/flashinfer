@@ -2050,9 +2050,12 @@ def test_batched_small_m_swap_and_row_rules():
     assert (
         plan.a_mn and plan.b_mn and plan.transposed_out and plan.block_n == 192
     )  # N' = 192: one exact tile
-    assert plan.template.startswith(
-        "dense_proj_gemm_nn_n192"
-    ) and plan.template.endswith("_t")
+    assert plan.template.startswith("dense_proj_gemm_nn_n192") and _transposed_template(
+        plan.template
+    )
+    # round 14: the sm_100a qabs weight-gradient rule puts the swapped tile on the tall transposed TMA-store family
+    assert plan.template == "dense_proj_gemm_nn_n192_m256_t_tma1"
+    assert plan.epi == "tma" and plan.cta_rows == 256 and plan.slots == 1
     assert tuple(out3.shape) == (H, M, N)
     # the rule table: exact (N, K, M) first, then the ragged-M (N, K, None) key, then the ragged-K (N, None, M) key
     ident = ("sm_100a", True, True, False, True, True)
