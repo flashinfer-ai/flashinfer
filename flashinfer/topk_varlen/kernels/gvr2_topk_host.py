@@ -1061,10 +1061,11 @@ def _prefill_reg_route(rows: int, k: int, n_hint: int) -> dict | None:
     2048}, window bounds filling each class; logs prefill_reg_sweep, same node
     vs sglang topk_v2, 3 interleaved reps, min; B200 and B300 agree within
     3%, Rubin differs):
-      * L <= 2048: B200/B300 VPT=1/MINB=4 (K <= 1024) or VPT=2/MINB=4 (K =
-        2048), 1.6-2.0x the slab at every row count. Rubin: VPT=1/MINB=4 only
-        while the launch is small (K <= 1024: <= 16K rows; K = 2048: <= 4K
-        rows) — above that Rubin's slab is as fast or faster (up to 1.4x).
+      * L <= 2048: B200/B300 VPT=1/MINB=4, 1.6-2.0x the slab at every row
+        count (K = 2048 never reaches this class: a <= 2048 window is an
+        identity row, ``n_hint <= k`` above). Rubin: VPT=1/MINB=4 only
+        while the launch is small (K <= 1024: <= 16K rows) — above that
+        Rubin's slab is as fast or faster (up to 1.4x).
       * L <= 4096: B200/B300 VPT=2/MINB=4 (the decode rung), 1.6-1.7x the
         slab. Rubin: VPT=2/MINB=2 — the MINB=4 rung is register-starved there
         (1.4-2x slower than the slab) while MINB=2 is 1.4x faster; bounds
@@ -1097,7 +1098,7 @@ def _prefill_reg_route(rows: int, k: int, n_hint: int) -> dict | None:
                 return None
             rung = (512, 1, 4)
         else:
-            rung = (512, 2, 4) if k == 2048 else (512, 1, 4)
+            rung = (512, 1, 4)  # k == 2048 never reaches this class (n_hint <= k above)
     elif n_hint <= 4096:
         if rubin:
             if rubin_short_gate and n_hint <= 2560:
@@ -1241,8 +1242,12 @@ def _launch_prefill(
     dead x5, kv_lens_slot=window lengths, tuning tail)``; the prefill compile
     reads ks from the pre_idx slot and the window length from the kv_lens slot
     and clamps ke to ``n_clamp`` (the logits width) in the ``n`` slot.
-    ``n_hint`` (max window length, capture-stable) only selects the plan tier
-    and envelope bucket — a tuning hint, never a bound the kernel trusts.
+    ``n_hint`` (the caller's max window length, capture-stable) selects the
+    engine: a register rung whose capacity covers it (``hinted``), else the
+    slab tier and envelope bucket. Every engine clamps ``ke`` to the logits
+    width; the slab ranks any window exactly, a register rung ranks exactly
+    every row whose extent (window + lead lanes) fits its capacity and reports
+    a longer row as all -1, never as a truncated ranking (``_prefill_reg_route``).
     ``abs_out`` selects the compiled variants that emit absolute logits
     columns (window-local + row start) instead of window-local indices."""
     num_rows = lg.shape[0]
@@ -2031,9 +2036,13 @@ def run_varlen(
     constant, e.g. dsa.py's ``indexer_max_seq_len``) the call performs NO
     host reads.  Without ``max_seq_len`` the envelope comes from ONE
     ``kv_lens.max()`` host read (documented sync, refused under capture).
-    With ``row_starts`` (windowed mode) ``max_seq_len`` is the max WINDOW
-    length and only selects the plan tier / envelope bucket; the kernel
-    always clamps windows to the logits width, never to ``max_seq_len``.
+    With ``row_starts`` (windowed mode) ``max_seq_len`` is the caller's bound
+    on the WINDOW lengths and selects the engine (a register rung whose
+    capacity covers the bound, else the streaming slab). Every engine clamps
+    windows to the logits width; the slab ranks any window exactly, while a
+    register rung reports a row whose extent exceeds its capacity as all -1
+    (never a truncated ranking), so the bound must hold at every graph replay
+    or the call must stay unhinted.
     ``engine="reference"`` keeps the b=1 host-loop reference implementation —
     the differential oracle the in-kernel engine is validated against.
 
