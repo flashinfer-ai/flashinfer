@@ -2032,6 +2032,14 @@ def top_k_varlen(
 
     if backend == "auto":
         backend = top_k_varlen.suitable_auto_backends[0]
+    if row_starts is not None and backend != "gvr_2":
+        # reachable under skip_check=True only (every other checker refuses
+        # row_starts): refuse BEFORE dispatch -- a radix / gvr run would
+        # silently rank the row prefix [0, seq_len) instead of the window
+        raise BackendSupportedError(
+            f"backend={backend!r} does not support row_starts (windowed mode); "
+            "use backend='gvr_2' or 'auto'"
+        )
     if pre_idx is None and backend == "gvr":
         # reachable under skip_check=True (the checkers did not run) with a
         # missing or just-discarded hint: refuse here instead of handing None
@@ -2105,12 +2113,6 @@ def top_k_varlen(
             row_starts=row_starts,
             max_seq_len=max_seq_len,
             absolute_indices=absolute_indices,
-        )
-    elif row_starts is not None:
-        # reachable under skip_check=True only (the checkers refuse it)
-        raise BackendSupportedError(
-            f"backend={backend!r} does not support row_starts (windowed mode); "
-            "use backend='gvr_2' or 'auto'"
         )
     elif backend == "radix_cutlass":
         out_i, out_v = _run_radix_cutlass(

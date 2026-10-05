@@ -803,6 +803,29 @@ def test_prefill_absolute_indices_validation():
         flashinfer.top_k_varlen(lg, le, k, absolute_indices=True)
 
 
+def test_prefill_skip_check_refuses_other_backends():
+    """``skip_check=True`` bypasses the checkers; the dispatcher must still
+    refuse ``row_starts`` on every backend but gvr_2 BEFORE launching anything
+    (a radix / gvr run would silently rank the row prefix, not the window)."""
+    from flashinfer.utils import BackendSupportedError
+
+    n, rows, k = 4096, 8, 512
+    lg = torch.randn((rows, n), dtype=torch.float32, device=_DEV)
+    le = torch.full((rows,), 1000, dtype=torch.int32, device=_DEV)
+    rs = torch.full((rows,), 100, dtype=torch.int32, device=_DEV)
+    for b in ("radix", "radix_cutlass", "radix_filter", "gvr"):
+        with pytest.raises(BackendSupportedError, match="row_starts"):
+            flashinfer.top_k_varlen(
+                lg, le, k, row_starts=rs, backend=b, skip_check=True
+            )
+    if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()):
+        out, _ = flashinfer.top_k_varlen(
+            lg, le, k, row_starts=rs, backend="gvr_2", skip_check=True
+        )
+        torch.cuda.synchronize()
+        _check_windowed(lg, out, rs, le, k)
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
 def test_prefill_absolute_indices_on_non_current_device():
     """logits on a device that is not the current one: the host re-enters
