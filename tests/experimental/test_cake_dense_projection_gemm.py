@@ -36,6 +36,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     default_block_n,
     default_group_m,
     default_hints,
+    b_stage_bytes,
     default_stages,
     device_l2_bytes,
     epi_cols,
@@ -44,6 +45,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     generated_program_available,
     instance_key,
     instance_symbol,
+    sk_exact_plan,
     operand_view,
     plan_dense_projection_gemm,
     plan_router_fp32_gemm,
@@ -816,17 +818,69 @@ def test_epilogue_rules():
             dict(a_mn=False, b_mn=False, cta_rows=256, park=True),
             "dense_proj_gemm_kk_n256_m256_pk",
         ),
+        # round 13 (W3): narrow MN-major B panels (``_bz64`` right after the tile family) and the exact p-way
+        # stream-K split (trailing ``_skx``); K-major B instances always keep the 128-byte panel (no suffix)
+        (
+            dict(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64),
+            "dense_proj_gemm_nn_n160_m256_bz64",
+        ),
+        (
+            dict(a_mn=True, b_mn=True, block_n=192, out_t=True, b_swz=64, hints=("evict_first", "evict_first")),
+            "dense_proj_gemm_nn_n192_bz64_hee_t",
+        ),
+        (
+            dict(a_mn=True, b_mn=True, block_n=128, out_t=True, hints=("evict_first", "none"), sk_exact=True),
+            "dense_proj_gemm_nn_n128_hen_t_skx",
+        ),
+        (
+            dict(a_mn=True, b_mn=True, block_n=128, cta_rows=64, out_t=True, out_f32=True, hints=("evict_first", "none"), sk_exact=True),
+            "dense_proj_gemm_nn_n128_m64_hen_f32_t_skx",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, block_n=256, b_swz=64),
+            "dense_proj_gemm_kk_n256",
+        ),
     ],
 )
 def test_instance_symbols(kwargs, symbol):
     assert instance_symbol(instance_key(**kwargs)) == symbol
 
 
+def test_round13_w3_knobs():
+    # fields 18 / 19 of the 20-field key: b_swz (128 for K-major B whatever the caller asks), sk_exact; the narrow panel
+    # shrinks the B stage (160 columns: 3 x 32-column panels = 12 KiB instead of 2 x 64-column = 16 KiB) and the
+    # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
+    key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
+    assert len(key) == 20 and key[18] == 64 and key[19] is False
+    assert instance_key(a_mn=False, b_mn=False, b_swz=64)[18] == 128
+    assert b_stage_bytes(True, 160, 64) == 3 * 64 * 64 and b_stage_bytes(True, 160, 128) == 2 * 64 * 128
+    assert default_stages(0, 256, 160, True, 64) >= default_stages(0, 256, 160, True, 128)
+    assert instance_key(a_mn=True, b_mn=True, block_n=128, out_t=True, sk_exact=True)[19] is True
+    with pytest.raises(ValueError):
+        instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=48)
+    with pytest.raises(ValueError):
+        instance_key(a_mn=False, b_mn=True, cta_rows=256, ovl=True, b_swz=64)
+    with pytest.raises(ValueError):
+        instance_key(a_mn=False, b_mn=False, cta_rows=256, htail=True, sk_exact=True)
+
+
+def test_sk_exact_plan_mirrors_cake():
+    # 24 tail tiles on 106 pairs, 96 K blocks: 3 parts of 32 steps -> 72 units, one segment each; a 2-part split of 3 K
+    # blocks is refused (part under SK_MIN_ITERS), as is a split whose last part would be empty
+    assert sk_exact_plan(24, 96, 106, 3) == (0, 24, 72, 32)
+    assert sk_exact_plan(130, 96, 106, 2) == (106, 24, 48, 48)
+    assert sk_exact_plan(24, 96, 106, 1) is None  # fewer than two parts
+    assert sk_exact_plan(212, 96, 106, 3) is None  # no tail
+    assert sk_exact_plan(24, SK_MIN_ITERS, 106, 2) is None  # a part under SK_MIN_ITERS steps
+    assert sk_exact_plan(24, 72, 106, 10) is None  # ceil(72 / 10) = 8 steps x 9 parts already cover K: empty last part
+    assert sk_exact_plan(24, 73, 106, 10) == (0, 24, 240, 8)  # ... one more K block and the tenth part is non-empty
+
+
 def test_round13_knob_normalisation():
-    # the 18-field key carries park / ovl / htail at fields 15 / 16 / 17; ovl is a 256-row x 256-column tall-tile
+    # the 20-field key carries park / ovl / htail at fields 15 / 16 / 17; ovl is a 256-row x 256-column tall-tile
     # knob (narrower or shorter tiles raise), htail needs the 256-row family, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 18 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 20 and key[15] is False and key[16] is True and key[17] is True
     assert instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15] is False
     with pytest.raises(ValueError):
         instance_key(a_mn=False, b_mn=False, cta_rows=256, block_n=192, ovl=True)
@@ -838,7 +892,7 @@ def test_round13_knob_normalisation():
 
 def test_quad_store_knob_normalisation():
     # only the row-major bf16 register epilogue carries the quad-store knob: fp32 output, the TMA-store
-    # epilogue and the transposed store drop it from the key (and the symbol); field 14 of the 18-field key
+    # epilogue and the transposed store drop it from the key (and the symbol); field 14 of the 20-field key
     assert instance_key(a_mn=False, b_mn=True, epi="reg", quad_store=True)[14] is True
     assert (
         instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", quad_store=True)[
@@ -1033,12 +1087,17 @@ def test_instance_key_rejects_bad_configurations():
     with pytest.raises(ValueError, match="prefetch"):
         instance_key(a_mn=False, b_mn=False, pf=17)
     key = instance_key(a_mn=False, b_mn=False)
-    # 15 fields since round 11 (the raster group width and the TMA L2 promotion left the key for the launch
-    # arguments): pf, hints, f32_v8, quad_store
-    assert len(key) == 15 and key[11:] == (
+    # 20 fields since round 13 (the raster group width and the TMA L2 promotion left the key for the launch
+    # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact
+    assert len(key) == 20 and key[11:] == (
         0,
         ("none", "none"),
         False,
+        False,
+        False,
+        False,
+        False,
+        128,
         False,
     )
     # the promotion is validated where it is resolved, by the planner

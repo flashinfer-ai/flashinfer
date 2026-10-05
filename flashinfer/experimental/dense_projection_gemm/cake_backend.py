@@ -116,6 +116,7 @@ BLOCK_K = 64  # K elements per stage (128-byte swizzle rows)  [Cake L58]
 PANEL_BYTES = (
     BLOCK_K * 128
 )  # one MN-major B panel: 64 K rows x 128 B = 8192  [Cake L60]
+B_SWZ_CHOICES = (128, 64, 32)  # round 13 (Cake L35): MN-major B panel width in bytes; 128 = the 64-column panels of rounds 1-12
 CTA_GROUP = 2  # CTAs per cluster / MMA pair  [Cake L59]
 EPI_WARPS = 8  # [Cake L67]
 WORK_STAGES = 4  # cluster-launch-control work-ring depth  [Cake L68]
@@ -322,12 +323,21 @@ def staging_bytes(slots: int) -> int:
     return EPI_WARPS * slots * SLOT_BYTES
 
 
-def b_stage_bytes(b_mn: bool, block_n: int) -> int:
-    """Bytes of one B stage per CTA: K-major = ``BLOCK_N / 2`` 128-byte rows; MN-major = whole
-    64-column panels (BLOCK_N = 192 loads two panels per stage, the MMA reads 1.5 of them).
-    [Cake ``b_stage_bytes`` L828-L832]"""
+def b_stage_bytes(b_mn: bool, block_n: int, b_swz: int = 128) -> int:
+    """Bytes of one B stage per CTA: K-major = ``BLOCK_N / 2`` 128-byte rows; MN-major = whole panels of
+    ``b_swz / 2`` columns (BLOCK_N = 192 with 128-byte panels loads two 64-column panels per stage and the MMA
+    reads 1.5 of them; with 64-byte panels it loads exactly the three 32-column panels it reads - round 13).
+    [Cake ``b_stage_bytes``]"""
     n_half = block_n // 2
-    return (-(-n_half // 64)) * PANEL_BYTES if b_mn else n_half * BLOCK_K * 2
+    if not b_mn:
+        return n_half * BLOCK_K * 2
+    cols = int(b_swz) // 2
+    return (-(-n_half // cols)) * BLOCK_K * int(b_swz)
+
+
+def a_halves_of(cta_rows: int) -> int:
+    """128-row A halves per CTA tile (1 for the 64 / 128-row families, 2 for the tall family).  [Cake ``A_HALVES_OF``]"""
+    return max(1, int(cta_rows) // BLOCK_M)
 
 
 def smem_limit_for(arch: Optional[str]) -> int:
@@ -341,16 +351,18 @@ def smem_limit_for(arch: Optional[str]) -> int:
 
 
 def default_stages(
-    slots: int, cta_rows: int = 128, block_n: int = 256, b_mn: bool = False
+    slots: int, cta_rows: int = 128, block_n: int = 256, b_mn: bool = False, b_swz: int = 128
 ) -> int:
     """Mainloop stages that fit the 227 KiB opt-in with the epilogue staging: 32 KiB stages
     for 128-row tiles (24 KiB at BLOCK_N = 128, where the streaming-bound small-N rows are
     still latency-bound at 7 stages: 9 / 8 / 6 for 0 / 1 / 2 slots), 48 KiB stages for tall
     (256-row) tiles.  Layout-B tiles (64 rows: 24 KiB stages at BLOCK_N = 256, 16 KiB at 128)
     take the deepest pipeline that fits beside the staging, at most 12 stages (round 9;
-    ``b_mn`` sizes the MN-major B panels).  [Cake ``default_stages`` L844-L857]"""
-    if cta_rows == 64:
-        stage = 64 * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n)
+    ``b_mn`` sizes the MN-major B panels).  Narrow-panel instances (``b_swz`` 64 / 32, round 13) have smaller
+    stages than their 128-byte-panel siblings and likewise take the deepest pipeline that fits the opt-in (at most
+    12).  [Cake ``default_stages``]"""
+    if cta_rows == 64 or int(b_swz) != 128:
+        stage = min(cta_rows, 128) * a_halves_of(cta_rows) * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz)
         return max(
             2,
             min(12, (SMEM_OPT_IN - WORK_STAGES * 16 - staging_bytes(slots)) // stage),
@@ -405,11 +417,15 @@ def instance_key(
     ovl: bool = False,
     htail: bool = False,
     smem_limit: Optional[int] = None,
+    b_swz: int = 128,
+    sk_exact: bool = False,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
-    hints, f32_v8, quad_store, park, ovl, htail)`` (round 13: ``park`` = parked tall epilogue, ``ovl`` =
-    overlapped single-TMEM-buffer tall epilogue, ``htail`` = deterministic half-height tail wave); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
+    hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact)`` (round 13: ``park`` = parked tall epilogue, ``ovl`` =
+    overlapped single-TMEM-buffer tall epilogue, ``htail`` = deterministic half-height tail wave, ``b_swz`` = MN-major B
+    panel width in bytes (128 / 64 / 32; K-major B instances always keep 128), ``sk_exact`` = exact p-way stream-K
+    split, ``_skx`` symbols); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
     architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
     the key, so an instance has one symbol on every architecture (the planner passes
     ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
@@ -433,6 +449,9 @@ def instance_key(
             f"BLOCK_N={block_n} with CTA_ROWS={cta_rows} gives {cols}-column warp slices; "
             "slices must be whole 16-column chunks"
         )
+    b_swz = int(b_swz) if b_mn else 128
+    if b_swz not in B_SWZ_CHOICES:
+        raise ValueError(f"b_swz must be one of {B_SWZ_CHOICES}, got {b_swz}")
     epi = epi_mode(out_f32, out_t, None, epi, block_n, cta_rows)
     if epi == "tma" and cols % (32 if out_f32 else 64):
         raise ValueError(
@@ -441,7 +460,7 @@ def instance_key(
         )
     slots = epi_slots(epi, out_f32, block_n, None, slots, cta_rows)
     stages = (
-        default_stages(slots, cta_rows, block_n, b_mn)
+        default_stages(slots, cta_rows, block_n, b_mn, b_swz)
         if stages is None
         else int(stages)
     )
@@ -449,7 +468,7 @@ def instance_key(
     if diag:
         raise ValueError(f"diagnostic instances are not exported: {diag}")
     limit = smem_limit_for(None) if smem_limit is None else int(smem_limit)
-    stage_bytes = cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n)
+    stage_bytes = cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz)
     if (
         stages < 2
         or stages * stage_bytes + staging_bytes(slots) + WORK_STAGES * 16 > limit
@@ -479,11 +498,19 @@ def instance_key(
             f"ovl needs cta_rows=256, block_n=256 and no park / pf / box_rows (got cta_rows={cta_rows}, "
             f"block_n={block_n}, park={park}, pf={pf}, box_rows={box_rows})"
         )
+    if ovl and b_swz != 128:
+        raise ValueError(
+            f"ovl owns the 256-column B load coordinates and needs the 128-byte B swizzle (got b_swz={b_swz})"
+        )
     htail = bool(htail)
     if htail and (cta_rows != 256 or pf or box_rows):
         raise ValueError(
             f"htail (half-height tail wave) needs cta_rows=256 and no pf / box_rows (got cta_rows={cta_rows}, "
             f"pf={pf}, box_rows={box_rows})"
+        )
+    if htail and sk_exact:
+        raise ValueError(
+            "htail (half-height tail wave) and sk_exact (exact p-way tail split) are two tail policies - choose one per instance"
         )
     return (
         a_mn,
@@ -504,6 +531,8 @@ def instance_key(
         park,
         ovl,
         htail,
+        b_swz,
+        bool(sk_exact),
     )
 
 
@@ -512,9 +541,10 @@ def instance_symbol(key: tuple) -> str:
     followed by ``_m256`` for tall tiles / ``_m64`` for the 64-row Layout-B family, ``_pf<n>`` for a
     prefetch distance, ``_h<a><b>`` for non-default (A, B) eviction hints (first letters, e.g.
     ``_hen`` = A evict_first / B none), ``_f32``, ``_v8`` for the 256-bit fp32 register stores, ``_t``,
-    ``_pk`` / ``_ov`` / ``_ht`` for the parked / overlapped / half-height-tail tall epilogues (round 13),
-    ``_<epi><slots>`` for the TMA-store epilogue, ``_s<stages>`` for a non-default stage count and
-    ``_box<rows>``).  [Cake ``instance_symbol``]"""
+    ``_bz<bytes>`` right after the tile family for a narrow MN-major B panel (round 13), ``_pk`` / ``_ov`` / ``_ht`` for
+    the parked / overlapped / half-height-tail tall epilogues (round 13), ``_<epi><slots>`` for the TMA-store
+    epilogue, ``_s<stages>`` for a non-default stage count, ``_box<rows>`` and a trailing ``_skx`` for the exact
+    p-way stream-K split (round 13)).  [Cake ``instance_symbol``]"""
     (
         a_mn,
         b_mn,
@@ -534,6 +564,8 @@ def instance_symbol(key: tuple) -> str:
         park,
         ovl,
         htail,
+        b_swz,
+        sk_exact,
     ) = key
     return (
         "dense_proj_gemm_"
@@ -541,6 +573,7 @@ def instance_symbol(key: tuple) -> str:
         + ("n" if b_mn else "k")
         + f"_n{block_n}"
         + ("_m256" if cta_rows == 256 else "_m64" if cta_rows == 64 else "")
+        + (f"_bz{b_swz}" if b_swz != 128 else "")
         + (f"_pf{pf}" if pf else "")
         + (f"_h{hints[0][0]}{hints[1][0]}" if hints != ("none", "none") else "")
         + ("_f32" if out_f32 else "")
@@ -553,10 +586,11 @@ def instance_symbol(key: tuple) -> str:
         + (f"_{epi}{slots}" if epi != "reg" else "")
         + (
             f"_s{stages}"
-            if stages != default_stages(slots, cta_rows, block_n, b_mn)
+            if stages != default_stages(slots, cta_rows, block_n, b_mn, b_swz)
             else ""
         )
         + (f"_box{box_rows}" if box_rows else "")
+        + ("_skx" if sk_exact else "")
         + "".join(f"_{d}" for d in diag)
     )
 
@@ -621,7 +655,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, False, False, False, False, 32, 6144, None): {"promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, False, 576, 6144, None): {"cta_rows": 256, "hints": ('evict_first', 'none'), "stages": 5},
     ('sm_107a', False, False, False, False, False, 6144, 12288, None): {"cta_rows": 256, "sk_parts": 3},
-    ('sm_107a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256},
+    ('sm_107a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256, "ovl": True, "htail": True},
     ('sm_107a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
     ('sm_107a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
@@ -629,8 +663,9 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 128, "slots": 2},
     ('sm_107a', False, True, False, False, False, 6144, 128, None): {"block_n": 128, "cta_rows": 256},
     ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "quad_store": True},
+    ('sm_107a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True},
     ('sm_107a', False, True, False, False, False, 12288, 6144, None): {"hints": ('none', 'evict_first')},
-    ('sm_107a', False, True, False, False, False, 16384, 6144, None): {"cta_rows": 256, "group_m": 8},
+    ('sm_107a', False, True, False, False, False, 16384, 6144, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
     ('sm_107a', False, True, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_107a', False, True, False, False, True, 256, 512, None): {"promo": 'l2_256b'},
     ('sm_107a', False, True, False, False, True, 512, 256, None): {"promo": 'l2_256b'},
@@ -641,27 +676,27 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 6144, 128, None): {"block_n": 128},
     ('sm_107a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b'},
     ('sm_107a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
-    ('sm_107a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256},
+    ('sm_107a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256, "sk_parts": 3},
     ('sm_107a', False, True, True, False, False, 12288, 6144, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 16384, 6144, None): {"cta_rows": 256},
-    ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "group_m": 4, "sk_parts": 2},
+    ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "group_m": 4, "sk_parts": 2, "b_swz": 64},
     ('sm_107a', True, True, False, False, False, 6144, None, 12288): {"cta_rows": 256, "sk_parts": 2},
     ('sm_107a', True, True, False, False, False, 12288, None, 6144): {"sk_parts": 3},
     ('sm_107a', True, True, False, False, False, 16384, None, 6144): {"cta_rows": 256, "sk_parts": 3},
-    ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "sk_parts": 3},
-    ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_parts": 3},
-    ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
+    ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "sk_exact": 3},
+    ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_exact": 2},
+    ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64},
     ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first')},
     ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first')},
-    ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "sk_parts": 3},
+    ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "sk_parts": 3, "b_swz": 64},
     ('sm_107a', True, True, True, False, False, 2048, None, 6144): {"cta_rows": 256},
     ('sm_107a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', True, True, True, False, False, 6144, None, 2048): {"cta_rows": 256},
     ('sm_107a', True, True, True, False, False, 6144, None, 12288): {"epi": 'reg', "f32_v8": True},
     ('sm_107a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
-    ('sm_107a', True, True, True, True, False, 32, None, 6144): {"block_n": 128, "sk_parts": 3},
-    ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_parts": 3},
-    ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
+    ('sm_107a', True, True, True, True, False, 32, None, 6144): {"block_n": 128, "sk_exact": 3},
+    ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_exact": 2},
+    ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64},
 }
 # fmt: on
 
@@ -789,6 +824,25 @@ def sk_parts_plan(
     ):
         return "auto", None
     return True, parts * tail
+
+
+def sk_exact_plan(
+    pair_tiles: int, k_blocks: int, pairs: int, parts: int
+) -> Optional[tuple[int, int, int, int]]:
+    """(num_full, tail_tiles, sk_units, iters_per_unit) of the exact ``parts``-way K split of the tail tiles
+    (Cake round 13, L36): the tiles that do not fill a whole wave of CTA pairs (all of them when there are fewer
+    tiles than pairs) each become ``parts`` units of ``ceil(k_blocks / parts)`` contiguous K steps - identical K
+    ranges on every tile, exactly ``parts`` partials per tile, no drift when ``parts`` does not divide
+    ``k_blocks``.  The unit count may exceed the pairs.  ``None`` when the split is not admissible: fewer than two
+    parts, no tail, a part under ``SK_MIN_ITERS`` steps, or an empty last part.  [Cake ``sk_exact_plan``]"""
+    tail = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
+    parts = int(parts)
+    if parts < 2 or tail == 0:
+        return None
+    ipu = _ceil_div(k_blocks, parts)
+    if ipu < SK_MIN_ITERS or (parts - 1) * ipu >= k_blocks:
+        return None
+    return pair_tiles - tail, tail, tail * parts, ipu
 
 
 def stream_k_plan(
@@ -925,6 +979,10 @@ class GemmPlan:
     park: bool = False
     ovl: bool = False
     htail: bool = False
+    # round-13 W3 knobs: MN-major B panel width (instance_key field 18) and the exact p-way tail split (field 19 is
+    # the flag; ``sk_exact`` here is the part count p, 0 = off)
+    b_swz: int = 128
+    sk_exact: int = 0
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -963,7 +1021,10 @@ class GemmPlan:
 
     @property
     def sk_iters(self) -> int:
-        """The launcher's linearised stream-K span; under ``htail`` every half item is one whole-K segment."""
+        """The launcher's linearised stream-K span; under ``htail`` every half item is one whole-K segment; the
+        exact split (``_skx`` instances) passes the part count p in this slot."""
+        if self.sk_exact:
+            return int(self.sk_exact)
         return (self.sk_units if self.htail else self.tail_tiles) * self.k_blocks
 
     @property
@@ -996,6 +1057,8 @@ def plan_dense_projection_gemm(
     park: Optional[bool] = None,
     ovl: Optional[bool] = None,
     htail: Optional[bool] = None,
+    b_swz: Optional[int] = None,
+    sk_exact: Optional[int] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -1038,6 +1101,8 @@ def plan_dense_projection_gemm(
         park=park,
         ovl=ovl,
         htail=htail,
+        b_swz=b_swz,
+        sk_exact=sk_exact,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -1101,7 +1166,7 @@ def plan_dense_projection_gemm(
         rule = {
             k: v
             for k, v in rule.items()
-            if k not in ("block_n", "stages", "slots", "epi", "ovl", "htail")
+            if k not in ("block_n", "stages", "slots", "epi", "ovl", "htail", "b_swz")
         }
     if block_n is None:
         block_n = rule.get("block_n", default_block_n(N, b_mn))
@@ -1123,6 +1188,10 @@ def plan_dense_projection_gemm(
         ovl = rule.get("ovl", False)
     if htail is None:
         htail = rule.get("htail", False)
+    if b_swz is None:
+        b_swz = rule.get("b_swz", 128)
+    if sk_exact is None:
+        sk_exact = rule.get("sk_exact")
     if ovl and int(block_n) != 256:
         # the overlapped epilogue is built for the 256-column tall tile; a narrower tall tile keeps the serialized
         # tall epilogue  [Cake launcher]
@@ -1133,19 +1202,28 @@ def plan_dense_projection_gemm(
     k_blocks = _ceil_div(K, BLOCK_K)
     pair_tiles = L * (m_tiles // CTA_GROUP) * n_tiles
     pairs = sm_pairs(sm_count)
+    # Round 13 (Cake W3): a ``sk_exact`` rule / kwarg is the row's tail policy (exact p-way K split of every tail
+    # tile, one unit per part); it pre-empts ``sk_parts`` and ``htail`` exactly as the Cake launcher orders them.
+    exact_plan = (
+        sk_exact_plan(pair_tiles, k_blocks, pairs, int(sk_exact))
+        if (sk_exact and sk == "auto" and sk_max_units is None)
+        else None
+    )
     parts = rule.get("sk_parts") if sk_parts is None else int(sk_parts)
-    if sk == "auto" and sk_max_units is None and parts:
+    if sk == "auto" and sk_max_units is None and parts and exact_plan is None:
         # Measured per-row p-way split of the tail wave (Cake round 4, L20); a caller ``sk_parts`` wins over the
         # rule's.  [Cake L1296-L1301]
         sk, sk_max_units = sk_parts_plan(pair_tiles, k_blocks, pairs, int(parts))
     # Round 13 (Cake W1): deterministic half-height tail wave of the tall family - the tail tiles become 2 x tail
     # standard-geometry items of full K (no partial slabs, no fixup), only when there is a tail and its half items fit
     # the CTA pairs; otherwise the plain plan / stream-K policy of the row applies.  [Cake launcher]
-    htail = bool(htail) and int(cta_rows) == 256
+    htail = bool(htail) and int(cta_rows) == 256 and exact_plan is None
     if htail:
         tail_h = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
         htail = bool(tail_h) and 2 * tail_h <= pairs
-    if htail:
+    if exact_plan is not None:
+        num_full, tail_tiles, sk_units, iters_per_unit = exact_plan
+    elif htail:
         num_full, tail_tiles, sk_units, iters_per_unit = (
             pair_tiles - tail_h,
             tail_h,
@@ -1208,6 +1286,8 @@ def plan_dense_projection_gemm(
         ovl=ovl,
         htail=htail,
         smem_limit=smem_limit_for(arch),
+        b_swz=int(b_swz),
+        sk_exact=exact_plan is not None,
     )
     plan = GemmPlan(
         L=L,
@@ -1243,6 +1323,8 @@ def plan_dense_projection_gemm(
         park=bool(key[15]),
         ovl=bool(key[16]),
         htail=bool(key[17]),
+        b_swz=int(key[18]),
+        sk_exact=int(sk_exact) if exact_plan is not None else 0,
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
@@ -1475,6 +1557,8 @@ def prepare_dense_projection_gemm(
     park: Optional[bool] = None,
     ovl: Optional[bool] = None,
     htail: Optional[bool] = None,
+    b_swz: Optional[int] = None,
+    sk_exact: Optional[int] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -1511,6 +1595,8 @@ def prepare_dense_projection_gemm(
         park=park,
         ovl=ovl,
         htail=htail,
+        b_swz=b_swz,
+        sk_exact=sk_exact,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)
