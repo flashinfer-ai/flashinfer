@@ -129,7 +129,9 @@ def _make_case(rows, ncols, ks_list, len_list, *, seed, dist="randn"):
     pat = torch.tensor([float("nan"), float("inf"), 3e38, float("-inf")], device=_DEV)[
         cols % 4
     ].expand(rows, -1)
-    full.masked_scatter_(outside, pat[outside])
+    # torch.where, not masked_scatter_: the latter's int64 prefix sum over the
+    # mask doubled the peak memory of the large fixtures
+    full.copy_(torch.where(outside, pat, full))
     for r, s in enumerate(ks_list):
         full[r, max(s - 3, 0) : s] = float("inf")
     return logits, ks, lens
@@ -408,12 +410,21 @@ def test_prefill_register_rung_hinted(top_k, bound):
     """With ``max_seq_len`` the launch runs on the register rung the per-part
     table picks for that bound (or the slab where the table says so): exact on
     every lead with +inf poison, and the register launcher really is what ran."""
-    R = 3
     L = bound
+    if bound <= 4097:
+        R = 3  # three packed requests: every lead class at the request edges
+        ks = [(r * L) for r in range(R) for _ in range(L)]
+        ncols = R * L
+    else:
+        # one request at the 8K class, misaligned by 3 (the packing is covered
+        # by the classes above): 3 x 8192 rows x 24832 cols fp32 plus the
+        # poison scatter peaked near 10 GB and ran a 24576-row check loop
+        R = 1
+        ks = [3] * L
+        ncols = L + 4
     rows = R * L
-    ks = [(r * L) for r in range(R) for _ in range(L)]
     lens = [i + 1 for _ in range(R) for i in range(L)]
-    lg, rs, le = _make_case(rows, R * L, ks, lens, seed=bound + top_k)
+    lg, rs, le = _make_case(rows, ncols, ks, lens, seed=bound + top_k)
     plan = _host._prefill_reg_route(rows, top_k, L)
     before = set(_reg_keys())
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
@@ -824,6 +835,101 @@ def test_prefill_skip_check_refuses_other_backends():
         )
         torch.cuda.synchronize()
         _check_windowed(lg, out, rs, le, k)
+
+
+def test_prefill_next_n_refused():
+    """Windowed mode is one row per request: ``next_n=2`` with ``row_starts``
+    is refused by every checker (auto: no suitable backend; explicit gvr_2:
+    backend validation)."""
+    from flashinfer.utils import BackendSupportedError
+
+    n, reqs, k = 4096, 4, 512
+    lg = torch.randn((2 * reqs, n), dtype=torch.float32, device=_DEV)
+    le = torch.full((reqs,), n, dtype=torch.int32, device=_DEV)
+    rs = torch.zeros((2 * reqs,), dtype=torch.int32, device=_DEV)
+    with pytest.raises(BackendSupportedError):
+        flashinfer.top_k_varlen(lg, le, k, next_n=2, row_starts=rs)
+    with pytest.raises((ValueError, BackendSupportedError)):
+        flashinfer.top_k_varlen(lg, le, k, next_n=2, row_starts=rs, backend="gvr_2")
+
+
+@requires_gvr2
+def test_prefill_zero_rows():
+    """An empty batch returns without a launch; a caller buffer is untouched."""
+    n, k = 4096, 512
+    lg = torch.empty((0, n), dtype=torch.float32, device=_DEV)
+    le = torch.empty((0,), dtype=torch.int32, device=_DEV)
+    rs = torch.empty((0,), dtype=torch.int32, device=_DEV)
+    out, _ = flashinfer.top_k_varlen(lg, le, k, row_starts=rs, backend="gvr_2")
+    assert out.shape == (0, k)
+    buf = torch.empty((0, k), dtype=torch.int32, device=_DEV)
+    out2, _ = flashinfer.top_k_varlen(
+        lg, le, k, row_starts=rs, out_indices=buf, backend="gvr_2"
+    )
+    assert out2.shape == (0, k)
+    torch.cuda.synchronize()
+
+
+@requires_gvr2
+@pytest.mark.parametrize("hinted", [False, True], ids=["unhinted", "hinted"])
+def test_prefill_out_values_through_api(hinted):
+    """``return_values`` with caller buffers (2-D and flat): the values are the
+    window scores at the selected columns and the pads hold the fp32 sentinel,
+    on both engines."""
+    top_k, R, L = 512, 2, 1500
+    rows = R * L
+    ks = [(r * L) for r in range(R) for _ in range(L)]
+    lens = [i + 1 for _ in range(R) for i in range(L)]
+    lg, rs, le = _make_case(rows, R * L, ks, lens, seed=11)
+    for shape in ((rows, top_k), (rows * top_k,)):
+        out_i = torch.full(shape, -7, dtype=torch.int32, device=_DEV)
+        out_v = torch.full(shape, 123.0, dtype=torch.float32, device=_DEV)
+        idx, vals = flashinfer.top_k_varlen(
+            lg,
+            le,
+            top_k,
+            row_starts=rs,
+            return_values=True,
+            out_indices=out_i,
+            out_values=out_v,
+            backend="gvr_2",
+            max_seq_len=L if hinted else None,
+        )
+        torch.cuda.synchronize()
+        idx = idx.view(rows, top_k)
+        vals = vals.view(rows, top_k)
+        _check_windowed(lg, idx, rs, le, top_k)
+        valid = idx >= 0
+        cols = (idx.to(torch.int64) + rs.unsqueeze(1).to(torch.int64)).clamp_min(0)
+        gathered = lg.gather(1, cols)
+        assert torch.equal(vals[valid], gathered[valid])
+        assert bool((vals[~valid] == torch.finfo(torch.float32).min).all())
+
+
+@requires_gvr2
+def test_prefill_row_starts_out_of_range():
+    """Out-of-range starts: a negative ks is clamped to 0 and the window keeps
+    its length; a ks at or past the width is an empty window (all -1); a window
+    past the width is clamped. Never a read outside the row (poisoned cells)."""
+    n, k, rows = 4096, 512, 4
+    full = torch.full((rows, ((n + 256 + 255) // 256) * 256), float("nan"), device=_DEV)
+    lg = full[:, :n]
+    lg.normal_()  # finite inside the row, NaN in the stride slack beyond it
+    le = torch.tensor([1000, 1000, 1000, 1000], dtype=torch.int32, device=_DEV)
+    rs = torch.tensor([-1, n + 5, 0, n - 700], dtype=torch.int32, device=_DEV)
+    out = _run(lg, rs, le, k)
+    ref = _run(
+        lg, torch.tensor([0, 0, 0, n - 700], dtype=torch.int32, device=_DEV), le, k
+    )
+    assert _same_rows(out[0:1], ref[0:1])  # ks=-1 behaves as ks=0
+    assert bool((out[1] == -1).all())  # ks past the width: empty window
+    assert _same_rows(out[2:3], ref[2:3])
+    # window of 1000 at n-700 is clamped to the 700 columns that exist
+    _check_windowed(lg[3:4], out[3:4], rs[3:4], le[3:4], k)
+    ref_eng = torch.empty((rows, k), dtype=torch.int32, device=_DEV)
+    _host.run_varlen(lg, None, le, ref_eng, top_k=k, row_starts=rs, engine="reference")
+    torch.cuda.synchronize()
+    assert _same_rows(out, ref_eng)
 
 
 @requires_gvr2
