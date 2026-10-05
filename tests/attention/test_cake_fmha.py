@@ -2715,7 +2715,11 @@ def test_cake_decode_fp16_hd512_matches_flashinfer_reference() -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
 def test_cake_context_bf16_separate_tables_matches_reference(monkeypatch) -> None:
     from tests.attention.test_trtllm_gen_attention_prefill import (
         _test_trtllm_batch_prefill,
@@ -2748,7 +2752,11 @@ def test_cake_context_bf16_separate_tables_matches_reference(monkeypatch) -> Non
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
 def test_cake_context_fp8_nhd_device_scale_skip_matches_reference(monkeypatch) -> None:
     from tests.attention.test_trtllm_gen_attention_prefill import (
         _test_trtllm_batch_prefill,
