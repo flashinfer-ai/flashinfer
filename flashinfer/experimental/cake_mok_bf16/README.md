@@ -104,8 +104,9 @@ replays, earlier-graph reuse, and same-shape input updates.
 
 Owner: Haozheng Fan. Tracking: [#6052](https://github.com/flashinfer-ai/flashinfer/issues/6052).
 This draft needs a maintainer-agreed release target before experimental admission. Graduation requires
-full EP16/EP64 qualification of the exported runtime and sanitizer acceptance;
-numerical checks alone do not clear those gates. No whole-model or public performance claim is made.
+resolving the remaining sanitizer qualification described below;
+numerical checks alone do not clear that gate. No whole-model or comparative
+performance claim is made.
 
 The CUDA schedules derive from Cursor Research's Apache-2.0 Mixture of Kittens
 implementation at revision `caeb2963f855c7ad53bb50c8bbf211086405cb98`. Copyright and modification notices are
@@ -149,3 +150,44 @@ route/padding checks for per-rank Compute Sanitizer instrumentation. It omits
 the reference and must accompany a separate full numerical pass. A successful
 workload exit alone does not establish sanitizer acceptance: inspect every
 rank's tool report.
+
+
+The exported runtime has passed all seven full-shape rows at EP16 and EP64,
+including all nine output/gradient tensors on every rank and the reuse checks
+above. Nonempty rows pass maximum absolute error <=0.5 and global relative L1
+<=0.01 against the independent BF16-rounding reference; the observed worst
+values are 0.0625 and 0.003320751. Separate full-shape FP32-reference diagnostics
+are retained as diagnostics, not the acceptance reference. Distributed API
+and capacity/ownership tests pass two tests per rank at both scales.
+
+Full-shape memcheck passes all six nonempty shape/routing pairs at each scale.
+Full-shape synccheck passes those six pairs at EP16; EP64 requires
+`NCCL_ALGO=Ring` for the reported pass. With the default NCCL selection,
+synccheck reports an NVLS collective barrier error before this adapter runs;
+an independent NCCL-only program reproduces the diagnostic.
+
+Reduced-shape racecheck passes uniform and imbalanced routing at EP16/EP64
+with 512 source tokens per rank, H=I=256, eight CPU workers per rank and
+`--racecheck-deadlock-timeout 0`. This disables deadlock detection. Positive
+windows of 10,000 and 60,000 ms report forward barrier deadlocks in diagnostic
+runs, including a controlled eight-worker run. The cause remains unresolved;
+these results do not establish full sanitizer acceptance.
+
+Instrument one worker per GPU so each rank produces its own tool report. For
+example, on each participating node, choose a shared output directory and run:
+
+```bash
+export MOK_VALIDATION_OUTPUT=results/synccheck-fixed-uniform
+mkdir -p "$MOK_VALIDATION_OUTPUT"
+# Set NCCL_ALGO=Ring for the reported EP64 synccheck configuration.
+torchrun --nnodes="$NNODES" --nproc-per-node="$GPUS_PER_NODE" \
+  --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR" --master-port=29500 \
+  --no-python bash -c 'exec compute-sanitizer --tool synccheck \
+    --error-exitcode 99 --log-file "$MOK_VALIDATION_OUTPUT/rank-$RANK.log" \
+    python examples/mok_bf16_validate.py --sanitizer-smoke \
+    --output "$MOK_VALIDATION_OUTPUT/workload" --layout fixed --routing uniform'
+```
+
+Use distinct output directories for each layout/routing/tool combination.
+Check the exit status and tool summary for every rank. The complete numerical
+driver must run separately from `--sanitizer-smoke`.
