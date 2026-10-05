@@ -31,7 +31,7 @@ from contextlib import suppress
 import dataclasses
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, ClassVar, List, Literal, Mapping, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, List, Literal, Mapping, Optional
 
 import torch
 
@@ -94,6 +94,9 @@ from .utils import (
     make_hybrid_bucket_mapper,
     map_to_hybrid_bucket,
 )
+
+if TYPE_CHECKING:
+    from ..jit.cake_stepfun_moe import CakeStepFunTarget
 
 
 _CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
@@ -6861,12 +6864,17 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
         return super().supports_quant(quant)
 
     @property
-    def target(self) -> str:
-        """Exact JIT target of this runner's device (``sm_100a`` or ``sm_103a``)."""
+    def target(self) -> CakeStepFunTarget:
+        """Exact JIT target of this runner's device (``sm_100a`` or ``sm_103a``).
+
+        Narrowed once through :func:`cake_stepfun_target`, which raises for any
+        device the Cake StepFun kernels are not exported for.
+        """
+        from ..jit.cake_stepfun_moe import cake_stepfun_target
         from ..utils import get_compute_capability
 
         major, minor = get_compute_capability(self.device)
-        return f"sm_{major}{minor}a"
+        return cake_stepfun_target(f"sm_{major}{minor}a")
 
     @property
     def full_path(self) -> bool:
@@ -6995,18 +7003,17 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
             )
         return min(tactics, key=lambda tactic: int(tactic[0]))
 
-    def forward(
-        self,
-        inputs: List[torch.Tensor],
-        tactic: Any = -1,
-        do_preparation: bool = False,
-        **kwargs: Any,
-    ) -> torch.Tensor | List[torch.Tensor]:
+    def _resolve_tactic(self, inputs: List[torch.Tensor], tactic: Any) -> Any:
+        """Map the autotuner's ``-1`` onto the smallest exported Cake tile.
+
+        The native trtllm-gen runners resolve ``-1`` to the trtllm-gen default
+        tile, which the Cake StepFun module may not export; the concrete
+        runners below route their ``forward`` through this helper before
+        calling the native family's ``forward``.
+        """
         if tactic == -1:
-            tactic = self.default_tactic(inputs)
-        return super().forward(
-            inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
-        )
+            return self.default_tactic(inputs)
+        return tactic
 
     def _cache_key_extras(self) -> tuple:
         # The runner name and the module variant keep the tactic spaces apart.
@@ -7028,6 +7035,21 @@ class CakeStepFunNvfp4Runner(CakeStepFunRunner, TrtllmFp4RoutedRunner):
     # aggregate on CakeStepFunRunner is for MoELayer backend filtering only).
     supports_fused_shared_experts = TrtllmFp4RoutedRunner.supports_fused_shared_experts
 
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        return TrtllmFp4RoutedRunner.forward(
+            self,
+            inputs,
+            tactic=self._resolve_tactic(inputs, tactic),
+            do_preparation=do_preparation,
+            **kwargs,
+        )
+
 
 class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
     """BF16 StepFun over the Cake FC1 kernels (BlockMajorK weights)."""
@@ -7039,6 +7061,21 @@ class CakeStepFunBf16Runner(CakeStepFunRunner, TrtllmBf16RoutedRunner):
         SwiGLUStep,
     )
     supports_fused_shared_experts = TrtllmBf16RoutedRunner.supports_fused_shared_experts
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        return TrtllmBf16RoutedRunner.forward(
+            self,
+            inputs,
+            tactic=self._resolve_tactic(inputs, tactic),
+            do_preparation=do_preparation,
+            **kwargs,
+        )
 
 
 class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner):
@@ -7054,6 +7091,21 @@ class CakeStepFunFp8PerTensorRunner(CakeStepFunRunner, TrtllmFp8PerTensorRunner)
         TrtllmFp8PerTensorRunner.supports_fused_shared_experts
     )
 
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        return TrtllmFp8PerTensorRunner.forward(
+            self,
+            inputs,
+            tactic=self._resolve_tactic(inputs, tactic),
+            do_preparation=do_preparation,
+            **kwargs,
+        )
+
 
 class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
     """MXFP8 StepFun over the Cake FC1 kernels (UE8M0 block scales)."""
@@ -7067,6 +7119,21 @@ class CakeStepFunMxfp8Runner(CakeStepFunRunner, TrtllmFp8BlockRunner):
         (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLUStep,),
     }
     supports_fused_shared_experts = TrtllmFp8BlockRunner.supports_fused_shared_experts
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        return TrtllmFp8BlockRunner.forward(
+            self,
+            inputs,
+            tactic=self._resolve_tactic(inputs, tactic),
+            do_preparation=do_preparation,
+            **kwargs,
+        )
 
 
 _CAKE_STEPFUN_RUNNERS: tuple[type[CakeStepFunRunner], ...] = (

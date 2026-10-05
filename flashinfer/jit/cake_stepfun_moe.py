@@ -359,9 +359,26 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
     )
 
 
+def cake_stepfun_target(name: str) -> CakeStepFunTarget:
+    """Narrow an architecture string to the exact Cake StepFun JIT target.
+
+    The Cake StepFun kernels are exported per exact target; every other
+    architecture string (including ``sm_120a`` and the generic ``sm_100``)
+    raises instead of being silently mapped onto a neighbouring target.
+    """
+    if name == "sm_100a":
+        return "sm_100a"
+    if name == "sm_103a":
+        return "sm_103a"
+    raise ValueError(
+        f"unsupported Cake StepFun target: {name!r} (expected one of "
+        + ", ".join(repr(t) for t in _TARGET_FLAGS)
+        + ")"
+    )
+
+
 def _require_target(target: CakeStepFunTarget) -> None:
-    if target not in _TARGET_FLAGS:
-        raise ValueError(f"unsupported Cake StepFun target: {target}")
+    cake_stepfun_target(target)
 
 
 def cake_stepfun_stages(target: CakeStepFunTarget) -> frozenset[str]:

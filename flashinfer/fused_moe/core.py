@@ -114,6 +114,7 @@ from .utils import (
 
 if TYPE_CHECKING:
     from flashinfer.fused_moe.da_config import TrtllmDaConfig
+    from flashinfer.jit.cake_stepfun_moe import CakeStepFunTarget
 
 
 # RoutingInputMode (the FusedMoE launcher's routing-input ABI enum) lives in
@@ -1741,7 +1742,9 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
 
 
 @functools.cache
-def get_cake_stepfun_moe_module(target: str, full_path: bool | None = None):
+def get_cake_stepfun_moe_module(
+    target: "CakeStepFunTarget", full_path: bool | None = None
+):
     """Load the Cake StepFun fused-MoE module for an exact ``sm_100a``/``sm_103a`` target.
 
     The module exports the trtllm-gen fused-MoE operations with the GEMM1 stage
