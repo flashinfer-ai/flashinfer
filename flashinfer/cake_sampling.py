@@ -30,8 +30,8 @@ Two frozen kernels per row of probabilities:
    prologue overlaps the tail of stage 1.
 
 Semantics follow :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` with
-``filter_apply_order="top_k_first"`` (same support, same Philox stream advancement) with these
-guarantees on top:
+``filter_apply_order="top_k_first"`` (same support, same Philox stream advancement outside
+CUDA-graph capture) with these guarantees on top:
 
 * **Strict determinism.** Ties at the top-k boundary are resolved toward the lower vocabulary
   index (the support is exactly the first ``k`` entries of ``lexsort(-prob, index)``), every
@@ -252,10 +252,43 @@ _RAGGED_CHUNK_FILL = 0.75
 _WORKSPACES: dict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ] = {}
+# (device index, id(generator)) -> next Philox offset handed to a call captured into a CUDA graph.
+_CAPTURE_PHILOX_OFFSETS: dict[tuple[int, int], int] = {}
 
 
 def _device_index(device: torch.device) -> int:
     return torch.cuda.current_device() if device.index is None else int(device.index)
+
+
+def _philox_params(
+    batch: int,
+    generator: Optional[torch.Generator],
+    device: torch.device,
+    philox_seed: Optional[int],
+    philox_offset: Optional[int],
+) -> tuple[int, int]:
+    """Philox ``(seed, offset)`` for one call (32 reserved draws per row, the ``top_k_first`` stride).
+
+    Outside CUDA-graph capture the generator is read and advanced exactly like
+    :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`, so a generator shared with the
+    ``top_k_first`` route stays in lockstep.  Inside capture the generator is never touched: reading
+    its state there makes PyTorch register it with the graph, and every replay then runs two
+    ``FillFunctor`` kernels that refresh device-side seed/offset words the Cake kernels do not read
+    (both routes take the Philox parameters by value, so a replay reproduces the captured draws
+    either way; measured +46 us per replay on GB300).  The capture path uses the generator's
+    initial seed and a host-side per-(device, generator) offset counter, so distinct captures draw
+    from distinct Philox streams while replays stay bitwise reproducible.
+    """
+    if philox_seed is not None:
+        return int(philox_seed), int(philox_offset)
+    if not torch.cuda.is_current_stream_capturing():
+        return get_seed_and_offset(batch * 32, generator, device)
+    index = _device_index(device)
+    gen = generator if generator is not None else torch.cuda.default_generators[index]
+    key = (index, id(gen))
+    offset = _CAPTURE_PHILOX_OFFSETS.get(key, 0)
+    _CAPTURE_PHILOX_OFFSETS[key] = offset + (batch * 32 + 3) // 4 * 4
+    return int(gen.initial_seed()), offset
 
 
 def _capability(device: torch.device) -> Optional[tuple[int, int]]:
@@ -1247,7 +1280,10 @@ def top_k_top_p_sampling_from_probs(
         Upper bound of ``top_k`` when it is a tensor (avoids a device synchronization).
     generator: Optional[torch.Generator]
         Source of the Philox seed/offset (default CUDA generator when omitted), advanced exactly
-        like :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`.
+        like :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`.  While a CUDA graph is
+        being captured the generator is not read or advanced (that would register it with the
+        graph and add two fill kernels to every replay); the captured launch uses the generator's
+        initial seed with a host-side offset that differs between captures.
     philox_seed, philox_offset: Optional[int]
         Explicit Philox parameters (both required together); ``generator`` is then not touched.
     out: Optional[torch.Tensor]
@@ -1311,12 +1347,9 @@ def top_k_top_p_sampling_from_probs(
     )
     if out is None:
         out = torch.empty(batch, device=probs.device, dtype=torch.int32)
-    if philox_seed is None:
-        # Same stride as top_p_sampling_from_probs (32 reserved draws per row): a generator shared with
-        # the top_k_first route stays in lockstep.
-        philox_seed, philox_offset = get_seed_and_offset(
-            batch * 32, generator, probs.device
-        )
+    philox_seed, philox_offset = _philox_params(
+        batch, generator, probs.device, philox_seed, philox_offset
+    )
     if isinstance(top_k, int):
         k_arr, k_scalar, k_kind = cnt, int(top_k), _TOPK_SCALAR
     else:

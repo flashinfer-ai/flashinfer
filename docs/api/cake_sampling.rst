@@ -112,6 +112,9 @@ the precision level and the selection exactness may not):
 * **Sample**: always inside the exact support (the kept prefix); run-to-run deterministic for identical inputs,
   ``philox_seed`` and ``philox_offset`` (CUDA-graph replay, concurrent streams and repeated invocation included);
   multi-seed next-token histograms within the 99 % binomial band of the exact distribution per row class.
+  A call captured into a CUDA graph without explicit Philox parameters never reads the generator inside the
+  capture (PyTorch would register it with the graph and replay two ``FillFunctor`` kernels per launch, +46 us per
+  replay on GB300); it uses the generator's initial seed with a host-side offset that differs between captures.
 * **Renormalized slab** (``renorm_out``): fp32 with ``rtol 1e-6``, ``atol 1e-7`` against the float64 reference.
   Keys stay exact fp32 bit patterns; every accumulation is at least fp32 (no bf16 / fp16 anywhere); no tolerance is
   loosened to admit a kernel change.

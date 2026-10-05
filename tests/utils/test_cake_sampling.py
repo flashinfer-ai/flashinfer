@@ -2864,3 +2864,46 @@ def test_slab_tail_build_matches_spec_build():
                 flags,
                 stream,
             )
+
+
+def test_cuda_graph_capture_never_registers_the_generator():
+    """A captured default-generator call must not read the generator inside the capture: PyTorch would register it
+    with the graph and every replay would run two ``FillFunctor`` kernels (host-side round-9 lever C4).  The replays
+    stay bitwise reproducible, the generator is untouched by the capture, and distinct captures get distinct offsets."""
+    _require_supported_device()
+    probs = _probs(4, 32768)
+    gen = torch.cuda.default_generators[torch.cuda.current_device()]
+    before = gen.get_state().clone()
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            top_k_top_p_sampling_from_probs(probs, 50, 0.9)
+    torch.cuda.synchronize()
+    after_warmup = gen.get_state().clone()
+    assert not torch.equal(before, after_warmup)  # eager calls advance the generator as top_k_first does
+    from flashinfer import cake_sampling as cs
+
+    key = (torch.cuda.current_device(), id(gen))
+    counter_before = cs._CAPTURE_PHILOX_OFFSETS.get(key, 0)
+    graphs = []
+    for _ in range(2):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            out = top_k_top_p_sampling_from_probs(probs, 50, 0.9)
+        graphs.append((g, out))
+    torch.cuda.synchronize()
+    assert torch.equal(gen.get_state(), after_warmup)  # the captures never touched the generator
+    assert cs._CAPTURE_PHILOX_OFFSETS[key] == counter_before + 2 * ((4 * 32 + 3) // 4 * 4)
+    g, out = graphs[0]
+    g.replay()
+    torch.cuda.synchronize()
+    first = out.clone()
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        g.replay()
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
+    assert names and not any("FillFunctor" in n for n in names), names
+    assert torch.equal(out, first)
+    assert bool(torch.all((out >= 0) & (out < probs.shape[1])))
