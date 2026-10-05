@@ -10,9 +10,14 @@ import pytest
 
 @pytest.fixture(scope="session")
 def mok_distributed_group():
-    if "RANK" not in os.environ or int(os.environ.get("WORLD_SIZE", "0")) not in (1, 4):
+    if "RANK" not in os.environ or int(os.environ.get("WORLD_SIZE", "0")) not in (
+        1,
+        4,
+        16,
+        64,
+    ):
         pytest.skip(
-            "Launch MoK distributed tests with torchrun using one or four ranks"
+            "Launch MoK distributed tests with torchrun using 1, 4, 16 or 64 ranks"
         )
     import torch
     import torch.distributed as dist

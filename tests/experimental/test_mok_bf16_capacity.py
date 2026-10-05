@@ -13,8 +13,8 @@ import torch.distributed as dist
 
 
 @pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) != 4,
-    reason="Requires an actual four-rank symmetric-memory group",
+    int(os.environ.get("WORLD_SIZE", "1")) not in (4, 16, 64),
+    reason="Requires a 4-, 16- or 64-rank symmetric-memory group",
 )
 def test_source_capacity_and_context_ownership(mok_distributed_group):
     from flashinfer.experimental.cake_mok_bf16.workspace import MoKConfig
@@ -22,10 +22,11 @@ def test_source_capacity_and_context_ownership(mok_distributed_group):
 
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
-    rank = dist.get_rank()
-    counts = [0, 1, 255, 256]
-    n, h, k, le = counts[rank], 256, 2, 4
-    f = prepare_mok_bf16(ep_size=4, local_experts=le, topk=k)
+    rank, ep = dist.get_rank(), dist.get_world_size()
+    counts = [0, 1, 255, 256] * (ep // 4)
+    n, h = counts[rank], 256
+    k, le = (2, 4) if ep == 4 else (8, 256 // ep)
+    f = prepare_mok_bf16(ep_size=ep, local_experts=le, topk=k)
     config = MoKConfig(
         fwd_num_comm_sms=8,
         bwd_num_comm_sms=8,
@@ -71,7 +72,7 @@ def test_source_capacity_and_context_ownership(mok_distributed_group):
             num_local_experts=le,
         )
     row = torch.arange(n, device=device)
-    ids = torch.stack([row % 16, (row + 1) % 16], -1)
+    ids = torch.stack([(row + slot) % (ep * le) for slot in range(k)], -1)
     x = torch.zeros(n, h, device=device, dtype=torch.bfloat16)
     dy, scores = torch.zeros_like(x), torch.ones(n, k, device=device)
     shared = [
