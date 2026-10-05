@@ -663,7 +663,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 128, "slots": 2},
     ('sm_107a', False, True, False, False, False, 6144, 128, None): {"block_n": 128, "cta_rows": 256},
     ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "quad_store": True},
-    ('sm_107a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True},
+    ('sm_107a', False, True, False, False, False, 6144, 12288, None): {"sk_parts": 2},
     ('sm_107a', False, True, False, False, False, 12288, 6144, None): {"hints": ('none', 'evict_first')},
     ('sm_107a', False, True, False, False, False, 16384, 6144, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
     ('sm_107a', False, True, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
