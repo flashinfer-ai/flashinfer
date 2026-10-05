@@ -328,8 +328,8 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
       for (uint32_t it = 0; it < kIters; ++it) {
         // Rows of one request read the same keys, and blocks for those rows run
         // together, so L1 is where most of these repeats belong.
-        cp_async::load_128b<cp_async::PrefetchMode::kNoPrefetch, cp_async::CacheMode::kCacheAll>(
-            dst + it * kColStep * kSliceRow, reinterpret_cast<const DType*>(src[it]));
+        cp_async::load_128b_ca(dst + it * kColStep * kSliceRow,
+                               reinterpret_cast<const DType*>(src[it]));
       }
     } else {
       constexpr uint32_t kEvenVecs = SLICE_K / kPerVec;
@@ -338,7 +338,7 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
         const uint32_t c = i / vecs;
         const uint32_t v = i - c * vecs;
         const uintptr_t base = tile_bases[c];
-        cp_async::load_128b<cp_async::PrefetchMode::kNoPrefetch, cp_async::CacheMode::kCacheAll>(
+        cp_async::load_128b_ca(
             dst_base + c * kSliceRow + v * kPerVec,
             reinterpret_cast<const DType*>(base + (k0 + v * kPerVec) * sizeof(DType)));
       }

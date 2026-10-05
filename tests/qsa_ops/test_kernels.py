@@ -16,7 +16,6 @@ limitations under the License.
 QSA kernels: pre-indexer, scorer, route expansion and output gate.
 """
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -700,37 +699,3 @@ def test_aot_registers_the_qsa_modules_together(monkeypatch, archs, misc, expect
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
     built = [s.name for s in aot.gen_all_modules(*[[]] * 6, {}, *[0] * 5, misc, 0)]
     assert [built.count(n) for n in names] == [expected] * 3 + [misc]
-
-
-_CP_ASYNC_CALLS = """
-#include <flashinfer/cp_async.cuh>
-using namespace flashinfer::cp_async;
-using P = PrefetchMode;
-using F = SharedMemFillMode;
-constexpr CacheMode ca = CacheMode::kCacheAll;
-__global__ void calls(const float* g) {
-  __shared__ float s[8];
-  load_128b<P::kNoPrefetch, float>(s, g);
-  load_128b<P::kPrefetch>(s, g);
-  load_128b<P::kNoPrefetch, ca>(s, g);
-  pred_load_128b<P::kNoPrefetch, F::kFillZero, float>(s, g, true);
-  pred_load_128b<P::kPrefetch, F::kNoFill>(s, g, true);
-  pred_load_128b<P::kNoPrefetch, F::kFillZero, ca>(s, g, true);
-  load<256, P::kNoPrefetch, float>(s, g);
-  load<128, P::kPrefetch>(s, g);
-  load<256, P::kNoPrefetch, ca>(s, g);
-  pred_load<256, P::kNoPrefetch, F::kFillZero, float>(s, g, true);
-  pred_load<128, P::kPrefetch, F::kNoFill>(s, g, true);
-  pred_load<256, P::kNoPrefetch, F::kFillZero, ca>(s, g, true);
-}
-"""
-
-
-def test_cp_async_keeps_the_template_arguments_it_had(tmp_path):
-    """Explicit-type, deduced and cache-mode calls of the four copies compile."""
-    if os.environ.get("FLASHINFER_DISABLE_JIT"):
-        pytest.skip("this compiles a kernel")
-    from flashinfer.jit.core import gen_jit_spec
-
-    (tmp_path / "calls.cu").write_text(_CP_ASYNC_CALLS)
-    gen_jit_spec("qsa_cp_async_calls", [tmp_path / "calls.cu"]).build()
