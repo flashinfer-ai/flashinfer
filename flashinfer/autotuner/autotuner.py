@@ -1989,12 +1989,6 @@ class AutoTuner:
                         continue
                     return True, r_id, tactic, stored_profile
 
-            # Managed and bundled entries without per-entry replay/L2 policy
-            # require fresh profiling for a non-default policy while tuning.
-            use_file_config = not (
-                self.is_tuning_mode and requested_policy != default_policy
-            )
-
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
             #    serving path never builds a file_key string here.
@@ -2754,7 +2748,9 @@ class AutoTuner:
             # Populate the choose_one cache with the winner so stage lookups
             # remain consistent between rank_tactics and choose_one.
             self.profiling_cache[cache_key] = (ranked[0], profile)
-            self._profiling_cache_policies[cache_key] = self._profiling_policy(
+            # profiling_cache is the unpartitioned winner cache, so its
+            # provenance lives under the None winner identity.
+            self._profiling_cache_policies[(None, cache_key)] = self._profiling_policy(
                 tuning_config
             )
             self._ranked_tactics_cache[cache_key] = tuple(ranked)
@@ -3543,8 +3539,9 @@ class AutoTuner:
                 # Store runner class name (not positional index) for robustness
                 tactic_json = _tactic_to_json(tactic)
                 configs[file_key] = [cache_key.runner_class_name, tactic_json]
-                if cache_key in self._profiling_cache_policies:
-                    configs[file_key].append(self._profiling_cache_policies[cache_key])
+                policy = self._profiling_cache_policies.get((None, cache_key))
+                if policy is not None:
+                    configs[file_key].append(policy)
 
         current_meta = _collect_metadata()
 
