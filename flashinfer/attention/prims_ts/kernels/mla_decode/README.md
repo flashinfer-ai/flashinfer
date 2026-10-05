@@ -1,5 +1,9 @@
 # Task-Scheduled MLA Decode
 
+Native D512 two-source sparse MLA is available through
+`BatchSparseMLADecodePagedTSWrapper`; see [the sparse contract](SPARSE.md).
+The dense API contract below retains its 512-latent plus 64-RoPE layout.
+
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
 Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
 paged-cache APIs. The implementation accepts the post-matrix-absorption MLA
