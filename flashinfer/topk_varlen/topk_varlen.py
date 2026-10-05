@@ -163,6 +163,10 @@ def _radix_cutlass_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
+    *,
+    row_starts=None,
+    max_seq_len=None,
+    absolute_indices=False,
     pre_idx=None,
     compress_ratio=1,
     next_n=1,
@@ -172,9 +176,6 @@ def _radix_cutlass_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
-    row_starts=None,
-    max_seq_len=None,
-    absolute_indices=False,
 ):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers, on contiguous
     logits (the CUDA launcher checks contiguity; gating here lets ``auto``
@@ -223,6 +224,10 @@ def _gvr_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
+    *,
+    row_starts=None,
+    max_seq_len=None,
+    absolute_indices=False,
     pre_idx=None,
     compress_ratio=1,
     next_n=1,
@@ -232,9 +237,6 @@ def _gvr_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
-    row_starts=None,
-    max_seq_len=None,
-    absolute_indices=False,
 ):
     """Return True only when GVR can run on this exact configuration.
 
@@ -273,6 +275,10 @@ def _gvr2_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
+    *,
+    row_starts=None,
+    max_seq_len=None,
+    absolute_indices=False,
     pre_idx=None,
     compress_ratio=1,
     next_n=1,
@@ -282,9 +288,6 @@ def _gvr2_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
-    row_starts=None,
-    max_seq_len=None,
-    absolute_indices=False,
 ):
     """Return True only when the self-sampling GVR V2 port can run this config.
 
@@ -335,6 +338,10 @@ def _top_k_varlen_heuristic(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
     top_k: int,
+    *,
+    row_starts=None,
+    max_seq_len=None,
+    absolute_indices=False,
     pre_idx=None,
     compress_ratio: int = 1,
     next_n: int = 1,
@@ -344,9 +351,6 @@ def _top_k_varlen_heuristic(
     backend: str = "auto",
     load_balance: bool = True,
     workspace=None,
-    row_starts=None,
-    max_seq_len=None,
-    absolute_indices=False,
 ):
     """Shape/dtype-aware ranking so auto tracks the measured per-config winner.
 
@@ -1282,6 +1286,10 @@ def _radix_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
+    *,
+    row_starts=None,
+    max_seq_len=None,
+    absolute_indices=False,
     pre_idx=None,
     compress_ratio=1,
     next_n=1,
@@ -1291,9 +1299,6 @@ def _radix_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
-    row_starts=None,
-    max_seq_len=None,
-    absolute_indices=False,
 ):
     """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required.
     Overlapping row layouts (stride(0) < shape[1]) fail the kernel's stride
@@ -1426,6 +1431,10 @@ def _radix_filter_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
+    *,
+    row_starts=None,
+    max_seq_len=None,
+    absolute_indices=False,
     pre_idx=None,
     compress_ratio=1,
     next_n=1,
@@ -1435,9 +1444,6 @@ def _radix_filter_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
-    row_starts=None,
-    max_seq_len=None,
-    absolute_indices=False,
 ):
     """Return True only when the vendored DKG kernel covers this configuration.
 
@@ -1557,6 +1563,10 @@ def top_k_varlen(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
     top_k: int,
+    *,
+    row_starts: Optional[torch.Tensor] = None,
+    max_seq_len: Optional[int] = None,
+    absolute_indices: bool = False,
     pre_idx: Optional[torch.Tensor] = None,
     compress_ratio: int = 1,
     next_n: int = 1,
@@ -1568,9 +1578,6 @@ def top_k_varlen(
     ] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
-    row_starts: Optional[torch.Tensor] = None,
-    max_seq_len: Optional[int] = None,
-    absolute_indices: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -1617,59 +1624,65 @@ def top_k_varlen(
         to the width by every backend: only the scores present in the buffer
         are ranked. With
         ``row_starts`` it is the WINDOW LENGTH of each row (see below).
-    row_starts : torch.Tensor, optional
-        Windowed (prefill) mode. 1-D ``int32`` CUDA tensor of shape
-        ``(num_rows,)``: row ``r``'s candidates are
-        ``logits[r, row_starts[r] : row_starts[r] + seq_lens[r]]`` and the
-        returned indices are LOCAL to that window (``column - row_starts[r]``;
-        absolute columns with ``absolute_indices=True``),
-        ``-1`` padded, identity for windows shorter than ``top_k``. This is the
-        DSA prefill-indexer layout: every request's keys packed along the
-        column axis, one query row per prompt token with a causal window into
-        its own request's slice. No column before ``row_starts[r] & ~3`` or at
-        or after the window end is read, and the up to three columns between
-        ``row_starts[r] & ~3`` and ``row_starts[r]`` are loaded for 16-byte
-        alignment but never influence the result (so cells outside the window
-        may be unwritten). A negative start is clamped to 0 and the window
-        keeps its length; a start at or past the width yields an empty window
-        (all ``-1``); a window past the width is clamped to the width. Requires
-        ``next_n == 1``, ``compress_ratio
-        == 1`` and no ``pre_idx``. Served by ``gvr_2`` (dedicated windowed
-        engines, TRT-LLM #18702 port); the other backends are not eligible.
-        CUDA graphs: warm up with one eager windowed call of the same
-        (row count, top_k, ``max_seq_len``, logits width) or ``warmup_prefill``.
-        Default ``None`` (every window starts at column 0).
-    max_seq_len : int, optional
-        Windowed mode only: the caller's upper bound on every row's window
-        length (``seq_lens.max()``, e.g. the longest prompt of the prefill
-        batch, which the framework knows on the host). It selects the engine
-        before CUDA-graph capture: with it the launch runs on the
-        register-resident gvr_2 engine whose capacity covers the bound
-        (windows up to 4K tokens, 1.5-1.7x faster than the streaming engine
-        on B200/B300; the 8K class only for ``top_k=2048`` at ~1.05x; Rubin
-        gates by row count); without it the lengths are device data and
-        every row takes the streaming engine, which ranks every window
-        exactly. On a register engine a row is either ranked exactly or, when
-        its window plus the up-to-3 alignment lanes exceeds that engine's
-        capacity (part-dependent; see ``_prefill_reg_route``), reported as
-        all ``-1`` -- never a truncated ranking. So the bound must hold at
-        every graph replay, or the call must stay unhinted. A bound larger
-        than the logits width is clamped. Must be a Python ``int``. Ignored
-        when ``row_starts`` is ``None``.
-    absolute_indices : bool, optional
-        Windowed mode only. ``True`` returns each hit as its absolute column
-        of ``logits`` (``window-local index + row_starts[r]``) instead of the
-        window-local index; ``-1`` padding is unchanged. In the DSA prefill
-        layout the column axis is the batch's packed key sequence, so this
-        is the flattened-KV position the sparse-attention kernel consumes
-        directly, saving the framework a separate offset-add launch over
-        ``num_rows * top_k`` indices. Fused into the kernels' index emit (no
-        extra memory traffic); a distinct compiled variant, so warm up with
-        the same value (``warmup_prefill(..., absolute_indices=True)``).
-        Default ``False``.
     top_k : int
         Number of top elements per row.  GVR backend supports
         ``{512, 1024, 2048}``; radix backend has no restriction.
+    row_starts : torch.Tensor, optional
+        Windowed (prefill) mode: where each row's request begins on the column
+        axis. 1-D ``int32`` CUDA tensor of shape ``(num_rows,)``; row ``r``
+        then ranks ``logits[r, row_starts[r] : row_starts[r] + seq_lens[r]]``
+        (``seq_lens[r]`` is the WINDOW LENGTH: cached prefix + position + 1)
+        and returns window-local indices (``column - row_starts[r]``; absolute
+        columns with ``absolute_indices=True``), ``-1`` padded, identity for
+        windows shorter than ``top_k``. This is the DSA prefill-indexer layout:
+        every request's keys packed along the column axis, one query row per
+        prompt token with a causal window into its own request's slice (the
+        ``ks`` / ``lengths`` pair SGLang and TRT-LLM hand their indexer GEMM).
+        No column before ``row_starts[r] & ~3`` or at or after the window end
+        is read, and the up to three columns between ``row_starts[r] & ~3``
+        and ``row_starts[r]`` are loaded for 16-byte alignment but never
+        influence the result (so cells outside the window may be unwritten).
+        A negative start is clamped to 0 and the window keeps its length; a
+        start at or past the width yields an empty window (all ``-1``); a
+        window past the width is clamped to the width. Requires
+        ``next_n == 1``, ``compress_ratio == 1`` and no ``pre_idx``. Served by
+        ``gvr_2`` (dedicated windowed engines, TRT-LLM #18702 port); the other
+        backends are not eligible. CUDA graphs: warm up with one eager windowed
+        call of the same (row count, top_k, ``max_seq_len``, logits width) or
+        ``warmup_prefill``. Default ``None`` (every window starts at column 0).
+    max_seq_len : int, optional
+        Windowed mode only: an optional tighter bound on the window lengths,
+        used to pick the engine before the launch (and before CUDA-graph
+        capture, where the choice is frozen). Defaults to the logits width,
+        which is always a valid bound (no window is wider than its row) but a
+        loose one for a packed multi-request batch, whose width sums every
+        request's keys. Pass the batch's longest window (``seq_lens.max()``,
+        host knowledge in every serving framework) so that short-window
+        batches run on the register-resident gvr_2 engine (windows up to 4K
+        tokens, 1.5-1.7x faster than the streaming engine on B200/B300; the 8K
+        class only for ``top_k=2048`` at ~1.05x; Rubin gates by row count);
+        beyond the register capacity every row takes the streaming engine,
+        which ranks every window exactly. On a register engine a row is either
+        ranked exactly or, when its window plus the up-to-3 alignment lanes
+        exceeds that engine's capacity (part-dependent; see
+        ``_prefill_reg_route``), reported as all ``-1`` -- never a truncated
+        ranking. So a caller-given bound must hold at every graph replay (the
+        width-derived default cannot be exceeded). A bound larger than the
+        logits width is clamped. Must be a Python ``int``. Ignored when
+        ``row_starts`` is ``None``.
+    absolute_indices : bool, optional
+        Windowed mode only: write each hit as its column of ``logits``
+        (``window-local index + row_starts[r]``) instead of the window-local
+        position; ``-1`` padding is unchanged. In the DSA prefill layout the
+        column axis is the batch's packed key sequence, so this is the
+        flattened-KV position the ragged sparse-attention kernel consumes
+        directly (SGLang's ``out_offsets == row_starts`` convention), saving
+        the framework a separate offset-add launch over ``num_rows * top_k``
+        indices; a paged consumer keeps the default and maps the local
+        position through its page table. Fused into the kernels' index emit
+        (no extra memory traffic); a distinct compiled variant, so warm up with
+        the same value (``warmup_prefill(..., absolute_indices=True)``).
+        Default ``False``.
     pre_idx : torch.Tensor, optional
         ``int32[num_rows // next_n, top_k]`` — top-K KV-cache indices
         selected by **this same layer** at the **previous token's decode
@@ -1844,7 +1857,6 @@ def top_k_varlen(
             synchronizes the device, drops them and returns the bytes freed;
             graphs captured against them must then be re-captured after a
             fresh eager warm-up.
-
     Returns
     -------
     (indices, values) : Tuple[torch.Tensor, Optional[torch.Tensor]]

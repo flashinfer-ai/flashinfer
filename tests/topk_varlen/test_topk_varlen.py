@@ -1331,7 +1331,9 @@ def test_backend_heuristic_priority():
             if hinted
             else None
         )
-        return _top_k_varlen_heuristic(suitable, logits, seq_lens, top_k, pre_idx)
+        return _top_k_varlen_heuristic(
+            suitable, logits, seq_lens, top_k, pre_idx=pre_idx
+        )
 
     assert order_k(all5, 16, 32768, 512, False)[0] == "gvr_2"
     assert order_k(all5, 1, 4096, 1024, False)[0] == "gvr_2"
