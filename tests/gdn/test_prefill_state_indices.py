@@ -376,6 +376,84 @@ def test_prefill_state_indices_preserves_inner_strides(backend, use_cp, H):
     assert torch.equal(packed_final, indexed_final[slots])
 
 
+def _make_transposed_pool(init_state, perm, n_pool, dtype, device, fill):
+    """Build a pool backed by an ``[N_pool, H, K, V]`` buffer and passed as its
+    ``[N_pool, H, V, K]`` transpose, so K is not the unit-stride dimension."""
+    _, H, D, _ = init_state.shape
+    storage = torch.full((n_pool, H, D, D), fill, dtype=dtype, device=device)
+    pool = storage.transpose(-1, -2)
+    assert pool.stride(-1) == D and pool.stride(-2) == 1
+    for i, r in enumerate(perm):
+        pool[r] = init_state[i]
+    return pool
+
+
+@pytest.mark.parametrize(
+    "seq_lens,H",
+    [
+        pytest.param([1024], 8, id="8-states"),
+        pytest.param([256, 244, 500], 4, id="varlen-12-states"),
+        pytest.param([1024, 1024], 8, id="16-states"),
+        pytest.param([4096], 32, id="32-states"),
+        pytest.param([512, 512, 512, 512], 32, id="128-states"),
+    ],
+)
+@pytest.mark.parametrize("transposed", ["initial", "output", "in-place"])
+def test_prefill_cp_transposed_state_pools(seq_lens, H, transposed):
+    """The CP route honors [N, H, K, V]-backed (transposed) initial and output
+    state pools: outputs and final states match contiguous pools, every
+    requested row is written and no other row is touched. The cases cover the
+    SIMT (<= 9 states) and the UTCMMA fixup state counts."""
+    _skip_if_not_supported("flashinfer", True)
+    device = torch.device("cuda")
+    D = 128
+    num_seqs = len(seq_lens)
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=7
+    )
+    state_dtype = init_state.dtype
+    n_pool = 2 * num_seqs + 1
+    perm = [2 * (num_seqs - i) - 1 for i in range(num_seqs)]  # reversed odd rows
+    untouched = [r for r in range(n_pool) if r not in perm]
+    idx = torch.tensor(perm, dtype=torch.int32, device=device)
+    nan = float("nan")
+
+    ref_initial = _make_pool(init_state, perm, n_pool, 0, state_dtype, device)
+    ref_final = torch.full_like(ref_initial, nan)
+    ref_output, _ = _run(
+        q, k, v, g, beta, cu_seqlens, ref_initial, ref_final, idx, True, "flashinfer"
+    )
+
+    if transposed == "in-place":
+        initial = _make_transposed_pool(
+            init_state, perm, n_pool, state_dtype, device, nan
+        )
+        final = initial
+    elif transposed == "initial":
+        initial = _make_transposed_pool(
+            init_state, perm, n_pool, state_dtype, device, 0.0
+        )
+        final = torch.full_like(ref_initial, nan)
+    else:
+        initial = ref_initial.clone()
+        final = _make_transposed_pool(
+            torch.zeros_like(init_state), [], n_pool, state_dtype, device, nan
+        )
+    output, _ = _run(
+        q, k, v, g, beta, cu_seqlens, initial, final, idx, True, "flashinfer"
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(final[perm]).all(), (
+        "requested final-state rows not fully written"
+    )
+    assert torch.isnan(final[untouched]).all(), (
+        "rows outside state_indices were written"
+    )
+    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(final[perm], ref_final[perm], atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "backend,use_cp",
     [("auto", "auto"), ("cake_gdn", "auto"), ("cake_gdn", True)],
