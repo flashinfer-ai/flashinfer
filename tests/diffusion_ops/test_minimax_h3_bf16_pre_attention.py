@@ -421,7 +421,9 @@ def _reference(case):
     )
     adaln = torch.where(valid_index[:, None], adaln, torch.zeros_like(adaln))
     qkv = F.linear(adaln, case["qkv_weight"]).to(torch.bfloat16)
-    grouped = qkv.view(case["x"].shape[0], NUM_HEADS, QKV_KINDS, HEAD_DIM)
+    # Engine-resident weight rows are [qkv_kind, head, head_dim]: the projection
+    # columns are [q_all | k_all | v_all].
+    grouped = qkv.view(case["x"].shape[0], QKV_KINDS, NUM_HEADS, HEAD_DIM).transpose(1, 2)
     q = F.rms_norm(
         grouped[:, :, 0, :], (HEAD_DIM,), case["q_norm_weight"], eps=qk_eps
     ).to(torch.bfloat16)

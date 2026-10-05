@@ -294,8 +294,11 @@ def minimax_h3_bf16_pre_attention(
         the CUDA kernel and makes its output row all-zero instead of
         addressing outside the tables.
     qkv_weight : torch.Tensor
-        Contiguous BF16 checkpoint weight with physical shape
-        ``[21504, 5376]`` and row order ``[head, qkv_kind, head_dim]``.
+        Contiguous BF16 fused QKV projection weight with physical shape
+        ``[21504, 5376]`` in the engine-resident row order
+        ``[qkv_kind, head, head_dim]`` (``[q_all | k_all | v_all]``, the
+        layout the model holds after loading the per-head-interleaved
+        checkpoint).
     q_norm_weight, k_norm_weight : torch.Tensor
         Contiguous BF16 per-head RMSNorm weights with shape ``[128]``.
     rope_cos_sin : torch.Tensor
