@@ -159,10 +159,25 @@ Maximum absolute error and global relative L1 remain diagnostics only.
 The driver records mismatch counts and worst normalized errors per rank and
 globally, and preserves failed reports before returning a failing exit status.
 
-The previous seven-row EP16/EP64 qualification used an aggregate-error gate;
-it does not establish a pass under the elementwise criterion. Requalification
-with `atol=1e-2, rtol=1e-2` is pending. The independent BF16-rounding reference
-is unchanged; FP32-reference runs remain separate diagnostics.
+Strict requalification completes all seven cases at EP16 and EP64:
+**EP16 5/7 and EP64 2/7 pass**. Router-weight gradients exceed
+the elementwise tolerance in the failing cases below; the other eight tensors
+pass. These numerical failures remain unresolved. All cases retain finite
+outputs, three bitwise-identical replays and earlier-Graph replay.
+
+| Source input lengths | Expert routing | EP16 | EP64 |
+| --- | --- | --- | --- |
+| fixed | uniform | PASS | FAIL |
+| fixed | imbalanced | PASS | PASS |
+| near | uniform | PASS | FAIL |
+| near | imbalanced | FAIL | FAIL |
+| strong | uniform | FAIL | FAIL |
+| strong | imbalanced | PASS | FAIL |
+| empty | uniform | PASS | PASS |
+
+The previous aggregate-error qualification does not establish a strict pass.
+The independent BF16-rounding reference and runtime sources are unchanged;
+FP32-reference runs remain separate diagnostics.
 
 Full-shape memcheck passes all six nonempty shape/routing pairs at each scale.
 Full-shape synccheck passes those six pairs at EP16; EP64 requires
