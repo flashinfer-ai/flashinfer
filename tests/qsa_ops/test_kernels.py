@@ -659,6 +659,7 @@ def test_gate_under_graph_capture_and_its_rounding_order():
 def test_gate_refuses_aliasing_and_short_attention():
     a, both, g = (torch.randn(n, 4, 64, dtype=BF16, device=DEV) for n in (8, 10, 8))
     shifted = both.flatten()[1 : 1 + 8 * 256].view(8, 4, 64)
+    qsa.qsa_output_gate(both, g, out=both[:8])  # the padded prefix, in place
     for attention, gate, out, match in [
         (a[:4], g, None, "at least the output's rows"),
         (a, both[:8], both[:8], "overlap"),
@@ -668,7 +669,6 @@ def test_gate_refuses_aliasing_and_short_attention():
     ]:
         with pytest.raises(RuntimeError, match=match):
             qsa.qsa_output_gate(attention, gate, out=out)
-    qsa.qsa_output_gate(both, g, out=both[:8])  # the padded prefix, in place
     for shape in ((4, 0, 64), (4, 2, 0), (0, 2, 64)):
         empty = torch.empty(shape, dtype=BF16, device=DEV)
         assert qsa.qsa_output_gate(empty, empty.clone()).shape == shape
