@@ -658,8 +658,11 @@ def test_epilogue_rules():
     assert epi_mode(False, False, K=1024) == "tma"
     assert epi_mode(False, False, K=1025) == "reg"
     assert epi_mode(False, False) == "reg"
+    # round 14: the transposed TMA-store epilogue is an opt-in whose warp slice must be whole CH_T_COLS-column chunks
+    assert epi_mode(False, True, epi="tma", block_n=192, cta_rows=256) == "tma"
+    assert epi_mode(False, True, epi="tma", block_n=256, cta_rows=256) == "tma"
     with pytest.raises(ValueError, match="transposed"):
-        epi_mode(False, True, epi="tma")
+        epi_mode(False, True, epi="tma", block_n=160, cta_rows=256)
     with pytest.raises(ValueError, match="epi must be"):
         epi_mode(False, False, epi="bad")
     assert epi_slots("reg", False, 256) == 0
@@ -965,10 +968,74 @@ def test_epilogue_rules():
             ),
             "dense_proj_gemm_kn_n256_f32_v8_ef_s9",
         ),
+        # round 14 (W3): the transposed TMA-store epilogue of the swapped MLA weight gradients (``_t_tma1``)
+        (
+            dict(
+                a_mn=True,
+                b_mn=True,
+                out_t=True,
+                block_n=192,
+                cta_rows=256,
+                epi="tma",
+                slots=1,
+            ),
+            "dense_proj_gemm_nn_n192_m256_t_tma1",
+        ),
+        (
+            dict(
+                a_mn=True,
+                b_mn=True,
+                out_t=True,
+                block_n=256,
+                cta_rows=256,
+                epi="tma",
+                slots=1,
+            ),
+            "dense_proj_gemm_nn_n256_m256_t_tma1",
+        ),
+        (
+            dict(
+                a_mn=True,
+                b_mn=True,
+                out_t=True,
+                block_n=192,
+                cta_rows=256,
+                b_swz=64,
+                hints=("evict_first", "evict_first"),
+                epi="tma",
+                slots=1,
+            ),
+            "dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1",
+        ),
     ],
 )
 def test_instance_symbols(kwargs, symbol):
     assert instance_symbol(instance_key(**kwargs)) == symbol
+
+
+def test_round14_transposed_tma_store_instances():
+    """Round 14 (W3): a transposed box stages CH_T_COLS output rows per chunk, so the swapped MLA weight-gradient tiles
+    (BLOCK_N 192 / 256 x 256 rows) take ``epi="tma"`` while the row-major bf16 192-column tile has no whole 64-column
+    chunk path (the round-14 export run died on this mirror check).  [Cake ``instance_key`` L1259-L1261]"""
+    key = instance_key(
+        a_mn=True, b_mn=True, out_t=True, block_n=192, cta_rows=256, epi="tma", slots=1
+    )
+    assert key[3] is True and key[7] == "tma" and key[8] == 1
+    assert instance_symbol(key) == "dense_proj_gemm_nn_n192_m256_t_tma1"
+    with pytest.raises(ValueError, match="128-byte column chunks"):
+        instance_key(
+            a_mn=True, b_mn=True, block_n=192, cta_rows=256, epi="tma", slots=1
+        )
+    with pytest.raises(ValueError, match="transposed TMA-store"):
+        instance_key(
+            a_mn=True,
+            b_mn=True,
+            out_t=True,
+            block_n=160,
+            cta_rows=256,
+            epi="tma",
+            slots=1,
+        )
 
 
 def test_round13_w3_knobs():

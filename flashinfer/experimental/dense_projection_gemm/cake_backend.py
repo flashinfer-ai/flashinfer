@@ -484,7 +484,8 @@ def instance_key(
             f"batch_group must be 0 (off), 1 (every batch entry) or a group size G > 1, got {batch_group}"
         )
     epi = epi_mode(out_f32, out_t, None, epi, block_n, cta_rows)
-    if epi == "tma" and cols % (32 if out_f32 else 64):
+    # a transposed box stages CH_T_COLS output rows per chunk (round 14); row-major chunks are 128 bytes  [Cake L1260]
+    if epi == "tma" and cols % (CH_T_COLS if out_t else (32 if out_f32 else 64)):
         raise ValueError(
             f"the TMA-store epilogue needs whole 128-byte column chunks per warp; BLOCK_N={block_n} "
             f"CTA_ROWS={cta_rows} {'fp32' if out_f32 else 'bf16'} output needs epi='reg'"
