@@ -3415,7 +3415,12 @@ def test_cake_fmha_balanced_hd64_route_owns_bf16_gqa_decode(monkeypatch) -> None
         page_size=16,
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
-    assert cake_api._route_components(route) == (component,)
+    # Two structural instances of one body: eight softmax columns for head
+    # groups 1..8, sixteen for 9..16 (selected by the host from the group).
+    assert cake_api._route_components(route) == (
+        component,
+        "decode_balanced_bf16_hd64_g16",
+    )
 
     # One to sixteen query heads per KV head, at every KV length and tile count.
     for group, batch_size, seq_lens in (
@@ -3689,13 +3694,20 @@ def test_cake_fmha_decode_balanced_fp8_family_jit_selects_the_q_dtype_component(
             cake_fmha_balanced_fp8_component_name(bad_q_dtype)
 
 
-def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(monkeypatch) -> None:
+@pytest.mark.parametrize("max_group", [8, 16])
+def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(
+    monkeypatch, max_group
+) -> None:
     import flashinfer.jit.core as jit_core
 
     monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
-    component = "decode_balanced_bf16_hd64"
-    spec = gen_cake_fmha_decode_balanced_hd64_module("sm100a")
-    assert spec.name == get_cake_fmha_decode_balanced_hd64_uri("sm100a")
+    component = (
+        "decode_balanced_bf16_hd64"
+        if max_group == 8
+        else "decode_balanced_bf16_hd64_g16"
+    )
+    spec = gen_cake_fmha_decode_balanced_hd64_module("sm100a", max_group)
+    assert spec.name == get_cake_fmha_decode_balanced_hd64_uri("sm100a", max_group)
     assert spec.name.startswith(f"cake_fmha_{component}_sm100a_")
     assert {Path(source).name for source in spec.sources} == {
         "default.cu",
