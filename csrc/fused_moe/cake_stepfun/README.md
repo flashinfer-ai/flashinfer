@@ -59,7 +59,7 @@ pairs of the kernel signature), `block`, `cluster`, `dynamic_smem_bytes` and
 
 | stage | record keys | uniqueness |
 |---|---|---|
-| `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`, `bounds_acquired_tiles`; `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`) | one record per (arch, stage, family, tile), every tile of the family mapping present |
+| `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`, `bounds_acquired_tiles`; `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`) and `split_k` (1, or the cluster split-K factor) | one record per (arch, stage, family, tile), every tile of the family mapping present |
 | `routing` | `variant`, `logits_dtype` (`float32` / `bfloat16`), `min_tokens`, `max_tokens`, `grid_rule` (`fixed` / `token_blocks`), `grid`, `tokens_per_cta`, `writes_benign_tail` | one record per (arch, stage, variant) |
 | `requant` | `variant`, `sf_layout`, `rows_per_cta` | one record per (arch, stage, variant) |
 | `finalize` | `variant` (`scalar` / `vector`), `max_top_k` | one record per (arch, stage, variant) |
@@ -165,7 +165,7 @@ GEMM2 over the permuted FC1 output, bf16 output in permuted order
 | `fp8` | `[E, H, I]` | - | `[max_padded, I]` | - | `scale_c` per expert |
 | `mxfp8` | `[E, H, I]` | `[E * grid_m, I/128, 2, 256]` | `[max_padded, I]` | `[max_padded, I/32]` | - |
 
-Grid `(grid_m = H / output_rows_per_cta, grid_n = max_ctas)`; routing arrays
+Grid `(grid_m = H / output_rows_per_cta, grid_n = max_ctas, split_k)`; routing arrays
 `tile_expert`, `tile_mn_limit`, `total_tiles = num_non_exiting_ctas`,
 `total_num_padded_tokens`; the same routing-tail rule as FC1. GEMM2 bias,
 per-channel scales, output scales and valid (unpadded) dimensions smaller than

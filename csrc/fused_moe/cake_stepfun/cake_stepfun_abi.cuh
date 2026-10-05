@@ -150,6 +150,9 @@ struct Fc2KernelSpec {
   int tile_n;
   int output_rows_per_cta;
   int block_k;
+  // Split-K factor: the launch grid is (grid_m, grid_n, split_k); 1 when the kernel does not
+  // split K across a cluster.
+  int split_k;
   // Block-scale layout the kernel reads for its activation operand (the requantization stage must
   // write this layout for kFc2Nvfp4PerToken; the FC1 epilogue writes kR8c4 for kFc2Nvfp4).
   SfLayout sf_layout_a;

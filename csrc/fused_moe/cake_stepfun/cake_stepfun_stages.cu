@@ -446,7 +446,8 @@ void Fc2Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, v
   }
 
   cudaLaunchConfig_t config{};
-  config.gridDim = dim3(static_cast<unsigned>(gridM), static_cast<unsigned>(gridN), 1u);
+  config.gridDim = dim3(static_cast<unsigned>(gridM), static_cast<unsigned>(gridN),
+                        static_cast<unsigned>(spec.split_k > 0 ? spec.split_k : 1));
   config.blockDim = dim3(spec.block[0], spec.block[1], spec.block[2]);
   config.dynamicSmemBytes = spec.dynamic_smem_bytes;
   config.stream = stream;
@@ -464,7 +465,8 @@ void Fc2Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, v
   config.numAttrs = numAttrs;
   cudaError_t const launched = spec.submit(&config, args);
   FLASHINFER_CHECK(launched == cudaSuccess, "Cake StepFun FC2 launch failed for ", spec.symbol,
-                   " grid=(", gridM, ",", gridN, ") : ", cudaGetErrorString(launched));
+                   " grid=(", gridM, ",", gridN, ",", spec.split_k,
+                   ") : ", cudaGetErrorString(launched));
 }
 
 // ------------------------------------------------------------------------------------------------
