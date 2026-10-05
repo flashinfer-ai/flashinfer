@@ -662,7 +662,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
     ('sm_100a', False, True, False, False, False, 2048, 16384, None): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True},
     ('sm_100a', False, True, False, False, False, 6144, 32, None): {"slots": 2},
-    ('sm_100a', False, True, False, False, False, 6144, 128, None): {"slots": 2},  # round 14 (W2f): indexer_k bf16 input gradient on the 128-row two-slot TMA-store family
+    ('sm_100a', False, True, False, False, False, 6144, 128, None): {"block_n": 128, "cta_rows": 256},
     ('sm_100a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "stages": 6, "quad_store": True},
     ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
