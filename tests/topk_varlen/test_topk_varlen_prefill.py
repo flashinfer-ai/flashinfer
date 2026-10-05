@@ -158,19 +158,20 @@ def test_prefill_causal_ramp_single_request(top_k):
 
 
 @requires_gvr2
-@pytest.mark.parametrize("hinted", [False, True], ids=["unhinted", "hinted"])
+@pytest.mark.parametrize("hinted", [False, True], ids=["slab", "rung"])
 @pytest.mark.parametrize("lead", [1, 2, 3], ids=lambda x: f"lead{x}")
 @pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
 def test_prefill_packed_misaligned_ks(top_k, lead, hinted):
     """Two packed requests; the second starts at ks % 4 == lead with +inf
     poison at [ks-lead, ks): a leaked lead lane would become top-1 and a missed
-    frame correction a negative index. Unhinted = streaming slab engine;
-    hinted = the register rung picked for the ``max_seq_len`` bound."""
+    frame correction a negative index. slab = no bound and a logits width past
+    every register capacity (the width is the bound then); rung = the register
+    rung picked for the ``max_seq_len`` bound."""
     a = 300
     ks1 = ((a + 3) // 4) * 4 + lead
     n1 = 4096 + 17
     rows = a + n1
-    ncols = ks1 + n1
+    ncols = ks1 + n1 + (0 if hinted else 8192)
     ks = [0] * a + [ks1] * n1
     lens = list(range(1, a + 1)) + list(range(1, n1 + 1))
     lg, rs, le = _make_case(rows, ncols, ks, lens, seed=top_k * 100 + lead)
@@ -204,17 +205,18 @@ def test_prefill_ties_degenerate(top_k, dist):
 
 
 @requires_gvr2
-@pytest.mark.parametrize("hinted", [False, True], ids=["unhinted", "hinted"])
+@pytest.mark.parametrize("hinted", [False, True], ids=["slab", "rung"])
 @pytest.mark.parametrize("lead", [1, 2, 3], ids=lambda x: f"lead{x}")
 @pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
 def test_prefill_neginf_masks_in_window(top_k, lead, hinted):
     """Fewer than K finite values in the window (the rest -inf, as SGLang's
     init/local-token masks): the K-th boundary lies in the -inf tie class,
-    crossed with a misaligned lead; no negative index may leak."""
+    crossed with a misaligned lead; no negative index may leak. slab = width
+    past every register capacity, no bound; rung = ``max_seq_len`` bound."""
     n_finite = top_k - 100
     nv = top_k + 400
     ks1 = ((37 + 3) // 4) * 4 + lead
-    ncols = ks1 + nv
+    ncols = ks1 + nv + (0 if hinted else 8192)
     rows = 5
     gen = torch.Generator(device=_DEV).manual_seed(top_k * 10 + lead)
     stride = ((ncols + 256 + 255) // 256) * 256
@@ -668,15 +670,16 @@ def _same_rows(a, b):
 
 
 @requires_gvr2
-@pytest.mark.parametrize("hinted", [False, True], ids=["unhinted", "hinted"])
+@pytest.mark.parametrize("hinted", [False, True], ids=["slab", "rung"])
 @pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
 def test_prefill_absolute_indices(top_k, hinted):
     """``absolute_indices=True`` returns logits columns: every hit is the
     window-local index plus ``row_starts[r]``, ``-1`` pads are untouched and
-    identity (short) windows are shifted too. Both engine families: the hinted
-    bound admits the register rung, the unhinted call takes the slab. Values
-    are the logits at the absolute columns."""
-    rows, ncols = 96, 6144
+    identity (short) windows are shifted too. Both engine families: the
+    ``max_seq_len`` bound admits the register rung; without a bound the width
+    (past every register capacity here) routes to the slab. Values are the
+    logits at the absolute columns."""
+    rows, ncols = 96, 6144 if hinted else 6144 + 8192
     ks = [(r * 61) % 3000 + (r % 4) for r in range(rows)]  # every lead 0..3
     lens = _abs_lens(rows, ncols, ks, top_k)
     lg, rs, le = _make_case(rows, ncols, ks, lens, seed=11 + top_k)
@@ -871,16 +874,17 @@ def test_prefill_zero_rows():
 
 
 @requires_gvr2
-@pytest.mark.parametrize("hinted", [False, True], ids=["unhinted", "hinted"])
+@pytest.mark.parametrize("hinted", [False, True], ids=["slab", "rung"])
 def test_prefill_out_values_through_api(hinted):
     """``return_values`` with caller buffers (2-D and flat): the values are the
     window scores at the selected columns and the pads hold the fp32 sentinel,
-    on both engines."""
+    on both engines (slab = no bound, width past the register capacity; rung =
+    ``max_seq_len`` bound)."""
     top_k, R, L = 512, 2, 1500
     rows = R * L
     ks = [(r * L) for r in range(R) for _ in range(L)]
     lens = [i + 1 for _ in range(R) for i in range(L)]
-    lg, rs, le = _make_case(rows, R * L, ks, lens, seed=11)
+    lg, rs, le = _make_case(rows, R * L + (0 if hinted else 8192), ks, lens, seed=11)
     for shape in ((rows, top_k), (rows * top_k,)):
         out_i = torch.full(shape, -7, dtype=torch.int32, device=_DEV)
         out_v = torch.full(shape, 123.0, dtype=torch.float32, device=_DEV)
@@ -1027,10 +1031,12 @@ def test_prefill_hinted_cuda_graph_replay_shifts_starts():
 def test_prefill_hinted_capture_on_fresh_stream_needs_no_slab():
     """A hinted register-rung call never needs the per-stream workspace slab:
     after warm-up it captures on a stream that ran no eager gvr_2 call, and
-    ``prefill_ready`` says so; the slab engine on that stream is not ready."""
+    ``prefill_ready`` says so; a slab-routed geometry (width past the register
+    capacity) on that stream is not ready."""
     top_k, L, R = 512, 2045, 2
     rows = R * L
-    _host.warmup_prefill(top_k, R * L)  # on the current (default) stream
+    wide = 8192 + 4  # a width every register rung refuses -> slab engine
+    _host.warmup_prefill(top_k, wide)  # on the current (default) stream
     stride = (R * L + 256 + 255) // 256 * 256
     full = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)
     lg = full[:, : R * L]
@@ -1044,7 +1050,7 @@ def test_prefill_hinted_capture_on_fresh_stream_needs_no_slab():
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
         assert _host.prefill_ready(rows, top_k, L, width=R * L)
-        assert not _host.prefill_ready(rows, top_k, R * L)  # slab: no slab on s
+        assert not _host.prefill_ready(rows, top_k, wide)  # slab engine: no slab on s
     g = torch.cuda.CUDAGraph()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):

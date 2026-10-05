@@ -1116,14 +1116,18 @@ def _prefill_reg_route(rows: int, k: int, n_hint: int) -> dict | None:
 
 
 _PREFILL_CLASS_BOUNDS = (2048, 4096, 8192)  # register capacity classes (VPT 1 / 2 / 4)
-# Unhinted windowed calls (no max_seq_len) run the slab for every row. A
-# per-row split across two launches (register rung + slab, each skipping the
-# other's rows) was measured and rejected: the slab launch that only skips
-# still schedules one CTA per row at its 1-2 CTA/SM smem occupancy (~35 us per
-# 32K rows on B200), and without the bound the register launch must take the
-# largest class, which is the wrong kernel for short windows (VPT=4 on 2K
-# windows: slower than the slab itself at K = 2048). The bound is host
-# knowledge in every serving framework, so the API asks for it.
+# Every windowed call routes by ONE window-length bound: the caller's
+# max_seq_len when given, else the logits width (always a valid bound: no
+# window is wider than its row). The bound picks a register rung whose capacity
+# covers bound + 3 lead lanes, else the slab tier. A per-row split across two
+# launches (register rung + slab, each skipping the other's rows) was measured
+# and rejected: the slab launch that only skips still schedules one CTA per row
+# at its 1-2 CTA/SM smem occupancy (~35 us per 32K rows on B200), and without a
+# bound the register launch must take the largest class, which is the wrong
+# kernel for short windows (VPT=4 on 2K windows: slower than the slab itself at
+# K = 2048). The width is a loose bound for a packed multi-request batch (it
+# sums every request's keys), and the tight one is host knowledge in every
+# serving framework, so the API also takes it as max_seq_len.
 
 
 def _prefill_cache_key(fam: str, tier_or_tpl, k: int, n_bucket: int, abs_out: bool = False):
@@ -1235,21 +1239,23 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int, abs_out: bool = False) -
 
 
 def _launch_prefill(
-    lg, row_starts, kv_lens, idx, ws, k, n_clamp, n_hint, npad, hinted, abs_out=False
+    lg, row_starts, kv_lens, idx, ws, k, n_clamp, n_hint, npad, abs_out=False
 ) -> None:
     """Launch the windowed engine over ``lg`` in row slabs. ABI (main varlen):
     ``fn(logits, pre_idx_slot=row_starts, out, ws, n, npad, k, SCAP_, CMP_, R,
     dead x5, kv_lens_slot=window lengths, tuning tail)``; the prefill compile
     reads ks from the pre_idx slot and the window length from the kv_lens slot
     and clamps ke to ``n_clamp`` (the logits width) in the ``n`` slot.
-    ``n_hint`` (the caller's max window length, capture-stable) selects the
-    engine: a register rung whose capacity covers it (``hinted``), else the
-    slab tier and envelope bucket. Every engine clamps ``ke`` to the logits
-    width; the slab ranks any window exactly, a register rung ranks exactly
-    every row whose extent (window + lead lanes) fits its capacity and reports
-    a longer row as all -1, never as a truncated ranking (``_prefill_reg_route``).
-    ``abs_out`` selects the compiled variants that emit absolute logits
-    columns (window-local + row start) instead of window-local indices."""
+    ``n_hint`` (the window-length bound: the caller's ``max_seq_len`` or, when
+    none was given, the logits width; capture-stable either way) selects the
+    engine: a register rung whose capacity covers it, else the slab tier and
+    envelope bucket. Every engine clamps ``ke`` to the logits width; the slab
+    ranks any window exactly, a register rung ranks exactly every row whose
+    extent (window + lead lanes) fits its capacity and reports a longer row as
+    all -1, never as a truncated ranking (``_prefill_reg_route``); a
+    width-derived bound cannot be exceeded. ``abs_out`` selects the compiled
+    variants that emit absolute logits columns (window-local + row start)
+    instead of window-local indices."""
     num_rows = lg.shape[0]
     n_hint = min(max(int(n_hint), 1), int(n_clamp))
     n_bucket = _prefill_bucket(n_hint)
@@ -1257,18 +1263,9 @@ def _launch_prefill(
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
         rows = r1 - r0
-        if hinted:
-            # the caller's window-length bound picks ONE engine for the slab:
-            # a register rung whose capacity covers bound + 3 lead lanes, else
-            # the streaming main tier
-            lc = _prefill_get(rows, k, n_hint, n_bucket, compile_ok=not capture, abs_out=abs_out)
-        else:
-            # unhinted: window lengths are device data -> streaming main for
-            # every row (see the note at _PREFILL_CLASS_BOUNDS)
-            tier = _prefill_tier(rows, n_hint, k)
-            lc = _PREFILL_CACHE.get(_prefill_cache_key("main", tier, k, n_bucket, abs_out))
-            if lc is None and not capture:
-                lc = _prefill_launcher(tier, k, n_bucket, abs_out)
+        # the bound picks ONE engine for the slab: a register rung whose
+        # capacity covers bound + 3 lead lanes, else the streaming main tier
+        lc = _prefill_get(rows, k, n_hint, n_bucket, compile_ok=not capture, abs_out=abs_out)
         if lc is None:
             raise RuntimeError(
                 "prefill launcher not compiled for this shape — warm up "
@@ -1333,9 +1330,11 @@ def warmup_prefill(
     row count) and every pow2 envelope bucket up to ``max_cols``, at both
     edges of the bucket (the slab tier promotes and the register classes
     2048 / 4096 / 8192 step exactly at the edges), this warms the slab tier
-    that width takes (unhinted calls, and hinted calls the rung table sends
-    to the slab) plus the register rung the table admits for a hint at that
-    edge: about six slab engines plus the admitted rungs per k.
+    that width takes (calls whose bound the rung table sends to the slab)
+    plus the register rung the table admits for a bound at that edge: about
+    six slab engines plus the admitted rungs per k. A call without
+    ``max_seq_len`` routes by the logits width, so it is covered like a call
+    whose bound is that width.
     ``max_cols`` is the compressed max column count (the logits width the
     serving producer emits). Every engine is compiled for the exact launcher
     key the serving call will look up and launched once on a one-row window,
@@ -1379,8 +1378,8 @@ def warmup_prefill(
                         absolute_indices,
                     )
                     reps.setdefault(key, ("reg", plan, n_h))
-                # the slab tier of this width: unhinted calls take it whatever
-                # the table admits, hinted calls take it where the table says so
+                # the slab tier of this width: taken wherever the table admits
+                # no rung for the bound (max_seq_len, or the width itself)
                 tier = _prefill_tier(rows, n_h, k)
                 key = _prefill_cache_key("main", tier, k, bk, absolute_indices)
                 reps.setdefault(key, ("main", (tier, bk), n_h))
@@ -1413,12 +1412,12 @@ def prefill_ready(
 ) -> bool:
     """True iff a windowed ``run_varlen`` call with this geometry would launch
     without compiling (the same launcher keys it looks up), so a caller can
-    route around the engine under CUDA graph capture. Unhinted call: pass the
-    logits width as ``n_env`` and leave ``width`` None. Hinted call: ``n_env``
-    is the ``max_seq_len`` bound and ``width`` the logits width."""
+    route around the engine under CUDA graph capture. ``n_env`` is the bound
+    the call routes by: the ``max_seq_len`` it will pass (then ``width`` is
+    the logits width), or the logits width itself for a call without
+    ``max_seq_len`` (leave ``width`` None)."""
     if num_rows == 0:
         return True
-    hinted = width is not None
     width = int(n_env) if width is None else int(width)
     n_env = min(max(int(n_env), 1), width)
     n_bucket = _prefill_bucket(n_env)
@@ -1428,15 +1427,8 @@ def prefill_ready(
     slab_ok = _ws_hot.get(_ws_key(torch.cuda.current_device())) is not None
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         rows = min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0
-        if hinted:
-            lc = _prefill_get(rows, k, n_env, n_bucket, compile_ok=False, abs_out=absolute_indices)
-            if lc is None or (lc[0] == "main" and not slab_ok):
-                return False
-            continue
-        tier = _prefill_tier(rows, n_env, k)  # unhinted: slab only
-        if not slab_ok:
-            return False
-        if _prefill_cache_key("main", tier, k, n_bucket, absolute_indices) not in _PREFILL_CACHE:
+        lc = _prefill_get(rows, k, n_env, n_bucket, compile_ok=False, abs_out=absolute_indices)
+        if lc is None or (lc[0] == "main" and not slab_ok):
             return False
     return True
 
@@ -2036,13 +2028,14 @@ def run_varlen(
     constant, e.g. dsa.py's ``indexer_max_seq_len``) the call performs NO
     host reads.  Without ``max_seq_len`` the envelope comes from ONE
     ``kv_lens.max()`` host read (documented sync, refused under capture).
-    With ``row_starts`` (windowed mode) ``max_seq_len`` is the caller's bound
-    on the WINDOW lengths and selects the engine (a register rung whose
-    capacity covers the bound, else the streaming slab). Every engine clamps
+    With ``row_starts`` (windowed mode) the engine is chosen by a bound on the
+    WINDOW lengths: ``max_seq_len`` when given, else the logits width (always
+    a valid bound, no host read). A register rung whose capacity covers the
+    bound serves the launch, else the streaming slab. Every engine clamps
     windows to the logits width; the slab ranks any window exactly, while a
     register rung reports a row whose extent exceeds its capacity as all -1
-    (never a truncated ranking), so the bound must hold at every graph replay
-    or the call must stay unhinted.
+    (never a truncated ranking), so a caller-given bound must hold at every
+    graph replay; the width-derived default cannot be exceeded.
     ``engine="reference"`` keeps the b=1 host-loop reference implementation —
     the differential oracle the in-kernel engine is validated against.
 
@@ -2240,9 +2233,10 @@ def run_varlen(
                 )
         cshift = 0 if cr == 1 else 2
         if windowed and max_seq_len is None:
-            # unhinted windowed call: the envelope is the logits width (no
-            # host read of device data); the rows are routed per row below
-            n_env = npad
+            # windowed call without a bound: the logits width is the bound
+            # (always valid: no window is wider than its row; no host read of
+            # device data) and routes the engine exactly like max_seq_len
+            n_env = min(logits.shape[1], npad)
         elif max_seq_len is not None:
             n_env = int(max_seq_len) >> cshift
         else:
@@ -2266,13 +2260,12 @@ def run_varlen(
             if vals is not None and vals.shape[1] != k:
                 vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
             # ws stays None here: _launch_prefill resolves the default slab only
-            # for a slab (streaming main) launch, so a hinted register-rung
-            # capture needs no eager call on the capturing stream
-            # (prefill_ready mirrors the same rule)
-            # every engine clamps windows to the logits WIDTH (memory safety);
-            # max_seq_len, if given, is the caller's window-length bound and
-            # picks the engine (register rung or slab tier / envelope bucket);
-            # a register rung reports rows beyond its capacity as all -1
+            # for a slab (streaming main) launch, so a register-rung capture
+            # needs no eager call on the capturing stream (prefill_ready
+            # mirrors the same rule). Every engine clamps windows to the logits
+            # WIDTH (memory safety); n_env (max_seq_len, else the width) picks
+            # the engine (register rung or slab tier / envelope bucket); a
+            # register rung reports rows beyond its capacity as all -1
             _launch_prefill(
                 lg,
                 row_starts,
@@ -2283,7 +2276,6 @@ def run_varlen(
                 min(logits.shape[1], npad),
                 n_env,
                 npad,
-                hinted=max_seq_len is not None,
                 abs_out=bool(absolute_indices),
             )
             if vals is not None:
