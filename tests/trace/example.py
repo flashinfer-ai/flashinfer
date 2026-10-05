@@ -123,6 +123,8 @@ silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
+top_k_varlen_n4096_k512.json
+top_k_varlen_n8192_k1024.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
@@ -142,6 +144,7 @@ dsv41_fp4_quantize_*_sparse_mla_cache_*.json and dsv41_fp8_quantize_*_sparse_mla
 are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
+top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
 
 import contextlib
@@ -2935,3 +2938,41 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+# ── top_k_varlen (DeepSeek sparse-attention indexer top-k) ─────────────────
+# decode shape: one row per request, per-request lengths; the radix_cutlass
+# backend runs on any GPU -> top_k_varlen_n8192_k1024.json
+from flashinfer.trace.templates.topk import top_k_varlen_trace as _tkv_trace
+
+_tkv_in = _tkv_trace.init(batch_size=32, max_seq_len=8192, top_k=1024, device=device)
+flashinfer.top_k_varlen(**_tkv_in)
+
+# windowed (prefill) shape: one row per prompt token, every request's keys
+# packed along the column axis, row r ranks [row_starts[r], row_starts[r] +
+# seq_lens[r]) and returns absolute columns; served by the gvr_2 engines
+# (SM100/SM103/SM107) -> top_k_varlen_n4096_k512.json
+_tkv_cc = torch.cuda.get_device_capability()
+if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _tkv_cc[0] * 10 + _tkv_cc[1]):
+    _tkv_R, _tkv_L = 2, 2048  # two 2048-token prompts
+    _tkv_logits = torch.randn(
+        _tkv_R * _tkv_L, _tkv_R * _tkv_L, dtype=torch.float32, device=device
+    )
+    _tkv_starts = torch.tensor(
+        [(r * _tkv_L) for r in range(_tkv_R) for _ in range(_tkv_L)],
+        dtype=torch.int32,
+        device=device,
+    )
+    _tkv_lens = torch.tensor(
+        [i + 1 for _ in range(_tkv_R) for i in range(_tkv_L)],
+        dtype=torch.int32,
+        device=device,
+    )
+    flashinfer.top_k_varlen(
+        _tkv_logits,
+        _tkv_lens,
+        512,
+        row_starts=_tkv_starts,
+        max_seq_len=_tkv_L,
+        absolute_indices=True,
+        backend="gvr_2",
+    )

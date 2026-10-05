@@ -97,6 +97,10 @@ def _top_k_varlen_check(
         sel = act[r].long()  # window-local indices (absolute: shift back by s)
         if absolute_indices:
             sel = sel - s
+        # a -1 pad in a full row, or any index outside the window, is a
+        # failure -- not a wrap-around gather or a device-side index assert
+        if bool((sel < 0).any()) or bool((sel >= n).any()):
+            return False
         if (row[sel] < kth - 1e-5).any():
             return False
     return True
@@ -141,12 +145,15 @@ top_k_varlen_trace = TraceTemplate(
     ),
     axes={
         "batch_size": Var(description="Number of decode requests."),
-        "max_seq_len": Const(abbrev="n", description="Logits row width (padded)."),
+        # the width axis is NOT called max_seq_len: that name is the API's
+        # windowed-mode bound (a scalar input below), and the axis extractor
+        # would read the scalar kwarg ahead of the logits shape
+        "num_cols": Const(abbrev="n", description="Logits row width (padded)."),
         "top_k": Const(abbrev="k", description="Number of top elements per row."),
     },
     inputs={
         "logits": Tensor(
-            ["batch_size", "max_seq_len"],
+            ["batch_size", "num_cols"],
             description="Decode-step attention logits (bfloat16 / float16 / float32).",
         ),
         "seq_lens": Tensor(
@@ -176,6 +183,15 @@ top_k_varlen_trace = TraceTemplate(
             "bool",
             optional=True,
             description="Windowed mode: return absolute logits columns instead of window-local indices.",
+        ),
+        "max_seq_len": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "Windowed mode: the caller's bound on the window lengths; selects "
+                "the gvr_2 engine (register rung vs streaming slab) before CUDA-graph "
+                "capture. Ignored without row_starts."
+            ),
         ),
     },
     outputs={
