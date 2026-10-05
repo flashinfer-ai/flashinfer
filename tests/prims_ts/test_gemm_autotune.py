@@ -257,6 +257,24 @@ def test_legal_tactics_cover_each_axis_and_drop_illegal_ones():
     assert narrowed.use_tma_store is True
 
 
+def test_sm107_fp8_tactics_use_deeper_stages_and_wide_clusters():
+    linear = legal_tactics(107, "fp8_e4m3", "bf16", "linear")
+    assert len(linear) <= MAX_PROFILED_TACTICS
+    assert {tactic[5] for tactic in linear} == {5, 6, 7, 8}
+    assert any((tactic[0], tactic[1]) == (2, 4) for tactic in linear)
+    assert (2, 4, 256, 128, False, 8, 64, True, 8, True) in linear
+
+    swiglu = legal_tactics(107, "fp8_e4m3", "bf16", "swiglu")
+    assert (2, 2, 256, 128, False, 5, 64, True, 8, True) in swiglu
+
+    qkv = legal_tactics(107, "fp8_e4m3", "bf16", "qkv_qknorm_rope")
+    assert all(tactic[5] == 4 for tactic in qkv)
+
+    sm100 = legal_tactics(100, "fp8_e4m3", "bf16", "linear")
+    assert {tactic[5] for tactic in sm100} <= {5, 6}
+    assert all((tactic[0], tactic[1]) != (2, 4) for tactic in sm100)
+
+
 def test_explicit_config_does_not_call_the_tuner(monkeypatch):
     _require_gemm_gpu()
     from flashinfer.gemm import fp8_linear

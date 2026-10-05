@@ -32,7 +32,12 @@ from flashinfer.utils import (
 from .config import PrimsTsGemmConfig
 from .support import nvfp4_128x4_numel as _nvfp4_128x4_numel
 from .support import validate_dense_gemm
-from .tactics import default_fp8_mma_k, derived_ab_stages, fallback_cluster
+from .tactics import (
+    default_fp8_mma_k,
+    derived_ab_stages,
+    fallback_cluster,
+    loadable_ab_stages,
+)
 
 _COMPILED: dict[tuple[PrimsTsGemmConfig, int, int, bool], object] = {}
 _KERNEL_MODULES: dict[PrimsTsGemmConfig, ModuleType] = {}
@@ -301,11 +306,13 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
             config.tile_n,
             config.tile_k,
         )
+        loadable = loadable_ab_stages(config.arch, config.operand_format)
         if config.ab_stages is None:
             module.ab_stages = forced_stages
-        elif config.ab_stages not in (1, 2, 4, 5, 6):
+        elif config.ab_stages not in loadable:
             raise ValueError(
-                f"ab_stages must be one of 1, 2, 4, 5, 6, got {config.ab_stages}"
+                f"ab_stages must be one of {', '.join(map(str, loadable))}, "
+                f"got {config.ab_stages}"
             )
         elif (
             config.nvfp4_mma_k == 96
