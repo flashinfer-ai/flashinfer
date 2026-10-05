@@ -24,7 +24,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(32) void
-kernel_cake_all_gather_matmul_18d5d4b7d46bb61cc447(int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
+kernel_cake_all_gather_matmul_2e04a762811cd00a1cd5(int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

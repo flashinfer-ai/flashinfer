@@ -24,7 +24,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_all_gather_matmul_bda23d0402c5309b99dd(unsigned int* __restrict__ inp, long long* __restrict__ payload_peers, long long* __restrict__ signal_peers, unsigned int* __restrict__ counters, unsigned int ready_target)
+kernel_cake_all_gather_matmul_a90116586399c59ba880(unsigned int* __restrict__ inp, long long* __restrict__ payload_peers, long long* __restrict__ signal_peers, unsigned int* __restrict__ counters, unsigned int ready_target)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
