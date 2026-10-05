@@ -798,15 +798,47 @@ def test_epilogue_rules():
             dict(a_mn=False, b_mn=True, block_n=192, cta_rows=64, out_f32=True),
             "dense_proj_gemm_kn_n192_m64_f32",
         ),
+        # round 13: the tall family's overlapped single-TMEM-buffer epilogue (``_ov``), the deterministic
+        # half-height tail wave (``_ht``) and the parked epilogue (``_pk``); suffix order after ``_q``
+        (
+            dict(a_mn=False, b_mn=False, cta_rows=256, ovl=True),
+            "dense_proj_gemm_kk_n256_m256_ov",
+        ),
+        (
+            dict(a_mn=False, b_mn=True, cta_rows=256, ovl=True, htail=True),
+            "dense_proj_gemm_kn_n256_m256_ov_ht",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, cta_rows=256, htail=True),
+            "dense_proj_gemm_kk_n256_m256_ht",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, cta_rows=256, park=True),
+            "dense_proj_gemm_kk_n256_m256_pk",
+        ),
     ],
 )
 def test_instance_symbols(kwargs, symbol):
     assert instance_symbol(instance_key(**kwargs)) == symbol
 
 
+def test_round13_knob_normalisation():
+    # the 18-field key carries park / ovl / htail at fields 15 / 16 / 17; ovl is a 256-row x 256-column tall-tile
+    # knob (narrower or shorter tiles raise), htail needs the 256-row family, park only the bf16 row-major tall store
+    key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
+    assert len(key) == 18 and key[15] is False and key[16] is True and key[17] is True
+    assert instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15] is False
+    with pytest.raises(ValueError):
+        instance_key(a_mn=False, b_mn=False, cta_rows=256, block_n=192, ovl=True)
+    with pytest.raises(ValueError):
+        instance_key(a_mn=False, b_mn=False, cta_rows=128, htail=True)
+    with pytest.raises(ValueError):
+        instance_key(a_mn=False, b_mn=False, cta_rows=256, park=True, ovl=True)
+
+
 def test_quad_store_knob_normalisation():
     # only the row-major bf16 register epilogue carries the quad-store knob: fp32 output, the TMA-store
-    # epilogue and the transposed store drop it from the key (and the symbol); field 14 of the 15-field key
+    # epilogue and the transposed store drop it from the key (and the symbol); field 14 of the 18-field key
     assert instance_key(a_mn=False, b_mn=True, epi="reg", quad_store=True)[14] is True
     assert (
         instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", quad_store=True)[

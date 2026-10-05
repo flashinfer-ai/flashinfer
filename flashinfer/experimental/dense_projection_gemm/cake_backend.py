@@ -401,11 +401,15 @@ def instance_key(
     hints: tuple = ("none", "none"),
     f32_v8: bool = False,
     quad_store: bool = False,
+    park: bool = False,
+    ovl: bool = False,
+    htail: bool = False,
     smem_limit: Optional[int] = None,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
-    hints, f32_v8, quad_store)``; the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
+    hints, f32_v8, quad_store, park, ovl, htail)`` (round 13: ``park`` = parked tall epilogue, ``ovl`` =
+    overlapped single-TMEM-buffer tall epilogue, ``htail`` = deterministic half-height tail wave); the raster group width (``group_m``) and the TMA L2 promotion (``promo_code``) are launch parameters since round 11.  ``smem_limit`` (bytes; default = the largest
     architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
     the key, so an instance has one symbol on every architecture (the planner passes
     ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
@@ -453,6 +457,34 @@ def instance_key(
         raise ValueError(
             f"{stages} stages at BLOCK_N={block_n}, CTA_ROWS={cta_rows} exceed the {limit} B dynamic SMEM limit"
         )
+    f32_v8 = (
+        bool(f32_v8) and out_f32 and epi == "reg" and not out_t
+    )  # only the row-major fp32 register epilogue has the knob
+    quad_store = (
+        bool(quad_store)
+        and (not out_f32)
+        and epi == "reg"
+        and not out_t
+        # bf16 row-major register epilogue with whole 64-column groups per warp slice: quad-transposed
+        # 32-byte row segments (round 7)
+        and cols % 64 == 0
+    )
+    # parked tall epilogue: bf16 row-major 256-row tiles only (Cake round 10 knob, measured per row)
+    park = bool(park) and cta_rows == 256 and (not out_f32) and (not out_t)
+    ovl = bool(ovl)
+    if ovl and (cta_rows != 256 or block_n != 256 or park or pf or box_rows):
+        # round 13: the overlapped epilogue's chunks are the two 128-column passes of the tall 256-column tile; it
+        # owns the B load coordinates (no prefetch / box cap) and excludes the parked epilogue  [Cake instance_key]
+        raise ValueError(
+            f"ovl needs cta_rows=256, block_n=256 and no park / pf / box_rows (got cta_rows={cta_rows}, "
+            f"block_n={block_n}, park={park}, pf={pf}, box_rows={box_rows})"
+        )
+    htail = bool(htail)
+    if htail and (cta_rows != 256 or pf or box_rows):
+        raise ValueError(
+            f"htail (half-height tail wave) needs cta_rows=256 and no pf / box_rows (got cta_rows={cta_rows}, "
+            f"pf={pf}, box_rows={box_rows})"
+        )
     return (
         a_mn,
         b_mn,
@@ -467,17 +499,11 @@ def instance_key(
         cta_rows,
         pf,
         hints,
-        bool(f32_v8)
-        and out_f32
-        and epi == "reg"
-        and not out_t,  # only the row-major fp32 register epilogue has the knob
-        bool(quad_store)
-        and (not out_f32)
-        and epi == "reg"
-        and not out_t
-        # bf16 row-major register epilogue with whole 64-column groups per warp slice: quad-transposed
-        # 32-byte row segments (round 7)
-        and cols % 64 == 0,
+        f32_v8,
+        quad_store,
+        park,
+        ovl,
+        htail,
     )
 
 
@@ -486,8 +512,9 @@ def instance_symbol(key: tuple) -> str:
     followed by ``_m256`` for tall tiles / ``_m64`` for the 64-row Layout-B family, ``_pf<n>`` for a
     prefetch distance, ``_h<a><b>`` for non-default (A, B) eviction hints (first letters, e.g.
     ``_hen`` = A evict_first / B none), ``_f32``, ``_v8`` for the 256-bit fp32 register stores, ``_t``,
+    ``_pk`` / ``_ov`` / ``_ht`` for the parked / overlapped / half-height-tail tall epilogues (round 13),
     ``_<epi><slots>`` for the TMA-store epilogue, ``_s<stages>`` for a non-default stage count and
-    ``_box<rows>``).  [Cake ``instance_symbol`` L908-L912]"""
+    ``_box<rows>``).  [Cake ``instance_symbol``]"""
     (
         a_mn,
         b_mn,
@@ -504,6 +531,9 @@ def instance_symbol(key: tuple) -> str:
         hints,
         f32_v8,
         quad_store,
+        park,
+        ovl,
+        htail,
     ) = key
     return (
         "dense_proj_gemm_"
@@ -516,6 +546,9 @@ def instance_symbol(key: tuple) -> str:
         + ("_f32" if out_f32 else "")
         + ("_v8" if f32_v8 else "")
         + ("_q" if quad_store else "")
+        + ("_pk" if park else "")
+        + ("_ov" if ovl else "")
+        + ("_ht" if htail else "")
         + ("_t" if out_t else "")
         + (f"_{epi}{slots}" if epi != "reg" else "")
         + (
@@ -888,6 +921,10 @@ class GemmPlan:
     # ... and the plan landed on the nearest registered knob variant (tile height, raster group, epilogue path,
     # BLOCK_N) because no generated program serves the row's default tail-T instance either
     knob_fallback: bool = False
+    # round-13 tall-family knobs of the planned instance (instance_key fields 15 / 16 / 17)
+    park: bool = False
+    ovl: bool = False
+    htail: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -906,8 +943,9 @@ class GemmPlan:
 
     @property
     def ws_f32_elems(self) -> int:
-        """fp32 elements of the stream-K partial slabs (unit + tail-tile slabs); 0 without stream-K."""
-        if not self.sk_units:
+        """fp32 elements of the stream-K partial slabs (unit + tail-tile slabs); 0 without stream-K and
+        under the half-height tail wave (its items are whole-K tiles: no partial slabs, no fixup)."""
+        if not self.sk_units or self.htail:
             return 0
         return (self.sk_units + self.tail_tiles) * 2 * self.cta_rows * self.block_n
 
@@ -925,7 +963,8 @@ class GemmPlan:
 
     @property
     def sk_iters(self) -> int:
-        return self.tail_tiles * self.k_blocks
+        """The launcher's linearised stream-K span; under ``htail`` every half item is one whole-K segment."""
+        return (self.sk_units if self.htail else self.tail_tiles) * self.k_blocks
 
     @property
     def tma_out(self) -> bool:
@@ -954,6 +993,9 @@ def plan_dense_projection_gemm(
     group_m: Optional[int] = None,
     f32_v8: Optional[bool] = None,
     quad_store: Optional[bool] = None,
+    park: Optional[bool] = None,
+    ovl: Optional[bool] = None,
+    htail: Optional[bool] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -993,6 +1035,9 @@ def plan_dense_projection_gemm(
         group_m=group_m,
         f32_v8=f32_v8,
         quad_store=quad_store,
+        park=park,
+        ovl=ovl,
+        htail=htail,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -1056,7 +1101,7 @@ def plan_dense_projection_gemm(
         rule = {
             k: v
             for k, v in rule.items()
-            if k not in ("block_n", "stages", "slots", "epi")
+            if k not in ("block_n", "stages", "slots", "epi", "ovl", "htail")
         }
     if block_n is None:
         block_n = rule.get("block_n", default_block_n(N, b_mn))
@@ -1072,6 +1117,16 @@ def plan_dense_projection_gemm(
         f32_v8 = rule.get("f32_v8", False)
     if quad_store is None:
         quad_store = rule.get("quad_store", False)
+    if park is None:
+        park = rule.get("park", False)
+    if ovl is None:
+        ovl = rule.get("ovl", False)
+    if htail is None:
+        htail = rule.get("htail", False)
+    if ovl and int(block_n) != 256:
+        # the overlapped epilogue is built for the 256-column tall tile; a narrower tall tile keeps the serialized
+        # tall epilogue  [Cake launcher]
+        ovl = False
     m_tiles = _ceil_div(M, cta_rows)
     m_tiles += m_tiles % CTA_GROUP
     n_tiles = _ceil_div(N, block_n)
@@ -1083,9 +1138,24 @@ def plan_dense_projection_gemm(
         # Measured per-row p-way split of the tail wave (Cake round 4, L20); a caller ``sk_parts`` wins over the
         # rule's.  [Cake L1296-L1301]
         sk, sk_max_units = sk_parts_plan(pair_tiles, k_blocks, pairs, int(parts))
-    num_full, tail_tiles, sk_units, iters_per_unit = stream_k_plan(
-        pair_tiles, k_blocks, pairs, sk, sk_max_units
-    )
+    # Round 13 (Cake W1): deterministic half-height tail wave of the tall family - the tail tiles become 2 x tail
+    # standard-geometry items of full K (no partial slabs, no fixup), only when there is a tail and its half items fit
+    # the CTA pairs; otherwise the plain plan / stream-K policy of the row applies.  [Cake launcher]
+    htail = bool(htail) and int(cta_rows) == 256
+    if htail:
+        tail_h = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
+        htail = bool(tail_h) and 2 * tail_h <= pairs
+    if htail:
+        num_full, tail_tiles, sk_units, iters_per_unit = (
+            pair_tiles - tail_h,
+            tail_h,
+            2 * tail_h,
+            k_blocks,
+        )
+    else:
+        num_full, tail_tiles, sk_units, iters_per_unit = stream_k_plan(
+            pair_tiles, k_blocks, pairs, sk, sk_max_units
+        )
     if tail_tiles * 16 > SK_DUMMY_BASE:
         raise ValueError(
             f"dense_projection_gemm: {tail_tiles} stream-K tail tiles exceed the {SK_DUMMY_BASE // 16} slice-counter budget"
@@ -1134,6 +1204,9 @@ def plan_dense_projection_gemm(
         hints=hints,
         f32_v8=f32_v8,
         quad_store=quad_store,
+        park=park,
+        ovl=ovl,
+        htail=htail,
         smem_limit=smem_limit_for(arch),
     )
     plan = GemmPlan(
@@ -1167,6 +1240,9 @@ def plan_dense_projection_gemm(
         template=instance_symbol(key),
         swap_fallback=swap_eligible and not _allow_swap,
         rule_fallback=bool(rule_dropped),
+        park=bool(key[15]),
+        ovl=bool(key[16]),
+        htail=bool(key[17]),
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
@@ -1396,6 +1472,9 @@ def prepare_dense_projection_gemm(
     group_m: Optional[int] = None,
     f32_v8: Optional[bool] = None,
     quad_store: Optional[bool] = None,
+    park: Optional[bool] = None,
+    ovl: Optional[bool] = None,
+    htail: Optional[bool] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -1429,6 +1508,9 @@ def prepare_dense_projection_gemm(
         group_m=group_m,
         f32_v8=f32_v8,
         quad_store=quad_store,
+        park=park,
+        ovl=ovl,
+        htail=htail,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)
