@@ -50,13 +50,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 256
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) void
-kernel_cake_dsa_h64_train_a87a953e2d2ac436209c(float* __restrict__ src_latent, float* __restrict__ src_rope, __nv_bfloat16* __restrict__ dst_latent, __nv_bfloat16* __restrict__ dst_rope, float* __restrict__ dst_latent_f32, float* __restrict__ dst_rope_f32, int latent_groups, int rope_groups, int out_f32, float* __restrict__ dst_packed, int dst_row_stride, int* __restrict__ dst_map, int has_dst_map, int accumulate)
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+kernel_cake_dsa_h64_train_2a461db82be6f8b6558d(float* __restrict__ src_latent, float* __restrict__ src_rope, __nv_bfloat16* __restrict__ dst_latent, __nv_bfloat16* __restrict__ dst_rope, float* __restrict__ dst_latent_f32, float* __restrict__ dst_rope_f32, int latent_groups, int rope_groups, int out_f32, float* __restrict__ dst_packed, int dst_row_stride, int* __restrict__ dst_map, int has_dst_map, int accumulate)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
