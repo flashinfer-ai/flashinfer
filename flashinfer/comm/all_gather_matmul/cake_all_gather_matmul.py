@@ -103,7 +103,9 @@ class _Workspace:
         rows = self.peer_signals.get(num_chunks)
         if rows is None:
             if num_chunks > self.max_chunks:
-                raise RuntimeError("readiness pad is smaller than the call's chunk count")
+                raise RuntimeError(
+                    "readiness pad is smaller than the call's chunk count"
+                )
             rows = tuple(
                 self.scratch_handle.get_signal_pad(
                     peer, (self.world_size, num_chunks), torch.uint32, 0
@@ -116,9 +118,9 @@ class _Workspace:
     def fused_tables(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.fused_buffers is None:
             signals = tuple(
-                self.scratch_handle.get_signal_pad(peer, (self.world_size, 1), torch.uint32, 0)[
-                    self.rank
-                ]
+                self.scratch_handle.get_signal_pad(
+                    peer, (self.world_size, 1), torch.uint32, 0
+                )[self.rank]
                 for peer in _peer_order(self.rank, self.world_size)
             )
             self.fused_buffers = (
@@ -132,7 +134,9 @@ class _Workspace:
                     dtype=torch.int64,
                     device=self.device_index,
                 ),
-                torch.zeros(self.world_size - 1, dtype=torch.uint32, device=self.device_index),
+                torch.zeros(
+                    self.world_size - 1, dtype=torch.uint32, device=self.device_index
+                ),
             )
         return self.fused_buffers
 
@@ -228,7 +232,15 @@ def _validate(inp: torch.Tensor, w: torch.Tensor, group: dist.ProcessGroup) -> _
             f"SM{capability[0]}{capability[1]}"
         )
     return _Call(
-        device_index, rank, world_size, _group_name(group), dtype_name, arch, rows, n, b_layout
+        device_index,
+        rank,
+        world_size,
+        _group_name(group),
+        dtype_name,
+        arch,
+        rows,
+        n,
+        b_layout,
     )
 
 
@@ -306,7 +318,11 @@ def _grow_workspace(workspace: _Workspace, call: _Call, pitch: int) -> None:
     """Allocate the symmetric scratch for ``pitch`` rows per peer (collective; caller synchronized)."""
 
     scratch = symm_mem.empty(
-        call.world_size, pitch, loader.K, dtype=workspace.dtype, device=call.device_index
+        call.world_size,
+        pitch,
+        loader.K,
+        dtype=workspace.dtype,
+        device=call.device_index,
     )
     handle = symm_mem.rendezvous(scratch, group=call.group_name)
     if int(handle.rank) != call.rank or int(handle.world_size) != call.world_size:
@@ -460,7 +476,9 @@ def _launch(
             comm_stream = workspace.comm_stream
 
             barrier = loader.load(loader.barrier_program(phase), arch)
-            main = loader.load(loader.main_program(world_size, call.dtype_name, call.b_layout), arch)
+            main = loader.load(
+                loader.main_program(world_size, call.dtype_name, call.b_layout), arch
+            )
 
             # Launchers run on the current stream of the input's device; the
             # barrier has no tensor argument, so it takes that device explicitly
@@ -492,7 +510,9 @@ def _launch(
             else:
                 signal_rows = workspace.signal_rows(num_chunks)
                 with torch.cuda.stream(comm_stream):
-                    for peer_scratch, peer_signal in zip(workspace.peer_scratch, signal_rows, strict=True):
+                    for peer_scratch, peer_signal in zip(
+                        workspace.peer_scratch, signal_rows, strict=True
+                    ):
                         for chunk in range(num_chunks):
                             begin = chunk * chunk_rows
                             end = min(begin + chunk_rows, rows)
@@ -614,7 +634,9 @@ class _PreparedLauncher:
         if not inp.is_contiguous():
             raise ValueError("prepared all-gather matmul inp must be contiguous")
         if _fingerprint(self.weight) != self.weight_fingerprint:
-            raise RuntimeError("prepared all-gather matmul bound weight contract changed")
+            raise RuntimeError(
+                "prepared all-gather matmul bound weight contract changed"
+            )
         if rows == self.call.rows:
             return self.call
         return _Call(

@@ -77,9 +77,9 @@ def test_fused_copy_program_is_delivered_for_its_routed_architecture_only():
             "sm_103a",
         ]
     for world_size, dtype_name, b_layout in _main_programs():
-        assert loader.PROGRAMS[
-            loader.main_program(world_size, dtype_name, b_layout)
-        ]["arches"] == ["sm_100a", "sm_103a"]
+        assert loader.PROGRAMS[loader.main_program(world_size, dtype_name, b_layout)][
+            "arches"
+        ] == ["sm_100a", "sm_103a"]
     loader.spec.cache_clear()
     try:
         with pytest.raises(ValueError, match="sm_100a"):
@@ -210,10 +210,17 @@ def test_fused_peer_copy_is_the_exact_sm103_tp8_packed_qkv_route(
         (2, 1024, 2048, 2),
     ],
 )
-def test_peer_partitions_runs_latency_bound_shapes_over_every_peer(world_size, rows, n, expected):
+def test_peer_partitions_runs_latency_bound_shapes_over_every_peer(
+    world_size, rows, n, expected
+):
     assert (
         loader.peer_partitions(
-            arch="sm_100a", dtype_name="bfloat16", world_size=world_size, rows=rows, n=n, fused=False
+            arch="sm_100a",
+            dtype_name="bfloat16",
+            world_size=world_size,
+            rows=rows,
+            n=n,
+            fused=False,
         )
         == expected
     )
@@ -256,7 +263,9 @@ def test_weight_layout_rejects_other_stride_patterns():
     with pytest.raises(ValueError, match="strides"):
         loader.weight_layout(padded)
     with pytest.raises(ValueError, match=r"\[8192, N\]"):
-        loader.weight_layout(torch.empty(4096, 2048, dtype=torch.bfloat16, device="meta"))
+        loader.weight_layout(
+            torch.empty(4096, 2048, dtype=torch.bfloat16, device="meta")
+        )
 
 
 def _fake_group(world_size, rank, name="fake_group"):
@@ -474,7 +483,9 @@ def test_public_prepare_forwards_the_row_capacity(monkeypatch):
     inp, w, group = object(), object(), object()
     assert dispatcher.prepare_all_gather_matmul(inp, w, group) is launcher
     assert (
-        dispatcher.prepare_all_gather_matmul(inp, w, group, backend="cake", max_rows=2048)
+        dispatcher.prepare_all_gather_matmul(
+            inp, w, group, backend="cake", max_rows=2048
+        )
         is launcher
     )
     assert calls == [(inp, w, group, None, False), (inp, w, group, 2048, False)]
@@ -511,7 +522,9 @@ def test_prepared_launcher_serves_every_row_count_up_to_its_capacity(monkeypatch
     with pytest.raises(ValueError, match=r"\[1, 2048\]"):
         launcher._validate_input(_CudaLike((2049, 8192), torch.bfloat16))
     with pytest.raises(ValueError, match="contiguous"):
-        launcher._validate_input(_CudaLike((512, 8192), torch.bfloat16, contiguous=False))
+        launcher._validate_input(
+            _CudaLike((512, 8192), torch.bfloat16, contiguous=False)
+        )
     with pytest.raises(ValueError, match="dtype"):
         launcher._validate_input(_CudaLike((512, 8192), torch.float16))
     with pytest.raises(ValueError, match=r"\[M, 8192\]"):
@@ -524,7 +537,9 @@ def test_launch_refuses_a_workspace_smaller_than_the_padded_rows():
         dtype=torch.bfloat16, rank=0, world_size=2, device_index=0, pitch=128
     )
     call = backend._Call(0, 0, 2, "g", "bfloat16", "sm_100a", 129, 2048, "n_major")
-    with pytest.raises(RuntimeError, match="holds 128 rows per peer, the call needs 256"):
+    with pytest.raises(
+        RuntimeError, match="holds 128 rows per peer, the call needs 256"
+    ):
         backend._launch(state, workspace, call, None, None, None)
     # A capacity shortfall is a caller error, not a failed collective.
     assert state.poisoned is False

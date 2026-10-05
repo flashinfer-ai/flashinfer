@@ -97,7 +97,10 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     _check(all_gather_matmul(inp, param.t(), group, backend="cake"), expected_k_major)
     with pytest.raises(ValueError, match="strides"):
         all_gather_matmul(
-            inp, torch.randn(K, 4096, dtype=dtype, device=device)[:, :2048], group, backend="cake"
+            inp,
+            torch.randn(K, 4096, dtype=dtype, device=device)[:, :2048],
+            group,
+            backend="cake",
         )
 
     # Tail row counts: the output has exactly world_size * M rows and the
@@ -160,7 +163,9 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
                 served = torch.randn(served_rows, K, dtype=dtype, device=device)
                 served_out = launcher(served)
                 assert served_out.shape == (world_size * served_rows, n)
-                _check(served_out, _expected(served, engine_param.t(), group, world_size))
+                _check(
+                    served_out, _expected(served, engine_param.t(), group, world_size)
+                )
                 del served, served_out
             with pytest.raises(ValueError, match=r"\[1, 2048\]"):
                 launcher(torch.randn(2049, K, dtype=dtype, device=device))
