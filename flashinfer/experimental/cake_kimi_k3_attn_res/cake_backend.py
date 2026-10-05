@@ -106,13 +106,17 @@ _SM103_K1_NC2_M = frozenset({256})
 _SM103_K5_NC4_DEPTH_M = {4096: 3}
 # Cells (M, K) that run three sources per chunk with a depth-3 pipeline.
 _NC3_D3_CELLS = {
-    "sm_100a": frozenset(
-        {(2048, 4), (4096, 4), (8192, 4), (16384, 4), (4096, 3), (4096, 5)}
-    ),
+    "sm_100a": frozenset({(4096, 3), (4096, 5)}),
     "sm_103a": frozenset({(1024, 4), (2048, 4), (4096, 4)}),
 }
+# Round r4 (direction 2): sm_100a K4 runs three sources per chunk at depth 3 from this M up.
+_SM100_K4_NC3_D3_MIN_M = 1536
 # sm_100a dense cells that hold the consumed-stage release through the output stats.
 _SM100_HELD_CONSUMED_RELEASE_CELLS = frozenset({(4096, 5)})
+# Round r4 (direction 2): sm_100a bands just above the grid that keep the release held (K -> last M).
+_SM100_HELD_CONSUMED_RELEASE_MAX_M = {2: 768, 3: 384, 4: 255, 7: 255}
+# Round r4 (direction 2): sm_103a bands that release early (K -> first M).
+_SM103_EARLY_CONSUMED_RELEASE_MIN_M = {6: 384, 7: 256, 8: 384}
 # K = 0 TMA route: grid multiple of the SM count on the promoted mid-M cells.
 _K0_TMA_GRID_MULTIPLIER_M = {
     "sm_100a": {256: 2, 512: 2, 1024: 3},
@@ -268,7 +272,9 @@ def _wait_policy(arch: str) -> bool:
 
 def _schedule(arch: str, M: int, K: int) -> tuple[int, int]:
     """``(sources_per_chunk, chunk_depth)`` of the persistent common path."""
-    if (M, K) in _NC3_D3_CELLS[arch]:
+    if (M, K) in _NC3_D3_CELLS[arch] or (
+        arch == "sm_100a" and K == 4 and M >= _SM100_K4_NC3_D3_MIN_M
+    ):
         return 3, 3
     if arch == "sm_100a":
         if K == 0 and M in {1, 2, 16, 32, 64, 512, 2048, 4096, 8192, 16384}:
@@ -305,8 +311,20 @@ def _grid(M: int, num_sms: int, sources_per_chunk: int) -> tuple[int, str]:
 
 def _early_consumed_release(arch: str, M: int, K: int, grid_x: int) -> bool:
     if arch == "sm_100a":
-        return K > 0 and grid_x < M and (M, K) not in _SM100_HELD_CONSUMED_RELEASE_CELLS
-    return K > 0 and grid_x < M and (M, K) in _SM103_EARLY_CONSUMED_RELEASE_CELLS
+        return (
+            K > 0
+            and grid_x < M
+            and (M, K) not in _SM100_HELD_CONSUMED_RELEASE_CELLS
+            and _SM100_HELD_CONSUMED_RELEASE_MAX_M.get(K, 0) < M
+        )
+    return (
+        K > 0
+        and grid_x < M
+        and (
+            (M, K) in _SM103_EARLY_CONSUMED_RELEASE_CELLS
+            or _SM103_EARLY_CONSUMED_RELEASE_MIN_M.get(K, M + 1) <= M
+        )
+    )
 
 
 def _producer_wait_acquire(arch: str, M: int, K: int) -> bool:
