@@ -505,7 +505,7 @@ class MoKScheduler:
     def __init__(self, world_size: int, local_experts: int):
         from .jit import load_kernel
 
-        if (world_size, local_experts) not in ((1, 4), (4, 4), (16, 16)):
+        if (world_size, local_experts) not in ((1, 4), (4, 4), (16, 16), (64, 4)):
             raise ValueError("Unsupported EP size or expert count")
         self.world_size = world_size
         self.local_experts = local_experts

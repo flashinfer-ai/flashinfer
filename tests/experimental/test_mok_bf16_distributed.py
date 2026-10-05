@@ -12,8 +12,13 @@ pytest_plugins = ["tests.experimental._mok_bf16_test_utils"]
 
 
 def test_complete_training_graph(monkeypatch, mok_distributed_group):
-    if "RANK" not in os.environ or int(os.environ.get("WORLD_SIZE", "0")) not in (1, 4):
-        pytest.skip("Launch with torchrun using one or four ranks")
+    if "RANK" not in os.environ or int(os.environ.get("WORLD_SIZE", "0")) not in (
+        1,
+        4,
+        16,
+        64,
+    ):
+        pytest.skip("Launch with torchrun using 1, 4, 16 or 64 ranks")
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (

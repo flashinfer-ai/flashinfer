@@ -227,10 +227,11 @@ def main():
             "nccl", device_id=device, timeout=datetime.timedelta(seconds=180)
         )
     rank, ep = dist.get_rank(), dist.get_world_size()
-    assert ep in (1, 4), "The example supports one or four local ranks"
+    assert ep in (1, 4, 16, 64), "Launch with 1, 4, 16 or 64 ranks"
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    tokens, topk, local_experts = 512, 2, 4
+    tokens = 512
+    topk, local_experts = (2, 4) if ep in (1, 4) else (8, 256 // ep)
     total_experts = ep * local_experts
     functional = prepare_mok_bf16(ep_size=ep, local_experts=local_experts, topk=topk)
     gate = dict(max_absolute_error=0.01, relative_l1_error=0.01)

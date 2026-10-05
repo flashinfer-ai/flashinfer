@@ -68,7 +68,7 @@ for unequal lengths, empty ranks, count changes and graph reuse.
 ## Toy contract
 
 - Scheduler layouts `(EP, local experts, top-k)`: `(1, 4, 2)`, `(4, 4, 2)`,
-  and `(16, 16, 8)`. EP1/EP4 are small diagnostic settings.
+  `(16, 16, 8)`, and `(64, 4, 8)`. EP1/EP4 are small diagnostic settings.
 - BF16 inputs, expert weights, outputs and weight gradients; FP32 positive
   router scores; contiguous int64 expert IDs. Each token selects distinct,
   valid expert IDs. Scores are already normalized/scaled by the caller.
@@ -104,9 +104,48 @@ replays, earlier-graph reuse, and same-shape input updates.
 
 Owner: Haozheng Fan. Tracking: [#6052](https://github.com/flashinfer-ai/flashinfer/issues/6052).
 This draft needs a maintainer-agreed release target before experimental admission. Graduation requires
-full EP16 qualification of the exported runtime and sanitizer acceptance;
+full EP16/EP64 qualification of the exported runtime and sanitizer acceptance;
 numerical checks alone do not clear those gates. No whole-model or public performance claim is made.
 
 The CUDA schedules derive from Cursor Research's Apache-2.0 Mixture of Kittens
 implementation at revision `caeb2963f855c7ad53bb50c8bbf211086405cb98`. Copyright and modification notices are
 retained in the generated source files.
+
+
+## EP16 and EP64 validation
+
+Launch one process per GPU in a single peer-accessible NVLink domain. The
+full-shape driver uses H=6144, I=2048, 256 routed experts, top-8, and 16,384
+source input tokens per rank (262,144 total at EP16; 1,048,576 at EP64).
+It checks all nine outputs against an independent BF16-rounding reference,
+routing and padding, three identical graph replays, changed source counts,
+earlier-graph replay, and same-shape input updates.
+
+On each participating node, with the same rendezvous address and a distinct
+node rank:
+
+```bash
+torchrun --nnodes="$NNODES" --nproc-per-node="$GPUS_PER_NODE" \
+  --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR" --master-port=29500 \
+  examples/mok_bf16_validate.py --output results/fixed-uniform \
+  --layout fixed --routing uniform --save-outputs --benchmark
+```
+
+Run each pair of `--layout fixed|near|strong` and
+`--routing uniform|imbalanced` with a separate output directory. `near`
+preserves the total token count with distinct neighboring rank lengths;
+`strong` includes empty ranks and lengths up to 32,768. The `empty`
+layout additionally exercises a globally empty batch.
+
+The optional benchmark reports three groups of full captured iterations,
+using completed CUDA-event intervals, at least 100 ms warmup and 1,000 ms
+measurement on every rank per group, and the slowest rank's latency.
+It includes recurring copies, scheduling, resets, and recomputation. Reference
+checks and compilation are excluded. This is a warm-input timing protocol;
+it does not establish a speedup or a whole-model training result.
+
+`--sanitizer-smoke` runs the initial, changed-count and earlier graphs with
+route/padding checks for per-rank Compute Sanitizer instrumentation. It omits
+the reference and must accompany a separate full numerical pass. A successful
+workload exit alone does not establish sanitizer acceptance: inspect every
+rank's tool report.

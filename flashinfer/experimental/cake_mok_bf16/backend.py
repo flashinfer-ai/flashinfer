@@ -51,7 +51,12 @@ class MoKFunctional:
     """Precompile kernels before capture; retain native function signatures."""
 
     def __init__(self, ep, local_experts, topk):
-        if (ep, local_experts, topk) not in ((1, 4, 2), (4, 4, 2), (16, 16, 8)):
+        if (ep, local_experts, topk) not in (
+            (1, 4, 2),
+            (4, 4, 2),
+            (16, 16, 8),
+            (64, 4, 8),
+        ):
             raise ValueError("Unsupported exported (EP, local experts, top-k) layout")
         self.ep, self.local_experts, self.topk = ep, local_experts, topk
         self.device = torch.device("cuda", torch.cuda.current_device())

@@ -15,7 +15,7 @@ def prepare_mok_bf16(*, ep_size=16, local_experts=16, topk=8):
     metadata. All compute uses the standalone CUDA sources shipped here.
 
     Prepare and warm up outside graph capture. Supported scheduler layouts
-    are (EP, local experts, top-k) = (1, 4, 2), (4, 4, 2), (16, 16, 8).
+    are (EP, local experts, top-k) = (1, 4, 2), (4, 4, 2), (16, 16, 8), (64, 4, 8).
     Tokens and hidden/intermediate dimensions remain runtime values subject
     to the documented alignment constraints. This is a synthetic training
     experiment, with no full-model or optimizer integration.

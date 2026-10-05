@@ -1288,5 +1288,152 @@
     "flags": [
       "--use_fast_math"
     ]
+  },
+  "count_64_4": {
+    "sources": [
+      "cake_mok_count_64_4.cu",
+      "cake_mok_count_64_4_binding.cu"
+    ],
+    "sha256": [
+      "241138053475a58de484bf839d93b43ae1d747b1bdea0a717ea58ecf3e6c05e3",
+      "2ca0a0c1b64d53284a706bed9c3b3832409398b1e8624d251e4d66b5acc38126"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "pad_64_4": {
+    "sources": [
+      "cake_mok_pad_64_4.cu",
+      "cake_mok_pad_64_4_binding.cu"
+    ],
+    "sha256": [
+      "eb94dbbfa75456c3673cef7e24aeb62cdaca10117f69cae4f9f7247766294946",
+      "dd9383153bd6414794d98f0850751d8a7f9fad6951cbb1a562347c37df914927"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
+  },
+  "rows_64_4": {
+    "sources": [
+      "cake_mok_rows_64_4.cu",
+      "cake_mok_rows_64_4_binding.cu"
+    ],
+    "sha256": [
+      "a4646d3254d3b88c7f34b4ec3e7655dfe1faa9dbcafd4fcbf7001db36311de3c",
+      "21686dfb97ad90795cd801f2fb3b268ed1a28d8df42a08595e8c8e6cd84a72a8"
+    ],
+    "arguments": [
+      [
+        "buffer",
+        "topk_all"
+      ],
+      [
+        "buffer",
+        "counts"
+      ],
+      [
+        "buffer",
+        "tokens_per_expert"
+      ],
+      [
+        "buffer",
+        "num_tokens"
+      ],
+      [
+        "buffer",
+        "schedule_peer_rank"
+      ],
+      [
+        "buffer",
+        "schedule_peer_token_idx"
+      ],
+      [
+        "parameter",
+        "local_tokens"
+      ],
+      [
+        "parameter",
+        "top_k"
+      ],
+      [
+        "parameter",
+        "capacity"
+      ],
+      [
+        "parameter",
+        "rank"
+      ],
+      [
+        "grid",
+        "grid_x"
+      ],
+      [
+        "grid",
+        "grid_y"
+      ],
+      [
+        "grid",
+        "grid_z"
+      ]
+    ],
+    "flags": []
   }
 }
