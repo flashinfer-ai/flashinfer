@@ -645,6 +645,87 @@ def test_bf16_zero_tokens():
     assert tuple(out.shape) == (0, 7, HEAD_DIM)
 
 
+def test_bf16_plan_cache_reuses_tables_per_layout_and_stream(monkeypatch):
+    """One-shot calls with one segment layout reuse the cached plan (tables, workspace); a different
+    layout, head count or stream gets its own plan; the cache is bounded and evicts the oldest."""
+    _require_program("bf16")
+    monkeypatch.setattr(cake_backend, "BF16_PLAN_CACHE_CAPACITY", 2)
+    cake_backend._BF16_PLANS.clear()
+    cu, heads = [0, 133, 300, 900], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=11)
+    out = torch.empty_like(q)
+    first = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+    )
+    second = prepare_minimax_h3_varlen_attention(
+        k, v, q, cu_seqlens, out=out, cu_seqlens_host=cu
+    )
+    assert second.plan is first.plan  # same layout, same stream: cached tables
+    assert len(cake_backend._BF16_PLANS) == 1
+    other_heads = prepare_minimax_h3_varlen_attention(
+        q[:, :5], k[:, :5], v[:, :5], cu_seqlens, cu_seqlens_host=cu
+    )
+    assert other_heads.plan is not first.plan
+    assert len(cake_backend._BF16_PLANS) == 2
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        on_stream = prepare_minimax_h3_varlen_attention(
+            q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+        )
+    assert on_stream.plan is not first.plan  # streams never share a plan
+    assert len(cake_backend._BF16_PLANS) == 2  # bounded: the oldest (first) was evicted
+    again = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+    )
+    assert again.plan is not first.plan and len(cake_backend._BF16_PLANS) == 2
+    # The cached plan reproduces the freshly built one table for table.
+    fresh = build_bf16_segment_plan(cu, q.device, heads)
+    for name in ("seg_begin", "seg_len", "unit_table", "combine_table"):
+        assert torch.equal(getattr(again.plan, name), getattr(fresh, name)), name
+    assert again.plan.num_clusters == fresh.num_clusters
+    cake_backend._BF16_PLANS.clear()
+    monkeypatch.undo()
+
+
+def test_bf16_one_shot_repeated_calls_do_not_allocate_or_copy():
+    """After the first call of a segment layout the one-shot entry re-launches with the cached plan:
+    no device allocation (caller-owned ``out``) and no host-to-device copy; the output is bitwise the
+    prepared runner's."""
+    _require_program("bf16")
+    cake_backend._BF16_PLANS.clear()
+    cu, heads = [0, 4310, 4567, 4824], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=12)
+    out = torch.empty_like(q)
+    minimax_h3_varlen_attention(q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(3):
+            minimax_h3_varlen_attention(
+                q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+            )
+        torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == allocated
+    names = [event.name for event in prof.events()]
+    copies = [n for n in names if "Memcpy" in n or "memcpy" in n]
+    syncs = [
+        n for n in names if "Synchronize" in n and "cudaDeviceSynchronize" not in n
+    ]
+    assert not copies, copies
+    assert not syncs, syncs
+    runner = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, cu_seqlens_host=cu
+    )
+    runner()
+    torch.cuda.synchronize()
+    assert torch.equal(runner.out, out)
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), BF16_ATOL, BF16_RTOL
+    )
+
+
 ENGINE_VIEW_ROWS = [
     ("smoke_p8_133_300", [0, 133, 300], 7),
     ("empty_segments", [0, 0, 640, 640, 1200, 1201], 7),

@@ -53,12 +53,20 @@ out4 = minimax_h3_varlen_nvfp4_attention(
 )  # NVFP4 QK, NVFP4 PV
 ```
 
-Both one-shot APIs plan on every call. Without `cu_seqlens_host` they read
-`cu_seqlens` back to the host (one stream synchronization) to build the
-segment plan; passing `cu_seqlens_host=[...]` (the same offsets as a Python
-sequence) is the fast path: no device synchronization, only the small plan
-table uploads. For repeated launches or CUDA Graph capture use the prepared
-form from this package:
+The BF16 one-shot API resolves its segment plan through a most-recently-used
+plan cache (`cached_bf16_segment_plan`, `BF16_PLAN_CACHE_CAPACITY = 256`
+entries keyed by `(cu_seqlens, device, num_heads, kv_splits, stream)`): the
+first call for a segment layout builds and uploads the plan tables, every
+later call with the same `cu_seqlens` / `num_heads` on that device and stream
+re-launches with them -- no Python planning, no host-to-device copies, no
+allocation when `out` is given (the diffusion engine issues hundreds of
+identical-layout calls per sample). The NVFP4 one-shot API plans and
+allocates its packed operand workspace on every call. Without
+`cu_seqlens_host` both read `cu_seqlens` back to the host (one stream
+synchronization); passing `cu_seqlens_host=[...]` (the same offsets as a
+Python sequence) avoids any device synchronization. For CUDA Graph capture
+use the prepared form from this package (or warm the BF16 one-shot entry up
+with the exact `cu_seqlens` on the capture stream before capturing):
 
 ```python
 from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
@@ -236,9 +244,13 @@ is CUDA-Graph capturable.
   `fp8` PV mode is the default because its error is lower at similar speed;
   `fp4` PV is the fastest mode for long segments.
 * One-shot APIs synchronize once to read `cu_seqlens` unless
-  `cu_seqlens_host` is passed (the fast path). The prepared runners never
-  allocate or synchronize; device facts (SM count, compute capability) are
-  read once per device.
+  `cu_seqlens_host` is passed (the fast path). BF16 plans are cached per
+  `(cu_seqlens, device, num_heads, kv_splits, stream)` (most recent 256;
+  the oldest is evicted); launches of one plan are stream-ordered on their
+  stream (a K/V-split plan's partial workspace is rewritten by every
+  launch) and concurrent streams never share a plan. The prepared runners
+  never allocate or synchronize; device facts (SM count, compute
+  capability) are read once per device.
 * Generated sources live under `csrc/cake_minimax_h3_varlen_attention/` (one
   kernel source and one host binding per program, shared by both
   architectures) and are registered in `cake_jit.py` (`MODULES`, `ROUTES`) by

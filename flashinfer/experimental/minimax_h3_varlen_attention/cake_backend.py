@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import functools
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
 
@@ -111,6 +112,14 @@ BF16_MAX_SEGMENT_CLUSTERS = 1 << 16
 # Fixed per-unit overhead (Q staging, pipeline fill, epilogue) in K/V-block
 # units for the longest-processing-time-first slot assignment.
 BF16_UNIT_OVERHEAD_BLOCKS = 2
+# Most recently used BF16 segment plans (device tables and the partial
+# workspace), keyed by ``(cu_seqlens, device index, num_heads, kv_splits,
+# stream)``.  The diffusion engine issues hundreds of calls per sample with
+# one segment layout; a hit re-launches with the cached tables (no Python
+# planning, no host-to-device copies, no allocation, no synchronization).
+# Bounded: the oldest plan is evicted once the limit is reached, so varying
+# segment layouts cannot grow device memory without bound.
+BF16_PLAN_CACHE_CAPACITY = 256
 # K/V-split planner (mirrors the Cake production planner ``choose_kv_splits``):
 # a unit is split into at most ``MAX_KV_SPLITS`` near-equal K/V block ranges;
 # the cost model is in K/V-block units (combine launch + per-slot traffic) and
@@ -590,6 +599,48 @@ def build_bf16_segment_plan(
         num_combine_units=len(combine) // COMBINE_WORDS,
         max_kv_splits=max(split_of, default=1),
     )
+
+
+_BF16_PLANS: "OrderedDict[tuple, BF16SegmentPlan]" = OrderedDict()
+
+
+def cached_bf16_segment_plan(
+    cu_seqlens: Sequence[int],
+    device: torch.device,
+    num_heads: int,
+    *,
+    kv_splits: Optional[int] = None,
+) -> BF16SegmentPlan:
+    """The BF16 segment plan of ``(cu_seqlens, device, num_heads, kv_splits)``
+    on the current stream, built once.
+
+    ``cu_seqlens`` is the validated host tuple (:func:`normalize_cu_seqlens`).
+    Plans live in a most-recently-used cache of ``BF16_PLAN_CACHE_CAPACITY``
+    entries; a hit returns the same tables and partial workspace, so repeated
+    calls with one segment layout cost no planning, uploads or allocations.
+    The key includes the current CUDA stream: launches of one plan are
+    stream-ordered on their stream (a K/V-split plan's partial workspace is
+    rewritten by every launch) and concurrent streams never share a plan.
+    """
+    index = _device_index(device)
+    key = (
+        tuple(int(v) for v in cu_seqlens),
+        index,
+        int(num_heads),
+        None if kv_splits is None else int(kv_splits),
+        torch.cuda.current_stream(index).cuda_stream,
+    )
+    plan = _BF16_PLANS.get(key)
+    if plan is None:
+        while len(_BF16_PLANS) >= BF16_PLAN_CACHE_CAPACITY:
+            _BF16_PLANS.popitem(last=False)
+        plan = build_bf16_segment_plan(
+            key[0], torch.device("cuda", index), num_heads, kv_splits=kv_splits
+        )
+        _BF16_PLANS[key] = plan
+    else:
+        _BF16_PLANS.move_to_end(key)
+    return plan
 
 
 def combine_kwargs(
@@ -1282,9 +1333,11 @@ def prepare_minimax_h3_varlen_attention(
     innermost stride, 16-byte-aligned head and token strides and base; for
     example the column slices of a fused QKV projection or the slices of a
     ``[T, H, 3, 128]`` pack): the kernel reads them in place, no copies are
-    made.  ``out`` is contiguous.  Every allocation happens here (only the
-    optional output and the small int32 plan tables); the returned runner
-    launches with none.
+    made.  ``out`` is contiguous.  The segment plan comes from the
+    most-recently-used plan cache (:func:`cached_bf16_segment_plan`): the
+    first preparation of a ``(cu_seqlens, num_heads, device, stream)`` builds
+    and uploads the tables, later ones reuse them, so the only allocation
+    here is the optional output; the returned runner launches with none.
     """
     if backend != "cake":
         raise ValueError("MiniMax-H3 varlen attention supports backend='cake'")
@@ -1306,7 +1359,7 @@ def prepare_minimax_h3_varlen_attention(
         out = torch.empty(
             (total_tokens, num_heads, HEAD_DIM), dtype=torch.bfloat16, device=device
         )
-    plan = build_bf16_segment_plan(bounds, device, num_heads)
+    plan = cached_bf16_segment_plan(bounds, device, num_heads)
     total_tiles = int(plan.total_tiles)
     main_kwargs = dict(
         Q=query,
@@ -1575,12 +1628,18 @@ def minimax_h3_varlen_attention(
 ) -> torch.Tensor:
     """BF16 packed-varlen attention in one call: plan, bind and launch.
 
-    Every call plans from ``cu_seqlens``.  Without ``cu_seqlens_host`` the
-    int32 CUDA tensor is read back to the host first (one stream
+    The segment plan is resolved from ``cu_seqlens`` through the
+    most-recently-used plan cache (:func:`cached_bf16_segment_plan`): the
+    first call for a segment layout builds and uploads the tables, every
+    later call with the same ``cu_seqlens`` / ``num_heads`` on the same
+    device and stream re-launches with them (no planning, no host-to-device
+    copies, no allocation when ``out`` is given).  Without ``cu_seqlens_host``
+    the int32 CUDA tensor is read back to the host first (one stream
     synchronization); pass ``cu_seqlens_host`` (the same offsets as a
-    Python sequence) to plan without any device synchronization.  For
-    repeated launches of one problem or CUDA Graph capture prepare once
-    with :func:`prepare_minimax_h3_varlen_attention` and call the runner.
+    Python sequence) to call without any device synchronization.  For CUDA
+    Graph capture prepare once with
+    :func:`prepare_minimax_h3_varlen_attention` (or warm this entry up with
+    the exact ``cu_seqlens`` on the capture stream) and replay the runner.
     """
     runner = prepare_minimax_h3_varlen_attention(
         query,
