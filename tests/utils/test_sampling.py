@@ -1535,6 +1535,43 @@ def test_int64_indices_sampling(batch_size, vocab_size, sampling_type, indices_d
     assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
 
+def test_top_k_min_p_param_indexed_by_input_row():
+    """Regression test for https://github.com/flashinfer-ai/flashinfer/issues/5878.
+
+    Per-request ``top_k``/``min_p`` tensors are validated against the input batch
+    (``probs.size(0)``) but must be indexed by the *input* row
+    (``indices[bx]``), not the output row (``bx``), when ``indices`` is longer
+    than ``probs``. With ``top_k=1``/``min_p=1.0`` every output must equal the
+    argmax of the distribution its ``indices`` entry maps to; before the fix the
+    out-of-bounds reads silently corrupted the outputs.
+    """
+    torch.manual_seed(0)
+    num_inputs, num_outputs, vocab_size = 4, 16, 512
+    probs = torch.softmax(torch.randn(num_inputs, vocab_size, device="cuda"), dim=-1)
+    indices = (torch.arange(num_outputs, device="cuda") % num_inputs).to(torch.int32)
+    expected = probs.argmax(dim=-1)[indices.to(torch.long)].to(torch.int32)
+
+    out_top_k = flashinfer.sampling.top_k_sampling_from_probs(
+        probs,
+        torch.ones(num_inputs, dtype=torch.int32, device="cuda"),
+        indices=indices,
+        deterministic=True,
+    )
+    assert torch.equal(out_top_k, expected), (
+        f"top_k OOB read: {(out_top_k != expected).sum().item()}/{num_outputs} rows wrong"
+    )
+
+    out_min_p = flashinfer.sampling.min_p_sampling_from_probs(
+        probs,
+        torch.ones(num_inputs, device="cuda"),
+        indices=indices,
+        deterministic=True,
+    )
+    assert torch.equal(out_min_p, expected), (
+        f"min_p OOB read: {(out_min_p != expected).sum().item()}/{num_outputs} rows wrong"
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99])
 @pytest.mark.parametrize("vocab_size", [111, 32000])
 def test_sampling_with_default_device_cuda(batch_size, vocab_size):
