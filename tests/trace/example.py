@@ -60,6 +60,7 @@ gqa_ragged_h32_kv8_d128.json
 layernorm_h768.json
 layernorm_quant_h768.json
 linear_nvfp4_svdquant_N3072_K3072_K_packed1536_rank32.json
+minimax_m3_index_decode_h1_d128_ps128_bt128_kv1_k16.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
@@ -2935,3 +2936,19 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+# Paged MiniMax indexer: tracing is GPU-independent.
+flashinfer.minimax_m3_index_decode.fi_trace(
+    save_dir=SAVE_DIR,
+    idx_q=torch.empty((8, 1, 128), dtype=torch.bfloat16, device="meta"),
+    index_kv_cache=torch.empty((8, 128, 128), dtype=torch.bfloat16, device="meta"),
+    block_table=torch.empty((8, 128), dtype=torch.int32, device="meta"),
+    seq_lens=torch.empty((8,), dtype=torch.int32, device="meta"),
+    max_seq_len=16384,
+    topk=16,
+    init_blocks=0,
+    local_blocks=1,
+    num_kv_heads=1,
+    decode_query_len=1,
+    max_decode_query_len=1,
+)

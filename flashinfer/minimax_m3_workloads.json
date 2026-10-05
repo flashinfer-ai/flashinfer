@@ -1,0 +1,1 @@
+{"batch": [8, 16], "head_dim": 128, "heads": 1, "block_table_width": 128, "topk": 16, "max_seq_len_bound": 16384}

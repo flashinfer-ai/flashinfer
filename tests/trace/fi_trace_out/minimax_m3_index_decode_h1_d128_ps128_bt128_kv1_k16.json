@@ -1,0 +1,110 @@
+{
+  "name": "minimax_m3_index_decode_h1_d128_ps128_bt128_kv1_k16",
+  "description": "Logical block IDs with a valid selected prefix and trailing -1.",
+  "op_type": "minimax_m3_index_decode",
+  "tags": [
+    "fi_api:flashinfer.minimax_m3.minimax_m3_index_decode"
+  ],
+  "axes": {
+    "batch": {
+      "type": "var"
+    },
+    "pages": {
+      "type": "var"
+    },
+    "heads": {
+      "type": "const",
+      "value": 1
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "page_size": {
+      "type": "const",
+      "value": 128
+    },
+    "table_width": {
+      "type": "const",
+      "value": 128
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 1
+    },
+    "topk": {
+      "type": "const",
+      "value": 16
+    }
+  },
+  "inputs": {
+    "idx_q": {
+      "shape": [
+        "batch",
+        "heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "index_kv_cache": {
+      "shape": [
+        "pages",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "block_table": {
+      "shape": [
+        "batch",
+        "table_width"
+      ],
+      "dtype": "int32"
+    },
+    "seq_lens": {
+      "shape": [
+        "batch"
+      ],
+      "dtype": "int32"
+    },
+    "max_seq_len": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "topk": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "init_blocks": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "local_blocks": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "num_kv_heads": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "decode_query_len": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "max_decode_query_len": {
+      "shape": null,
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "indices": {
+      "shape": [
+        "num_kv_heads",
+        "batch",
+        "topk"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
