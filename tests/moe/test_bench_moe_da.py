@@ -758,3 +758,65 @@ def test_replay_routes_ignore_tuning_rng_consumption():
     assert torch.equal(torch.cuda.get_rng_state(), state)
     for expected, actual in zip(first, second, strict=True):
         assert torch.equal(expected, actual)
+
+
+def test_nvfp4_tma_scale_padding_uses_input_token_extent(monkeypatch):
+    """Routed scale storage is smaller than the padded output capacity."""
+    from benchmarks import bench_moe_da as bench
+    from flashinfer.autotuner import AutoTuner, autotune
+    from flashinfer.prims_ts import is_prims_ts_device_supported
+    from flashinfer.prims_ts.moe.runner import PrimsTsNvfp4MoERunner
+    from flashinfer.prims_ts.moe.config_mapper import map_trtllm_nvfp4_moe_tactic
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import RouteImpl
+
+    if not torch.cuda.is_available() or not is_prims_ts_device_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("PrimsTS device support required")
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "0")
+    shape = bench.BenchmarkShape(
+        num_tokens=64,
+        num_experts=128,
+        local_num_experts=16,
+        local_expert_offset=0,
+        top_k=4,
+        hidden_size=6144,
+        intermediate_size=3072,
+        n_group=1,
+        topk_group=1,
+        tune_max_num_tokens=64,
+        activation="swiglu",
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        swiglu_limit=7.0,
+    )
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner(warmup=0, repeat=2))
+    prepared = bench._prepare_precision("nvfp4", shape, backend="prims_ts")
+    # Exercise the profiling allocation that originally exposed the invalid TMA
+    # extent. Keep the test bounded to the routed-SF TMA candidate.
+    monkeypatch.setattr(
+        PrimsTsNvfp4MoERunner, "get_valid_tactics", lambda *a, **kw: [(8, 18)]
+    )
+    with autotune(tuning_buckets=(64,)):
+        prepared.invoke()
+    # Only three local assignments: the second gather4 group is all padding.
+    ids = torch.tensor([16, 17, 18, 19], device="cuda", dtype=torch.int32).repeat(64, 1)
+    ids[:3, 0] = 0
+    weights = torch.full((64, 4), 0.25, device="cuda", dtype=torch.float32)
+    prepared.stage(ids, weights)
+    # These two tactics share FC2 and differ in the FC1 gather implementation.
+    tma_tactic, ldgsts_tactic = (8, 18), (8, 12)
+    pair = map_trtllm_nvfp4_moe_tactic(
+        tma_tactic, num_tokens=64, top_k=4, num_local_experts=16
+    )
+    assert pair.fc1.cfg.build().route_sfs_act == int(RouteImpl.TMA)
+    monkeypatch.setattr(AutoTuner, "choose_one", lambda *a, **kw: (0, ldgsts_tactic))
+    expected = prepared.invoke().clone()
+    monkeypatch.setattr(AutoTuner, "choose_one", lambda *a, **kw: (0, tma_tactic))
+    actual = prepared.invoke()
+    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = prepared.invoke()
+    graph.replay()
+    torch.testing.assert_close(captured, expected, atol=0.02, rtol=0.02)

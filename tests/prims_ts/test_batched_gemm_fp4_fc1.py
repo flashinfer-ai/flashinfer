@@ -582,7 +582,8 @@ class TestFp4Fc1SfGather:
             **self._BASE,
         )
 
-    def test_sf_tma_gather4_k512_gpu(self):
+    @pytest.mark.parametrize("num_tokens", [256, 129])
+    def test_sf_tma_gather4_k512_gpu(self, num_tokens):
         """SF TMA gather4 at tile_k=512: GPU correctness."""
         base = {
             k: v
@@ -595,7 +596,7 @@ class TestFp4Fc1SfGather:
 
         result = reference_check(
             num_experts=2,
-            num_tokens=256,
+            num_tokens=num_tokens,
             top_k=1,
             tile_n=8,
             mma_n=8,
@@ -673,9 +674,11 @@ class TestFp4Fc1SfGather:
             act_kind=0,
         )
 
-    def test_sf_tma_gather4_swap_k512_gpu(self):
+    @pytest.mark.parametrize("num_tokens", [256, 129])
+    def test_sf_tma_gather4_swap_k512_gpu(self, num_tokens):
         """SwapAB SF TMA gather4 at tile_k=512: covers routed SFB via TMA."""
         _run_fp4_fc1(
+            num_tokens=num_tokens,
             tile_n=8,
             tile_k=512,
             pipeline_stages=5,
