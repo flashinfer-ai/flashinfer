@@ -149,6 +149,7 @@ L2_PROMOS = (
     "l2_128b",
     "l2_256b",
 )  # TMA descriptor L2 promotion  [Cake L772]
+PD_CHOICES = (0, 1, 2, 3)  # round 15 (Cake W1): pipelined-drain forms of the 128-row single-pass epilogue (0 = the blocking load)
 L2_HINTS = (
     "none",
     "evict_normal",
@@ -442,6 +443,9 @@ def instance_key(
     sk_exact: bool = False,
     batch_group: int = 0,
     store_ef: bool = False,
+    store_hint: str = "none",
+    pd: int = 0,
+    sh: int = 0,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -455,7 +459,12 @@ def instance_key(
     exported.  [Cake ``instance_key`` L873-L905]  ``batch_group`` (round 13, L38b) = the batch-entry raster of the
     batched MLA rows: 0 = off, 1 = every entry (``_bf``), G > 1 = G adjacent entries interleaved across the CTA pairs
     (``_bg{G}``); the planner keeps 0 for a batch of one.  ``store_ef`` (round 13, Cake W4) = st.global.L1::no_allocate.L2::evict_first on the fp32 v8
-    register stores (``_ef``); only that store form carries the hint, so the field is False for every other epilogue."""
+    register stores (``_ef``); only that store form carries the hint, so the field is False for every other epilogue.
+    ``store_hint`` (round 15, Cake W3) = the L2 eviction policy operand of the TMA-store epilogue's bulk tensor stores
+    (field 22, ``_so{f|l|n}``); only the TMA-store epilogue carries the operand, so the field is "none" for every other
+    epilogue.  ``pd`` (round 15, Cake W1) = the software-pipelined chunked TMEM drain of the 128-row single-pass family
+    (field 23, ``_pd{n}``: 1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight) and ``sh``
+    (field 24, ``_sh{n}``) = the PTX suspendTimeHint in ns of the free-running waits; both 0 when off."""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
     hints = (str(hints[0]), str(hints[1]))
@@ -546,6 +555,37 @@ def instance_key(
         )
     # L1::no_allocate.L2::evict_first on the fp32 v8 stores: only that store form carries the hint  [Cake instance_key]
     store_ef = bool(store_ef) and f32_v8
+    store_hint = str(store_hint)
+    if store_hint not in L2_HINTS:
+        raise ValueError(f"store_hint must be in {L2_HINTS}, got {store_hint!r}")
+    # round 15 (Cake W3): only the TMA-store epilogue carries the L2 eviction-policy operand  [Cake instance_key]
+    store_hint = store_hint if epi == "tma" else "none"
+    pd, sh = int(pd), int(sh)
+    if pd not in PD_CHOICES:
+        raise ValueError(
+            f"pd must be one of {PD_CHOICES} (0 off, 1 chunk-pipelined drain, 2 cross-tile pipelined drain, 3 both chunks in flight), got {pd}"
+        )
+    if pd and (
+        cta_rows != 128
+        or out_t
+        or cols not in (64, 128)
+        or "no_tmem" in diag
+        or box_rows
+        or pf
+        or "a_mcast" in diag
+    ):
+        # round 15 (Cake W1): the pipelined drain is built for the 128-row single-pass family's row-major epilogues
+        # (64- / 128-column warp slices = one / two 64-column TMEM chunks)  [Cake instance_key]
+        raise ValueError(
+            f"pd needs cta_rows=128, a row-major output, BLOCK_N 128 / 256 and no no_tmem / a_mcast / pf / box_rows "
+            f"(got cta_rows={cta_rows}, out_t={out_t}, block_n={block_n}, diag={diag}, pf={pf}, box_rows={box_rows})"
+        )
+    if pd in (1, 3) and cols != 128:
+        raise ValueError(
+            f"pd={pd} overlaps the two chunks of a 128-column warp slice; BLOCK_N={block_n} has one chunk per slice (use pd=2)"
+        )
+    if sh < 0 or sh > 4294967295:
+        raise ValueError(f"sh (suspendTimeHint ns) must fit a u32, got {sh}")
     return (
         a_mn,
         b_mn,
@@ -569,6 +609,9 @@ def instance_key(
         bool(sk_exact),
         batch_group,
         store_ef,
+        store_hint,
+        pd,
+        sh,
     )
 
 
@@ -580,7 +623,8 @@ def instance_symbol(key: tuple) -> str:
     ``_bz<bytes>`` right after the tile family for a narrow MN-major B panel (round 13), ``_pk`` / ``_ov`` / ``_ht`` for
     the parked / overlapped / half-height-tail tall epilogues (round 13), ``_<epi><slots>`` for the TMA-store
     epilogue, ``_s<stages>`` for a non-default stage count, ``_box<rows>`` and a trailing ``_skx`` for the exact
-    p-way stream-K split (round 13)).  [Cake ``instance_symbol``]"""
+    p-way stream-K split (round 13), ``_so<f|l|n>`` after the batch-raster term for the TMA-store L2 eviction policy,
+    then ``_pd<n>`` / ``_sh<n>`` for the pipelined TMEM drain / suspend-time hint (round 15)).  [Cake ``instance_symbol``]"""
     (
         a_mn,
         b_mn,
@@ -604,7 +648,13 @@ def instance_symbol(key: tuple) -> str:
         sk_exact,
         batch_group,
         store_ef,
+        store_hint,
+        pd,
+        sh,
     ) = key
+    so = {"evict_first": "f", "evict_last": "l", "evict_normal": "n", "default": "d"}.get(
+        store_hint, ""
+    )
     return (
         "dense_proj_gemm_"
         + ("n" if a_mn else "k")
@@ -637,6 +687,9 @@ def instance_symbol(key: tuple) -> str:
             if batch_group > 1
             else ""
         )
+        + (f"_so{so}" if so else "")
+        + (f"_pd{pd}" if pd else "")
+        + (f"_sh{sh}" if sh else "")
         + "".join(f"_{d}" for d in diag)
     )
 
@@ -662,8 +715,8 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_100a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
     ('sm_100a', False, True, False, False, False, 2048, 16384, None): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True},
-    ('sm_100a', False, True, False, False, False, 6144, 32, None): {"slots": 2},
-    ('sm_100a', False, True, False, False, False, 6144, 128, None): {"block_n": 128, "cta_rows": 256},
+    ('sm_100a', False, True, False, False, False, 6144, 32, None): {"slots": 2, "pd": 2},
+    ('sm_100a', False, True, False, False, False, 6144, 128, None): {"slots": 2, "pd": 2},
     ('sm_100a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "stages": 6, "quad_store": True},
     ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
@@ -707,15 +760,15 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, True, 512, 256, None): {"promo": 'l2_256b'},
-    ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 128, "slots": 2},
-    ('sm_107a', False, True, False, False, False, 6144, 128, None): {"block_n": 128, "cta_rows": 256},
-    ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "quad_store": True},
+    ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 128, "slots": 2, "pd": 2},
+    ('sm_107a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 128, "slots": 2, "pd": 2},
+    ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "quad_store": True, "pd": 1},
     ('sm_107a', False, True, False, False, False, 6144, 12288, None): {"sk_parts": 2},
     ('sm_107a', False, True, False, False, False, 12288, 6144, None): {"hints": ('none', 'evict_first')},
     ('sm_107a', False, True, False, False, False, 16384, 6144, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
     ('sm_107a', False, True, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_107a', False, True, False, False, True, 256, 512, None): {"promo": 'l2_256b'},
-    ('sm_107a', False, True, False, False, True, 512, 192, None): {"batch_group": 8},
+    ('sm_107a', False, True, False, False, True, 512, 192, None): {"batch_group": 8, "store_hint": "evict_last"},
     ('sm_107a', False, True, False, False, True, 512, 256, None): {"promo": 'l2_256b', "batch_group": 8},
     ('sm_107a', False, True, True, False, False, 2048, 4096, None): {"epi": 'reg', "f32_v8": True},
     ('sm_107a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
@@ -734,8 +787,8 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "sk_exact": 3},
     ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_exact": 2},
     ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64},
-    ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "b_swz": 64},
-    ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma'},
+    ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "b_swz": 64, "stages": 6},
+    ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "stages": 6},
     ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "sk_parts": 3, "b_swz": 64},
     ('sm_107a', True, True, True, False, False, 2048, None, 6144): {"cta_rows": 256},
     ('sm_107a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
@@ -1035,6 +1088,11 @@ class GemmPlan:
     batch_group: int = 0
     # round 13 (Cake W4): fp32 v8 register stores carry L1::no_allocate.L2::evict_first (instance_key field 21)
     store_ef: bool = False
+    # round 15 (Cake W3): L2 eviction policy of the TMA-store epilogue's bulk tensor stores (instance_key field 22)
+    store_hint: str = "none"
+    # round 15 (Cake W1): pipelined TMEM drain form (field 23) and suspend-time hint in ns (field 24) of the planned instance
+    pd: int = 0
+    sh: int = 0
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -1113,6 +1171,9 @@ def plan_dense_projection_gemm(
     sk_exact: Optional[int] = None,
     batch_group: Optional[int] = None,
     store_ef: Optional[bool] = None,
+    store_hint: Optional[str] = None,
+    pd: Optional[int] = None,
+    sh: Optional[int] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -1159,6 +1220,9 @@ def plan_dense_projection_gemm(
         sk_exact=sk_exact,
         batch_group=batch_group,
         store_ef=store_ef,
+        store_hint=store_hint,
+        pd=pd,
+        sh=sh,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -1222,7 +1286,8 @@ def plan_dense_projection_gemm(
         rule = {
             k: v
             for k, v in rule.items()
-            if k not in ("block_n", "stages", "slots", "epi", "ovl", "htail", "b_swz")
+            if k
+            not in ("block_n", "stages", "slots", "epi", "ovl", "htail", "b_swz", "pd")
         }
     if block_n is None:
         block_n = rule.get("block_n", default_block_n(N, b_mn))
@@ -1258,6 +1323,13 @@ def plan_dense_projection_gemm(
         )
     if store_ef is None:
         store_ef = rule.get("store_ef", False)
+    if store_hint is None:
+        # round 15 (Cake W3): L2 eviction policy of the TMA-store epilogue's stores  [Cake launcher]
+        store_hint = rule.get("store_hint", "none")
+    if pd is None:
+        pd = rule.get("pd", 0)  # round 15 (Cake W1): pipelined TMEM drain of the 128-row family  [Cake launcher]
+    if sh is None:
+        sh = rule.get("sh", 0)
     if ovl and int(block_n) != 256:
         # the overlapped epilogue is built for the 256-column tall tile; a narrower tall tile keeps the serialized
         # tall epilogue  [Cake launcher]
@@ -1356,6 +1428,9 @@ def plan_dense_projection_gemm(
         sk_exact=exact_plan is not None,
         batch_group=batch_group,
         store_ef=bool(store_ef),
+        store_hint=str(store_hint),
+        pd=int(pd),
+        sh=int(sh),
     )
     plan = GemmPlan(
         L=L,
@@ -1395,6 +1470,9 @@ def plan_dense_projection_gemm(
         sk_exact=int(sk_exact) if exact_plan is not None else 0,
         batch_group=int(key[20]),
         store_ef=bool(key[21]),
+        store_hint=str(key[22]),
+        pd=int(key[23]),
+        sh=int(key[24]),
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
@@ -1631,6 +1709,9 @@ def prepare_dense_projection_gemm(
     sk_exact: Optional[int] = None,
     batch_group: Optional[int] = None,
     store_ef: Optional[bool] = None,
+    store_hint: Optional[str] = None,
+    pd: Optional[int] = None,
+    sh: Optional[int] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -1671,6 +1752,9 @@ def prepare_dense_projection_gemm(
         sk_exact=sk_exact,
         batch_group=batch_group,
         store_ef=store_ef,
+        store_hint=store_hint,
+        pd=pd,
+        sh=sh,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)

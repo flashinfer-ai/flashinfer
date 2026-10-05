@@ -1021,6 +1021,25 @@ def test_epilogue_rules():
             ),
             "dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1",
         ),
+        (
+            dict(
+                a_mn=False,
+                b_mn=True,
+                epi="tma",
+                slots=1,
+                batch_group=8,
+                store_hint="evict_last",
+            ),
+            "dense_proj_gemm_kn_n256_tma1_bg8_sol",
+        ),
+        (
+            dict(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2),
+            "dense_proj_gemm_kn_n256_tma2_pd2",
+        ),
+        (
+            dict(a_mn=False, b_mn=True, epi="reg", quad_store=True, pd=1),
+            "dense_proj_gemm_kn_n256_q_pd1",
+        ),
     ],
 )
 def test_instance_symbols(kwargs, symbol):
@@ -1058,7 +1077,7 @@ def test_round13_w3_knobs():
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
     assert (
-        len(key) == 22
+        len(key) == 25
         and key[18] == 64
         and key[19] is False
         and key[20] == 0
@@ -1113,6 +1132,66 @@ def test_round13_store_ef_knob():
     assert instance_key(a_mn=False, b_mn=True, store_ef=True)[21] is False
 
 
+def test_round15_store_hint_knob():
+    # field 22 of the 25-field key (round 15, Cake W3): the L2 eviction policy of the TMA-store epilogue's bulk
+    # tensor stores (symbol ``_so<f|l|n>``); the register epilogues carry no operand, so the field is forced to
+    # "none" there (one key per register-epilogue instance) and an unknown policy raises
+    key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last")
+    assert len(key) == 25 and key[22] == "evict_last"
+    assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma1_sol"
+    assert instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22] == "none"
+    assert instance_key(a_mn=False, b_mn=True)[22] == "none"
+    with pytest.raises(ValueError, match="store_hint"):
+        instance_key(
+            a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_sometimes"
+        )
+    # the round-15 sm_107a rule: the batched MLA qabs forward (N = 512, K = 192) plans the 8-head interleave with
+    # evict_last stores; sm_100a keeps the round-13 plan without the operand
+    v = _views("mla", "qabs", "fwd", "bf16", 1001)
+    r200, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False
+    )
+    assert r200.store_hint == "evict_last" and r200.batch_group == 8
+    assert r200.template == "dense_proj_gemm_kn_n256_tma1_bg8_sol"
+    b200, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False
+    )
+    assert b200.store_hint == "none" and "_so" not in b200.template
+
+
+def test_round15_pd_sh_knobs():
+    # fields 23 / 24 of the 25-field key (round 15, Cake W1): the pipelined TMEM drain form of the 128-row single-pass
+    # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
+    # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
+    key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
+    assert len(key) == 25 and key[23] == 2 and key[24] == 0
+    assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
+    assert instance_key(a_mn=False, b_mn=True)[23:] == (0, 0)
+    assert instance_symbol(
+        instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
+    ) == "dense_proj_gemm_kn_n256_tma2_pd2_sh1000"
+    with pytest.raises(ValueError, match="pd must be one of"):
+        instance_key(a_mn=False, b_mn=True, pd=4)
+    with pytest.raises(ValueError, match="pd needs cta_rows=128"):
+        instance_key(a_mn=False, b_mn=True, cta_rows=256, pd=2)
+    with pytest.raises(ValueError, match="one chunk per slice"):
+        instance_key(a_mn=False, b_mn=True, block_n=128, pd=1)
+    with pytest.raises(ValueError, match="suspendTimeHint"):
+        instance_key(a_mn=False, b_mn=True, sh=-1)
+    # the round-15 rules: the sm_107a indexer_k bf16 input gradient (N = 6144, K = 128) plans the 128-row two-slot
+    # TMA-store family with the cross-tile pipelined drain; a caller-forced tall tile drops the family knob
+    v = _views("proj", "indexer_k", "dgrad", "bf16", 1001)
+    r200, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False
+    )
+    assert r200.pd == 2 and r200.slots == 2 and r200.cta_rows == 128
+    assert r200.template == "dense_proj_gemm_kn_n256_tma2_pd2"
+    tall, *_ = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False, cta_rows=256
+    )
+    assert tall.pd == 0 and "_pd" not in tall.template
+
+
 def test_sk_exact_plan_mirrors_cake():
     # 24 tail tiles on 106 pairs, 96 K blocks: 3 parts of 32 steps -> 72 units, one segment each; a 2-part split of 3 K
     # blocks is refused (part under SK_MIN_ITERS), as is a split whose last part would be empty
@@ -1138,7 +1217,7 @@ def test_round13_knob_normalisation():
     # the 20-field key carries park / ovl / htail at fields 15 / 16 / 17; ovl is a 256-row x 256-column tall-tile
     # knob (narrower or shorter tiles raise), htail needs the 256-row family, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 22 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 25 and key[15] is False and key[16] is True and key[17] is True
     assert (
         instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
         is False
@@ -1350,7 +1429,7 @@ def test_instance_key_rejects_bad_configurations():
     key = instance_key(a_mn=False, b_mn=False)
     # 20 fields since round 13 (the raster group width and the TMA L2 promotion left the key for the launch
     # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef
-    assert len(key) == 22 and key[11:] == (
+    assert len(key) == 25 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -1362,6 +1441,9 @@ def test_instance_key_rejects_bad_configurations():
         False,
         0,
         False,
+        "none",
+        0,
+        0,
     )
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)
