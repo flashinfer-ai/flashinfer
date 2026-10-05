@@ -23,17 +23,19 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.qsa import qsa_selection_run_trace
 from .route import qsa_expand_block_route
 from .scores import qsa_paged_scores
+from ._workspace import check_buffer, cut
 from ..topk import (
     WORKSPACE_ALIGNMENT,
-    PreparedTopKRaggedTransform,
     TopKTieBreak,
+    resolve_ragged_transform_backend,
+    top_k_ragged_transform,
+    top_k_ragged_transform_workspace_size,
 )
 from ..utils import round_up
 
 
 #: What each dtype a region is cut in costs per element. A constant, so the
 #: cutting never has to make a tensor to ask.
-_ITEM_BYTES = {torch.float32: 4, torch.int32: 4}
 
 #: The shapes the scorer has kernels for.
 _SCORER_HEAD_DIMS = (64, 128, 192, 256)
@@ -49,11 +51,8 @@ _POSITION_DTYPES = (torch.int32, torch.int64)
 
 
 def selection_columns(max_model_len: int, compress_ratio: int, capacity: int) -> int:
-    """How many compressed columns a row can ever score against.
-
-    The context bounds it; what the cache can address bounds it again. Rounded
-    up to 64 so the score rows stay cooperative with the top-k's alignment.
-    """
+    """Compressed columns a row can score against: bounded by the context and the
+    block table, rounded up to 64 for the top-k's alignment."""
     columns = -(-max_model_len // compress_ratio)
     return min(max(64, -(-columns // 64) * 64), capacity)
 
@@ -66,16 +65,11 @@ def selection_route_width(token_topk: int, compress_ratio: int) -> int:
 class QSASelection:
     r"""Score a compressed cache, take the top blocks, and expand them to a route.
 
-    The three steps a block-granular selector runs -- score, select, expand --
-    with the scratch between them owned by the caller. Nothing is allocated
-    inside :meth:`run`, so the whole selection can be captured into a CUDA graph
-    without leaving buffers in the graph's private pool, and two selections can
-    run at once by handing each its own slice of an arena.
-
-    The score buffer is the large one, and it is what bounds a chunk: a batch
-    wider or taller than the budget is scored a few rows at a time, with the
-    top-k taken per chunk, and the expansion run once over the whole batch at
-    the end.
+    Score, select and expand, with the scratch between them owned by the
+    caller: :meth:`run` allocates nothing, so it captures into a CUDA graph and
+    two selections run at once from slices of one arena. A batch past the
+    score budget is scored a chunk of rows at a time, the top-k taken per
+    chunk, and expanded once at the end.
 
     Parameters
     ----------
@@ -133,10 +127,8 @@ class QSASelection:
             raise ValueError(f"token_topk must be positive, got {token_topk}")
         if num_heads < 1 or head_dim < 1:
             raise ValueError("num_heads and head_dim have to be positive")
-        # What the scorer has an instantiation for. Its mma tile fixes both: a
-        # head dimension it was built with, and one n-tile of query heads. A
-        # shape outside this is one the library cannot build, not one it is
-        # merely slower at, so it is refused while planning.
+        # The scorer's mma tile fixes the head dimensions and the query-head
+        # count it is instantiated for; anything else cannot be built.
         if num_heads > _MAX_SCORER_HEADS:
             raise ValueError(
                 f"the scorer serves at most {_MAX_SCORER_HEADS} query heads, "
@@ -181,7 +173,10 @@ class QSASelection:
         per_row = max_columns * 4
         self.rows_per_chunk = max(1, min(max_rows, score_budget_bytes // per_row))
 
-        self._topk = PreparedTopKRaggedTransform(
+        self.deterministic = deterministic
+        self.tie_break = tie_break
+        self.dsa_graph_safe = dsa_graph_safe
+        self.backend = resolve_ragged_transform_backend(
             num_rows=self.rows_per_chunk,
             max_len=max_columns,
             k=self.block_topk,
@@ -190,17 +185,15 @@ class QSASelection:
             deterministic=deterministic,
             tie_break=tie_break,
             dsa_graph_safe=dsa_graph_safe,
+            use_row_starts=False,
         )
-        self.backend = self._topk.backend
 
         # The workspace, as offsets fixed here so run() only takes views.
         scores_bytes = round_up(
             self.rows_per_chunk * max_columns * 4, WORKSPACE_ALIGNMENT
         )
         visible_bytes = round_up(self.rows_per_chunk * 4, WORKSPACE_ALIGNMENT)
-        # The top-k writes a full chunk's worth of rows every pass, so the
-        # block buffer is padded to whole chunks; the rows past the batch are
-        # written and never read.
+        # The top-k writes whole chunks, so the block buffer is padded to them.
         self.padded_rows = round_up(max_rows, self.rows_per_chunk)
         blocks_bytes = round_up(
             self.padded_rows * self.block_topk * 4, WORKSPACE_ALIGNMENT
@@ -217,22 +210,19 @@ class QSASelection:
         )
 
     def _measure_topk_workspace(self) -> int:
-        """Ask the top-k how much scratch it needs, once, while planning.
-
-        Both backends answer from the shape they were prepared for, so nothing
-        is allocated here at all -- which is the point: a selection that exists
-        to keep its memory in a caller's arena should not reserve a score buffer
-        just to say how big the arena has to be.
-        """
-        return int(self._topk.workspace_size())
+        return top_k_ragged_transform_workspace_size(
+            self.rows_per_chunk,
+            self.max_columns,
+            self.block_topk,
+            torch.float32,
+            self.device,
+            backend=self.backend,
+            tie_break=self.tie_break,
+        )
 
     @flashinfer_api
     def bind_workspace(self, workspace: torch.Tensor) -> None:
-        """Keep the scratch this selection runs out of.
-
-        The caller reserves it -- it is the caller's memory budget -- and hands
-        it over once, here, rather than on every call. ``run`` still takes one
-        per call for a caller that would rather pass it.
+        """Keep the scratch this selection runs out of; ``run`` still takes one per call.
 
         Parameters
         ----------
@@ -240,8 +230,7 @@ class QSASelection:
             ``uint8`` on this selection's device, at least
             :meth:`workspace_size` bytes.
         """
-        if workspace.dtype != torch.uint8:
-            raise ValueError(f"the workspace must be uint8, got {workspace.dtype}")
+        check_buffer(workspace, "the workspace")
         if workspace.device != self.device:
             raise ValueError(
                 f"the workspace must be on {self.device}, got {workspace.device}"
@@ -271,11 +260,6 @@ class QSASelection:
         dsa_graph_safe: bool = True,
     ) -> int:
         """Bytes :meth:`run` will need, without allocating any of them.
-
-        A caller reserves this before the workspace it draws on is locked, and
-        before there is a cache to run against. Preparing the object is itself
-        allocation-free -- every offset is arithmetic on the geometry -- so the
-        answer is the object's own, asked and dropped.
 
         Parameters
         ----------
@@ -307,19 +291,24 @@ class QSASelection:
         return self._total_bytes
 
     def _views(self, workspace: torch.Tensor, rows: int, columns: int):
-        def region(offset: int, count: int, dtype: torch.dtype):
-            # The element size is a constant of the dtype, taken at plan time:
-            # making a tensor to ask would be an allocation per call.
-            itemsize = _ITEM_BYTES[dtype]
-            flat = workspace[offset : offset + count * itemsize]
-            return flat.view(dtype)
-
-        scores = region(self._scores_at, self.rows_per_chunk * columns, torch.float32)
-        visible = region(self._visible_at, self.rows_per_chunk, torch.int32)
-        blocks = region(
-            self._blocks_at, self.padded_rows * self.block_topk, torch.int32
+        scores = cut(
+            workspace,
+            (self._scores_at, self.rows_per_chunk * columns * 4),
+            torch.float32,
+            None,
         )
-        offsets = region(self._offsets_at, self.rows_per_chunk, torch.int32)
+        visible = cut(
+            workspace, (self._visible_at, self.rows_per_chunk * 4), torch.int32, None
+        )
+        blocks = cut(
+            workspace,
+            (self._blocks_at, self.padded_rows * self.block_topk * 4),
+            torch.int32,
+            None,
+        )
+        offsets = cut(
+            workspace, (self._offsets_at, self.rows_per_chunk * 4), torch.int32, None
+        )
         topk = workspace[self._topk_at : self._topk_at + self._topk_bytes]
         return (
             scores.view(self.rows_per_chunk, columns),
@@ -416,13 +405,9 @@ class QSASelection:
                 "token_to_request must carry the block table's dtype "
                 f"{block_table.dtype}, got {token_to_request.dtype}"
             )
-        # Positions are not an index into the cache -- a position is a number
-        # bounded by the context length -- so they carry their own type. A
-        # caller that builds them beside a slot mapping keeps them in int64,
-        # and converting on the way in would allocate once per call. The
-        # kernels read them in whichever of the two they arrive in and narrow
-        # inside, where a value that does not fit becomes a masked-off row
-        # rather than a wrapped one.
+        # Positions may arrive as int64 beside a slot mapping; converting would
+        # allocate per call, so the kernels take either and narrow inside, where
+        # a value that does not fit becomes a masked-off row, not a wrapped one.
         if query_positions.dtype not in _POSITION_DTYPES:
             raise ValueError(
                 f"query_positions must be one of {_POSITION_DTYPES}, got "
@@ -433,10 +418,8 @@ class QSASelection:
                 "seq_lens must carry the block table's dtype "
                 f"{block_table.dtype}, got {seq_lens.dtype}"
             )
-        # The visible-block counts this cuts out of the workspace are int32, and
-        # the scorer requires them to match the block table, so the whole index
-        # side is int32 here rather than failing inside the kernel on a dtype it
-        # cannot report usefully.
+        # The visible-block counts are int32 and the scorer requires the block
+        # table to match, so the whole index side is int32.
         if block_table.dtype != torch.int32:
             raise ValueError(f"block_table must be int32, got {block_table.dtype}")
         if block_table.ndim != 2:
@@ -476,8 +459,7 @@ class QSASelection:
             )
         if out_route.dtype != torch.int32:
             raise ValueError(f"out_route must be int32, got {out_route.dtype}")
-        if workspace.dtype != torch.uint8 or not workspace.is_contiguous():
-            raise ValueError("workspace must be contiguous uint8")
+        check_buffer(workspace, "workspace")
         if workspace.device != self.device:
             raise ValueError(
                 f"workspace must be on {self.device}, got {workspace.device}"
@@ -486,8 +468,6 @@ class QSASelection:
             raise ValueError(
                 f"workspace needs {self._total_bytes} bytes, got {workspace.numel()}"
             )
-        if workspace.data_ptr() % WORKSPACE_ALIGNMENT:
-            raise ValueError(f"workspace must be {WORKSPACE_ALIGNMENT}-byte aligned")
         if rows == 0:
             return out_route
 
@@ -496,10 +476,7 @@ class QSASelection:
         )
         offsets.zero_()
         # The radix top-k reads its counters before it writes them on the first
-        # round. Rather than make that the caller's problem -- a contract they
-        # would meet by accident with torch.zeros and break with torch.empty --
-        # the region is cleared here. It is a memset of a megabyte inside a
-        # kernel launch, and it is graph-safe.
+        # round, so its region is cleared here rather than by the caller.
         topk_workspace.zero_()
 
         for start in range(0, rows, self.rows_per_chunk):
@@ -525,12 +502,17 @@ class QSASelection:
                 # score nothing, so their selection is empty and unread.
                 chunk_visible = visible[chunk:]
                 chunk_visible.zero_()
-            self._topk.run(
+            top_k_ragged_transform(
                 scores,
                 offsets,
                 visible,
+                self.block_topk,
+                self.deterministic,
+                self.tie_break,
+                self.dsa_graph_safe,
                 out=blocks[start : start + self.rows_per_chunk],
                 workspace=topk_workspace,
+                backend=self.backend,
             )
 
         qsa_expand_block_route(

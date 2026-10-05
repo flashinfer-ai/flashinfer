@@ -183,7 +183,7 @@ def test_selection_refuses():
     for batch, out, w, match in [
         (b, route, ws[:-1], "workspace needs"),
         (b, route, arena[1:-15], "aligned"),
-        (b, route, ws.view(torch.int32), "contiguous uint8"),
+        (b, route, ws.view(torch.int32), "raw bytes"),
         (b, wide, ws, "out_route must be"),
         (b[:2] + [t.long() for t in b[2:]], route, ws, "int32"),
         ([b[0].float(), b[1].float(), *b[2:]], route, ws, "q must be one of"),

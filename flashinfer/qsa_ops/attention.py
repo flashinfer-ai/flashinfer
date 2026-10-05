@@ -25,14 +25,12 @@ from ..trace.templates.qsa import qsa_attention_run_trace
 from .output_gate import qsa_output_gate
 from ..sparse import BlockSparseAttentionWrapper
 from .route import qsa_route_from_logical
+from ._workspace import check_buffer, cut, walk
 from ..topk import WORKSPACE_ALIGNMENT
 from ..utils import round_up
 
 
-#: What a cache's bytes mean. A ``uint8`` tensor is a view of raw memory and
-#: says nothing on its own -- raw FP8 and packed NVFP4 both arrive as one -- so
-#: the caller names the format and the checks below follow from the name.
-#:
+#: What a cache's bytes mean; a ``uint8`` cache says nothing on its own.
 #: ``dense``     values at their own dtype, no scales at all.
 #: ``fp8_e4m3``  e4m3 values, one host scale per tensor, no scale planes.
 #: ``nvfp4``     packed e2m1 values with an e4m3 scale plane each, and a host
@@ -51,15 +49,10 @@ _SIZING_PAGE_SIZE = 16
 def row_buckets(max_rows: int, max_plans: int = 16) -> Tuple[int, ...]:
     """Row counts to keep a plan for, for a caller that may send ``max_rows``.
 
-    A step pads up to one of these, so a batch whose size moves never replans --
-    and a batch past the widest rung has no plan at all, so the widest rung is
-    ``max_rows``. Padding is not free: a padding row is masked off, but the plan
-    still attends over its whole route, so it costs what a real row does. The
-    rungs are the powers of two and the multiples of the granularity above
-    them, which keep a batch under twice its size -- unless they outnumber
-    ``max_plans`` and the ladder is thinned, which trades that bound for the
-    plan count. A rung costs only its plan's integer workspace: the buffers
-    that scale with rows are shared by every rung.
+    A step pads up to one of these and the top rung is ``max_rows``. The rungs
+    are the powers of two and the multiples of the granularity above them,
+    which keep a batch under twice its size unless ``max_plans`` thins the
+    ladder. A padding row is masked off but costs what a real row does.
     """
     if max_rows < 1:
         raise ValueError(f"max_rows must be positive, got {max_rows}")
@@ -69,10 +62,7 @@ def row_buckets(max_rows: int, max_plans: int = 16) -> Tuple[int, ...]:
     rungs.update(1 << k for k in range(max_rows.bit_length()) if 1 << k < max_rows)
     rungs.update(range(_ROW_GRANULARITY, max_rows, _ROW_GRANULARITY))
     if len(rungs) > max_plans:
-        # Thin geometrically rather than dropping the bottom: what a rung is
-        # worth is the padding it saves, and padding is a ratio, so rungs
-        # evenly spaced on a log scale bound it evenly. Dropping the low ones
-        # would leave a decode batch padded to a chunk.
+        # Thin geometrically: padding is a ratio, so log-spaced rungs bound it evenly.
         steps = max_plans - 1
         rungs = {max_rows}
         if steps > 0:
@@ -91,12 +81,7 @@ def _check_geometry(
     kv_data_type: torch.dtype,
     kv_layout: str,
 ) -> None:
-    """Everything about a shape that can be judged without a cache.
-
-    Asked in one place because two callers ask it: the constructor, which has
-    no cache yet, and the sizing query, which never builds one. A geometry this
-    refuses has no workspace size either.
-    """
+    """Shape checks that need no cache, shared by the constructor and the sizing query."""
     if route_width < 1:
         raise ValueError(f"route_width must be positive, got {route_width}")
     if kv_layout not in ("NHD", "HND"):
@@ -153,12 +138,8 @@ def _plan_bytes_for(
     o_data_type: torch.dtype,
     backend: str,
 ) -> Tuple[int, Tuple[int, ...]]:
-    """Float workspace bytes, and the integer region each bucket's plan needs.
-
-    Asked of the planner rather than of a wrapper: building one to size its own
-    workspace costs eight megabytes of device memory and as much pinned host
-    memory, and this is called before there is a workspace at all.
-    """
+    """Float workspace bytes and each bucket's integer region, asked of the planner
+    without building a wrapper (which would allocate its own workspace)."""
     float_bytes = 0
     sizes = []
     for rows in buckets:
@@ -183,9 +164,8 @@ def _plan_bytes_for(
             kv_data_type=kv_data_type,
             o_data_type=o_data_type,
             use_custom_mask=True,
-            # The planner lays out one entry per route element and the page
-            # size only says how those elements are addressed, so the answer
-            # does not move with it. Asserted in the suite rather than assumed.
+            # The planner lays out one entry per route element; the page size
+            # only addresses them, so the sizes do not move with it.
             kv_cache_page_size=_SIZING_PAGE_SIZE,
             backend=backend,
         )
@@ -195,14 +175,9 @@ def _plan_bytes_for(
 
 
 class _Persistent(NamedTuple):
-    """What has to survive between calls, and where it sits in its buffer.
-
-    The plans keep byte offsets into the integer arena and read them back when
-    they run; the row pointers are read by every plan that was built against
-    them. Both outlive a call, so neither can live in memory another consumer
-    reuses in the meantime. A call does rewrite its bucket's row pointers, ahead
-    of the plan that reads them, to give the padding rows no entries.
-    """
+    """Bytes read back by later calls -- the plan arena and the row pointers -- so
+    never in memory another consumer reuses. A call rewrites its bucket's row
+    pointers ahead of the plan that reads them, to give padding rows no entries."""
 
     arena: Tuple[int, int]
     indptr: Tuple[Tuple[int, int], ...]
@@ -210,13 +185,7 @@ class _Persistent(NamedTuple):
 
 
 class _Transient(NamedTuple):
-    """What a call rewrites before it reads, and where it sits in its buffer.
-
-    All of it is scratch: the route and the mask are written for every row the
-    plan covers, the padded output is written by the kernel, the padded query's
-    live rows are copied in, and the float workspace is the split-k algorithm's
-    own. A caller may hand over the same bytes it gives everything else.
-    """
+    """Bytes a call rewrites before it reads; may be the caller's shared scratch."""
 
     float_workspace: Tuple[int, int]
     padded_q: Tuple[int, int]
@@ -226,42 +195,9 @@ class _Transient(NamedTuple):
     total: int
 
 
-def _walk():
-    """A cursor that hands out aligned spans and remembers where it got to."""
-    offset = 0
-
-    def take(nbytes):
-        nonlocal offset
-        begin = offset
-        offset += round_up(nbytes, WORKSPACE_ALIGNMENT)
-        return (begin, nbytes)
-
-    def total():
-        return offset
-
-    return take, total
-
-
-def _check_buffer(buffer: torch.Tensor, what: str) -> None:
-    if buffer.dtype != torch.uint8:
-        raise ValueError(f"{what} is raw bytes, got {buffer.dtype}")
-    if not buffer.is_cuda:
-        raise ValueError(f"{what} has to be on a CUDA device")
-    if not buffer.is_contiguous():
-        raise ValueError(f"{what} has to be contiguous")
-    if buffer.data_ptr() % WORKSPACE_ALIGNMENT:
-        raise ValueError(f"{what} has to be {WORKSPACE_ALIGNMENT}-byte aligned")
-
-
-def _cut(buffer: torch.Tensor, span, dtype: torch.dtype, shape):
-    begin, size = span
-    view = buffer[begin : begin + size].view(dtype)
-    return view if shape is None else view.view(shape)
-
-
 def _persistent_layout(*, buckets, plan_bytes) -> _Persistent:
     """Cut the buffer this object keeps for as long as it exists."""
-    take, total = _walk()
+    take, total = walk()
     arena = take(sum(plan_bytes))
     indptr = tuple(take((rows + 1) * 4) for rows in buckets)
     return _Persistent(arena=arena, indptr=indptr, total=total())
@@ -279,7 +215,7 @@ def _transient_layout(
     o_data_type: torch.dtype,
 ) -> _Transient:
     """Cut the buffer a call may share with everything else the step runs."""
-    take, total = _walk()
+    take, total = walk()
     widest = buckets[-1]
     float_workspace = take(float_bytes)
     padded_q = take(widest * num_qo_heads * head_dim * q_data_type.itemsize)
@@ -299,23 +235,13 @@ def _transient_layout(
 class QSAAttention:
     r"""Sparse attention over a paged cache, from a logical token route.
 
-    What a caller hands over is the route a selector produced -- logical token
-    indices, ``-1`` where a position has no token -- and what comes back is the
-    gated attention output. Everything between is here: the route is mapped
-    through the block table into physical slots and a validity mask, the plan
-    for the row count is already built, and the gate is folded in by a kernel
-    rather than by a chain of elementwise ops.
-
-    **Given ``out``, :meth:`run` allocates nothing.** The plans and their row
-    pointers live in the persistent buffer, one slice per row bucket that no
-    other plan touches. The route, the mask, the padded query and output and
-    the float workspace live in the transient buffer handed over by
-    :meth:`bind_transient_workspace`.
-
-    **The plans are all built up front.** A row count is rounded up to one of
-    ``row_buckets`` and the plan for that bucket already exists, so a step whose
-    batch changes size never plans, never allocates, and never has to be told
-    that a CUDA graph capture is in progress.
+    The route (logical token indices, ``-1`` where a position has no token) is
+    mapped through the block table into physical slots and a mask, attended
+    with the plan already built for its row bucket, and gated by a kernel.
+    Given ``out``, :meth:`run` allocates nothing: the plans and their row
+    pointers live in the persistent buffer, the scratch in the transient one
+    from :meth:`bind_transient_workspace`. Every ``row_buckets`` plan is built
+    up front, so a batch that changes size never plans under a capture.
 
     Parameters
     ----------
@@ -375,7 +301,7 @@ class QSAAttention:
             kv_data_type=kv_data_type,
             kv_layout=kv_layout,
         )
-        _check_buffer(persistent, "the persistent workspace")
+        check_buffer(persistent, "the persistent workspace")
 
         device = persistent.device
         self.device = device
@@ -391,9 +317,7 @@ class QSAAttention:
         self.kv_cache_format = kv_cache_format
         self.backend = backend
         self.mask_bytes = -(-route_width // 8)
-        # Set by plan_cache, which is the only thing that needs a cache. The
-        # page size is the cache's too: how many slots a page holds is decided
-        # when the cache is allocated, which is after this is sized.
+        # Set by plan_cache: slots and page size are the cache's, which does not exist yet.
         self.num_slots: Optional[int] = None
         self.page_size: Optional[int] = None
         self.pages: Optional[int] = None
@@ -417,10 +341,10 @@ class QSAAttention:
                 f"{persistent.numel()}"
             )
 
-        self._arena = _cut(persistent, regions.arena, torch.uint8, None)
+        self._arena = cut(persistent, regions.arena, torch.uint8, None)
         self._indptr = {}
         for rows, span in zip(buckets, regions.indptr, strict=True):
-            view = _cut(persistent, span, torch.int32, None)
+            view = cut(persistent, span, torch.int32, None)
             torch.arange(0, (rows + 1) * route_width, route_width, out=view)
             self._indptr[rows] = view
 
@@ -440,14 +364,9 @@ class QSAAttention:
     def bind_transient_workspace(self, transient: torch.Tensor) -> None:
         """Take the scratch a call rewrites before it reads.
 
-        Separate from the buffer above because the two have different
-        lifetimes, and a caller's scratch is scratch: the memory handed over
-        here may be the same memory every other consumer of the step reuses,
-        and between two calls anything at all may have been written to it. What
-        may never live here is a plan, because a plan is read back.
-
-        Bound once the caller's scratch has stopped moving, which for a
-        workspace that grows by reallocating means after it is locked.
+        It may be the memory every other consumer of the step reuses, so
+        nothing read back later -- a plan -- may live here. Bind it once the
+        caller's scratch has stopped moving.
 
         Parameters
         ----------
@@ -455,7 +374,7 @@ class QSAAttention:
             ``uint8``, at least the transient size :meth:`workspace_bytes`
             reports, aligned like ``persistent``.
         """
-        _check_buffer(transient, "the transient workspace")
+        check_buffer(transient, "the transient workspace")
         regions = self._transient_regions()
         if transient.numel() < regions.total:
             raise ValueError(
@@ -465,25 +384,25 @@ class QSAAttention:
         buckets = self.row_buckets
         widest = buckets[-1]
         self._transient = transient
-        self._float_workspace = _cut(
+        self._float_workspace = cut(
             transient, regions.float_workspace, torch.uint8, None
         )
-        self._padded_q = _cut(
+        self._padded_q = cut(
             transient,
             regions.padded_q,
             self.q_data_type,
             (widest, self.num_qo_heads, self.head_dim),
         )
-        self._padded_out = _cut(
+        self._padded_out = cut(
             transient,
             regions.padded_out,
             self.o_data_type,
             (widest, self.num_qo_heads, self.head_dim),
         )
-        self._route_base = _cut(
+        self._route_base = cut(
             transient, regions.route, torch.int32, (widest, self.route_width)
         )
-        self._mask_base = _cut(transient, regions.mask, torch.uint8, None)
+        self._mask_base = cut(transient, regions.mask, torch.uint8, None)
         self._route = {rows: self._route_base[:rows] for rows in buckets}
         self._mask = {
             rows: self._mask_base[: rows * self.mask_bytes] for rows in buckets
@@ -521,17 +440,11 @@ class QSAAttention:
         backend: str = "auto",
         max_plans: int = 16,
     ) -> Tuple[int, int]:
-        """What this geometry runs out of, as two numbers and no allocation.
+        """Persistent and transient bytes for this geometry, allocating nothing.
 
-        Two, because the bytes have two lifetimes. The first are the plans and
-        the row pointers they read: those are written once and read back on
-        every call, so they need memory nobody else writes. The second are the
-        padded query and output, the route, its mask and the float workspace:
-        every call rewrites them before it reads them, so they can come out of
-        whatever scratch the caller shares between its consumers.
-
-        ``num_slots`` and ``page_size`` are absent from both: they are what a
-        cache has, and they change the plan rather than the room it needs.
+        Persistent bytes are read back on later calls and need memory nobody
+        else writes; transient bytes are rewritten before they are read. The
+        cache's ``num_slots`` and ``page_size`` change the plan, not the room.
 
         Parameters
         ----------
@@ -592,29 +505,12 @@ class QSAAttention:
     def plan_cache(self, num_slots: int, page_size: int) -> None:
         """Build every bucket's plan for a cache of this many slots.
 
-        Separate from construction because the two are answered at different
-        times: how much room this needs is a property of the geometry and is
-        asked while the caller's workspace can still grow, and what the plans
-        are depends on the cache, which does not exist until later. A caller
-        that binds a minimal cache for a memory profile and then the real one
-        calls this twice; the workspace is the same both times and nothing is
-        allocated by the second call.
-
-        Building the plans here rather than on first use is what keeps
-        :meth:`run` free of planning: a capture never reaches a plan that does
-        not exist. Every plan is built before any of them is published, so a
-        failure leaves the attention unplanned rather than half planned.
-
-        Asking for the cache it is already planned for does nothing, which is
-        what makes a shared runtime work: every layer of a rank binds the same
-        cache and calls this, and only the first of them does anything. It
-        stays a no-op after a run for the same reason -- nothing about the
-        schedule changes, so there is nothing for a capture to lose.
-
-        A *different* cache after a run is refused. The plans keep byte offsets
-        into the arena and a graph replays them, so replacing one under a
-        capture that already holds it would be reading a schedule that is no
-        longer there.
+        Separate from construction because the cache does not exist when the
+        workspace is sized. Every plan is built before any is published, so a
+        failure leaves the attention unplanned. Planning for the cache it
+        already has is a no-op, so every layer of a rank may call it; a
+        different cache after a run is refused, because a captured graph
+        replays the plans' byte offsets into the arena.
 
         Parameters
         ----------
@@ -655,11 +551,8 @@ class QSAAttention:
             ranges.append((rows, offset, offset + size))
             offset += size
 
-        # One staging buffer for every plan. The planner copies through it and
-        # is done with it before it returns, and the plans below are built one
-        # after another, so they share it rather than taking eight megabytes of
-        # pinned host memory each. Host memory, so it is not the caller's
-        # workspace and not device memory anyone counted.
+        # One pinned staging buffer for every plan: the planner is done with it
+        # before it returns, and the plans are built one after another.
         if self._staging is None:
             self._staging = torch.empty(
                 (max(self._plan_bytes),),
@@ -668,13 +561,9 @@ class QSAAttention:
                 device="cpu",
             )
 
-        # The planner reads the route and the mask, and both live in the
-        # caller's shared scratch, which at this point still holds whatever the
-        # last consumer of that buffer left there. A route element is loaded
-        # into a uint32_t, so a leftover negative is rejected and a leftover
-        # in-range value plans against a pattern no step will use. The schedule
-        # comes from the row pointers, which are fixed, so an all-zero route
-        # and an empty mask plan exactly the same thing and depend on nothing.
+        # The planner reads the route and the mask out of the caller's dirty
+        # scratch. The schedule comes from the row pointers alone, so an
+        # all-zero route and an empty mask plan the same thing as any step.
         self._route_base.zero_()
         self._mask_base.zero_()
 
@@ -682,9 +571,7 @@ class QSAAttention:
         # through would otherwise leave an object that looks planned and is not.
         wrappers = {}
         for rows, start, end in ranges:
-            # The planner splits the work by the lengths it reads here, so every
-            # row has to have the full width -- a call before this one may have
-            # left its padding rows at none.
+            # The planner splits by these lengths: every row gets the full width.
             torch.arange(
                 0,
                 (rows + 1) * self.route_width,
@@ -720,9 +607,7 @@ class QSAAttention:
         self.num_slots = num_slots
         self.page_size = page_size
         self.pages = num_slots // page_size
-        # The previous set, if there was one, is dropped here: its plans lived
-        # in the same arena these just wrote over, so nothing may still be
-        # holding them -- which is what the refusal above is for.
+        # The previous plans lived in the arena these just overwrote.
         self._wrappers = wrappers
 
     def bucket_for(self, rows: int) -> int:
@@ -739,16 +624,9 @@ class QSAAttention:
     # -- validation --------------------------------------------------------
 
     def _check_tensor(self, tensor, name, shape, dtype, packed=True):
-        """Shape, dtype, device and layout, before anything is launched.
-
-        ``packed`` is for the cache planes, which are not required to be
-        contiguous -- only unit-stride in their innermost dimension. A packed
-        NVFP4 cache is commonly laid out as one allocation per slot holding
-        ``[fp4 data | e4m3 block scales]``, which is what this library's own
-        writer takes and what leaves both planes strided; the block-sparse
-        route reads page, token and head strides from the tensors. Demanding
-        contiguity here would refuse a cache the writer just filled.
-        """
+        """Shape, dtype, device and layout, before anything is launched. ``packed``
+        planes need only unit stride innermost: a packed NVFP4 cache keeps data
+        and block scales strided in one allocation, and the kernel reads strides."""
         if tuple(tensor.shape) != tuple(shape):
             raise ValueError(
                 f"{name} must be {tuple(shape)}, got {tuple(tensor.shape)}"
@@ -767,13 +645,8 @@ class QSAAttention:
             )
 
     def _checked_scale(self, value, name):
-        """A global scale is a real, finite, positive host number.
-
-        Not a tensor: reading one from the device on every call is a
-        synchronisation a graph capture refuses. Not a bool, not a NaN, not
-        zero and not negative -- each of those reaches the kernel as a
-        multiplier and produces something that looks like an answer.
-        """
+        """A real, finite, positive host number: a device tensor would synchronise
+        under capture, and a bool, NaN, zero or negative reaches the kernel as a multiplier."""
         if isinstance(value, torch.Tensor):
             raise TypeError(
                 f"{name} has to be a host float: reading it from the device on "
@@ -809,13 +682,8 @@ class QSAAttention:
         k_scale,
         v_scale,
     ):
-        """Everything the kernels assume, checked before the first of them runs.
-
-        A cache of the wrong shape, a scale plane that is too short, a global
-        scale left out -- each of those reaches a kernel as a pointer it reads
-        past the end of, or as a multiplier of one where the caller meant
-        something else, and none of them is a mistake the kernel can report.
-        """
+        """Everything the kernels assume, checked before the first of them launches:
+        a short plane or a missing scale is read past the end or multiplied by one."""
         self._check_tensor(
             q, "q", (rows, self.num_qo_heads, self.head_dim), self.q_data_type
         )
@@ -959,11 +827,9 @@ class QSAAttention:
             refuses.
         output_gate : torch.Tensor
             The gate to fold in, ``[rows, num_qo_heads * head_dim]`` or
-            ``[rows, num_qo_heads, head_dim]``. Left unchanged. **Required**:
-            the model this serves gates its attention output, and a route that
-            served it ungated once already is what this API exists to prevent.
-            Sparse attention without a gate is
-            :class:`BlockSparseAttentionWrapper`.
+            ``[rows, num_qo_heads, head_dim]``. Left unchanged. Required: the
+            model this serves gates its attention output; ungated sparse
+            attention is :class:`BlockSparseAttentionWrapper`.
         out : Optional[torch.Tensor]
             Where to write, ``[rows, num_qo_heads, head_dim]``. Allocated when
             omitted, which a captured step should not do.
@@ -1013,10 +879,8 @@ class QSAAttention:
                 out, "out", (rows, self.num_qo_heads, self.head_dim), self.o_data_type
             )
 
-        # The route for this step, mapped into the plan's own buffers. Rows past
-        # the batch are padding: they come out fully masked, and their row
-        # pointers give them no entries, so the plan's work for them reads
-        # nothing. A padding row costs what a real one does otherwise.
+        # Rows past the batch are padding: fully masked, with row pointers that
+        # give them no entries.
         qsa_route_from_logical(
             route,
             token_to_request,
