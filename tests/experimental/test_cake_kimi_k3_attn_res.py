@@ -503,33 +503,43 @@ def _check(inputs, expected):
     )
 
 
-GPU_ROWS = [
-    (1, 0),
-    (1, 4),
-    (1, 5),
-    (1, 6),
-    (1, 7),
-    (1, 8),
-    (16, 8),
-    (64, 4),
-    (256, 1),
-    (256, 8),
-    (512, 1),
-    (1024, 4),
-    # table variants this checkout does not register (registered-variant fallback)
-    (7, 5),
-    (17, 5),
-    (64, 6),
-    (128, 7),
-    (140, 4),
-    (200, 8),
-    (300, 3),
-    (300, 5),
-    (1000, 1),
-    (1000, 2),
-    (4096, 5),
-    (16384, 8),
-]
+def _route_band_start_rows(m_max: int = 16384):
+    """(M, K) of every token count where the dense route changes its kernel key on any
+    architecture / PDL setting: the first row of every route band, so each registered
+    program is exercised at the edge of the band that selects it."""
+    rows = set()
+    for arch in ARCHES:
+        for K in range(MAX_BLOCKS + 1):
+            for pdl in (False, True):
+                previous = None
+                for M in range(1, m_max + 1):
+                    key = plan_route(arch, SM_COUNT, M, K, pdl).kernel_key
+                    if key != previous:
+                        rows.add((M, K))
+                        previous = key
+    return rows
+
+
+GPU_ROWS = sorted(
+    _route_band_start_rows()
+    | {
+        (16, 8),
+        (64, 4),
+        (256, 1),
+        (512, 1),
+        # off-grid token counts (registered-variant fallback where this checkout lacks the exact program)
+        (7, 5),
+        (64, 6),
+        (128, 7),
+        (140, 4),
+        (200, 8),
+        (300, 3),
+        (300, 5),
+        (1000, 1),
+        (1000, 2),
+        (16384, 8),
+    }
+)
 
 
 @pytest.mark.parametrize("pdl", [False, True])
