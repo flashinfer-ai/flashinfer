@@ -419,6 +419,7 @@ def instance_key(
     smem_limit: Optional[int] = None,
     b_swz: int = 128,
     sk_exact: bool = False,
+    batch_group: int = 0,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -429,7 +430,9 @@ def instance_key(
     architecture limit, ``smem_limit_for(None)``) only bounds the stage count - it is not part of
     the key, so an instance has one symbol on every architecture (the planner passes
     ``smem_limit_for(arch)`` like the Cake launcher).  Diagnostic (attribution) instances are not
-    exported.  [Cake ``instance_key`` L873-L905]"""
+    exported.  [Cake ``instance_key`` L873-L905]  ``batch_group`` (round 13, L38b) = the batch-entry raster of the
+    batched MLA rows: 0 = off, 1 = every entry (``_bf``), G > 1 = G adjacent entries interleaved across the CTA pairs
+    (``_bg{G}``); the planner keeps 0 for a batch of one."""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
     hints = (str(hints[0]), str(hints[1]))
@@ -452,6 +455,11 @@ def instance_key(
     b_swz = int(b_swz) if b_mn else 128
     if b_swz not in B_SWZ_CHOICES:
         raise ValueError(f"b_swz must be one of {B_SWZ_CHOICES}, got {b_swz}")
+    batch_group = int(batch_group)
+    if batch_group < 0:
+        raise ValueError(
+            f"batch_group must be 0 (off), 1 (every batch entry) or a group size G > 1, got {batch_group}"
+        )
     epi = epi_mode(out_f32, out_t, None, epi, block_n, cta_rows)
     if epi == "tma" and cols % (32 if out_f32 else 64):
         raise ValueError(
@@ -533,6 +541,7 @@ def instance_key(
         htail,
         b_swz,
         bool(sk_exact),
+        batch_group,
     )
 
 
@@ -566,6 +575,7 @@ def instance_symbol(key: tuple) -> str:
         htail,
         b_swz,
         sk_exact,
+        batch_group,
     ) = key
     return (
         "dense_proj_gemm_"
@@ -591,6 +601,7 @@ def instance_symbol(key: tuple) -> str:
         )
         + (f"_box{box_rows}" if box_rows else "")
         + ("_skx" if sk_exact else "")
+        + ("_bf" if batch_group == 1 else f"_bg{batch_group}" if batch_group > 1 else "")
         + "".join(f"_{d}" for d in diag)
     )
 
@@ -983,6 +994,8 @@ class GemmPlan:
     # the flag; ``sk_exact`` here is the part count p, 0 = off)
     b_swz: int = 128
     sk_exact: int = 0
+    # round 13 (Cake W3, L38b): batch-entry raster of the batched MLA rows (instance_key field 20; 0 = row-major)
+    batch_group: int = 0
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -1059,6 +1072,7 @@ def plan_dense_projection_gemm(
     htail: Optional[bool] = None,
     b_swz: Optional[int] = None,
     sk_exact: Optional[int] = None,
+    batch_group: Optional[int] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -1103,6 +1117,7 @@ def plan_dense_projection_gemm(
         htail=htail,
         b_swz=b_swz,
         sk_exact=sk_exact,
+        batch_group=batch_group,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -1192,6 +1207,14 @@ def plan_dense_projection_gemm(
         b_swz = rule.get("b_swz", 128)
     if sk_exact is None:
         sk_exact = rule.get("sk_exact")
+    if batch_group is None:
+        batch_group = rule.get("batch_group", 0)
+    # the raster knob only exists for batched rows (one batch entry: identical raster)  [Cake launcher]
+    batch_group = int(batch_group) if L > 1 else 0
+    if batch_group < 0 or (batch_group > 1 and L % batch_group):
+        raise ValueError(
+            f"dense_projection_gemm: batch_group must be 0, 1 or a divisor of the batch size {L}, got {batch_group}"
+        )
     if ovl and int(block_n) != 256:
         # the overlapped epilogue is built for the 256-column tall tile; a narrower tall tile keeps the serialized
         # tall epilogue  [Cake launcher]
@@ -1288,6 +1311,7 @@ def plan_dense_projection_gemm(
         smem_limit=smem_limit_for(arch),
         b_swz=int(b_swz),
         sk_exact=exact_plan is not None,
+        batch_group=batch_group,
     )
     plan = GemmPlan(
         L=L,
@@ -1325,6 +1349,7 @@ def plan_dense_projection_gemm(
         htail=bool(key[17]),
         b_swz=int(key[18]),
         sk_exact=int(sk_exact) if exact_plan is not None else 0,
+        batch_group=int(key[20]),
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
@@ -1559,6 +1584,7 @@ def prepare_dense_projection_gemm(
     htail: Optional[bool] = None,
     b_swz: Optional[int] = None,
     sk_exact: Optional[int] = None,
+    batch_group: Optional[int] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -1597,6 +1623,7 @@ def prepare_dense_projection_gemm(
         htail=htail,
         b_swz=b_swz,
         sk_exact=sk_exact,
+        batch_group=batch_group,
         arch=arch,
     )
     module_name = select_module(arch, plan.template)

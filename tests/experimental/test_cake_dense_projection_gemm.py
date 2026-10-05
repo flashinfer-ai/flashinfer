@@ -840,6 +840,19 @@ def test_epilogue_rules():
             dict(a_mn=False, b_mn=False, block_n=256, b_swz=64),
             "dense_proj_gemm_kk_n256",
         ),
+        # round 13 (W3, L38b): the batch-entry raster of the batched MLA rows (trailing ``_bg{G}`` / ``_bf``)
+        (
+            dict(a_mn=False, b_mn=True, epi="tma", slots=1, batch_group=8),
+            "dense_proj_gemm_kn_n256_tma1_bg8",
+        ),
+        (
+            dict(a_mn=False, b_mn=True, cta_rows=256, epi="tma", slots=1, batch_group=4),
+            "dense_proj_gemm_kn_n256_m256_tma1_bg4",
+        ),
+        (
+            dict(a_mn=False, b_mn=True, epi="tma", slots=1, batch_group=1),
+            "dense_proj_gemm_kn_n256_tma1_bf",
+        ),
     ],
 )
 def test_instance_symbols(kwargs, symbol):
@@ -851,7 +864,7 @@ def test_round13_w3_knobs():
     # shrinks the B stage (160 columns: 3 x 32-column panels = 12 KiB instead of 2 x 64-column = 16 KiB) and the
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
-    assert len(key) == 20 and key[18] == 64 and key[19] is False
+    assert len(key) == 21 and key[18] == 64 and key[19] is False and key[20] == 0
     assert instance_key(a_mn=False, b_mn=False, b_swz=64)[18] == 128
     assert b_stage_bytes(True, 160, 64) == 3 * 64 * 64 and b_stage_bytes(True, 160, 128) == 2 * 64 * 128
     assert default_stages(0, 256, 160, True, 64) >= default_stages(0, 256, 160, True, 128)
@@ -862,6 +875,14 @@ def test_round13_w3_knobs():
         instance_key(a_mn=False, b_mn=True, cta_rows=256, ovl=True, b_swz=64)
     with pytest.raises(ValueError):
         instance_key(a_mn=False, b_mn=False, cta_rows=256, htail=True, sk_exact=True)
+
+
+def test_round13_batch_group_knob():
+    # field 20 of the 21-field key: the batch-entry raster (0 off, 1 every entry, G > 1 groups); negative values raise
+    assert instance_key(a_mn=False, b_mn=True, batch_group=8)[20] == 8
+    assert instance_key(a_mn=False, b_mn=True)[20] == 0
+    with pytest.raises(ValueError, match="batch_group"):
+        instance_key(a_mn=False, b_mn=True, batch_group=-1)
 
 
 def test_sk_exact_plan_mirrors_cake():
@@ -880,7 +901,7 @@ def test_round13_knob_normalisation():
     # the 20-field key carries park / ovl / htail at fields 15 / 16 / 17; ovl is a 256-row x 256-column tall-tile
     # knob (narrower or shorter tiles raise), htail needs the 256-row family, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 20 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 21 and key[15] is False and key[16] is True and key[17] is True
     assert instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15] is False
     with pytest.raises(ValueError):
         instance_key(a_mn=False, b_mn=False, cta_rows=256, block_n=192, ovl=True)
@@ -1088,8 +1109,8 @@ def test_instance_key_rejects_bad_configurations():
         instance_key(a_mn=False, b_mn=False, pf=17)
     key = instance_key(a_mn=False, b_mn=False)
     # 20 fields since round 13 (the raster group width and the TMA L2 promotion left the key for the launch
-    # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact
-    assert len(key) == 20 and key[11:] == (
+    # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group
+    assert len(key) == 21 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -1099,6 +1120,7 @@ def test_instance_key_rejects_bad_configurations():
         False,
         128,
         False,
+        0,
     )
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)
