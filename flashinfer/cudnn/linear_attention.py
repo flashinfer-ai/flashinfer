@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import inspect
 import math
 from enum import Enum
 from typing import Optional, Union
@@ -123,6 +124,7 @@ def _la_graph_key_fn(
     gate_lower_bound: Optional[float],
     batch_invariant: bool,
     gate_domain: str = "log",
+    overwrite_initial_state: bool = False,
 ):
     def layout(t):
         return None if t is None else (t.shape, t.stride(), t.dtype)
@@ -150,14 +152,14 @@ def _la_graph_key_fn(
         gate_lower_bound,
         batch_invariant,
         gate_domain,
+        overwrite_initial_state,
     )
 
 
 if CUDNN_AVAILABLE:
 
     @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
-    @cudnn.graph_cache(key_fn=_la_graph_key_fn)
-    def _build_la_graph(
+    def _create_la_graph(
         family: str,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -180,6 +182,7 @@ if CUDNN_AVAILABLE:
         gate_lower_bound: Optional[float],
         batch_invariant: bool,
         gate_domain: str = "log",
+        overwrite_initial_state: bool = False,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
@@ -241,6 +244,8 @@ if CUDNN_AVAILABLE:
             if family == "gdp":
                 attrs["num_householder"] = num_householder
             attrs["gate_domain"] = gate_domain
+            if overwrite_initial_state:
+                attrs["overwrite_initial_state"] = True
 
             O, fs, _checkpoints = getattr(graph, family)(**ports, **attrs)
 
@@ -257,7 +262,57 @@ if CUDNN_AVAILABLE:
             tensors = [cudnn_q, cudnn_k, cudnn_v, O]
             if fs is not None:
                 tensors.append(fs)
+            # Only the binding order is cached. Operands, workspace and stream
+            # are observed afresh on every execute, including graph capture.
+            graph._fi_la_uids = tuple(
+                uid.value
+                for uid, tensor in (
+                    (UIDs.Q_UID, q),
+                    (UIDs.K_UID, k),
+                    (UIDs.V_UID, v),
+                    (UIDs.G_UID, g),
+                    (UIDs.BETA_UID, beta),
+                    (UIDs.CU_SEQLENS_UID, cu_seqlens),
+                    (UIDs.O_UID, o),
+                    (UIDs.W_UID, w),
+                    (UIDs.A_LOG_UID, a_log),
+                    (UIDs.DT_BIAS_UID, dt_bias),
+                    (UIDs.INITIAL_STATE_UID, initial_state),
+                    (UIDs.FINAL_STATE_UID, final_state),
+                )
+                if tensor is not None
+            )
             return graph, tensors
+
+    @cudnn.graph_cache(key_fn=_la_graph_key_fn)
+    def _build_la_graph(*args, overwrite_initial_state=False, **kwargs):
+        # Cache the completed build, including a compatibility fallback. A
+        # failed overwrite graph must neither enter the cache nor be retried
+        # on every warm call. This is an FE capability, not a backend version.
+        try:
+            version = tuple(int(part) for part in cudnn.__version__.split(".")[:2])
+        except (AttributeError, ValueError):
+            version = ()
+        overwrite = overwrite_initial_state and version >= (1, 30)
+        try:
+            result = _create_la_graph(
+                *args, overwrite_initial_state=overwrite, **kwargs
+            )
+        except (cudnn.cudnnGraphNotSupportedError, NotImplementedError):
+            if not overwrite:
+                raise
+            result = _create_la_graph(*args, **kwargs)
+            overwrite = False
+        graph = result[0]
+        graph._fi_la_overwrite = overwrite
+        graph._fi_la_workspace_size = max(graph.get_workspace_size(), 1)
+        try:
+            graph._fi_la_ordered = (
+                "tensor_uids" in inspect.signature(graph.execute).parameters
+            )
+        except (TypeError, ValueError):
+            graph._fi_la_ordered = False
+        return result
 
 
 def _run_la_graph(
@@ -283,7 +338,8 @@ def _run_la_graph(
     gate_lower_bound: Optional[float],
     batch_invariant: bool,
     gate_domain: str = "log",
-) -> None:
+    overwrite_initial_state: bool = False,
+) -> Optional[torch.Tensor]:
     graph, _ = _build_la_graph(
         family,
         q,
@@ -306,33 +362,45 @@ def _run_la_graph(
         gate_lower_bound=gate_lower_bound,
         batch_invariant=batch_invariant,
         gate_domain=gate_domain,
+        overwrite_initial_state=overwrite_initial_state,
     )
 
-    var_map = {
-        UIDs.Q_UID.value: q,
-        UIDs.K_UID.value: k,
-        UIDs.V_UID.value: v,
-        UIDs.G_UID.value: g,
-        UIDs.BETA_UID.value: beta,
-        UIDs.CU_SEQLENS_UID.value: cu_seqlens,
-        UIDs.O_UID.value: o,
-    }
+    if overwrite_initial_state and not graph._fi_la_overwrite:
+        # The overwrite candidate has a compact state descriptor. Older FE or
+        # a plan that cannot overwrite retains the separate scratch + copy.
+        assert final_state is not None
+        final_state = torch.empty_like(final_state)
+
+    buffers: tuple[torch.Tensor, ...] = (q, k, v, g, beta, cu_seqlens, o)
     if w is not None:
-        var_map[UIDs.W_UID.value] = w
+        buffers += (w,)
     if a_log is not None:
-        var_map[UIDs.A_LOG_UID.value] = a_log
+        buffers += (a_log,)
     if dt_bias is not None:
-        var_map[UIDs.DT_BIAS_UID.value] = dt_bias
+        buffers += (dt_bias,)
     if initial_state is not None:
-        var_map[UIDs.INITIAL_STATE_UID.value] = initial_state
+        buffers += (initial_state,)
     if final_state is not None:
-        var_map[UIDs.FINAL_STATE_UID.value] = final_state
+        buffers += (final_state,)
 
     workspace_buffer = _get_cache_buf(
-        "cudnn_linear_attention", max(graph.get_workspace_size(), 1), q.device
+        "cudnn_linear_attention", graph._fi_la_workspace_size, q.device
     )
     handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
-    graph.execute(var_map, workspace=workspace_buffer, handle=handle)
+    if graph._fi_la_ordered:
+        graph.execute(
+            buffers,
+            workspace=workspace_buffer,
+            handle=handle,
+            tensor_uids=graph._fi_la_uids,
+        )
+    else:
+        graph.execute(
+            dict(zip(graph._fi_la_uids, buffers, strict=True)),
+            workspace=workspace_buffer,
+            handle=handle,
+        )
+    return final_state
 
 
 def _state_out(
@@ -871,15 +939,38 @@ def cudnn_recurrent_kda(
         )
     o = output.squeeze(0) if output.dim() == 4 else output
     num_seqs = cu_seqlens.shape[0] - 1
+    # The fallback scratch is compact. Keep other state layouts on their
+    # existing path so both graph descriptors and runtime storage still match.
+    overwrite_initial_state = (
+        initial_state is not None
+        and output_state is None
+        and initial_state.is_contiguous()
+        and not initial_state.requires_grad
+        and (torch.is_inference_mode_enabled() or not initial_state.is_inference())
+    )
     final_state = (
-        _state_out(
-            initial_state, output_state, num_seqs, num_heads, head_dim, v_dim, q.device
+        initial_state
+        if overwrite_initial_state
+        else (
+            _state_out(
+                initial_state,
+                output_state,
+                num_seqs,
+                num_heads,
+                head_dim,
+                v_dim,
+                q.device,
+            )
+            if (
+                output_final_state
+                or output_state is not None
+                or initial_state is not None
+            )
+            else None
         )
-        if (output_final_state or output_state is not None or initial_state is not None)
-        else None
     )
 
-    _run_la_graph(
+    final_state = _run_la_graph(
         "kda",
         q,
         k,
@@ -898,9 +989,15 @@ def cudnn_recurrent_kda(
         safe_gate=bool(use_gate_in_kernel),
         gate_lower_bound=float(lower_bound) if lower_bound is not None else None,
         batch_invariant=bool(batch_invariant),
+        overwrite_initial_state=overwrite_initial_state,
     )
 
     if output_state is None and initial_state is not None:
-        initial_state.copy_(final_state)
-        final_state = initial_state
+        if final_state is initial_state:
+            # FE writes through a raw pointer. Preserve the mutation tracking
+            # previously supplied by copy_ (a no-op for inference tensors).
+            torch.autograd.graph.increment_version(initial_state)
+        else:
+            initial_state.copy_(final_state)
+            final_state = initial_state
     return output.reshape(out_shape), final_state if output_final_state else None
