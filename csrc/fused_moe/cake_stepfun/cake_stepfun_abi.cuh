@@ -107,14 +107,14 @@ struct RoutingKernelSpec {
 // ------------------------------------------------------------------------------------------------
 // FC2 (grouped GEMM over the permuted FC1 output, bf16 output in permuted order).
 // ------------------------------------------------------------------------------------------------
-// FC2 kernel families (A = permuted activations, B = expert weights, as the trtllm-gen GEMM2 names
-// them).
+// FC2 kernel families; the values equal the FC1 family values (Fc1Family) so one family index names
+// a precision in every stage (families[name].index of the inventory). them).
 enum Fc2Family : int {
-  kFc2Bf16 = 0,           // bf16 activations x bf16 weights (BlockMajorK)
-  kFc2Fp8PerTensor = 1,   // E4m3 x E4m3, per-expert output scale
-  kFc2MxFp8 = 2,          // MxE4m3 x MxE4m3 with UE8M0 block scales
-  kFc2Nvfp4 = 3,          // E2m1 x E2m1, activation block scales from the FC1 epilogue
-  kFc2Nvfp4PerToken = 4,  // E2m1 x E2m1 on the requantized FC1 output + fp32 per-token scales
+  kFc2Nvfp4 = 0,          // E2m1 x E2m1, activation block scales from the FC1 epilogue
+  kFc2Nvfp4PerToken = 1,  // E2m1 x E2m1 on the requantized FC1 output + fp32 per-token scales
+  kFc2Bf16 = 2,           // bf16 activations x bf16 weights (BlockMajorK)
+  kFc2Fp8PerTensor = 3,   // E4m3 x E4m3, per-expert output scale
+  kFc2MxFp8 = 4,          // MxE4m3 x MxE4m3 with UE8M0 block scales
 };
 
 // Complete FC2 launch arguments. Tensor-map and pointer members of one operand coexist because
