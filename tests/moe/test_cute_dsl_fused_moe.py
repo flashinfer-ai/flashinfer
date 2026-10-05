@@ -436,11 +436,7 @@ def test_localized_runner_injects_localized_execution_resources():
 
 @cute_dsl_available
 def test_adaptive_localization_executes_autotuner_selected_runner(monkeypatch):
-    import importlib
-
-    fused_moe_module = importlib.import_module(
-        "flashinfer.fused_moe.cute_dsl.fused_moe"
-    )
+    from flashinfer.fused_moe.cute_dsl import fused_moe as fused_moe_module
 
     created_runners = []
 
@@ -530,13 +526,10 @@ def test_adaptive_localization_executes_autotuner_selected_runner(monkeypatch):
 def test_localized_gather_validates_shared_buffers_before_allocation(
     monkeypatch, domain_id, buffer_name, invalid_kind, exception, match
 ):
-    import importlib
-
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    module = importlib.import_module(
-        "flashinfer.fused_moe.cute_dsl."
-        "blockscaled_contiguous_gather_grouped_gemm_act_fusion"
+    from flashinfer.fused_moe.cute_dsl import (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion as module,
     )
 
     # Fake tensors exercise device/stride metadata without requiring Rubin or
@@ -623,15 +616,14 @@ def test_finalize_rejects_invalid_output_before_launch(
     monkeypatch, domain_id, invalid_kind, exception, match
 ):
     """Raw-pointer output writes require a contiguous buffer on the input device."""
-    import importlib
     from types import SimpleNamespace
 
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    module = importlib.import_module(
-        "flashinfer.fused_moe.cute_dsl."
-        "blockscaled_contiguous_grouped_gemm_finalize_fusion"
+    from flashinfer.fused_moe.cute_dsl import (
+        blockscaled_contiguous_grouped_gemm_finalize_fusion as module,
     )
+
     width = 256 if domain_id >= 0 else 128
     with FakeTensorMode():
         kwargs = {
@@ -4524,12 +4516,12 @@ if __name__ == "__main__":
 def test_moe_core_preserves_fc2_output_dtype(
     monkeypatch, localized, output_dtype, entrypoint
 ):
-    import importlib
     from contextlib import nullcontext
     from types import SimpleNamespace
     import sys
 
-    module = importlib.import_module("flashinfer.fused_moe.cute_dsl.fused_moe")
+    from flashinfer.fused_moe.cute_dsl import fused_moe as module
+
     packed = torch.empty((1, 128, 64), dtype=torch.uint8)
     scale = torch.ones(1)
     indices = torch.zeros(128, dtype=torch.int32)
@@ -4617,11 +4609,11 @@ def test_moe_core_preserves_fc2_output_dtype(
 @cute_dsl_available
 @pytest.mark.parametrize("missing_module", [False, True])
 def test_localized_moe_reports_missing_green_context_api(monkeypatch, missing_module):
-    import importlib
     import sys
     from types import SimpleNamespace
 
-    module = importlib.import_module("flashinfer.fused_moe.cute_dsl.fused_moe")
+    from flashinfer.fused_moe.cute_dsl import fused_moe as module
+
     monkeypatch.setitem(
         sys.modules,
         "torch.cuda.green_contexts",

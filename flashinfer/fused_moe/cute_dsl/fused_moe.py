@@ -1596,6 +1596,24 @@ def cute_dsl_fused_moe(
         With ``True``, retain their valid contents because autotuning may run
         and select the full-width path. ``w1_alpha``, ``w2_alpha``, and
         ``fc2_input_scale`` remain shared across domains.
+
+        Example with shards already allocated in their domain pools and
+        scale factors already converted to the MMA layout::
+
+            shards = [
+                {
+                    "w1_weight": w1_domain0,
+                    "w1_weight_sf": w1_sf_domain0,
+                    "w2_weight": w2_domain0,
+                    "w2_weight_sf": w2_sf_domain0,
+                },
+                {
+                    "w1_weight": w1_domain1,
+                    "w1_weight_sf": w1_sf_domain1,
+                    "w2_weight": w2_domain1,
+                    "w2_weight_sf": w2_sf_domain1,
+                },
+            ]
     localized_streams : Optional[list]
         One long-lived green-context CUDA stream for each locality domain.
         Requires a PyTorch build with
