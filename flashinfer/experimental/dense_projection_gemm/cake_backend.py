@@ -149,7 +149,12 @@ L2_PROMOS = (
     "l2_128b",
     "l2_256b",
 )  # TMA descriptor L2 promotion  [Cake L772]
-PD_CHOICES = (0, 1, 2, 3)  # round 15 (Cake W1): pipelined-drain forms of the 128-row single-pass epilogue (0 = the blocking load)
+PD_CHOICES = (
+    0,
+    1,
+    2,
+    3,
+)  # round 15 (Cake W1): pipelined-drain forms of the 128-row single-pass epilogue (0 = the blocking load)
 L2_HINTS = (
     "none",
     "evict_normal",
@@ -652,9 +657,12 @@ def instance_symbol(key: tuple) -> str:
         pd,
         sh,
     ) = key
-    so = {"evict_first": "f", "evict_last": "l", "evict_normal": "n", "default": "d"}.get(
-        store_hint, ""
-    )
+    so = {
+        "evict_first": "f",
+        "evict_last": "l",
+        "evict_normal": "n",
+        "default": "d",
+    }.get(store_hint, "")
     return (
         "dense_proj_gemm_"
         + ("n" if a_mn else "k")
@@ -1327,7 +1335,9 @@ def plan_dense_projection_gemm(
         # round 15 (Cake W3): L2 eviction policy of the TMA-store epilogue's stores  [Cake launcher]
         store_hint = rule.get("store_hint", "none")
     if pd is None:
-        pd = rule.get("pd", 0)  # round 15 (Cake W1): pipelined TMEM drain of the 128-row family  [Cake launcher]
+        pd = rule.get(
+            "pd", 0
+        )  # round 15 (Cake W1): pipelined TMEM drain of the 128-row family  [Cake launcher]
     if sh is None:
         sh = rule.get("sh", 0)
     if ovl and int(block_n) != 256:
