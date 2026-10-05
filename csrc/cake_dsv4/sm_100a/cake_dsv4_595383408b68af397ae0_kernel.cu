@@ -340,7 +340,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_b92d8b0d72e95035a62a(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_o, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_595383408b68af397ae0(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_o, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1046,10 +1046,6 @@ kernel_cake_dsv4_b92d8b0d72e95035a62a(const __grid_constant__ CUtensorMap tmap_q
                     float row_max_val = -CAKE_INF;
                     float row_sum_val = 0.0f;
                     int sink_head = ((1) ? bid % 2 * 64 + my_row : my_row);
-                    if (has_sinks != 0 && sink_head < num_heads && split_idx_2 == 0) {
-                        row_max_val = sinks[sink_head] * 1.4426950408889634f / softmax_scale_log2;
-                        row_sum_val = 1.0f;
-                    }
                     #pragma unroll 1
                     for (int tile_2 = 0; tile_2 < num_kv_tiles_1; tile_2++) {
                         int pipeline_tile = softmax_tile_cursor + tile_2;
@@ -1718,6 +1714,18 @@ kernel_cake_dsv4_b92d8b0d72e95035a62a(const __grid_constant__ CUtensorMap tmap_q
                     {
                         mbarrier_wait(source_sum_empty_addr, _phase_source_sum_empty_0);
                         _phase_source_sum_empty_0 ^= 1;
+                    }
+                    if (has_sinks != 0 && sink_head < num_heads && split_idx_2 == 0 && n_half == 0) {
+                        float sink_max = sinks[sink_head] * 1.4426950408889634f / softmax_scale_log2;
+                        if (row_max_val > -CAKE_INF) {
+                            float _fma_3 = __fmaf_rn(sink_max, softmax_scale_log2, (-row_max_val) * softmax_scale_log2);
+                            float sink_delta = _fma_3;
+                            float _exp2_1 = approx_exp2(sink_delta);
+                            row_sum_val = row_sum_val + _exp2_1;
+                        } else {
+                            row_max_val = sink_max;
+                            row_sum_val = 1.0f;
+                        }
                     }
                     smem_stats_sum[stats_row] = row_sum_val;
                     smem_stats_final_max[stats_row] = row_max_val;

@@ -386,7 +386,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_swa_k, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int max_q_len, int batch_size)
+kernel_cake_dsv4_74e3158027d9108791d3(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_swa_k, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -641,7 +641,8 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                         int _max_0 = ((sparse_topk_lens[mapped_query_idx] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx] + sparse_topk_lens_offset) : (0));
                         int _min_0 = ((_max_0) < (sparse_topk) ? (_max_0) : (sparse_topk));
                         int active_topk = _min_0;
-                        all_num_kv_tiles = (active_topk + 128 - 1) / 128;
+                        int _max_1 = ((active_topk) > (1) ? (active_topk) : (1));
+                        all_num_kv_tiles = (_max_1 + 128 - 1) / 128;
                         int tiles_per_split = all_num_kv_tiles + 1 - 1;
                         int first_tile = split_idx * tiles_per_split;
                         int num_index_passes = (tiles_per_split + 1) / 2;
@@ -806,10 +807,11 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                 int mapped_query_idx_1 = source_work_z_1 * (unsigned int)max_q_len + source_work_x_1;
                 if (source_work_valid_1 != 0) {
                     {
-                        int _max_1 = ((sparse_topk_lens[mapped_query_idx_1] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_1] + sparse_topk_lens_offset) : (0));
-                        int _min_1 = ((_max_1) < (sparse_topk) ? (_max_1) : (sparse_topk));
+                        int _max_2 = ((sparse_topk_lens[mapped_query_idx_1] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_1] + sparse_topk_lens_offset) : (0));
+                        int _min_1 = ((_max_2) < (sparse_topk) ? (_max_2) : (sparse_topk));
                         int active_topk_1 = _min_1;
-                        all_num_kv_tiles_1 = (active_topk_1 + 128 - 1) / 128;
+                        int _max_3 = ((active_topk_1) > (1) ? (active_topk_1) : (1));
+                        all_num_kv_tiles_1 = (_max_3 + 128 - 1) / 128;
                     }
                     int tiles_per_split_1 = all_num_kv_tiles_1 + 1 - 1;
                     int first_tile_1 = split_idx_1 * tiles_per_split_1;
@@ -1029,22 +1031,46 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                 int source_work_valid_2 = source_work_z_2 * (unsigned int)max_q_len + source_work_x_2 < (unsigned int)num_query_tokens;
                 int mapped_query_idx_2 = source_work_z_2 * (unsigned int)max_q_len + source_work_x_2;
                 if (source_work_valid_2 != 0) {
-                    int _max_3 = ((sparse_topk_lens[mapped_query_idx_2] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_2] + sparse_topk_lens_offset) : (0));
-                    int _min_3 = ((_max_3) < (sparse_topk) ? (_max_3) : (sparse_topk));
+                    int _max_6 = ((sparse_topk_lens[mapped_query_idx_2] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_2] + sparse_topk_lens_offset) : (0));
+                    int _min_3 = ((_max_6) < (sparse_topk) ? (_max_6) : (sparse_topk));
                     int active_topk_2 = _min_3;
                     {
-                        all_num_kv_tiles_2 = (active_topk_2 + 128 - 1) / 128;
+                        int _max_7 = ((active_topk_2) > (1) ? (active_topk_2) : (1));
+                        all_num_kv_tiles_2 = (_max_7 + 128 - 1) / 128;
                     }
                     int tiles_per_split_2 = all_num_kv_tiles_2 + 1 - 1;
                     int first_tile_2 = split_idx_2 * tiles_per_split_2;
                     int num_kv_tiles_1 = tiles_per_split_2;
+                    int query_batch = mapped_query_idx_2 / max_q_len;
+                    int query_offset = mapped_query_idx_2 - query_batch * max_q_len;
+                    int query_length = max_q_len;
+                    if (ragged_query != 0) {
+                        query_batch = 0;
+                        #pragma unroll 1
+                        for (int batch = 0; batch < batch_size; batch++) {
+                            if (mapped_query_idx_2 >= cum_seq_lens_q[batch + 1]) {
+                                query_batch = batch + 1;
+                            }
+                        }
+                        int query_begin = cum_seq_lens_q[query_batch];
+                        query_length = cum_seq_lens_q[query_batch + 1] - query_begin;
+                        query_offset = mapped_query_idx_2 - query_begin;
+                    }
+                    int visible = seq_lens[query_batch] - query_length + query_offset + 1;
+                    if (visible < 0) {
+                        visible = 0;
+                    }
+                    if (visible > 128) {
+                        visible = 128;
+                    }
+                    int swa_visible = visible;
+                    int swa_tile_cols = active_topk_2;
+                    if (swa_tile_cols > swa_visible) {
+                        swa_tile_cols = swa_visible;
+                    }
                     float row_max_val = -CAKE_INF;
                     float row_sum_val = 0.0f;
                     int sink_head = ((1) ? my_row : my_row);
-                    if (has_sinks != 0 && sink_head < num_heads && split_idx_2 == 0) {
-                        row_max_val = sinks[sink_head] * 1.4426950408889634f / softmax_scale_log2;
-                        row_sum_val = 1.0f;
-                    }
                     #pragma unroll 1
                     for (int tile_2 = 0; tile_2 < num_kv_tiles_1; tile_2++) {
                         int pipeline_tile = softmax_tile_cursor + tile_2;
@@ -1053,7 +1079,7 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                         int s_off = ((phase != 0) ? 128 : 0);
                         int s_base = taddr + (unsigned int)s_off + (unsigned int)(tmem_score_row_base << 16);
                         float new_max = row_max_val;
-                        int valid_sparse_cols = ((active_topk_2 < sparse_topk) ? active_topk_2 : sparse_topk);
+                        int valid_sparse_cols = ((first_tile_2 + tile_2 == 0) ? swa_tile_cols : active_topk_2);
                         valid_sparse_cols = valid_sparse_cols - (first_tile_2 + tile_2) * 128 - n_half * 64;
                         if (valid_sparse_cols < 0) {
                             valid_sparse_cols = 0;
@@ -1101,7 +1127,7 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                         float sv_split[64];
                         {
                             {
-                                int m64_tile_valid_cols = ((active_topk_2 < sparse_topk) ? active_topk_2 : sparse_topk) - (first_tile_2 + tile_2) * 128;
+                                int m64_tile_valid_cols = ((first_tile_2 + tile_2 == 0) ? swa_tile_cols : active_topk_2) - (first_tile_2 + tile_2) * 128;
                                 if (m64_tile_valid_cols < 0) {
                                     m64_tile_valid_cols = 0;
                                 }
@@ -1269,12 +1295,12 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                                     #error "Max3 requires PTX three-input max.f32 support on sm_100+"
                                     #endif
                                     asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_29) : "f"(_max3_24), "f"(_max3_25), "f"(_max3_26));
-                                    float _max_4 = max_noftz(_max3_27, sv_split[63]);
+                                    float _max_8 = max_noftz(_max3_27, sv_split[63]);
                                     float _max3_30;
                                     #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                                     #error "Max3 requires PTX three-input max.f32 support on sm_100+"
                                     #endif
-                                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_30) : "f"(_max3_28), "f"(_max3_29), "f"(_max_4));
+                                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_30) : "f"(_max3_28), "f"(_max3_29), "f"(_max_8));
                                     score_tile_max = _max3_30;
                                 } else {
                                     asm volatile(
@@ -1432,13 +1458,13 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
                                 :: "r"(s_empty_addr + phase * 8), "r"(0) : "memory");
-                            float _max_6 = max_noftz(new_max, score_tile_max);
-                            new_max = _max_6;
+                            float _max_10 = max_noftz(new_max, score_tile_max);
+                            new_max = _max_10;
                             mbarrier_wait(split_pv_p_empty_addr + (phase) * 8, s_wait_phase ^ 1);
                             {
                                 float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, new_max, 16);
-                                float _max_7 = max_noftz(new_max, _shfl_xor_0);
-                                new_max = _max_7;
+                                float _max_11 = max_noftz(new_max, _shfl_xor_0);
+                                new_max = _max_11;
                             }
                         }
                         float _fma_0 = __fmaf_rn(row_max_val, softmax_scale_log2, (-new_max) * softmax_scale_log2);
@@ -1736,6 +1762,18 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                         mbarrier_wait(source_sum_empty_addr, _phase_source_sum_empty_0);
                         _phase_source_sum_empty_0 ^= 1;
                     }
+                    if (has_sinks != 0 && sink_head < num_heads && split_idx_2 == 0 && n_half == 0) {
+                        float sink_max = sinks[sink_head] * 1.4426950408889634f / softmax_scale_log2;
+                        if (row_max_val > -CAKE_INF) {
+                            float _fma_3 = __fmaf_rn(sink_max, softmax_scale_log2, (-row_max_val) * softmax_scale_log2);
+                            float sink_delta = _fma_3;
+                            float _exp2_1 = approx_exp2(sink_delta);
+                            row_sum_val = row_sum_val + _exp2_1;
+                        } else {
+                            row_max_val = sink_max;
+                            row_sum_val = 1.0f;
+                        }
+                    }
                     smem_stats_sum[stats_row] = row_sum_val;
                     smem_stats_final_max[stats_row] = row_max_val;
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -1849,10 +1887,11 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                 int mapped_query_idx_3 = source_work_z_3 * (unsigned int)max_q_len + source_work_x_3;
                 if (source_work_valid_3 != 0) {
                     {
-                        int _max_11 = ((sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) : (0));
-                        int _min_4 = ((_max_11) < (sparse_topk) ? (_max_11) : (sparse_topk));
+                        int _max_15 = ((sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) : (0));
+                        int _min_4 = ((_max_15) < (sparse_topk) ? (_max_15) : (sparse_topk));
                         int active_topk_3 = _min_4;
-                        all_num_kv_tiles_3 = (active_topk_3 + 128 - 1) / 128;
+                        int _max_16 = ((active_topk_3) > (1) ? (active_topk_3) : (1));
+                        all_num_kv_tiles_3 = (_max_16 + 128 - 1) / 128;
                     }
                     int tiles_per_split_3 = all_num_kv_tiles_3 + 1 - 1;
                     int first_tile_3 = split_idx_3 * tiles_per_split_3;
@@ -2224,10 +2263,11 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                 int mapped_query_idx_4 = source_work_z_4 * (unsigned int)max_q_len + source_work_x_4;
                 if (source_work_valid_4 != 0) {
                     {
-                        int _max_2 = ((sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) : (0));
-                        int _min_2 = ((_max_2) < (sparse_topk) ? (_max_2) : (sparse_topk));
+                        int _max_4 = ((sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) : (0));
+                        int _min_2 = ((_max_4) < (sparse_topk) ? (_max_4) : (sparse_topk));
                         int active_topk_4 = _min_2;
-                        all_num_kv_tiles_4 = (active_topk_4 + 128 - 1) / 128;
+                        int _max_5 = ((active_topk_4) > (1) ? (active_topk_4) : (1));
+                        all_num_kv_tiles_4 = (_max_5 + 128 - 1) / 128;
                     }
                     int tiles_per_split_4 = all_num_kv_tiles_4 + 1 - 1;
                     int first_tile_4 = split_idx_4 * tiles_per_split_4;
@@ -2676,10 +2716,11 @@ kernel_cake_dsv4_9b7bdad0fca7ed045eb7(const __grid_constant__ CUtensorMap tmap_q
                 int pv_valid = source_work_z_5 * (unsigned int)max_q_len + source_work_x_5 < (unsigned int)num_query_tokens;
                 if (pv_valid != 0) {
                     int pv_query = source_work_z_5 * (unsigned int)max_q_len + source_work_x_5;
-                    int _max_12 = ((sparse_topk_lens[pv_query] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[pv_query] + sparse_topk_lens_offset) : (0));
-                    int _min_5 = ((_max_12) < (sparse_topk) ? (_max_12) : (sparse_topk));
+                    int _max_17 = ((sparse_topk_lens[pv_query] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[pv_query] + sparse_topk_lens_offset) : (0));
+                    int _min_5 = ((_max_17) < (sparse_topk) ? (_max_17) : (sparse_topk));
                     int pv_active = _min_5;
-                    int pv_tiles = (pv_active + 128 - 1) / 128;
+                    int _max_18 = ((pv_active) > (1) ? (pv_active) : (1));
+                    int pv_tiles = (_max_18 + 128 - 1) / 128;
                     int pv_first = 1;
                     #pragma unroll 1
                     for (int pv_tile = 0; pv_tile < pv_tiles; pv_tile++) {
