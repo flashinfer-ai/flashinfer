@@ -1232,18 +1232,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1341,18 +1341,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd256_p16",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1450,18 +1450,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd256_p32",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1559,18 +1559,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd256_p64",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1664,22 +1664,22 @@
     },
     "decode_balanced_bf16_hd64": {
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_binding.cu",
-      "dynamic_shared_memory_bytes": 117760,
+      "dynamic_shared_memory_bytes": 159616,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1771,24 +1771,133 @@
       ],
       "threads": 512
     },
+    "decode_balanced_bf16_hd64_g16": {
+      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_hd64_g16_binding.cu",
+      "dynamic_shared_memory_bytes": 159616,
+      "launch_binding": "cake_fmha_launch_decode_balanced_bf16_hd64_g16",
+      "parameters": [
+        {
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
+          "name": "K"
+        },
+        {
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "group_ratio"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16_hd64_g16",
+      "source_family": [
+        {
+          "selector": {},
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_bf16_hd64_g16/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_hd64_g16/default.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
     "decode_balanced_bf16_mtp_n32": {
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu",
       "dynamic_shared_memory_bytes": 222208,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n32",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1881,18 +1990,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n64",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -1990,13 +2099,13 @@
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2099,18 +2208,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_fp16",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2208,18 +2317,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_fp16_mtp_n32",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2312,18 +2421,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_fp16_mtp_n64",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Q"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2421,13 +2530,13 @@
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -2530,18 +2639,18 @@
       "launch_binding": "cake_fmha_launch_decode_balanced_fp8",
       "parameters": [
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "Qt"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "K"
         },
         {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
+          "ctype": "CUtensorMap const&",
+          "kind": "tensor_map",
           "name": "V"
         },
         {
@@ -5300,7 +5409,11 @@
       "components": [
         {
           "component": "decode_balanced_bf16_hd64",
-          "condition": "always"
+          "condition": "num_qo_heads // num_kv_heads <= 8"
+        },
+        {
+          "component": "decode_balanced_bf16_hd64_g16",
+          "condition": "9 <= num_qo_heads // num_kv_heads <= 16"
         }
       ],
       "standalone_ready": true,
