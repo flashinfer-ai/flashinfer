@@ -157,3 +157,6 @@ void qsa_route_from_logical(TensorView logical, TensorView token_to_request, Ten
     return true;
   });
 }
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_expand_block_route, qsa_expand_block_route);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_route_from_logical, qsa_route_from_logical);

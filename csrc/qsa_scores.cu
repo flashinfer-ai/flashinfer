@@ -141,3 +141,5 @@ void qsa_paged_scores(TensorView q, TensorView k_cache, TensorView block_table,
     });
   });
 }
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_paged_scores, qsa_paged_scores);

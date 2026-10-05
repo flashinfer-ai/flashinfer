@@ -268,3 +268,6 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
     return false;
   });
 }
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_pre_indexer_dispatch_mask, qsa_pre_indexer_dispatch_mask);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_pre_indexer, qsa_pre_indexer);

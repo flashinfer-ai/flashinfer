@@ -129,3 +129,6 @@ int64_t qsa_output_gate_capabilities() {
 #endif
   return bits;
 }
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_output_gate, qsa_output_gate);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_output_gate_capabilities, qsa_output_gate_capabilities);

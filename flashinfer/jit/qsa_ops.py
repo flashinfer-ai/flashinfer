@@ -33,7 +33,6 @@ def gen_qsa_ops_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "qsa_pre_indexer.cu",
             jit_env.FLASHINFER_CSRC_DIR / "qsa_scores.cu",
             jit_env.FLASHINFER_CSRC_DIR / "qsa_route.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "qsa_ops_jit_binding.cu",
         ],
         extra_cuda_cflags=nvcc_flags + ["-DENABLE_BF16"],
     )
@@ -44,7 +43,6 @@ def gen_qsa_output_gate_module() -> JitSpec:
         "qsa_output_gate",
         [
             jit_env.FLASHINFER_CSRC_DIR / "qsa_output_gate.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "qsa_output_gate_jit_binding.cu",
         ],
         # The gate stands in for an elementwise expression and is judged
         # against it. Fast math flushes a subnormal logistic to zero, so a gate
