@@ -1571,11 +1571,18 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 # the raster group width is a launch parameter since round 11: never a template suffix
                 # ("_gemm" is not one)
                 assert re.search(r"_g\d+", plan.template) is None
+                # round 13: the narrow MN-major B panels (``b_swz`` 64 / 32) have smaller stages and take the deepest
+                # pipeline that fits the opt-in, like the 64-row family
+                assert not mirrored or plan.b_swz == (
+                    rule.get("b_swz", 128) if plan.b_mn else 128
+                )
                 assert plan.stages == rule.get(
                     "stages",
-                    default_stages(plan.slots, plan.cta_rows, plan.block_n, plan.b_mn),
+                    default_stages(
+                        plan.slots, plan.cta_rows, plan.block_n, plan.b_mn, plan.b_swz
+                    ),
                 )
-                if "stages" not in rule and plan.cta_rows == 128:
+                if "stages" not in rule and plan.cta_rows == 128 and plan.b_swz == 128:
                     assert (
                         plan.stages
                         == {
