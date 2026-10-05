@@ -513,6 +513,130 @@ Array<String> cake_stepfun_routing_inputs() {
   return inputs;
 }
 
+/**
+ * Run the exported Cake routing on caller-owned tables: the launch ``RoutingRunner`` performs for
+ * the fused-MoE forward, without the forward's allocations. Renormalize top-k over
+ * ``routing_logits`` ([num_tokens, num_experts] bfloat16 or float32; ``topk_packed`` and bf16
+ * ``topk_weights`` [num_tokens, top_k] are written) or the permutation tables of pre-computed
+ * ``topk_ids`` ([num_tokens, top_k] int32; ``topk_weights`` is the caller's input and
+ * ``topk_packed`` is not written). The other tensors are the fused forward's buffers of the same
+ * names: ``expert_count_histogram`` (>= 2 * num_experts int32), ``total_num_padded_tokens`` [1],
+ * ``expanded_idx_to_permuted_idx`` [num_tokens * top_k], ``permuted_idx_to_token_idx``
+ * (>= Routing::getMaxPermutedPaddedCount), ``cta_idx_xy_to_batch_idx`` / ``cta_idx_xy_to_mn_limit``
+ * (>= Routing::getMaxNumCtasInBatchDim), ``num_non_exiting_ctas`` [1] and the optional
+ * ``num_tokens_per_expert`` [num_experts].
+ */
+void cake_stepfun_routing(Optional<TensorView> const& routing_logits,
+                          Optional<TensorView> const& topk_ids, TensorView const& topk_packed,
+                          TensorView const& topk_weights, TensorView const& expert_count_histogram,
+                          TensorView const& total_num_padded_tokens,
+                          TensorView const& expanded_idx_to_permuted_idx,
+                          TensorView const& permuted_idx_to_token_idx,
+                          TensorView const& cta_idx_xy_to_batch_idx,
+                          TensorView const& cta_idx_xy_to_mn_limit,
+                          TensorView const& num_non_exiting_ctas,
+                          Optional<TensorView> const& num_tokens_per_expert, int64_t num_experts,
+                          int64_t top_k, int64_t local_expert_offset, int64_t local_num_experts,
+                          int64_t tile_tokens_dim, bool enable_pdl) {
+  TVM_FFI_ICHECK(routing_logits.has_value() != topk_ids.has_value())
+      << "cake_stepfun_routing: pass exactly one of routing_logits (scores path) or topk_ids "
+         "(pre-computed path).";
+  DLDevice const device = topk_packed.device();
+  TVM_FFI_ICHECK(device.device_type == kDLCUDA)
+      << "cake_stepfun_routing: topk_packed must be a CUDA tensor.";
+  int64_t num_tokens = 0;
+  btg::Dtype dtype_logits = btg::Dtype::Bfloat16;
+  if (routing_logits.has_value()) {
+    TensorView const& logits = routing_logits.value();
+    checkTensor(logits, "routing_logits", 2, device);
+    TVM_FFI_ICHECK(logits.dtype() == dl_bfloat16 || logits.dtype() == dl_float32)
+        << "cake_stepfun_routing: routing_logits must be bfloat16 or float32.";
+    TVM_FFI_ICHECK_EQ(logits.size(1), num_experts)
+        << "cake_stepfun_routing: routing_logits columns must equal num_experts.";
+    num_tokens = logits.size(0);
+    dtype_logits = logits.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+  } else {
+    TensorView const& ids = topk_ids.value();
+    checkTensor(ids, "topk_ids", 2, device);
+    checkDtype(ids, "topk_ids", dl_int32);
+    TVM_FFI_ICHECK_EQ(ids.size(1), top_k) << "cake_stepfun_routing: topk_ids columns must equal top_k.";
+    num_tokens = ids.size(0);
+  }
+  TVM_FFI_ICHECK(num_tokens > 0) << "cake_stepfun_routing: num_tokens must be positive.";
+  TVM_FFI_ICHECK(top_k > 0 && top_k <= num_experts)
+      << "cake_stepfun_routing: top_k must be between one and num_experts.";
+  TVM_FFI_ICHECK(local_num_experts > 0 && local_expert_offset >= 0 &&
+                 local_expert_offset + local_num_experts <= num_experts)
+      << "cake_stepfun_routing: the local expert range must lie within num_experts.";
+  TVM_FFI_ICHECK_GT(tile_tokens_dim, 0) << "cake_stepfun_routing: tile_tokens_dim must be positive.";
+  checkTensor(topk_packed, "topk_packed", 2, device);
+  checkDtype(topk_packed, "topk_packed", dl_int32);
+  TVM_FFI_ICHECK(topk_packed.size(0) == num_tokens && topk_packed.size(1) == top_k)
+      << "cake_stepfun_routing: topk_packed must be [num_tokens, top_k].";
+  checkTensor(topk_weights, "topk_weights", 2, device);
+  checkDtype(topk_weights, "topk_weights", dl_bfloat16);
+  TVM_FFI_ICHECK(topk_weights.size(0) == num_tokens && topk_weights.size(1) == top_k)
+      << "cake_stepfun_routing: topk_weights must be [num_tokens, top_k].";
+  int64_t const max_padded_tokens = tgm::Routing::getMaxPermutedPaddedCount(
+      static_cast<int32_t>(num_tokens), static_cast<int32_t>(top_k),
+      static_cast<int32_t>(num_experts), static_cast<int32_t>(tile_tokens_dim));
+  int64_t const max_num_ctas = tgm::Routing::getMaxNumCtasInBatchDim(
+      static_cast<int32_t>(num_tokens), static_cast<int32_t>(top_k),
+      static_cast<int32_t>(num_experts), static_cast<int32_t>(tile_tokens_dim));
+  struct Table {
+    TensorView const* tensor;
+    char const* name;
+    int64_t min_size;
+  };
+  Table const tables[] = {
+      {&expert_count_histogram, "expert_count_histogram", 2 * num_experts},
+      {&total_num_padded_tokens, "total_num_padded_tokens", 1},
+      {&expanded_idx_to_permuted_idx, "expanded_idx_to_permuted_idx", num_tokens * top_k},
+      {&permuted_idx_to_token_idx, "permuted_idx_to_token_idx", max_padded_tokens},
+      {&cta_idx_xy_to_batch_idx, "cta_idx_xy_to_batch_idx", max_num_ctas},
+      {&cta_idx_xy_to_mn_limit, "cta_idx_xy_to_mn_limit", max_num_ctas},
+      {&num_non_exiting_ctas, "num_non_exiting_ctas", 1},
+  };
+  for (Table const& table : tables) {
+    TVM_FFI_ICHECK(table.tensor->IsContiguous() &&
+                   table.tensor->device().device_type == kDLCUDA &&
+                   table.tensor->device().device_id == device.device_id)
+        << "cake_stepfun_routing: " << table.name << " must be a contiguous tensor on the launch device.";
+    checkDtype(*table.tensor, table.name, dl_int32);
+    TVM_FFI_ICHECK_GE(table.tensor->numel(), table.min_size)
+        << "cake_stepfun_routing: " << table.name << " must hold at least " << table.min_size
+        << " entries.";
+  }
+  int32_t* num_tokens_per_expert_ptr = nullptr;
+  if (num_tokens_per_expert.has_value()) {
+    checkTensor(num_tokens_per_expert.value(), "num_tokens_per_expert", 1, device);
+    checkDtype(num_tokens_per_expert.value(), "num_tokens_per_expert", dl_int32);
+    TVM_FFI_ICHECK_GE(num_tokens_per_expert.value().size(0), num_experts)
+        << "cake_stepfun_routing: num_tokens_per_expert must hold one count per expert.";
+    num_tokens_per_expert_ptr = static_cast<int32_t*>(num_tokens_per_expert.value().data_ptr());
+  }
+  tgm::cake_stepfun::RoutingRunner runner(static_cast<int32_t>(tile_tokens_dim));
+  runner.run(routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr,
+             /*routingBias=*/nullptr, static_cast<int32_t>(num_tokens),
+             static_cast<int32_t>(num_experts), static_cast<int32_t>(top_k),
+             /*numFusedSharedExpert=*/0, /*nGroup=*/0, /*topkGroup=*/0,
+             static_cast<int32_t>(local_expert_offset), static_cast<int32_t>(local_num_experts),
+             /*routedScalingFactor=*/1.0f, static_cast<int32_t*>(topk_packed.data_ptr()),
+             static_cast<int32_t*>(expert_count_histogram.data_ptr()),
+             static_cast<int32_t*>(total_num_padded_tokens.data_ptr()),
+             static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr()),
+             /*permutedIdxToExpandedIdx=*/nullptr,
+             static_cast<int32_t*>(permuted_idx_to_token_idx.data_ptr()),
+             topk_ids.has_value() ? static_cast<int32_t*>(topk_ids.value().data_ptr()) : nullptr,
+             topk_weights.data_ptr(), num_tokens_per_expert_ptr,
+             static_cast<int32_t*>(cta_idx_xy_to_batch_idx.data_ptr()),
+             static_cast<int32_t*>(cta_idx_xy_to_mn_limit.data_ptr()),
+             static_cast<int32_t*>(num_non_exiting_ctas.data_ptr()), btg::Dtype::Bfloat16,
+             btg::Dtype::Bfloat16, /*useRoutingScalesOnInput=*/false, /*useDeepSeekFp8=*/false,
+             tgm::Routing::RoutingMethodType::Renormalize, get_stream(device), dtype_logits,
+             /*normTopkProb=*/true, /*routing_replay_out=*/nullptr, enable_pdl);
+}
+
 /** Expert-weight dtypes (``float32``, ``bfloat16``) with an exported Cake finalize kernel. */
 Array<String> cake_stepfun_finalize_weight_dtypes() {
   Array<String> dtypes;
@@ -585,6 +709,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_full_path, cake_stepfun_full_path);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_stages, cake_stepfun_stages);
 #ifdef CAKE_STEPFUN_FULL
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_routing_inputs, cake_stepfun_routing_inputs);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_routing, cake_stepfun_routing);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_finalize_weight_dtypes,
                               cake_stepfun_finalize_weight_dtypes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc2_tiles, cake_stepfun_fc2_tiles);

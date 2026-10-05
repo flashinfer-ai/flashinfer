@@ -276,3 +276,7 @@ struct FinalizeKernelSpec {
 };
 
 }  // namespace flashinfer::cake_stepfun::generated
+
+// Generated stage tables (routing, requantization, FC2, finalize) and their Submit thunks, rendered
+// positionally against the structures above; included last so the tables see every stage type.
+#include "generated/cake_stepfun_generated_stages.cuh"

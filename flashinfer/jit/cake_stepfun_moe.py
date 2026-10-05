@@ -338,14 +338,25 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
                         f"for target {target}"
                     )
     manifest = (repo_root / manifest_relative).resolve()
-    manifest_text = manifest.read_text(encoding="utf-8")
+    table_sources = {manifest_relative: manifest.read_text(encoding="utf-8")}
+    # The tables of the stages other than fc1 live in the second generated header the inventory
+    # names (``stages_manifest``, included at the end of the hand-written ABI header).
+    stages_relative = inventory.get("stages_manifest")
+    if stages_relative is not None:
+        if not isinstance(stages_relative, str) or stages_relative not in files:
+            raise ValueError(
+                "Cake StepFun inventory stages_manifest must name a generated file listed in files"
+            )
+        table_sources[stages_relative] = (
+            (repo_root / stages_relative).resolve().read_text(encoding="utf-8")
+        )
     for stage in CAKE_STEPFUN_STAGES:
         if any(stage in present for present in stages.values()):
             table = _STAGE_TABLE[stage]
-            if table not in manifest_text:
+            if not any(table in text for text in table_sources.values()):
                 raise ValueError(
                     f"Cake StepFun inventory lists {stage} kernels but the generated "
-                    f"manifest {manifest_relative} defines no {table} table"
+                    f"manifest(s) {', '.join(table_sources)} define no {table} table"
                 )
     return CakeStepFunInventory(
         path=inventory_path,

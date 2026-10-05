@@ -52,7 +52,8 @@ those of the public module.
 
 ## Inventory (`flashinfer.cake_stepfun.inventory.v3`)
 
-Top-level keys: `schema`, `manifest` (path of the launch manifest), `files`
+Top-level keys: `schema`, `manifest` (path of the launch manifest), optional
+`stages_manifest` (path of the generated stage-table header, see below), `files`
 (path -> SHA-256 of every generated file), `families` (FC1 families), optional
 `fc2_families` (FC2 families, same shape), `kernels`, `program_hash` (SHA-256 of
 `json.dumps({kernels, families, fc2_families, files}, sort_keys=True,
@@ -71,10 +72,11 @@ pairs of the kernel signature), `block`, `cluster`, `dynamic_smem_bytes` and
 | `requant` | `variant`, `sf_layout`, `rows_per_cta` | one record per (arch, stage, variant) |
 | `finalize` | `variant` (`scalar` / `vector`, unique per dtype, e.g. `scalar_bf16`), `expert_weights_dtype` (`float32` / `bfloat16`), `max_top_k` | one record per (arch, stage, variant) |
 
-A target with any kernel must have `fc1` kernels. The manifest must define the
-kernel table of every stage the inventory lists (`kFc1Kernels`, `kRoutingKernels`,
-`kRequantKernels`, `kFc2Kernels`, `kFinalizeKernels`); the loader checks this
-before compiling anything.
+A target with any kernel must have `fc1` kernels. The manifest (or the
+`stages_manifest` header) must define the kernel table of every stage the
+inventory lists (`kFc1Kernels`, `kRoutingKernels`, `kRequantKernels`,
+`kFc2Kernels`, `kFinalizeKernels`); the loader checks this before compiling
+anything.
 
 ## Launch manifest
 
@@ -226,8 +228,9 @@ the stages of the build in pipeline order and `cake_stepfun_full_path()` tells t
 variant. On the full path the module adds `cake_stepfun_routing_inputs()`,
 `cake_stepfun_finalize_weight_dtypes()`, `cake_stepfun_fc2_tiles(family)`,
 `cake_stepfun_fc2_activation_sf_layout(family, tile)`, `cake_stepfun_fc2(...)`,
-`cake_stepfun_requant(...)` and `cake_stepfun_finalize(...)`; routing alone is
-reachable through the module's `trtllm_moe_run_routing*` operations, which the
-full path serves with the Cake router. The operands of every standalone
+`cake_stepfun_requant(...)`, `cake_stepfun_finalize(...)` and
+`cake_stepfun_routing(...)` (the router on caller-owned tables, both input
+kinds); routing is also reachable through the module's `trtllm_moe_run_routing*`
+operations, which the full path serves with the Cake router. The operands of every standalone
 operation are the tensors `MoE::Runner` passes to the stage; see the binding's
 doc comments.
