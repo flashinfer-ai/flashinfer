@@ -527,6 +527,9 @@ class Runner {
 
   [[nodiscard]] MoEConfig getConfigComponents(int64_t configIndex) const;
 
+  // True when at least one (GEMM1, GEMM2) configuration pair exists for this tile.
+  [[nodiscard]] bool hasPassingConfigs() const { return !mPassingConfigs.empty(); }
+
   [[nodiscard]] bool isValidConfigIndex(int64_t configIndex, int32_t topK, int32_t hiddenSize,
                                         int32_t intermediateSize, int32_t numLocalExperts,
                                         int32_t numTokens, int32_t hiddenSizeOutput = -1) const;

@@ -75,6 +75,10 @@ _STAGE_TABLE: dict[str, str] = {
 # Stages whose records are (family, tile) pairs declared in a families mapping.
 _TILED_STAGES: dict[str, str] = {"fc1": "families", "fc2": "fc2_families"}
 _HASHED_KEYS = ("kernels", "families", "fc2_families", "files")
+#: Routing input kinds a routing record declares (``RoutingInput`` of the ABI header).
+CAKE_STEPFUN_ROUTING_INPUTS: tuple[str, ...] = ("scores", "topk_ids")
+#: Expert-weight dtypes a finalize record declares (``FinalizeKernelSpec.expert_weights_dtype``).
+CAKE_STEPFUN_FINALIZE_WEIGHT_DTYPES: tuple[str, ...] = ("float32", "bfloat16")
 
 
 def _get_cake_stepfun_csrc_dir() -> Path:
@@ -106,6 +110,10 @@ class CakeStepFunInventory:
     #: Per target: device translation units and their extra compile flags.
     device_sources: dict[CakeStepFunTarget, list[Path]]
     compile_flags: dict[CakeStepFunTarget, dict[Path, list[str]]]
+    #: Per target: routing input kinds (``scores`` / ``topk_ids``) with a kernel.
+    routing_inputs: dict[CakeStepFunTarget, frozenset[str]]
+    #: Per target: expert-weight dtypes (``float32`` / ``bfloat16``) with a finalize kernel.
+    finalize_weight_dtypes: dict[CakeStepFunTarget, frozenset[str]]
 
     def missing_stages(self, target: CakeStepFunTarget) -> tuple[str, ...]:
         present = self.stages.get(target, frozenset())
@@ -148,6 +156,39 @@ def _validate_variant_record(kernel: dict, index: int, stage: str, seen: set) ->
             f"for {kernel['arch']}"
         )
     seen.add(key)
+    if stage == "routing" and kernel.get("input") not in CAKE_STEPFUN_ROUTING_INPUTS:
+        raise ValueError(
+            f"Cake StepFun inventory kernels[{index}] (routing) input must be one of "
+            f"{CAKE_STEPFUN_ROUTING_INPUTS}, got {kernel.get('input')!r}"
+        )
+    if (
+        stage == "finalize"
+        and kernel.get("expert_weights_dtype")
+        not in CAKE_STEPFUN_FINALIZE_WEIGHT_DTYPES
+    ):
+        raise ValueError(
+            f"Cake StepFun inventory kernels[{index}] (finalize) expert_weights_dtype must "
+            f"be one of {CAKE_STEPFUN_FINALIZE_WEIGHT_DTYPES}, got "
+            f"{kernel.get('expert_weights_dtype')!r}"
+        )
+
+
+def _pre_kernel_device(kernel: dict, index: int, files: dict) -> str | None:
+    """Device unit of a routing record's leading kernel (``pre_kernel``), if any."""
+    pre = kernel.get("pre_kernel")
+    if pre is None:
+        return None
+    if (
+        not isinstance(pre, dict)
+        or not isinstance(pre.get("kernel_symbol"), str)
+        or not pre["kernel_symbol"]
+        or pre.get("device") not in files
+    ):
+        raise ValueError(
+            f"Cake StepFun inventory kernels[{index}] (routing) pre_kernel needs a "
+            "kernel_symbol and a device unit listed in files"
+        )
+    return pre["device"]
 
 
 @functools.cache
@@ -159,7 +200,9 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
     :data:`CAKE_STEPFUN_STAGES`), ``arch``, ``device`` path, ``compile_flags`` and
     launch metadata. ``fc1`` / ``fc2`` records are ``(family, tile_n)`` pairs declared
     in ``families`` / ``fc2_families``; ``routing``, ``requant`` and ``finalize``
-    records carry a unique ``variant``. ``program_hash`` seals ``kernels``,
+    records carry a unique ``variant`` (routing records also their ``input`` kind
+    and, for the two-kernel large-token path, a ``pre_kernel`` unit; finalize
+    records their ``expert_weights_dtype``). ``program_hash`` seals ``kernels``,
     ``families``, ``fc2_families`` and the per-file ``files`` digests, and the
     generated manifest header must define the kernel table of every listed stage.
     """
@@ -224,6 +267,12 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
     compile_flags: dict[CakeStepFunTarget, dict[Path, list[str]]] = {
         t: {} for t in _TARGET_FLAGS
     }
+    routing_inputs: dict[CakeStepFunTarget, set[str]] = {
+        t: set() for t in _TARGET_FLAGS
+    }
+    finalize_dtypes: dict[CakeStepFunTarget, set[str]] = {
+        t: set() for t in _TARGET_FLAGS
+    }
     seen: set = set()
     for index, kernel in enumerate(kernels):
         if not isinstance(kernel, dict) or kernel.get("arch") not in _TARGET_FLAGS:
@@ -257,6 +306,16 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
         source = (repo_root / device).resolve()
         device_sources[target].append(source)
         compile_flags[target][source] = list(flags)
+        if stage == "routing":
+            routing_inputs[target].add(kernel["input"])
+            pre_device = _pre_kernel_device(kernel, index, files)
+            if pre_device is not None:
+                pre_source = (repo_root / pre_device).resolve()
+                if pre_source not in compile_flags[target]:
+                    device_sources[target].append(pre_source)
+                    compile_flags[target][pre_source] = list(flags)
+        elif stage == "finalize":
+            finalize_dtypes[target].add(kernel["expert_weights_dtype"])
     for target in _TARGET_FLAGS:
         if not device_sources[target]:
             continue
@@ -295,6 +354,8 @@ def load_cake_stepfun_inventory(csrc_dir: Path | None = None) -> CakeStepFunInve
         stages={t: frozenset(s) for t, s in stages.items()},
         device_sources=device_sources,
         compile_flags=compile_flags,
+        routing_inputs={t: frozenset(s) for t, s in routing_inputs.items()},
+        finalize_weight_dtypes={t: frozenset(s) for t, s in finalize_dtypes.items()},
     )
 
 
@@ -313,6 +374,19 @@ def cake_stepfun_missing_stages(target: CakeStepFunTarget) -> tuple[str, ...]:
     """Return the stages (in pipeline order) the inventory does not cover for ``target``."""
     _require_target(target)
     return load_cake_stepfun_inventory().missing_stages(target)
+
+
+def cake_stepfun_routing_inputs(target: CakeStepFunTarget) -> frozenset[str]:
+    """Return the routing input kinds (``scores``, ``topk_ids``) exported for ``target``."""
+    _require_target(target)
+    return load_cake_stepfun_inventory().routing_inputs[target]
+
+
+def cake_stepfun_finalize_weight_dtypes(target: CakeStepFunTarget) -> frozenset[str]:
+    """Return the expert-weight dtypes (``float32``, ``bfloat16``) the exported finalize
+    kernels of ``target`` read."""
+    _require_target(target)
+    return load_cake_stepfun_inventory().finalize_weight_dtypes[target]
 
 
 def resolve_cake_stepfun_full_path(

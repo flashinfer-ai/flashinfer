@@ -16,7 +16,8 @@
 #pragma once
 
 // Kernel ABI of the Cake StepFun fused-MoE stages other than FC1 (routing, FC2, the NVFP4 per-token
-// requantization and finalize). The generated launch manifest
+// requantization and finalize). Field order of every structure is part of the contract: the
+// exporter renders the tables positionally. The generated launch manifest
 // (generated/cake_stepfun_generated_manifest.cuh) declares the exported kernels and renders, for
 // every stage it covers, one `Submit_<i>` thunk per kernel that unpacks the stage's `*Args`
 // structure below into the kernel's parameter list, plus a per-architecture table of `*KernelSpec`
@@ -47,14 +48,24 @@ enum class SfLayout : int {
 };
 
 // ------------------------------------------------------------------------------------------------
-// Routing (Renormalize top-k over the routing logits; writes every table the GEMM stages consume).
+// Routing (Renormalize top-k over the routing logits, or the permutation tables of pre-computed
+// top-k expert ids; writes every table the GEMM stages consume).
 // ------------------------------------------------------------------------------------------------
+// Which routing input a kernel variant reads.
+enum class RoutingInput : int {
+  kScores = 0,   // routing_logits [num_tokens, num_experts] (logits_dtype); computes the top-k
+  kTopKIds = 1,  // topk_ids [num_tokens, top_k] int32 (+ topk_weights as an input); tables only
+};
+
 struct RoutingArgs {
-  const void*
-      routing_logits;  // [num_tokens, num_experts], dtype per RoutingKernelSpec::logits_dtype
-  int* topk_packed;    // [num_tokens, top_k] packed (bf16 score, int16 expert) as the native kernel
-                       // writes
-  void* topk_weights;  // [num_tokens, top_k] bf16 expert weights
+  const void* routing_logits;  // kScores: [num_tokens, num_experts], dtype per
+                               // RoutingKernelSpec::logits_dtype; nullptr on the kTopKIds path
+  const int* topk_ids;         // kTopKIds: [num_tokens, top_k] expert ids; nullptr on kScores
+  int* topk_packed;  // [num_tokens, top_k] packed (bf16 score, int16 expert) as the native kernel
+                     // writes (kScores); untouched on the kTopKIds path, where the caller may alias
+                     // it to topk_ids exactly as the trtllm-gen launcher does
+  void* topk_weights;  // [num_tokens, top_k] bf16 expert weights: written on the kScores path, a
+                       // caller-provided input (not written) on the kTopKIds path
   int* expert_count_histogram;        // max(2 * num_experts, 512) int32 scratch
   int* total_num_padded_tokens;       // [1]
   int* expanded_idx_to_permuted_idx;  // [num_tokens * top_k], -1 when the expert is not local
@@ -77,24 +88,40 @@ struct RoutingArgs {
 enum class RoutingGrid : int {
   kFixed = 0,        // grid = RoutingKernelSpec::grid (a fixed CTA count, e.g. the cluster kernel)
   kTokenBlocks = 1,  // grid.x = ceil(num_tokens / RoutingKernelSpec::tokens_per_cta)
+  kCoopSms = 2,      // grid.x = the device's SM count minus the reserved SMs of the trtllm-gen
+                     // overlap policy (moe::dev::routing::getCoopLaunchSMCounts: 8 by default,
+                     // FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS), resolved at run time
+                     // (152 -> 144 on B300, 148 -> 140 on B200); the cooperative kernel
 };
 
 using RoutingSubmitFn = cudaError_t (*)(const cudaLaunchConfig_t*, const RoutingArgs&);
 
+// One routing launch sequence: the kernel `symbol`, optionally preceded by the kernel
+// `pre_symbol` on the same stream with the same arguments (the histogram-scores kernel of the
+// two-kernel large-token path; pre_submit == nullptr when the variant is a single kernel).
 struct RoutingKernelSpec {
   const char* symbol;
-  // Logits dtype the kernel reads: 0 = float32, 1 = bfloat16.
+  RoutingInput input;
+  // Logits dtype the kernel reads on the kScores path: 0 = float32, 1 = bfloat16 (-1 for
+  // kTopKIds variants, which read no logits).
   int logits_dtype;
   // Token range the kernel variant serves ([min_tokens, max_tokens]; the host picks the first
-  // match), mirroring the native dispatcher's per-token-count kernel selection.
+  // match of the input kind), mirroring the native dispatcher's per-token-count kernel selection.
   int min_tokens;
   int max_tokens;
   RoutingGrid grid_rule;
   uint32_t grid[3];
   int tokens_per_cta;
+  // Largest number of expanded indices (tokens x top_k) one thread of the kernel visits, or 0 when
+  // the kernel is not bounded that way; the host checks num_tokens * top_k <= grid.x * block.x *
+  // max_expanded_per_thread before launching (the cooperative kernel's capacity rule).
+  int max_expanded_per_thread;
   uint32_t block[3];
   uint32_t cluster[3];
   bool cluster_attribute;
+  // Launch `symbol` with cudaLaunchAttributeCooperative (grid-wide synchronization); the grid must
+  // be co-resident, which the kCoopSms rule guarantees.
+  bool cooperative;
   // True when the kernel writes benign entries into the routing tail [num_non_exiting_ctas,
   // max_num_ctas) (expert 0, mn_limit = tile * tile_tokens_dim, permuted slots -1), so no padding
   // kernel is needed before GEMM units that acquire surplus tiles through cluster launch control.
@@ -102,6 +129,14 @@ struct RoutingKernelSpec {
   size_t dynamic_smem_bytes;
   ConfigureFn configure;
   RoutingSubmitFn submit;
+  // Optional kernel launched immediately before `symbol` (nullptr submit = none). Launched with the
+  // caller's PDL flag only (no cluster, not cooperative) on a fixed grid.
+  const char* pre_symbol;
+  uint32_t pre_grid[3];
+  uint32_t pre_block[3];
+  size_t pre_dynamic_smem_bytes;
+  ConfigureFn pre_configure;
+  RoutingSubmitFn pre_submit;
 };
 
 // ------------------------------------------------------------------------------------------------
@@ -202,11 +237,12 @@ struct RequantKernelSpec {
 };
 
 // ------------------------------------------------------------------------------------------------
-// Finalize (unpermute + top-k weighted sum, bf16 in / bf16 expert weights / bf16 out).
+// Finalize (unpermute + top-k weighted sum, bf16 in / bf16 or fp32 expert weights / bf16 out).
 // ------------------------------------------------------------------------------------------------
 struct FinalizeArgs {
   const __nv_bfloat16* input;               // [max_padded_tokens, hidden_dim_padded]
-  const __nv_bfloat16* expert_weights;      // [num_tokens, top_k]
+  const void* expert_weights;               // [num_tokens, top_k], dtype per
+                                            // FinalizeKernelSpec::expert_weights_dtype
   __nv_bfloat16* output;                    // [num_tokens, hidden_dim]
   const int* expanded_idx_to_permuted_idx;  // [num_tokens * top_k], -1 = skip
   const int* total_num_padded_tokens;       // [1]
@@ -228,6 +264,10 @@ using FinalizeSubmitFn = cudaError_t (*)(const cudaLaunchConfig_t*, const Finali
 struct FinalizeKernelSpec {
   const char* symbol;
   FinalizeVariant variant;
+  // Expert-weight dtype the kernel reads: 0 = float32, 1 = bfloat16 (the routing stage writes
+  // bf16; pre-computed top-k weights arrive in either dtype). The host selects the kernel whose
+  // variant and dtype match the forward.
+  int expert_weights_dtype;
   int max_top_k;  // kVector: largest top_k the unit supports; kScalar: 0 (unbounded)
   uint32_t block[3];
   size_t dynamic_smem_bytes;

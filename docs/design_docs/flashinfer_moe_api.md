@@ -805,10 +805,13 @@ fused-MoE pipeline with exported Cake kernels in the FC1 stage and, when the
 generated inventory covers them (`fused_moe_cake_stepfun_full_*`), in the
 routing, FC2, requantization and finalize stages as well. It is not in the
 default backend list; weights must come from `CakeStepFunConfig.prepare_weights`
-(view `cake_stepfun`). A tactic is the FC1 tile x GEMM configuration; tiles
-without an exported kernel have no tactic and `tactic=-1` picks the smallest
-exported tile of the token window. The full path routes `Renormalize` from
-logits only and has no fused shared experts. The host contract lives in
+(view `cake_stepfun`). A tactic is the FC1 tile x GEMM configuration; the
+module restricts the trtllm-gen tile ladder to the tiles with exported Cake
+kernels in every Cake stage, so neither the tactic windows nor `tactic=-1` (the
+smallest exported tile of the token window) can name a tile without a kernel.
+The full path routes `Renormalize` from logits or from unpacked pre-computed
+top-k ids + weights (each when the inventory exports that routing variant) and
+has no fused shared experts. The host contract lives in
 `csrc/fused_moe/cake_stepfun/README.md`.
 
 The class-level matrix below is generated from the registered runner classes.

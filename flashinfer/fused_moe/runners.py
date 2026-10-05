@@ -6805,8 +6805,14 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
     tile sizes they cover; on the full Cake path (``fused_moe_cake_stepfun_full_*``,
     see :attr:`full_path`) routing, GEMM2, the NVFP4 per-token requantization and
     finalize are Cake kernels too. A tactic is the FC1 tile (``tile_N``) x the
-    GEMM configuration index; tiles without an exported kernel have no tactic
-    and ``tactic=-1`` resolves to :meth:`default_tactic`.
+    GEMM configuration index. The module restricts the trtllm-gen tile ladder to
+    the tiles with exported Cake kernels in every Cake stage of the build, so the
+    tactic windows and the default tactic (``tactic=-1``, :meth:`default_tactic`)
+    never name a tile without a kernel. On the full path the Cake router reads
+    routing logits (``RoutingInputMode.FromLogits``) or unpacked pre-computed
+    top-k ids + weights (``RoutingInputMode.UnpackedPrecomputed``), each only when
+    the generated inventory exports that routing variant (and, for pre-computed
+    weights, a finalize variant of their dtype); other protocols raise.
 
     The weight view must come from :meth:`CakeStepFunConfig.prepare_weights`:
     the Cake kernels read the per-expert ``gemm1_clamp_limit`` and have no
@@ -6924,20 +6930,61 @@ class CakeStepFunRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} requires the per-expert gemm1_clamp_limit "
                 "produced by CakeStepFunConfig.prepare_weights in the 'cake_stepfun' view."
             )
-        if self.full_path and act.routing_input_mode is not RoutingInputMode.FromLogits:
-            raise NotImplementedError(
-                f"{type(self).__name__} on the full Cake path routes from logits "
-                "(RoutingInputMode.FromLogits) only, got "
-                f"routing_input_mode={act.routing_input_mode!r}."
-            )
+        if self.full_path:
+            self._check_full_path_routing_protocol(act)
         return super().pack_inputs(act, weights)
+
+    def _check_full_path_routing_protocol(self, act: MoEActivationPack) -> None:
+        """Reject routing protocols the exported Cake routing / finalize kernels do not serve."""
+        from ..jit.cake_stepfun_moe import (
+            cake_stepfun_finalize_weight_dtypes,
+            cake_stepfun_routing_inputs,
+        )
+
+        name = type(self).__name__
+        mode = act.routing_input_mode
+        if mode is RoutingInputMode.FromLogits:
+            kind = "scores"
+        elif mode is RoutingInputMode.UnpackedPrecomputed:
+            kind = "topk_ids"
+        else:
+            raise NotImplementedError(
+                f"{name} on the full Cake path routes from logits "
+                "(RoutingInputMode.FromLogits) or from unpacked pre-computed top-k ids "
+                "and weights (RoutingInputMode.UnpackedPrecomputed); the Cake router has "
+                f"no variant for routing_input_mode={mode!r}."
+            )
+        inputs = cake_stepfun_routing_inputs(self.target)
+        if kind not in inputs:
+            raise NotImplementedError(
+                f"{name} on the full Cake path: the generated inventory has no routing "
+                f"kernel reading {kind} for {self.target} (exported routing inputs: "
+                f"{', '.join(sorted(inputs)) or 'none'}), so "
+                f"routing_input_mode={mode!r} is unavailable."
+            )
+        if (
+            mode is RoutingInputMode.UnpackedPrecomputed
+            and act.topk_weights is not None
+        ):
+            weights_dtype = {
+                torch.float32: "float32",
+                torch.bfloat16: "bfloat16",
+            }.get(act.topk_weights.dtype, str(act.topk_weights.dtype))
+            dtypes = cake_stepfun_finalize_weight_dtypes(self.target)
+            if weights_dtype not in dtypes:
+                raise NotImplementedError(
+                    f"{name} on the full Cake path: the generated inventory has no "
+                    f"finalize kernel reading {weights_dtype} expert weights for "
+                    f"{self.target} (exported: {', '.join(sorted(dtypes)) or 'none'}); "
+                    "pass topk_weights in an exported dtype."
+                )
 
     def default_tactic(self, inputs: List[torch.Tensor]) -> Any:
         """Tactic ``forward`` runs for ``tactic=-1``.
 
         The native default policy (smallest FC1 tile of the token-count window,
-        first GEMM configuration) restricted to the tiles with exported Cake
-        kernels; the Cake backend has no native fallback for the other tiles.
+        first GEMM configuration) over the tile ladder of exported Cake kernels;
+        the Cake backend has no native fallback for the other tiles.
         """
         tactics = self.get_valid_tactics(inputs, None)
         if not tactics:

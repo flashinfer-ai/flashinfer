@@ -28,6 +28,7 @@
 
 #include "cake_stepfun_routing_tail.cuh"
 #include "flashinfer/exception.h"
+#include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 
 namespace tensorrt_llm {
@@ -164,9 +165,6 @@ void RoutingRunner::run(
   FLASHINFER_CHECK(routingMethodType == Routing::RoutingMethodType::Renormalize,
                    "Cake StepFun routing serves RoutingMethodType::Renormalize only, got ",
                    Routing::serializeMoeRoutingMethodType(routingMethodType));
-  FLASHINFER_CHECK(expertIds == nullptr && routingLogits != nullptr,
-                   "Cake StepFun routing computes the expert selection from routing_logits; "
-                   "pre-computed expert ids are not supported");
   FLASHINFER_CHECK(numFusedSharedExpert == 0,
                    "Cake StepFun routing does not support fused shared experts");
   FLASHINFER_CHECK(routing_replay_out == nullptr,
@@ -177,24 +175,45 @@ void RoutingRunner::run(
   FLASHINFER_CHECK(!useRoutingScalesOnInput && !useDeepSeekFp8,
                    "Cake StepFun routing does not support routing scales on the input or "
                    "DeepSeek FP8");
-  FLASHINFER_CHECK(dtypeLogits == btg::Dtype::Fp32 || dtypeLogits == btg::Dtype::Bfloat16,
-                   "Cake StepFun routing reads float32 or bfloat16 routing logits");
-  int const logitsDtype = dtypeLogits == btg::Dtype::Fp32 ? 0 : 1;
+  // Same input selection as Routing::Runner: pre-computed expert ids take precedence over the
+  // logits (mPtrScores = nullptr when mPtrTopKIds is given), and the pre-computed path needs the
+  // caller's top-k weights.
+  bool const fromIds = expertIds != nullptr;
+  generated::RoutingInput const input =
+      fromIds ? generated::RoutingInput::kTopKIds : generated::RoutingInput::kScores;
+  int logitsDtype = -1;
+  if (fromIds) {
+    FLASHINFER_CHECK(expertWeights != nullptr,
+                     "Cake StepFun routing from pre-computed top-k ids requires the top-k weights");
+  } else {
+    FLASHINFER_CHECK(routingLogits != nullptr,
+                     "Cake StepFun routing requires routing_logits or pre-computed top-k ids");
+    FLASHINFER_CHECK(dtypeLogits == btg::Dtype::Fp32 || dtypeLogits == btg::Dtype::Bfloat16,
+                     "Cake StepFun routing reads float32 or bfloat16 routing logits");
+    logitsDtype = dtypeLogits == btg::Dtype::Fp32 ? 0 : 1;
+  }
+  char const* const inputName = fromIds            ? "pre-computed top-k ids"
+                                : logitsDtype == 0 ? "float32 logits"
+                                                   : "bfloat16 logits";
 
   generated::RoutingKernelSpec const* spec = nullptr;
   for (size_t index = 0; index < generated::kRoutingKernelCount; ++index) {
     auto const& candidate = generated::kRoutingKernels[index];
-    if (candidate.logits_dtype == logitsDtype && candidate.min_tokens <= numTokens &&
-        numTokens <= candidate.max_tokens) {
+    if (candidate.input != input) continue;
+    if (!fromIds && candidate.logits_dtype != logitsDtype) continue;
+    if (candidate.min_tokens <= numTokens && numTokens <= candidate.max_tokens) {
       spec = &candidate;
       break;
     }
   }
   FLASHINFER_CHECK(spec != nullptr, "No Cake StepFun routing kernel serves num_tokens=", numTokens,
-                   " with ", logitsDtype == 0 ? "float32" : "bfloat16", " logits");
+                   " from ", inputName,
+                   " (the generated inventory has no routing variant of that input kind and token "
+                   "range)");
 
   generated::RoutingArgs args{};
-  args.routing_logits = routingLogits;
+  args.routing_logits = fromIds ? nullptr : routingLogits;
+  args.topk_ids = expertIds;
   args.topk_packed = routingExpertIndexes;
   args.topk_weights = expertWeights;
   args.expert_count_histogram = expertCountHistogram;
@@ -213,24 +232,81 @@ void RoutingRunner::run(
   args.tile_tokens_dim = mTileTokensDim;
   args.max_num_ctas = Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
+  size_t const specIndex = static_cast<size_t>(spec - generated::kRoutingKernels);
   static std::vector<bool> configured(generated::kRoutingKernelCount, false);
-  configureSmem(*spec, configured, static_cast<size_t>(spec - generated::kRoutingKernels),
-                "routing");
+  static std::vector<bool> preConfigured(generated::kRoutingKernelCount, false);
+  configureSmem(*spec, configured, specIndex, "routing");
+
+  // Grid of the main kernel.
+  dim3 grid(1u, 1u, 1u);
+  switch (spec->grid_rule) {
+    case generated::RoutingGrid::kFixed:
+      grid = dim3(spec->grid[0], spec->grid[1], spec->grid[2]);
+      break;
+    case generated::RoutingGrid::kTokenBlocks:
+      FLASHINFER_CHECK(spec->tokens_per_cta > 0, "Cake StepFun routing kernel ", spec->symbol,
+                       " declares no tokens_per_cta");
+      grid =
+          dim3(static_cast<unsigned>((numTokens + spec->tokens_per_cta - 1) / spec->tokens_per_cta),
+               1u, 1u);
+      break;
+    case generated::RoutingGrid::kCoopSms: {
+      // The trtllm-gen cooperative budget: device SM count minus the reserved overlap SMs
+      // (same helper, same environment variable, same one-time log line as the native path).
+      int device = 0;
+      cudaError_t rc = cudaGetDevice(&device);
+      FLASHINFER_CHECK(rc == cudaSuccess, "cudaGetDevice failed: ", cudaGetErrorString(rc));
+      int smCount = 0;
+      rc = cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device);
+      FLASHINFER_CHECK(
+          rc == cudaSuccess && smCount > 0,
+          "cudaDeviceGetAttribute(MultiProcessorCount) failed: ", cudaGetErrorString(rc));
+      moe::dev::routing::CoopLaunchSMCounts const counts =
+          moe::dev::routing::getCoopLaunchSMCounts(smCount);
+      moe::dev::routing::logCoopLaunchSMCounts(counts);
+      grid = dim3(static_cast<unsigned>(counts.moeSms), 1u, 1u);
+      break;
+    }
+  }
+  if (spec->max_expanded_per_thread > 0) {
+    int64_t const capacity = static_cast<int64_t>(grid.x) * spec->block[0] *
+                             static_cast<int64_t>(spec->max_expanded_per_thread);
+    FLASHINFER_CHECK(static_cast<int64_t>(numTokens) * topK <= capacity,
+                     "Cake StepFun routing kernel ", spec->symbol, " covers at most ",
+                     capacity / topK, " tokens on this device (grid ", grid.x, " x block ",
+                     spec->block[0], " x ", spec->max_expanded_per_thread,
+                     " expanded indices per thread), got num_tokens=", numTokens);
+  }
+
+  // Optional leading kernel (the histogram-scores kernel of the large-token path).
+  if (spec->pre_submit != nullptr) {
+    if (!preConfigured[specIndex]) {
+      cudaError_t const rc = spec->pre_configure(spec->pre_dynamic_smem_bytes);
+      FLASHINFER_CHECK(rc == cudaSuccess, "Cake StepFun routing: cudaFuncSetAttribute(",
+                       "MaxDynamicSharedMemorySize=", spec->pre_dynamic_smem_bytes, ") failed for ",
+                       spec->pre_symbol, ": ", cudaGetErrorString(rc));
+      preConfigured[specIndex] = true;
+    }
+    cudaLaunchConfig_t preConfig{};
+    preConfig.gridDim = dim3(spec->pre_grid[0], spec->pre_grid[1], spec->pre_grid[2]);
+    preConfig.blockDim = dim3(spec->pre_block[0], spec->pre_block[1], spec->pre_block[2]);
+    preConfig.dynamicSmemBytes = spec->pre_dynamic_smem_bytes;
+    preConfig.stream = stream;
+    cudaLaunchAttribute preAttribute = pdlAttribute();
+    preConfig.attrs = &preAttribute;
+    preConfig.numAttrs = enable_pdl ? 1u : 0u;
+    cudaError_t const preLaunched = spec->pre_submit(&preConfig, args);
+    FLASHINFER_CHECK(preLaunched == cudaSuccess, "Cake StepFun routing launch failed for ",
+                     spec->pre_symbol, " num_tokens=", numTokens, " : ",
+                     cudaGetErrorString(preLaunched));
+  }
 
   cudaLaunchConfig_t config{};
-  if (spec->grid_rule == generated::RoutingGrid::kFixed) {
-    config.gridDim = dim3(spec->grid[0], spec->grid[1], spec->grid[2]);
-  } else {
-    FLASHINFER_CHECK(spec->tokens_per_cta > 0, "Cake StepFun routing kernel ", spec->symbol,
-                     " declares no tokens_per_cta");
-    config.gridDim =
-        dim3(static_cast<unsigned>((numTokens + spec->tokens_per_cta - 1) / spec->tokens_per_cta),
-             1u, 1u);
-  }
+  config.gridDim = grid;
   config.blockDim = dim3(spec->block[0], spec->block[1], spec->block[2]);
   config.dynamicSmemBytes = spec->dynamic_smem_bytes;
   config.stream = stream;
-  std::array<cudaLaunchAttribute, 2> attributes{};
+  std::array<cudaLaunchAttribute, 3> attributes{};
   unsigned numAttrs = 0;
   if (enable_pdl) attributes[numAttrs++] = pdlAttribute();
   if (spec->cluster_attribute) {
@@ -240,11 +316,17 @@ void RoutingRunner::run(
     attributes[numAttrs].val.clusterDim.z = spec->cluster[2];
     ++numAttrs;
   }
+  if (spec->cooperative) {
+    attributes[numAttrs].id = cudaLaunchAttributeCooperative;
+    attributes[numAttrs].val.cooperative = 1;
+    ++numAttrs;
+  }
   config.attrs = attributes.data();
   config.numAttrs = numAttrs;
   cudaError_t const launched = spec->submit(&config, args);
   FLASHINFER_CHECK(launched == cudaSuccess, "Cake StepFun routing launch failed for ", spec->symbol,
-                   " num_tokens=", numTokens, " : ", cudaGetErrorString(launched));
+                   " num_tokens=", numTokens, " grid=", grid.x, " : ",
+                   cudaGetErrorString(launched));
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -538,9 +620,12 @@ namespace finalize {
 
 void run(moe::dev::finalize::Data const& data, cudaStream_t stream) {
   FLASHINFER_CHECK(!data.mUseDeepSeekFp8, "Cake StepFun finalize does not serve DeepSeek FP8");
-  FLASHINFER_CHECK(
-      data.mDtypeElt == btg::Dtype::Bfloat16 && data.mDtypeExpW == btg::Dtype::Bfloat16,
-      "Cake StepFun finalize reads bf16 FC2 output and bf16 expert weights");
+  FLASHINFER_CHECK(data.mDtypeElt == btg::Dtype::Bfloat16,
+                   "Cake StepFun finalize reads the bf16 FC2 output");
+  FLASHINFER_CHECK(data.mDtypeExpW == btg::Dtype::Bfloat16 || data.mDtypeExpW == btg::Dtype::Fp32,
+                   "Cake StepFun finalize reads bfloat16 or float32 expert weights");
+  int const expertWeightsDtype = data.mDtypeExpW == btg::Dtype::Fp32 ? 0 : 1;
+  char const* const expertWeightsName = expertWeightsDtype == 0 ? "float32" : "bfloat16";
   FLASHINFER_CHECK(data.inDqSfsPtr == nullptr && data.outDqSfsPtr == nullptr,
                    "Cake StepFun finalize consumes no dequantization scales");
   FLASHINFER_CHECK(data.expertWeightsPtr != nullptr,
@@ -555,14 +640,17 @@ void run(moe::dev::finalize::Data const& data, cudaStream_t stream) {
                                                  : generated::FinalizeVariant::kVector;
   generated::FinalizeKernelSpec const* spec = nullptr;
   for (size_t index = 0; index < generated::kFinalizeKernelCount; ++index) {
-    if (generated::kFinalizeKernels[index].variant == variant) {
-      spec = &generated::kFinalizeKernels[index];
+    auto const& candidate = generated::kFinalizeKernels[index];
+    if (candidate.variant == variant && candidate.expert_weights_dtype == expertWeightsDtype) {
+      spec = &candidate;
       break;
     }
   }
   FLASHINFER_CHECK(spec != nullptr, "No Cake StepFun finalize kernel of variant ",
-                   variant == generated::FinalizeVariant::kScalar ? "scalar" : "vector",
-                   " (hidden_dim=", data.hiddenDim, ", num_tokens=", data.numTokens, ")");
+                   variant == generated::FinalizeVariant::kScalar ? "scalar" : "vector", " reads ",
+                   expertWeightsName, " expert weights (hidden_dim=", data.hiddenDim,
+                   ", num_tokens=", data.numTokens,
+                   "; the generated inventory has no finalize variant for that dtype)");
   FLASHINFER_CHECK(spec->max_top_k <= 0 || data.topK <= spec->max_top_k,
                    "Cake StepFun finalize kernel ", spec->symbol,
                    " supports top_k <= ", spec->max_top_k, ", got ", data.topK);
@@ -573,7 +661,7 @@ void run(moe::dev::finalize::Data const& data, cudaStream_t stream) {
 
   generated::FinalizeArgs args{};
   args.input = static_cast<__nv_bfloat16 const*>(data.inPtr);
-  args.expert_weights = static_cast<__nv_bfloat16 const*>(data.expertWeightsPtr);
+  args.expert_weights = data.expertWeightsPtr;
   args.output = static_cast<__nv_bfloat16*>(data.outPtr);
   args.expanded_idx_to_permuted_idx = data.expandedIdxToPermutedIdx;
   args.total_num_padded_tokens = data.totalNumPaddedTokens;

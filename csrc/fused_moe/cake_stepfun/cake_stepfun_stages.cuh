@@ -48,9 +48,11 @@ namespace cake_stepfun {
 bool routingWritesBenignTail();
 
 // Routing stage. Same constructor and run() argument list as Routing::Runner; serves
-// RoutingMethodType::Renormalize from logits only and rejects (does not fall back for) every other
-// method, pre-computed expert ids, fused shared experts, routing replay output and the GEMM1 Mn
-// bias row map.
+// RoutingMethodType::Renormalize from float32 / bfloat16 logits or from pre-computed top-k ids
+// (+ weights, the trtllm-gen launcher's unpacked pre-routed protocol) and rejects (does not fall
+// back for) every other method, fused shared experts, routing replay output and the GEMM1 Mn bias
+// row map. A variant is one kernel, or the two-kernel large-token sequence (histogram-scores
+// kernel, then the cooperative kernel on the device's cooperative SM budget).
 class RoutingRunner {
  public:
   explicit RoutingRunner(int32_t tileTokensDim) : mTileTokensDim(tileTokensDim) {}

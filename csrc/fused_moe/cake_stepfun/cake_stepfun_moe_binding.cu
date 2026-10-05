@@ -499,9 +499,37 @@ void cake_stepfun_requant(TensorView const& gemm1_output,
       get_stream(device), enable_pdl);
 }
 
+/** Routing input kinds (``scores``, ``topk_ids``) with an exported Cake routing kernel. */
+Array<String> cake_stepfun_routing_inputs() {
+  Array<String> inputs;
+  for (auto input : {generated::RoutingInput::kScores, generated::RoutingInput::kTopKIds}) {
+    for (size_t index = 0; index < generated::kRoutingKernelCount; ++index) {
+      if (generated::kRoutingKernels[index].input == input) {
+        inputs.push_back(String(input == generated::RoutingInput::kScores ? "scores" : "topk_ids"));
+        break;
+      }
+    }
+  }
+  return inputs;
+}
+
+/** Expert-weight dtypes (``float32``, ``bfloat16``) with an exported Cake finalize kernel. */
+Array<String> cake_stepfun_finalize_weight_dtypes() {
+  Array<String> dtypes;
+  for (int dtype : {0, 1}) {
+    for (size_t index = 0; index < generated::kFinalizeKernelCount; ++index) {
+      if (generated::kFinalizeKernels[index].expert_weights_dtype == dtype) {
+        dtypes.push_back(String(dtype == 0 ? "float32" : "bfloat16"));
+        break;
+      }
+    }
+  }
+  return dtypes;
+}
+
 /**
  * Run the Cake finalize stage: unpermute the bf16 FC2 output and reduce the top-k experts of
- * every token with ``expert_weights`` (bf16 [num_tokens, top_k]) into ``output``
+ * every token with ``expert_weights`` (bf16 or fp32 [num_tokens, top_k]) into ``output``
  * (bf16 [num_tokens, hidden_size]).
  */
 void cake_stepfun_finalize(TensorView const& gemm2_output, TensorView const& expert_weights,
@@ -514,7 +542,8 @@ void cake_stepfun_finalize(TensorView const& gemm2_output, TensorView const& exp
   checkTensor(gemm2_output, "gemm2_output", 2, device);
   checkDtype(gemm2_output, "gemm2_output", dl_bfloat16);
   checkTensor(expert_weights, "expert_weights", 2, device);
-  checkDtype(expert_weights, "expert_weights", dl_bfloat16);
+  TVM_FFI_ICHECK(expert_weights.dtype() == dl_bfloat16 || expert_weights.dtype() == dl_float32)
+      << "cake_stepfun_finalize: expert_weights must be bfloat16 or float32.";
   checkTensor(expanded_idx_to_permuted_idx, "expanded_idx_to_permuted_idx", 1, device);
   checkDtype(expanded_idx_to_permuted_idx, "expanded_idx_to_permuted_idx", dl_int32);
   checkTensor(total_num_padded_tokens, "total_num_padded_tokens", 1, device);
@@ -532,7 +561,7 @@ void cake_stepfun_finalize(TensorView const& gemm2_output, TensorView const& exp
       << "cake_stepfun_finalize: output width exceeds the FC2 output row stride.";
   moe::dev::finalize::Data data{};
   data.mDtypeElt = btg::Dtype::Bfloat16;
-  data.mDtypeExpW = btg::Dtype::Bfloat16;
+  data.mDtypeExpW = expert_weights.dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
   data.mUsePdl = enable_pdl;
   data.mUseDeepSeekFp8 = false;
   data.inPtr = gemm2_output.data_ptr();
@@ -555,6 +584,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc1, cake_stepfun_fc1);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_full_path, cake_stepfun_full_path);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_stages, cake_stepfun_stages);
 #ifdef CAKE_STEPFUN_FULL
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_routing_inputs, cake_stepfun_routing_inputs);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_finalize_weight_dtypes,
+                              cake_stepfun_finalize_weight_dtypes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc2_tiles, cake_stepfun_fc2_tiles);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_stepfun_fc2_activation_sf_layout,
                               cake_stepfun_fc2_activation_sf_layout);

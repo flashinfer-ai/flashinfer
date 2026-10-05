@@ -22,9 +22,16 @@ exactly when the inventory lists kernels of every stage for the target
 stage) and disabled by `FLASHINFER_CAKE_STEPFUN_FULL_PATH=0`. The FC1-only module
 runs the trtllm-gen routing, GEMM2 and finalize kernels of the public artifact.
 
-The stages a (family, tile) pair does not cover have **no fallback**: the tile has
-no tactic, and an explicit or default selection of it fails with the family, the
-tile and the exported tiles.
+The stages a (family, tile) pair does not cover have **no fallback**. The module
+restricts the trtllm-gen tile ladder of every launcher it serves to the tiles
+with exported Cake kernels in every Cake stage of the build (FC1; FC2 as well on
+the full path), on the C++ side (`cakeStepFunTileLadder` in
+`csrc/trtllm_fused_moe_kernel_launcher.cu`, which feeds both the tactic windows
+of `trtllm_get_valid_moe_configs` and the default-tactic fallback of the entry
+points) and therefore on the Python runner: no caller can reach a tile without a
+kernel, and a shape whose family exports no tile at all fails naming the family
+and the ladder. An explicit tactic on an unexported tile fails at the launcher
+map ("missing ... launcher for tile_N").
 
 ## Hand-written sources
 
@@ -60,9 +67,9 @@ pairs of the kernel signature), `block`, `cluster`, `dynamic_smem_bytes` and
 | stage | record keys | uniqueness |
 |---|---|---|
 | `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`, `bounds_acquired_tiles`; `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`) and `split_k` (1, or the cluster split-K factor) | one record per (arch, stage, family, tile), every tile of the family mapping present |
-| `routing` | `variant`, `logits_dtype` (`float32` / `bfloat16`), `min_tokens`, `max_tokens`, `grid_rule` (`fixed` / `token_blocks`), `grid`, `tokens_per_cta`, `writes_benign_tail` | one record per (arch, stage, variant) |
+| `routing` | `variant`, `input` (`scores` / `topk_ids`), `logits_dtype` (`float32` / `bfloat16`; `none` for `topk_ids`), `min_tokens`, `max_tokens`, `grid_rule` (`fixed` / `token_blocks` / `coop_sms`), `grid`, `tokens_per_cta`, `max_expanded_per_thread`, `cooperative`, `writes_benign_tail`, optional `pre_kernel` (`{kernel_symbol, device, grid, block, dynamic_smem_bytes}`: the leading kernel of the two-kernel large-token path; its `device` unit is listed in `files` and compiled with the record's `compile_flags`) | one record per (arch, stage, variant) |
 | `requant` | `variant`, `sf_layout`, `rows_per_cta` | one record per (arch, stage, variant) |
-| `finalize` | `variant` (`scalar` / `vector`), `max_top_k` | one record per (arch, stage, variant) |
+| `finalize` | `variant` (`scalar` / `vector`, unique per dtype, e.g. `scalar_bf16`), `expert_weights_dtype` (`float32` / `bfloat16`), `max_top_k` | one record per (arch, stage, variant) |
 
 A target with any kernel must have `fc1` kernels. The manifest must define the
 kernel table of every stage the inventory lists (`kFc1Kernels`, `kRoutingKernels`,
@@ -81,9 +88,12 @@ pointer-vs-descriptor form of each operand are the unit's business.
 
 The FC1 types (`TensorLayout`, `Fc1Family`, `Fc1Args`, `Fc1KernelSpec`) are
 defined in the manifest; the types of the other stages are defined in
-`cake_stepfun_abi.cuh`, which includes the manifest. Every table is
-`inline constexpr <Spec> k<Stage>Kernels[]` with
-`inline constexpr size_t k<Stage>KernelCount`.
+`cake_stepfun_abi.cuh`, which includes the manifest, and the tables + `Submit`
+thunks of those stages live in a second generated header
+(`generated/cake_stepfun_generated_stages.cuh`) included at the end of the ABI
+header. Every table is `inline constexpr <Spec> k<Stage>Kernels[]` with
+`inline constexpr size_t k<Stage>KernelCount`; the field order of every `*Spec`
+is the contract (tables are rendered positionally).
 
 ## Stage contracts
 
@@ -97,28 +107,52 @@ wait with `griddepcontrol.wait` before their first global read and trigger
 ### Routing (`RoutingArgs`, `RoutingKernelSpec`)
 
 Renormalize top-k (top-k over the logits, then softmax over the selected
-scores) with routed experts only. Inputs: `routing_logits` `[T, num_experts]`
-(`logits_dtype` selects the kernel), `num_experts`, `top_k`,
-`local_expert_offset`, `local_num_experts`, `tile_tokens_dim`, `max_num_ctas`.
-Outputs (the trtllm-gen routing tables, byte for byte): `topk_packed`
-`[T, top_k]` (packed bf16 score / int16 expert as the native router stores it),
-`topk_weights` bf16 `[T, top_k]`, `expert_count_histogram` (scratch,
-`max(2 * num_experts, 512)` int32), `total_num_padded_tokens[1]`,
+scores) with routed experts only, or the permutation tables of pre-computed
+top-k ids. Two input kinds, selected by the host from the call (pre-computed
+ids take precedence over logits, as in `Routing::Runner`):
+
+* `scores`: `routing_logits` `[T, num_experts]` (`logits_dtype` selects the
+  kernel); writes `topk_packed` and the bf16 `topk_weights`.
+* `topk_ids`: `topk_ids` `[T, top_k]` int32 plus the caller's `topk_weights`
+  (read-only input, never written; the launcher aliases `topk_packed` to the ids
+  tensor, so the kernel must not write `topk_packed` either). This is the
+  unpacked pre-routed protocol of the fused-MoE benchmark.
+
+Common inputs: `num_experts`, `top_k`, `local_expert_offset`,
+`local_num_experts`, `tile_tokens_dim`, `max_num_ctas`. Outputs (the trtllm-gen
+routing tables, byte for byte): `expert_count_histogram` (scratch, `max(2 *
+num_experts, 512)` int32), `total_num_padded_tokens[1]`,
 `expanded_idx_to_permuted_idx[T * top_k]` (-1 for non-local experts),
 `permuted_idx_to_token_idx[max_padded + 1]` (-1 in padded slots),
 `cta_idx_xy_to_batch_idx[max_ctas]`, `cta_idx_xy_to_mn_limit[max_ctas]`,
 `num_non_exiting_ctas[1]`, and `num_tokens_per_expert[num_experts]` when the
-pointer is non-null. The host selects the first table entry whose
-`logits_dtype` matches and whose `[min_tokens, max_tokens]` contains `T`; the
-grid is either fixed (`grid_rule = kFixed`, cluster kernels) or
-`ceil(T / tokens_per_cta)` blocks. A kernel with `writes_benign_tail` fills
-`[num_non_exiting_ctas, max_num_ctas)` with expert 0 / `mn_limit = tile_idx *
-tile` / slot -1 so the GEMM stages never launch the routing-tail kernel.
+pointer is non-null (the host passes every buffer through unchanged). The two
+permutation maps are assigned in atomic arrival order inside the cluster and
+cooperative kernels (T >= 17), exactly as the reference does; they are therefore
+compared canonically, not byte for byte.
 
-Rejected (not supported, no fallback): every other `RoutingMethodType`,
-pre-computed expert ids, fused shared experts, routing bias, routing scales on
-the input, DeepSeek FP8, `routing_replay_out`, `permuted_idx_to_expanded_idx`
-(the GEMM1 Mn-bias row map).
+Variant selection: the first table entry whose `input` (and, for `scores`,
+`logits_dtype`) matches and whose `[min_tokens, max_tokens]` contains `T`. A
+variant is one kernel or, for the large-token path, the two-kernel sequence of
+the reference: `pre_symbol` (the histogram-scores kernel, fixed `pre_grid` /
+`pre_block`, PDL only) followed by `symbol` (the cooperative kernel,
+`cooperative = true`, launched with the cooperative + PDL attributes). Grid
+rules: `kFixed` (`grid`, cluster kernels), `kTokenBlocks` (`ceil(T /
+tokens_per_cta)`), `kCoopSms` (the device's SM count minus the reserved overlap
+SMs through the trtllm-gen helper `getCoopLaunchSMCounts`: 152 -> 144 on B300,
+148 -> 140 on B200, `FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS` honoured); the
+table carries the rule, never a device-specific number. With
+`max_expanded_per_thread > 0` the host requires `T * top_k <= grid.x * block.x *
+max_expanded_per_thread` (the cooperative capacity rule). A kernel with
+`writes_benign_tail` fills `[num_non_exiting_ctas, max_num_ctas)` with expert 0
+/ `mn_limit = tile_idx * tile` / slot -1 so the GEMM stages never launch the
+routing-tail kernel; the Cake router sets it.
+
+Rejected (not supported, no fallback): every other `RoutingMethodType`, the
+packed pre-computed protocol (`PackedPrecomputed`), fused shared experts,
+routing bias, routing scales on the input, DeepSeek FP8, `routing_replay_out`,
+`permuted_idx_to_expanded_idx` (the GEMM1 Mn-bias row map), and an input kind
+or token range without an exported variant (the error names them).
 
 ### FC1 (`Fc1Args`, `Fc1KernelSpec`)
 
@@ -174,19 +208,23 @@ per-channel scales, output scales and valid (unpadded) dimensions smaller than
 ### Finalize (`FinalizeArgs`, `FinalizeKernelSpec`)
 
 Unpermute the bf16 FC2 output `[max_padded, hidden_dim_padded]` and reduce the
-`top_k` experts of each token with the bf16 `expert_weights[T, top_k]` into
-`output[T, hidden_dim]`, skipping `expanded_idx_to_permuted_idx == -1`. Two
-variants with the native dispatcher's rule: the `scalar` kernel (grid
-`(ceil(hidden_dim / 256), min(8192, T))`) when that grid has fewer than 1184
-CTAs, the `vector` kernel (grid `(T)`, 128-bit loads, `top_k <= max_top_k`)
-otherwise. DeepSeek FP8 (dequantization scales) is rejected.
+`top_k` experts of each token with `expert_weights[T, top_k]` (bf16 from the
+router, or fp32 / bf16 pre-computed weights; `expert_weights_dtype` of the
+kernel must match the forward's `mDtypeExpW`) into `output[T, hidden_dim]`,
+skipping `expanded_idx_to_permuted_idx == -1`. Two variants with the native
+dispatcher's rule: the `scalar` kernel (grid `(ceil(hidden_dim / 256),
+min(8192, T))`) when that grid has fewer than 1184 CTAs, the `vector` kernel
+(grid `(T)`, 128-bit loads, `top_k <= max_top_k`) otherwise. DeepSeek FP8
+(dequantization scales) and an expert-weight dtype without an exported kernel
+are rejected (the error names the variant and dtype).
 
 ## Standalone operations
 
 `cake_stepfun_fc1_families()`, `cake_stepfun_fc1_tiles(family)`,
 `cake_stepfun_fc1(...)` run on every module build; `cake_stepfun_stages()` lists
 the stages of the build in pipeline order and `cake_stepfun_full_path()` tells the
-variant. On the full path the module adds `cake_stepfun_fc2_tiles(family)`,
+variant. On the full path the module adds `cake_stepfun_routing_inputs()`,
+`cake_stepfun_finalize_weight_dtypes()`, `cake_stepfun_fc2_tiles(family)`,
 `cake_stepfun_fc2_activation_sf_layout(family, tile)`, `cake_stepfun_fc2(...)`,
 `cake_stepfun_requant(...)` and `cake_stepfun_finalize(...)`; routing alone is
 reachable through the module's `trtllm_moe_run_routing*` operations, which the
