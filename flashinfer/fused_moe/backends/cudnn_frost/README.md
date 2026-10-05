@@ -280,10 +280,11 @@ A shape or scale version evicted from lookup must be prepared again outside
 capture before capturing a new call. MoELayer keeps at most 128 winner entries;
 `reset_winner()` clears them as before.
 
-BF16 admission and packing share a 128-entry selection cache keyed by artifact
+Admission and packing share a 128-entry selection cache per dtype keyed by artifact
 roots and cache version, architecture, exact geometry, and activation. It holds
 only kernel metadata; tensor layouts, alignment, and semantics are checked on
-each call. `bf16.runtime.clear_artifact_cache()` invalidates this metadata when
+each call. Quantized selectors also key by SM count and compiler/policy identity.
+Each dtype's `runtime.clear_artifact_cache()` invalidates this metadata when
 refreshing artifacts. Measure ordinary warm calls separately from CUDA Graph
 replay, which bypasses Python admission and packing.
 

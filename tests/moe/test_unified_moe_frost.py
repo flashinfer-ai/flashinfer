@@ -5,12 +5,13 @@ from collections import OrderedDict
 from dataclasses import replace
 import importlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 import warnings
 
 import pytest
 import torch
 
-from flashinfer.autotuner import autotune
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import (
     BackendOptions,
     CudnnFrostBf16Config,
@@ -271,7 +272,10 @@ def test_existing_runner_rechecks_selected_assembler(dtype, name, monkeypatch):
 
 @pytest.fixture(scope="module", params=FORMATS)
 def frost_case(request):
-    dtype = request.param
+    return _make_frost_case(request.param)
+
+
+def _make_frost_case(dtype, geometry=(64, 2048, 1408, 6)):
     supported = ((10, 7), (12, 0)) if dtype == "bf16" else ((10, 7),)
     if (
         not torch.cuda.is_available()
@@ -290,7 +294,7 @@ def frost_case(request):
     except NotImplementedError as exc:
         pytest.skip(str(exc))
     cls, canonical, weight, activation = FORMATS[dtype]
-    e, h, i, k = 64, 2048, 1408, 6
+    e, h, i, k = geometry
     config = MoEConfig(
         routing=RoutingConfig(num_experts=e, top_k=k),
         quant=QuantConfig(weight=weight, activation=activation),
@@ -374,3 +378,145 @@ def test_public_config_graph_and_automatic_admission(frost_case, monkeypatch):
         check(automatic(act, shared))
         assert automatic.winner_backend == key
     assert not any(type(w.message).__name__ == "ExperimentalWarning" for w in caught)
+
+
+@pytest.mark.parametrize("dtype", ("mxfp8", "nvfp4", "mxfp8_mxfp4"))
+def test_quantized_selection_cache(dtype, monkeypatch):
+    moe = importlib.import_module(
+        f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
+    )
+    props = SimpleNamespace(multi_processor_count=128)
+    monkeypatch.setattr(moe.common, "_arch_for", lambda _: "sm_107a")
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+    selection = Mock(wraps=moe.select_stages)
+    monkeypatch.setattr(moe, "select_stages", selection)
+    args = dict(
+        tokens=17,
+        hidden=2048,
+        intermediate=1536,
+        experts=16,
+        topk=2,
+        device="cpu",
+        activation=api.SwiGLU(),
+    )
+    moe.runtime.clear_artifact_cache()
+    try:
+        first, second = moe._selected_kernels(**args)
+        assert sum(not k.quantizes_output for k in first) == len(second) == 4
+        for _ in range(25):
+            assert moe._selected_kernels(**args) == (first, second)
+        assert selection.call_count == 1
+
+        # Use real artifacts for the other admission branch, beyond offline T.
+        profiles = moe._read(moe._artifact_roots())[
+            ("sm_107a", "swiglu", 64, 2048, 1408, 6)
+        ]
+        moe._selected_kernels(
+            **(
+                args
+                | dict(tokens=max(profiles) + 1, intermediate=1408, experts=64, topk=6)
+            )
+        )
+        assert selection.call_count == 2
+        for changes in (
+            dict(tokens=18),
+            dict(hidden=4096),
+            dict(intermediate=3072),
+            dict(experts=32),
+            dict(topk=4),
+            dict(activation=api.ReLU()),
+        ):
+            misses = moe._selected_kernels_cached.cache_info().misses
+            moe._selected_kernels(**(args | changes))
+            assert moe._selected_kernels_cached.cache_info().misses == misses + 1
+
+        for owner, name, value in (
+            (props, "multi_processor_count", 120),
+            (compiler, "identity_key", lambda: "changed"),
+            (moe.common, "_arch_for", lambda _: "sm_120a"),
+            (moe, "_artifact_roots", lambda: ()),
+        ):
+            monkeypatch.setattr(owner, name, value)
+            misses = moe._selected_kernels_cached.cache_info().misses
+            moe._selected_kernels(**args)
+            assert moe._selected_kernels_cached.cache_info().misses == misses + 1
+
+        version = moe.runtime._artifact_cache_version
+        moe.runtime.clear_artifact_cache()
+        assert moe.runtime._artifact_cache_version == version + 1
+        for tokens in range(1, 130):
+            assert moe._selected_kernels(**(args | dict(tokens=tokens))) == ((), ())
+        info = moe._selected_kernels_cached.cache_info()
+        assert info.currsize == info.maxsize == 128
+        moe._selected_kernels(**(args | dict(tokens=129)))
+        assert moe._selected_kernels_cached.cache_info().misses == info.misses
+        moe._selected_kernels(**(args | dict(tokens=1)))
+        assert moe._selected_kernels_cached.cache_info().misses == info.misses + 1
+    finally:
+        moe.runtime.clear_artifact_cache()
+
+
+@pytest.mark.parametrize("dtype", ("mxfp8", "nvfp4", "mxfp8_mxfp4"))
+def test_factorized_tuning_and_graph_replay(dtype, monkeypatch):
+    from flashinfer.fused_moe.backends.cudnn_frost import tuning
+
+    tokens, e, h, i, k = 17, 16, 2048, 1536, 2
+    _, cls, _, config, layer, view = _make_frost_case(dtype, (e, h, i, k))
+    moe = importlib.import_module(
+        f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
+    )
+    moe.runtime.clear_artifact_cache()
+    selection = Mock(wraps=moe.select_stages)
+    monkeypatch.setattr(moe, "select_stages", selection)
+    stage_calls = set()
+    original_forward = tuning._StageRunner.forward
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        stage_calls.add((self.stage, do_preparation))
+        return original_forward(self, inputs, tactic, do_preparation, **kwargs)
+
+    monkeypatch.setattr(tuning._StageRunner, "forward", forward)
+    weights = MoEWeightPack({"cutlass_" + dtype: view})
+    x = torch.randn(tokens, h, device="cuda", dtype=torch.bfloat16)
+    xq, xsf = cls.prepare_activations(x, quant=config.quant)
+    ids = torch.rand(tokens, e, device="cuda").topk(k, dim=-1).indices.int()
+    scores = torch.rand(tokens, k, device="cuda").softmax(-1).bfloat16().float()
+    act = MoEActivationPack(xq, xsf, ids, scores)
+
+    def reference():
+        if dtype == "nvfp4":
+            return _nvfp4_moe_reference(act, weights, config.activation)
+        return _mxfp8_moe_reference(
+            act, weights, config.activation, mixed=dtype == "mxfp8_mxfp4"
+        )
+
+    def check(out, ref):
+        assert torch.isfinite(out).all()
+        error = (out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)
+        assert error < 0.03, error
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    try:
+        with autotune(tuning_buckets=(tokens,)):
+            out = layer(act, weights).clone()
+        assert stage_calls == {(1, True), (1, False), (2, True), (2, False)}
+        ref = reference()
+        check(out, ref)
+        check(layer(act, weights), ref)
+        assert selection.call_count == 1  # Admission and packing share the result.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out = layer(act, weights)
+        ids.copy_(torch.tensor([e - 2, e - 1], device="cuda", dtype=ids.dtype))
+        scores.copy_(scores.flip(-1))
+        changed_ref = reference()
+        assert not torch.allclose(ref, changed_ref)
+        graph_out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        check(graph_out, changed_ref)
+        assert selection.call_count == 1
+    finally:
+        tuner.clear_cache()
+        moe.runtime.clear_artifact_cache()

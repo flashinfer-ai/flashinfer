@@ -72,10 +72,23 @@ def _artifact_roots():
 def _kernels(
     rows, hidden, intermediate, experts, device, activation, *, quantized_output=False
 ):
-    name = activation_name(activation)
-    arch = common._arch_for(device)
+    return _matching_kernels(
+        _artifact_roots(),
+        common._arch_for(device),
+        rows,
+        hidden,
+        intermediate,
+        experts,
+        activation_name(activation),
+        quantized_output=quantized_output,
+    )
+
+
+def _matching_kernels(
+    roots, arch, rows, hidden, intermediate, experts, name, *, quantized_output=False
+):
     first, second = [], []
-    for root in _artifact_roots():
+    for root in roots:
         for kernel in runtime.discover(root, quantized_output=quantized_output):
             n, k = (intermediate, hidden) if kernel.fc1 else (hidden, intermediate)
             dims = dict(s=rows, n=n, k=k, experts=experts, groups=experts)
@@ -93,27 +106,53 @@ def _kernels(
 
 
 def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activation):
-    roots, arch, name = (
-        _artifact_roots(),
-        common._arch_for(device),
-        activation_name(activation),
-    )
-    profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
     if not 0 < tokens <= 1 << 20:
         return (), ()
+    return _selected_kernels_cached(
+        _artifact_roots(),
+        runtime._artifact_cache_version,
+        common._tactic_digest(POLICY_VERSION),
+        common._arch_for(device),
+        torch.cuda.get_device_properties(device).multi_processor_count,
+        tokens,
+        hidden,
+        intermediate,
+        experts,
+        topk,
+        activation_name(activation),
+    )
+
+
+@functools.lru_cache(maxsize=128)
+def _selected_kernels_cached(
+    roots,
+    artifact_version,
+    compiler_key,
+    arch,
+    sm_count,
+    tokens,
+    hidden,
+    intermediate,
+    experts,
+    topk,
+    name,
+):
+    # Admission and packing share metadata only; per-call validation stays outside.
+    profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
     if not profiles or tokens > max(profiles):
-        first, second = _kernels(
-            tokens * topk, hidden, intermediate, experts, device, activation
+        first, second = _matching_kernels(
+            roots, arch, tokens * topk, hidden, intermediate, experts, name
         )
         if not first or not second:
             return (), ()
-        fused, _ = _kernels(
+        fused, _ = _matching_kernels(
+            roots,
+            arch,
             tokens * topk,
             hidden,
             intermediate,
             experts,
-            device,
-            activation,
+            name,
             quantized_output=True,
         )
         return select_stages(
@@ -125,24 +164,25 @@ def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activ
             intermediate=intermediate,
             experts=experts,
             topk=topk,
-            sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
+            sm_count=sm_count,
         )
     bucket = min((n for n in profiles if n >= tokens), default=max(profiles))
     if any(len(ids) != 2 for ids in profiles[bucket]):
         return (), ()
-    first, second = _kernels(
-        tokens * topk, hidden, intermediate, experts, device, activation
+    first, second = _matching_kernels(
+        roots, arch, tokens * topk, hidden, intermediate, experts, name
     )
     first, second = select(
         roots, arch, name, tokens, hidden, intermediate, experts, topk, first, second
     )
-    fused, _ = _kernels(
+    fused, _ = _matching_kernels(
+        roots,
+        arch,
         tokens * topk,
         hidden,
         intermediate,
         experts,
-        device,
-        activation,
+        name,
         quantized_output=True,
     )
     tiles = {kernel.tactic_metadata["tile"] for kernel in first}

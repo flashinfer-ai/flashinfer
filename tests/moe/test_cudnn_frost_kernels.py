@@ -2301,6 +2301,7 @@ def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
 
 
 def _assert_moe_shortlist_buckets(moe, monkeypatch):
+    moe.runtime.clear_artifact_cache()
     key = ("sm_107a", "swiglu", 8, 4096, 14336, 2)
     first = tuple(
         SimpleNamespace(artifact_id=f"first{j}", tactic_metadata={"tile": f"tile{j}"})
@@ -2310,7 +2311,7 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
     monkeypatch.setattr(moe.common, "_arch_for", lambda device: "sm_107a")
     monkeypatch.setattr(
         moe,
-        "_kernels",
+        "_matching_kernels",
         lambda *args, **kwargs: (
             ((), ()) if kwargs.get("quantized_output") else (first, second)
         ),
@@ -2341,9 +2342,12 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
         assert moe._selected_kernels(tokens, *args) == fallback
     assert moe._selected_kernels(128, 4096, 14336, 9, 2, "cuda", SwiGLU()) == fallback
     table[key][128] = (("first2",), ("second1", "second2"))
+    moe._selected_kernels_cached.cache_clear()
     assert moe._selected_kernels(128, *args) == ((), ())
     table.clear()
+    moe._selected_kernels_cached.cache_clear()
     assert moe._selected_kernels(128, *args) == fallback
+    moe._selected_kernels_cached.cache_clear()
 
 
 def test_mxfp8_plan_workspaces_preserve_prior_allocations(monkeypatch):
@@ -3111,6 +3115,11 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
     assert table
     assert {key[1] for key in table} == set(ACTIVATIONS)
     monkeypatch.setattr(moe.common, "_arch_for", lambda device: "sm_107a")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=128),
+    )
     for (arch, name, experts, hidden, intermediate, topk), profiles in table.items():
         assert arch == "sm_107a"
         previous = 0

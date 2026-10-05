@@ -21,6 +21,7 @@ from ..activations import ACTIVATIONS, is_gated
 
 _FC2 = "block_scale_grouped_gemm2"
 _OPS = {f"block_scale_grouped_gemm1_{name}" for name in ACTIVATIONS} | {_FC2}
+_artifact_cache_version = 0
 _TAIL_SLOTS = {
     "output": 0,
     "scale": 1,
@@ -167,6 +168,20 @@ def discover(
             )
         )
     return tuple(result)
+
+
+def clear_artifact_cache() -> None:
+    """Refresh artifact metadata shared by selection, admission and packing."""
+    global _artifact_cache_version
+
+    from ..shortlist import _read
+    from .moe import _selected_kernels_cached
+
+    _artifact_cache_version += 1
+    discover.cache_clear()
+    _selected_kernels_cached.cache_clear()
+    _read.cache_clear()
+    runtime._clear_source_cache()
 
 
 def segmented_scale_rows(rows: int, groups: int) -> int:
