@@ -68,8 +68,8 @@ from flashinfer.dense_mqa import fp8_mqa_logits
 logits = fp8_mqa_logits(q, (kv, kv_scales), weights, ks, ke, clean_logits=False)   # f32 [Q, K]
 
 from flashinfer.paged_mqa import get_paged_mqa_logits_metadata, fp8_paged_mqa_logits, prepare_paged_mqa_logits
-meta = get_paged_mqa_logits_metadata(context_lens_2d, 64, num_sms)                 # int32 [num_sms + 1, 2]
-logits = fp8_paged_mqa_logits(q, kv_cache, weights, context_lens_2d, block_table, meta, max_context_len)
+meta = get_paged_mqa_logits_metadata(context_lens_2d, 64, num_sms)                 # int32 [num_sms + 1, 2] placeholder, no launch
+logits = fp8_paged_mqa_logits(q, kv_cache, weights, context_lens_2d, block_table, meta, max_context_len)  # one launch
 plan = prepare_paged_mqa_logits(q, kv_cache, weights, context_lens_2d, block_table, max_context_len)
 ```
 
@@ -94,8 +94,10 @@ The paged entries read the fused DeepGEMM cache layout in place: `kv_cache` uint
 `[pages, block_kv, 1, 132]` (`block_kv` FP8 rows of 128 then `block_kv` FP32 scales per page), E4M3
 `q [B, next_n, H, 128]`, FP32 `weights [B * next_n, H]`, int32 `context_lens [B, next_n]` (two-dimensional;
 the schedule is sized from each request's last token, every token masks with its own length), int32
-`block_table [B, S]` with unit column stride (any row stride) and the metadata produced by
-`get_paged_mqa_logits_metadata` for the same CTA budget. The result is the
+`block_table [B, S]` with unit column stride (any row stride). Each paged call is ONE kernel launch: the
+logits program derives its (request, KV split) walk in-kernel from `context_lens` and the CTA budget, so
+`get_paged_mqa_logits_metadata` launches nothing and returns a `[num_sms + 1, 2]` placeholder that
+`fp8_paged_mqa_logits` accepts for DeepGEMM signature parity (`None` is accepted too). The result is the
 `[B * next_n, max_context_len]` view of a `[B * next_n, paged_logits_stride(max_context_len)]` FP32
 buffer (`align(align(max_context_len, 256), 256)` elements per row, DeepGEMM's 1024-byte rule) with
 DeepGEMM's `clean_logits=False` semantics with one strictly-safer deviation: inside each request's

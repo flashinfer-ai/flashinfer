@@ -1,15 +1,21 @@
-"""Paged prepared API (DeepGEMM paged signatures): metadata against the scalar
-DeepGEMM schedule specification, logits against the dequantized PyTorch paged
-reference (and DeepGEMM when importable), the clean_logits=False mask, graph
-replay with changed contents and chunk equivalence on SM100a/SM103a.
+"""Paged prepared API (DeepGEMM paged signatures): logits against the
+dequantized PyTorch paged reference (and DeepGEMM when importable), the
+clean_logits=False mask, graph replay with changed contents and chunk
+equivalence on SM100a/SM103a. Every paged call is ONE kernel launch (the
+schedule is derived in-kernel); ``get_paged_mqa_logits_metadata`` is a
+no-launch DeepGEMM-signature placeholder.
 
 The tests skip while the installed catalog carries no paged route for the
 shape (``paged_route_available``); the host-only helpers are tested always.
+Correctness is validated on EVERY shipped shape through
+``PagedMqaPlan(enforce_admission=False)`` (the export protocol's view: the
+catalog's admission rules are routing policy, not a validity bound); where the
+per-architecture rules withhold a (batch, max_context_len) the public entries
+must refuse it, which the same tests assert.
 """
 
 import pytest
 import torch
-
 from flashinfer.experimental.deepgemm_dense_mqa import paged_mqa as _runtime
 from flashinfer.paged_mqa import (
     fp8_paged_mqa_logits,
@@ -30,6 +36,12 @@ CASES = [
 ]
 
 
+def _catalog_paged_routes():
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+
+    return list(_catalog()["paged_routes"].values())
+
+
 def _skip_unless_route(heads, page, next_n):
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
@@ -40,21 +52,35 @@ def _skip_unless_route(heads, page, next_n):
     except RuntimeError as error:
         pytest.skip(str(error))
     if not _runtime.paged_route_available(heads, page, next_n):
-        pytest.skip(
-            f"catalog has no paged route for H={heads}, page {page}, next_n {next_n}"
-        )
+        pytest.skip(f"catalog has no paged route for H={heads}, page {page}, next_n {next_n}")
+
+
+def _admitted(q, ctx_2d, max_len, heads, page, next_n):
+    """The shipped per-architecture verdict for this exact call (batch = ``ctx_2d.shape[0]``)."""
+    arch = _runtime._resolve_device(q, None)[0]
+    return _runtime.paged_route_admitted(
+        arch, _runtime.paged_route_name(heads, page, next_n), int(ctx_2d.shape[0]), int(max_len)
+    )
+
+
+def _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len, **kwargs):
+    """The plan the export validates with: every shipped shape, admission rules bypassed."""
+    return _runtime.PagedMqaPlan(
+        q, kv_cache, weights, ctx_2d, block_table, max_len, enforce_admission=False, **kwargs
+    )
+
+
+def _one_shot(q, kv_cache, weights, ctx_2d, block_table, num_sms, max_len):
+    """``fp8_paged_mqa_logits`` minus the admission check (same plan, same single ``run``)."""
+    return _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len, sm_count=num_sms).run()
 
 
 def _inputs(heads, page, next_n, batch, avg_ctx, seed=7):
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(seed)
     lo, hi = max(page, int(0.7 * avg_ctx)), max(page + 1, int(1.3 * avg_ctx))
-    ctx_max = torch.randint(
-        lo, hi, (batch,), device=device, dtype=torch.int32, generator=generator
-    )
-    offsets = (next_n - 1 - torch.arange(next_n, device=device, dtype=torch.int32))[
-        None, :
-    ]
+    ctx_max = torch.randint(lo, hi, (batch,), device=device, dtype=torch.int32, generator=generator)
+    offsets = (next_n - 1 - torch.arange(next_n, device=device, dtype=torch.int32))[None, :]
     ctx_2d = (ctx_max[:, None] - offsets).clamp_min(1).contiguous()
     max_context_len = int(ctx_max.max())
     blocks = (ctx_max + page - 1) // page
@@ -67,9 +93,7 @@ def _inputs(heads, page, next_n, batch, avg_ctx, seed=7):
         n = int(blocks[b])
         block_table[b, :n] = perm[offset : offset + n]
         offset += n
-    q = torch.randn(
-        batch, next_n, heads, HEAD_DIM, device=device, generator=generator
-    ).to(torch.float8_e4m3fn)
+    q = torch.randn(batch, next_n, heads, HEAD_DIM, device=device, generator=generator).to(torch.float8_e4m3fn)
     kv = torch.randn(pages, page, HEAD_DIM, device=device, generator=generator)
     scale = (kv.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4) / 448.0).squeeze(-1)
     kv_fp8 = (kv / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
@@ -77,9 +101,7 @@ def _inputs(heads, page, next_n, batch, avg_ctx, seed=7):
     fused[:, : page * HEAD_DIM] = kv_fp8.reshape(pages, -1).view(torch.uint8)
     fused[:, page * HEAD_DIM :] = scale.reshape(pages, page).view(torch.uint8)
     kv_cache = fused.view(pages, page, 1, HEAD_DIM + 4)
-    weights = (
-        torch.rand(batch * next_n, heads, device=device, generator=generator) + 0.1
-    )
+    weights = torch.rand(batch * next_n, heads, device=device, generator=generator) + 0.1
     return q, kv_cache, kv_fp8, scale, weights, ctx_2d, block_table, max_context_len
 
 
@@ -87,12 +109,7 @@ def _reference(q, kv_fp8, scale, weights, ctx_2d, block_table, max_context_len, 
     """logits[b*next_n + t, k] = sum_h relu(q . kv[k]) * w * scale[k] for k < ctx[b, t], -inf otherwise."""
     batch, next_n, heads, _ = q.shape
     device = q.device
-    out = torch.full(
-        (batch * next_n, max_context_len),
-        float("-inf"),
-        device=device,
-        dtype=torch.float32,
-    )
+    out = torch.full((batch * next_n, max_context_len), float("-inf"), device=device, dtype=torch.float32)
     for b in range(batch):
         ctx_last = int(ctx_2d[b, -1])
         n_blocks = (ctx_last + page - 1) // page
@@ -101,37 +118,10 @@ def _reference(q, kv_fp8, scale, weights, ctx_2d, block_table, max_context_len, 
         kscale = scale[phys].reshape(-1)[:ctx_last]
         for t in range(next_n):
             qt = q[b, t].float()
-            logits = (torch.relu(qt @ keys.T) * weights[b * next_n + t][:, None]).sum(
-                0
-            ) * kscale
+            logits = (torch.relu(qt @ keys.T) * weights[b * next_n + t][:, None]).sum(0) * kscale
             ctx_t = int(ctx_2d[b, t])
             out[b * next_n + t, :ctx_t] = logits[:ctx_t]
     return out
-
-
-def _metadata_reference(ctx_2d, next_n, num_sms, split_kv, atoms):
-    """Scalar specification of the paged schedule: (q_atom_idx, kv_split_idx) per CTA boundary."""
-    lens = [int(ctx_2d[b, -1]) for b in range(ctx_2d.shape[0])]
-    segs = [(c + split_kv - 1) // split_kv for c in lens]
-    prefix, acc = [], 0
-    for s in segs:
-        acc += s
-        prefix.append(acc)
-    total = acc * atoms
-    qd, rd = total // num_sms, total % num_sms
-    meta = []
-    for sm in range(num_sms + 1):
-        start = sm * qd + min(sm, rd)
-        q_idx = 0
-        while q_idx < len(lens) and prefix[q_idx] * atoms <= start:
-            q_idx += 1
-        prev = prefix[q_idx - 1] if q_idx else 0
-        cur = prefix[q_idx] if q_idx < len(lens) else acc
-        offset, n = start - prev * atoms, cur - prev
-        atom = offset // n if n else 0
-        split = offset % n if n else 0
-        meta.append([q_idx * atoms + atom, split])
-    return meta
 
 
 def _check(got, ref, ctx_2d, max_context_len, stride_rows):
@@ -139,13 +129,9 @@ def _check(got, ref, ctx_2d, max_context_len, stride_rows):
     position = torch.arange(max_context_len, device=got.device)[None, :]
     inside = position < lengths[:, None]
     assert torch.isfinite(got[inside]).all()
-    row_max = (
-        ref.masked_fill(~inside, 0.0).abs().amax(dim=1, keepdim=True).clamp_min(1.0)
-    )
+    row_max = ref.masked_fill(~inside, 0.0).abs().amax(dim=1, keepdim=True).clamp_min(1.0)
     err = (got - ref).abs().masked_fill(~inside, 0.0)
-    assert bool(
-        (err <= 1e-2 * row_max + 1e-2 * ref.abs().masked_fill(~inside, 0.0)).all()
-    )
+    assert bool((err <= 1e-2 * row_max + 1e-2 * ref.abs().masked_fill(~inside, 0.0)).all())
     # clean_logits=False semantics: inside the aligned range of each request the cells at or past the
     # row's length are exact -inf (DeepGEMM stores finite don't-care there; -inf is the strictly safer
     # value for the engine's top-k). Which cells are written at all is checked against DeepGEMM's own
@@ -154,9 +140,7 @@ def _check(got, ref, ctx_2d, max_context_len, stride_rows):
     # max_context_len % SPLIT_KV != 0: check it on the physical rows, not on the [:, :max_context_len] view.
     for row in range(got.shape[0]):
         aligned = min(_aligned_extent(ctx_2d, row), stride_rows.shape[1])
-        assert bool(
-            torch.isneginf(stride_rows[row, int(lengths[row]) : aligned]).all()
-        ), row
+        assert bool(torch.isneginf(stride_rows[row, int(lengths[row]) : aligned]).all()), row
 
 
 def _aligned_extent(ctx_2d, row):
@@ -184,43 +168,29 @@ def _deep_gemm_measured(q, kv_cache, weights, ctx_2d, block_table, max_len, page
         return None
 
     def run():
-        meta = deep_gemm.get_paged_mqa_logits_metadata(
-            ctx_2d, page, deep_gemm.get_num_sms()
-        )
+        meta = deep_gemm.get_paged_mqa_logits_metadata(ctx_2d, page, deep_gemm.get_num_sms())
         return deep_gemm.fp8_paged_mqa_logits(
             q, kv_cache, weights, ctx_2d, block_table, meta, max_len, clean_logits=False
         )
 
     probe = run()
     torch.cuda.synchronize()
-    nbytes, rows, stride = (
-        probe.untyped_storage().nbytes(),
-        int(probe.shape[0]),
-        int(probe.stride(0)),
-    )
+    nbytes, rows, stride = probe.untyped_storage().nbytes(), int(probe.shape[0]), int(probe.stride(0))
     del probe
-    poison = torch.full(
-        (nbytes // 4,), float("nan"), dtype=torch.float32, device=q.device
-    )
+    poison = torch.full((nbytes // 4,), float("nan"), dtype=torch.float32, device=q.device)
     del poison
     native = run()
     torch.cuda.synchronize()
     if native.untyped_storage().nbytes() != nbytes or rows * stride * 4 > nbytes:
         return None
-    full = torch.empty(0, dtype=torch.float32, device=q.device).set_(
-        native.untyped_storage(), 0, (rows * stride,)
-    )
+    full = torch.empty(0, dtype=torch.float32, device=q.device).set_(native.untyped_storage(), 0, (rows * stride,))
     full = full.view(rows, stride)
     # Witness that the poison survived: columns past each request's source-derived extent are never written
     # by DeepGEMM (the buffer is [rows, align(max_context_len, SPLIT_KV)], so rows of shorter requests have
     # such columns); without any witness cell the measurement is not observable.
-    witness = [
-        full[row, min(_aligned_extent(ctx_2d, row), stride) :] for row in range(rows)
-    ]
+    witness = [full[row, min(_aligned_extent(ctx_2d, row), stride) :] for row in range(rows)]
     witness_cells = sum(int(w.numel()) for w in witness)
-    if witness_cells == 0 or not all(
-        bool(torch.isnan(w).all()) for w in witness if w.numel()
-    ):
+    if witness_cells == 0 or not all(bool(torch.isnan(w).all()) for w in witness if w.numel()):
         return None
     return native, ~torch.isnan(full)
 
@@ -235,9 +205,7 @@ def _check_write_extent(cake_output, measured, ctx_2d, max_len):
     for row in range(cake_output.shape[0]):
         aligned = min(_aligned_extent(ctx_2d, row), cake_output.shape[1])
         tail = cake_output[row, max_len:aligned]
-        assert bool(torch.isneginf(tail).all()), (
-            f"row {row}: cells in [{max_len}, {aligned}) are not -inf"
-        )
+        assert bool(torch.isneginf(tail).all()), f"row {row}: cells in [{max_len}, {aligned}) are not -inf"
     if measured is None:
         for row in range(cake_output.shape[0]):
             aligned = min(_aligned_extent(ctx_2d, row), cake_output.shape[1])
@@ -259,18 +227,21 @@ def _check_write_extent(cake_output, measured, ctx_2d, max_len):
             f"{int(cols[0])}..{int(cols[-1])} (Cake wrote {int(cake_written[row, cols].sum())} of them, DeepGEMM "
             f"{int(dg_written[row, cols].sum())}); request length {int(ctx_2d.reshape(-1)[row])}"
         )
-    assert not bool(cake_written[:, common:].any()) and not bool(
-        dg_written[:, common:].any()
-    )
+    assert not bool(cake_written[:, common:].any()) and not bool(dg_written[:, common:].any())
 
 
 @pytest.mark.parametrize("heads,page,next_n,batch,avg_ctx", CASES)
 def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
     _skip_unless_route(heads, page, next_n)
-    q, kv_cache, kv_fp8, scale, weights, ctx_2d, block_table, max_len = _inputs(
-        heads, page, next_n, batch, avg_ctx
-    )
-    plan = prepare_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, max_len)
+    q, kv_cache, kv_fp8, scale, weights, ctx_2d, block_table, max_len = _inputs(heads, page, next_n, batch, avg_ctx)
+    admitted = _admitted(q, ctx_2d, max_len, heads, page, next_n)
+    if admitted:
+        plan = prepare_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, max_len)
+    else:
+        # Withheld on this architecture: the public entry refuses, the kernel is validated through the plan.
+        with pytest.raises(ValueError, match="is not admitted on"):
+            prepare_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, max_len)
+        plan = _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len)
     assert plan.route_name == _runtime.paged_route_name(heads, page, next_n)
     num_sms = plan.num_sms
     plan.output.fill_(float("nan"))
@@ -282,21 +253,17 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
     stream.synchronize()
     ref = _reference(q, kv_fp8, scale, weights, ctx_2d, block_table, max_len, page)
     _check(plan.logical_output, ref, ctx_2d, max_len, plan.output)
-    policy = _runtime.paged_policy()
-    expected_meta = _metadata_reference(
-        ctx_2d,
-        next_n,
-        num_sms,
-        int(policy["split_kv"]),
-        _runtime.paged_next_n_atoms(next_n),
-    )
-    assert plan.schedule_meta.tolist() == expected_meta
-    # One-shot entries on the same operands: identical bits.
+    assert plan.launch_count == 1 and plan.program_names == [plan.route["stages"][0][1]]
+    # One-shot entries on the same operands: identical bits. The metadata entry is a no-launch
+    # placeholder of the DeepGEMM signature (zeros of the CTA-budget shape).
     meta = get_paged_mqa_logits_metadata(ctx_2d, page, num_sms)
-    assert torch.equal(meta, plan.schedule_meta)
-    one_shot = fp8_paged_mqa_logits(
-        q, kv_cache, weights, ctx_2d, block_table, meta, max_len
-    )
+    assert meta.dtype == torch.int32 and tuple(meta.shape) == (num_sms + 1, 2) and not meta.any()
+    if admitted:
+        one_shot = fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, meta, max_len)
+    else:
+        with pytest.raises(ValueError, match="is not admitted on"):
+            fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, meta, max_len)
+        one_shot = _one_shot(q, kv_cache, weights, ctx_2d, block_table, num_sms, max_len)
     # Identical bits on every written cell; the one-shot entry's fresh buffer is unspecified elsewhere.
     written = ~torch.isnan(plan.logical_output)
     assert torch.equal(one_shot[written], plan.logical_output[written])
@@ -309,65 +276,54 @@ def test_paged_mqa_logits(heads, page, next_n, batch, avg_ctx):
         weights.neg_()
         ctx_2d.copy_((ctx_2d - 3).clamp_min(1))
         plan.output.fill_(float("nan"))
-        plan.schedule_meta.fill_(0x55555555)
         graph.replay()
     stream.synchronize()
     ref = _reference(q, kv_fp8, scale, weights, ctx_2d, block_table, max_len, page)
     _check(plan.logical_output, ref, ctx_2d, max_len, plan.output)
     # Written extent vs DeepGEMM on the same operands (the replayed graph wrote the current contents).
-    measured = _deep_gemm_measured(
-        q, kv_cache, weights, ctx_2d, block_table, max_len, page
-    )
+    measured = _deep_gemm_measured(q, kv_cache, weights, ctx_2d, block_table, max_len, page)
     _check_write_extent(plan.output, measured, ctx_2d, max_len)
     if measured is None:
         return
     native, _written = measured
-    inside = (
-        torch.arange(max_len, device=q.device)[None, :] < ctx_2d.reshape(-1)[:, None]
-    )
-    torch.testing.assert_close(
-        plan.logical_output[inside], native[inside], atol=1e-2, rtol=1e-2
-    )
+    inside = torch.arange(max_len, device=q.device)[None, :] < ctx_2d.reshape(-1)[:, None]
+    torch.testing.assert_close(plan.logical_output[inside], native[inside], atol=1e-2, rtol=1e-2)
 
 
 def test_paged_chunking_is_equivalent():
-    """One call above the CTA budget equals the engine-style per-chunk calls."""
+    """One call above the CTA budget equals the engine-style per-chunk calls (kernel property, validated
+    through the plan on every architecture; the public entry's verdict for the whole call follows the
+    shipped admission rules for batch 2 * SMs + 5)."""
     heads, page, next_n = 64, 64, 1
     _skip_unless_route(heads, page, next_n)
     batch = 2 * torch.cuda.get_device_properties(0).multi_processor_count + 5
-    q, kv_cache, _kv, _scale, weights, ctx_2d, block_table, max_len = _inputs(
-        heads, page, next_n, batch, 1024
-    )
+    q, kv_cache, _kv, _scale, weights, ctx_2d, block_table, max_len = _inputs(heads, page, next_n, batch, 1024)
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    whole = fp8_paged_mqa_logits(
-        q,
-        kv_cache,
-        weights,
-        ctx_2d,
-        block_table,
-        get_paged_mqa_logits_metadata(ctx_2d, page, num_sms),
-        max_len,
-    )
+    whole_meta = get_paged_mqa_logits_metadata(ctx_2d, page, num_sms)
+    if _admitted(q, ctx_2d, max_len, heads, page, next_n):
+        whole = fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, whole_meta, max_len)
+    else:
+        with pytest.raises(ValueError, match="is not admitted on"):
+            fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, whole_meta, max_len)
+        whole = _one_shot(q, kv_cache, weights, ctx_2d, block_table, num_sms, max_len)
     chunks = []
     for start in range(0, batch, num_sms):
         end = min(start + num_sms, batch)
         ctx = ctx_2d[start:end].contiguous()
         chunks.append(
-            fp8_paged_mqa_logits(
+            _one_shot(
                 q[start:end],
                 kv_cache,
                 weights[start:end],
                 ctx,
                 block_table[start:end],
-                get_paged_mqa_logits_metadata(ctx, page, num_sms),
+                num_sms,
                 max_len,
             )
         )
     chunked = torch.cat(chunks, dim=0)
     torch.cuda.synchronize()
-    inside = (
-        torch.arange(max_len, device=q.device)[None, :] < ctx_2d.reshape(-1)[:, None]
-    )
+    inside = torch.arange(max_len, device=q.device)[None, :] < ctx_2d.reshape(-1)[:, None]
     assert torch.equal(whole[inside], chunked[inside])
 
 
@@ -378,9 +334,11 @@ def test_paged_host_helpers_and_rejections():
     assert stride % 256 == 0 and stride >= 1000
     assert not _runtime.paged_route_available(16, 64, 1)
     assert not _runtime.paged_route_available(64, 128, 1)
-    # Paged head counts come from policy["paged"]["heads"], not the dense heads(); one metadata atom per
-    # exported next_n (whole-request programs); next_n = 3 has no program.
+    # Paged head counts come from policy["paged"]["heads"], not the dense heads(); one schedule atom per
+    # exported next_n (whole-request programs); next_n = 3 has no program; no metadata program at all.
     policy = _runtime.paged_policy()
+    assert policy["metadata_program"] is None
+    assert all(len(route["stages"]) == 1 and route["stages"][0][0] == "logits" for route in _catalog_paged_routes())
     assert tuple(_runtime.paged_heads()) == tuple(int(h) for h in policy["heads"])
     assert all(_runtime.paged_next_n_atoms(int(n)) == 1 for n in policy["next_n_atoms"])
     with pytest.raises(ValueError):
@@ -394,76 +352,160 @@ def test_paged_host_helpers_and_rejections():
         get_paged_mqa_logits_metadata(ctx_1d, 64, 148)
     with pytest.raises(ValueError):
         get_paged_mqa_logits_metadata(
-            ctx_1d[:, None].contiguous(),
-            64,
-            148,
-            torch.zeros(4, device=device, dtype=torch.int32),
+            ctx_1d[:, None].contiguous(), 64, 148, torch.zeros(4, device=device, dtype=torch.int32)
         )
     if _runtime.paged_route_available(64, 64, 1):
-        q, kv_cache, _kv, _scale, weights, ctx_2d, block_table, max_len = _inputs(
-            64, 64, 1, 2, 512
-        )
+        q, kv_cache, _kv, _scale, weights, ctx_2d, block_table, max_len = _inputs(64, 64, 1, 2, 512)
         meta = get_paged_mqa_logits_metadata(ctx_2d, 64, 148)
+        assert tuple(meta.shape) == (149, 2) and not meta.any()
+        out = torch.full((149, 2), 7, dtype=torch.int32, device=device)
+        assert get_paged_mqa_logits_metadata(ctx_2d, 64, 148, out=out) is out and not out.any()
         with pytest.raises(ValueError):
-            fp8_paged_mqa_logits(
-                q,
-                kv_cache,
-                weights,
-                ctx_2d,
-                block_table,
-                meta,
-                max_len,
-                clean_logits=True,
-            )
+            get_paged_mqa_logits_metadata(ctx_2d, 3, 148)  # block_kv 3 is not exported
+        with pytest.raises(ValueError):
+            fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, meta, max_len, clean_logits=True)
+        with pytest.raises(ValueError):
+            fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, torch.zeros(1, 2, dtype=torch.int32, device=device), max_len)
 
 
 @pytest.mark.parametrize("heads,page,next_n,batch,avg_ctx", CASES[:1])
 def test_paged_one_shot_graph_replay(heads, page, next_n, batch, avg_ctx):
-    """``get_paged_mqa_logits_metadata`` + ``fp8_paged_mqa_logits`` captured in
-    a CUDA graph (the engine's decode path) launch on the capture stream: a
-    replay after poisoning the captured buffers reproduces the eager bits on
-    every cell inside the rows' lengths and the logits are non-trivial; an
-    empty capture leaves the poison and fails."""
+    """``fp8_paged_mqa_logits`` (the engine's decode call, one launch) captured in
+    a CUDA graph launches on the capture stream: a replay after poisoning the
+    captured buffer reproduces the eager bits on every cell inside the rows'
+    lengths and the logits are non-trivial; an empty capture leaves the poison
+    and fails. ``schedule_meta=None`` is the signature-parity path."""
     _skip_unless_route(heads, page, next_n)
-    q, kv_cache, _kv_fp8, _scale, weights, ctx_2d, block_table, max_len = _inputs(
-        heads, page, next_n, batch, avg_ctx
-    )
+    q, kv_cache, _kv_fp8, _scale, weights, ctx_2d, block_table, max_len = _inputs(heads, page, next_n, batch, avg_ctx)
     num_sms = _runtime._resolve_device(q, None)[1]
     meta = get_paged_mqa_logits_metadata(ctx_2d, page, num_sms)
-    eager = fp8_paged_mqa_logits(
-        q, kv_cache, weights, ctx_2d, block_table, meta, max_len
-    )
+    eager = fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, meta, max_len)
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            captured_meta = get_paged_mqa_logits_metadata(ctx_2d, page, num_sms)
-            captured = fp8_paged_mqa_logits(
-                q, kv_cache, weights, ctx_2d, block_table, captured_meta, max_len
-            )
+            captured = fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, None, max_len)
     with torch.cuda.stream(stream):
-        captured_meta.fill_(0x55555555)
         captured.fill_(float("nan"))
         graph.replay()
     stream.synchronize()
-    assert torch.equal(captured_meta, meta)
     inside = torch.arange(max_len, device="cuda")[None, :] < ctx_2d.reshape(-1)[:, None]
-    assert torch.equal(captured[inside], eager[inside]), (
-        "graph replay does not reproduce the eager logits"
-    )
-    assert torch.isfinite(captured[inside]).all() and bool(
-        (captured[inside] != 0).any()
-    )
+    assert torch.equal(captured[inside], eager[inside]), "graph replay does not reproduce the eager logits"
+    assert torch.isfinite(captured[inside]).all() and bool((captured[inside] != 0).any())
     with torch.cuda.stream(stream):
         weights.neg_()
         captured.fill_(float("nan"))
         graph.replay()
-        changed = fp8_paged_mqa_logits(
-            q, kv_cache, weights, ctx_2d, block_table, meta, max_len
-        )
+        changed = fp8_paged_mqa_logits(q, kv_cache, weights, ctx_2d, block_table, meta, max_len)
     stream.synchronize()
-    assert torch.equal(captured[inside], changed[inside]) and not torch.equal(
-        captured[inside], eager[inside]
+    assert torch.equal(captured[inside], changed[inside]) and not torch.equal(captured[inside], eager[inside])
+
+
+def test_paged_bindings_cover_every_program_argument():
+    """Every operand of every paged program's launcher contract (the catalog ``arg_plan``) is produced
+    by the runtime's binding builders, and every paged route is the single ``logits`` stage. This is the
+    contract-level check that fails before a prebuild or launch would: the single-kernel logits programs
+    take the CTA budget ``num_sms`` as a kernel parameter, which the runtime must bind as well as use for
+    the launch grid (an earlier export left it unbound); no program binds a schedule buffer."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    from flashinfer.experimental.deepgemm_dense_mqa.dense_mqa import _catalog
+
+    catalog = _catalog()
+    device = torch.device("cuda")
+    num_sms, batch, pages, max_len = 4, 2, 4, 100
+    checked = 0
+    for route_name, route in catalog["paged_routes"].items():
+        fields = {field[0]: int(field[1:]) for field in route_name.split(":")[2:5]}
+        heads, page, next_n = fields["h"], fields["p"], fields["n"]
+        ctx_2d = torch.full((batch, next_n), max_len, dtype=torch.int32, device=device)
+        q = torch.zeros((batch, next_n, heads, HEAD_DIM), dtype=torch.float8_e4m3fn, device=device)
+        kv_cache = torch.zeros((pages, page, 1, _runtime.FUSED_ROW_BYTES), dtype=torch.uint8, device=device)
+        weights = torch.zeros((batch * next_n, heads), dtype=torch.float32, device=device)
+        block_table = torch.zeros((batch, pages), dtype=torch.int32, device=device)
+        output = torch.zeros((batch * next_n, _runtime.paged_logits_stride(max_len)), dtype=torch.float32, device=device)
+        bindings = {
+            "logits": _runtime.logits_bindings(q, kv_cache, weights, ctx_2d, block_table, output, num_sms=num_sms),
+        }
+        assert [stage for stage, _program in route["stages"]] == ["logits"], route_name
+        for stage, program in route["stages"]:
+            arg_plan = catalog["programs"][program]["arg_plan"]
+            missing = [name for _kind, name in arg_plan if name not in bindings[stage]]
+            assert not missing, f"{route_name} stage {stage} ({program}): unbound arguments {missing}"
+            assert "schedule_meta" not in {name for _kind, name in arg_plan}, f"{program} binds a schedule buffer"
+            checked += 1
+    assert checked > 0
+
+
+def test_paged_admission_rules_are_applied_per_arch(monkeypatch):
+    """``policy.paged.admission`` rules a (arch, route) pair by (batch, max_context_len): admitted iff some
+    ``(max_batch, max_context_len)`` rule covers the call, unbounded where absent; the plan constructor
+    refuses a withheld call before any build (the export's ``enforce_admission=False`` bypasses it)."""
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
+
+    real = dense_mqa._catalog()
+    heads, page = 64, 64
+    route_n2, route_n1 = _runtime.paged_route_name(heads, page, 2), _runtime.paged_route_name(heads, page, 1)
+    if route_n2 not in real["paged_routes"] or route_n1 not in real["paged_routes"]:
+        pytest.skip("catalog lacks the h64 p64 n1/n2 paged routes")
+    # The shipped policy itself: well-formed rules on catalogued architectures and routes.
+    paged = real["policy"]["paged"]
+    assert int(paged["measured_max_context_len"]) % int(paged["split_kv"]) == 0
+    for arch, table in paged["admission"].items():
+        assert arch in real["arches"], arch
+        assert isinstance(paged["admission_reason"].get(arch), str) or not table
+        for route, rules in table.items():
+            assert route in real["paged_routes"], route
+            batches = [rule[0] for rule in rules]
+            finite = [b for b in batches if b is not None]
+            assert finite == sorted(finite) and all(b >= 1 for b in finite), (route, rules)
+            assert None not in batches[:-1], (route, rules)
+            for _max_batch, max_ctx in rules:
+                assert max_ctx is None or (int(max_ctx) >= 1 and int(max_ctx) % int(paged["split_kv"]) == 0)
+    # Rule semantics on a patched policy.
+    patched = dict(real)
+    patched["policy"] = dict(real["policy"])
+    patched["policy"]["paged"] = dict(
+        paged, admission={"sm_100a": {route_n2: [[16, None], [64, 32768], [None, 8192]]}}
     )
+    monkeypatch.setattr(dense_mqa, "_catalog", lambda: patched)
+    monkeypatch.setattr(_runtime, "_catalog", lambda: patched)
+    assert _runtime.paged_admission_rules("sm_100a", route_n2) == [(16, None), (64, 32768), (None, 8192)]
+    assert _runtime.paged_admission_rules("sm_103a", route_n2) is None
+    assert _runtime.paged_admission_rules("sm_100a", route_n1) is None
+    admitted = lambda batch, ctx: _runtime.paged_route_available(heads, page, 2, arch="sm_100a", batch=batch, max_context_len=ctx)
+    assert _runtime.paged_route_available(heads, page, 2)  # no arch: table availability only
+    assert admitted(16, 1 << 20) and admitted(1, 131072)
+    assert admitted(17, 32768) and not admitted(17, 32769)
+    assert admitted(64, 32768) and not admitted(65, 32768)
+    assert admitted(65, 8192) and admitted(4096, 8192) and not admitted(4096, 8448)
+    assert _runtime.paged_route_available(heads, page, 2, arch="sm_103a", batch=4096, max_context_len=1 << 20)
+    assert _runtime.paged_route_available(heads, page, 1, arch="sm_100a", batch=4096, max_context_len=1 << 20)
+    with pytest.raises(ValueError, match="requires batch and max_context_len"):
+        _runtime.paged_route_available(heads, page, 2, arch="sm_100a")
+    monkeypatch.undo()
+    if not torch.cuda.is_available():
+        return
+    # Live refusal under the shipped rules of this device's architecture (and the export bypass).
+    arch = dense_mqa.device_arch(torch.device("cuda"))
+    rules = _runtime.paged_admission_rules(arch, route_n2)
+    if rules is None:
+        return
+    withheld = next(
+        ((b, c) for b, c in ((17, 1024), (17, 32769), (65, 8448), (129, 8448), (4096, 131072))
+         if not _runtime.paged_route_admitted(arch, route_n2, b, c)),
+        None,
+    )
+    assert withheld is not None, f"shipped rules {rules} admit every probe; extend the probe list"
+    batch, ctx = withheld
+    q, kv_cache, _kv, _scale, weights, ctx_2d, block_table, _max_len = _inputs(heads, page, 2, batch, 1024)
+    # A block table wide enough for both the generated rows and the probed max_context_len.
+    width = max(int(block_table.shape[1]), (ctx + page - 1) // page)
+    wide = torch.zeros((batch, width), dtype=torch.int32, device=q.device)
+    wide[:, : block_table.shape[1]] = block_table
+    with pytest.raises(ValueError, match="is not admitted on"):
+        _runtime.PagedMqaPlan(q, kv_cache, weights, ctx_2d, wide, ctx)
+    plan = _runtime.PagedMqaPlan(q, kv_cache, weights, ctx_2d, wide, ctx, enforce_admission=False)
+    assert plan.batch == batch and plan.max_context_len == ctx

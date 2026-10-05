@@ -29,11 +29,11 @@
 #include <cstdint>
 #include <vector>
 
-extern "C" __global__ void kernel_cake_deepgemm_dense_mqa_25c0349d07e2c270fc40(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens);
-extern "C" __global__ void kernel_cake_deepgemm_dense_mqa_16c66ead857c21f63dba(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta);
+extern "C" __global__ void kernel_cake_deepgemm_dense_mqa_478e6d795a15deff38fc(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens);
+extern "C" __global__ void kernel_cake_deepgemm_dense_mqa_7a43f9a21e23875fe07f(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta);
 
 
-namespace cake_host_shim_7788021c82a4eaf5 {
+namespace cake_host_shim_688e1c3a261cdd94 {
 
 using tvm::ffi::TensorView;
 
@@ -103,7 +103,9 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_Starts, TensorView 
   prepared.retained.push_back(arg_Ends);
   prepared.retained.push_back(arg_Metadata);
 
-
+  static const bool smem_ready = CakeSetMaxDynamicSmem(
+      reinterpret_cast<const void*>(kernel_cake_deepgemm_dense_mqa_478e6d795a15deff38fc), 232448);
+  (void)smem_ready;
   prepared.p_Starts = arg_Starts.data_ptr();
   prepared.p_Ends = arg_Ends.data_ptr();
   prepared.p_Metadata = arg_Metadata.data_ptr();
@@ -133,14 +135,14 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 0u;
+  config.dynamicSmemBytes = 232448u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_deepgemm_dense_mqa_25c0349d07e2c270fc40), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_deepgemm_dense_mqa_478e6d795a15deff38fc), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_deepgemm_dense_mqa_25c0349d07e2c270fc40 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_deepgemm_dense_mqa_478e6d795a15deff38fc failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -444,7 +446,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_Q, TensorView arg_K
   prepared.retained.push_back(arg_ScheduleMeta);
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_deepgemm_dense_mqa_16c66ead857c21f63dba), 206336);
+      reinterpret_cast<const void*>(kernel_cake_deepgemm_dense_mqa_7a43f9a21e23875fe07f), 206336);
   (void)smem_ready;
   prepared.p_Q = EncodeTma_Q(arg_Q);
   prepared.p_KV = EncodeTma_KV(arg_KV);
@@ -496,9 +498,9 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_deepgemm_dense_mqa_16c66ead857c21f63dba), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_deepgemm_dense_mqa_7a43f9a21e23875fe07f), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_deepgemm_dense_mqa_16c66ead857c21f63dba failed: "
+      << "cudaLaunchKernelExC for kernel_cake_deepgemm_dense_mqa_7a43f9a21e23875fe07f failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -509,10 +511,13 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
       << "prepared sequence expects 24 arguments, got " << num_args;
   DLDevice dev = args[0].cast<TensorView>().device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
-  static thread_local int encoder_context_device = -1;  // context this thread bound for the encoders
-  if (encoder_context_device != dev.device_id) {
-    TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));
-    encoder_context_device = dev.device_id;
+  {
+    // Bind the primary context for the tensor-map encoders once per thread and device.
+    static thread_local int encoder_context_device = -1;
+    if (encoder_context_device != dev.device_id) {
+      TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));
+      encoder_context_device = dev.device_id;
+    }
   }
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
   check_same_device(args[8].cast<TensorView>(), args[0].cast<TensorView>(), "Q", "metadata.Starts");
@@ -524,14 +529,14 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   stage_logits::Submit(prepared_logits, stream);
 }
 
-}  // namespace cake_host_shim_7788021c82a4eaf5
+}  // namespace cake_host_shim_688e1c3a261cdd94
 
 extern "C" {
-TVM_FFI_DLL_EXPORT int __tvm_ffi_cake_deepgemm_dense_mqa_seq_1a24b9536b1464fac439(
+TVM_FFI_DLL_EXPORT int __tvm_ffi_cake_deepgemm_dense_mqa_seq_25ded622d7e4223841b9(
     void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result) {
   TVM_FFI_SAFE_CALL_BEGIN();
   (void)self;
-  cake_host_shim_7788021c82a4eaf5::RunPacked(
+  cake_host_shim_688e1c3a261cdd94::RunPacked(
       reinterpret_cast<const tvm::ffi::AnyView*>(args), num_args);
   tvm::ffi::TypeTraits<std::nullptr_t>::CopyToAnyView(nullptr, result);
   TVM_FFI_SAFE_CALL_END();

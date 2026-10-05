@@ -69,6 +69,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #ifndef SM_COUNT
 #error "SM_COUNT is a downstream specialization of this program; define it on the compile line"
 #endif
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -87,8 +88,8 @@ __device__ __forceinline__ uint32_t elect_sync() {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) void
-kernel_cake_deepgemm_dense_mqa_efd6c5e13bc586e7996d(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens)
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+kernel_cake_deepgemm_dense_mqa_478e6d795a15deff38fc(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

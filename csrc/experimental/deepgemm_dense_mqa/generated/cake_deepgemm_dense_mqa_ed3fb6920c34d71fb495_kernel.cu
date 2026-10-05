@@ -53,22 +53,23 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_WORK_PREFIX_OFF 0
-#define SMEM_WORK_PREFIX_STAGE_BYTES 128
-#define SMEM_WORK_PREFIX_STRIDE 128
-#define SMEM_COST_PREFIX_OFF 128
-#define SMEM_COST_PREFIX_STAGE_BYTES 128
-#define SMEM_COST_PREFIX_STRIDE 128
-#define SMEM_WARP_SUMS_OFF 256
+#define SMEM_WORK_PREFIX_STAGE_BYTES 16
+#define SMEM_WORK_PREFIX_STRIDE 16
+#define SMEM_COST_PREFIX_OFF 16
+#define SMEM_COST_PREFIX_STAGE_BYTES 16
+#define SMEM_COST_PREFIX_STRIDE 16
+#define SMEM_WARP_SUMS_OFF 32
 #define SMEM_WARP_SUMS_STAGE_BYTES 64
 #define SMEM_WARP_SUMS_STRIDE 64
-#define SMEM_CARRY_OFF 320
+#define SMEM_CARRY_OFF 96
 #define SMEM_CARRY_STAGE_BYTES 8
 #define SMEM_CARRY_STRIDE 8
-#define SMEM_TOTAL 384
+#define SMEM_TOTAL 128
 #define THREADS 256
 #ifndef SM_COUNT
 #error "SM_COUNT is a downstream specialization of this program; define it on the compile line"
 #endif
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -87,8 +88,8 @@ __device__ __forceinline__ uint32_t elect_sync() {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, 1) void
-kernel_cake_deepgemm_dense_mqa_7f7531261749ec829b4c(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens)
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
+kernel_cake_deepgemm_dense_mqa_ed3fb6920c34d71fb495(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -111,12 +112,12 @@ kernel_cake_deepgemm_dense_mqa_7f7531261749ec829b4c(unsigned int* __restrict__ S
     // Kernel setup ops
     unsigned int* work_prefix = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int work_prefix_addr = smem + 0;
-    unsigned int* cost_prefix = reinterpret_cast<unsigned int*>(smem_raw + 128);
-    const int cost_prefix_addr = smem + 128;
-    unsigned long long* warp_sums = reinterpret_cast<unsigned long long*>(smem_raw + 256);
-    const int warp_sums_addr = smem + 256;
-    unsigned long long* carry = reinterpret_cast<unsigned long long*>(smem_raw + 320);
-    const int carry_addr = smem + 320;
+    unsigned int* cost_prefix = reinterpret_cast<unsigned int*>(smem_raw + 16);
+    const int cost_prefix_addr = smem + 16;
+    unsigned long long* warp_sums = reinterpret_cast<unsigned long long*>(smem_raw + 32);
+    const int warp_sums_addr = smem + 32;
+    unsigned long long* carry = reinterpret_cast<unsigned long long*>(smem_raw + 96);
+    const int carry_addr = smem + 96;
 
     // Kernel post-init ops
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -130,7 +131,7 @@ kernel_cake_deepgemm_dense_mqa_7f7531261749ec829b4c(unsigned int* __restrict__ S
     unsigned int num_q_blocks = (num_q_tokens + 3) / 4;
     unsigned int span_offset = (3 * SM_COUNT + 1) / 2 * 2;
     #pragma unroll 1
-    for (unsigned int qidx = tid; qidx < 32; qidx += 256) {
+    for (unsigned int qidx = tid; qidx < 4; qidx += 256) {
         if (num_q_blocks > qidx) {
             unsigned int start = 4294967295;
             unsigned int end = 0;
@@ -201,40 +202,22 @@ kernel_cake_deepgemm_dense_mqa_7f7531261749ec829b4c(unsigned int* __restrict__ S
         unsigned int coordinate = total_work;
         if (target != total_cost) {
             block = 0;
-            unsigned int candidate = block + 32;
+            unsigned int candidate = block + 4;
             if (candidate <= num_q_blocks) {
                 if (target >= cost_prefix[candidate - 1]) {
                     block = candidate;
                 }
             }
-            unsigned int candidate_0 = block + 16;
+            unsigned int candidate_0 = block + 2;
             if (candidate_0 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_0 - 1]) {
                     block = candidate_0;
                 }
             }
-            unsigned int candidate_1 = block + 8;
+            unsigned int candidate_1 = block + 1;
             if (candidate_1 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_1 - 1]) {
                     block = candidate_1;
-                }
-            }
-            unsigned int candidate_2 = block + 4;
-            if (candidate_2 <= num_q_blocks) {
-                if (target >= cost_prefix[candidate_2 - 1]) {
-                    block = candidate_2;
-                }
-            }
-            unsigned int candidate_3 = block + 2;
-            if (candidate_3 <= num_q_blocks) {
-                if (target >= cost_prefix[candidate_3 - 1]) {
-                    block = candidate_3;
-                }
-            }
-            unsigned int candidate_4 = block + 1;
-            if (candidate_4 <= num_q_blocks) {
-                if (target >= cost_prefix[candidate_4 - 1]) {
-                    block = candidate_4;
                 }
             }
             unsigned int cost_before = 0;
@@ -255,40 +238,22 @@ kernel_cake_deepgemm_dense_mqa_7f7531261749ec829b4c(unsigned int* __restrict__ S
         unsigned int coordinate_3 = total_work;
         if (target_0 != total_cost) {
             block_1 = 0;
-            unsigned int candidate_5 = block_1 + 32;
-            if (candidate_5 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_5 - 1]) {
-                    block_1 = candidate_5;
+            unsigned int candidate_2 = block_1 + 4;
+            if (candidate_2 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_2 - 1]) {
+                    block_1 = candidate_2;
                 }
             }
-            unsigned int candidate_0_1 = block_1 + 16;
+            unsigned int candidate_0_1 = block_1 + 2;
             if (candidate_0_1 <= num_q_blocks) {
                 if (target_0 >= cost_prefix[candidate_0_1 - 1]) {
                     block_1 = candidate_0_1;
                 }
             }
-            unsigned int candidate_1_1 = block_1 + 8;
+            unsigned int candidate_1_1 = block_1 + 1;
             if (candidate_1_1 <= num_q_blocks) {
                 if (target_0 >= cost_prefix[candidate_1_1 - 1]) {
                     block_1 = candidate_1_1;
-                }
-            }
-            unsigned int candidate_2_1 = block_1 + 4;
-            if (candidate_2_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_2_1 - 1]) {
-                    block_1 = candidate_2_1;
-                }
-            }
-            unsigned int candidate_3_1 = block_1 + 2;
-            if (candidate_3_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_3_1 - 1]) {
-                    block_1 = candidate_3_1;
-                }
-            }
-            unsigned int candidate_4_1 = block_1 + 1;
-            if (candidate_4_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_4_1 - 1]) {
-                    block_1 = candidate_4_1;
                 }
             }
             unsigned int cost_before_1 = 0;

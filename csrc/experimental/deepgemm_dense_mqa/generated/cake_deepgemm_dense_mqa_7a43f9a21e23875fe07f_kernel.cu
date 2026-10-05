@@ -73,6 +73,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #ifndef SM_COUNT
 #error "SM_COUNT is a downstream specialization of this program; define it on the compile line"
 #endif
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -228,8 +229,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) void
-kernel_cake_deepgemm_dense_mqa_16c66ead857c21f63dba(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
+kernel_cake_deepgemm_dense_mqa_7a43f9a21e23875fe07f(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

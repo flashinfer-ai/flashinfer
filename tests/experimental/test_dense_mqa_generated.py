@@ -390,7 +390,7 @@ def test_dense_route_table_is_catalog_driven():
     assert record["clean_logits"] == "fused" and record["kv_alignment"] == 256
     if 64 in _runtime.heads():
         assert _runtime.block_q(64) == 2
-        assert _runtime.route_name("fp8", 16, 4096, 64) == "fp8:h64:full:le8"
+        assert _runtime.route_name("fp8", 16, 4096, 64) == "fp8:h64:full:le64"
         assert _runtime.route_name("fp8", 3, 4100, 64) == "fp8:h64:partial:le8"
         assert _runtime.route_name("fp8", 1, 300, 64) == "fp8:h64:q1"
         assert _runtime.route_name("fp8", 1024, 5124, 64) == "fp8:h64:full:le1024"
