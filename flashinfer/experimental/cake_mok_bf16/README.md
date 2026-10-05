@@ -102,8 +102,8 @@ tests and three tests on each of four ranks. Unequal inputs include empty
 ranks, all-empty inputs, changed counts, three bitwise-identical graph
 replays, earlier-graph reuse, and same-shape input updates.
 
-Owner: Haozheng Fan. This draft needs a public tracking issue and a maintainer-
-agreed release target before experimental admission. Graduation requires
+Owner: Haozheng Fan. Tracking: [#6052](https://github.com/flashinfer-ai/flashinfer/issues/6052).
+This draft needs a maintainer-agreed release target before experimental admission. Graduation requires
 full EP16 qualification of the exported runtime and sanitizer acceptance;
 numerical checks alone do not clear those gates. No whole-model or public performance claim is made.
 
