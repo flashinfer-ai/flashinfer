@@ -855,11 +855,11 @@ def test_epilogue_rules():
         ),
         # round 13 (W4): the fp32 v8 register stores with L1::no_allocate.L2::evict_first (``_ef`` right after ``_v8``)
         (
-            dict(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True),
+            dict(a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True, store_ef=True),
             "dense_proj_gemm_kn_n256_f32_v8_ef",
         ),
         (
-            dict(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True, stages=9),
+            dict(a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True, store_ef=True, stages=9),
             "dense_proj_gemm_kn_n256_f32_v8_ef_s9",
         ),
     ],
@@ -896,8 +896,9 @@ def test_round13_batch_group_knob():
 
 def test_round13_store_ef_knob():
     # field 21 of the 22-field key: the hint exists only on the fp32 v8 register store form
-    assert instance_key(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True)[21] is True
-    assert instance_key(a_mn=False, b_mn=True, out_f32=True, store_ef=True)[21] is False
+    assert instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True, store_ef=True)[21] is True
+    assert instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", store_ef=True)[21] is False
+    assert instance_key(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True)[21] is False  # TMA-store fp32 epilogue: no v8 stores
     assert instance_key(a_mn=False, b_mn=True, store_ef=True)[21] is False
 
 
