@@ -25,7 +25,7 @@ from ..trace.templates.qsa import qsa_attention_run_trace
 from .output_gate import qsa_output_gate
 from ..sparse import BlockSparseAttentionWrapper
 from .route import qsa_route_from_logical
-from ._workspace import check_buffer, cut, walk
+from ._workspace import check_buffer, check_tensor, cut, walk
 from ..topk import WORKSPACE_ALIGNMENT
 from ..utils import round_up
 
@@ -627,22 +627,15 @@ class QSAAttention:
         """Shape, dtype, device and layout, before anything is launched. ``packed``
         planes need only unit stride innermost: a packed NVFP4 cache keeps data
         and block scales strided in one allocation, and the kernel reads strides."""
-        if tuple(tensor.shape) != tuple(shape):
-            raise ValueError(
-                f"{name} must be {tuple(shape)}, got {tuple(tensor.shape)}"
-            )
-        if tensor.dtype != dtype:
-            raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
-        if tensor.device != self.device:
-            raise ValueError(f"{name} must be on {self.device}, got {tensor.device}")
-        if packed:
-            if not tensor.is_contiguous():
-                raise ValueError(f"{name} must be contiguous")
-        elif tensor.stride(-1) != 1:
-            raise ValueError(
-                f"{name} must be contiguous in its innermost dimension, got "
-                f"stride {tensor.stride(-1)}"
-            )
+        check_tensor(
+            tensor,
+            name,
+            shape=shape,
+            dtype=dtype,
+            device=self.device,
+            contiguous=packed,
+            innermost=not packed,
+        )
 
     def _checked_scale(self, value, name):
         """A real, finite, positive host number: a device tensor would synchronise
@@ -718,27 +711,21 @@ class QSAAttention:
 
         # The gate arrives split by head or flat over them; both are the same
         # values, and both have to cover the batch.
-        if output_gate.ndim == 3:
-            gate_shape = (rows, self.num_qo_heads, self.head_dim)
-        elif output_gate.ndim == 2:
-            gate_shape = (rows, self.num_qo_heads * self.head_dim)
-        else:
+        if output_gate.ndim not in (2, 3):
             raise ValueError(
                 "output_gate is [rows, heads, dim] or [rows, heads * dim], got "
                 f"{output_gate.ndim} axes"
             )
-        if tuple(output_gate.shape) != gate_shape:
-            raise ValueError(
-                f"output_gate must be {gate_shape}, got {tuple(output_gate.shape)}"
-            )
-        if output_gate.dtype != self.o_data_type:
-            raise ValueError(
-                f"output_gate must be {self.o_data_type}, got {output_gate.dtype}"
-            )
-        if output_gate.device != self.device:
-            raise ValueError(
-                f"output_gate must be on {self.device}, got {output_gate.device}"
-            )
+        gate_shape = (rows, self.num_qo_heads, self.head_dim)
+        if output_gate.ndim == 2:
+            gate_shape = (rows, self.num_qo_heads * self.head_dim)
+        check_tensor(
+            output_gate,
+            "output_gate",
+            shape=gate_shape,
+            dtype=self.o_data_type,
+            device=self.device,
+        )
 
         # The cache, by the format that was named when this was built. A packed
         # NVFP4 entry is half a byte per value; everything else is one value.

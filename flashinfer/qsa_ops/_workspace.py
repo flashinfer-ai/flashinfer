@@ -1,4 +1,4 @@
-"""Carving one caller-owned byte buffer into the views a QSA object runs from."""
+"""Carving caller-owned buffers into views, and the tensor checks made before a launch."""
 
 import torch
 
@@ -37,3 +37,27 @@ def cut(buffer: torch.Tensor, span, dtype: torch.dtype, shape):
     begin, size = span
     view = buffer[begin : begin + size].view(dtype)
     return view if shape is None else view.view(shape)
+
+
+def check_tensor(
+    tensor,
+    name,
+    *,
+    shape=None,
+    dtype=None,
+    device=None,
+    contiguous=False,
+    innermost=False,
+):
+    if shape is not None and tuple(tensor.shape) != tuple(shape):
+        raise ValueError(f"{name} must be {tuple(shape)}, got {tuple(tensor.shape)}")
+    if dtype is not None and tensor.dtype != dtype:
+        raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
+    if device is not None and tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if contiguous and not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if innermost and tensor.stride(-1) != 1:
+        raise ValueError(
+            f"{name} must be contiguous in its innermost dimension, got stride {tensor.stride(-1)}"
+        )

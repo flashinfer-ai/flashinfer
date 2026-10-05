@@ -23,7 +23,7 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.qsa import qsa_selection_run_trace
 from .route import qsa_expand_block_route
 from .scores import qsa_paged_scores
-from ._workspace import check_buffer, cut
+from ._workspace import check_buffer, check_tensor, cut
 from ..topk import (
     WORKSPACE_ALIGNMENT,
     TopKTieBreak,
@@ -375,36 +375,23 @@ class QSASelection:
             raise ValueError(
                 f"this selection was prepared for {self.max_rows} rows, got {rows}"
             )
-        if tuple(q.shape[1:]) != (self.num_heads, self.head_dim):
-            raise ValueError(
-                f"q must be [rows, {self.num_heads}, {self.head_dim}], got "
-                f"{tuple(q.shape)}"
-            )
         if q.dtype not in _SCORE_DTYPES:
             raise ValueError(f"q must be one of {_SCORE_DTYPES}, got {q.dtype}")
-        if q.dtype != k_compressed.dtype:
-            raise ValueError(
-                "q and the compressed cache share one dtype, got "
-                f"{q.dtype} and {k_compressed.dtype}"
-            )
+        check_tensor(
+            q, "q", shape=(rows, self.num_heads, self.head_dim), device=self.device
+        )
         if k_compressed.ndim != 3 or k_compressed.size(2) != self.head_dim:
             raise ValueError(
                 "k_compressed must be [pages, page_size, head_dim] with "
                 f"head_dim {self.head_dim}, got {tuple(k_compressed.shape)}"
             )
-        for name, tensor, shape in (
-            ("token_to_request", token_to_request, (rows,)),
-            ("query_positions", query_positions, (rows,)),
-        ):
-            if tensor.shape[0] < shape[0]:
-                raise ValueError(
-                    f"{name} must cover {shape[0]} rows, got {tensor.shape[0]}"
-                )
-        if token_to_request.dtype != block_table.dtype:
+        check_tensor(k_compressed, "k_compressed", dtype=q.dtype, device=self.device)
+        if block_table.ndim != 2:
             raise ValueError(
-                "token_to_request must carry the block table's dtype "
-                f"{block_table.dtype}, got {token_to_request.dtype}"
+                f"block_table must be [requests, pages], got {tuple(block_table.shape)}"
             )
+        # The visible-block counts are int32 and the scorer requires the block
+        # table and the per-request arrays to match, so the index side is int32.
         # Positions may arrive as int64 beside a slot mapping; converting would
         # allocate per call, so the kernels take either and narrow inside, where
         # a value that does not fit becomes a masked-off row, not a wrapped one.
@@ -413,52 +400,31 @@ class QSASelection:
                 f"query_positions must be one of {_POSITION_DTYPES}, got "
                 f"{query_positions.dtype}"
             )
-        if seq_lens.dtype != block_table.dtype:
-            raise ValueError(
-                "seq_lens must carry the block table's dtype "
-                f"{block_table.dtype}, got {seq_lens.dtype}"
-            )
-        # The visible-block counts are int32 and the scorer requires the block
-        # table to match, so the whole index side is int32.
-        if block_table.dtype != torch.int32:
-            raise ValueError(f"block_table must be int32, got {block_table.dtype}")
-        if block_table.ndim != 2:
-            raise ValueError(
-                f"block_table must be [requests, pages], got {tuple(block_table.shape)}"
-            )
-        for name, tensor in (
-            ("token_to_request", token_to_request),
-            ("query_positions", query_positions),
-            ("seq_lens", seq_lens),
+        for name, tensor, dtype in (
+            ("block_table", block_table, torch.int32),
+            ("token_to_request", token_to_request, torch.int32),
+            ("query_positions", query_positions, query_positions.dtype),
+            ("seq_lens", seq_lens, torch.int32),
         ):
-            if tensor.ndim != 1:
+            if name != "block_table" and tensor.ndim != 1:
                 raise ValueError(f"{name} must be one axis, got {tensor.ndim}")
-            if not tensor.is_contiguous():
-                raise ValueError(f"{name} must be contiguous")
-        if not block_table.is_contiguous():
-            raise ValueError("block_table must be contiguous")
-        if not out_route.is_contiguous():
-            raise ValueError("out_route must be contiguous")
+            check_tensor(tensor, name, dtype=dtype, device=self.device, contiguous=True)
         for name, tensor in (
-            ("q", q),
-            ("k_compressed", k_compressed),
-            ("block_table", block_table),
             ("token_to_request", token_to_request),
             ("query_positions", query_positions),
-            ("seq_lens", seq_lens),
-            ("out_route", out_route),
         ):
-            if tensor.device != self.device:
+            if tensor.shape[0] < rows:
                 raise ValueError(
-                    f"{name} must be on {self.device}, got {tensor.device}"
+                    f"{name} must cover {rows} rows, got {tensor.shape[0]}"
                 )
-        if tuple(out_route.shape) != (rows, self.route_width):
-            raise ValueError(
-                f"out_route must be [{rows}, {self.route_width}], got "
-                f"{tuple(out_route.shape)}"
-            )
-        if out_route.dtype != torch.int32:
-            raise ValueError(f"out_route must be int32, got {out_route.dtype}")
+        check_tensor(
+            out_route,
+            "out_route",
+            shape=(rows, self.route_width),
+            dtype=torch.int32,
+            device=self.device,
+            contiguous=True,
+        )
         check_buffer(workspace, "workspace")
         if workspace.device != self.device:
             raise ValueError(
