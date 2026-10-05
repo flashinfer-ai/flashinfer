@@ -2746,6 +2746,7 @@ from ._batch_mla._wrapper import (
 # Keep the trtllm-gen autotune sweep bounded; actual counter storage is sized
 # dynamically per profiled batch.
 _TRTLLM_GEN_MLA_MAX_BATCH = 8192
+_MLA_DECODE_TUNING_CONFIG_CACHE_SIZE = 256
 
 
 def _round_to_seq_len_bucket(x: int) -> int:
@@ -3165,7 +3166,7 @@ def _cute_dsl_incompatibility_reason(
     return None
 
 
-@functools.cache
+@functools.lru_cache(maxsize=_MLA_DECODE_TUNING_CONFIG_CACHE_SIZE)
 def _mla_decode_tuning_config(
     buckets: tuple[int, ...],
     num_pages: int,
@@ -3178,8 +3179,9 @@ def _mla_decode_tuning_config(
 ) -> TuningConfig:
     """One TuningConfig and stable initializer set per key.
 
-    Memoized so equivalent dispatcher calls reuse a single config object (and
-    its initializer closures) instead of rebuilding them every call. The
+    Memoized with a bounded cache so equivalent dispatcher calls reuse a single
+    config object (and its initializer closures) instead of rebuilding them
+    every call without retaining an unbounded number of configurations. The
     initializer closures no longer participate in ``AutoTuner``'s nearest-profile
     cache key (it keys only on the dynamic-tensor specs and constraints), so this
     memoization is a host-overhead optimization rather than a leak guard.
@@ -3270,8 +3272,8 @@ def _build_mla_decode_tuning_config(
 
     Key stability: num_pages and profile_seq_len are fixed per KV-cache
     allocation. A caller that varies max_seq_len or block-table width per
-    call gets one cached config per distinct value (bounded, unlike the
-    per-call configs this replaces).
+    call gets one cached config per distinct value; the LRU bound prevents
+    those values from accumulating for the lifetime of the process.
     """
     # kv_cache may be 3D [num_pages, page_size, D] or 4D
     # [num_pages, 1, page_size, D] after `_check_trtllm_gen_mla_shape` —
