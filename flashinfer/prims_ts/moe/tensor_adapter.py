@@ -1455,6 +1455,7 @@ def build_fp8_block_scale_launch_io(
     if gemm2_output.dtype != torch.bfloat16:
         raise ValueError("FP8 block-scale FC2 output must be bfloat16")
     if is_deepseek:
+        native_mx_activation = bool(cfg.dsfp8_mxfp8_sfb_is_mxfp8)
         for name, tensor in (
             ("hidden_states_scale", hidden_states_scale),
             ("gemm1_weights_scale", gemm1_weights_scale),
@@ -1462,8 +1463,23 @@ def build_fp8_block_scale_launch_io(
             ("gemm1_output_scale", gemm1_output_scale),
             ("activation_output_scale", activation_output_scale),
         ):
-            if tensor.dtype != torch.float32:
-                raise ValueError(f"DeepSeek FP8 {name} must be float32")
+            native_mx_scale = (
+                native_mx_activation
+                and name
+                in {
+                    "hidden_states_scale",
+                    "gemm1_output_scale",
+                    "activation_output_scale",
+                }
+            ) or (
+                cfg.has_epilogue_quant
+                and name in {"gemm1_output_scale", "activation_output_scale"}
+            )
+            expected_dtype = torch.uint8 if native_mx_scale else torch.float32
+            if tensor.dtype != expected_dtype:
+                raise ValueError(
+                    f"DeepSeek FP8 {name} must be {expected_dtype}, got {tensor.dtype}"
+                )
     else:
         sf_k_fc1 = (int(hidden_size) + 31) // 32
         sf_k_fc2 = (int(intermediate_size) + 31) // 32
@@ -1518,7 +1534,11 @@ def build_fp8_block_scale_launch_io(
     )
     logical_output_m = m_val // 2 if cfg.has_gated_epilogue else m_val
     data_dtype = cutlass.Float8E4M3FN
-    sf_dtype = cutlass.Float32 if is_deepseek else cutlass.Float8E8M0FNU
+    expanded_sf_dtype = cutlass.Float32 if is_deepseek else cutlass.Float8E8M0FNU
+    sfa_dtype = expanded_sf_dtype
+    sfb_dtype = (
+        cutlass.Float8E8M0FNU if cfg.dsfp8_mxfp8_sfb_is_mxfp8 else expanded_sf_dtype
+    )
     dummy_data_ptr = output_buf.data_ptr()
     global_scale = (
         _get_expert_scale_ones(num_experts, hidden_states.device)
@@ -1548,10 +1568,10 @@ def build_fp8_block_scale_launch_io(
         assumed_align=16,
     )
     sfa_dp = make_ptr(
-        sf_dtype, weights_scale.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
+        sfa_dtype, weights_scale.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=32
     )
     sfb_dp = make_ptr(
-        sf_dtype,
+        sfb_dtype,
         activation_scale.data_ptr(),
         cutlass.AddressSpace.gmem,
         assumed_align=32,
@@ -1564,7 +1584,7 @@ def build_fp8_block_scale_launch_io(
             assumed_align=16,
         )
         sf_c_dp = make_ptr(
-            sf_dtype,
+            expanded_sf_dtype if cfg.has_epilogue_quant else cutlass.Float32,
             output_scale.data_ptr(),
             cutlass.AddressSpace.gmem,
             assumed_align=16,
@@ -1577,7 +1597,7 @@ def build_fp8_block_scale_launch_io(
             assumed_align=16,
         )
         sf_c_dp = make_ptr(
-            sf_dtype,
+            expanded_sf_dtype if cfg.has_epilogue_quant else cutlass.Float32,
             output_scale.data_ptr(),
             cutlass.AddressSpace.gmem,
             assumed_align=16,

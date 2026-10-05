@@ -34,7 +34,9 @@ SUPPORTED_FP8_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_MXFP4_MXFP8_TILE_N = (8, 16, 32, 64, 128, 192, 256)
 SUPPORTED_MXFP4_BF16_TILE_N = (8, 16, 32, 64, 128)
 SUPPORTED_DSFP8_TILE_N = (8, 16, 32, 64, 128)
+SUPPORTED_DSFP8_MXFP8_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_MXFP8_MXFP8_TILE_N = (8, 16, 32, 64, 128, 256)
+
 
 _ACTIVATION_TO_ACT_KIND = {
     int(ActivationType.Identity): 0,
@@ -201,6 +203,7 @@ _SUPPORTED_JSON_OPTION_KEYS = frozenset(
         "use_early_exit",
         "use_global_scales",
         "use_max_tmem_overlap",
+        "use_mxfp8_deepseek_fp8",
         "use_pdl",
         "use_per_token_sf_a",
         "use_per_token_sf_b",
@@ -640,6 +643,7 @@ def _json_config_matches_moe(
     dtype_b: int,
     dtype_c: int,
     use_deepseek_fp8: bool = False,
+    use_mxfp8_deepseek_fp8: bool = False,
     use_per_token_sf_a: bool | None = None,
     use_per_token_sf_b: bool | None = None,
     per_token_sf_dtype: int | None = None,
@@ -665,6 +669,10 @@ def _json_config_matches_moe(
     if json_dtype_c != int(dtype_c):
         return False
     if _bool_value(options.get("use_deepseek_fp8", False)) != bool(use_deepseek_fp8):
+        return False
+    if _bool_value(options.get("use_mxfp8_deepseek_fp8", False)) != bool(
+        use_mxfp8_deepseek_fp8
+    ):
         return False
     try:
         json_weight_layout = _json_weight_layout_value(
@@ -741,6 +749,7 @@ def _moe_json_passing_indices(
     dtype_b: int,
     dtype_c: int,
     use_deepseek_fp8: bool = False,
+    use_mxfp8_deepseek_fp8: bool = False,
     use_per_token_sf_a: bool | None = None,
     use_per_token_sf_b: bool | None = None,
     per_token_sf_dtype: int | None = None,
@@ -758,6 +767,7 @@ def _moe_json_passing_indices(
             dtype_b=dtype_b,
             dtype_c=dtype_c,
             use_deepseek_fp8=use_deepseek_fp8,
+            use_mxfp8_deepseek_fp8=use_mxfp8_deepseek_fp8,
             use_per_token_sf_a=use_per_token_sf_a,
             use_per_token_sf_b=use_per_token_sf_b,
             per_token_sf_dtype=per_token_sf_dtype,
@@ -777,6 +787,7 @@ def _resolve_moe_json_config_pair(
     fc2_dtype_c: int,
     dtype_label: str,
     use_deepseek_fp8: bool = False,
+    use_mxfp8_deepseek_fp8: bool = False,
     fc1_use_per_token_sf_a: bool | None = None,
     fc2_use_per_token_sf_a: bool | None = None,
     fc1_use_per_token_sf_b: bool | None = None,
@@ -794,6 +805,7 @@ def _resolve_moe_json_config_pair(
         dtype_b=dtype_b,
         dtype_c=fc1_dtype_c,
         use_deepseek_fp8=use_deepseek_fp8,
+        use_mxfp8_deepseek_fp8=use_mxfp8_deepseek_fp8,
         use_per_token_sf_a=fc1_use_per_token_sf_a,
         use_per_token_sf_b=fc1_use_per_token_sf_b,
         per_token_sf_dtype=per_token_sf_dtype,
@@ -807,6 +819,7 @@ def _resolve_moe_json_config_pair(
         dtype_b=dtype_b,
         dtype_c=fc2_dtype_c,
         use_deepseek_fp8=use_deepseek_fp8,
+        use_mxfp8_deepseek_fp8=use_mxfp8_deepseek_fp8,
         use_per_token_sf_a=fc2_use_per_token_sf_a,
         use_per_token_sf_b=fc2_use_per_token_sf_b,
         per_token_sf_dtype=per_token_sf_dtype,
@@ -1019,6 +1032,8 @@ def _json_config_kwargs(
         kwargs["use_deepseek_fp8"] = 1
         kwargs["num_load_sfab_warps"] = 1
         kwargs["load_sfab_regs"] = int(options.get("load_sfab_regs", load_sf_regs))
+    if _bool_value(options.get("use_mxfp8_deepseek_fp8", False)):
+        kwargs["use_mxfp8_deepseek_fp8"] = 1
     if use_per_token_sf_a:
         kwargs["use_per_token_sf_a"] = 1
     if use_per_token_sf_b:
@@ -1101,6 +1116,7 @@ def _make_json_moe_config_pair(
     fc1_has_bias: bool = False,
     fc2_has_bias: bool = False,
     use_deepseek_fp8: bool = False,
+    use_mxfp8_deepseek_fp8: bool = False,
     fc1_use_per_token_sf_a: bool | None = None,
     fc2_use_per_token_sf_a: bool | None = None,
     fc1_use_per_token_sf_b: bool | None = None,
@@ -1122,6 +1138,7 @@ def _make_json_moe_config_pair(
         fc2_dtype_c=fc2_dtype_c,
         dtype_label=dtype_label,
         use_deepseek_fp8=use_deepseek_fp8,
+        use_mxfp8_deepseek_fp8=use_mxfp8_deepseek_fp8,
         fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
         fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
         fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
@@ -1258,6 +1275,7 @@ def _fallback_tile_ns_for_label(dtype_label: str, tile_n: int) -> tuple[int, ...
         "MXFP4xBF16": SUPPORTED_MXFP4_BF16_TILE_N,
         "MXFP8xMXFP8": SUPPORTED_MXFP8_MXFP8_TILE_N,
         "DeepSeek FP8": SUPPORTED_DSFP8_TILE_N,
+        "MXFP8-backed DeepSeek FP8": SUPPORTED_DSFP8_MXFP8_TILE_N,
     }
     supported_tiles = supported_by_label.get(dtype_label, (tile_n,))
     larger_tiles = tuple(tile for tile in supported_tiles if tile > tile_n)
@@ -1277,6 +1295,7 @@ def _make_default_json_moe_config_pair(
     fc1_has_bias: bool = False,
     fc2_has_bias: bool = False,
     use_deepseek_fp8: bool = False,
+    use_mxfp8_deepseek_fp8: bool = False,
     fc1_use_per_token_sf_a: bool | None = None,
     fc2_use_per_token_sf_a: bool | None = None,
     fc1_use_per_token_sf_b: bool | None = None,
@@ -1299,6 +1318,7 @@ def _make_default_json_moe_config_pair(
         dtype_b=dtype_b,
         dtype_c=fc1_dtype_c,
         use_deepseek_fp8=use_deepseek_fp8,
+        use_mxfp8_deepseek_fp8=use_mxfp8_deepseek_fp8,
         use_per_token_sf_a=fc1_use_per_token_sf_a,
         use_per_token_sf_b=fc1_use_per_token_sf_b,
         per_token_sf_dtype=per_token_sf_dtype,
@@ -1312,6 +1332,7 @@ def _make_default_json_moe_config_pair(
         dtype_b=dtype_b,
         dtype_c=fc2_dtype_c,
         use_deepseek_fp8=use_deepseek_fp8,
+        use_mxfp8_deepseek_fp8=use_mxfp8_deepseek_fp8,
         use_per_token_sf_a=fc2_use_per_token_sf_a,
         use_per_token_sf_b=fc2_use_per_token_sf_b,
         per_token_sf_dtype=per_token_sf_dtype,
@@ -1331,6 +1352,7 @@ def _make_default_json_moe_config_pair(
         fc1_has_bias=fc1_has_bias,
         fc2_has_bias=fc2_has_bias,
         use_deepseek_fp8=use_deepseek_fp8,
+        use_mxfp8_deepseek_fp8=use_mxfp8_deepseek_fp8,
         fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
         fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
         fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
@@ -1407,6 +1429,7 @@ def _valid_json_moe_tactics(
     fc1_has_bias: bool = False,
     fc2_has_bias: bool = False,
     use_deepseek_fp8: bool = False,
+    use_mxfp8_deepseek_fp8: bool = False,
     fc1_use_per_token_sf_a: bool | None = None,
     fc2_use_per_token_sf_a: bool | None = None,
     fc1_use_per_token_sf_b: bool | None = None,
@@ -1433,6 +1456,7 @@ def _valid_json_moe_tactics(
             dtype_b=dtype_b,
             dtype_c=fc1_dtype_c,
             use_deepseek_fp8=use_deepseek_fp8,
+            use_mxfp8_deepseek_fp8=use_mxfp8_deepseek_fp8,
             use_per_token_sf_a=fc1_use_per_token_sf_a,
             use_per_token_sf_b=fc1_use_per_token_sf_b,
             per_token_sf_dtype=per_token_sf_dtype,
@@ -1446,6 +1470,7 @@ def _valid_json_moe_tactics(
             dtype_b=dtype_b,
             dtype_c=fc2_dtype_c,
             use_deepseek_fp8=use_deepseek_fp8,
+            use_mxfp8_deepseek_fp8=use_mxfp8_deepseek_fp8,
             use_per_token_sf_a=fc2_use_per_token_sf_a,
             use_per_token_sf_b=fc2_use_per_token_sf_b,
             per_token_sf_dtype=per_token_sf_dtype,
@@ -1689,19 +1714,28 @@ def valid_prims_ts_deepseek_fp8_moe_tactics(
     num_local_experts: int | None = None,
     enable_pdl: bool = False,
     weight_layout: int = int(WeightLayout.MajorK),
+    use_mxfp8_backed_dsfp8: bool = False,
 ) -> list[list[int]]:
+    supported_tiles = (
+        SUPPORTED_DSFP8_MXFP8_TILE_N
+        if use_mxfp8_backed_dsfp8
+        else SUPPORTED_DSFP8_TILE_N
+    )
     return _valid_json_moe_tactics(
-        supported_tiles=SUPPORTED_DSFP8_TILE_N,
+        supported_tiles=supported_tiles,
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
         activation_type=int(ActivationType.Swiglu),
-        dtype_a=int(_DType.E4M3),
-        dtype_b=int(_DType.E4M3),
-        fc1_dtype_c=int(_DType.E4M3),
+        dtype_a=int(_DType.MXE4M3 if use_mxfp8_backed_dsfp8 else _DType.E4M3),
+        dtype_b=int(_DType.MXE4M3 if use_mxfp8_backed_dsfp8 else _DType.E4M3),
+        fc1_dtype_c=int(_DType.MXE4M3 if use_mxfp8_backed_dsfp8 else _DType.E4M3),
         fc2_dtype_c=int(_DType.BF16),
-        dtype_label="DeepSeek FP8",
-        use_deepseek_fp8=True,
+        dtype_label=(
+            "MXFP8-backed DeepSeek FP8" if use_mxfp8_backed_dsfp8 else "DeepSeek FP8"
+        ),
+        use_deepseek_fp8=not use_mxfp8_backed_dsfp8,
+        use_mxfp8_deepseek_fp8=use_mxfp8_backed_dsfp8,
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
     )
@@ -2038,17 +2072,28 @@ def map_trtllm_deepseek_fp8_moe_tactic(
     num_local_experts: int | None = None,
     enable_pdl: bool = False,
     weight_layout: int = int(WeightLayout.MajorK),
+    use_mxfp8_backed_dsfp8: bool = False,
 ) -> PrimsTsGemmPair:
-    """Return Prims-TS FC1/FC2 configs for Prims-TS DeepSeek FP8 MoE."""
+    """Return Prims-TS FC1/FC2 configs for Prims-TS DeepSeek FP8 MoE.
 
+    ``use_mxfp8_backed_dsfp8=True`` selects the staged native-MX path. Both FCs
+    consume native UE8M0 K32 activation scales, while weights retain compact
+    K128 FP32 checkpoint scales. FC1 SwiGLU emits true MXFP8 for FC2 to consume
+    directly. The former pre-expanded GMEM recipe has been removed.
+    """
+
+    native_mxfp8 = use_mxfp8_backed_dsfp8
+    supported_tiles = (
+        SUPPORTED_DSFP8_MXFP8_TILE_N if native_mxfp8 else SUPPORTED_DSFP8_TILE_N
+    )
     tile_n, moe_config_index = _parse_tactic(
         tactic,
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
-        supported_tiles=SUPPORTED_DSFP8_TILE_N,
+        supported_tiles=supported_tiles,
     )
-    if tile_n not in SUPPORTED_DSFP8_TILE_N:
+    if tile_n not in supported_tiles:
         raise ValueError(f"Unsupported Prims-TS DeepSeek FP8 tile_N={tile_n}")
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
@@ -2060,12 +2105,13 @@ def map_trtllm_deepseek_fp8_moe_tactic(
         top_k=top_k,
         num_experts=num_local_experts,
         activation_type=int(ActivationType.Swiglu),
-        dtype_a=int(_DType.E4M3),
-        dtype_b=int(_DType.E4M3),
-        fc1_dtype_c=int(_DType.E4M3),
+        dtype_a=int(_DType.MXE4M3 if native_mxfp8 else _DType.E4M3),
+        dtype_b=int(_DType.MXE4M3 if native_mxfp8 else _DType.E4M3),
+        fc1_dtype_c=int(_DType.MXE4M3 if native_mxfp8 else _DType.E4M3),
         fc2_dtype_c=int(_DType.BF16),
-        dtype_label="DeepSeek FP8",
-        use_deepseek_fp8=True,
+        dtype_label=("MXFP8-backed DeepSeek FP8" if native_mxfp8 else "DeepSeek FP8"),
+        use_deepseek_fp8=not native_mxfp8,
+        use_mxfp8_deepseek_fp8=native_mxfp8,
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
     )
