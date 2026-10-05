@@ -15,8 +15,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-import hashlib
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,83 +47,48 @@ def _assert_oracle_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2, equal_nan=True)
 
 
-def test_generated_source_inventory_and_hashes() -> None:
+def _kernel_table(arch: str) -> dict[str, str]:
+    table = gdn_cp_jit.KERNELS
+    if any(isinstance(value, dict) for value in table.values()):
+        table = table[arch]
+    return table
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_registry_maps_every_logical_kernel_to_a_program_for_the_arch(
+    arch: str,
+) -> None:
+    csrc = _source_root().parents[1]
+    table = _kernel_table(arch)
+    assert table, "the generated registry lists the kernels the host dispatches on"
+    for name in table:
+        program = gdn_cp_jit.program_for(name, arch)
+        assert program.startswith("cake_gdn_cp_")
+        record = gdn_cp_jit.MODULES[program]
+        assert arch in record["arches"]
+        assert record["sources"], program
+        for relative in record["sources"]:
+            assert Path(relative).name.startswith("cake_gdn_cp_"), relative
+            assert (csrc / relative).is_file(), relative
+        assert record["ffi_entry"]
+        assert record["arg_plan"], program
+    with pytest.raises(ValueError):
+        gdn_cp_jit.program_for("not_a_gdn_cp_kernel", arch)
+
+
+def test_generated_sources_carry_no_manifest_and_every_kernel_is_registered() -> None:
     root = _source_root()
-    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema"] == "flashinfer.gdn_cp.runtime_manifest.v1"
-    legacy_inventory = {"README.md", "manifest.json"}
-    legacy_inventory.update(header["path"] for header in manifest["cuda_headers"])
-    for kernel in manifest["kernels"]:
-        legacy_inventory.add(kernel["host_binding"]["path"])
-        legacy_inventory.update(output["path"] for output in kernel["outputs"])
-    assert len(legacy_inventory) == 72
-    assert all((root / path).is_file() for path in legacy_inventory)
-    implementation_paths = [record["path"] for record in manifest["cuda_headers"]]
-    for kernel in manifest["kernels"]:
-        implementation_paths.append(kernel["host_binding"]["path"])
-        implementation_paths.extend(record["path"] for record in kernel["outputs"])
-    assert len(implementation_paths) == 70
-    assert all(
-        Path(path).name.startswith("cake_gdn_cp_") for path in implementation_paths
-    )
-    assert len(manifest["cuda_headers"]) == 1
-    assert manifest["cuda_headers"][0]["path"] == "cuda/cake_gdn_cp_common.cuh"
-    assert manifest["cuda_headers"][0]["sha256"] == (
-        "58977b0805adba62e0f07df9e3e90d4b46754fc672f02deef6c27f0b55952777"
-    )
-    assert [record["name"] for record in manifest["kernels"]] == [
-        "qk_norm",
-        "qk_norm_bf16",
-        "t_precompute",
-        "t_precompute_bf16",
-        "t_precompute_gb300_hv48_min6",
-        "mn_precompute",
-        "mn_precompute_bf16",
-        "state_fixup_simt_row4",
-        "normalized_final_state",
-        "normalized_final_state_bf16",
-        "state_gather_fp32",
-        "state_gather_fp16",
-        "state_gather_bf16",
-        "state_gather_fp32_int64",
-        "state_gather_fp16_int64",
-        "state_gather_bf16_int64",
-        "state_scatter_fp32",
-        "state_scatter_fp16",
-        "state_scatter_bf16",
-        "state_scatter_fp32_int64",
-        "state_scatter_fp16_int64",
-        "state_scatter_bf16_int64",
-        "state_fixup_utcmma64",
-        "state_fixup_utcmma128",
-        "cp_prefill",
-        "cp_prefill_checkpoint",
-        "cp_prefill_equal_head",
-        "cp_prefill_equal_head_checkpoint",
-        "cp_prefill_equal_head_h32",
-        "cp_prefill_bf16",
-        "cp_prefill_generic",
-        "cp_prefill_generic_checkpoint",
-        "cp_prefill_generic_bf16",
-    ]
-    assert len(manifest["kernels"]) == 33
-    for record in manifest["kernels"]:
-        host = record["host_binding"]
-        host_path = root / host["path"]
-        assert hashlib.sha256(host_path.read_bytes()).hexdigest() == host["sha256"]
-        for output in record["outputs"]:
-            source = root / output["path"]
-            assert hashlib.sha256(source.read_bytes()).hexdigest() == output["sha256"]
-    common_header = root / manifest["cuda_headers"][0]["path"]
-    assert (
-        hashlib.sha256(common_header.read_bytes()).hexdigest()
-        == (manifest["cuda_headers"][0]["sha256"])
-    )
-
-
-def test_jit_loader_accepts_checked_in_manifest() -> None:
-    gdn_cp_jit._manifest.cache_clear()
-    assert gdn_cp_jit._manifest()["schema"] == "flashinfer.gdn_cp.runtime_manifest.v1"
+    assert not (root / "manifest.json").exists()
+    referenced = {
+        Path(relative).name
+        for record in gdn_cp_jit.MODULES.values()
+        for relative in record["sources"]
+    }
+    delivered = {path.name for path in root.iterdir() if path.suffix == ".cu"}
+    assert delivered, "generated CUDA sources are delivered next to the README"
+    assert delivered <= referenced, sorted(delivered - referenced)
+    present = {path.name for path in root.iterdir()}
+    assert referenced <= present, sorted(referenced - present)
 
 
 @pytest.mark.parametrize(
@@ -1228,8 +1191,10 @@ def test_explicit_cake_backend_uses_cp_only_when_requested(
     ("capability", "backend"),
     [((10, 0), "cake_gdn"), ((10, 0), "flashinfer"), ((12, 0), "flashinfer")],
 )
-@pytest.mark.parametrize(("max_seqlen", "expected"), [(None, 5), (11, 11)])
-def test_public_dispatch_forwards_max_seqlen_or_balanced_fallback(
+# Without a hint CP falls back to the packed length, the only bound that
+# holds for every batch.
+@pytest.mark.parametrize(("max_seqlen", "expected"), [(None, 17), (11, 11)])
+def test_public_dispatch_forwards_max_seqlen_or_packed_length_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capability: tuple[int, int],
     backend: str,

@@ -176,9 +176,11 @@ def _validate_common(
         raise ValueError(f"token K={k} does not match weight K={weight_k}")
     if first_token_offset.ndim != 1 or first_token_offset.dtype != torch.int32:
         raise ValueError("first_token_offset must be a one-dimensional int32 tensor")
-    groups = int(first_token_offset.numel())
-    if groups == 0:
-        raise ValueError("first_token_offset must contain at least one group")
+    groups = int(first_token_offset.numel()) - 1
+    if groups < 1 or e < 1 or groups % e:
+        raise ValueError(
+            "first_token_offset must contain G+1 boundaries for a positive multiple of E groups"
+        )
     if scale.dtype != torch.float32 or scale.numel() != 1:
         raise ValueError("scale must contain one float32 value")
     if out is not None and (tuple(out.shape) != (s, n) or out.dtype != torch.bfloat16):
@@ -197,7 +199,7 @@ def _validate_common(
     if any(not t.is_contiguous() for t in tensors):
         raise ValueError("all grouped GEMM1 tensors must be contiguous")
     if any(t.dtype != torch.bfloat16 for t in tensors[:3]):
-        raise ValueError("the v1 grouped GEMM1 ABI requires BF16 tokens and weights")
+        raise ValueError("the v2 grouped GEMM1 ABI requires BF16 tokens and weights")
     return s, n, k, e, groups
 
 
@@ -297,7 +299,7 @@ def _launch(
         s if kernel.swap_ab else n,
         k,
         e,
-        int(first_token_offset.numel()),
+        int(first_token_offset.numel()) - 1,
         *(int(stride) for operand in operands for stride in operand.stride()),
         *map(int, output.stride()),
     )

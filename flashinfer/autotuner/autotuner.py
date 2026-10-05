@@ -991,6 +991,7 @@ def autotune(
     if cache is not None:
         with tuner._lock:
             tuner._file_configs.clear()
+            tuner._file_config_policies.clear()
             tuner._namespaced_records.clear()
             tuner._dirty_namespaces.clear()
             tuner._logged_file_hits.clear()
@@ -1582,6 +1583,7 @@ class AutoTuner:
 
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: dict[str, tuple[str, Any]] = {}
+        self._file_config_policies: dict[str, tuple[Any, ...]] = {}
         # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache).
         # Design doc: docs/design_docs/autotuner_v2.md §2.1 -- process-lifetime
         # attach is forced by both consumers serving OUTSIDE any context; a
@@ -1984,8 +1986,8 @@ class AutoTuner:
                         continue
                     return True, r_id, tactic, stored_profile
 
-            # Persisted v1 entries do not record per-entry replay/L2 policy,
-            # so a non-default policy requests fresh profiling while tuning.
+            # Managed and bundled entries without per-entry replay/L2 policy
+            # require fresh profiling for a non-default policy while tuning.
             use_file_config = not (
                 self.is_tuning_mode and requested_policy != default_policy
             )
@@ -1993,10 +1995,16 @@ class AutoTuner:
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
             #    serving path never builds a file_key string here.
-            if use_file_config and self._file_configs:
+            if self._file_configs:
                 for r_id, cache_key in runner_keys:
                     file_key = cache_key.file_key
                     if file_key in self._file_configs:
+                        if (
+                            self.is_tuning_mode
+                            and self._file_config_policies.get(file_key, default_policy)
+                            != requested_policy
+                        ):
+                            continue
                         runner_name, tactic = self._file_configs[file_key]
                         if runner_name != runners[r_id].__class__.__name__:
                             continue
@@ -2731,6 +2739,7 @@ class AutoTuner:
             # Populate the choose_one cache with the winner so stage lookups
             # remain consistent between rank_tactics and choose_one.
             self.profiling_cache[cache_key] = (ranked[0], profile)
+            self._profiling_cache_policies[cache_key] = policy
             self._ranked_tactics_cache[cache_key] = (policy, tuple(ranked))
             self._dirty = True
             self._dirty_seq += 1
@@ -3453,7 +3462,10 @@ class AutoTuner:
         When configs were previously loaded via ``load_configs()``, those
         entries are included in the output as well (with in-memory profiling
         results taking priority for overlapping keys). This ensures the saved
-        file is always a complete, self-contained config.
+        file is always a complete, self-contained config. Entries include their
+        replay/L2 measurement policy when known, so tuning can reuse results
+        measured under the same policy. Legacy entries without provenance are
+        treated as hot-L2 measurements.
 
         If a file already exists at ``path``, its ``_metadata`` decides how
         the save proceeds:
@@ -3498,6 +3510,8 @@ class AutoTuner:
             # Include previously loaded file configs as a base
             for file_key, (runner_name, tactic) in self._file_configs.items():
                 configs[file_key] = [runner_name, _tactic_to_json(tactic)]
+                if file_key in self._file_config_policies:
+                    configs[file_key].append(self._file_config_policies[file_key])
 
             num_previous = len(configs)
 
@@ -3512,6 +3526,8 @@ class AutoTuner:
                 # Store runner class name (not positional index) for robustness
                 tactic_json = _tactic_to_json(tactic)
                 configs[file_key] = [cache_key.runner_class_name, tactic_json]
+                if cache_key in self._profiling_cache_policies:
+                    configs[file_key].append(self._profiling_cache_policies[cache_key])
 
         current_meta = _collect_metadata()
 
@@ -3765,6 +3781,11 @@ class AutoTuner:
                     skipped_legacy_cudnn_tactics += 1
                     continue
                 self._file_configs[key] = (runner_name, tactic)
+                # Older records contain only runner and tactic. Do not inherit
+                # provenance from a previously loaded record for the same key.
+                self._file_config_policies.pop(key, None)
+                if len(value) > 2:
+                    self._file_config_policies[key] = tuple(value[2])
 
         if skipped_legacy_cudnn_tactics:
             logger.warning(
@@ -3919,6 +3940,7 @@ class AutoTuner:
             self._ranked_tactics_cache.clear()
             self._profiling_cache_policies.clear()
             self._file_configs.clear()
+            self._file_config_policies.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()
             self._observed_cache_generations.clear()

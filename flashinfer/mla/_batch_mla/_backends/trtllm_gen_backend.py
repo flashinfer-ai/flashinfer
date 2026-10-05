@@ -172,9 +172,9 @@ def _validate_trtllm_gen_mla_native_capability(
 
 def _validate_trtllm_gen_mla_device_capability(device: torch.device) -> None:
     major, minor = get_compute_capability(device)
-    if (major, minor) not in ((10, 0), (10, 3)):
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
         raise _BackendPlanUnsupportedError(
-            "trtllm-gen MLA requires SM100/SM103, got compute capability "
+            "trtllm-gen MLA requires SM100/SM103/SM107, got compute capability "
             f"SM{major}{minor}."
         )
 

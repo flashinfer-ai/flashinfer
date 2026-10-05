@@ -68,6 +68,7 @@ from .gemm_mm_mxfp8_cute_dsl import (
     _b12x_gemm_mxfp8_requirement,
     _b12x_gemm_mxfp8_runner,
 )
+from ..experimental.cake_nvfp4_per_token.support import cake_mm_fp4_requirement
 from .kernels.utils import (
     _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
     _SM100_MMA_TILER_MN_CANDIDATES,
@@ -372,7 +373,7 @@ def _cutlass_mm_bf16_requirement(
 
 
 # cuBLASLt supports BF16 GEMM on SM80+.
-@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cublaslt_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -402,7 +403,7 @@ def _cublaslt_mm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -511,7 +512,7 @@ def _cute_dsl_mm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([90, 100, 103, 110, 120, 121])
+@supported_compute_capability([90, 100, 103, 107, 110, 120, 121])
 def _cutile_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -844,7 +845,7 @@ def _cutlass_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -856,7 +857,7 @@ def _cudnn_bmm_bf16_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
-@supported_compute_capability([90, 100, 103, 110, 120, 121])
+@supported_compute_capability([90, 100, 103, 107, 110, 120, 121])
 def _cutile_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -6216,7 +6217,7 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cudnn_mm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -6474,24 +6475,26 @@ def _cute_dsl_gemm_mxfp8_runner(
             sf_dtype = cutlass.Float8E8M0FNU
             batch_size = 1
 
+            if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
+                # Untuned low-M execution uses the corresponding base tactic.
+                fallback_tactic = (
+                    split_k_kernel_cls.mma_tiler_mn_for_m(m),
+                    (1, 1),
+                    True,
+                    False,
+                    1,
+                )
+            else:
+                fallback_tactic = (
+                    _SM100_DEFAULT_MMA_TILER_MN,
+                    _SM100_DEFAULT_CLUSTER_SHAPE_MN,
+                    False,
+                    False,
+                    1,
+                )
+
             if tactic is None or tactic == -1:
-                if split_k_kernel_cls.supports_m(m) and out.is_contiguous():
-                    # Untuned low-M execution uses the corresponding base tactic.
-                    tactic = (
-                        split_k_kernel_cls.mma_tiler_mn_for_m(m),
-                        (1, 1),
-                        True,
-                        False,
-                        1,
-                    )
-                else:
-                    tactic = (
-                        _SM100_DEFAULT_MMA_TILER_MN,
-                        _SM100_DEFAULT_CLUSTER_SHAPE_MN,
-                        False,
-                        False,
-                        1,
-                    )
+                tactic = fallback_tactic
 
             (
                 mma_tiler_mn,
@@ -6505,20 +6508,56 @@ def _cute_dsl_gemm_mxfp8_runner(
             is_split_k = split_k_slices > 1
 
             if is_split_k:
-                if (
-                    cluster_shape_mn != (1, 1)
-                    or not swap_ab
-                    or use_prefetch
-                    or not out.is_contiguous()
-                    or not split_k_kernel_cls.is_valid_tactic(
+                structurally_invalid = (
+                    cluster_shape_mn != (1, 1) or not swap_ab or use_prefetch
+                )
+                if structurally_invalid:
+                    raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
+
+                shape_valid = (
+                    out.is_contiguous()
+                    and split_k_kernel_cls.is_valid_tactic(
                         m,
                         real_k,
                         cutlass.Float8E4M3FN,
                         split_k_slices,
                     )
-                    or mma_tiler_mn != split_k_kernel_cls.mma_tiler_mn_for_m(m)
-                ):
-                    raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
+                    and mma_tiler_mn == split_k_kernel_cls.mma_tiler_mn_for_m(m)
+                )
+                if not shape_valid:
+                    # Autotune cache entries are bucketed by M. A tactic selected
+                    # for a low-M bucket can therefore be reused by a runtime shape
+                    # that the split-K kernel cannot implement. Keep the runner's
+                    # fallback contract instead of turning a stale optimization
+                    # into a serving failure.
+                    tactic = fallback_tactic
+                    (
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        swap_ab,
+                        use_prefetch,
+                        split_k_slices,
+                    ) = tactic
+                    is_split_k = False
+
+            # Re-check whatever is about to launch against the narrow-tile
+            # envelope (Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok):
+            # a swap-AB tactic tuned for a low-M bucket and replayed at a larger
+            # runtime M (floor mapping, clamp above the top bucket, stale cache)
+            # faults with cudaErrorMisalignedAddress. fallback_tactic always
+            # passes: its narrow tile covers M <= 32, otherwise it is 128x128.
+            if not Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok(
+                mma_tiler_mn[1], m if swap_ab else n
+            ):
+                tactic = fallback_tactic
+                (
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    swap_ab,
+                    use_prefetch,
+                    split_k_slices,
+                ) = tactic
+                is_split_k = False
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -7236,7 +7275,9 @@ def _check_mm_fp4_problem_size(
     out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,  # unused
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
+    backend: Literal[
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "cake", "auto"
+    ] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -7272,10 +7313,10 @@ def _check_mm_fp4_problem_size(
                 "alpha must be a scalar, or one scale per row of a for the "
                 f"per-token path. Got {alpha.numel()} for m={a.shape[0]}."
             )
-        if backend not in ("auto", "cute-dsl"):
+        if backend not in ("auto", "cute-dsl", "cake"):
             raise ValueError(
-                "per-token alpha is only implemented by the 'cute-dsl' backend "
-                f"(SM100/SM103), got backend={backend!r}."
+                "per-token alpha is only implemented by the 'cute-dsl' and 'cake' "
+                f"backends (SM100/SM103), got backend={backend!r}."
             )
 
     if out_dtype not in (torch.bfloat16, torch.float16):
@@ -7389,7 +7430,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([100, 103, 107, 120, 121])
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7404,6 +7445,26 @@ def _cute_dsl_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
+    if _match_sm_version(a.device, ["120", "121"]):
+        if backend == "auto":
+            return False
+        from .kernels.sm12x_cute.runner import check_requirement
+
+        _check_cute_dsl_availability()
+        _check_cute_dsl_arch(a.device)
+        return check_requirement(
+            a,
+            b,
+            a_descale,
+            b_descale,
+            alpha,
+            out_dtype,
+            out,
+            block_size,
+            use_nvfp4,
+            use_8x4_sf_layout,
+        )
+
     # cute_dsl backend requires 128x4 scale factor layout.
     # The kernel internally uses CUTLASS BlockScaledBasicChunk which expects
     # M/N padded to 128, K padded to 4 -- matching FlashInfer's quantization
@@ -7931,6 +7992,11 @@ def _cute_dsl_gemm_fp4_runner(
     The autotuner selects the best (kernel_type, tile, cluster, swap_ab, prefetch,
     use_tma_store) combination.
     """
+    if sm_major == 12:
+        from .kernels.sm12x_cute.runner import get_runner
+
+        return get_runner()
+
     import cutlass
 
     from .kernels.dense_blockscaled_gemm_sm100 import (
@@ -8274,22 +8340,24 @@ def _cute_dsl_gemm_fp4_runner(
             # and its swap_ab requires m % 8 == 0) -- exactly where low-concurrency
             # decode lives.
             # trtllm_fp4_block_scale_moe, which this path does not touch.
-            if tactic is None or tactic == -1:
+            def untuned_tactic():
                 if sm_version == 107 and Sm107Kernel is not None:
-                    tactic = _select_sm107_mm_fp4_cute_dsl_tactic(
+                    return _select_sm107_mm_fp4_cute_dsl_tactic(
                         m, n, real_k, get_device_sm_count(a.device), sf_vec_size
                     )
-                else:
-                    sm_count = get_device_sm_count(a.device)
-                    tactic = (
-                        _select_sm100_mm_fp4_splitk_tactic(
-                            m, n, real_k, sm_count, out.is_contiguous(), sm_minor
-                        )
-                        if use_nvfp4
-                        else None
-                    ) or _select_sm100_mm_fp4_cute_dsl_tactic(
-                        m, n, real_k, sm_count, sf_vec_size
+                sm_count = get_device_sm_count(a.device)
+                return (
+                    _select_sm100_mm_fp4_splitk_tactic(
+                        m, n, real_k, sm_count, out.is_contiguous(), sm_minor
                     )
+                    if use_nvfp4
+                    else None
+                ) or _select_sm100_mm_fp4_cute_dsl_tactic(
+                    m, n, real_k, sm_count, sf_vec_size
+                )
+
+            if tactic is None or tactic == -1:
+                tactic = untuned_tactic()
 
             (
                 mma_tiler_mn,
@@ -8299,6 +8367,40 @@ def _cute_dsl_gemm_fp4_runner(
                 kernel_type,
                 use_tma_store,
             ) = tactic
+
+            # Autotune cache entries are bucketed by M, so a tactic tuned for a
+            # low-M bucket can be replayed at a runtime M it cannot serve (floor
+            # mapping, clamp above the top bucket, stale cache): a narrow tile
+            # past Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok
+            # faults with cudaErrorMisalignedAddress, and a split-K tactic past
+            # the split-K kernel's M range is shape-invalid. Fall back to the
+            # untuned selector, which only returns tactics valid for this M.
+            # Structurally malformed split-K tactics still raise below, as in
+            # the mm_mxfp8 runner.
+            if kernel_type == _SM100_SPLITK_KERNEL_TYPE:
+                stale = (
+                    cluster_shape_mn == (1, 1) and swap_ab and not use_prefetch
+                ) and (
+                    not out.is_contiguous()
+                    or not _SplitKKernel.is_valid_tactic(
+                        m, real_k, cutlass.Float4E2M1FN, int(use_tma_store)
+                    )
+                    or not _SplitKKernel.supports_mma_tiler_for_m(mma_tiler_mn, m)
+                )
+            else:
+                stale = not Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok(
+                    mma_tiler_mn[1], m if swap_ab else n
+                )
+            if stale:
+                tactic = untuned_tactic()
+                (
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    swap_ab,
+                    use_prefetch,
+                    kernel_type,
+                    use_tma_store,
+                ) = tactic
 
             if swap_ab:
                 kernel_m, kernel_n = n, m
@@ -8661,7 +8763,14 @@ def _heuristic_func_mm_fp4(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "auto"
+        "cudnn",
+        "trtllm",
+        "cutlass",
+        "cute-dsl",
+        "cutedsl_low_latency",
+        "b12x",
+        "cake",
+        "auto",
     ] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -8871,6 +8980,7 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
         "cute-dsl": _cute_dsl_gemm_fp4_requirement,
         "cutedsl_low_latency": _cutedsl_low_latency_gemm_fp4_requirement,
         "b12x": _b12x_gemm_fp4_requirement,
+        "cake": cake_mm_fp4_requirement,
     },
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
@@ -8887,7 +8997,14 @@ def mm_fp4(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "auto"
+        "cudnn",
+        "trtllm",
+        "cutlass",
+        "cute-dsl",
+        "cutedsl_low_latency",
+        "b12x",
+        "cake",
+        "auto",
     ] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
@@ -8912,8 +9029,9 @@ def mm_fp4(
         Global scale tensor, float scalar, or a float32 tensor of ``m``
         elements holding one dequant scale per row of ``a`` (activations
         quantized with a dynamic per-token NVFP4 global scale). The per-token
-        form is implemented by the ``"cute-dsl"`` backend on SM100/SM103;
-        ``backend="auto"`` selects it.
+        form is implemented by the ``"cute-dsl"`` backend on SM100/SM103
+        (``backend="auto"`` selects it) and by the experimental ``"cake"``
+        backend (explicit opt-in).
 
     out_dtype: torch.dtype
         Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
@@ -8927,7 +9045,7 @@ def mm_fp4(
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "auto"]
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "cake", "auto"]
         Backend to use, defaults to ``"auto"``. On SM120, ``"auto"`` prefers
         ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
         architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
@@ -8936,7 +9054,17 @@ def mm_fp4(
         different weight preparation. The ``"cutedsl_low_latency"`` backend is the last
         heuristic candidate for eligible SM100/SM103 problems and requires
         ``M <= 8``, 128x4 scale factors, and K divisible by 64 for NVFP4 or 128
-        for MXFP4.
+        for MXFP4. The experimental ``"cake"`` backend (SM100/SM103, never
+        auto-selected) serves the per-token alpha NVFP4 case only: ``alpha`` of
+        shape ``(m,)``, 128x4 scale factors, ``b`` the column-major view of a
+        contiguous ``(n, k)`` weight, ``N % 8 == 0``, ``K % 256 == 0``, and a
+        contiguous bf16 / fp16 output; see
+        ``flashinfer/experimental/cake_nvfp4_per_token/README.md``.
+        On SM120/SM121, explicit ``"cute-dsl"`` supports packed
+        uint8 NVFP4 inputs with BF16 output, 128x4 scale factors, and logical
+        N and K divisible by 64. Logical M may be ragged. A and B scale storage
+        must retain physical M and N padding, respectively, to multiples of
+        128 rows. Packed inputs and output retain their logical dimensions.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.
@@ -8946,7 +9074,9 @@ def mm_fp4(
         Whether to enable Programmatic Dependent Launch (PDL) for the ``cute_dsl``
         and ``cutedsl_low_latency`` backends, defaults to ``True``. PDL allows overlapping
         the tail of one kernel with the start of the next for reduced launch latency.
-        This parameter is ignored by other backends.
+        The SM120/SM121 ``"cute-dsl"`` implementation uses ordinary
+        stream-ordered launches for either value. This parameter is ignored
+        by other backends.
 
     Notes
     -----
@@ -9003,11 +9133,19 @@ def mm_fp4(
     # without the per-row epilogue would silently apply alpha[0] to every row,
     # so keep a backstop for skip_check=True rather than trust the list.
     per_token_alpha = _is_per_token_alpha(alpha)
-    if per_token_alpha and list(backends) != ["cute-dsl"]:
+    if per_token_alpha and list(backends) not in (["cute-dsl"], ["cake"]):
         raise ValueError(
-            "per-token alpha is only implemented by the 'cute-dsl' backend "
-            f"(SM100/SM103), got backends {list(backends)}."
+            "per-token alpha is only implemented by the 'cute-dsl' and 'cake' "
+            f"backends (SM100/SM103), got backends {list(backends)}."
         )
+    if list(backends) == ["cake"]:
+        # Experimental generated-program backend: its own host dispatch, no
+        # autotuner. Explicit opt-in only (never in suitable_auto_backends).
+        from ..experimental.cake_nvfp4_per_token.cake_backend import (
+            mm_fp4_per_token,
+        )
+
+        return mm_fp4_per_token(a, b, a_descale, b_descale, alpha, out)
 
     tuner = AutoTuner.get()
     if per_token_alpha:
@@ -9404,7 +9542,7 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cutile_gemm_fp8_nt_groupwise_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -11007,9 +11145,75 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     )
 
 
+@supported_compute_capability([100, 103])
+def _check_batch_deepgemm_fp8_nt_groupwise_cake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["deepgemm", "cake"] = "cake",
+) -> bool:
+    """Admission of the generated Cake programs: exactly the band the Cake dispatcher owns.
+
+    SM100a / SM103a devices with an exported SM count, the eight inventory
+    ``(N, K)`` geometries, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
+    operands with float32 ``(1, 128, 128)`` scales (or the native MN-major packed
+    UE8M0 int32 scales of the serving routes), int32 ``masked_m`` and a bfloat16
+    output.  Every other problem raises through ``backend_requirement``.
+    """
+    del backend
+    from .cake_batch_deepgemm_fp8 import check_batch_deepgemm_fp8_nt_groupwise_cake
+
+    return check_batch_deepgemm_fp8_nt_groupwise_cake(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        scale_granularity_mnk=scale_granularity_mnk,
+        out=out,
+        out_dtype=out_dtype,
+    )
+
+
+@supported_compute_capability([100, 103, 107])
+def _check_batch_deepgemm_fp8_nt_groupwise_deepgemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["deepgemm", "cake"] = "deepgemm",
+) -> bool:
+    del backend
+    return _check_batch_deepgemm_fp8_nt_groupwise(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        scale_granularity_mnk=scale_granularity_mnk,
+        out=out,
+        out_dtype=out_dtype,
+    )
+
+
 @backend_requirement(
-    {},
-    common_check=_check_batch_deepgemm_fp8_nt_groupwise,
+    {
+        "deepgemm": _check_batch_deepgemm_fp8_nt_groupwise_deepgemm,
+        "cake": _check_batch_deepgemm_fp8_nt_groupwise_cake,
+    },
 )
 @flashinfer_api(trace=batch_deepgemm_fp8_nt_groupwise_trace)
 def batch_deepgemm_fp8_nt_groupwise(
@@ -11022,6 +11226,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,  # (batch_size, m, n)
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["deepgemm", "cake"] = "deepgemm",
 ):
     r"""Perform batch matrix multiplication with FP8 data types using DeepGEMM backend.
 
@@ -11081,6 +11286,22 @@ def batch_deepgemm_fp8_nt_groupwise(
         Data type of the output tensor. If `out` is provided, this parameter is ignored.
         Default is ``torch.bfloat16``.
 
+    backend : {"deepgemm", "cake"}, optional
+        ``"deepgemm"`` (default) runs the bundled DeepGEMM masked kernel.
+        ``"cake"`` runs the generated Cake programs for the band they own
+        (SM100a / SM103a; ``(n, k)`` in ``{(128, 512), (512, 128),
+        (4096, 7168), (7168, 2048), (6144, 7168), (7168, 3072), (4096, 4096),
+        (4096, 2048)}``; bfloat16 output; FP32 accumulation with the same
+        ordered block-scale application as DeepGEMM) and raises for every other
+        problem.  With ``backend="cake"`` the scales may also be the native
+        MN-major packed UE8M0 ``torch.int32`` tensors of the serving routes
+        (``a_scale`` of shape ``(batch_size, m, k // 512)``, ``b_scale`` of
+        shape ``(batch_size, n, k // 512)``), consumed without conversion.
+        Every launch of the Cake backend, including the first, may be captured
+        into a CUDA graph; see
+        :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.prepare_batch_deepgemm_fp8_nt_groupwise`
+        for the allocation-free prepared form.
+
     Returns
     -------
     torch.Tensor
@@ -11127,13 +11348,20 @@ def batch_deepgemm_fp8_nt_groupwise(
     - All input tensors must be on the same CUDA device
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
-    from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
-
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(
             a.shape[0], a.shape[1], b.shape[1], dtype=out_dtype, device=a.device
         )
+
+    if backend == "cake":
+        from .cake_batch_deepgemm_fp8 import run_batch_deepgemm_fp8_nt_groupwise
+
+        return run_batch_deepgemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, masked_m, expected_m, out=out
+        )
+
+    from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
 
     m_grouped_fp8_gemm_nt_masked(
         (a, a_scale), (b, b_scale), out, masked_m, expected_m, scale_granularity_mnk

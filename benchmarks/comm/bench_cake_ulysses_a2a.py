@@ -1,29 +1,31 @@
 """Benchmark three scatters plus independent gather with cold-L2 CUPTI.
 
-Run on an SM100 NVLink node with, for example:
+Run on an SM100/SM103 NVLink node with, for example:
     torchrun --standalone --nproc-per-node=8 \
         benchmarks/comm/bench_cake_ulysses_a2a.py --json results.json
 
 Both backends use the same input and caller-owned output tensors. Each sample
 includes all four staging-to-output copies. CUPTI unavailability is an error.
+Add ``--all-shapes`` to measure every portfolio row of the launched world.
 """
 
 import argparse
 import json
 import os
-from pathlib import Path
 import statistics
 import sys
 import time
 import warnings
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from examples.pytorch.ulysses_a2a_export.interface import prepare, shapes
 from flashinfer.testing import bench_gpu_time_with_cupti
+
+from tests.comm.cake_ulysses_a2a_fixture import prepare, shapes
 
 
 def main():
@@ -36,8 +38,9 @@ def main():
     if args.repeat_iters < 1 or args.warmup_iters < 0:
         parser.error("repeat-iters must be positive and warmup-iters nonnegative")
 
-    from cupti import cupti  # noqa: F401
     from importlib.metadata import version
+
+    from cupti import cupti  # noqa: F401
 
     if int(version("cupti-python").split(".")[0]) < 13:
         raise RuntimeError("CUPTI >= 13 is required")

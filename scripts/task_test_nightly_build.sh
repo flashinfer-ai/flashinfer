@@ -53,9 +53,10 @@ echo "Verifying installation..."
 # Run from /tmp to avoid importing local flashinfer/ source directory
 (cd /tmp && python -m flashinfer show-config)
 
-# Copy only test sources into an isolated directory so package tests exercise the
-# installed flashinfer distribution instead of shadowing it with /workspace.
+# Copy test sources and their benchmark fixtures into an isolated directory so
+# package tests exercise the installed distribution instead of /workspace.
 cp -a "${SOURCE_WORKSPACE}/tests" "${TEST_RUN_DIR}/"
+cp -a "${SOURCE_WORKSPACE}/benchmarks" "${TEST_RUN_DIR}/"
 cp -a "${SOURCE_WORKSPACE}/pytest.ini" "${TEST_RUN_DIR}/"
 
 # Run test shard

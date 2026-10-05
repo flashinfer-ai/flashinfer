@@ -106,6 +106,9 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
                     f"split-KV reducer: {error}"
                 ) from error
         compiled_kernel = implementation._get_compiled_mla_kernel(
+            implementation.cute_dsl_compile_arch(
+                *implementation.get_compute_capability(device)
+            ),
             q_data_type,
             out_dtype,
             page_size,
@@ -117,6 +120,7 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
             resolved_is_var_seq,
             is_var_q,
             False,
+            reducer_max_splits=implementation._get_reducer_max_splits(split_kv),
             is_workspace_size_zero=workspace_size == 0,
             enable_pdl=enable_pdl,
         )

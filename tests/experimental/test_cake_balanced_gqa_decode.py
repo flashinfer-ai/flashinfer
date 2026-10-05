@@ -529,10 +529,9 @@ def test_graph_replay_follows_device_lengths_mtp():
     runner, (query, k_cache, v_cache, block_tables, seq_lens_dev, out) = _run_and_check(
         seq_lens, 8, q_len=7, seed=606
     )
-    assert runner.module_name.endswith("sm_100a") or runner.module_name.endswith(
-        "sm_103a"
+    assert runner.module_name == cake_backend.select_module(
+        cake_backend._device_arch(query.device.index), "mtp64"
     )
-    assert "mtp64" in runner.module_name
     sm_scale = HEAD_DIM**-0.5
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

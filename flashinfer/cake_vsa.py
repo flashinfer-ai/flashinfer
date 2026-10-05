@@ -17,227 +17,47 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
-import hashlib
-import json
 import math
-import shutil
-import subprocess
-import tempfile
-from pathlib import Path
 from typing import Any, Optional
 
 import torch
 
 from .api_logging import flashinfer_api
+from .jit.cake_vsa import arch_for_capability, load_cake_vsa_module
 from .trace.templates.attention import (
     block_sparse_attention_run_trace,
     cake_vsa_plan_trace,
 )
 
-
 _MAX_COMPACT_BLOCKS = 64
 _MAX_DIRECT_TOPK = 32
 _MAX_LONGSEQ_BLOCKS = 192
 _BLK64_ORDINARY_MAX_AVERAGE_SELECTED_BLOCKS = 24
-_EXPECTED_PROFILES = {
-    "blk128_compact",
-    "blk64_persistent",
-    "blk64_persistent_ws_m64n256",
-    "longseq",
-    "ultrasparse_bsr",
-    "gqa_mask",
-    "head64_native",
-    "head96_native",
-    "blk128_fp16_compact",
-    "fp16_direct",
-}
+_FP16_DIRECT_Q_TILE = 256
 
 
-def _source_dir() -> Path:
-    from .jit import env as jit_env
-
-    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_vsa"
-    if installed.exists():
-        return installed
-    checkout = Path(__file__).resolve().parents[1] / "csrc" / "cake_vsa"
-    if checkout.exists():
-        return checkout
-    raise FileNotFoundError("Cake VSA source export is not installed")
+def _device_index(device: torch.device) -> int:
+    if device.type != "cuda":
+        raise RuntimeError(f"Cake VSA requires a CUDA device, got {device}")
+    return device.index if device.index is not None else torch.cuda.current_device()
 
 
 @functools.cache
-def _manifest() -> dict[str, Any]:
-    path = _source_dir() / "cake_vsa_manifest.json"
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != "cake-vsa-block-sparse-source-export-v2":
-        raise RuntimeError("unsupported Cake VSA source manifest")
-    source_records = _manifest_source_records(manifest)
-    content_identity = hashlib.sha256(
-        "".join(
-            f"{source_path}\0{digest}\n"
-            for source_path, digest in sorted(source_records)
-        ).encode("utf-8")
-    ).hexdigest()
-    if manifest.get("export_content_sha256") != content_identity:
-        raise RuntimeError("Cake VSA source manifest content identity mismatch")
-    return manifest
+def _arch_for_device_index(index: int) -> str:
+    return arch_for_capability(torch.cuda.get_device_capability(index))
 
 
-def _manifest_source_records(
-    manifest: dict[str, Any],
-) -> list[tuple[str, str]]:
-    architectures = manifest.get("architectures")
-    profiles = manifest.get("profiles")
-    if (
-        architectures != ["sm_100a", "sm_103a"]
-        or not isinstance(profiles, list)
-        or not profiles
-    ):
-        raise RuntimeError("invalid Cake VSA source manifest inventory")
-
-    records: list[tuple[str, str]] = []
-    profile_names: set[str] = set()
-    for profile in profiles:
-        if not isinstance(profile, dict) or not isinstance(profile.get("profile"), str):
-            raise RuntimeError("invalid Cake VSA profile record")
-        profile_name = profile["profile"]
-        if profile_name in profile_names:
-            raise RuntimeError(f"duplicate Cake VSA profile: {profile_name}")
-        profile_names.add(profile_name)
-        host = profile.get("host")
-        devices = profile.get("device")
-        if not isinstance(host, dict) or not isinstance(devices, dict):
-            raise RuntimeError(f"invalid Cake VSA source records for {profile_name}")
-        if set(devices) != set(architectures):
-            raise RuntimeError(
-                f"Cake VSA profile {profile_name} does not cover every architecture"
-            )
-        for source in (host, *(devices[arch] for arch in architectures)):
-            if not isinstance(source, dict):
-                raise RuntimeError(f"invalid Cake VSA source record for {profile_name}")
-            source_path = source.get("path")
-            digest = source.get("sha256")
-            size_bytes = source.get("size_bytes")
-            if (
-                not isinstance(source_path, str)
-                or not source_path
-                or "\0" in source_path
-                or "\n" in source_path
-                or not isinstance(digest, str)
-                or len(digest) != 64
-                or any(character not in "0123456789abcdef" for character in digest)
-                or not isinstance(size_bytes, int)
-                or size_bytes < 0
-            ):
-                raise RuntimeError(
-                    f"invalid Cake VSA source identity for {profile_name}"
-                )
-            records.append((source_path, digest))
-    source_paths = {source_path for source_path, _ in records}
-    if len(source_paths) != len(records):
-        raise RuntimeError("duplicate Cake VSA source path in manifest")
-    expected_source_paths = {
-        f"cake_vsa_{profile}_{suffix}"
-        for profile in _EXPECTED_PROFILES
-        for suffix in ("host.cpp", "sm_100a.cu", "sm_103a.cu")
-    }
-    if (
-        profile_names != _EXPECTED_PROFILES
-        or len(records) != 3 * len(_EXPECTED_PROFILES)
-        or source_paths != expected_source_paths
-    ):
-        raise RuntimeError("incomplete Cake VSA source manifest inventory")
-    return records
-
-
-def _profile_record(profile: str) -> dict[str, Any]:
-    for record in _manifest()["profiles"]:
-        if record["profile"] == profile:
-            return record
-    raise ValueError(f"unknown Cake VSA profile: {profile}")
+@functools.cache
+def _sm_count(index: int) -> int:
+    return torch.cuda.get_device_properties(index).multi_processor_count
 
 
 def _arch_for_device(device: torch.device) -> str:
-    properties = torch.cuda.get_device_properties(device)
-    cc = (properties.major, properties.minor)
-    if cc == (10, 0):
-        return "sm_100a"
-    if cc == (10, 3):
-        return "sm_103a"
-    raise RuntimeError(
-        "Cake VSA requires an SM100 or SM103 GPU, "
-        f"got compute capability {properties.major}.{properties.minor}"
-    )
+    return _arch_for_device_index(_device_index(device))
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _nvcc() -> Path:
-    executable = shutil.which("nvcc")
-    if executable is None:
-        raise RuntimeError("nvcc is required to build the Cake VSA source export")
-    return Path(executable).resolve()
-
-
-@functools.cache
-def _load_module(profile: str, arch: str):
-    from tvm_ffi import cpp
-
-    from .jit import env as jit_env
-
-    record = _profile_record(profile)
-    device_record = record["device"][arch]
-    root = _source_dir()
-    device_source = root / device_record["path"]
-    host_source = root / record["host"]["path"]
-    if _sha256(device_source) != device_record["sha256"]:
-        raise RuntimeError(f"Cake VSA device source hash mismatch: {device_source}")
-    if _sha256(host_source) != record["host"]["sha256"]:
-        raise RuntimeError(f"Cake VSA host source hash mismatch: {host_source}")
-
-    identity = hashlib.sha256(
-        (device_record["sha256"] + record["host"]["sha256"] + arch).encode("ascii")
-    ).hexdigest()[:16]
-    module_name = f"cake_vsa_{profile}_{arch}_{identity}"
-    build_dir = jit_env.FLASHINFER_JIT_DIR / module_name
-    build_dir.mkdir(parents=True, exist_ok=True)
-    cubin_path = build_dir / f"{module_name}.cubin"
-    if not cubin_path.exists():
-        nvcc = _nvcc()
-        with tempfile.NamedTemporaryFile(
-            dir=build_dir, prefix=f".{module_name}.", suffix=".cubin", delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-        command = [
-            str(nvcc),
-            "-cubin",
-            "--std=c++17",
-            "--use_fast_math",
-            f"-arch={arch}",
-            str(device_source),
-            "-o",
-            str(temporary),
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            temporary.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"Cake VSA CUDA compilation failed for {profile}/{arch}:\n{result.stderr}"
-            )
-        temporary.replace(cubin_path)
-
-    cuda_include = _nvcc().parent.parent / "include"
-    return cpp.load_inline(
-        module_name,
-        cpp_sources=host_source.read_text(encoding="utf-8"),
-        embed_cubin={record["module_ident"]: cubin_path.read_bytes()},
-        extra_include_paths=[str(cuda_include)],
-        extra_cflags=["-O3"],
-        extra_ldflags=["-lcuda"],
-        build_directory=str(build_dir),
-    )
+def _module(profile: str, device: torch.device):
+    return load_cake_vsa_module(profile, _arch_for_device(device))
 
 
 def _dense_mask(
@@ -312,6 +132,48 @@ def _shared_bsr(
     return ptr, cols
 
 
+def _fp16_direct_metadata(
+    dense: torch.Tensor,
+    row_counts: torch.Tensor,
+    *,
+    M: int,
+    N: int,
+    R: int,
+    mb: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Direct-route metadata of the FP16 GQA kernel, built once at plan time.
+
+    The kernel walks per-token ``q2k_indices`` of one KV-head group each; the
+    block mask is identical within a group (validated by the caller), so the
+    first head of every group provides the group's selections.
+    """
+    group_size = num_qo_heads // num_kv_heads
+    masks = dense[::group_size]
+    counts = row_counts[::group_size]
+    topk = int(counts.max().item())
+    if topk > _MAX_DIRECT_TOPK or not bool(torch.all(counts == topk).item()):
+        raise ValueError("Cake FP16 direct route requires fixed top-k <= 32")
+    per_block = masks.nonzero(as_tuple=False)[:, 2].view(num_kv_heads, mb, topk)
+    q2k_indices = (
+        per_block.repeat_interleave(R, dim=1)
+        .to(device=device, dtype=torch.int32)
+        .contiguous()
+    )
+    return {
+        "q2k_indices": q2k_indices,
+        "cu_seqlens_q": torch.tensor([0, M], dtype=torch.int32, device=device),
+        "cu_seqlens_k": torch.tensor([0, N], dtype=torch.int32, device=device),
+        "q_offsets": torch.zeros((1,), dtype=torch.int32, device=device),
+        "kv_lens": torch.tensor([N], dtype=torch.int32, device=device),
+        "page_table": torch.zeros((1,), dtype=torch.int32, device=device),
+        "scale_dummy": torch.empty((1, 1, 128, 8), dtype=torch.uint8, device=device),
+        "topk": topk,
+    }
+
+
 @flashinfer_api(trace=cake_vsa_plan_trace)
 def plan_cake_vsa(
     indptr: Optional[torch.Tensor],
@@ -381,7 +243,10 @@ def plan_cake_vsa(
     -------
     dict[str, Any]
         Validated metadata and reusable workspaces consumed by
-        :func:`run_cake_vsa`.
+        :func:`run_cake_vsa`. Every device-side reduction and every
+        route-specific metadata tensor (including the FP16 direct route's
+        per-token selections) is built here, so :func:`run_cake_vsa` only
+        validates tensor metadata and launches.
     """
 
     _arch_for_device(device)
@@ -554,6 +419,24 @@ def plan_cake_vsa(
             indices,
             trust_bsr=block_mask is None,
         )
+    fp16_direct = None
+    if (
+        R != 64
+        and head_dim == 128
+        and q_data_type == torch.float16
+        and num_qo_heads != num_kv_heads
+    ):
+        fp16_direct = _fp16_direct_metadata(
+            dense,
+            row_counts,
+            M=M,
+            N=N,
+            R=R,
+            mb=mb,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            device=device,
+        )
     return {
         "M": M,
         "N": N,
@@ -577,6 +460,7 @@ def plan_cake_vsa(
         "kv_block_lens": planned_kv_block_lens,
         "blk64_profile": blk64_profile,
         "blk64_selected_blocks_total": blk64_selected_blocks_total,
+        "fp16_direct": fp16_direct,
         "workspace": {},
     }
 
@@ -650,6 +534,10 @@ def _check_inputs(
             raise ValueError(f"{name} does not match the Cake VSA plan")
 
 
+def _softmax_scale_log2(plan: dict[str, Any]) -> float:
+    return float(plan["sm_scale"] or 1.0 / math.sqrt(plan["head_dim"])) / math.log(2.0)
+
+
 def _run_standard(
     profile: str,
     plan: dict[str, Any],
@@ -664,7 +552,7 @@ def _run_standard(
 ) -> None:
     import tvm_ffi
 
-    module = _load_module(profile, _arch_for_device(q.device))
+    module = _module(profile, q.device)
     args: list[Any] = [
         q,
         k,
@@ -693,8 +581,7 @@ def _run_standard(
         [
             plan["num_qo_heads"],
             plan["num_kv_heads"],
-            float(plan["sm_scale"] or 1.0 / math.sqrt(plan["head_dim"]))
-            / math.log(2.0),
+            _softmax_scale_log2(plan),
             1.0,
             int(return_lse),
             0,
@@ -706,8 +593,7 @@ def _run_standard(
         grid_x = (plan["M"] + tokens_per_tile - 1) // tokens_per_tile
         grid_y = plan["num_kv_heads"]
     elif profile == "ultrasparse_bsr":
-        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-        grid_x, grid_y = min(total_tiles, sm_count), 1
+        grid_x, grid_y = min(total_tiles, _sm_count(_device_index(q.device))), 1
     elif profile in {"head64_native", "head96_native"}:
         grid_x, grid_y = plan["mb"] * 2, plan["num_qo_heads"]
     else:
@@ -728,12 +614,10 @@ def _run_blk64(
 ) -> None:
     import tvm_ffi
 
-    module = _load_module(plan["blk64_profile"], _arch_for_device(q.device))
+    module = _module(plan["blk64_profile"], q.device)
     total_tiles = plan["mb"] * plan["num_qo_heads"]
-    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
-    persistent_ctas = min(total_tiles, sm_count)
+    persistent_ctas = min(total_tiles, _sm_count(_device_index(q.device)))
     tiles_per_cta = (total_tiles + persistent_ctas - 1) // persistent_ctas
-    scale = float(plan["sm_scale"] or 1.0 / math.sqrt(plan["head_dim"]))
     with tvm_ffi.use_torch_stream():
         module.run(
             q,
@@ -750,44 +634,12 @@ def _run_blk64(
             total_tiles,
             tiles_per_cta,
             plan["num_qo_heads"],
-            scale / math.log(2.0),
+            _softmax_scale_log2(plan),
             int(return_lse),
             persistent_ctas,
             1,
             1,
         )
-
-
-def _fp16_metadata(plan: dict[str, Any], q: torch.Tensor):
-    cached = plan["workspace"].get("fp16_metadata")
-    if cached is not None and cached[0].device == q.device:
-        return cached
-    group_size = plan["num_qo_heads"] // plan["num_kv_heads"]
-    masks = plan["block_mask"][::group_size]
-    counts = plan["row_counts"][::group_size]
-    topk = int(counts.max().item())
-    if topk > _MAX_DIRECT_TOPK or not torch.all(counts == topk):
-        raise ValueError("Cake FP16 direct route requires fixed top-k <= 32")
-    selected = masks.nonzero(as_tuple=False)
-    per_block = selected[:, 2].view(plan["num_kv_heads"], plan["mb"], topk)
-    q2k = (
-        per_block.repeat_interleave(plan["R"], dim=1)
-        .to(device=q.device, dtype=torch.int32)
-        .contiguous()
-    )
-    device = q.device
-    cached = (
-        q2k,
-        torch.tensor([0, plan["M"]], dtype=torch.int32, device=device),
-        torch.tensor([0, plan["N"]], dtype=torch.int32, device=device),
-        torch.zeros((1,), dtype=torch.int32, device=device),
-        torch.tensor([plan["N"]], dtype=torch.int32, device=device),
-        torch.zeros((1,), dtype=torch.int32, device=device),
-        torch.empty((1, 1, 128, 8), dtype=torch.uint8, device=device),
-        topk,
-    )
-    plan["workspace"]["fp16_metadata"] = cached
-    return cached
 
 
 def _run_fp16(
@@ -801,18 +653,11 @@ def _run_fp16(
 ) -> None:
     import tvm_ffi
 
-    module = _load_module("fp16_direct", _arch_for_device(q.device))
-    (
-        q2k,
-        cu_q,
-        cu_k,
-        q_offsets,
-        kv_lens,
-        page_table,
-        scale_dummy,
-        topk,
-    ) = _fp16_metadata(plan, q)
-    scale = float(plan["sm_scale"] or 1.0 / math.sqrt(plan["head_dim"]))
+    module = _module("fp16_direct", q.device)
+    metadata = plan["fp16_direct"]
+    if metadata is None:
+        raise RuntimeError("the Cake FP16 direct route was not planned")
+    scale_dummy = metadata["scale_dummy"]
     with tvm_ffi.use_torch_stream():
         module.run(
             q,
@@ -823,28 +668,28 @@ def _run_fp16(
             out,
             stats,
             stats,
-            q2k,
-            cu_q,
-            cu_k,
-            q_offsets,
-            kv_lens,
-            page_table,
+            metadata["q2k_indices"],
+            metadata["cu_seqlens_q"],
+            metadata["cu_seqlens_k"],
+            metadata["q_offsets"],
+            metadata["kv_lens"],
+            metadata["page_table"],
             plan["M"],
             plan["num_qo_heads"],
             plan["num_kv_heads"],
-            topk,
+            metadata["topk"],
             1,
             0,
             0,
             0,
             0,
-            scale / math.log(2.0),
+            _softmax_scale_log2(plan),
             1.0,
             1.0,
             1.0,
             int(return_lse),
             0,
-            (plan["M"] + 255) // 256,
+            (plan["M"] + _FP16_DIRECT_Q_TILE - 1) // _FP16_DIRECT_Q_TILE,
             plan["num_qo_heads"],
             1,
         )
