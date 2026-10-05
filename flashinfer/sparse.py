@@ -51,13 +51,8 @@ def _check_paged_cache(
     num_kv_heads: int,
     num_entries: int,
 ) -> None:
-    """Validate the raw paged KV tensors against the planned geometry.
-
-    The kernel derives page and head geometry from the key tensor alone and
-    then applies the value tensor's own strides, so a value cache that is
-    shorter or shaped differently does not raise -- it reads past the end.
-    Every check here is one the kernel cannot make for itself.
-    """
+    """Checks the kernel cannot make: it takes the geometry from the key tensor
+    and applies the value tensor's strides, so a short value cache reads past the end."""
     page_axis, head_axis = (1, 2) if kv_layout == "NHD" else (2, 1)
     reference = None
     for name, tensor in tensors:
@@ -110,13 +105,9 @@ def _check_nvfp4_kv(
     kv_layout: str,
     head_dim: int,
 ) -> None:
-    """Validate the NVFP4 contract the C++ binding cannot recover from.
-
-    ``GetFP4ScaleStrides`` only checks rank and the innermost stride, and the
-    generated binding then casts the pointer to ``uint8_t*``. A scale tensor on
-    the wrong device or with too few scale groups therefore turns into an
-    illegal address or an out-of-bounds read inside the kernel.
-    """
+    """Checks the binding cannot make: ``GetFP4ScaleStrides`` sees only rank and the
+    innermost stride, so a scale tensor on the wrong device or too short is an illegal
+    address or an out-of-bounds read inside the kernel."""
     if head_dim % 16:
         raise ValueError(
             "NVFP4 packs one E4M3 scale per 16 elements, so head_dim must be a "
@@ -511,13 +502,9 @@ def _resolve_prefill_module(
     logits_soft_cap: float,
     o_data_type: torch.dtype,
 ):
-    """Which backend serves this geometry, and the module that does.
-
-    Shared by :meth:`plan` and :meth:`workspace_size` so the second answers
-    for the kernel the first will build. Nothing here is written back to the
-    wrapper: asking how large a workspace has to be must not change which
-    backend a later plan picks.
-    """
+    """Which backend serves this geometry, and its module. Shared by :meth:`plan` and
+    :meth:`workspace_size` so sizing answers for the kernel plan will build, and
+    writes nothing back to the wrapper."""
     backend = requested_backend
     if kv_cache_page_size is not None:
         # Only the FA2 paged entry point divides a route element back into
@@ -793,14 +780,8 @@ class BlockSparseAttentionWrapper:
         kv_cache_page_size: Optional[int] = None,
         backend: str = "auto",
     ) -> Tuple[int, int]:
-        r"""What :meth:`workspace_size` returns, without allocating device workspace.
-
-        Constructing a wrapper to ask how large its workspace has to be takes
-        eight megabytes of device memory and as much pinned host memory, which
-        is a strange price for a question. Both sizes are *computed* by the
-        planner from the geometry -- the float workspace is an answer, not an
-        input -- so all this needs is a device to say which architecture is
-        being asked about, and the indptr that fixes the batch.
+        r"""What :meth:`workspace_size` returns, without a wrapper or its workspace:
+        the planner computes both sizes from the geometry, the device and ``indptr``.
 
         Parameters
         ----------
@@ -970,19 +951,11 @@ class BlockSparseAttentionWrapper:
         use_custom_mask: bool = False,
         kv_cache_page_size: Optional[int] = None,
     ) -> Tuple[int, int]:
-        r"""How many bytes a plan for this geometry needs, before making one.
+        r"""How many bytes a plan for this geometry needs, planning nothing.
 
-        A caller that hands the wrapper its buffers has to size them, and a
-        caller holding several plans at once has to give each its own
-        non-overlapping region of the integer workspace: ``plan`` writes the
-        scheduler's own metadata there and keeps byte offsets into it, which
-        ``run`` reads back. Two live plans sharing those bytes means the second
-        plan overwrites what the first will read.
-
-        Nothing is planned and nothing is written here; the wrapper is left as
-        it was. :meth:`query_workspace_size` answers the same question without
-        a wrapper at all, which is what a caller sizing an arena before it
-        builds anything wants.
+        Live plans need non-overlapping integer regions: ``plan`` keeps byte
+        offsets into it that ``run`` reads back. :meth:`query_workspace_size`
+        answers the same without a wrapper.
         """
         return BlockSparseAttentionWrapper.query_workspace_size(
             self.device,
