@@ -18,45 +18,24 @@ from . import env as jit_env
 from .core import JitSpec, current_compilation_context, gen_jit_spec
 
 # The scorer multiplies with m16n8k16, which arrived with compute capability
-# 8.0. Every 8.x, 9.x, 10.x and 12.x target has it; 7.x does not.
-QSA_SCORES_SUPPORTED_MAJOR_VERSIONS = [8, 9, 10, 11, 12]
+# 8.0; without -gencode flags of its own the module would be built for every
+# architecture in an AOT build, and a 7.5 target would reject that path.
+QSA_SUPPORTED_MAJOR_VERSIONS = [8, 9, 10, 11, 12]
 
 
-def gen_qsa_pre_indexer_module() -> JitSpec:
+def gen_qsa_ops_module() -> JitSpec:
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=QSA_SUPPORTED_MAJOR_VERSIONS
+    )
     return gen_jit_spec(
-        "qsa_pre_indexer",
+        "qsa_ops",
         [
             jit_env.FLASHINFER_CSRC_DIR / "qsa_pre_indexer.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "qsa_pre_indexer_jit_binding.cu",
-        ],
-        extra_cuda_cflags=["-DENABLE_BF16"],
-    )
-
-
-def gen_qsa_scores_module() -> JitSpec:
-    # Without -gencode flags of its own this module is built for every
-    # architecture in the build, so a mixed 7.5 + 8.0 AOT build would compile
-    # the m16n8k16 path for 7.5 and nvcc would reject it.
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=QSA_SCORES_SUPPORTED_MAJOR_VERSIONS
-    )
-    return gen_jit_spec(
-        "qsa_scores",
-        [
             jit_env.FLASHINFER_CSRC_DIR / "qsa_scores.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "qsa_scores_jit_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "qsa_route.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "qsa_ops_jit_binding.cu",
         ],
         extra_cuda_cflags=nvcc_flags + ["-DENABLE_BF16"],
-    )
-
-
-def gen_qsa_route_module() -> JitSpec:
-    return gen_jit_spec(
-        "qsa_route",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "qsa_route.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "qsa_route_jit_binding.cu",
-        ],
     )
 
 

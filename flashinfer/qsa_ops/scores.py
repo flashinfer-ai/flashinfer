@@ -21,7 +21,7 @@ import torch
 
 from ..trace.templates.qsa import qsa_paged_scores_trace
 from ..api_logging import flashinfer_api
-from ..jit.qsa_ops import gen_qsa_scores_module
+from ..jit.qsa_ops import gen_qsa_ops_module
 from ..utils import (
     backend_requirement,
     register_custom_op,
@@ -32,7 +32,7 @@ from ..utils import (
 
 @functools.cache
 def get_qsa_scores_module():
-    return gen_qsa_scores_module().build_and_load()
+    return gen_qsa_ops_module().build_and_load()
 
 
 # The scorer multiplies with m16n8k16, which arrived with SM80.

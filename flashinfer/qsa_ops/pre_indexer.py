@@ -20,13 +20,13 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.qsa import qsa_pre_indexer_trace
-from ..jit.qsa_ops import gen_qsa_pre_indexer_module
+from ..jit.qsa_ops import gen_qsa_ops_module
 from ..utils import register_custom_op, register_fake_op
 
 
 @functools.cache
 def get_qsa_pre_indexer_module():
-    return gen_qsa_pre_indexer_module().build_and_load()
+    return gen_qsa_ops_module().build_and_load()
 
 
 # Which (compute, output) relations a build dispatches. Bit 0 is "the output is the

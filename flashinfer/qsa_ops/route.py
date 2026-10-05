@@ -24,13 +24,13 @@ from ..trace.templates.qsa import (
     qsa_expand_block_route_trace,
     qsa_route_from_logical_trace,
 )
-from ..jit.qsa_ops import gen_qsa_route_module
+from ..jit.qsa_ops import gen_qsa_ops_module
 from ..utils import register_custom_op, register_fake_op
 
 
 @functools.cache
 def get_qsa_route_module():
-    return gen_qsa_route_module().build_and_load()
+    return gen_qsa_ops_module().build_and_load()
 
 
 @register_custom_op("flashinfer::qsa_expand_block_route", mutates_args=("out",))

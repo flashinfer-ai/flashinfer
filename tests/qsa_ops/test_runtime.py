@@ -573,7 +573,7 @@ def test_capabilities_report_this_build(monkeypatch):
     "module,symbol,lost",
     [
         ("qsa_ops.scores", None, SEL),
-        ("qsa_ops.route", "qsa_route_from_logical", SEL),
+        ("qsa_ops.scores", "qsa_route_from_logical", SEL),
         ("topk", None, SEL),
         ("topk", "cub_topk_ragged_transform_workspace_size_for", SEL),
         ("qsa_ops.output_gate", None, GATED),

@@ -108,10 +108,9 @@ def _capabilities(device: torch.device) -> int:
 def _capabilities_here(device: torch.device) -> int:
     bits = 0
 
-    # Selection is three pieces: the scorer, the route expansion, and a top-k
-    # whose scratch the caller owns. Any one of them missing is no selection.
+    # Selection is the scorer and route kernels, and a top-k whose scratch the
+    # caller owns. Any one of them missing is no selection.
     try:
-        from .route import get_qsa_route_module
         from .scores import get_qsa_scores_module, qsa_paged_scores
         from ..topk import get_topk_module
 
@@ -126,9 +125,9 @@ def _capabilities_here(device: torch.device) -> int:
             return get_qsa_scores_module()
 
         pieces = (
-            _module_has(scorer, "qsa_paged_scores"),
             _module_has(
-                get_qsa_route_module,
+                scorer,
+                "qsa_paged_scores",
                 "qsa_expand_block_route",
                 "qsa_route_from_logical",
             ),

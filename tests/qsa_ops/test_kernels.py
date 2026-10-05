@@ -683,19 +683,19 @@ def test_gate_refuses_aliasing_and_short_attention():
     + [({(12, "0f")}, 1, 1), ({(7, "5"), (9, "0a")}, 1, 1), ({(8, "0")}, 0, 0)],
 )
 def test_aot_registers_the_qsa_modules_together(monkeypatch, archs, misc, expected):
-    """Scorer, route and gate need SM8+ and go in together; the pre-indexer always."""
+    """The QSA kernels and the gate need SM8+ and go in together."""
     from flashinfer import aot
     from flashinfer.jit import core, qsa_ops
 
     fast_math = lambda spec: [f for f in spec.extra_cuda_cflags if "fast_math" in f]
-    assert fast_math(qsa_ops.gen_qsa_route_module())
+    assert fast_math(qsa_ops.gen_qsa_ops_module())
     assert not fast_math(qsa_ops.gen_qsa_output_gate_module())
     context = SimpleNamespace(TARGET_CUDA_ARCHS=archs)
     monkeypatch.setattr(core, "current_compilation_context", context)
-    names = ("qsa_output_gate", "qsa_route", "qsa_scores", "qsa_pre_indexer")
+    names = ("qsa_output_gate", "qsa_ops")
     stub = lambda name: lambda *args: SimpleNamespace(name=name)
     for name in (*names, "spdlog", "cudnn_fmha"):
         monkeypatch.setattr(aot, f"gen_{name}_module", stub(name))
     monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
     built = [s.name for s in aot.gen_all_modules(*[[]] * 6, {}, *[0] * 5, misc, 0)]
-    assert [built.count(n) for n in names] == [expected] * 3 + [misc]
+    assert [built.count(n) for n in names] == [expected] * 2
