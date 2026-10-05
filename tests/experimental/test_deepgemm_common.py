@@ -14,7 +14,7 @@ from flashinfer.experimental.deepgemm_common import (
 )
 
 _EXPERIMENTAL = Path(__file__).resolve().parents[2] / "flashinfer" / "experimental"
-_FAMILIES = ("deepgemm_", "mega_moe_v3", "source_mega_moe")
+_FAMILIES = ("deepgemm_", "mega_moe_v3")
 
 
 def _per_arch_catalog():
@@ -164,6 +164,64 @@ def test_merged_layout_shared_routes_are_returned_verbatim_for_every_arch():
     shared = {"a:sm148": {"program": "k_shared"}}
     assert catalog.routes("sm_100a") == shared
     assert catalog.routes("sm_103a") == shared
+
+
+def _merged_catalog_shared_routes_per_arch_sm_counts():
+    return {
+        "schema": "unit.v3",
+        "programs": {
+            "k_shared": {
+                "sources": ["csrc/x/shared.cu"],
+                "compile_flags": {"sm_100a": ["-a"], "sm_103a": ["-a", "-b"]},
+                "definitions": ["NUM_CTAS"],
+                "arches": ["sm_100a", "sm_103a"],
+            },
+            "k_plain": {
+                "sources": ["csrc/x/plain.cu"],
+                "compile_flags": ["-c"],
+                "arches": ["sm_100a", "sm_103a"],
+            },
+        },
+        "routes": {
+            "a": {
+                "num_sms": {"sm_100a": 148, "sm_103a": 152},
+                "program": "k_shared",
+            },
+        },
+    }
+
+
+def test_shared_routes_carry_one_sm_count_per_arch_and_per_arch_flags():
+    catalog = Catalog(_merged_catalog_shared_routes_per_arch_sm_counts(), label="Unit")
+    assert catalog.supported_num_sms("sm_100a") == (148,)
+    assert catalog.supported_num_sms("sm_103a") == (152,)
+    route = catalog.route("sm_103a", "a")
+    assert catalog.route_num_sms("sm_103a", "a", route) == 152
+    with pytest.raises(ValueError, match="carries no SM count for sm_90a"):
+        catalog.route_num_sms("sm_90a", "a", route)
+    shared = catalog.program("sm_100a", "k_shared")
+    assert Catalog.compile_flags(shared, "sm_100a") == ["-a"]
+    assert Catalog.compile_flags(shared, "sm_103a") == ["-a", "-b"]
+    assert Catalog.compile_flags(catalog.program("sm_100a", "k_plain"), "sm_100a") == [
+        "-c"
+    ]
+
+
+def test_definitions_are_exactly_the_declared_subset_and_name_the_spec():
+    catalog = Catalog(_merged_catalog_shared_routes_per_arch_sm_counts(), label="Unit")
+    assert catalog.definitions(
+        "sm_100a", "k_shared", {"NUM_CTAS": 148, "OTHER": 1}
+    ) == {"NUM_CTAS": 148}
+    assert catalog.definitions("sm_100a", "k_plain", {"NUM_CTAS": 148}) == {}
+    with pytest.raises(ValueError, match=r"cannot supply: \['NUM_CTAS'\]"):
+        catalog.definitions("sm_100a", "k_shared", {})
+    pytest.importorskip("torch")
+    spec = catalog.jit_spec("sm_103a", "k_shared", {"NUM_CTAS": 152})
+    assert spec.name == "k_shared_sm_103a_num_ctas152"
+    flags = spec.extra_cuda_cflags
+    assert "-DNUM_CTAS=152" in flags and "-a" in flags and "-b" in flags
+    plain = catalog.jit_spec("sm_100a", "k_plain")
+    assert plain.name == "k_plain_sm_100a" and "-c" in plain.extra_cuda_cflags
 
 
 def test_missing_route_raises_unsupported_device_naming_the_options():
@@ -318,18 +376,18 @@ class TestRandomInputs:
             self.h.assert_close(out.to(torch.float16), out)
 
 
-def _gpu_family(module_dir: str, catalog_file: str, label: str):
-    """Catalog, arch and SM count of the current device, or a skip naming the gap."""
+def _exported_device(describe):
+    """Architecture of the current device as the family's runtime resolves it
+    (``describe`` returns it or raises), or a skip naming the gap. The FP4 GEMM
+    and batched projection families select their programs from runtime shapes
+    and device facts; they ship no per-shape catalog file."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
-    catalog = load_catalog(_EXPERIMENTAL / module_dir / catalog_file, label=label)
     try:
-        arch = catalog.device_arch("cuda")
-        catalog.device_num_sms("cuda", arch)
+        return describe(torch)
     except (RuntimeError, UnsupportedDevice) as error:
         pytest.skip(str(error))
-    return catalog, arch
 
 
 class TestRandomInputReferenceChecks:
@@ -341,9 +399,12 @@ class TestRandomInputReferenceChecks:
     def test_fp4_gemm_matches_reference_on_random_operands(self, m, n, k, alpha):
         torch = pytest.importorskip("torch")
         from tests.experimental import deepgemm_common as helpers
+        from flashinfer.experimental.deepgemm_fp4_gemm import fp4_gemm as runtime
         from flashinfer.fp4_gemm import prepare_fp4_gemm
 
-        _gpu_family("deepgemm_fp4_gemm", "fp4_gemm_catalog.json", "Native FP4 GEMM")
+        _exported_device(
+            lambda torch: runtime.device_facts(torch.cuda.current_device())
+        )
         gen = helpers.seeded_generator(2026, "cuda")
         a, sfa, a_ref = helpers.random_fp4_operand(m, k, generator=gen, device="cuda")
         b, sfb, b_ref = helpers.random_fp4_operand(n, k, generator=gen, device="cuda")
@@ -362,13 +423,22 @@ class TestRandomInputReferenceChecks:
     ):
         torch = pytest.importorskip("torch")
         from tests.experimental import deepgemm_common as helpers
+        from flashinfer.experimental.deepgemm_batched_gemm import (
+            batched_gemm as runtime,
+        )
         from flashinfer.fp8_batched_gemm import prepare_fp8_batched_gemm
 
-        _gpu_family(
-            "deepgemm_batched_gemm",
-            "batched_gemm_catalog.json",
-            "Batched FP8 projection",
-        )
+        def describe(torch):
+            arch = runtime.device_arch("cuda")
+            sms = torch.cuda.get_device_properties(0).multi_processor_count
+            if sms not in runtime.supported_num_sms(arch):
+                raise UnsupportedDevice(
+                    f"Batched FP8 projection schedules are pinned to "
+                    f"{runtime.supported_num_sms(arch)} SMs, this device has {sms}"
+                )
+            return arch
+
+        _exported_device(describe)
         heads, inner, width = 8, 4096, 1024
         gen = helpers.seeded_generator(2026, "cuda")
         aq, asf, a_ref, bq, bsf, b_ref = [], [], [], [], [], []

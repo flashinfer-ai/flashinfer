@@ -61,7 +61,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "2675300c04a1351f7f3675eac75c633ef5504faa758a4630158d3f16c903b78c",
+        "closure_sha256": "e0011b044847d344061ee6d12175b2ac69949ce24a26a57bacab8cc195e61e66",
     },
     "cake_kimi_k3_attn_res_03bedd980b7a2200bf61": {
         "role": "kernel",
@@ -92,7 +92,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 128,
         "arches": ["sm_103a"],
-        "closure_sha256": "31dbd8b2e99bb5aa032c6d6f2de6a27f4a74aa3e4620cca24d5d44a06f2e07dd",
+        "closure_sha256": "320e6f8d46acd0495d22163b87955ba559756abdee175d4e2bc96e0d367d3258",
     },
     "cake_kimi_k3_attn_res_04179092271f793576fd": {
         "role": "kernel",
@@ -123,7 +123,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "098ff9e35154f812fd2d81c65ecb526760039af08367e76ab407505f86d5fa24",
+        "closure_sha256": "c1e6022b4d5d8974008a33de32554390db985acac8e45b372358082462a0389a",
     },
     "cake_kimi_k3_attn_res_05f4833fcaebced8982a": {
         "role": "kernel",
@@ -154,7 +154,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "b232d179f47c5025631d9e6a8331776cf0576272004eafc80e262a14ed3ebaca",
+        "closure_sha256": "4b413c90b28f60be9f5aa5a9d49611cdf47fb4cca46ea540ca5dea1891a142e2",
     },
     "cake_kimi_k3_attn_res_06a4152cb4621c4b09f2": {
         "role": "kernel",
@@ -185,7 +185,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "51816dd391a53dc71fe40e66c4efae41b427523b84c0a7a0426f576f14d10a50",
+        "closure_sha256": "8c3fdb6b18f55662b209c388a6fe53170580ac5da46a076cfc8236fe3498a169",
     },
     "cake_kimi_k3_attn_res_1fbd16a1745563095baf": {
         "role": "kernel",
@@ -216,7 +216,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 64,
         "arches": ["sm_100a"],
-        "closure_sha256": "b41b37d84f036fe1b5344f2a58ef7875c19dfd88d845118af3e913e08f8a9425",
+        "closure_sha256": "dffd9a2ba55ffae614338e6f084d07d82799069dc587beeecc93929a9a8ad297",
     },
     "cake_kimi_k3_attn_res_291d118f0d9137e82482": {
         "role": "kernel",
@@ -281,7 +281,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "030ff2d01df4e04395a4fe226c4f830097b05543c2b2d40921b37f9ee6c02358",
+        "closure_sha256": "3259e9170d830458c2f27d4e4216ecb62ad6a45c35a4c6272adc1d23c47f79e1",
     },
     "cake_kimi_k3_attn_res_2ddeb0485677f92cd8b4": {
         "role": "kernel",
@@ -312,38 +312,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "2bbb710f299c48cb3ae5a854fe2bb116b9c148307a1fc5386b9a4da69e97d606",
-    },
-    "cake_kimi_k3_attn_res_320ac84d68e18ee084ed": {
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_320ac84d68e18ee084ed_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_320ac84d68e18ee084ed_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "out"],
-            ["buffer", "prefix"],
-            ["buffer", "delta"],
-            ["buffer", "blocks"],
-            ["buffer", "norm_weight"],
-            ["buffer", "qk_weight"],
-            ["buffer", "output_norm_weight"],
-            ["parameter", "blocks_m_stride"],
-            ["parameter", "blocks_k_stride"],
-            ["parameter", "eps"],
-            ["parameter", "output_norm_eps"],
-            ["parameter", "M"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "tma_workspace_bytes": 0,
-        "threads": 288,
-        "arches": ["sm_103a"],
-        "closure_sha256": "8bcf8d50f91fb66ffe3eb764b1a7c10587a7e5988bbc2538f6d95f99fc813537",
+        "closure_sha256": "0f4f69ae4401fb4463296c5632fbf0aae72d98ecea40d0e1db2ebae86ba9ce04",
     },
     "cake_kimi_k3_attn_res_32f85df97de777defe91": {
         "role": "kernel",
@@ -408,7 +377,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 64,
         "arches": ["sm_100a"],
-        "closure_sha256": "42bb3fab497088075b2defdd5ed5c875fa650afbc2d3e1e02312dcd42803d631",
+        "closure_sha256": "94dfe145aacc495e26e643af5766f750e53db50e7aa7bf2a5eab09e9b50a631f",
     },
     "cake_kimi_k3_attn_res_3899a43dd652e8333bce": {
         "role": "kernel",
@@ -439,7 +408,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "912f09d0fcb62fc9bf3c839d07ed9a987764a40c995b0eda27ed6fe258c7de3f",
+        "closure_sha256": "b93d330bd9e62706f5b68661ccd0d8f3469d888d0fc6fd70a15c3b61f15888c9",
     },
     "cake_kimi_k3_attn_res_39bea7db7ae295dced4f": {
         "role": "kernel",
@@ -472,11 +441,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a", "sm_103a"],
         "closure_sha256": "f0ae1194711119e80083b9982aa14226585f3fa76531de899f0a12d06f74549c",
     },
-    "cake_kimi_k3_attn_res_3ba9e82486ba3a8e744a": {
+    "cake_kimi_k3_attn_res_42db4f4b8216ab6fcd8f": {
         "role": "kernel",
         "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ba9e82486ba3a8e744a_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_3ba9e82486ba3a8e744a_binding.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_42db4f4b8216ab6fcd8f_kernel.cu",
+            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_42db4f4b8216ab6fcd8f_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -499,9 +468,9 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "tma_workspace_bytes": 0,
-        "threads": 288,
-        "arches": ["sm_103a"],
-        "closure_sha256": "de4a8b674bd198c440f103934fbc705364edf8bc0a0b2675024413ddf2d0f9c1",
+        "threads": 256,
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "a073b257972a5f6a09bbae61c82da993f94375cff036dd92dfd11e696bda94b5",
     },
     "cake_kimi_k3_attn_res_4c2c0a5a9ea5a9093746": {
         "role": "kernel",
@@ -557,7 +526,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "238f26658077b664a77a9d3562f7d11bbe621b671a58d5ff07662bdb2c20fc4f",
+        "closure_sha256": "43698c564cadd1eb07f91d232a5d39e43acdef3d9b7505f83f5b0fe94f61f056",
     },
     "cake_kimi_k3_attn_res_50393c0dec14fafed1ab": {
         "role": "kernel",
@@ -588,7 +557,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "d85a69222ce38fe84045830faf4f8f795abf16f976160c6c5a9f4ce3ce5dab86",
+        "closure_sha256": "0247de8842ae94ccd518812235325afd3239e032def54bdf45ef35c911fb0b10",
     },
     "cake_kimi_k3_attn_res_5935d32598c8940b29b6": {
         "role": "kernel",
@@ -619,7 +588,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "89c72a7e0dcf2a66f8dee667620fc9c0609ed1d136e2afaba59de2fb518cc8fa",
+        "closure_sha256": "d289138e49fbbf204a26fc57ab83980c8d0ab11bb1e41c80b828cdee58e102fe",
     },
     "cake_kimi_k3_attn_res_5f8b1731faaafb050910": {
         "role": "kernel",
@@ -650,7 +619,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "40e6962da005cce95e400edd90e01fdb14897587b3f26ecc3d45c34ee64de05e",
+        "closure_sha256": "2ce4a834d03af2d6cc07275618a8708742f84fe75f20fa8983f7243a9b743db4",
     },
     "cake_kimi_k3_attn_res_62234b7d691bf3392986": {
         "role": "kernel",
@@ -681,7 +650,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "966fca9419a85db0c6d5499b24bfb86f8bcc91f1dba9d0d5cabeeec8f81561f9",
+        "closure_sha256": "1a822f6961a56d80d621e9ba533672d01f098a7c98c59d2490593c92dec7bba9",
     },
     "cake_kimi_k3_attn_res_6c023a0cead93de42945": {
         "role": "kernel",
@@ -712,7 +681,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 256,
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "4eac3ed0cdb5807313f8c652d49662ccec1f0da0dae8895b901157ed7f17c3aa",
+        "closure_sha256": "cb670acf0192cbceb21b1989d92fbab19512b6058e8935d94988cfbbde3fb1e6",
     },
     "cake_kimi_k3_attn_res_6d78f70ca0fc22e4d64b": {
         "role": "kernel",
@@ -743,7 +712,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "785beb8e2523dc4a3114f4339f8224addaf656f241573a3e72b180a535c83ee4",
+        "closure_sha256": "cfdda1609f6991372e974580bbc0ca26630ed30ee56811ee72daa7cf69690752",
     },
     "cake_kimi_k3_attn_res_7050d9bcb8abed5bbeca": {
         "role": "kernel",
@@ -774,7 +743,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "c5c071c4cebc9d83c23fb3f8bb22e0e26f8ede4316fa204d93baf0e278e6453f",
+        "closure_sha256": "93306c20ac0636619faee353ce78b38fb8330a5870570753b9747c4d9df96afc",
     },
     "cake_kimi_k3_attn_res_7194f290d641ae888abc": {
         "role": "kernel",
@@ -839,38 +808,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "102712700d42c64b291e35fdd7e939cb811c0969d0db60eca432ca688681f7fb",
-    },
-    "cake_kimi_k3_attn_res_78b0ba290a4ef1298d15": {
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_78b0ba290a4ef1298d15_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_78b0ba290a4ef1298d15_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "out"],
-            ["buffer", "prefix"],
-            ["buffer", "delta"],
-            ["buffer", "blocks"],
-            ["buffer", "norm_weight"],
-            ["buffer", "qk_weight"],
-            ["buffer", "output_norm_weight"],
-            ["parameter", "blocks_m_stride"],
-            ["parameter", "blocks_k_stride"],
-            ["parameter", "eps"],
-            ["parameter", "output_norm_eps"],
-            ["parameter", "M"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "tma_workspace_bytes": 0,
-        "threads": 288,
-        "arches": ["sm_103a"],
-        "closure_sha256": "18da6ccbc47da34e37ace1fb31ab0ff5b187ac087cd6d6e7203ef743112673c6",
+        "closure_sha256": "8cec519ec92f0bfb8d5c13b5aaa3e4cb912593d8b2e73c218e296bb0b9eb806b",
     },
     "cake_kimi_k3_attn_res_79b4ed02ddce5423fbb7": {
         "role": "kernel",
@@ -901,7 +839,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 128,
         "arches": ["sm_103a"],
-        "closure_sha256": "9b27c3c5ff9324599396956285eac98ae4bef707122e4a0615a8c0c5e0c8ef97",
+        "closure_sha256": "2c13f679e9496a50659d891ae5871ff010e438d55e849b5fcf1b1c8afde8e9a8",
     },
     "cake_kimi_k3_attn_res_8dbbd3a31f2077a46155": {
         "role": "kernel",
@@ -932,7 +870,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 64,
         "arches": ["sm_100a"],
-        "closure_sha256": "b043739600bb18720d1e9d0f06aefe46cb3c02694557e624a49580e5ad29d0ec",
+        "closure_sha256": "d0ddbc5e1e695173c5a2f0726f6e6aeb65443b11a66d928cf69270a2346baa22",
     },
     "cake_kimi_k3_attn_res_8e39ccd7a53d0d6dba18": {
         "role": "kernel",
@@ -963,7 +901,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 256,
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "8056bcf8247079abf7c2b72724ee2db4bf92e8446184551792ca94c1c0cd93cd",
+        "closure_sha256": "22b8ec501b91134866a4d7d69f8abdf662793eb85c4cd79fef9f35ed112a9d2b",
     },
     "cake_kimi_k3_attn_res_95af0f97dee8674c05f0": {
         "role": "kernel",
@@ -994,7 +932,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "681c2379049239528d617c95dc8e8c28d5eb43a091b07624c7ba58c2c4df1df8",
+        "closure_sha256": "3e495d592ebec32f9406f112d7f5ba3827a0e426c5784b25909c1d3ee7610049",
     },
     "cake_kimi_k3_attn_res_95daeeb4211b8860263c": {
         "role": "kernel",
@@ -1025,7 +963,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "f561da269af9c75d58b556b491976d810c5efb760a7fed713be84cf68f792e44",
+        "closure_sha256": "b2c73128fb9504b9ac125b962ff968fd792d2dc3cbff4af20f74eacc6ec58c80",
     },
     "cake_kimi_k3_attn_res_9a08b05661314c984c9c": {
         "role": "kernel",
@@ -1056,7 +994,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 256,
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "0cb158c811613fc37488cc027bdf8937c73b1c0ad6cf4afe2318d4f9f58603a1",
+        "closure_sha256": "ca53f80372bfe82a4927bc3bc2e754c120f8e5837183cde987d9d0776bc983e8",
     },
     "cake_kimi_k3_attn_res_a6741a83caf8cd798e00": {
         "role": "kernel",
@@ -1087,7 +1025,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "45fdd440552b964734450436db9a930579d5b035d2b56dec0e1d2532dbe55757",
+        "closure_sha256": "0f74aa447f06bad7bce6a91fbbe7b797c5edcc6476ecd94376ddd46e47134abe",
     },
     "cake_kimi_k3_attn_res_a858be9f148c77834881": {
         "role": "kernel",
@@ -1118,7 +1056,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "0c6e1e160a4cfb86a8cadd050cfa9462343d8934778e216630227eb93acf1bc8",
+        "closure_sha256": "c958c90eba554513c9b912e47d63e86669b836e1e4d1840fb3834f96499d5a38",
     },
     "cake_kimi_k3_attn_res_a891298f0acbfc7661a5": {
         "role": "kernel",
@@ -1149,7 +1087,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "ec1f10392613e696d3bf3666b1bdf0b1475ec0bdefa8eee5724d199b5c33438f",
+        "closure_sha256": "a7a90199aa534b60da0bd81ad6bb0906f1995c9dab6346b0bacf44aab3ddeea2",
     },
     "cake_kimi_k3_attn_res_aa857192cd56bffd3e5d": {
         "role": "kernel",
@@ -1180,7 +1118,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 128,
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "b02bcd30128c3efb8917679ece1dd63ddae22c90535efca3c139b9978472d56c",
+        "closure_sha256": "7bc34948d283e5cd95299f68e711477dbd0af4480a461ef9293236e31d7a7374",
     },
     "cake_kimi_k3_attn_res_af4218928933d4553a6f": {
         "role": "kernel",
@@ -1211,7 +1149,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 64,
         "arches": ["sm_100a"],
-        "closure_sha256": "080f664c3fcba3839150c1790ef925c3e94c406de71e197007a67fdd068d7a22",
+        "closure_sha256": "2a3d034ce6b291686e7bcd7a96b394dac4ee28dba2da2fe3cd198084a4dfa68a",
     },
     "cake_kimi_k3_attn_res_bea505d472b29401f431": {
         "role": "kernel",
@@ -1242,7 +1180,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "ada14dcea1cd18e9eab5a36d007eeb2534df11b80f89ac681e662b56bc7a059f",
+        "closure_sha256": "446d68942bc2177736fd7ace6006d2d47f5cbd52618ee4c471522e357f72377e",
     },
     "cake_kimi_k3_attn_res_c2e471b0412a3611b184": {
         "role": "kernel",
@@ -1273,7 +1211,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "b085c1c1665c3c38603dbd9db2e3cfd86c60f9eeb8d8f151b93feefc288db326",
+        "closure_sha256": "918d3258eb312f59b1c041ff9fda77961f6ac5683df231834353ac82cef6e162",
     },
     "cake_kimi_k3_attn_res_c84b13f3de176fff0611": {
         "role": "kernel",
@@ -1303,8 +1241,8 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "tma_workspace_bytes": 0,
         "threads": 128,
-        "arches": ["sm_103a"],
-        "closure_sha256": "9d0edb158d08a44a302581ebf69ec62e65c9829d43e7bb225b97990bac40588d",
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "f4608a1e5fb4d538fd7171bd38ef93c848980603815cc1475985a4774faf6292",
     },
     "cake_kimi_k3_attn_res_c9e9692ff7ae13af4d99": {
         "role": "kernel",
@@ -1335,7 +1273,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "e7caba64d6e28e6d266acd175ca23852cbe245caf14b3fb9bb8c0b2e418afd2f",
+        "closure_sha256": "3c21be271a155047ada8377a599eb9ee7524a5e305dabb6b2f6d5bc038d39e37",
     },
     "cake_kimi_k3_attn_res_cadf0285c87dabe05863": {
         "role": "kernel",
@@ -1366,38 +1304,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 64,
         "arches": ["sm_100a"],
-        "closure_sha256": "e4f7ce7222698425042e46d3d2bcb63c9d5266ad25b947c735bc1fdcdd27ef68",
-    },
-    "cake_kimi_k3_attn_res_cb5b0c965ed8dc97130b": {
-        "role": "kernel",
-        "sources": [
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_cb5b0c965ed8dc97130b_kernel.cu",
-            "cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_cb5b0c965ed8dc97130b_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "out"],
-            ["buffer", "prefix"],
-            ["buffer", "delta"],
-            ["buffer", "blocks"],
-            ["buffer", "norm_weight"],
-            ["buffer", "qk_weight"],
-            ["buffer", "output_norm_weight"],
-            ["parameter", "blocks_m_stride"],
-            ["parameter", "blocks_k_stride"],
-            ["parameter", "eps"],
-            ["parameter", "output_norm_eps"],
-            ["parameter", "M"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "tma_workspace_bytes": 0,
-        "threads": 288,
-        "arches": ["sm_100a"],
-        "closure_sha256": "3ad739f42f867143ccaaa49368516d1662d507c957851400601993886817d67f",
+        "closure_sha256": "6293863e05756d0ce80b90d56ced3c1f5d41a1e112a955e9896f797d71ec078d",
     },
     "cake_kimi_k3_attn_res_d6c48b9566d909d3e0b8": {
         "role": "kernel",
@@ -1462,7 +1369,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 128,
         "arches": ["sm_103a"],
-        "closure_sha256": "637e23728a8cd8d281762897d07884e5772051abfc113c0da29658df5a358ac9",
+        "closure_sha256": "bc08419a8f861e228db815a932e1969344786d2ec7581c2cca43f8dfb63a6016",
     },
     "cake_kimi_k3_attn_res_ec4df9c22e0215ef7821": {
         "role": "kernel",
@@ -1493,7 +1400,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": "70e91757a875c88d8bbefae4cfd36afb85cd55831ae673d530fbc26ea526ccf6",
+        "closure_sha256": "e0adcd21c32f593717d3f83da624622888e36ae39433f1a6d7e2b150b214c7d8",
     },
     "cake_kimi_k3_attn_res_ef66c031286a305c1104": {
         "role": "kernel",
@@ -1524,7 +1431,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "5a819ff9070bce8c2f6493b5996fb0c6390015fc98319ebec070ee5517b24d1f",
+        "closure_sha256": "0f8c24a1c2a322e8821f67d183b201521663b95437ce3c2ea7b15b1cd48621ca",
     },
     "cake_kimi_k3_attn_res_f6d43c3667f5ea30b6cc": {
         "role": "kernel",
@@ -1555,7 +1462,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_100a"],
-        "closure_sha256": "759995a01f019812333550d468c74f8ddfdd67bde760a4abed8a31620e3f2272",
+        "closure_sha256": "fb0435e2d8b3da3e3695feee2a07ee7fdd14c12f564bcc8d25527027b33b8ab8",
     },
     "cake_kimi_k3_attn_res_fc09e868f74b8c6fdf0e": {
         "role": "kernel",
@@ -1620,7 +1527,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "tma_workspace_bytes": 0,
         "threads": 288,
         "arches": ["sm_103a"],
-        "closure_sha256": "dab18481abb28a69ce1101310b9f8edcb29e425f8582fee9f6c398ecc271fda7",
+        "closure_sha256": "f3be900e2974ea46621ce218be41d2c817d493e27c0d94be36524ceb1113d5ca",
     },
 }
 KERNELS: dict[str, dict[str, str]] = {
@@ -1634,7 +1541,6 @@ KERNELS: dict[str, dict[str, str]] = {
         "native_k8": "cake_kimi_k3_attn_res_5935d32598c8940b29b6",
         "native_m128": "cake_kimi_k3_attn_res_ec4df9c22e0215ef7821",
         "persistent:k1_nc2_d2_f110000000000000": "cake_kimi_k3_attn_res_50393c0dec14fafed1ab",
-        "persistent:k1_nc4_d2_f011010000000000": "cake_kimi_k3_attn_res_cb5b0c965ed8dc97130b",
         "persistent:k1_nc4_d2_f110000000000000": "cake_kimi_k3_attn_res_028503fd0961d55b7765",
         "persistent:k2_nc4_d2_f110000000000000": "cake_kimi_k3_attn_res_95daeeb4211b8860263c",
         "persistent:k3_nc3_d3_f110000000000000": "cake_kimi_k3_attn_res_4cd66ac7fb3a3c76776a",
@@ -1646,6 +1552,7 @@ KERNELS: dict[str, dict[str, str]] = {
         "persistent:k8_nc3_d2_f011100000000000": "cake_kimi_k3_attn_res_04179092271f793576fd",
         "persistent:k8_nc5_d2_f110000000000000": "cake_kimi_k3_attn_res_a6741a83caf8cd798e00",
         "small_m_cluster2:k4": "cake_kimi_k3_attn_res_aa857192cd56bffd3e5d",
+        "small_m_cluster2:k8": "cake_kimi_k3_attn_res_c84b13f3de176fff0611",
         "small_m_cluster4:k4": "cake_kimi_k3_attn_res_af4218928933d4553a6f",
         "small_m_cluster4:k5": "cake_kimi_k3_attn_res_cadf0285c87dabe05863",
         "small_m_cluster4:k6": "cake_kimi_k3_attn_res_34163a739700379987b9",
@@ -1655,6 +1562,7 @@ KERNELS: dict[str, dict[str, str]] = {
         "small_m_direct:k1": "cake_kimi_k3_attn_res_6c023a0cead93de42945",
         "small_m_direct:k2": "cake_kimi_k3_attn_res_8e39ccd7a53d0d6dba18",
         "small_m_direct:k3": "cake_kimi_k3_attn_res_9a08b05661314c984c9c",
+        "small_m_direct:k4": "cake_kimi_k3_attn_res_42db4f4b8216ab6fcd8f",
     },
     "sm_103a": {
         "direct:k0_d0_w1_n1": "cake_kimi_k3_attn_res_fc09e868f74b8c6fdf0e",
@@ -1665,9 +1573,6 @@ KERNELS: dict[str, dict[str, str]] = {
         "k0_tma": "cake_kimi_k3_attn_res_4c2c0a5a9ea5a9093746",
         "native_k8": "cake_kimi_k3_attn_res_5935d32598c8940b29b6",
         "native_m128": "cake_kimi_k3_attn_res_ec4df9c22e0215ef7821",
-        "persistent:k1_nc2_d2_f010000000000000": "cake_kimi_k3_attn_res_3ba9e82486ba3a8e744a",
-        "persistent:k1_nc4_d2_f011000000000000": "cake_kimi_k3_attn_res_320ac84d68e18ee084ed",
-        "persistent:k1_nc4_d2_f011010000000000": "cake_kimi_k3_attn_res_78b0ba290a4ef1298d15",
         "persistent:k1_nc4_d2_f110000000000000": "cake_kimi_k3_attn_res_6d78f70ca0fc22e4d64b",
         "persistent:k1_nc4_d2_f110000000000010": "cake_kimi_k3_attn_res_5f8b1731faaafb050910",
         "persistent:k1_nc4_d2_f110000000100000": "cake_kimi_k3_attn_res_a858be9f148c77834881",
@@ -1691,6 +1596,7 @@ KERNELS: dict[str, dict[str, str]] = {
         "small_m_direct:k1": "cake_kimi_k3_attn_res_6c023a0cead93de42945",
         "small_m_direct:k2": "cake_kimi_k3_attn_res_8e39ccd7a53d0d6dba18",
         "small_m_direct:k3": "cake_kimi_k3_attn_res_9a08b05661314c984c9c",
+        "small_m_direct:k4": "cake_kimi_k3_attn_res_42db4f4b8216ab6fcd8f",
     },
 }
 
@@ -1735,7 +1641,7 @@ def kernel_module_name(arch: str, key: str) -> str:
     if name is None:
         raise NotImplementedError(
             f"The generated Kimi-K3 AttnRes kernel {key!r} for {arch} is not registered in this "
-            "checkout (the export covers the contract's token counts / block counts; see the package README)"
+            "checkout (plan_route substitutes a registered variant of the same family; see the package README)"
         )
     record = MODULES[name]
     if arch not in record["arches"]:

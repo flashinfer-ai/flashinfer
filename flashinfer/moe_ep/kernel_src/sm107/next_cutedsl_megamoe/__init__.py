@@ -59,6 +59,7 @@ _LAZY_HELPERS = (
     "quantize_mxfp8_block32",
     "quantize_nvfp4_block16",
     "round_up",
+    "round_trip_combine",
     "scale_to_f32",
     "swizzled_flat_sf_size",
     "to_blocked",

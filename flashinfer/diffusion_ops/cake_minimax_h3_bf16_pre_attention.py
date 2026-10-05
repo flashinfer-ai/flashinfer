@@ -43,11 +43,16 @@ def _minimax_h3_bf16_pre_attention_impl(
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     rope_cos_sin: torch.Tensor,
+    rope_positions: torch.Tensor,
     out: torch.Tensor,
     m: int,
     ulysses_degree: int,
     eps: float,
+    qk_eps: float,
 ) -> None:
+    # TVM-FFI argument order of the generated host tail: the AdaLN row count
+    # and row stride are read from the ``adaln_scale`` / ``adaln_shift``
+    # TensorViews, the RoPE cache row count from ``rope_cos_sin``.
     _get_module().minimax_h3_bf16_pre_attention(
         x,
         x_norm_weight,
@@ -58,10 +63,12 @@ def _minimax_h3_bf16_pre_attention_impl(
         q_norm_weight,
         k_norm_weight,
         rope_cos_sin,
+        rope_positions,
         out,
         m,
         ulysses_degree,
         eps,
+        qk_eps,
     )
 
 
@@ -76,10 +83,12 @@ def _minimax_h3_bf16_pre_attention_fake(
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     rope_cos_sin: torch.Tensor,
+    rope_positions: torch.Tensor,
     out: torch.Tensor,
     m: int,
     ulysses_degree: int,
     eps: float,
+    qk_eps: float,
 ) -> None:
     pass
 

@@ -1930,7 +1930,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     prefill kernel (one CTA per token and head block over all of its
     candidates, no split scratch) as chosen by
     :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`
-    from the measured crossover of the two sm_120a SKUs.
+    from the measured crossover of the two sm_120a SKUs. Write the NVFP4
+    pools with the fused SM120 writers
+    :func:`flashinfer.mla.cake_dsv4_nvfp4_rope_quantize_insert` (sliding-window
+    pool: GPT-J RoPE + head-padded ``q_out`` + quantize + insert in one launch)
+    and :func:`flashinfer.mla.cake_dsv4_nvfp4_kv_rope_quantize_insert`
+    (compressed pool / speculative context), which produce the bytes of
+    :func:`flashinfer.mla.nvfp4_quantize_append_sparse_mla_cache` applied to
+    the BF16-rounded roped rows.
 
     With ``backend="cake"`` on SM120/SM121 and
     ``kv_cache_format="fp8_dsv41_fp4_ca"``, this calls the Cake SM120
@@ -2521,7 +2528,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             dsv4_output_scale = _allocate_dsv4_rope_quant_output_scale(
                 num_tokens, num_heads, query.device
             )
-    elif out is None:
+    elif out is None and backend != "cake":
+        # backend='cake' allocates in run_cake_dsv4 once the route is known
+        # (route-dependent output base phase, see cake_dsv4._OUT_PHASE_BY_ROUTE).
         out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
 
     check_shape_dtype_device(
@@ -2580,6 +2589,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             cum_seq_lens_q=cum_seq_lens_q,
             seq_lens=seq_lens,
             backend="cake",
+            out_shape=tuple(expected_out_shape),
         )
 
     primary_kv_cache = compressed_kv_cache
@@ -4886,6 +4896,97 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         return_lse=return_lse,
         seq_lens_cpu=seq_lens_cpu,
         backend="cake",
+    )
+
+
+@flashinfer_experimental_api(feature="NVFP4 sparse MLA decode (SM100/SM103)")
+def nvfp4_sparse_mla_decode(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    bmm1_scale: float,
+    bmm2_scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+    num_ctas_per_token: Optional[int] = None,
+    backend: str = "cuda",
+) -> torch.Tensor:
+    r"""Sparse MLA decode over an NVFP4 (``nvfp4_ds_mla``) KV cache on SM100 and SM103.
+
+    Each query token attends to the KV rows its sparse indexer selected (DeepSeek-V3.2 and GLM-5 DSA)::
+
+        out[t, h] = bmm2_scale * sum_k softmax_k(bmm1_scale * query[t, h] . K[i_tk]) * V[i_tk]
+
+    ``K`` is a row's 576-dim latent (512 NoPE + 64 RoPE) and ``V`` its first 512 dims. Rows are dequantized exactly
+    in the kernel; nothing is staged in global memory.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        ``[num_tokens, 16, 576]`` ``torch.float8_e4m3fn``: 16 heads per rank (for example DeepSeek-V3.2 at TP8 or
+        GLM-5 at TP4).
+    kv_cache : torch.Tensor
+        ``torch.uint8`` rows of 352 bytes in vLLM's ``nvfp4_ds_mla`` layout, any leading shape (for example
+        ``[num_blocks, block_size, 352]``). Bytes 0-255 hold the 512 NoPE values as e2m1 (element ``2i`` in the
+        low nibble), bytes 256-319 the 64 RoPE values as e4m3, bytes 320-351 one e4m3 scale per 16 NoPE values,
+        block ``b``'s at byte ``320 + 8 * (b % 4) + b // 4``.
+    indices : torch.Tensor
+        ``[num_tokens, topk]`` ``torch.int32`` row ids into ``kv_cache`` viewed as ``[-1, 352]``
+        (``block_id * block_size + offset``); ``-1`` marks an empty slot. ``topk`` is a multiple of 32 (2048 in
+        DeepSeek-V3.2 and GLM-5). Values are not range-checked.
+    bmm1_scale : float
+        Scale of ``query . K`` before the softmax: the softmax scale times the query's dequantization scale.
+    bmm2_scale : float
+        Scale of the output.
+    out : Optional[torch.Tensor]
+        ``[num_tokens, 16, 512]`` ``torch.bfloat16`` output; allocated when omitted.
+    num_ctas_per_token : Optional[int]
+        Thread-block cluster size per query token: 3 to 8 with ``backend="cuda"``, 1 to 6 or 8 with
+        ``backend="cake"`` (7 is rejected). By default, the largest size whose ``num_tokens`` clusters all fit
+        on the device in one wave.
+    backend : str
+        ``"cuda"`` (default), the hand-written kernel, or ``"cake"``, the generated program of the same
+        operator (``flashinfer/experimental/nvfp4_sparse_mla_decode/cake_backend.py``).
+
+    Returns
+    -------
+    torch.Tensor
+        ``out``. A token whose indices are all ``-1`` gets zeros.
+
+    Notes
+    -----
+    Requires compute capability 10.0 (B200, GB200) or 10.3 (B300, GB300). The first call on a device compiles
+    the kernel and queries its cluster occupancy; later calls can be captured in CUDA graphs. Layout, limits and measurements:
+    ``flashinfer/experimental/nvfp4_sparse_mla_decode/README.md``.
+    """
+    if backend == "cake":
+        from ..experimental.nvfp4_sparse_mla_decode.cake_backend import (
+            nvfp4_sparse_mla_decode as run_cake,
+        )
+
+        return run_cake(
+            query,
+            kv_cache,
+            indices,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out=out,
+            num_ctas_per_token=num_ctas_per_token,
+            backend="cake",
+        )
+    if backend != "cuda":
+        raise ValueError(
+            "nvfp4_sparse_mla_decode supports backend='cuda' (default) or backend='cake'"
+        )
+    from ..experimental.nvfp4_sparse_mla_decode.backend import run
+
+    return run(
+        query,
+        kv_cache,
+        indices,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        out=out,
+        num_ctas_per_token=num_ctas_per_token,
     )
 
 

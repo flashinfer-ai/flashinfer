@@ -245,6 +245,8 @@ PageAttention for MLA
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits
     cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes
+    cake_dsv4_nvfp4_rope_quantize_insert
+    cake_dsv4_nvfp4_kv_rope_quantize_insert
 
 .. note::
 
@@ -253,6 +255,18 @@ PageAttention for MLA
     decode or the single-launch prefill kernel as chosen by
     ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` (DeepSeek-V4 sparse MLA
     SM120 tracker: flashinfer#4254).
+
+.. note::
+
+    The NVFP4 cache that route reads is written per layer by the fused
+    SM120/SM121 writers ``cake_dsv4_nvfp4_rope_quantize_insert`` (sliding-window
+    pool: GPT-J RoPE of the query and latent KV, head-padded ``q_out`` or, with
+    ``q_inplace=True`` and no head padding, the query rotated in place, NVFP4
+    quantization and paged insert in one launch) and
+    ``cake_dsv4_nvfp4_kv_rope_quantize_insert`` (compressed pool with
+    ``compress_ratio`` 1 or 2, speculative context with ratio 1); both produce
+    the bytes of ``nvfp4_quantize_append_sparse_mla_cache`` applied to the
+    BF16-rounded roped rows.
 
 .. note::
 

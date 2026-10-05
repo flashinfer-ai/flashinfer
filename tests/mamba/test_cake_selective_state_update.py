@@ -27,6 +27,36 @@ _CASES = (
     ("dynamic1", 1, 16, 1, 64, 128, 4, torch.float32, "simple", False, 1),
     ("dynamic3", 1, 16, 1, 64, 128, 8, torch.float32, "simple", False, 3),
     ("dynamic7", 1, 16, 1, 64, 128, 8, torch.float32, "simple", False, 7),
+    # Headdim-64 single-token decode (Nemotron-H / granite-4.0-h): row-owner tiles and paired batch programs.
+    ("stp_hd64_rows_bf16", 4, 128, 8, 64, 128, 0, torch.bfloat16, "auto", False, None),
+    (
+        "stp_hd64_paired_rows",
+        64,
+        128,
+        8,
+        64,
+        128,
+        0,
+        torch.bfloat16,
+        "auto",
+        False,
+        None,
+    ),
+    (
+        "stp_hd64_paired_rows_b320",
+        320,
+        128,
+        8,
+        64,
+        128,
+        0,
+        torch.bfloat16,
+        "auto",
+        False,
+        None,
+    ),
+    ("stp_hd64_fp32", 64, 128, 8, 64, 128, 0, torch.float32, "auto", False, None),
+    ("stp_hd64_odd_pairs", 8, 24, 8, 64, 128, 0, torch.bfloat16, "auto", False, None),
 )
 
 
@@ -182,6 +212,24 @@ def test_cake_selective_state_update_matches_flashinfer(case, cake_hits) -> None
 
 
 @requires_blackwell
+@pytest.mark.parametrize("name", ("mtp_short2", "dynamic0_b8"))
+def test_softplus_is_the_identity_above_the_threshold(name, cake_hits) -> None:
+    """``dt`` above 20 passes through softplus unchanged (``exp`` overflows past ~88); the reference thresholds too."""
+    inputs = _make_case(_case(name))
+    inputs["dt_softplus"] = True
+    dt_rows = torch.full(inputs["dt"].shape[:-1], 100.0, device="cuda")
+    dt_rows.flatten()[::3] = 30.0
+    dt_rows.flatten()[1::3] = -0.5
+    inputs["dt"] = dt_rows.as_strided(inputs["dt"].shape, (*dt_rows.stride(), 0))
+    reference, candidate = _split_arms(inputs)
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True]
+    assert torch.isfinite(out_candidate).all()
+    _assert_arms_close(candidate, out_candidate, reference, out_reference)
+
+
+@requires_blackwell
 def test_destination_table_with_per_sequence_columns(cake_hits) -> None:
     """Every non-pad entry of the destination table is a checkpoint; rows may differ."""
     case = ("dynamic_columns", 4, 16, 1, 64, 128, 8, torch.float32, "simple", False, 3)
@@ -333,11 +381,282 @@ def test_raw_projection_layout_matches_flashinfer(batch_size, cake_hits) -> None
     )
 
 
+def _raw_decode_case(batch_size: int, state_dtype, nheads: int = 128, ngroups: int = 8):
+    """SGLang Mamba2 decode views: x/B/C column slices of the fused ``xBC`` conv output, dt the trailing
+    columns of the fused ``zxbcdt`` projection broadcast over dim, BF16 coefficients, int32 slot tables."""
+    generator = torch.Generator(device="cuda").manual_seed(batch_size)
+    dim, dstate = 64, 128
+    xbc_width = nheads * dim + 2 * ngroups * dstate
+    zxbcdt_width = 2 * nheads * dim + 2 * ngroups * dstate + nheads
+    xbc = (
+        torch.randn((batch_size, xbc_width), generator=generator, device="cuda") * 0.1
+    ).to(torch.bfloat16)
+    x = xbc[:, : nheads * dim].view(batch_size, nheads, dim)
+    B = xbc[:, nheads * dim : nheads * dim + ngroups * dstate].view(
+        batch_size, ngroups, dstate
+    )
+    C = xbc[:, nheads * dim + ngroups * dstate :].view(batch_size, ngroups, dstate)
+    zxbcdt = torch.randn(
+        (batch_size, zxbcdt_width), generator=generator, device="cuda"
+    ).to(torch.bfloat16)
+    dt = (
+        zxbcdt[:, zxbcdt_width - nheads :].unsqueeze(-1).expand(batch_size, nheads, dim)
+    )
+    A_base = -torch.rand((nheads,), generator=generator, device="cuda") - 1.0
+    A = A_base.as_strided((nheads, dim, dstate), (1, 0, 0))
+    D_base = torch.randn((nheads,), generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    D = D_base.as_strided((nheads, dim), (1, 0))
+    bias_base = (torch.rand((nheads,), generator=generator, device="cuda") - 4.0).to(
+        torch.bfloat16
+    )
+    dt_bias = bias_base.as_strided((nheads, dim), (1, 0))
+    state = (
+        torch.randn(
+            (batch_size + 3, nheads, dim, dstate), generator=generator, device="cuda"
+        )
+        * 0.05
+    ).to(state_dtype)
+    source = torch.arange(batch_size, dtype=torch.int32, device="cuda") + 2
+    return {
+        "state": state,
+        "x": x,
+        "dt": dt,
+        "A": A,
+        "B": B,
+        "C": C,
+        "D": D,
+        "dt_bias": dt_bias,
+        "state_batch_indices": source,
+        "dst_state_batch_indices": None,
+        "cache_steps": 0,
+        "algorithm": "auto",
+        "dt_softplus": True,
+        "disable_state_update": False,
+        "intermediate_states_buffer": None,
+        "intermediate_state_indices": None,
+    }
+
+
+def _canonical_arm(candidate):
+    """The same call on the canonical layout (contiguous rows, FP32 coefficients, int64 tables) for the reference backend."""
+    nheads, dim = candidate["D"].shape
+
+    def rows_over_dim(view, shape):
+        rows = view[..., 0].float().contiguous()
+        return rows.as_strided(shape, (*rows.stride(), 0))
+
+    return dict(
+        candidate,
+        state=candidate["state"].clone(),
+        x=candidate["x"].contiguous(),
+        dt=rows_over_dim(candidate["dt"], candidate["dt"].shape),
+        B=candidate["B"].contiguous(),
+        C=candidate["C"].contiguous(),
+        D=rows_over_dim(candidate["D"], (nheads, dim)),
+        dt_bias=rows_over_dim(candidate["dt_bias"], (nheads, dim)),
+        state_batch_indices=candidate["state_batch_indices"].to(torch.int64),
+    )
+
+
+_RAW_DECODE_CASES = (
+    ("rows_bf16", 2, torch.bfloat16, "stp_hd64_rows_bf16"),
+    ("paired_bf16", 64, torch.bfloat16, "stp_paired_rows"),
+    ("rows_fp32", 8, torch.float32, "stp_hd64_rows_fp32"),
+)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("case", _RAW_DECODE_CASES, ids=lambda case: case[0])
+def test_raw_decode_layout_matches_flashinfer(case, cake_hits) -> None:
+    """Padded fused-projection views, BF16 dt/D/dt_bias and int32 slot tables run on the headdim-64 programs."""
+    _name, batch_size, state_dtype, program = case
+    candidate = _raw_decode_case(batch_size, state_dtype)
+    reference = _canonical_arm(candidate)
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    plan = _route(dict(candidate, x=candidate["x"]), output_like=candidate["x"])
+    assert plan is not None and plan.program == program
+    out_candidate = torch.empty(
+        (batch_size, 128, 64), dtype=torch.bfloat16, device="cuda"
+    )
+    cake_selective_state_update(**candidate, out=out_candidate)
+    assert cake_hits == [True], "the raw decode layout must run on Cake"
+    torch.testing.assert_close(out_candidate, out_reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        candidate["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
+
+
+@requires_blackwell
+@pytest.mark.parametrize("batch_size", (2, 64))
+def test_hd64_pad_rows_write_the_zero_state_output(batch_size, cake_hits) -> None:
+    """Rows whose slot equals ``pad_slot_id`` (SGLang CUDA-graph padding) read a zero state, write that row's output
+    like the FlashInfer STP kernel, and leave the state pool untouched."""
+    candidate = _raw_decode_case(batch_size, torch.bfloat16)
+    candidate["state_batch_indices"][0] = -1
+    if batch_size > 2:
+        candidate["state_batch_indices"][batch_size // 2] = -1
+    live = candidate["state_batch_indices"] >= 0
+    initial_state = candidate["state"].clone()
+    reference = _canonical_arm(candidate)
+    out_reference = selective_state_update(
+        **reference, backend="flashinfer", pad_slot_id=-1
+    )
+    out_candidate = torch.full(
+        (batch_size, 128, 64), 7.0, dtype=torch.bfloat16, device="cuda"
+    )
+    cake_selective_state_update(**candidate, out=out_candidate, pad_slot_id=-1)
+    assert cake_hits == [True]
+    torch.testing.assert_close(out_candidate, out_reference, atol=1e-2, rtol=1e-2)
+    assert bool((out_candidate[~live] != 7.0).any()), (
+        "pad rows carry the zero-state output row"
+    )
+    torch.testing.assert_close(
+        candidate["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
+    untouched = torch.ones(candidate["state"].shape[0], dtype=torch.bool, device="cuda")
+    untouched[candidate["state_batch_indices"][live].long()] = False
+    assert torch.equal(candidate["state"][untouched], initial_state[untouched])
+
+
+@requires_blackwell
+@pytest.mark.parametrize(
+    "case_name", ("stp_hd64_rows_bf16", "stp_hd64_paired_rows", "stp_hd64_fp32")
+)
+def test_hd64_routes_capture_into_cuda_graph(case_name, cake_hits) -> None:
+    """The headdim-64 routes read every slot on the device: no host synchronization, graph-capturable."""
+    reference, candidate = _split_arms(_make_case(_case(case_name)))
+    initial_state = candidate["state"].clone()
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    out_candidate = torch.empty_like(candidate["x"])
+    cake_selective_state_update(**candidate, out=out_candidate)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cake_selective_state_update(**candidate, out=out_candidate)
+    assert cake_hits == [True, True], (
+        "the headdim-64 routes must run on Cake inside stream capture"
+    )
+    candidate["state"].copy_(initial_state)
+    out_candidate.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_arms_close(candidate, out_candidate, reference, out_reference)
+
+
+@requires_blackwell
+def test_hd64_route_falls_back_for_non_dense_rows(cake_hits) -> None:
+    """Rows with a non-unit inner stride are outside the programs' addressing; the call runs on FlashInfer."""
+    inputs = _make_case(_case("stp_hd64_paired_rows"))
+    assert _route(inputs).program == "stp_paired_rows"
+    batch_size, nheads, dim = inputs["x"].shape
+    wide = torch.zeros(
+        (batch_size, nheads, 2 * dim), dtype=torch.bfloat16, device="cuda"
+    )
+    wide[..., ::2].copy_(inputs["x"])
+    inputs["x"] = wide[..., ::2]
+    assert _route(inputs) is None
+    _assert_falls_back(inputs, cake_hits)
+
+
+@requires_blackwell
+def test_hd64_saturated_odd_pairing_falls_back(cake_hits) -> None:
+    """An odd head pairing at saturating work has no delivered tile (the four-warp BF16 row owner); FlashInfer serves it."""
+    inputs = _make_case(
+        ("odd_saturated", 256, 24, 8, 64, 128, 0, torch.bfloat16, "auto", False, None)
+    )
+    assert _route(inputs) is None
+    _assert_falls_back(inputs, cake_hits)
+
+
+def test_hd64_defines_follow_the_storage_dtypes() -> None:
+    assert cake.rows_defines(torch.float32, torch.int64, 1, 8) == (
+        ("COEFFICIENT_BF16", 0),
+        ("INDEX_I32", 0),
+        ("PREFETCH_ROWS", 1),
+        ("DIM_TILES", 8),
+    )
+    assert cake.rows_defines(torch.bfloat16, torch.int32, 4, 2) == (
+        ("COEFFICIENT_BF16", 1),
+        ("INDEX_I32", 1),
+        ("PREFETCH_ROWS", 4),
+        ("DIM_TILES", 2),
+    )
+    assert cake.batch_abi_defines(torch.bfloat16, torch.int32, True, 4) == (
+        ("COEFFICIENT_BF16", 1),
+        ("INDEX_I32", 1),
+        ("PAIRED_HEADS", 1),
+        ("HEADS_PER_CTA", 4),
+    )
+    assert cake.direct_defines(8, 1024) == (
+        ("HEADS_PER_GROUP_STATIC", 8),
+        ("DIRECT_UNROLL", 4),
+    )
+    assert cake.direct_defines(64, 4096) == (
+        ("HEADS_PER_GROUP_STATIC", 0),
+        ("DIRECT_UNROLL", 1),
+    )
+
+
+def test_paired_heads_per_cta_follows_the_work_and_arch() -> None:
+    sms = 148
+    assert (
+        cake._paired_heads_per_cta(6 * 64, sms, "sm_100a") == 1
+    )  # 2.6 program heads per SM: one head per CTA
+    assert (
+        cake._paired_heads_per_cta(8 * 64, sms, "sm_100a") == 2
+    )  # 3.5 program heads per SM
+    assert (
+        cake._paired_heads_per_cta(16 * 64, sms, "sm_100a") == 2
+    )  # 6.9: below the B200 band
+    assert (
+        cake._paired_heads_per_cta(16 * 64, 152, "sm_103a") == 4
+    )  # 6.7: inside the GB300 band
+    assert (
+        cake._paired_heads_per_cta(20 * 64, sms, "sm_100a") == 4
+    )  # 8.6: inside the band
+    assert (
+        cake._paired_heads_per_cta(32 * 64, sms, "sm_100a") == 2
+    )  # 13.8: above the band
+    assert cake._paired_heads_per_cta(128 * 64, sms, "sm_100a") == 4  # 55: saturated
+    assert (
+        cake._paired_heads_per_cta(20 * 64, sms, "sm_120a") == 2
+    )  # no band for other archs
+    assert (
+        cake._paired_rows_program(8 * 64, sms, "sm_100a") == "stp_paired_rows"
+    )  # 3.5 per SM
+    assert (
+        cake._paired_rows_program(16 * 64, sms, "sm_100a") == "stp_paired_rows_mb4"
+    )  # 6.9: inside the B200 band
+    assert (
+        cake._paired_rows_program(32 * 64, sms, "sm_100a") == "stp_paired_rows_mb4"
+    )  # 13.8
+    assert (
+        cake._paired_rows_program(64 * 64, sms, "sm_100a") == "stp_paired_rows"
+    )  # 27.7: above the band
+    assert (
+        cake._paired_rows_program(16 * 64, 152, "sm_103a") == "stp_paired_rows"
+    )  # no band on GB300
+
+
+def test_hd64_rows_plan_follows_the_work() -> None:
+    sm_count = 148
+    assert cake.hd64_rows_plan(1, 128, torch.bfloat16, sm_count) == (8, 1)
+    assert cake.hd64_rows_plan(4, 128, torch.bfloat16, sm_count) == (4, 1)
+    assert cake.hd64_rows_plan(64, 24, torch.bfloat16, sm_count) is None
+    assert cake.hd64_rows_plan(1, 128, torch.float32, sm_count) == (8, 1)
+    assert cake.hd64_rows_plan(2, 128, torch.float32, sm_count) == (4, 1)
+    assert cake.hd64_rows_plan(4, 128, torch.float32, sm_count) == (2, 4)
+    assert cake.hd64_rows_plan(8, 128, torch.float32, sm_count) == (1, 4)
+    assert cake.hd64_rows_plan(64, 128, torch.float32, sm_count) == (1, 4)
+
+
 def _case(name):
     return next(case for case in _CASES if case[0] == name)
 
 
-def _route(inputs):
+def _route(inputs, output_like=None):
     """``plan_route`` of one normalized input set (the keyword arguments the public API forwards)."""
     forwarded = (
         "state",
@@ -360,7 +679,11 @@ def _route(inputs):
     return cake.plan_route(
         **{key: inputs[key] for key in forwarded},
         z=None,
-        output=torch.empty_like(inputs["x"]),
+        output=torch.empty(
+            tuple((inputs["x"] if output_like is None else output_like).shape),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ),
         pad_slot_id=-1,
         state_scale=None,
         intermediate_state_scales=None,
@@ -636,6 +959,25 @@ def test_cache_defines_follow_the_storage_dtypes_and_projection_layout() -> None
     )
 
 
+def test_direct_defines_follow_the_head_ratio_and_grid() -> None:
+    assert cake.direct_defines(1, 512) == (
+        ("HEADS_PER_GROUP_STATIC", 0),
+        ("DIRECT_UNROLL", 4),
+    )
+    assert cake.direct_defines(8, 1024) == (
+        ("HEADS_PER_GROUP_STATIC", 8),
+        ("DIRECT_UNROLL", 4),
+    )
+    assert cake.direct_defines(8, 2048) == (
+        ("HEADS_PER_GROUP_STATIC", 8),
+        ("DIRECT_UNROLL", 1),
+    )
+    assert cake.direct_defines(16, 4096) == (
+        ("HEADS_PER_GROUP_STATIC", 16),
+        ("DIRECT_UNROLL", 4),
+    )
+
+
 def test_shipped_stp_program_follows_the_head_ratio_and_grid() -> None:
     """The BF16 single-token clones keep their selection rules, and every one of them is present as source."""
     sm_count = 148
@@ -696,8 +1038,25 @@ def test_jit_names_stay_within_the_file_name_limit() -> None:
     )
 
 
+def test_aot_table_names_every_delivered_build() -> None:
+    """The AOT specifications are exactly the loader's build specifications, one per program instantiation."""
+    for arch in ("sm_100a", "sm_103a"):
+        expected = set()
+        for module, record in cake.MODULES.items():
+            for values in (record["instantiations"] or {"": {}}).values():
+                defines = tuple((name, int(values[name])) for name in record["defines"])
+                expected.add(cake.jit_spec(module, arch, defines).name)
+        specs = cake.gen_cake_selective_state_update_modules(arch)
+        assert len(specs) == len(expected)
+        assert {spec.name for spec in specs} == expected
+
+
 def test_registry_names_every_program() -> None:
     assert set(cake.PROGRAMS) == {
+        "stp_paired_rows",
+        "stp_paired_rows_mb4",
+        "stp_hd64_rows_bf16",
+        "stp_hd64_rows_fp32",
         "stp_fp32_identity",
         "mtp_short",
         "mtp_cache_c4_t6",
