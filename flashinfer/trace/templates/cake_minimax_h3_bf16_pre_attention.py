@@ -21,8 +21,9 @@ minimax_h3_bf16_pre_attention_trace = TraceTemplate(
     op_type="minimax_h3_bf16_pre_attention",
     name_prefix="minimax_h3_bf16_pre_attention",
     description=(
-        "MiniMax-H3 fused BF16 RMSNorm, indexed AdaLN, QKV projection, "
-        "Q/K RMSNorm, partial 3-D RoPE, and destination-major packing."
+        "MiniMax-H3 BF16 RMSNorm, indexed AdaLN, QKV projection, "
+        "Q/K RMSNorm, partial 3-D RoPE, and destination-major packing "
+        "(two launches: activation workspace + persistent GEMM)."
     ),
     axes={
         "num_tokens": Var(description="Local token count M."),
@@ -52,6 +53,14 @@ minimax_h3_bf16_pre_attention_trace = TraceTemplate(
             ["num_tokens"],
             optional=True,
             description="int64 cache row per token; absent means the identity.",
+        ),
+        "workspace": Tensor(
+            ["num_tokens", "hidden_size"],
+            optional=True,
+            description=(
+                "BF16 scratch for the normalized, modulated activation "
+                "(mutated); absent means a per-call allocation."
+            ),
         ),
         "out": Tensor(
             [

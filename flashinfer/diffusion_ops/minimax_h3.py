@@ -262,13 +262,17 @@ def minimax_h3_bf16_pre_attention(
     eps: float = _EPS,
     qk_eps: Optional[float] = None,
     rope_positions: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    r"""Run the fused BF16 pre-attention projection for MiniMax-H3.
+    r"""Run the BF16 pre-attention projection stage for MiniMax-H3.
 
     The operation applies input RMSNorm, indexed AdaLN, a BF16 QKV
     projection, per-head Q/K RMSNorm, partial 3-D split-half NeoX RoPE, and a
-    destination-major output pack. The collective that consumes ``out`` is
-    outside this operation.
+    destination-major output pack, as two kernel launches on the current
+    stream: the normalized and modulated activation is written to a BF16
+    ``[M, 5376]`` workspace, which the persistent QKV GEMM then streams
+    through TMA while its epilogue applies the Q/K RMSNorm, RoPE and pack.
+    The collective that consumes ``out`` is outside this operation.
 
     The operands are the engine's own tensors: AdaLN tables may be column
     chunks of a wider projection, indices are int64, and RoPE is a shared
@@ -324,6 +328,11 @@ def minimax_h3_bf16_pre_attention(
         that is allocated on the first call for that ``M`` and reused
         afterwards, so the identity path is CUDA-graph safe once warmed up
         with one eager call of the same ``M``.
+    workspace : Optional[torch.Tensor]
+        Contiguous BF16 ``[M, 5376]`` scratch for the normalized and
+        modulated activation (overwritten). ``None`` allocates one per call
+        from the caching allocator; callers that pin memory or capture CUDA
+        graphs may pass their own buffer.
 
     Returns
     -------
@@ -336,10 +345,10 @@ def minimax_h3_bf16_pre_attention(
     indices cannot form an out-of-bounds address. Valid indices preserve the
     MiniMax-H3 checkpoint semantics without a synchronizing host reduction.
 
-    This is a direct kernel entry point for all supported destination counts.
-    On SM103a, the measured performance promotion range is ``P in {2, 4, 8}``.
-    Callers that dispatch by ``P`` should retain their segmented fallback for
-    ``P=1``.
+    This is a direct entry point for all supported destination counts
+    (``P in {1, 2, 4, 8}``); the two-launch stage is faster than the
+    segmented norm + cuBLAS + fused-postprocess chain at every production
+    center on SM100a and SM103a, including ``P=1``.
     """
     _validate_input_contract(
         x,
@@ -357,10 +366,20 @@ def minimax_h3_bf16_pre_attention(
         eps=eps,
         qk_eps=qk_eps,
     )
-    _check_runtime_support(x.device)
     m = x.shape[0]
+    if workspace is not None:
+        _require_tensor(
+            "workspace",
+            workspace,
+            shape=(m, _HIDDEN),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+    _check_runtime_support(x.device)
     if rope_positions is None:
         rope_positions = _identity_rope_positions(m, x.device)
+    if workspace is None:
+        workspace = torch.empty((m, _HIDDEN), dtype=torch.bfloat16, device=x.device)
     get_minimax_h3_bf16_pre_attention_backend(backend="cake")(
         x,
         x_norm_weight,
@@ -372,6 +391,7 @@ def minimax_h3_bf16_pre_attention(
         k_norm_weight,
         rope_cos_sin,
         rope_positions,
+        workspace,
         out,
         m,
         ulysses_degree,
