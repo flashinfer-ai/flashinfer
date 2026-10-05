@@ -486,6 +486,55 @@ def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
     _assert_cute_parity(actual, expected, nheads=8, ngroups=8)
 
 
+@pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float16))
+def test_cake_ssd_explicit_exact_scan_strong_decay(state_dtype):
+    """Explicit selection replaces the negative-clamp workaround, including capture."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    constructor, tensors, arguments = _case(
+        nheads=128, ngroups=8, state_dtype=state_dtype, varlen=True
+    )
+    # One logical segment per sequence would select the prefix route in auto.
+    seq_idx, chunks, offsets = _varlen_metadata((128, 128), torch.int32)
+    tensors[1].zero_()
+    tensors[2].fill_(-100)
+    arguments.update(
+        dt_bias=torch.zeros(128, device="cuda"),
+        seq_idx=seq_idx,
+        chunk_indices=chunks,
+        chunk_offsets=offsets,
+        seq_chunk_cumsum=torch.arange(3, device="cuda", dtype=torch.int32),
+        checkpoint_token_indices=torch.tensor(
+            [128, 256], device="cuda", dtype=torch.int32
+        ),
+        checkpoint_state_slots=torch.tensor([1, 3], device="cuda", dtype=torch.int32),
+    )
+    pool = torch.full((5, 128, 64, 128), 13, device="cuda", dtype=state_dtype)
+    runner = SSDCombined(**constructor, backend="cake")
+    expected = runner.run(
+        *tensors,
+        **{**arguments, "dt_limit": (-float("inf"), float("inf"))},
+        checkpoint_states=pool,
+    )
+    expected_pool = pool.clone()
+    pool.fill_(13)
+    actual = runner.run(
+        *tensors,
+        **{**arguments, "dt_limit": (0.0, float("inf"))},
+        checkpoint_states=pool,
+        scan_algorithm="exact_scan",
+    )
+    for output, reference in zip(actual, expected, strict=True):
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
+    torch.testing.assert_close(pool[[1, 3]], actual[1], rtol=0, atol=0)
+    torch.testing.assert_close(pool[[0, 2, 4]], torch.full_like(pool[[0, 2, 4]], 13))
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 @pytest.mark.parametrize("varlen", (False, True), ids=("batched", "varlen_metadata"))
 def test_cake_ssd_combined_program_cache_is_multi_device_safe(varlen):
@@ -619,7 +668,10 @@ def test_cake_ssd_combined_rejects_invalid_public_inputs_like_cute(invalid):
     assert errors["cake"] == errors["cute"]
 
 
-def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, request):
+@pytest.mark.parametrize("scan_algorithm", ["auto", "exact_scan"])
+def test_ssd_combined_fwd_caches_by_device_stream_and_config(
+    monkeypatch, request, scan_algorithm
+):
     module = importlib.import_module("flashinfer.mamba.ssd_combined")
     runners = []
     active_stream = {"handle": 0x1000}
@@ -660,6 +712,7 @@ def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, reques
         "dt_bias": object(),
         "dt_softplus": True,
         "dt_limit": (-0.5, 0.75),
+        "scan_algorithm": scan_algorithm,
         "initial_states": initial_states,
         "seq_idx": seq_idx,
         "chunk_indices": object(),
@@ -727,6 +780,7 @@ def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, reques
     }
     assert runners[0].run_calls == [(positional, optional), (positional, optional)]
     assert runners[-1].run_calls[0][1]["dt_softplus"] is False
+    assert runners[-1].run_calls[0][1]["scan_algorithm"] == "auto"
 
 
 def _signature_contract(callable_, *, drop_self=False):
@@ -840,6 +894,7 @@ def test_source_public_api_signatures_are_stable():
             strict=True,
         )
     )
+    expected_run += (("scan_algorithm", inspect.Parameter.KEYWORD_ONLY, "auto"),)
     assert _signature_contract(module.SSDCombined.run, drop_self=True) == expected_run
     assert (
         _signature_contract(cake_module.CakeSSDCombined.run, drop_self=True)
@@ -1031,7 +1086,8 @@ def _cpu_public_run_inputs(batch=1):
     return x, dt, A, B, C
 
 
-def test_source_public_cake_dispatch_preserves_full_run_contract():
+@pytest.mark.parametrize("scan_algorithm", ["auto", "exact_scan"])
+def test_source_public_cake_dispatch_preserves_full_run_contract(scan_algorithm):
     result = (object(), None)
     runner = _public_runner_without_constructor("cake", result)
     tensors = _cpu_public_run_inputs()
@@ -1053,6 +1109,7 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
         **sentinels,
         "dt_softplus": True,
         "dt_limit": (-0.25, 0.75),
+        "scan_algorithm": scan_algorithm,
         "update_seq_chunk_cumsum": True,
         "out": out,
         "return_final_states": False,
@@ -1568,12 +1625,17 @@ def test_source_cake_checkpoint_validation_without_gpu(invalid, match):
         runner.run(*tensors, **kwargs)
 
 
-def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("dt_limit", [(0.0, float("inf")), (0.125, 0.75)])
+def test_source_runner_forwards_softplus_and_checkpoint_count(
+    monkeypatch, varlen, dt_limit
+):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = {}
 
     monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
+    monkeypatch.setattr(module, "_prefix_route_selected", lambda: True)
     monkeypatch.setattr(
         module,
         "_generated_program_profile",
@@ -1596,7 +1658,7 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
         lambda *_: SimpleNamespace(multi_processor_count=1),
     )
 
-    batch, seqlen, nheads, ngroups = 2, 128, 1, 1
+    batch, seqlen, nheads, ngroups = (1, 256, 128, 8) if varlen else (2, 128, 1, 1)
     x = torch.empty((batch, seqlen, nheads, 64), dtype=torch.bfloat16)
     dt = torch.empty((batch, seqlen, nheads), dtype=torch.float32)
     A = torch.empty((nheads,), dtype=torch.float32)
@@ -1615,12 +1677,21 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
         state_dtype=torch.bfloat16,
         has_d=False,
         d_has_hdim=False,
-        has_initial_states=False,
-        has_varlen=False,
+        has_initial_states=varlen,
+        has_varlen=varlen,
         has_z=False,
         seq_idx_dtype=torch.int32,
     )
 
+    metadata = {}
+    if varlen:
+        metadata = dict(
+            initial_states=torch.zeros((2, nheads, 64, 128), dtype=torch.bfloat16),
+            seq_idx=torch.arange(2, dtype=torch.int32).repeat_interleave(128)[None],
+            chunk_indices=torch.arange(2, dtype=torch.int32),
+            chunk_offsets=torch.zeros(2, dtype=torch.int32),
+            seq_chunk_cumsum=torch.arange(3, dtype=torch.int32),
+        )
     first = runner.run(
         x,
         dt,
@@ -1631,6 +1702,8 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
         checkpoint_token_indices=checkpoint_token_indices,
         checkpoint_state_slots=checkpoint_state_slots,
         checkpoint_states=checkpoint_states,
+        dt_limit=dt_limit,
+        **metadata,
     )
     second = runner.run(
         x,
@@ -1642,9 +1715,19 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
         checkpoint_token_indices=checkpoint_token_indices,
         checkpoint_state_slots=checkpoint_state_slots,
         checkpoint_states=checkpoint_states,
+        dt_limit=dt_limit,
+        scan_algorithm="exact_scan",
+        **metadata,
     )
 
-    exact = calls["exact_bf16_batched"]["stage_values"]
+    if varlen:
+        assert set(calls) == {"prefix_bf16_varlen", "exact_bf16_varlen"}
+    exact = calls["exact_bf16_varlen" if varlen else "exact_bf16_batched"][
+        "stage_values"
+    ]
+    for stage in ("preprocess", "main"):
+        assert exact[stage]["dt_min"] == dt_limit[0]
+        assert exact[stage]["dt_max"] == dt_limit[1]
     assert exact["preprocess"]["dt_softplus"] == 0
     main = exact["main"]
     assert main["dt_softplus"] == 0
@@ -1677,6 +1760,7 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
         (True, 2, 2, 128, 8, 0.0, True, "prefix_varlen"),
     ],
 )
+@pytest.mark.parametrize("scan_algorithm", ["auto", "exact_scan"])
 def test_source_route_predicates_do_not_bind_program_symbols(
     mode_varlen,
     num_logical_chunks,
@@ -1686,6 +1770,7 @@ def test_source_route_predicates_do_not_bind_program_symbols(
     dt_min,
     prefix_route_selected,
     expected,
+    scan_algorithm,
 ):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
 
@@ -1697,9 +1782,39 @@ def test_source_route_predicates_do_not_bind_program_symbols(
         ngroups=ngroups,
         dt_min=dt_min,
         prefix_route_selected=prefix_route_selected,
+        scan_algorithm=scan_algorithm,
     )
 
-    assert actual == expected
+    assert actual == (expected if scan_algorithm == "auto" else "exact_scan")
+
+
+@pytest.mark.parametrize("invalid", ["exact", "prefix_varlen", "", None])
+def test_source_scan_algorithm_rejects_invalid_values(invalid):
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    cake = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    with pytest.raises(ValueError, match="scan_algorithm"):
+        cake._select_scan_route(
+            mode_varlen=True,
+            num_logical_chunks=1,
+            num_sequences=1,
+            nheads=128,
+            ngroups=8,
+            dt_min=0.0,
+            prefix_route_selected=True,
+            scan_algorithm=invalid,
+        )
+    with pytest.raises(ValueError, match="scan_algorithm"):
+        module.ssd_combined_fwd(*_cpu_public_run_inputs(), scan_algorithm=invalid)
+    for backend in ("cake", "cute"):
+        runner = _public_runner_without_constructor(backend)
+        with pytest.raises(ValueError, match="scan_algorithm"):
+            runner.run(*_cpu_public_run_inputs(), scan_algorithm=invalid)
+
+
+def test_source_cute_rejects_explicit_scan_algorithm():
+    runner = _public_runner_without_constructor("cute")
+    with pytest.raises(ValueError, match="requires backend='cake'"):
+        runner.run(*_cpu_public_run_inputs(), scan_algorithm="exact_scan")
 
 
 def test_source_direct_preprocess_and_prepared_sequence_binding():

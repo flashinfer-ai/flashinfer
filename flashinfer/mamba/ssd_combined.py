@@ -512,6 +512,8 @@ class SSDCombined:
         checkpoint_states: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
+        *,
+        scan_algorithm: str = "auto",
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass.
 
@@ -561,6 +563,10 @@ class SSDCombined:
                 is allocated when omitted.
             return_final_states: Whether to return the final state for every
                 batch element or packed sequence.
+            scan_algorithm: Cake scan selection: ``"auto"`` preserves existing
+                dispatch; ``"exact_scan"`` selects the stable scan that evaluates
+                decay from differences of cumulative exponents, independently
+                of ``dt_limit``. Non-default selection requires ``backend="cake"``.
 
         Returns:
             A pair containing token-major output with shape
@@ -570,6 +576,10 @@ class SSDCombined:
         # Keep backend-independent public validation ahead of dispatch so Cake
         # and CuTe expose the same exception type and message for shared API
         # errors.  Backend-specific domain checks remain in their runners.
+        if scan_algorithm not in ("auto", "exact_scan"):
+            raise ValueError("scan_algorithm must be 'auto' or 'exact_scan'")
+        if scan_algorithm != "auto" and self._backend != "cake":
+            raise ValueError("scan_algorithm='exact_scan' requires backend='cake'")
         chunk_size = self.chunk_size
         batch, seqlen, nheads, headdim = x.shape
         nchunks = seqlen // chunk_size
@@ -673,6 +683,7 @@ class SSDCombined:
                 checkpoint_states=checkpoint_states,
                 out=out,
                 return_final_states=return_final_states,
+                scan_algorithm=scan_algorithm,
             )
 
         if any(
@@ -906,6 +917,8 @@ def ssd_combined_fwd(
     checkpoint_states: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
+    *,
+    scan_algorithm: str = "auto",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the source-built Cake SSDCombined backend.
 
@@ -955,6 +968,13 @@ def ssd_combined_fwd(
             allocated when omitted.
         return_final_states: Whether to return the final state for every batch
             element or packed sequence.
+        scan_algorithm: ``"auto"`` preserves existing Cake dispatch.
+            ``"exact_scan"`` bypasses shallow/prefix specializations and evaluates
+            decay from differences of cumulative exponents. This does not change
+            ``dt_limit``, softplus, or checkpoint semantics. For example, use
+            ``dt_softplus=True, dt_limit=(0.0, float("inf")),
+            scan_algorithm="exact_scan"`` to retain nonnegative step sizes while
+            avoiding separately exponentiated prefix factors.
 
     Returns:
         A pair containing token-major output with shape
@@ -962,6 +982,8 @@ def ssd_combined_fwd(
         when ``return_final_states`` is false.
     """
 
+    if scan_algorithm not in ("auto", "exact_scan"):
+        raise ValueError("scan_algorithm must be 'auto' or 'exact_scan'")
     _, _, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     state_dtype = (
@@ -1015,4 +1037,5 @@ def ssd_combined_fwd(
         checkpoint_states=checkpoint_states,
         out=out,
         return_final_states=return_final_states,
+        scan_algorithm=scan_algorithm,
     )

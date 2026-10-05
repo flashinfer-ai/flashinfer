@@ -53,6 +53,7 @@ def _select_scan_route(
     ngroups: int,
     dt_min: float,
     prefix_route_selected: bool,
+    scan_algorithm: str = "auto",
 ) -> str:
     """Resolve semantic routing without binding generated program identities.
 
@@ -62,6 +63,10 @@ def _select_scan_route(
     promoted prefix program.
     """
 
+    if scan_algorithm == _ROUTE_EXACT_SCAN:
+        return _ROUTE_EXACT_SCAN
+    if scan_algorithm != "auto":
+        raise ValueError("scan_algorithm must be 'auto' or 'exact_scan'")
     shallow_varlen = mode_varlen and num_logical_chunks <= num_sequences
     if dt_min < 0.0 or not shallow_varlen:
         return _ROUTE_EXACT_SCAN
@@ -599,7 +604,9 @@ class CakeSSDCombined:
                 "delta": torch.empty(
                     # Keep transformed dt in FP32 until scaled B / Q is formed.
                     # BF16 here adds an avoidable rounding before the MMA cast.
-                    (tile_count, _CHUNK_SIZE), dtype=torch.float32, device=device
+                    (tile_count, _CHUNK_SIZE),
+                    dtype=torch.float32,
+                    device=device,
                 ),
                 "cumsum": torch.empty(
                     (tile_count, _CHUNK_SIZE), dtype=torch.float32, device=device
@@ -690,6 +697,8 @@ class CakeSSDCombined:
         checkpoint_states: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
+        *,
+        scan_algorithm: str = "auto",
     ):
         batch, seqlen, nheads, headdim = x.shape
         if seqlen % _CHUNK_SIZE:
@@ -745,6 +754,7 @@ class CakeSSDCombined:
             ngroups=self.ngroups,
             dt_min=dt_min,
             prefix_route_selected=_prefix_route_selected(),
+            scan_algorithm=scan_algorithm,
         )
         checkpoint_args = (
             checkpoint_token_indices,
