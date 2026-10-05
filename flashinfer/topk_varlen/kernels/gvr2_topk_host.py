@@ -2089,6 +2089,15 @@ def run_varlen(
         # compression shift — kv_lens IS the window length in column units
         if not hint_free:
             raise RuntimeError("row_starts (windowed / prefill mode) requires pre_idx=None")
+        if k < 4:
+            # the window engines mask the <= 3 lead lanes of the float4-aligned
+            # read base in the vector path; the scalar tail lane is not lane-
+            # masked, which only matters when the whole scan extent is shorter
+            # than one float4 (nv + lead < 4 with nv > k, i.e. k <= 2). The
+            # public API admits k in {512, 1024, 2048}; keep direct callers out.
+            raise RuntimeError(
+                f"row_starts (windowed / prefill mode) requires top_k >= 4, got {k}"
+            )
         if nn != 1 or cr != 1:
             raise RuntimeError(
                 f"row_starts requires next_n == 1 and compress_ratio == 1, got {nn} / {cr}"
