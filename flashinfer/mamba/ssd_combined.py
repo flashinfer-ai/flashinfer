@@ -605,6 +605,7 @@ class SSDCombined:
             )
         assert A.dtype == torch.float32, f"A must be float32, got {A.dtype}"
         if out is not None:
+            expected_out: Tuple[int, ...]
             if cake:
                 expected_out = (batch, seqlen, nheads, headdim)
                 layout = "(B, S, EH, D)"
