@@ -623,7 +623,7 @@ def _moe_core_impl(
         # The join also orders buffer reuse; record_stream is unnecessary and
         # could leave allocator events referencing destroyed green streams.
         # Per-expert/global scales are shared because only N is partitioned.
-        def _fc1_die(i, _ctx):
+        def _fc1_die(i, _ctx=None):
             shard = localized_weights[i]
             blockscaled_contiguous_gather_grouped_gemm_act_fusion(
                 a=x,
@@ -670,9 +670,16 @@ def _moe_core_impl(
                 moe_output_memset_inplace(moe_output)
                 localized_memset_done.record(localized_memset_stream)
 
-        execute_in_green_contexts(localized_streams, _fc1_die)
-        if localized_memset_done is not None:
-            localization_main_stream.wait_event(localized_memset_done)
+        try:
+            execute_in_green_contexts(localized_streams, _fc1_die)
+        except BaseException:
+            # Older executors skip the join when a callback raises.
+            for stream in localized_streams:
+                localization_main_stream.wait_stream(stream)
+            raise
+        finally:
+            if localized_memset_done is not None:
+                localization_main_stream.wait_event(localized_memset_done)
         intermediate, intermediate_sf = gemm1_out, gemm1_out_scale
     else:
         intermediate, intermediate_sf = (
@@ -762,7 +769,7 @@ def _moe_core_impl(
     if use_localized_path:
         # Both domains read the joined FC1 output and write disjoint hidden
         # columns. Each contracts the full intermediate, so no reduction is needed.
-        def _fc2_die(i, _ctx):
+        def _fc2_die(i, _ctx=None):
             shard = localized_weights[i]
             blockscaled_contiguous_grouped_gemm_finalize_fusion(
                 a=intermediate,
@@ -792,7 +799,12 @@ def _moe_core_impl(
                 use_fused_finalize=use_fused_finalize,
             )
 
-        execute_in_green_contexts(localized_streams, _fc2_die)
+        try:
+            execute_in_green_contexts(localized_streams, _fc2_die)
+        except BaseException:
+            for stream in localized_streams:
+                localization_main_stream.wait_stream(stream)
+            raise
     else:
         blockscaled_contiguous_grouped_gemm_finalize_fusion(
             a=intermediate,

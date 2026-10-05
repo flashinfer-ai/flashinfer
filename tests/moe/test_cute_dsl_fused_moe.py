@@ -4562,11 +4562,13 @@ if __name__ == "__main__":
 
 
 @cute_dsl_available
-@pytest.mark.parametrize("localized", [False, True])
+@pytest.mark.parametrize(
+    "localized, callback_arity", [(False, 1), (True, 1), (True, 2)]
+)
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("entrypoint", ["core", "functional"])
 def test_moe_core_preserves_fc2_output_dtype(
-    monkeypatch, localized, output_dtype, entrypoint
+    monkeypatch, localized, callback_arity, output_dtype, entrypoint
 ):
     from contextlib import nullcontext
     from types import SimpleNamespace
@@ -4589,7 +4591,10 @@ def test_moe_core_preserves_fc2_output_dtype(
 
     def execute(streams, fn):
         for i in range(len(streams)):
-            fn(i, None)
+            if callback_arity == 1:
+                fn(i)
+            else:
+                fn(i, None)
 
     monkeypatch.setitem(
         sys.modules,
@@ -4700,3 +4705,97 @@ def test_localized_moe_reports_missing_green_context_api(monkeypatch, missing_mo
             localized_streams=[object(), object()],
             sm_count=8,
         )
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("failed_domain", [0, 1])
+@pytest.mark.parametrize("failed_gemm", ["fc1", "fc2"])
+@pytest.mark.parametrize("use_memset_stream", [False, True])
+def test_localized_streams_are_joined_on_failure(
+    monkeypatch, failed_domain, failed_gemm, use_memset_stream
+):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock, call
+    import sys
+
+    from flashinfer.fused_moe.cute_dsl import fused_moe as module
+
+    main_stream, memset_stream, done = Mock(), Mock(), Mock()
+    packed = torch.empty((1, 128, 64), dtype=torch.uint8)
+    scale = torch.ones(1)
+    indices = torch.zeros(128, dtype=torch.int32)
+    shard = dict(
+        w1_weight=packed, w1_weight_sf=scale, w2_weight=packed, w2_weight_sf=scale
+    )
+    error = ValueError(f"{failed_gemm} failed")
+    streams = [object(), object()]
+    visited = []
+
+    def launch(gemm, **kwargs):
+        visited.append((gemm, kwargs["domain_id"]))
+        if gemm == failed_gemm and kwargs["domain_id"] == failed_domain:
+            raise error
+
+    def execute(streams, fn):
+        for i in range(len(streams)):
+            fn(i)
+
+    memset = Mock()
+    finalize = Mock(side_effect=lambda **kw: launch("fc2", **kw))
+    monkeypatch.setattr(module, "moe_sort", lambda **kw: (indices,) * 6)
+    monkeypatch.setattr(module, "moe_output_memset_inplace", memset)
+    monkeypatch.setattr(
+        module,
+        "blockscaled_contiguous_gather_grouped_gemm_act_fusion",
+        lambda **kw: launch("fc1", **kw),
+    )
+    monkeypatch.setattr(
+        module, "blockscaled_contiguous_grouped_gemm_finalize_fusion", finalize
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main_stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", lambda: done)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch.cuda.green_contexts",
+        SimpleNamespace(execute_in_green_contexts=execute),
+    )
+    with pytest.raises(ValueError) as exc:
+        module._moe_core_impl(
+            x=torch.empty((1, 64), dtype=torch.uint8),
+            x_sf=scale,
+            token_selected_experts=indices[:1, None],
+            token_final_scales=scale,
+            w1_weight=packed,
+            w1_weight_sf=scale,
+            w1_alpha=scale,
+            fc2_input_scale=scale,
+            w2_weight=packed,
+            w2_weight_sf=scale,
+            w2_alpha=scale,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            use_async_memset=False,
+            gemm1_mma_tiler=(128, 128, 128),
+            gemm1_mma_inst_shape=(128, 128, 64),
+            sm_count=8,
+            localized_weights=[shard, shard],
+            localized_streams=streams,
+            localized_memset_stream=memset_stream if use_memset_stream else None,
+        )
+    assert exc.value is error
+    expected = [("fc1", 0), ("fc1", 1)] if failed_gemm == "fc2" else []
+    expected += [(failed_gemm, i) for i in range(failed_domain + 1)]
+    assert visited == expected
+    assert main_stream.wait_stream.call_args_list == [call(s) for s in streams]
+    if use_memset_stream:
+        memset.assert_called_once()
+        memset_stream.wait_stream.assert_called_once_with(main_stream)
+        done.record.assert_called_once_with(memset_stream)
+        main_stream.wait_event.assert_called_once_with(done)
+    else:
+        main_stream.wait_event.assert_not_called()
+    if failed_gemm == "fc1":
+        finalize.assert_not_called()
