@@ -468,6 +468,86 @@ def multi_process_parallel(
         )
 
 
+def _run_fp32_twoshot_worker(
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    max_token_num,
+    gpu_offset=0,
+):
+    # Two-shot at the workspace's max_token_num: the kernel writes
+    # 2 * token_num * hidden_dim elements into each rank's buffer.
+    device = torch.device(f"cuda:{rank + gpu_offset}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{distributed_init_port}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    workspace = None
+    try:
+        workspace = comm.create_allreduce_fusion_workspace(
+            backend="trtllm",
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            comm_backend=TorchDistBackend(),
+        )
+        assert workspace.is_buffer_size_sufficient(
+            world_size, max_token_num, hidden_dim, dtype
+        )
+        inputs = [
+            torch.randn(
+                max_token_num,
+                hidden_dim,
+                generator=torch.Generator(device=device).manual_seed(r),
+                device=device,
+                dtype=dtype,
+            )
+            for r in range(world_size)
+        ]
+        out = torch.empty_like(inputs[rank])
+        comm.allreduce_fusion(
+            input=inputs[rank],
+            workspace=workspace,
+            pattern=comm.AllReduceFusionPattern.kAllReduce,
+            output=out,
+            use_oneshot=False,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out, torch.stack(inputs).sum(0), atol=1e-4, rtol=1e-4
+        )
+    finally:
+        dist.barrier()
+        if workspace is not None:
+            workspace.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_trtllm_allreduce_fusion_fp32_twoshot_max_tokens(world_size):
+    """fp32 two-shot at max_token_num must fit in the workspace (sized per element)."""
+    available_gpus = torch.cuda.device_count()
+    if world_size > available_gpus:
+        pytest.skip(
+            f"world_size {world_size} is greater than available_gpus {available_gpus}"
+        )
+    multi_process_parallel(
+        world_size,
+        torch.float32,
+        4096,
+        _run_fp32_twoshot_worker,
+        target_args=(1024,),
+    )
+
+
 # Run as: python tests/comm/test_trtllm_allreduce_fusion.py
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
