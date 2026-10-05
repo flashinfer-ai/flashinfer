@@ -129,6 +129,7 @@ SLOT_BYTES = 32 * 128  # one epilogue staging slot (TMA-store epilogue)  [Cake L
 SK_MIN_ITERS = 8  # stream-K: fewest K steps per unit  [Cake L72]
 K_TMA_BF16 = 1024  # bf16 rows with K at or below this: TMA-store epilogue  [Cake L103]
 K_TWO_SLOTS = 0  # K at or below this: two staging slots per warp (off)  [Cake L104]
+CH_T_COLS = 32  # output rows n per transposed TMA-store box / staging chunk (round 14)  [Cake L111]
 # Stream-K slice counters: the real counters of the tail tiles use [0, tail_tiles * 16); lanes 1..31
 # of a fixup warp fetch-add 0 to private dummy counters at SK_DUMMY_BASE + slice * 32 + lane (slice <
 # 16), so the host asserts tail_tiles * 16 <= SK_DUMMY_BASE and allocates at least
@@ -280,11 +281,16 @@ def epi_mode(
     if epi is not None:
         if epi not in EPI_MODES:
             raise ValueError(f"epi must be one of {EPI_MODES}, got {epi!r}")
-        if out_t and epi != "reg":
-            raise ValueError("transposed output only supports epi='reg'")
+        if out_t and epi != "reg" and epi_cols(block_n, cta_rows) % CH_T_COLS:
+            # round 14: the transposed TMA-store epilogue stages CH_T_COLS-column chunks of the warp slice
+            raise ValueError(
+                "the transposed TMA-store epilogue needs warp slices of whole "
+                f"{CH_T_COLS}-column chunks; BLOCK_N={block_n} CTA_ROWS={cta_rows} gives "
+                f"{epi_cols(block_n, cta_rows)}"
+            )
         return epi
     if out_t:
-        return "reg"
+        return "reg"  # the transposed TMA store (round 14) is opt-in per row (ROW_RULES epi='tma')
     if out_f32:
         return "tma" if epi_cols(block_n, cta_rows) % 32 == 0 else "reg"
     # bf16 chunks are 64 columns: a 96-column (BLOCK_N = 192) or 32-column (Layout B, BLOCK_N = 128) warp slice has
@@ -303,13 +309,18 @@ def epi_slots(
     K: Optional[int] = None,
     slots: Optional[int] = None,
     cta_rows: int = 128,
+    out_t: bool = False,
 ) -> int:
     """Staging slots per epilogue warp (0 without the TMA-store epilogue).  The chunk count
     per tile must be a multiple of the slot count so the round-robin rotation restarts at
-    slot 0 on every tile.  [Cake ``epi_slots`` L808-L821]"""
+    slot 0 on every tile.  Row-major chunks are 128-byte column groups (64 bf16 / 32 fp32);
+    the transposed box (round 14, ``out_t``) stages ``CH_T_COLS`` columns per chunk.
+    [Cake ``epi_slots`` L1151-L1164]"""
     if epi != "tma":
         return 0
-    chunks = epi_cols(block_n, cta_rows) // (32 if out_f32 else 64)
+    chunks = epi_cols(block_n, cta_rows) // (
+        CH_T_COLS if out_t else (32 if out_f32 else 64)
+    )
     if slots is None:
         slots = 2 if (K is None or K <= K_TWO_SLOTS) else 1
         if chunks % slots:
@@ -478,7 +489,7 @@ def instance_key(
             f"the TMA-store epilogue needs whole 128-byte column chunks per warp; BLOCK_N={block_n} "
             f"CTA_ROWS={cta_rows} {'fp32' if out_f32 else 'bf16'} output needs epi='reg'"
         )
-    slots = epi_slots(epi, out_f32, block_n, None, slots, cta_rows)
+    slots = epi_slots(epi, out_f32, block_n, None, slots, cta_rows, out_t)
     stages = (
         default_stages(slots, cta_rows, block_n, b_mn, b_swz)
         if stages is None
@@ -658,31 +669,31 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, True, False, False, True, 512, 256, None): {"cta_rows": 256, "group_m": 4, "batch_group": 4},
     ('sm_100a', False, True, True, False, False, 2048, 4096, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
-    ('sm_100a', False, True, True, False, False, 2048, 16384, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_100a', False, True, True, False, False, 2048, 16384, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 6144, 32, None): {"block_n": 128, "slots": 2},
     ('sm_100a', False, True, True, False, False, 6144, 128, None): {"block_n": 128},
     ('sm_100a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b'},
     ('sm_100a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
-    ('sm_100a', False, True, True, False, False, 6144, 12288, None): {"epi": 'reg', "f32_v8": True, "store_ef": True},
+    ('sm_100a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 16384, 6144, None): {"epi": 'reg', "f32_v8": True},
     ('sm_100a', True, True, False, False, False, 2048, None, 4096): {"cta_rows": 256},
     ('sm_100a', True, True, False, False, False, 2048, None, 6144): {"group_m": 4},
     ('sm_100a', True, True, False, False, False, 6144, None, 2048): {"block_n": 192, "sk_parts": 2},
     ('sm_100a', True, True, False, False, False, 6144, None, 12288): {"cta_rows": 256, "group_m": 8},
     ('sm_100a', True, True, False, False, False, 12288, None, 6144): {"cta_rows": 256, "group_m": 8},
-    ('sm_100a', True, True, False, False, False, 16384, None, 6144): {"cta_rows": 256, "group_m": 8},
+    ('sm_100a', True, True, False, False, False, 16384, None, 6144): {"cta_rows": 256, "group_m": 8, "htail": True},
     ('sm_100a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "cta_rows": 64},
     ('sm_100a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64},
     ('sm_100a', True, True, False, True, False, 576, None, 6144): {"hints": ('evict_first', 'evict_first')},
-    ('sm_100a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256},
-    ('sm_100a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256},
+    ('sm_100a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "epi": 'tma'},
+    ('sm_100a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "epi": 'tma'},
     ('sm_100a', True, True, True, False, False, 2048, None, 4096): {"cta_rows": 256},
     ('sm_100a', True, True, True, False, False, 2048, None, 6144): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_100a', True, True, True, False, False, 6144, None, 2048): {"group_m": 32, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', True, True, True, False, False, 6144, None, 12288): {"cta_rows": 256},
     ('sm_100a', True, True, True, False, False, 12288, None, 6144): {"cta_rows": 256},
-    ('sm_100a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
+    ('sm_100a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256, "htail": True},
     ('sm_100a', True, True, True, True, False, 32, None, 6144): {"block_n": 128, "cta_rows": 64},
     ('sm_100a', True, True, True, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64},
     ('sm_100a', True, True, True, True, False, 576, None, 6144): {"hints": ('evict_first', 'evict_first')},
@@ -1293,7 +1304,7 @@ def plan_dense_projection_gemm(
         )
     out_f32 = out.dtype == torch.float32
     mode = epi_mode(out_f32, transposed_out, K, epi, block_n, cta_rows)
-    nslots = epi_slots(mode, out_f32, block_n, K, slots, cta_rows)
+    nslots = epi_slots(mode, out_f32, block_n, K, slots, cta_rows, transposed_out)
     if pf is None:
         pf = rule.get("pf", default_pf(M, N, K))
     if promo is None:
