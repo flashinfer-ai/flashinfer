@@ -400,12 +400,17 @@ def _make_transposed_pool(init_state, perm, n_pool, dtype, device, fill):
 )
 @pytest.mark.parametrize("transposed", ["initial", "output", "in-place"])
 def test_prefill_cp_transposed_state_pools(seq_lens, H, transposed):
-    """The CP route honors [N, H, K, V]-backed (transposed) initial and output
-    state pools: outputs and final states match contiguous pools, every
-    requested row is written and no other row is touched. The cases cover the
-    SIMT (<= 9 states) and the UTCMMA fixup state counts."""
+    """The SM100/SM103 CP route honors [N, H, K, V]-backed (transposed) initial
+    and output state pools: outputs and final states match contiguous pools,
+    every requested row is written and no other row is touched. The cases cover
+    the SIMT (<= 9 states) and the UTCMMA fixup state counts."""
     _skip_if_not_supported("flashinfer", True)
     device = torch.device("cuda")
+    if not is_sm100a_supported(device):
+        pytest.skip(
+            "arbitrary pool layouts are only documented on SM100/SM103, and "
+            "only the SM100 CP fixup is covered by this regression test"
+        )
     D = 128
     num_seqs = len(seq_lens)
     q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
