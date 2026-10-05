@@ -30,12 +30,8 @@ from ..utils import round_up
 class QSAConfig:
     """Everything about a deployment's QSA that a cache does not decide.
 
-    One object because the two halves of a QSA step are sized and built
-    together and share a buffer, and because a caller holding two descriptions
-    can let them disagree. Deliberately absent are ``num_slots`` and
-    ``page_size``: both are what a cache has, and a cache does not exist when
-    this is first asked -- the page size in particular is settled when the
-    cache is allocated, which is after this has been answered.
+    ``num_slots`` and ``page_size`` are deliberately absent: they are the
+    cache's, and the cache does not exist when this is first asked.
 
     Attributes
     ----------
@@ -89,12 +85,7 @@ class QSAConfig:
 
 
 class QSAWorkspaceRequirements(NamedTuple):
-    """What a caller has to hand over, and nothing about how it is used.
-
-    Two numbers because the bytes have two lifetimes. What is persistent is
-    read back on later calls and so needs memory nobody else writes; what is
-    transient is rewritten before it is read and may come out of whatever
-    scratch the caller shares between the consumers of a step.
+    """What a caller has to hand over, by lifetime.
 
     Attributes
     ----------
@@ -115,19 +106,11 @@ class QSA:
     """One deployment's QSA, selection and attention together.
 
     The caller provides two contiguous buffers and this cuts everything out of
-    them. Where each piece sits is not the caller's business; which buffer a
-    piece comes out of is decided by whether a later call reads it back:
-
-    * the plan arena and the row pointers are written once and read by every
-      call, so they live in the persistent buffer,
-    * the padded query and output, the physical route and its mask, the
-      selection's scratch and the float workspace are rewritten before they are
-      read, so they live in the transient one.
-
-    What the caller keeps for itself is the *logical* route -- the token
-    indices the selection writes and the attention reads. That one is per
-    layer, because a caller reusing a route across speculative steps reuses
-    that layer's, so it cannot live in a buffer this object shares.
+    them: the plan arena and the row pointers, read back by every call, out of
+    the persistent one; the padded query and output, the physical route and its
+    mask, the selection's scratch and the float workspace, rewritten before they
+    are read, out of the transient one. The *logical* route stays the caller's:
+    it is per layer, and this object is shared between layers.
 
     The order is fixed and it is the whole lifecycle:
 
@@ -180,12 +163,8 @@ class QSA:
 
     @flashinfer_api
     def bind_transient_workspace(self, transient: torch.Tensor) -> None:
-        """Take the scratch both halves rewrite before they read.
-
-        Handed over once the caller's scratch has stopped moving. A workspace
-        that grows by reallocating frees what earlier views point into, so a
-        view taken before it settles is a view into memory somebody else now
-        owns.
+        """Take the scratch both halves rewrite before they read, once the caller's
+        scratch has stopped moving: a reallocation would free what the views point into.
 
         Parameters
         ----------
@@ -245,12 +224,8 @@ class QSA:
     def workspace_requirements(
         config: QSAConfig, *, device: torch.device
     ) -> QSAWorkspaceRequirements:
-        """How much memory of each lifetime this configuration runs out of.
-
-        Asked before the caller's scratch is locked, which is before there is a
-        cache, so nothing is built to answer: both halves compute their sizes
-        from the geometry. A caller that built one to ask would pay the float
-        workspace and every buffer at startup, for a question.
+        """How much memory of each lifetime this configuration runs out of,
+        computed from the geometry without building either half.
 
         Parameters
         ----------
@@ -278,16 +253,9 @@ class QSA:
     def plan_cache(self, num_slots: int, page_size: int) -> None:
         """Plan for a cache of this many slots, in the workspace already held.
 
-        Called once the cache exists, and again if it is replaced -- a caller
-        that binds a minimal cache for a memory profile and then the real one
-        calls this twice. The workspace does not change and nothing is
-        allocated by the second call. Asking for the cache it already has does
-        nothing, so every layer of a rank may call it and only the first does.
-
-        Refused once a run has happened: the plans keep byte offsets that a
-        captured graph replays, so replacing one under a capture that holds it
-        would be reading a schedule that is no longer there.
-        See :meth:`QSAAttention.plan_cache`.
+        Called once the cache exists and again if it is replaced; a no-op for
+        the cache it already has, and refused after a run because a captured
+        graph replays the plans. See :meth:`QSAAttention.plan_cache`.
         """
         self._attention.plan_cache(num_slots, page_size)
 
@@ -310,12 +278,8 @@ class QSA:
         *,
         out_route: torch.Tensor,
     ) -> torch.Tensor:
-        """Choose this batch's tokens, writing them into the caller's route.
-
-        ``out_route`` is the caller's, not this object's: a caller reusing a
-        route across speculative steps reuses the one belonging to that layer,
-        and this object is shared between layers. See :meth:`QSASelection.run`.
-        """
+        """Choose this batch's tokens into the caller's per-layer ``out_route``.
+        See :meth:`QSASelection.run`."""
         return self._selection.run(
             q,
             k_compressed,
@@ -343,12 +307,9 @@ class QSA:
         v_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Attend over the route the selection wrote, gate it, and return it.
-
-        The cache planes arrive per call rather than being held: a caller whose
-        cache is replaced replans and keeps running, and nothing here outlives
-        a tensor the caller owns. See :meth:`QSAAttention.run`.
-        """
+        """Attend over the route the selection wrote, gate it, and return it. The
+        cache planes arrive per call, so nothing here outlives a tensor the caller
+        owns. See :meth:`QSAAttention.run`."""
         return self._attention.run(
             q,
             k_data,

@@ -48,14 +48,8 @@ _GATE_BF16 = 2
 
 
 def _module_has(loader, *symbols) -> bool:
-    """Build and load a module, and say whether it exports these.
-
-    Loading is what separates "this package has the Python for it" from "this
-    build has the kernels": the module is compiled on first use, and a source
-    tree whose kernels do not build fails here rather than in a forward pass.
-    A cached artifact older than the source answers with what it was built
-    with, which is the point.
-    """
+    """Build and load a module, and say whether it exports these: what separates
+    having the Python from having the kernels. A cached artifact answers for itself."""
     try:
         module = loader()
     except Exception:
@@ -94,35 +88,16 @@ def qsa_capabilities(device: Optional[torch.device] = None) -> int:
 
 @functools.cache
 def _capabilities(device: torch.device) -> int:
-    """What this build of FlashInfer can do for QSA, as a bitmask.
+    """The ``QSA_CAP_*`` bits this build serves on ``device``; zero is an answer.
 
-    A caller deciding whether to use this route should not have to guess from a
-    function signature or find out by catching an exception in the middle of a
-    forward pass.
-
-    What each bit rests on differs, and the difference matters:
-
-    * ``selection`` and ``output_gate`` are **compiled** capabilities. Their
-      modules are built and their symbols looked for, so a build missing one
-      of them reports it absent.
-    * ``attention_paged``, ``nvfp4`` and ``fp8`` are **API** capabilities: this
-      package carries the paged route and the two quantized formats, and the
-      kernels behind them are compiled per geometry when a plan is made. Their
-      presence here says the route exists, not that a particular shape will
-      build. Nothing here answers that, on purpose: the answer is building
-      :class:`~flashinfer.qsa_ops.QSAAttention` with the buffers the
-      caller reserved, which raises with the reason. See the note at the foot
-      of this module.
-
-    Returns
-    -------
-    int
-        The OR of the ``QSA_CAP_*`` bits. Zero means this build serves none of
-        it, which is a usable answer rather than an error.
+    ``selection`` and ``output_gate`` are **compiled** capabilities: their
+    modules are built and their symbols looked for. ``attention_paged``,
+    ``nvfp4`` and ``fp8`` are **API** capabilities: the block-sparse kernels
+    behind them are compiled per geometry when a plan is made, so whether a
+    shape builds is answered by building :class:`~flashinfer.qsa_ops.QSAAttention`
+    with the caller's buffers, which raises with the reason.
     """
-    # The loaders below compile for whatever device is current, and not all of
-    # them take one as an argument, so the question is asked from inside the
-    # device being asked about.
+    # The loaders compile for the current device, so ask from inside it.
     context = (
         torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext()
     )
@@ -179,18 +154,13 @@ def _capabilities_here(device: torch.device) -> int:
     if gate & _GATE_BF16:
         bits |= QSA_CAP_OUTPUT_GATE
 
-    # Attention needs the paged block-sparse wrapper, its allocation-free
-    # sizing query, and -- because the route is gated on the way out -- the
-    # gate. The quantized formats ride the same wrapper, so they are claimed
-    # only when it is there.
+    # Attention needs the paged wrapper, its sizing query and the gate; the
+    # quantized formats ride the same wrapper.
     try:
         from ..sparse import BlockSparseAttentionWrapper
 
         from .attention import QSAAttention  # noqa: F401
 
-        # An API capability, not a compiled one: the block-sparse kernels are
-        # built per geometry, so what is checked here is that the route and
-        # its allocation-free sizing query exist at all.
         paged = hasattr(BlockSparseAttentionWrapper, "query_workspace_size") and (
             "kv_cache_page_size"
             in inspect.signature(BlockSparseAttentionWrapper.plan).parameters
@@ -212,17 +182,7 @@ def qsa_capability_names() -> FrozenSet[str]:
     return frozenset(name for bit, name in _NAMES.items() if available & bit)
 
 
-# There is deliberately no ``supports_qsa_config()`` here.
-#
-# Whether a particular geometry works is answered by building it, and building
-# it means a float workspace, an integer arena and a JIT compile -- all of
-# which the caller is going to provide and pay for anyway. A probe that
-# allocated its own would answer for a workspace nobody runs with (how much
-# room split-k has changes what the planner lays down), and a caller that
-# probed and then built would compile and allocate twice.
-#
-# So the answer is the construction: build :class:`~flashinfer.qsa_ops.
-# QSAAttention` with the buffers the deployment reserved and bind it. A shape
-# the library cannot serve raises there, with the reason -- a ValueError for a
-# geometry, the compiler's own error for a build failure, an out-of-memory for
-# memory -- rather than collapsing all three into False.
+# There is deliberately no ``supports_qsa_config()``: a probe would allocate and
+# compile what the caller is about to anyway, for a workspace nobody runs with.
+# Building QSAAttention with the deployment's buffers raises with the reason
+# (a ValueError, the compiler's error or an out-of-memory) instead of False.
