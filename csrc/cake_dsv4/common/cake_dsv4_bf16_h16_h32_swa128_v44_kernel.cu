@@ -272,7 +272,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_661d789cd673c86dd7f2(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_417b7986b17546cae356(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -393,11 +393,15 @@ kernel_cake_dsv4_661d789cd673c86dd7f2(const __grid_constant__ CUtensorMap tmap_q
             int query_length = max_q_len;
             if (ragged_query != 0) {
                 query_batch = 0;
-                #pragma unroll 1
-                for (int batch = 0; batch < batch_size; batch++) {
-                    if (query_idx >= cum_seq_lens_q[batch + 1]) {
-                        query_batch = batch + 1;
-                    }
+                #pragma unroll 2
+                for (int chunk = 0; chunk < (batch_size + 31) / 32; chunk++) {
+                    int lane_entry = chunk * 32 + lane + 1;
+                    int _min_1 = ((lane_entry) < (batch_size) ? (lane_entry) : (batch_size));
+                    int lane_load = _min_1;
+                    unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, lane_entry <= batch_size && query_idx >= cum_seq_lens_q[lane_load]);
+                    unsigned int started = _vote_1;
+                    int _popc_0 = __popc(started);
+                    query_batch = query_batch + _popc_0;
                 }
                 int query_begin = cum_seq_lens_q[query_batch];
                 query_length = cum_seq_lens_q[query_batch + 1] - query_begin;

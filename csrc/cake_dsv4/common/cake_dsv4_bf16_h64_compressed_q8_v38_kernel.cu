@@ -275,7 +275,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_0c50d61d111184e02602(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_splits, int has_sinks, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_c4b4973e524f0c21c6e6(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_splits, int has_sinks, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -404,11 +404,15 @@ kernel_cake_dsv4_0c50d61d111184e02602(const __grid_constant__ CUtensorMap tmap_q
             int query_length = max_q_len;
             if (ragged_query != 0) {
                 query_batch = 0;
-                #pragma unroll 1
-                for (int batch = 0; batch < batch_size; batch++) {
-                    if (query_idx >= cum_seq_lens_q[batch + 1]) {
-                        query_batch = batch + 1;
-                    }
+                #pragma unroll 2
+                for (int chunk = 0; chunk < (batch_size + 31) / 32; chunk++) {
+                    int lane_entry = chunk * 32 + lane + 1;
+                    int _min_1 = ((lane_entry) < (batch_size) ? (lane_entry) : (batch_size));
+                    int lane_load = _min_1;
+                    unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, lane_entry <= batch_size && query_idx >= cum_seq_lens_q[lane_load]);
+                    unsigned int started = _vote_1;
+                    int _popc_0 = __popc(started);
+                    query_batch = query_batch + _popc_0;
                 }
                 int query_begin = cum_seq_lens_q[query_batch];
                 query_length = cum_seq_lens_q[query_batch + 1] - query_begin;
@@ -545,14 +549,14 @@ kernel_cake_dsv4_0c50d61d111184e02602(const __grid_constant__ CUtensorMap tmap_q
             if (first_invalid < valid_cols) {
                 int chunk_rows[4];
                 #pragma unroll
-                for (int chunk = 0; chunk < 64; chunk += 4) {
+                for (int chunk_1 = 0; chunk_1 < 64; chunk_1 += 4) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&chunk_rows[0])), "=r"(*reinterpret_cast<uint32_t*>(&chunk_rows[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&chunk_rows[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&chunk_rows[(0) + 3]))
-                        : "r"(smem_indices_addr + (unsigned int)((col_half * 64 + chunk) * 4)));
+                        : "r"(smem_indices_addr + (unsigned int)((col_half * 64 + chunk_1) * 4)));
                     #pragma unroll
                     for (int chunk_i = 0; chunk_i < 4; chunk_i++) {
                         if (chunk_rows[chunk_i] < 0) {
-                            _tmem_load_0[chunk + chunk_i] = -CAKE_INF;
+                            _tmem_load_0[chunk_1 + chunk_i] = -CAKE_INF;
                         }
                     }
                 }

@@ -278,7 +278,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_98b6013eb28fff267149(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_query_tokens, int has_sinks, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_ff06f399e59e95a0d852(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_query_tokens, int has_sinks, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -457,11 +457,15 @@ kernel_cake_dsv4_98b6013eb28fff267149(const __grid_constant__ CUtensorMap tmap_q
                 int query_length = max_q_len;
                 if (ragged_query != 0) {
                     query_batch = 0;
-                    #pragma unroll 1
-                    for (int batch = 0; batch < batch_size; batch++) {
-                        if (window_query_idx >= cum_seq_lens_q[batch + 1]) {
-                            query_batch = batch + 1;
-                        }
+                    #pragma unroll 2
+                    for (int chunk = 0; chunk < (batch_size + 31) / 32; chunk++) {
+                        int lane_entry = chunk * 32 + lane + 1;
+                        int _min_3 = ((lane_entry) < (batch_size) ? (lane_entry) : (batch_size));
+                        int lane_load = _min_3;
+                        unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, lane_entry <= batch_size && window_query_idx >= cum_seq_lens_q[lane_load]);
+                        unsigned int started = _vote_0;
+                        int _popc_0 = __popc(started);
+                        query_batch = query_batch + _popc_0;
                     }
                     int query_begin = cum_seq_lens_q[query_batch];
                     query_length = cum_seq_lens_q[query_batch + 1] - query_begin;
@@ -631,15 +635,15 @@ kernel_cake_dsv4_98b6013eb28fff267149(const __grid_constant__ CUtensorMap tmap_q
                     if (!(_slice_lo_mask_1 & (1u << 29))) _tmem_load_0[61] = -CAKE_INF;
                     if (!(_slice_lo_mask_1 & (1u << 30))) _tmem_load_0[62] = -CAKE_INF;
                     if (!(_slice_lo_mask_1 & (1u << 31))) _tmem_load_0[63] = -CAKE_INF;
-                    int _vote_0 = __any_sync(0xFFFFFFFF, group_rows[0] < 0 && group_col < tile_bound || group_rows[1] < 0 && tile_bound > group_col + 1 || group_rows[2] < 0 && tile_bound > group_col + 2 || group_rows[3] < 0 && tile_bound > group_col + 3);
-                    int any_negative = _vote_0;
+                    int _vote_1 = __any_sync(0xFFFFFFFF, group_rows[0] < 0 && group_col < tile_bound || group_rows[1] < 0 && tile_bound > group_col + 1 || group_rows[2] < 0 && tile_bound > group_col + 2 || group_rows[3] < 0 && tile_bound > group_col + 3);
+                    int any_negative = _vote_1;
                     if (any_negative != 0) {
                         int half_shift = col_half * 16;
                         unsigned int negative_slots[4];
                         #pragma unroll
                         for (int row_i_2 = 0; row_i_2 < 4; row_i_2++) {
-                            unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, group_rows[row_i_2] < 0);
-                            negative_slots[row_i_2] = _vote_1 >> (unsigned int)half_shift;
+                            unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, group_rows[row_i_2] < 0);
+                            negative_slots[row_i_2] = _vote_2 >> (unsigned int)half_shift;
                         }
                         #pragma unroll
                         for (int group = 0; group < 16; group++) {
@@ -812,8 +816,8 @@ kernel_cake_dsv4_98b6013eb28fff267149(const __grid_constant__ CUtensorMap tmap_q
                     break;
                 }
                 int _max_9 = ((sparse_topk_lens[query_idx_1] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx_1] + sparse_topk_lens_offset) : (0));
-                int _min_3 = ((_max_9) < (sparse_topk) ? (_max_9) : (sparse_topk));
-                int active_topk_1 = _min_3;
+                int _min_4 = ((_max_9) < (sparse_topk) ? (_max_9) : (sparse_topk));
+                int active_topk_1 = _min_4;
                 int _max_10 = (((active_topk_1 + 128 - 1) / 128) > (1) ? ((active_topk_1 + 128 - 1) / 128) : (1));
                 int num_loop_steps_1 = _max_10;
                 unsigned int first_stats_stage_1 = stats_cursor_1 & 1;
@@ -842,8 +846,8 @@ kernel_cake_dsv4_98b6013eb28fff267149(const __grid_constant__ CUtensorMap tmap_q
                     float acc_scale_1 = ((max_diff != 0.0f) ? _exp2_1 : 1.0f);
                     mbarrier_wait(o_full_addr, global_tile_1 - 1 & 1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _vote_2 = __any_sync(0xFFFFFFFF, acc_scale_1 < 1.0f);
-                    int any_rescale = _vote_2;
+                    int _vote_3 = __any_sync(0xFFFFFFFF, acc_scale_1 < 1.0f);
+                    int any_rescale = _vote_3;
                     if (any_rescale != 0) {
                         #pragma unroll
                         for (int v_stage = 0; v_stage < 4; v_stage++) {
@@ -1319,8 +1323,8 @@ kernel_cake_dsv4_98b6013eb28fff267149(const __grid_constant__ CUtensorMap tmap_q
                 int* swa_row_1 = swa_indices + (query_idx_3 * (unsigned int)swa_index_stride);
                 int* compressed_row_1 = compressed_indices + (query_idx_3 * (unsigned int)compressed_index_stride);
                 int _max_11 = ((sparse_topk_lens[query_idx_3] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx_3] + sparse_topk_lens_offset) : (0));
-                int _min_4 = ((_max_11) < (sparse_topk) ? (_max_11) : (sparse_topk));
-                int active_topk_3 = _min_4;
+                int _min_5 = ((_max_11) < (sparse_topk) ? (_max_11) : (sparse_topk));
+                int active_topk_3 = _min_5;
                 int _max_12 = (((active_topk_3 + 128 - 1) / 128) > (1) ? ((active_topk_3 + 128 - 1) / 128) : (1));
                 int num_loop_steps_3 = _max_12;
                 int num_page_pairs = (num_loop_steps_3 + 1) / 2;
