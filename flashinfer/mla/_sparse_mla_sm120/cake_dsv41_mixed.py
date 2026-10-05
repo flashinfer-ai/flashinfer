@@ -487,10 +487,10 @@ def cake_sparse_mla_sm120_dsv41_mixed_plan_variant(
     unified memory = GB10), the cache layout (``dual`` = main + compressed cache), the
     head count and the token bucket; ``ragged`` (per-token ``topk_length`` /
     ``extra_topk_length`` given) consults the ragged cells first; ``direct_cvt`` is
-    the toolchain probe -- without the direct BF16x2 converts (CUDA < 13.2)
-    discrete-memory cards run the fallback variant on dual two-tile head counts and
-    the plain render elsewhere (the GB10 was measured on CUDA >= 13.2 only).  Any
-    other card, or a unified-memory part that is not the GB10, keeps the plain render.
+    the toolchain probe -- without the direct BF16x2 converts (CUDA < 13.2) every
+    measured card (the two SM120 cards and the GB10) runs the manifest's fallback
+    variant on dual two-tile head counts and the plain render elsewhere.  Any other
+    card, or a unified-memory part that is not the GB10, keeps the plain render.
     ``pow2_pages`` says whether every page size in use (main, and the compressed cache
     when ``dual``) is a power of two; otherwise the shift-and-mask page-resolve parts
     (``pw``) are dropped from the label and the same variant's generic-division body runs.
@@ -536,8 +536,8 @@ def _table_variant(
     if bool(unified_memory) != (sms == d.unified_memory_sm_count):
         return DEFAULT_VARIANT
     if not direct_cvt:
-        if unified_memory:
-            return DEFAULT_VARIANT
+        # SM120 and the GB10 alike (both measured on CUDA 12.9 / 13.0): the two-tile dual
+        # renders take the fallback body, single-cache and one-tile renders the plain one.
         two_tile = int(num_heads) in g.two_tile_head_counts
         return (
             d.fallback_dual_two_tile_variant if (dual and two_tile) else DEFAULT_VARIANT

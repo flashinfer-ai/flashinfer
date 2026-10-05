@@ -993,7 +993,7 @@ def test_plan_variant_rules() -> None:
         == DEFAULT_VARIANT
     )
     # Toolchains without the direct BF16x2 converts (CUDA < 13.2): the fallback body on dual two-tile head
-    # counts of discrete-memory cards, the plain render elsewhere (the GB10 was measured on CUDA >= 13.2 only).
+    # counts of every measured card (SM120 and the GB10 alike), the plain render elsewhere.
     assert pick(num_tokens=32, ragged=False, direct_cvt=False, **pro) == "tl+e2f"
     assert (
         pick(
@@ -1040,6 +1040,18 @@ def test_plan_variant_rules() -> None:
             unified_memory=True,
             dual=True,
             num_heads=64,
+        )
+        == "tl+e2f"
+    )
+    assert (
+        pick(
+            num_tokens=8,
+            ragged=False,
+            direct_cvt=False,
+            num_sms=48,
+            unified_memory=True,
+            dual=True,
+            num_heads=8,
         )
         == DEFAULT_VARIANT
     )
