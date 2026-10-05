@@ -23,7 +23,9 @@ from ._capabilities import (
 )
 
 
-_CUTILE_SUPPORTED_COMPUTE_CAPABILITIES = frozenset({(10, 0), (10, 3), (12, 0), (12, 1)})
+_CUTILE_SUPPORTED_COMPUTE_CAPABILITIES = frozenset(
+    {(10, 0), (10, 3), (10, 7), (12, 0), (12, 1)}
+)
 
 
 def _tensor_byte_span(tensor: torch.Tensor) -> tuple[int, int]:
@@ -78,9 +80,9 @@ def _get_compute_capability(device: torch.device):
     return get_compute_capability(device)
 
 
-@functools.lru_cache(maxsize=1)
-def get_cutile_mla_decode():
-    """Resolve executable preparation only after the cuTile plan is validated."""
+@functools.lru_cache(maxsize=32)
+def get_cutile_mla_decode(device: torch.device):
+    """Resolve preparation with compiler availability cached for the planned device."""
 
     try:
         installed_version = Version(importlib.metadata.version("cuda-tile"))
@@ -97,7 +99,7 @@ def get_cutile_mla_decode():
     from ._cutile_prepared import prepare_cutile_mla_decode
 
     try:
-        available = is_cuda_tile_available()
+        available = is_cuda_tile_available(device)
     except ModuleNotFoundError as exc:
         if not exc.name.startswith("cuda.tile"):
             raise
@@ -332,7 +334,7 @@ class _BatchMLAPagedAttentionCutileBackend:
         if (major, minor) not in _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES:
             raise _BackendPlanUnsupportedError(
                 "cutile backend supports only the validated Blackwell targets "
-                f"SM100, SM103, SM120, and SM121, got SM{major}{minor}."
+                f"SM100, SM103, SM107, SM120, and SM121, got SM{major}{minor}."
             )
 
         batch_size = cum_seq_lens_q.numel() - 1
@@ -368,7 +370,7 @@ class _BatchMLAPagedAttentionCutileBackend:
         # identity, which lets callers mutate values in place before graph replay.
         planned_kv_len = kv_len.to(device=self.device, non_blocking=True)
         planned_page_table = page_table.to(device=self.device, non_blocking=True)
-        decode_mla_kv_paged_cutile = get_cutile_mla_decode()(
+        decode_mla_kv_paged_cutile = get_cutile_mla_decode(self.device)(
             device=self.device,
             batch=batch_size,
             heads=num_heads,

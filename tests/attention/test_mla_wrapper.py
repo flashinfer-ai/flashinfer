@@ -736,7 +736,9 @@ def test_failed_backend_replan_keeps_previous_runnable_backend(
         wrapper, kernel = _planned_cutile_wrapper(monkeypatch)
         plan_kwargs = _cutile_contract_plan_kwargs()
         query, cache = _cutile_contract_inputs()
-        monkeypatch.setattr(cutile_backend, "get_cutile_mla_decode", lambda: fail_plan)
+        monkeypatch.setattr(
+            cutile_backend, "get_cutile_mla_decode", lambda device: fail_plan
+        )
         old_indices = None
     else:
         kernel = _FakeBatchMLAModule()
@@ -2144,8 +2146,10 @@ def _skip_if_planned_backend_runtime_is_unavailable(backend):
             pytest.skip("xqa planned MLA requires a supported SM12x/CUDA configuration")
         return
 
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip(f"{backend} planned MLA requires SM100/SM103, got {capability}")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip(
+            f"{backend} planned MLA requires SM100/SM103/SM107, got {capability}"
+        )
     if backend == "cutile":
         pytest.importorskip("cuda.tile.compilation")
         from flashinfer.cutile.cutile_common import is_cuda_tile_available
@@ -2734,8 +2738,11 @@ def test_cute_dsl_alias_does_not_hide_planning_errors(monkeypatch, error_type, m
 
 @pytest.fixture
 def cutile_sm100():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("prepared cuTile acceptance requires SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 7),
+    ):
+        pytest.skip("prepared cuTile acceptance requires SM100/SM107")
     pytest.importorskip("cuda.tile.compilation")
     from flashinfer.cutile.cutile_common import is_cuda_tile_available
 
@@ -2819,7 +2826,7 @@ def _cutile_reference(query, cache, lengths, table, scale=None):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("heads", [64, 128, 192])
 @pytest.mark.parametrize("page", [1, 2])
 def test_cutile_small_page_large_batch_numerics(cutile_sm100, dtype, heads, page):
     """Small key tiles must remain correct with the large-batch launch policy."""
@@ -2949,7 +2956,7 @@ def _patch_fake_cutile_kernel(monkeypatch, kernel):
         cutile_backend, "_get_compute_capability", lambda device: (10, 0)
     )
     monkeypatch.setattr(
-        cutile_backend, "get_cutile_mla_decode", lambda: lambda **kwargs: kernel
+        cutile_backend, "get_cutile_mla_decode", lambda device: lambda **kwargs: kernel
     )
 
 
@@ -3008,6 +3015,69 @@ def _planned_cutile_wrapper(monkeypatch, *, use_cuda_graph=False, metadata=None)
     return wrapper, kernel
 
 
+@pytest.mark.parametrize("planned_supported", [False, True])
+def test_cutile_availability_uses_planned_device(monkeypatch, planned_supported):
+    import importlib.metadata
+
+    from flashinfer.cutile import cutile_common
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+    from flashinfer.mla._batch_mla._backends import cutile_backend, _cutile_prepared
+
+    # Model a mixed-GPU process without launching kernels. CPU storage represents
+    # the planned device; the implicit current device has the opposite support.
+    target = torch.device("cpu")
+    current = [100]
+    original_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: "1.4.0" if name == "cuda-tile" else original_version(name),
+    )
+    original_find_spec = cutile_common.importlib.util.find_spec
+    monkeypatch.setattr(
+        cutile_common.importlib.util,
+        "find_spec",
+        lambda name: object() if name == "cuda.tile.tune" else original_find_spec(name),
+    )
+    monkeypatch.setattr(cutile_common, "_find_tileiras_binary", lambda: "tileiras")
+    monkeypatch.setattr(
+        cutile_common, "_tileiras_supports_arch", lambda _, arch: arch == "sm_100"
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device=None: (10, (0 if planned_supported else 7))
+        if device == target
+        else (10, current[0] - 100),
+    )
+    monkeypatch.setattr(cutile_backend, "_get_compute_capability", lambda _: (10, 7))
+    kernel = _FakeCutileKernel()
+    monkeypatch.setattr(
+        _cutile_prepared, "prepare_cutile_mla_decode", lambda **kwargs: kernel
+    )
+    cutile_backend.get_cutile_mla_decode.cache_clear()
+    try:
+        # A successful lookup on another device must not approve this target.
+        cutile_backend.get_cutile_mla_decode(torch.device("cuda:0"))
+        if planned_supported:
+            cutile_backend.get_cutile_mla_decode.cache_clear()
+            current[0] = 107
+        wrapper = BatchMLAPagedAttentionWrapper(
+            torch.empty(1024, dtype=torch.uint8), backend="cutile"
+        )
+        if planned_supported:
+            wrapper.plan(**_cutile_contract_plan_kwargs())
+            query, kv_cache = _cutile_contract_inputs()
+            wrapper.run(query=query, kv_cache=kv_cache)
+            assert len(kernel.calls) == 1
+        else:
+            with pytest.raises(_BackendPlanUnsupportedError, match="compiler"):
+                wrapper.plan(**_cutile_contract_plan_kwargs())
+    finally:
+        cutile_backend.get_cutile_mla_decode.cache_clear()
+
+
 def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
@@ -3020,8 +3090,8 @@ def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
         cutile_backend, "_get_compute_capability", lambda device: (10, 0)
     )
 
-    def get_kernel():
-        getter_calls.append(None)
+    def get_kernel(device):
+        getter_calls.append(device)
         return lambda **kwargs: kernel
 
     monkeypatch.setattr(cutile_backend, "get_cutile_mla_decode", get_kernel)
@@ -3033,14 +3103,14 @@ def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
     assert getter_calls == []
 
     wrapper.plan(**_cutile_contract_plan_kwargs(metadata))
-    assert getter_calls == [None]
+    assert getter_calls == [wrapper.device]
 
     query, kv_cache = _cutile_contract_inputs()
     out = torch.empty_like(query[0])
     actual = wrapper.run(query=query, kv_cache=kv_cache, out=out)
 
     assert actual is out
-    assert getter_calls == [None]
+    assert getter_calls == [wrapper.device]
     assert len(kernel.calls) == 1
     call = kernel.calls[0]
     assert call["q_nope"] is query[0]
@@ -3182,7 +3252,7 @@ def test_cutile_plan_rejects_unsupported_contracts(monkeypatch, plan_overrides):
         lambda device: (10, 0),
     )
 
-    def unexpected_preparation():
+    def unexpected_preparation(device):
         pytest.fail("unsupported cuTile plan attempted native preparation")
 
     monkeypatch.setattr(
@@ -3217,7 +3287,7 @@ def test_cutile_rejects_unsupported_head_counts(num_heads):
         _validate_cutile_num_heads(num_heads)
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0), (12, 1)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7), (12, 0), (12, 1)])
 def test_cutile_plan_accepts_supported_blackwell_architectures(monkeypatch, capability):
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
     from flashinfer.mla._batch_mla._backends import cutile_backend
@@ -3227,7 +3297,7 @@ def test_cutile_plan_accepts_supported_blackwell_architectures(monkeypatch, capa
         cutile_backend, "_get_compute_capability", lambda device: capability
     )
     monkeypatch.setattr(
-        cutile_backend, "get_cutile_mla_decode", lambda: lambda **kwargs: kernel
+        cutile_backend, "get_cutile_mla_decode", lambda device: lambda **kwargs: kernel
     )
     wrapper = BatchMLAPagedAttentionWrapper(
         torch.empty(1024, dtype=torch.uint8), backend="cutile"
@@ -3248,7 +3318,7 @@ def test_cutile_plan_rejects_undemonstrated_architectures(monkeypatch, capabilit
         cutile_backend, "_get_compute_capability", lambda device: capability
     )
 
-    def unexpected_preparation():
+    def unexpected_preparation(device):
         pytest.fail("unsupported cuTile plan attempted native preparation")
 
     monkeypatch.setattr(
