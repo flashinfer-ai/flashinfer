@@ -216,6 +216,33 @@ def test_plan_route_sm103_k2_k4_consumed_release_bands(M, K, pdl, early):
     assert (flags[0] == "1") is early, (plan.kernel_key, early)
 
 
+@pytest.mark.parametrize("pdl", (False, True))
+@pytest.mark.parametrize(
+    "arch,M,nc,depth",
+    (
+        # sm_100a: nc4 depth 3 from the band edge (round r4 closing screening); the r1 M4096 cell keeps nc3 depth 3.
+        ("sm_100a", 1535, 4, 2),
+        ("sm_100a", 1536, 4, 3),
+        ("sm_100a", 3072, 4, 3),
+        ("sm_100a", 4096, 3, 3),
+        ("sm_100a", 8192, 4, 3),
+        ("sm_100a", 16384, 4, 3),
+        # sm_103a: nc4 depth 3 from M1536 (round r4 direction 2).
+        ("sm_103a", 1535, 4, 2),
+        ("sm_103a", 1536, 4, 3),
+        ("sm_103a", 4096, 4, 3),
+        ("sm_103a", 16384, 4, 3),
+    ),
+)
+def test_plan_route_k5_depth3_bands(arch, M, nc, depth, pdl):
+    """Round r4: the persistent K5 program runs four sources per chunk with a depth-3 pipeline from the
+    per-architecture band edge (same-GPU ABBA, bit-identical, 1.3-3.8 % faster than depth 2); the band
+    edges are the dispatcher / evaluator / FI mirror constants."""
+    plan = plan_route(arch, SM_COUNT, M, 5, pdl)
+    assert plan.kind == "persistent", plan
+    assert f"_nc{nc}_d{depth}_" in plan.schedule_id, (plan.schedule_id, nc, depth)
+
+
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
 @pytest.mark.parametrize("pdl", (False, True))
 @pytest.mark.parametrize(

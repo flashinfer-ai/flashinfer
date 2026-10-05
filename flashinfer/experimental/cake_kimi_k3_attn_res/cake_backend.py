@@ -105,6 +105,9 @@ _SM100_K1_NC2_M = frozenset({512, 1024, 2048, 8192})
 _SM103_K1_NC2_M = frozenset({256})
 # Round r4 (direction 2): sm_103a K5 runs four sources per chunk at depth 3 from this M up.
 _SM103_K5_NC4_D3_MIN_M = 1536
+# Round r4 (closing screening): sm_100a K5 runs four sources per chunk at depth 3 from this M up
+# (the r1 (M4096, K5) nc3-depth-3 cell keeps its program).
+_SM100_K5_NC4_D3_MIN_M = 1536
 # Cells (M, K) that run three sources per chunk with a depth-3 pipeline.
 _NC3_D3_CELLS = {
     "sm_100a": frozenset({(4096, 3), (4096, 5)}),
@@ -287,6 +290,8 @@ def _schedule(arch: str, M: int, K: int) -> tuple[int, int]:
             return 1, PERSISTENT_CHUNK_DEPTH
         if K == 1 and M in _SM100_K1_NC2_M:
             return 2, PERSISTENT_CHUNK_DEPTH
+        if K == 5 and M >= _SM100_K5_NC4_D3_MIN_M:
+            return PERSISTENT_SOURCES_PER_CHUNK, 3
         if K == 4:
             return (
                 5 if M in {1, 32, 1024, 2048, 4096, 8192, 16384} else 3
