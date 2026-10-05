@@ -7318,7 +7318,11 @@ def test_attention_ts_decode_packed_q_sliding_window_public_parity():
 def test_attention_ts_decode_packed_q_sliding_window_clc_persistent():
     """Run live packed offsets and sliding bounds through the CLC scheduler."""
 
-    q_lens = tuple((3, 5, 7)[batch_idx % 3] for batch_idx in range(22))
+    # The scheduler picks CLC persistence only when the direct launch exceeds
+    # one wave, so scale the 22-request shape (sized for 148 SMs) with the SM count.
+    sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
+    num_requests = 22 * -(-sm_count // 148)
+    q_lens = tuple((3, 5, 7)[batch_idx % 3] for batch_idx in range(num_requests))
     max_seq_len_q = max(q_lens)
     case = _make_decode_case(
         kv_lens=(257,) * len(q_lens),
