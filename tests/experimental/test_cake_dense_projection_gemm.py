@@ -1615,21 +1615,70 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     if not (plan.a_mn and plan.b_mn) and plan.n_tiles > 1:
                         assert plan.hints == ("none", "none")
                 assert (plan.n_tiles == 1) == (plan.N <= 256)
-                # stream-K: a measured ``sk_parts`` rule (round 4, L20) splits every tail tile p ways when the
-                # p * tail units fit the CTA pairs with SK_MIN_ITERS K steps each; otherwise "auto" = a two-part
+                # stream-K tail policies in the Cake launcher's order (round 13): an exact ``sk_exact`` p-way split
+                # of every tail tile (one unit per part, identical K ranges on every tile) pre-empts the deterministic
+                # half-height tail wave (``htail``: the tail tiles become 2 x tail whole-K items, no partial slabs),
+                # which pre-empts a measured ``sk_parts`` rule (round 4, L20: every tail tile split p ways when the
+                # p * tail units fit the CTA pairs with SK_MIN_ITERS K steps each); otherwise "auto" = a two-part
                 # K-aligned split of a single partial wave, else whole tiles
+                tail = (
+                    plan.pair_tiles % plan.sm_pairs
+                    if plan.pair_tiles > plan.sm_pairs
+                    else plan.pair_tiles
+                )
+                exact = int(rule.get("sk_exact") or 0)
+                exact_plan = (
+                    sk_exact_plan(plan.pair_tiles, plan.k_blocks, plan.sm_pairs, exact)
+                    if exact
+                    else None
+                )
+                htail = (
+                    bool(rule.get("htail"))
+                    and plan.cta_rows == 256
+                    and exact_plan is None
+                    and 0 < 2 * tail <= plan.sm_pairs
+                )
                 parts = rule.get("sk_parts")
                 sk_rule = (
                     sk_parts_plan(plan.pair_tiles, plan.k_blocks, plan.sm_pairs, parts)
-                    if parts
+                    if parts and exact_plan is None
                     else ("auto", None)
                 )
-                if sk_rule[0] is True:
-                    tail = (
-                        plan.pair_tiles % plan.sm_pairs
-                        if plan.pair_tiles > plan.sm_pairs
-                        else plan.pair_tiles
+                assert plan.sk_exact == (exact if exact_plan is not None else 0)
+                assert plan.htail == htail
+                if exact_plan is not None:
+                    assert (
+                        plan.num_full,
+                        plan.tail_tiles,
+                        plan.sk_units,
+                        plan.iters_per_unit,
+                    ) == exact_plan
+                    # exactly p units of ceil(k_blocks / p) K steps per tail tile, a non-empty last part, no drift;
+                    # the unit count may exceed the pairs (the persistent CTAs take several units)
+                    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
+                        plan.pair_tiles - tail,
+                        tail,
+                        exact * tail,
                     )
+                    assert (
+                        plan.iters_per_unit
+                        == -(-plan.k_blocks // exact)
+                        >= SK_MIN_ITERS
+                    )
+                    assert (exact - 1) * plan.iters_per_unit < plan.k_blocks
+                    assert plan.sk_iters == exact
+                elif htail:
+                    # 2 x tail half-height items of whole K: no partial slabs, no fixup, no counters in use beyond
+                    # the tail tiles; the tall tile may exceed one wave of pairs
+                    assert (
+                        plan.num_full,
+                        plan.tail_tiles,
+                        plan.sk_units,
+                        plan.iters_per_unit,
+                    ) == (plan.pair_tiles - tail, tail, 2 * tail, plan.k_blocks)
+                    assert plan.sk_iters == plan.sk_units * plan.k_blocks
+                    assert plan.ws_f32_elems == 0
+                elif sk_rule[0] is True:
                     assert 0 < parts * tail <= plan.sm_pairs
                     assert plan.k_blocks >= parts * SK_MIN_ITERS
                     assert (
@@ -1664,7 +1713,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         2 * plan.pair_tiles,
                     )
                     assert plan.iters_per_unit == -(-plan.k_blocks // 2)
-                if plan.sk_units:
+                if plan.sk_units and not htail:
                     assert (
                         plan.ws_f32_elems
                         == (plan.sk_units + plan.tail_tiles)
@@ -1672,7 +1721,9 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         * plan.cta_rows
                         * plan.block_n
                     )
-                else:
+                    if exact_plan is None:
+                        assert plan.sk_iters == plan.tail_tiles * plan.k_blocks
+                elif not plan.sk_units:
                     assert (plan.num_full, plan.tail_tiles, plan.iters_per_unit) == (
                         plan.pair_tiles,
                         0,
