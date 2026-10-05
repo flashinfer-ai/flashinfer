@@ -546,7 +546,14 @@ class SSDCombined:
                 it is omitted and takes the count from ``seq_chunk_cumsum``
                 or ``num_seqs``.
             seq_idx: Optional int32/int64 packed-sequence IDs of shape
-                ``[batch, seqlen]``.
+                ``[batch, seqlen]``.  Precondition for both backends (not
+                checked on the device-side hot path): every ID lies in
+                ``[0, num_seqs)``, IDs are non-decreasing along the packed
+                token axis, and every ID in that range owns at least one
+                token.  An out-of-range ID indexes ``initial_states`` /
+                the ``[num_seqs + 1]`` chunk-boundary table out of bounds,
+                and an ID without tokens leaves its boundary entry
+                undefined for the Cake backend.
             chunk_indices: Optional int32 physical-chunk index for every logical
                 varlen segment.
             chunk_offsets: Optional int32 in-chunk start offset for every logical
@@ -583,7 +590,9 @@ class SSDCombined:
                 batch element or packed sequence.
             num_seqs: Optional packed-sequence count for the Cake backend when
                 varlen mode runs without ``initial_states`` and without
-                ``seq_chunk_cumsum``.  Rejected by the CuTe backend.
+                ``seq_chunk_cumsum``.  Rejected by the CuTe backend.  Must
+                equal the number of distinct IDs in ``seq_idx`` (see the
+                ``seq_idx`` precondition).
 
         Returns:
             A pair containing token-major output with shape
