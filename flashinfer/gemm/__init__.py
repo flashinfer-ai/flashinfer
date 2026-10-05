@@ -54,6 +54,9 @@ from .kimi_k3_fp8_projection import (
 )
 from .kimi_k3_fp8_projection import kimi_k3_fp8_projection as kimi_k3_fp8_projection
 from .kimi_k3_fp8_projection import (
+    kimi_k3_fp8_projection_launcher as kimi_k3_fp8_projection_launcher,
+)
+from .kimi_k3_fp8_projection import (
     prepare_kimi_k3_fp8_projection as prepare_kimi_k3_fp8_projection,
 )
 from .kimi_k3_fp8_projection import (
@@ -182,6 +185,7 @@ __all__ = (
         "PreparedBatchDeepGemmFp8NtGroupwise",
         "allocate_kimi_k3_fp8_projection_workspace",
         "kimi_k3_fp8_projection",
+        "kimi_k3_fp8_projection_launcher",
         "prepare_kimi_k3_fp8_projection",
         "prepare_kimi_k3_fp8_projection_weights",
         "fp8_blockscale_gemm_sm90",
