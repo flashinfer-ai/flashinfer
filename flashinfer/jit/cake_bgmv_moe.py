@@ -119,7 +119,9 @@ CAKE_BGMV_MOE_GROUPED_MIN_PAIRS = 2048
 CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_SUB64 = 4096
 CAKE_BGMV_MOE_GROUPED_MIN_ROUTES_PER_BIN = 4
 CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS = 12288
-CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS_R8 = 16384
+CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS_R8 = 6144
+CAKE_BGMV_MOE_GROUPED_R8_SMALL_WEIGHT_ELEMS = 16384
+CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_R8_SMALL = 8192  # lever 24c: rank-8 weights below 16384 elements group from this many routes
 # Lever 27: bin-ordered dispatch of the per-route shrink (SM90 only).  A single-CTA
 # prologue kernel sorts the routes by their (LoRA, expert) bin so the CTAs that
 # stream the same LoRA-A rows run back to back and the second and later readers
@@ -200,7 +202,10 @@ def select_cake_bgmv_moe_generic_grouped(
     per-pair weights (``hidden_size * rank``) are large enough for the saved
     traffic to exceed the fixed grouping prologue and the FP32 partials round
     trip; between ``CAKE_BGMV_MOE_GROUPED_MIN_PAIRS`` and
-    ``CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_SUB64`` routes only rank 64 wins; the
+    ``CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_SUB64`` routes only rank 64 wins; rank 8
+    with ``hidden_size * rank`` in [``CAKE_BGMV_MOE_GROUPED_MIN_WEIGHT_ELEMS_R8``,
+    ``CAKE_BGMV_MOE_GROUPED_R8_SMALL_WEIGHT_ELEMS``) groups from
+    ``CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_R8_SMALL`` routes (lever 24c); the
     grouping prologue bounds the bin count by ``CAKE_BGMV_MOE_GROUP_BINS_MAX``.
     """
 
@@ -220,6 +225,12 @@ def select_cake_bgmv_moe_generic_grouped(
     )
     if int(hidden_size) * int(rank) < min_elems:
         return False
+    if (
+        int(rank) < 16
+        and int(hidden_size) * int(rank) < CAKE_BGMV_MOE_GROUPED_R8_SMALL_WEIGHT_ELEMS
+        and int(num_pairs) < CAKE_BGMV_MOE_GROUPED_MIN_PAIRS_R8_SMALL
+    ):
+        return False  # lever 24c: small rank-8 weights need twice the routes
     if (
         int(num_pairs) + CAKE_BGMV_MOE_GROUP_TILE_TOKENS - 1
     ) // CAKE_BGMV_MOE_GROUP_TILE_TOKENS >= 65536:

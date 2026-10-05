@@ -555,7 +555,13 @@ def test_grouped_workspace_sizing_and_selector():
     assert not select(8192, 4096, 64, 128, 4096, 32)  # too many bins
     assert not select(8192, 4096, 0, 128, 4096, 32)
     # small per-pair weights: the fixed grouping cost exceeds the reuse win
-    assert not select(8192, 4096, 8, 128, 768, 8)
+    # lever 24c: 768 x 8 groups from 8192 routes (0.86-0.91 of per-route on B200/GB300),
+    # not at 4096 routes (1.14-1.25x slower); 512 x 8 stays per-route
+    assert select(8192, 4096, 8, 128, 768, 8)
+    assert not select(4096, 2048, 8, 128, 768, 8)
+    assert not select(4096, 2048, 8, 128, 1024, 8)
+    assert select(8192, 4096, 8, 128, 1536, 8)
+    assert not select(8192, 4096, 8, 128, 512, 8)
     assert select(
         8192, 4096, 8, 128, 2048, 8
     )  # 16384 weight elems: wins 5-13 % with the multi-CTA prologue
