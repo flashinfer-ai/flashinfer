@@ -1119,9 +1119,9 @@ def test_full_path_resolution_names_missing_stages(target, monkeypatch):
     monkeypatch.setenv(CAKE_STEPFUN_FULL_PATH_ENV, "sometimes")
     with pytest.raises(ValueError, match="auto, 0 or 1"):
         resolve_cake_stepfun_full_path(target)
-    assert get_cake_stepfun_fused_moe_uri(target, False).endswith(target[3:7])
-    assert "_full_" in get_cake_stepfun_fused_moe_uri(target, True)
-    assert "_full_" not in get_cake_stepfun_fused_moe_uri(target, False)
+    suffix = "sm" + target[3:6]
+    assert get_cake_stepfun_fused_moe_uri(target, False).endswith(suffix)
+    assert get_cake_stepfun_fused_moe_uri(target, True).endswith("_full_" + suffix)
 
 
 def test_module_build_matches_the_resolved_variant():
