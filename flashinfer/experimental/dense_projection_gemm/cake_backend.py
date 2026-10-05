@@ -116,7 +116,11 @@ BLOCK_K = 64  # K elements per stage (128-byte swizzle rows)  [Cake L58]
 PANEL_BYTES = (
     BLOCK_K * 128
 )  # one MN-major B panel: 64 K rows x 128 B = 8192  [Cake L60]
-B_SWZ_CHOICES = (128, 64, 32)  # round 13 (Cake L35): MN-major B panel width in bytes; 128 = the 64-column panels of rounds 1-12
+B_SWZ_CHOICES = (
+    128,
+    64,
+    32,
+)  # round 13 (Cake L35): MN-major B panel width in bytes; 128 = the 64-column panels of rounds 1-12
 CTA_GROUP = 2  # CTAs per cluster / MMA pair  [Cake L59]
 EPI_WARPS = 8  # [Cake L67]
 WORK_STAGES = 4  # cluster-launch-control work-ring depth  [Cake L68]
@@ -351,7 +355,11 @@ def smem_limit_for(arch: Optional[str]) -> int:
 
 
 def default_stages(
-    slots: int, cta_rows: int = 128, block_n: int = 256, b_mn: bool = False, b_swz: int = 128
+    slots: int,
+    cta_rows: int = 128,
+    block_n: int = 256,
+    b_mn: bool = False,
+    b_swz: int = 128,
 ) -> int:
     """Mainloop stages that fit the 227 KiB opt-in with the epilogue staging: 32 KiB stages
     for 128-row tiles (24 KiB at BLOCK_N = 128, where the streaming-bound small-N rows are
@@ -362,7 +370,9 @@ def default_stages(
     stages than their 128-byte-panel siblings and likewise take the deepest pipeline that fits the opt-in (at most
     12).  [Cake ``default_stages``]"""
     if cta_rows == 64 or int(b_swz) != 128:
-        stage = min(cta_rows, 128) * a_halves_of(cta_rows) * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz)
+        stage = min(cta_rows, 128) * a_halves_of(
+            cta_rows
+        ) * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n, b_swz)
         return max(
             2,
             min(12, (SMEM_OPT_IN - WORK_STAGES * 16 - staging_bytes(slots)) // stage),
@@ -608,7 +618,13 @@ def instance_symbol(key: tuple) -> str:
         )
         + (f"_box{box_rows}" if box_rows else "")
         + ("_skx" if sk_exact else "")
-        + ("_bf" if batch_group == 1 else f"_bg{batch_group}" if batch_group > 1 else "")
+        + (
+            "_bf"
+            if batch_group == 1
+            else f"_bg{batch_group}"
+            if batch_group > 1
+            else ""
+        )
         + "".join(f"_{d}" for d in diag)
     )
 

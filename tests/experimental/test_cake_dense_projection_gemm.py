@@ -825,15 +825,38 @@ def test_epilogue_rules():
             "dense_proj_gemm_nn_n160_m256_bz64",
         ),
         (
-            dict(a_mn=True, b_mn=True, block_n=192, out_t=True, b_swz=64, hints=("evict_first", "evict_first")),
+            dict(
+                a_mn=True,
+                b_mn=True,
+                block_n=192,
+                out_t=True,
+                b_swz=64,
+                hints=("evict_first", "evict_first"),
+            ),
             "dense_proj_gemm_nn_n192_bz64_hee_t",
         ),
         (
-            dict(a_mn=True, b_mn=True, block_n=128, out_t=True, hints=("evict_first", "none"), sk_exact=True),
+            dict(
+                a_mn=True,
+                b_mn=True,
+                block_n=128,
+                out_t=True,
+                hints=("evict_first", "none"),
+                sk_exact=True,
+            ),
             "dense_proj_gemm_nn_n128_hen_t_skx",
         ),
         (
-            dict(a_mn=True, b_mn=True, block_n=128, cta_rows=64, out_t=True, out_f32=True, hints=("evict_first", "none"), sk_exact=True),
+            dict(
+                a_mn=True,
+                b_mn=True,
+                block_n=128,
+                cta_rows=64,
+                out_t=True,
+                out_f32=True,
+                hints=("evict_first", "none"),
+                sk_exact=True,
+            ),
             "dense_proj_gemm_nn_n128_m64_hen_f32_t_skx",
         ),
         (
@@ -846,7 +869,9 @@ def test_epilogue_rules():
             "dense_proj_gemm_kn_n256_tma1_bg8",
         ),
         (
-            dict(a_mn=False, b_mn=True, cta_rows=256, epi="tma", slots=1, batch_group=4),
+            dict(
+                a_mn=False, b_mn=True, cta_rows=256, epi="tma", slots=1, batch_group=4
+            ),
             "dense_proj_gemm_kn_n256_m256_tma1_bg4",
         ),
         (
@@ -855,11 +880,26 @@ def test_epilogue_rules():
         ),
         # round 13 (W4): the fp32 v8 register stores with L1::no_allocate.L2::evict_first (``_ef`` right after ``_v8``)
         (
-            dict(a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True, store_ef=True),
+            dict(
+                a_mn=False,
+                b_mn=True,
+                out_f32=True,
+                epi="reg",
+                f32_v8=True,
+                store_ef=True,
+            ),
             "dense_proj_gemm_kn_n256_f32_v8_ef",
         ),
         (
-            dict(a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True, store_ef=True, stages=9),
+            dict(
+                a_mn=False,
+                b_mn=True,
+                out_f32=True,
+                epi="reg",
+                f32_v8=True,
+                store_ef=True,
+                stages=9,
+            ),
             "dense_proj_gemm_kn_n256_f32_v8_ef_s9",
         ),
     ],
@@ -873,11 +913,25 @@ def test_round13_w3_knobs():
     # shrinks the B stage (160 columns: 3 x 32-column panels = 12 KiB instead of 2 x 64-column = 16 KiB) and the
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
-    assert len(key) == 22 and key[18] == 64 and key[19] is False and key[20] == 0 and key[21] is False
+    assert (
+        len(key) == 22
+        and key[18] == 64
+        and key[19] is False
+        and key[20] == 0
+        and key[21] is False
+    )
     assert instance_key(a_mn=False, b_mn=False, b_swz=64)[18] == 128
-    assert b_stage_bytes(True, 160, 64) == 3 * 64 * 64 and b_stage_bytes(True, 160, 128) == 2 * 64 * 128
-    assert default_stages(0, 256, 160, True, 64) >= default_stages(0, 256, 160, True, 128)
-    assert instance_key(a_mn=True, b_mn=True, block_n=128, out_t=True, sk_exact=True)[19] is True
+    assert (
+        b_stage_bytes(True, 160, 64) == 3 * 64 * 64
+        and b_stage_bytes(True, 160, 128) == 2 * 64 * 128
+    )
+    assert default_stages(0, 256, 160, True, 64) >= default_stages(
+        0, 256, 160, True, 128
+    )
+    assert (
+        instance_key(a_mn=True, b_mn=True, block_n=128, out_t=True, sk_exact=True)[19]
+        is True
+    )
     with pytest.raises(ValueError):
         instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=48)
     with pytest.raises(ValueError):
@@ -896,9 +950,22 @@ def test_round13_batch_group_knob():
 
 def test_round13_store_ef_knob():
     # field 21 of the 22-field key: the hint exists only on the fp32 v8 register store form
-    assert instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True, store_ef=True)[21] is True
-    assert instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", store_ef=True)[21] is False
-    assert instance_key(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True)[21] is False  # TMA-store fp32 epilogue: no v8 stores
+    assert (
+        instance_key(
+            a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True, store_ef=True
+        )[21]
+        is True
+    )
+    assert (
+        instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", store_ef=True)[21]
+        is False
+    )
+    assert (
+        instance_key(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True)[
+            21
+        ]
+        is False
+    )  # TMA-store fp32 epilogue: no v8 stores
     assert instance_key(a_mn=False, b_mn=True, store_ef=True)[21] is False
 
 
@@ -909,9 +976,18 @@ def test_sk_exact_plan_mirrors_cake():
     assert sk_exact_plan(130, 96, 106, 2) == (106, 24, 48, 48)
     assert sk_exact_plan(24, 96, 106, 1) is None  # fewer than two parts
     assert sk_exact_plan(212, 96, 106, 3) is None  # no tail
-    assert sk_exact_plan(24, SK_MIN_ITERS, 106, 2) is None  # a part under SK_MIN_ITERS steps
-    assert sk_exact_plan(24, 72, 106, 10) is None  # ceil(72 / 10) = 8 steps x 9 parts already cover K: empty last part
-    assert sk_exact_plan(24, 73, 106, 10) == (0, 24, 240, 8)  # ... one more K block and the tenth part is non-empty
+    assert (
+        sk_exact_plan(24, SK_MIN_ITERS, 106, 2) is None
+    )  # a part under SK_MIN_ITERS steps
+    assert (
+        sk_exact_plan(24, 72, 106, 10) is None
+    )  # ceil(72 / 10) = 8 steps x 9 parts already cover K: empty last part
+    assert sk_exact_plan(24, 73, 106, 10) == (
+        0,
+        24,
+        240,
+        8,
+    )  # ... one more K block and the tenth part is non-empty
 
 
 def test_round13_knob_normalisation():
@@ -919,7 +995,10 @@ def test_round13_knob_normalisation():
     # knob (narrower or shorter tiles raise), htail needs the 256-row family, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
     assert len(key) == 22 and key[15] is False and key[16] is True and key[17] is True
-    assert instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15] is False
+    assert (
+        instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
+        is False
+    )
     with pytest.raises(ValueError):
         instance_key(a_mn=False, b_mn=False, cta_rows=256, block_n=192, ovl=True)
     with pytest.raises(ValueError):
