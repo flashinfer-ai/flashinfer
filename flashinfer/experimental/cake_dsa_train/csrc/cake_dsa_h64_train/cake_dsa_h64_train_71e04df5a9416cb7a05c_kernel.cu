@@ -107,6 +107,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_BLOCKS_WORD_STRIDE 4
 #define SMEM_TOTAL 231680
 #define THREADS 640
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -214,8 +215,8 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 
 extern "C" {
 
-__global__ __launch_bounds__(640, 1) void
-kernel_cake_dsa_h64_train_984ca578391d90eb4245(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ o_lo, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts)
+__global__ __launch_bounds__(640, LAUNCH_MIN_BLOCKS) void
+kernel_cake_dsa_h64_train_71e04df5a9416cb7a05c(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap dout, const __grid_constant__ CUtensorMap dq_latent, const __grid_constant__ CUtensorMap dq_rope, const __grid_constant__ CUtensorMap kv_latent, const __grid_constant__ CUtensorMap k_rope, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ o_lo, int* __restrict__ indices, int* __restrict__ topk_length, float* __restrict__ dkv_f32, float* __restrict__ dkr_f32, int dkv_stride, int dkr_stride, int dkr_col0, int* __restrict__ dkv_dst_map, int dkv_has_map, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, float scale_log2, float sm_scale, int pass_lo, int pass_hi, int dq_mode, float* __restrict__ dq_partial, int* __restrict__ key_scratch, int* __restrict__ pass_counts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1284,10 +1285,6 @@ kernel_cake_dsa_h64_train_984ca578391d90eb4245(const __grid_constant__ CUtensorM
             int blocks_2 = blocks_word[0];
             int lpos = 32 * w2 + 4 * (lane_0_1 / 4);
             int rpos = 16 * w2 + 2 * (lane_0_1 / 4);
-            int npos = 32 * w2 + 8 * (lane_0_1 >> 2 & 3) + 4 * (lane_0_1 >> 4);
-            int nrpos = 16 * w2 + (lane_0_1 >> 2 & 6) + 8 * (lane_0_1 >> 2 & 1);
-            int spos = 32 * w2 + (lane_0_1 >> 2);
-            int srpos = 16 * w2 + (lane_0_1 >> 2);
             #pragma unroll 1
             for (int i_2 = 0; i_2 < blocks_2; i_2++) {
                 unsigned int par_1 = i_2 & 1;
@@ -1304,41 +1301,6 @@ kernel_cake_dsa_h64_train_984ca578391d90eb4245(const __grid_constant__ CUtensorM
                 keys[7] = tile_idx[slot_2 * 80 + wg * 32 + 24 + 2 * (lane_0_1 % 4) + 1];
                 if (lane_0_1 == 0) {
                     mbarrier_arrive(idx_free_addr + (slot_2) * 8);
-                }
-                int rows_1[8];
-                rows_1[0] = keys[0];
-                rows_1[1] = keys[1];
-                rows_1[2] = keys[2];
-                rows_1[3] = keys[3];
-                rows_1[4] = keys[4];
-                rows_1[5] = keys[5];
-                rows_1[6] = keys[6];
-                rows_1[7] = keys[7];
-                if (dkv_has_map != 0) {
-                    if (keys[0] >= 0) {
-                        rows_1[0] = dkv_dst_map[(long long)keys[0]];
-                    }
-                    if (keys[1] >= 0) {
-                        rows_1[1] = dkv_dst_map[(long long)keys[1]];
-                    }
-                    if (keys[2] >= 0) {
-                        rows_1[2] = dkv_dst_map[(long long)keys[2]];
-                    }
-                    if (keys[3] >= 0) {
-                        rows_1[3] = dkv_dst_map[(long long)keys[3]];
-                    }
-                    if (keys[4] >= 0) {
-                        rows_1[4] = dkv_dst_map[(long long)keys[4]];
-                    }
-                    if (keys[5] >= 0) {
-                        rows_1[5] = dkv_dst_map[(long long)keys[5]];
-                    }
-                    if (keys[6] >= 0) {
-                        rows_1[6] = dkv_dst_map[(long long)keys[6]];
-                    }
-                    if (keys[7] >= 0) {
-                        rows_1[7] = dkv_dst_map[(long long)keys[7]];
-                    }
                 }
                 mbarrier_wait(dkv_a_full_addr, par_1);
                 float a0[32];
@@ -1378,141 +1340,77 @@ kernel_cake_dsa_h64_train_984ca578391d90eb4245(const __grid_constant__ CUtensorM
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(dkr_drained_addr);
                 }
-                float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[0] : a0[2]), 4);
-                float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[16] : a0[18]), 4);
-                float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_0 : a0[0]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_1 : a0[16])), 8);
-                float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[2] : _shfl_xor_0) : (((lane_0_1 >> 2 & 1) != 0) ? a0[18] : _shfl_xor_1)), 8);
-                float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[0] : a1[2]), 4);
-                float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[16] : a1[18]), 4);
-                float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_4 : a1[0]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_5 : a1[16])), 8);
-                float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[2] : _shfl_xor_4) : (((lane_0_1 >> 2 & 1) != 0) ? a1[18] : _shfl_xor_5)), 8);
-                float _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? rk[0] : rk[2]), 4);
                 int key = keys[0];
                 if (key >= 0) {
-                    int row = rows_1[0];
-                    long long base = (long long)row * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_2 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_0 : a0[0]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_3 : (((lane_0_1 >> 2 & 1) != 0) ? a0[2] : _shfl_xor_0))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_1 : a0[16]) : _shfl_xor_2)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[18] : _shfl_xor_1) : _shfl_xor_3)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_6 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_4 : a1[0]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_7 : (((lane_0_1 >> 2 & 1) != 0) ? a1[2] : _shfl_xor_4))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_5 : a1[16]) : _shfl_xor_6)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[18] : _shfl_xor_5) : _shfl_xor_7)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)row * (long long)dkr_stride + (long long)dkr_col0 + (long long)nrpos])), "f"((((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_8 : rk[0])), "f"((((lane_0_1 >> 2 & 1) != 0) ? rk[2] : _shfl_xor_8)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base = (long long)key * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base])), "f"(a0[0]), "f"(a0[2]), "f"(a0[16]), "f"(a0[18]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base + 128])), "f"(a1[0]), "f"(a1[2]), "f"(a1[16]), "f"(a1[18]), "l"(0x14F0000000000000ULL) : "memory");
+                    {
+                        asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)key * 64 + (long long)rpos])), "f"(rk[0]), "f"(rk[2]), "l"(0x14F0000000000000ULL) : "memory");
+                    }
                 }
-                float _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[1] : a0[3]), 4);
-                float _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[17] : a0[19]), 4);
-                float _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_9 : a0[1]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_10 : a0[17])), 8);
-                float _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[3] : _shfl_xor_9) : (((lane_0_1 >> 2 & 1) != 0) ? a0[19] : _shfl_xor_10)), 8);
-                float _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[1] : a1[3]), 4);
-                float _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[17] : a1[19]), 4);
-                float _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_13 : a1[1]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_14 : a1[17])), 8);
-                float _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[3] : _shfl_xor_13) : (((lane_0_1 >> 2 & 1) != 0) ? a1[19] : _shfl_xor_14)), 8);
-                float _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? rk[1] : rk[3]), 4);
                 int key_0 = keys[1];
                 if (key_0 >= 0) {
-                    int row_1 = rows_1[1];
-                    long long base_1 = (long long)row_1 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_1])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_11 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_9 : a0[1]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_12 : (((lane_0_1 >> 2 & 1) != 0) ? a0[3] : _shfl_xor_9))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_10 : a0[17]) : _shfl_xor_11)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[19] : _shfl_xor_10) : _shfl_xor_12)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_1 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_15 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_13 : a1[1]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_16 : (((lane_0_1 >> 2 & 1) != 0) ? a1[3] : _shfl_xor_13))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_14 : a1[17]) : _shfl_xor_15)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[19] : _shfl_xor_14) : _shfl_xor_16)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)row_1 * (long long)dkr_stride + (long long)dkr_col0 + (long long)nrpos])), "f"((((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_17 : rk[1])), "f"((((lane_0_1 >> 2 & 1) != 0) ? rk[3] : _shfl_xor_17)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base_1 = (long long)key_0 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_1])), "f"(a0[1]), "f"(a0[3]), "f"(a0[17]), "f"(a0[19]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_1 + 128])), "f"(a1[1]), "f"(a1[3]), "f"(a1[17]), "f"(a1[19]), "l"(0x14F0000000000000ULL) : "memory");
+                    {
+                        asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)key_0 * 64 + (long long)rpos])), "f"(rk[1]), "f"(rk[3]), "l"(0x14F0000000000000ULL) : "memory");
+                    }
                 }
-                float _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[4] : a0[6]), 4);
-                float _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[20] : a0[22]), 4);
-                float _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_18 : a0[4]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_19 : a0[20])), 8);
-                float _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[6] : _shfl_xor_18) : (((lane_0_1 >> 2 & 1) != 0) ? a0[22] : _shfl_xor_19)), 8);
-                float _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[4] : a1[6]), 4);
-                float _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[20] : a1[22]), 4);
-                float _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_22 : a1[4]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_23 : a1[20])), 8);
-                float _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[6] : _shfl_xor_22) : (((lane_0_1 >> 2 & 1) != 0) ? a1[22] : _shfl_xor_23)), 8);
-                float _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? rk[4] : rk[6]), 4);
                 int key_1 = keys[2];
                 if (key_1 >= 0) {
-                    int row_2 = rows_1[2];
-                    long long base_2 = (long long)row_2 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_2])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_20 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_18 : a0[4]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_21 : (((lane_0_1 >> 2 & 1) != 0) ? a0[6] : _shfl_xor_18))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_19 : a0[20]) : _shfl_xor_20)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[22] : _shfl_xor_19) : _shfl_xor_21)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_2 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_24 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_22 : a1[4]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_25 : (((lane_0_1 >> 2 & 1) != 0) ? a1[6] : _shfl_xor_22))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_23 : a1[20]) : _shfl_xor_24)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[22] : _shfl_xor_23) : _shfl_xor_25)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)row_2 * (long long)dkr_stride + (long long)dkr_col0 + (long long)nrpos])), "f"((((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_26 : rk[4])), "f"((((lane_0_1 >> 2 & 1) != 0) ? rk[6] : _shfl_xor_26)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base_2 = (long long)key_1 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_2])), "f"(a0[4]), "f"(a0[6]), "f"(a0[20]), "f"(a0[22]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_2 + 128])), "f"(a1[4]), "f"(a1[6]), "f"(a1[20]), "f"(a1[22]), "l"(0x14F0000000000000ULL) : "memory");
+                    {
+                        asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)key_1 * 64 + (long long)rpos])), "f"(rk[4]), "f"(rk[6]), "l"(0x14F0000000000000ULL) : "memory");
+                    }
                 }
-                float _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[5] : a0[7]), 4);
-                float _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[21] : a0[23]), 4);
-                float _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_27 : a0[5]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_28 : a0[21])), 8);
-                float _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[7] : _shfl_xor_27) : (((lane_0_1 >> 2 & 1) != 0) ? a0[23] : _shfl_xor_28)), 8);
-                float _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[5] : a1[7]), 4);
-                float _shfl_xor_32 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[21] : a1[23]), 4);
-                float _shfl_xor_33 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_31 : a1[5]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_32 : a1[21])), 8);
-                float _shfl_xor_34 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[7] : _shfl_xor_31) : (((lane_0_1 >> 2 & 1) != 0) ? a1[23] : _shfl_xor_32)), 8);
-                float _shfl_xor_35 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? rk[5] : rk[7]), 4);
                 int key_2 = keys[3];
                 if (key_2 >= 0) {
-                    int row_3 = rows_1[3];
-                    long long base_3 = (long long)row_3 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_3])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_29 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_27 : a0[5]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_30 : (((lane_0_1 >> 2 & 1) != 0) ? a0[7] : _shfl_xor_27))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_28 : a0[21]) : _shfl_xor_29)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[23] : _shfl_xor_28) : _shfl_xor_30)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_3 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_33 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_31 : a1[5]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_34 : (((lane_0_1 >> 2 & 1) != 0) ? a1[7] : _shfl_xor_31))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_32 : a1[21]) : _shfl_xor_33)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[23] : _shfl_xor_32) : _shfl_xor_34)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)row_3 * (long long)dkr_stride + (long long)dkr_col0 + (long long)nrpos])), "f"((((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_35 : rk[5])), "f"((((lane_0_1 >> 2 & 1) != 0) ? rk[7] : _shfl_xor_35)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base_3 = (long long)key_2 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_3])), "f"(a0[5]), "f"(a0[7]), "f"(a0[21]), "f"(a0[23]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_3 + 128])), "f"(a1[5]), "f"(a1[7]), "f"(a1[21]), "f"(a1[23]), "l"(0x14F0000000000000ULL) : "memory");
+                    {
+                        asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)key_2 * 64 + (long long)rpos])), "f"(rk[5]), "f"(rk[7]), "l"(0x14F0000000000000ULL) : "memory");
+                    }
                 }
-                float _shfl_xor_36 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[8] : a0[10]), 4);
-                float _shfl_xor_37 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[24] : a0[26]), 4);
-                float _shfl_xor_38 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_36 : a0[8]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_37 : a0[24])), 8);
-                float _shfl_xor_39 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[10] : _shfl_xor_36) : (((lane_0_1 >> 2 & 1) != 0) ? a0[26] : _shfl_xor_37)), 8);
-                float _shfl_xor_40 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[8] : a1[10]), 4);
-                float _shfl_xor_41 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[24] : a1[26]), 4);
-                float _shfl_xor_42 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_40 : a1[8]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_41 : a1[24])), 8);
-                float _shfl_xor_43 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[10] : _shfl_xor_40) : (((lane_0_1 >> 2 & 1) != 0) ? a1[26] : _shfl_xor_41)), 8);
-                float _shfl_xor_44 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? rk[8] : rk[10]), 4);
                 int key_3 = keys[4];
                 if (key_3 >= 0) {
-                    int row_4 = rows_1[4];
-                    long long base_4 = (long long)row_4 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_4])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_38 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_36 : a0[8]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_39 : (((lane_0_1 >> 2 & 1) != 0) ? a0[10] : _shfl_xor_36))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_37 : a0[24]) : _shfl_xor_38)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[26] : _shfl_xor_37) : _shfl_xor_39)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_4 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_42 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_40 : a1[8]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_43 : (((lane_0_1 >> 2 & 1) != 0) ? a1[10] : _shfl_xor_40))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_41 : a1[24]) : _shfl_xor_42)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[26] : _shfl_xor_41) : _shfl_xor_43)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)row_4 * (long long)dkr_stride + (long long)dkr_col0 + (long long)nrpos])), "f"((((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_44 : rk[8])), "f"((((lane_0_1 >> 2 & 1) != 0) ? rk[10] : _shfl_xor_44)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base_4 = (long long)key_3 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_4])), "f"(a0[8]), "f"(a0[10]), "f"(a0[24]), "f"(a0[26]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_4 + 128])), "f"(a1[8]), "f"(a1[10]), "f"(a1[24]), "f"(a1[26]), "l"(0x14F0000000000000ULL) : "memory");
+                    {
+                        asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)key_3 * 64 + (long long)rpos])), "f"(rk[8]), "f"(rk[10]), "l"(0x14F0000000000000ULL) : "memory");
+                    }
                 }
-                float _shfl_xor_45 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[9] : a0[11]), 4);
-                float _shfl_xor_46 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[25] : a0[27]), 4);
-                float _shfl_xor_47 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_45 : a0[9]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_46 : a0[25])), 8);
-                float _shfl_xor_48 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[11] : _shfl_xor_45) : (((lane_0_1 >> 2 & 1) != 0) ? a0[27] : _shfl_xor_46)), 8);
-                float _shfl_xor_49 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[9] : a1[11]), 4);
-                float _shfl_xor_50 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[25] : a1[27]), 4);
-                float _shfl_xor_51 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_49 : a1[9]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_50 : a1[25])), 8);
-                float _shfl_xor_52 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[11] : _shfl_xor_49) : (((lane_0_1 >> 2 & 1) != 0) ? a1[27] : _shfl_xor_50)), 8);
-                float _shfl_xor_53 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? rk[9] : rk[11]), 4);
                 int key_4 = keys[5];
                 if (key_4 >= 0) {
-                    int row_5 = rows_1[5];
-                    long long base_5 = (long long)row_5 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_5])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_47 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_45 : a0[9]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_48 : (((lane_0_1 >> 2 & 1) != 0) ? a0[11] : _shfl_xor_45))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_46 : a0[25]) : _shfl_xor_47)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[27] : _shfl_xor_46) : _shfl_xor_48)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_5 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_51 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_49 : a1[9]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_52 : (((lane_0_1 >> 2 & 1) != 0) ? a1[11] : _shfl_xor_49))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_50 : a1[25]) : _shfl_xor_51)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[27] : _shfl_xor_50) : _shfl_xor_52)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)row_5 * (long long)dkr_stride + (long long)dkr_col0 + (long long)nrpos])), "f"((((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_53 : rk[9])), "f"((((lane_0_1 >> 2 & 1) != 0) ? rk[11] : _shfl_xor_53)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base_5 = (long long)key_4 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_5])), "f"(a0[9]), "f"(a0[11]), "f"(a0[25]), "f"(a0[27]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_5 + 128])), "f"(a1[9]), "f"(a1[11]), "f"(a1[25]), "f"(a1[27]), "l"(0x14F0000000000000ULL) : "memory");
+                    {
+                        asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)key_4 * 64 + (long long)rpos])), "f"(rk[9]), "f"(rk[11]), "l"(0x14F0000000000000ULL) : "memory");
+                    }
                 }
-                float _shfl_xor_54 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[12] : a0[14]), 4);
-                float _shfl_xor_55 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[28] : a0[30]), 4);
-                float _shfl_xor_56 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_54 : a0[12]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_55 : a0[28])), 8);
-                float _shfl_xor_57 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[14] : _shfl_xor_54) : (((lane_0_1 >> 2 & 1) != 0) ? a0[30] : _shfl_xor_55)), 8);
-                float _shfl_xor_58 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[12] : a1[14]), 4);
-                float _shfl_xor_59 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[28] : a1[30]), 4);
-                float _shfl_xor_60 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_58 : a1[12]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_59 : a1[28])), 8);
-                float _shfl_xor_61 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[14] : _shfl_xor_58) : (((lane_0_1 >> 2 & 1) != 0) ? a1[30] : _shfl_xor_59)), 8);
-                float _shfl_xor_62 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? rk[12] : rk[14]), 4);
                 int key_5 = keys[6];
                 if (key_5 >= 0) {
-                    int row_6 = rows_1[6];
-                    long long base_6 = (long long)row_6 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_6])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_56 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_54 : a0[12]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_57 : (((lane_0_1 >> 2 & 1) != 0) ? a0[14] : _shfl_xor_54))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_55 : a0[28]) : _shfl_xor_56)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[30] : _shfl_xor_55) : _shfl_xor_57)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_6 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_60 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_58 : a1[12]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_61 : (((lane_0_1 >> 2 & 1) != 0) ? a1[14] : _shfl_xor_58))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_59 : a1[28]) : _shfl_xor_60)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[30] : _shfl_xor_59) : _shfl_xor_61)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)row_6 * (long long)dkr_stride + (long long)dkr_col0 + (long long)nrpos])), "f"((((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_62 : rk[12])), "f"((((lane_0_1 >> 2 & 1) != 0) ? rk[14] : _shfl_xor_62)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base_6 = (long long)key_5 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_6])), "f"(a0[12]), "f"(a0[14]), "f"(a0[28]), "f"(a0[30]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_6 + 128])), "f"(a1[12]), "f"(a1[14]), "f"(a1[28]), "f"(a1[30]), "l"(0x14F0000000000000ULL) : "memory");
+                    {
+                        asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)key_5 * 64 + (long long)rpos])), "f"(rk[12]), "f"(rk[14]), "l"(0x14F0000000000000ULL) : "memory");
+                    }
                 }
-                float _shfl_xor_63 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[13] : a0[15]), 4);
-                float _shfl_xor_64 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[29] : a0[31]), 4);
-                float _shfl_xor_65 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_63 : a0[13]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_64 : a0[29])), 8);
-                float _shfl_xor_66 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[15] : _shfl_xor_63) : (((lane_0_1 >> 2 & 1) != 0) ? a0[31] : _shfl_xor_64)), 8);
-                float _shfl_xor_67 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[13] : a1[15]), 4);
-                float _shfl_xor_68 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[29] : a1[31]), 4);
-                float _shfl_xor_69 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_67 : a1[13]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_68 : a1[29])), 8);
-                float _shfl_xor_70 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[15] : _shfl_xor_67) : (((lane_0_1 >> 2 & 1) != 0) ? a1[31] : _shfl_xor_68)), 8);
-                float _shfl_xor_71 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? rk[13] : rk[15]), 4);
                 int key_6 = keys[7];
                 if (key_6 >= 0) {
-                    int row_7 = rows_1[7];
-                    long long base_7 = (long long)row_7 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_65 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_63 : a0[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_66 : (((lane_0_1 >> 2 & 1) != 0) ? a0[15] : _shfl_xor_63))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_64 : a0[29]) : _shfl_xor_65)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[31] : _shfl_xor_64) : _shfl_xor_66)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7 + 128])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_69 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_67 : a1[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_70 : (((lane_0_1 >> 2 & 1) != 0) ? a1[15] : _shfl_xor_67))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_68 : a1[29]) : _shfl_xor_69)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[31] : _shfl_xor_68) : _shfl_xor_70)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)row_7 * (long long)dkr_stride + (long long)dkr_col0 + (long long)nrpos])), "f"((((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_71 : rk[13])), "f"((((lane_0_1 >> 2 & 1) != 0) ? rk[15] : _shfl_xor_71)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base_7 = (long long)key_6 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7])), "f"(a0[13]), "f"(a0[15]), "f"(a0[29]), "f"(a0[31]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base_7 + 128])), "f"(a1[13]), "f"(a1[15]), "f"(a1[29]), "f"(a1[31]), "l"(0x14F0000000000000ULL) : "memory");
+                    {
+                        asm volatile("red.global.add.L2::cache_hint.v2.f32 [%0], {%1, %2}, %3;" :: "l"(reinterpret_cast<uint64_t>(&dkr_f32[(long long)key_6 * 64 + (long long)rpos])), "f"(rk[13]), "f"(rk[15]), "l"(0x14F0000000000000ULL) : "memory");
+                    }
                 }
                 mbarrier_wait(dkv_b_full_addr, par_1);
                 asm volatile(
@@ -1538,125 +1436,53 @@ kernel_cake_dsa_h64_train_984ca578391d90eb4245(const __grid_constant__ CUtensorM
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(dkv_b_drained_addr);
-                float _shfl_xor_72 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[0] : a0[2]), 4);
-                float _shfl_xor_73 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[16] : a0[18]), 4);
-                float _shfl_xor_74 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_72 : a0[0]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_73 : a0[16])), 8);
-                float _shfl_xor_75 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[2] : _shfl_xor_72) : (((lane_0_1 >> 2 & 1) != 0) ? a0[18] : _shfl_xor_73)), 8);
-                float _shfl_xor_76 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[0] : a1[2]), 4);
-                float _shfl_xor_77 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[16] : a1[18]), 4);
-                float _shfl_xor_78 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_76 : a1[0]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_77 : a1[16])), 8);
-                float _shfl_xor_79 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[2] : _shfl_xor_76) : (((lane_0_1 >> 2 & 1) != 0) ? a1[18] : _shfl_xor_77)), 8);
                 int key2 = keys[0];
                 if (key2 >= 0) {
-                    int row2 = rows_1[0];
-                    long long base2 = (long long)row2 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_74 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_72 : a0[0]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_75 : (((lane_0_1 >> 2 & 1) != 0) ? a0[2] : _shfl_xor_72))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_73 : a0[16]) : _shfl_xor_74)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[18] : _shfl_xor_73) : _shfl_xor_75)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_78 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_76 : a1[0]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_79 : (((lane_0_1 >> 2 & 1) != 0) ? a1[2] : _shfl_xor_76))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_77 : a1[16]) : _shfl_xor_78)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[18] : _shfl_xor_77) : _shfl_xor_79)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base2 = (long long)key2 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2 + 256])), "f"(a0[0]), "f"(a0[2]), "f"(a0[16]), "f"(a0[18]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2 + 384])), "f"(a1[0]), "f"(a1[2]), "f"(a1[16]), "f"(a1[18]), "l"(0x14F0000000000000ULL) : "memory");
                 }
-                float _shfl_xor_80 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[1] : a0[3]), 4);
-                float _shfl_xor_81 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[17] : a0[19]), 4);
-                float _shfl_xor_82 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_80 : a0[1]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_81 : a0[17])), 8);
-                float _shfl_xor_83 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[3] : _shfl_xor_80) : (((lane_0_1 >> 2 & 1) != 0) ? a0[19] : _shfl_xor_81)), 8);
-                float _shfl_xor_84 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[1] : a1[3]), 4);
-                float _shfl_xor_85 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[17] : a1[19]), 4);
-                float _shfl_xor_86 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_84 : a1[1]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_85 : a1[17])), 8);
-                float _shfl_xor_87 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[3] : _shfl_xor_84) : (((lane_0_1 >> 2 & 1) != 0) ? a1[19] : _shfl_xor_85)), 8);
                 int key2_7 = keys[1];
                 if (key2_7 >= 0) {
-                    int row2_1 = rows_1[1];
-                    long long base2_1 = (long long)row2_1 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_1 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_82 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_80 : a0[1]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_83 : (((lane_0_1 >> 2 & 1) != 0) ? a0[3] : _shfl_xor_80))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_81 : a0[17]) : _shfl_xor_82)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[19] : _shfl_xor_81) : _shfl_xor_83)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_1 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_86 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_84 : a1[1]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_87 : (((lane_0_1 >> 2 & 1) != 0) ? a1[3] : _shfl_xor_84))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_85 : a1[17]) : _shfl_xor_86)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[19] : _shfl_xor_85) : _shfl_xor_87)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base2_1 = (long long)key2_7 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_1 + 256])), "f"(a0[1]), "f"(a0[3]), "f"(a0[17]), "f"(a0[19]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_1 + 384])), "f"(a1[1]), "f"(a1[3]), "f"(a1[17]), "f"(a1[19]), "l"(0x14F0000000000000ULL) : "memory");
                 }
-                float _shfl_xor_88 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[4] : a0[6]), 4);
-                float _shfl_xor_89 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[20] : a0[22]), 4);
-                float _shfl_xor_90 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_88 : a0[4]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_89 : a0[20])), 8);
-                float _shfl_xor_91 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[6] : _shfl_xor_88) : (((lane_0_1 >> 2 & 1) != 0) ? a0[22] : _shfl_xor_89)), 8);
-                float _shfl_xor_92 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[4] : a1[6]), 4);
-                float _shfl_xor_93 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[20] : a1[22]), 4);
-                float _shfl_xor_94 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_92 : a1[4]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_93 : a1[20])), 8);
-                float _shfl_xor_95 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[6] : _shfl_xor_92) : (((lane_0_1 >> 2 & 1) != 0) ? a1[22] : _shfl_xor_93)), 8);
                 int key2_8 = keys[2];
                 if (key2_8 >= 0) {
-                    int row2_2 = rows_1[2];
-                    long long base2_2 = (long long)row2_2 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_2 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_90 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_88 : a0[4]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_91 : (((lane_0_1 >> 2 & 1) != 0) ? a0[6] : _shfl_xor_88))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_89 : a0[20]) : _shfl_xor_90)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[22] : _shfl_xor_89) : _shfl_xor_91)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_2 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_94 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_92 : a1[4]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_95 : (((lane_0_1 >> 2 & 1) != 0) ? a1[6] : _shfl_xor_92))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_93 : a1[20]) : _shfl_xor_94)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[22] : _shfl_xor_93) : _shfl_xor_95)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base2_2 = (long long)key2_8 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_2 + 256])), "f"(a0[4]), "f"(a0[6]), "f"(a0[20]), "f"(a0[22]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_2 + 384])), "f"(a1[4]), "f"(a1[6]), "f"(a1[20]), "f"(a1[22]), "l"(0x14F0000000000000ULL) : "memory");
                 }
-                float _shfl_xor_96 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[5] : a0[7]), 4);
-                float _shfl_xor_97 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[21] : a0[23]), 4);
-                float _shfl_xor_98 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_96 : a0[5]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_97 : a0[21])), 8);
-                float _shfl_xor_99 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[7] : _shfl_xor_96) : (((lane_0_1 >> 2 & 1) != 0) ? a0[23] : _shfl_xor_97)), 8);
-                float _shfl_xor_100 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[5] : a1[7]), 4);
-                float _shfl_xor_101 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[21] : a1[23]), 4);
-                float _shfl_xor_102 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_100 : a1[5]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_101 : a1[21])), 8);
-                float _shfl_xor_103 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[7] : _shfl_xor_100) : (((lane_0_1 >> 2 & 1) != 0) ? a1[23] : _shfl_xor_101)), 8);
                 int key2_9 = keys[3];
                 if (key2_9 >= 0) {
-                    int row2_3 = rows_1[3];
-                    long long base2_3 = (long long)row2_3 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_3 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_98 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_96 : a0[5]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_99 : (((lane_0_1 >> 2 & 1) != 0) ? a0[7] : _shfl_xor_96))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_97 : a0[21]) : _shfl_xor_98)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[23] : _shfl_xor_97) : _shfl_xor_99)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_3 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_102 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_100 : a1[5]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_103 : (((lane_0_1 >> 2 & 1) != 0) ? a1[7] : _shfl_xor_100))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_101 : a1[21]) : _shfl_xor_102)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[23] : _shfl_xor_101) : _shfl_xor_103)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base2_3 = (long long)key2_9 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_3 + 256])), "f"(a0[5]), "f"(a0[7]), "f"(a0[21]), "f"(a0[23]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_3 + 384])), "f"(a1[5]), "f"(a1[7]), "f"(a1[21]), "f"(a1[23]), "l"(0x14F0000000000000ULL) : "memory");
                 }
-                float _shfl_xor_104 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[8] : a0[10]), 4);
-                float _shfl_xor_105 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[24] : a0[26]), 4);
-                float _shfl_xor_106 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_104 : a0[8]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_105 : a0[24])), 8);
-                float _shfl_xor_107 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[10] : _shfl_xor_104) : (((lane_0_1 >> 2 & 1) != 0) ? a0[26] : _shfl_xor_105)), 8);
-                float _shfl_xor_108 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[8] : a1[10]), 4);
-                float _shfl_xor_109 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[24] : a1[26]), 4);
-                float _shfl_xor_110 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_108 : a1[8]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_109 : a1[24])), 8);
-                float _shfl_xor_111 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[10] : _shfl_xor_108) : (((lane_0_1 >> 2 & 1) != 0) ? a1[26] : _shfl_xor_109)), 8);
                 int key2_10 = keys[4];
                 if (key2_10 >= 0) {
-                    int row2_4 = rows_1[4];
-                    long long base2_4 = (long long)row2_4 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_4 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_106 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_104 : a0[8]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_107 : (((lane_0_1 >> 2 & 1) != 0) ? a0[10] : _shfl_xor_104))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_105 : a0[24]) : _shfl_xor_106)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[26] : _shfl_xor_105) : _shfl_xor_107)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_4 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_110 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_108 : a1[8]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_111 : (((lane_0_1 >> 2 & 1) != 0) ? a1[10] : _shfl_xor_108))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_109 : a1[24]) : _shfl_xor_110)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[26] : _shfl_xor_109) : _shfl_xor_111)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base2_4 = (long long)key2_10 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_4 + 256])), "f"(a0[8]), "f"(a0[10]), "f"(a0[24]), "f"(a0[26]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_4 + 384])), "f"(a1[8]), "f"(a1[10]), "f"(a1[24]), "f"(a1[26]), "l"(0x14F0000000000000ULL) : "memory");
                 }
-                float _shfl_xor_112 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[9] : a0[11]), 4);
-                float _shfl_xor_113 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[25] : a0[27]), 4);
-                float _shfl_xor_114 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_112 : a0[9]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_113 : a0[25])), 8);
-                float _shfl_xor_115 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[11] : _shfl_xor_112) : (((lane_0_1 >> 2 & 1) != 0) ? a0[27] : _shfl_xor_113)), 8);
-                float _shfl_xor_116 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[9] : a1[11]), 4);
-                float _shfl_xor_117 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[25] : a1[27]), 4);
-                float _shfl_xor_118 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_116 : a1[9]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_117 : a1[25])), 8);
-                float _shfl_xor_119 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[11] : _shfl_xor_116) : (((lane_0_1 >> 2 & 1) != 0) ? a1[27] : _shfl_xor_117)), 8);
                 int key2_11 = keys[5];
                 if (key2_11 >= 0) {
-                    int row2_5 = rows_1[5];
-                    long long base2_5 = (long long)row2_5 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_5 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_114 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_112 : a0[9]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_115 : (((lane_0_1 >> 2 & 1) != 0) ? a0[11] : _shfl_xor_112))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_113 : a0[25]) : _shfl_xor_114)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[27] : _shfl_xor_113) : _shfl_xor_115)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_5 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_118 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_116 : a1[9]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_119 : (((lane_0_1 >> 2 & 1) != 0) ? a1[11] : _shfl_xor_116))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_117 : a1[25]) : _shfl_xor_118)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[27] : _shfl_xor_117) : _shfl_xor_119)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base2_5 = (long long)key2_11 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_5 + 256])), "f"(a0[9]), "f"(a0[11]), "f"(a0[25]), "f"(a0[27]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_5 + 384])), "f"(a1[9]), "f"(a1[11]), "f"(a1[25]), "f"(a1[27]), "l"(0x14F0000000000000ULL) : "memory");
                 }
-                float _shfl_xor_120 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[12] : a0[14]), 4);
-                float _shfl_xor_121 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[28] : a0[30]), 4);
-                float _shfl_xor_122 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_120 : a0[12]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_121 : a0[28])), 8);
-                float _shfl_xor_123 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[14] : _shfl_xor_120) : (((lane_0_1 >> 2 & 1) != 0) ? a0[30] : _shfl_xor_121)), 8);
-                float _shfl_xor_124 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[12] : a1[14]), 4);
-                float _shfl_xor_125 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[28] : a1[30]), 4);
-                float _shfl_xor_126 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_124 : a1[12]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_125 : a1[28])), 8);
-                float _shfl_xor_127 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[14] : _shfl_xor_124) : (((lane_0_1 >> 2 & 1) != 0) ? a1[30] : _shfl_xor_125)), 8);
                 int key2_12 = keys[6];
                 if (key2_12 >= 0) {
-                    int row2_6 = rows_1[6];
-                    long long base2_6 = (long long)row2_6 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_6 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_122 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_120 : a0[12]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_123 : (((lane_0_1 >> 2 & 1) != 0) ? a0[14] : _shfl_xor_120))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_121 : a0[28]) : _shfl_xor_122)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[30] : _shfl_xor_121) : _shfl_xor_123)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_6 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_126 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_124 : a1[12]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_127 : (((lane_0_1 >> 2 & 1) != 0) ? a1[14] : _shfl_xor_124))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_125 : a1[28]) : _shfl_xor_126)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[30] : _shfl_xor_125) : _shfl_xor_127)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base2_6 = (long long)key2_12 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_6 + 256])), "f"(a0[12]), "f"(a0[14]), "f"(a0[28]), "f"(a0[30]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_6 + 384])), "f"(a1[12]), "f"(a1[14]), "f"(a1[28]), "f"(a1[30]), "l"(0x14F0000000000000ULL) : "memory");
                 }
-                float _shfl_xor_128 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[13] : a0[15]), 4);
-                float _shfl_xor_129 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a0[29] : a0[31]), 4);
-                float _shfl_xor_130 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_128 : a0[13]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_129 : a0[29])), 8);
-                float _shfl_xor_131 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[15] : _shfl_xor_128) : (((lane_0_1 >> 2 & 1) != 0) ? a0[31] : _shfl_xor_129)), 8);
-                float _shfl_xor_132 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[13] : a1[15]), 4);
-                float _shfl_xor_133 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 2 & 1) != 0) ? a1[29] : a1[31]), 4);
-                float _shfl_xor_134 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_132 : a1[13]) : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_133 : a1[29])), 8);
-                float _shfl_xor_135 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[15] : _shfl_xor_132) : (((lane_0_1 >> 2 & 1) != 0) ? a1[31] : _shfl_xor_133)), 8);
                 int key2_13 = keys[7];
                 if (key2_13 >= 0) {
-                    int row2_7 = rows_1[7];
-                    long long base2_7 = (long long)row2_7 * (long long)dkv_stride + (long long)npos;
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_7 + 256])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_130 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_128 : a0[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_131 : (((lane_0_1 >> 2 & 1) != 0) ? a0[15] : _shfl_xor_128))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_129 : a0[29]) : _shfl_xor_130)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a0[31] : _shfl_xor_129) : _shfl_xor_131)), "l"(0x14F0000000000000ULL) : "memory");
-                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_7 + 384])), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_134 : (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_132 : a1[13]))), "f"((((lane_0_1 >> 3 & 1) != 0) ? _shfl_xor_135 : (((lane_0_1 >> 2 & 1) != 0) ? a1[15] : _shfl_xor_132))), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? _shfl_xor_133 : a1[29]) : _shfl_xor_134)), "f"((((lane_0_1 >> 3 & 1) != 0) ? (((lane_0_1 >> 2 & 1) != 0) ? a1[31] : _shfl_xor_133) : _shfl_xor_135)), "l"(0x14F0000000000000ULL) : "memory");
+                    long long base2_7 = (long long)key2_13 * 512 + (long long)lpos;
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_7 + 256])), "f"(a0[13]), "f"(a0[15]), "f"(a0[29]), "f"(a0[31]), "l"(0x14F0000000000000ULL) : "memory");
+                    asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&dkv_f32[base2_7 + 384])), "f"(a1[13]), "f"(a1[15]), "f"(a1[29]), "f"(a1[31]), "l"(0x14F0000000000000ULL) : "memory");
                 }
             }
         }

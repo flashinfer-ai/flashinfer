@@ -86,6 +86,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_LEN_CELLS_STRIDE 8
 #define SMEM_TOTAL 231680
 #define THREADS 384
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -238,8 +239,8 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) void
-kernel_cake_dsa_h64_train_561ca97baafaba4074ad(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap kv_latent, __nv_bfloat16* __restrict__ k_rope, const __grid_constant__ CUtensorMap out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int k_rope_stride, int k_rope_offset, int has_topk_length, int derive_length, float scale_log2)
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
+kernel_cake_dsa_h64_train_257d4674f88939dbe09d(const __grid_constant__ CUtensorMap q_latent, const __grid_constant__ CUtensorMap q_rope, const __grid_constant__ CUtensorMap kv_latent, __nv_bfloat16* __restrict__ k_rope, const __grid_constant__ CUtensorMap out, __nv_bfloat16* __restrict__ o_lo, float* __restrict__ lse, int* __restrict__ indices, int* __restrict__ topk_length, int num_queries, int num_kv, int topk, int idx_stride, int indices_offset, int k_rope_stride, int k_rope_offset, int has_topk_length, int derive_length, float scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

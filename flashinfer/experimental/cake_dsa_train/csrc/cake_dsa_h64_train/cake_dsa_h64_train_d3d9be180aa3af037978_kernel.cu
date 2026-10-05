@@ -50,13 +50,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 128
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void
-kernel_cake_dsa_h64_train_f362dd10b022aa648c28(int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ key_scratch, int* __restrict__ pass_counts, int num_tokens, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, int pass_lo, int pass_hi)
+__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
+kernel_cake_dsa_h64_train_d3d9be180aa3af037978(int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ key_scratch, int* __restrict__ pass_counts, int num_tokens, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, int pass_lo, int pass_hi)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
