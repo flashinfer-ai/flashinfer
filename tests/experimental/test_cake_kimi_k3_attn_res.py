@@ -177,6 +177,45 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x):
     assert plan.route_id.startswith(schedule_id + ".")
 
 
+@pytest.mark.parametrize("pdl", (False, True))
+@pytest.mark.parametrize(
+    "M,K,early",
+    (
+        # K2: the early-release band M768..2048 (+ the M4096 cell); held below, between and above.
+        (767, 2, False),
+        (768, 2, True),
+        (1536, 2, True),
+        (2048, 2, True),
+        (2049, 2, False),
+        (3072, 2, False),
+        (4096, 2, True),
+        (4097, 2, False),
+        (6144, 2, False),
+        # K4: the nc5 band M513..1023 + the pow2 cells {512, 1024, 2048, 4096}; held at 1025..2047 and above 4096.
+        (512, 4, True),
+        (513, 4, True),
+        (768, 4, True),
+        (1023, 4, True),
+        (1024, 4, True),
+        (1025, 4, False),
+        (1536, 4, False),
+        (2048, 4, True),
+        (3072, 4, False),
+        (4096, 4, True),
+        (6144, 4, False),
+    ),
+)
+def test_plan_route_sm103_k2_k4_consumed_release_bands(M, K, pdl, early):
+    """Round r4 (K2 / K4 screening, Cake 9d069424c49): on sm_103a the early consumed-stage release
+    of the persistent K2 program wins only at M768..2048 (1.3-2.6 % vs the held program, bit-identical)
+    and loses from M12288 on; the K4 nc5 program releases early at M513..1023. The first persistent
+    flag is the release policy; the band edges are the dispatcher / evaluator / FI mirror constants."""
+    plan = plan_route("sm_103a", SM_COUNT, M, K, pdl)
+    assert plan.kind == "persistent", plan
+    flags = plan.kernel_key.rsplit("_f", 1)[1]
+    assert (flags[0] == "1") is early, (plan.kernel_key, early)
+
+
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
 @pytest.mark.parametrize("pdl", (False, True))
 @pytest.mark.parametrize(
