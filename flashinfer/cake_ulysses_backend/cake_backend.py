@@ -19,7 +19,7 @@ arguments and launches the exported programs.
 
 The package allocates nothing and opens no IPC handle itself.  The caller
 (``flashinfer.comm.ulysses.UlyssesCommunicator``) provisions, per rank, one
-symmetric staging allocation of ``max_elems`` elements and one symmetric signal
+symmetric staging allocation of ``max_bytes`` bytes and one symmetric signal
 allocation of at least :data:`cake_jit.SIGNAL_BYTES` bytes, exchanges their
 device addresses over CUDA IPC, and hands every rank's two addresses to
 :class:`CakeUlyssesA2A`.  The handle builds the two CPU ``int64`` peer tables
