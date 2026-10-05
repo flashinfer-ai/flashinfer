@@ -921,9 +921,10 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
             assert (
                 program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n") == 1
             )
-            assert (
-                "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)" in program_text
-            )
+            # one text for both architectures: codegen's device-pass guard selects the sm_100a lowering
+            assert "#if __CUDA_ARCH__ == 1000" in program_text
+            assert "const __grid_constant__ CUtensorMap" in program_text
+            assert "TensorMap const*" not in program_text
             texts[value] = program_text
         assert len(set(texts.values())) == len(texts)  # distinct programs
         for member in entry["source_family"]:

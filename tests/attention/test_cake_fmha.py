@@ -864,10 +864,6 @@ def test_cake_fmha_optimized_context_adapters_require_signed_seq_lens(
         ("jit/cake_fmha_context_fp8_jit_binding.cu", 5),
         ("jit/cake_fmha_context_hd256_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_bf16_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_fp8_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_hd64_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_hd256_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_quant_bf16q_jit_binding.cu", 2),
@@ -882,6 +878,31 @@ def test_cake_fmha_typed_launch_adapters_use_typed_tensor_maps(
     assert adapter.count("reinterpret_cast<CakeFmhaTensorMap const*>") == (
         descriptor_count
     )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "jit/cake_fmha_decode_balanced_jit_binding.cu",
+        "jit/cake_fmha_decode_balanced_fp8_jit_binding.cu",
+        "jit/cake_fmha_decode_balanced_hd64_jit_binding.cu",
+        "jit/cake_fmha_decode_balanced_hd256_jit_binding.cu",
+        "jit/cake_fmha_dcp_spec_bf16_balanced_jit_binding.cu",
+        "jit/cake_fmha_dcp_spec_bf16_fp8_balanced_jit_binding.cu",
+        "jit/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_jit_binding.cu",
+    ],
+)
+def test_cake_fmha_balanced_launch_adapters_pass_descriptors_by_value(
+    relative_path,
+) -> None:
+    # The balanced kernels take their TMA descriptors as ``__grid_constant__``
+    # parameters: the adapter encodes each descriptor on the host and hands it
+    # to the launch binding by reference, with no device descriptor slots.
+    adapter = (get_cake_fmha_csrc_dir() / relative_path).read_text(encoding="utf-8")
+    assert adapter.count("CUtensorMap const& p_") == 3
+    assert "CakeFmhaTensorMap" not in adapter
+    assert "TmaDeviceSlot" not in adapter
+    assert "cuMemAlloc" not in adapter
 
 
 @pytest.mark.parametrize(
