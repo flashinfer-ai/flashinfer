@@ -276,8 +276,7 @@ def dcp_balanced_program_variants(family: str) -> Optional[Mapping[str, Any]]:
     the program from launch metadata (:func:`flashinfer.cake_dcp.dcp_balanced_program`).
     """
 
-    addon = get_cake_fmha_manifest()["add_ons"]["cake_fmha_dcp_spec"]
-    route = addon["manifest"].get("balanced_routes", {}).get(family)
+    route = get_dcp_spec_registry()["balanced_routes"].get(family)
     return None if route is None else route.get("program_variants")
 
 
