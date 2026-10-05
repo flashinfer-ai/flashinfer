@@ -179,7 +179,7 @@ void Run(TensorView arg_dt, TensorView arg_A, TensorView arg_dt_bias, TensorView
   CheckDtype(arg_chunk_offsets, "chunk_offsets", 0, 32, 1);
   CheckContiguous(arg_chunk_offsets, "chunk_offsets");
   CheckCudaTensor(arg_delta, "delta");
-  CheckDtype(arg_delta, "delta", 4, 16, 1);
+  CheckDtype(arg_delta, "delta", 2, 32, 1);
   CheckContiguous(arg_delta, "delta");
   CheckCudaTensor(arg_cumsum, "cumsum");
   CheckDtype(arg_cumsum, "cumsum", 2, 32, 1);

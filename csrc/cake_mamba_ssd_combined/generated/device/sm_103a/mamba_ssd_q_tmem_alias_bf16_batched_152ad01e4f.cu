@@ -39,15 +39,15 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_SMEM_STATE_STAGE_BYTES 16384
 #define SMEM_SMEM_STATE_STRIDE 16384
 #define SMEM_SMEM_DELTA_ALL_OFF 197632
-#define SMEM_SMEM_DELTA_ALL_STAGE_BYTES 512
-#define SMEM_SMEM_DELTA_ALL_STRIDE 512
-#define SMEM_SMEM_CUMSUM_ALL_OFF 198144
+#define SMEM_SMEM_DELTA_ALL_STAGE_BYTES 1024
+#define SMEM_SMEM_DELTA_ALL_STRIDE 1024
+#define SMEM_SMEM_CUMSUM_ALL_OFF 198656
 #define SMEM_SMEM_CUMSUM_ALL_STAGE_BYTES 1024
 #define SMEM_SMEM_CUMSUM_ALL_STRIDE 1024
-#define SMEM_SMEM_Y_OFF 199168
+#define SMEM_SMEM_Y_OFF 199680
 #define SMEM_SMEM_Y_STAGE_BYTES 16384
 #define SMEM_SMEM_Y_STRIDE 16384
-#define SMEM_TOTAL 231936
+#define SMEM_TOTAL 232448
 #define THREADS 512
 
 #include <math_constants.h>
@@ -428,7 +428,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __nv_bfloat16* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ initial_states, __nv_bfloat16* __restrict__ final_states, __nv_bfloat16* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int has_seq_chunk_cumsum, int seq_idx_int64, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
+kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, float* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ initial_states, __nv_bfloat16* __restrict__ final_states, __nv_bfloat16* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int has_seq_chunk_cumsum, int seq_idx_int64, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -454,12 +454,14 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x
     const int smem_scaled_b_addr = smem + 164864;
     __nv_bfloat16* smem_state = reinterpret_cast<__nv_bfloat16*>(smem_raw + 164864);
     const int smem_state_addr = smem + 164864;
-    __nv_bfloat16* smem_delta_all = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
+    float* smem_delta_all = reinterpret_cast<float*>(smem_raw + 197632);
     const int smem_delta_all_addr = smem + 197632;
-    float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + 198144);
-    const int smem_cumsum_all_addr = smem + 198144;
-    __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 199168);
-    const int smem_y_addr = smem + 199168;
+    float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + 198656);
+    const int smem_cumsum_all_addr = smem + 198656;
+    __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 199680);
+    // FP32 delta makes the output tile 1024-byte aligned. TMA stores no
+    // longer need the old 512-byte-origin row XOR compensation.
+    const int smem_y_addr = smem + 199680;
 
     // Mbarrier init (17 groups, 25 barriers)
     // Mbarriers at smem_raw[0..200)
@@ -941,7 +943,7 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x
                         int physical_token = group_start + local;
                         int factor_token = physical_token - segment_offset_1;
                         float cumsum_value = 0.0f;
-                        __nv_bfloat16 delta_value = 0.0f;
+                        float delta_value = 0.0f;
                         if (physical_token >= segment_offset_1 && physical_token < segment_limit_1) {
                             cumsum_value = cumsum_precomputed[tile * 128 + factor_token];
                             delta_value = delta_precomputed[tile * 128 + factor_token];
@@ -1077,7 +1079,7 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x
                                 }
                                 float _exp2_1 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage_4 * 128 + (unsigned int)col]) * 1.4426950408889634f);
                                 float b_scale = _exp2_1;
-                                float _cvt_f32_0 = __bfloat162float(smem_delta_all[input_stage_4 * 128 + (unsigned int)col]);
+                                float _cvt_f32_0 = smem_delta_all[input_stage_4 * 128 + (unsigned int)col];
                                 b_scale *= _cvt_f32_0;
                                 const float2 _scale2_1 = {b_scale, b_scale};
                                 #pragma unroll
@@ -1383,7 +1385,7 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x
                                             {
                                                 __nv_bfloat16 _bval_0 = __float2bfloat16_rn(value);
                                                 uint16_t _bits_0 = *(uint16_t*)&_bval_0;
-                                                uint32_t _addr_0 = static_cast<uint32_t>((smem_y_addr + output_stage * 16384 + (unsigned int)((row_1 ^ 32) / 64 * 8192 + dim_3 * 128 + (row_1 ^ 32) % 64 * 2 ^ ((row_1 ^ 32) / 64 * 8192 + dim_3 * 128 + (row_1 ^ 32) % 64 * 2 >> 7 & 7) << 4)));
+                                                uint32_t _addr_0 = static_cast<uint32_t>((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 / 64 * 8192 + dim_3 * 128 + row_1 % 64 * 2 ^ (row_1 / 64 * 8192 + dim_3 * 128 + row_1 % 64 * 2 >> 7 & 7) << 4)));
                                                 asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_0), "h"(_bits_0) : "memory");
                                             }
                                         }
@@ -1436,4 +1438,3 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched(const __grid_constant__ CUtensorMap x
 }
 
 } // extern "C"
-

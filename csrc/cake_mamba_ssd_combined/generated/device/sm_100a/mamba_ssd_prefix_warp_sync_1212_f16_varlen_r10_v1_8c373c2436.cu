@@ -40,15 +40,15 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_SMEM_STATE_STAGE_BYTES 16384
 #define SMEM_SMEM_STATE_STRIDE 16384
 #define SMEM_SMEM_DELTA_ALL_OFF 115712
-#define SMEM_SMEM_DELTA_ALL_STAGE_BYTES 256
-#define SMEM_SMEM_DELTA_ALL_STRIDE 256
-#define SMEM_SMEM_CUMSUM_ALL_OFF 115968
+#define SMEM_SMEM_DELTA_ALL_STAGE_BYTES 512
+#define SMEM_SMEM_DELTA_ALL_STRIDE 512
+#define SMEM_SMEM_CUMSUM_ALL_OFF 116224
 #define SMEM_SMEM_CUMSUM_ALL_STAGE_BYTES 512
 #define SMEM_SMEM_CUMSUM_ALL_STRIDE 512
-#define SMEM_SMEM_Y_OFF 116480
+#define SMEM_SMEM_Y_OFF 116736
 #define SMEM_SMEM_Y_STAGE_BYTES 16384
 #define SMEM_SMEM_Y_STRIDE 16384
-#define SMEM_TOTAL 149248
+#define SMEM_TOTAL 149504
 #define THREADS 512
 
 #include <math_constants.h>
@@ -422,7 +422,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __nv_bfloat16* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __half* __restrict__ initial_states, __half* __restrict__ final_states, __half* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int has_seq_chunk_cumsum, int seq_idx_int64, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
+kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, float* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __half* __restrict__ initial_states, __half* __restrict__ final_states, __half* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int has_seq_chunk_cumsum, int seq_idx_int64, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -448,12 +448,12 @@ kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1(const __grid_constant__
     const int smem_scaled_b_addr = smem + 82944;
     __nv_bfloat16* smem_state = reinterpret_cast<__nv_bfloat16*>(smem_raw + 82944);
     const int smem_state_addr = smem + 82944;
-    __nv_bfloat16* smem_delta_all = reinterpret_cast<__nv_bfloat16*>(smem_raw + 115712);
+    float* smem_delta_all = reinterpret_cast<float*>(smem_raw + 115712);
     const int smem_delta_all_addr = smem + 115712;
-    float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + 115968);
-    const int smem_cumsum_all_addr = smem + 115968;
-    __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 116480);
-    const int smem_y_addr = smem + 116480;
+    float* smem_cumsum_all = reinterpret_cast<float*>(smem_raw + 116224);
+    const int smem_cumsum_all_addr = smem + 116224;
+    __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 116736);
+    const int smem_y_addr = smem + 116736;
 
     // Mbarrier init (16 groups, 18 barriers)
     // Mbarriers at smem_raw[0..144)
@@ -691,7 +691,7 @@ kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1(const __grid_constant__
                                         : "r"(b_packed[_pair]));
                                 }
                                 float b_scale = _exp2_1 * smem_cumsum_all[input_stage * 128 + (unsigned int)col];
-                                float _cvt_f32_0 = __bfloat162float(smem_delta_all[input_stage * 128 + (unsigned int)col]);
+                                float _cvt_f32_0 = smem_delta_all[input_stage * 128 + (unsigned int)col];
                                 b_scale *= _cvt_f32_0;
                                 const float2 _scale2_1 = {b_scale, b_scale};
                                 #pragma unroll
@@ -1282,7 +1282,7 @@ kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1(const __grid_constant__
                         int physical_token = group_start + local;
                         int factor_token = physical_token - segment_offset_2;
                         float cumsum_value = 0.0f;
-                        __nv_bfloat16 delta_value = 0.0f;
+                        float delta_value = 0.0f;
                         if (physical_token >= segment_offset_2 && physical_token < segment_limit_2) {
                             cumsum_value = cumsum_precomputed[tile * 128 + factor_token];
                             delta_value = delta_precomputed[tile * 128 + factor_token];
@@ -1575,4 +1575,3 @@ kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1(const __grid_constant__
 }
 
 } // extern "C"
-

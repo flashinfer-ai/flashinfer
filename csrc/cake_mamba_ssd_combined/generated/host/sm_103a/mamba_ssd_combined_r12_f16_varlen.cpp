@@ -211,7 +211,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_
   CheckDtype(arg_chunk_offsets, "chunk_offsets", 0, 32, 1);
   CheckContiguous(arg_chunk_offsets, "chunk_offsets");
   CheckCudaTensor(arg_delta, "delta");
-  CheckDtype(arg_delta, "delta", 4, 16, 1);
+  CheckDtype(arg_delta, "delta", 2, 32, 1);
   CheckContiguous(arg_delta, "delta");
   CheckCudaTensor(arg_cumsum, "cumsum");
   CheckDtype(arg_cumsum, "cumsum", 2, 32, 1);
@@ -562,7 +562,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   CheckDtype(arg_dt, "dt", 2, 32, 1);
   CheckContiguous(arg_dt, "dt");
   CheckCudaTensor(arg_delta_precomputed, "delta_precomputed");
-  CheckDtype(arg_delta_precomputed, "delta_precomputed", 4, 16, 1);
+  CheckDtype(arg_delta_precomputed, "delta_precomputed", 2, 32, 1);
   CheckContiguous(arg_delta_precomputed, "delta_precomputed");
   CheckCudaTensor(arg_cumsum_precomputed, "cumsum_precomputed");
   CheckDtype(arg_cumsum_precomputed, "cumsum_precomputed", 2, 32, 1);
@@ -725,7 +725,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   prepared.kernel = &Kernel();
   static signed char cake_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = CakeConfigureDynamicSmem(
-      Kernel(), (int)arg_x_map.device().device_id, 149248,
+      Kernel(), (int)arg_x_map.device().device_id, 149504,
       cake_smem_mode_cache, 64);
   TVM_FFI_CHECK(!use_oversized_smem, RuntimeError)
       << "oversized dynamic shared memory requires the extended (cluster) launch path";
@@ -821,7 +821,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
 
 inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      prepared.kernel->Launch(prepared.kargs, prepared.grid, prepared.block, stream, 149248u));
+      prepared.kernel->Launch(prepared.kargs, prepared.grid, prepared.block, stream, 149504u));
 }
 }  // namespace stage_main
 

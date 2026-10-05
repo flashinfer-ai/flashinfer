@@ -92,7 +92,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -293,14 +293,14 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-            "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6",
+            "sha256": "e21b5df57e4a26decb80b0b710809f69115090612e93f877a587828323232638",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_batched.cpp",
-          "sha256": "4a04d30045670a9f678122324d89c84d3753a6fbbb86a9da341beba7d5a696a6"
+          "sha256": "8a6f2fd74a361d2ead2f8fc0e8470c56f8894eac76caf138dd36ea309068026d"
         },
         "launch_count": 2,
         "stage_order": [
@@ -506,7 +506,7 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-            "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6",
+            "sha256": "e21b5df57e4a26decb80b0b710809f69115090612e93f877a587828323232638",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -597,7 +597,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -693,7 +693,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -894,14 +894,14 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-            "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6",
+            "sha256": "e21b5df57e4a26decb80b0b710809f69115090612e93f877a587828323232638",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_batched.cpp",
-          "sha256": "2c392e97f143807040ae65adecb9e5a325e2df066731c69ca99b68f5c91803c1"
+          "sha256": "a6c37d2431c4ac1a76a7870b046ea3d0639206eeb9d777425a0ec0e524c4732b"
         },
         "launch_count": 2,
         "stage_order": [
@@ -1107,7 +1107,7 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-            "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6",
+            "sha256": "e21b5df57e4a26decb80b0b710809f69115090612e93f877a587828323232638",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -1198,7 +1198,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -1296,7 +1296,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -1497,14 +1497,14 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-            "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9",
+            "sha256": "c0a20ebb95fffbde439f649d2e832157bebfb0e1f591ebfe44d2918eb105b3fd",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-          "sha256": "5901c4c02c2f2fe2d6f6f75fbc1a9c33a2649aa88e77a1e62bf725bc714802b9"
+          "sha256": "83f539c95ae83787a47845529f3c3c2c2ae193b651d97934cbcc483b8c778f5f"
         },
         "launch_count": 2,
         "stage_order": [
@@ -1710,7 +1710,7 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-            "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9",
+            "sha256": "c0a20ebb95fffbde439f649d2e832157bebfb0e1f591ebfe44d2918eb105b3fd",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -1801,7 +1801,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -1897,7 +1897,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -2098,14 +2098,14 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-            "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9",
+            "sha256": "c0a20ebb95fffbde439f649d2e832157bebfb0e1f591ebfe44d2918eb105b3fd",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-          "sha256": "bab1905bde254c634c14128132f23132f115ef0c08ebc718079e2d61645029f1"
+          "sha256": "f01f484cf85e86208a418aa22e1191092305da61c3e9012939a3f0cdff7f804e"
         },
         "launch_count": 2,
         "stage_order": [
@@ -2311,7 +2311,7 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-            "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9",
+            "sha256": "c0a20ebb95fffbde439f649d2e832157bebfb0e1f591ebfe44d2918eb105b3fd",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -2402,7 +2402,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -2500,7 +2500,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -2701,14 +2701,14 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-            "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692",
+            "sha256": "b9438324d035ce54253f3ae8ec6ad48d049b36248633ebce88db0fd7cd1ffd6c",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_exact_f16_batched.cpp",
-          "sha256": "61596d69ec4bc3c583ff51b6486d0d264b5796adead899cb2f9d1454e983c119"
+          "sha256": "196966ab6d33ba395da5cdcaf270406d6be6df711321ce52df7e225cd71929fd"
         },
         "launch_count": 2,
         "stage_order": [
@@ -2914,7 +2914,7 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-            "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692",
+            "sha256": "b9438324d035ce54253f3ae8ec6ad48d049b36248633ebce88db0fd7cd1ffd6c",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -3005,7 +3005,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -3101,7 +3101,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -3302,14 +3302,14 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-            "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692",
+            "sha256": "b9438324d035ce54253f3ae8ec6ad48d049b36248633ebce88db0fd7cd1ffd6c",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_exact_f16_batched.cpp",
-          "sha256": "0421eb5a05be74eb173c8b57cd8ee983f6099f9469294e44e6bcd981004aead9"
+          "sha256": "cf014bbfea541a67af9a7e5c915257f97fde144c455d9b1501975579e669caac"
         },
         "launch_count": 2,
         "stage_order": [
@@ -3515,7 +3515,7 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-            "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692",
+            "sha256": "b9438324d035ce54253f3ae8ec6ad48d049b36248633ebce88db0fd7cd1ffd6c",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -3606,7 +3606,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -3704,7 +3704,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -3905,14 +3905,14 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_varlen_1895881324",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-            "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe",
+            "sha256": "d8ebcb3750910ce9e54f186c4f9f2209df46224596caba4c9a1684af7ea6e2ee",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_exact_f16_varlen.cpp",
-          "sha256": "e6edfe7fed0aca29c038e6ed037aa3e2732b6949d77e2d8684b3cc8c86058c1e"
+          "sha256": "bdbeac9a7a694f78229a35938cfb7796c403846360c6353e3db8cc61b452632d"
         },
         "launch_count": 2,
         "stage_order": [
@@ -4118,7 +4118,7 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_varlen_1895881324",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-            "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe",
+            "sha256": "d8ebcb3750910ce9e54f186c4f9f2209df46224596caba4c9a1684af7ea6e2ee",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -4209,7 +4209,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -4305,7 +4305,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -4506,14 +4506,14 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_varlen_1895881324",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-            "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe",
+            "sha256": "d8ebcb3750910ce9e54f186c4f9f2209df46224596caba4c9a1684af7ea6e2ee",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_exact_f16_varlen.cpp",
-          "sha256": "2e643fb55433c18214315d7c430b2b1da5cb5f8ad719713355adac640fd11744"
+          "sha256": "eda79dfcca2b7b59048e93a4a9a437fc25b226d4189bbc180d101a31be3f3a75"
         },
         "launch_count": 2,
         "stage_order": [
@@ -4719,7 +4719,7 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_varlen_1895881324",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-            "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe",
+            "sha256": "d8ebcb3750910ce9e54f186c4f9f2209df46224596caba4c9a1684af7ea6e2ee",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -4810,7 +4810,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -4908,7 +4908,7 @@
             "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
             "module_ident": "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f",
             "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669",
             "tma_abi": "pointer"
           },
           {
@@ -5109,14 +5109,14 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2",
             "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2.cu",
-            "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56",
+            "sha256": "abe66bd694c1d2f74850bd1ae1e05e182c85fa80ea624beddd809ff60de8a216",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-          "sha256": "951f7367c23a607c7291a2b355921b21ef919c3395d350a471930b88b944a6d2"
+          "sha256": "69878a6c6e2eaf8741becfa8b2a3b298e5c49a155d04a39e62f4a075037c66ee"
         },
         "launch_count": 2,
         "stage_order": [
@@ -5322,7 +5322,7 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2",
             "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2.cu",
-            "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56",
+            "sha256": "abe66bd694c1d2f74850bd1ae1e05e182c85fa80ea624beddd809ff60de8a216",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -5413,7 +5413,7 @@
             "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
             "module_ident": "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f",
             "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669",
             "tma_abi": "pointer"
           }
         },
@@ -5509,7 +5509,7 @@
             "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
             "module_ident": "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f",
             "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669",
             "tma_abi": "pointer"
           },
           {
@@ -5710,14 +5710,14 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2",
             "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2.cu",
-            "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56",
+            "sha256": "abe66bd694c1d2f74850bd1ae1e05e182c85fa80ea624beddd809ff60de8a216",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-          "sha256": "d6339f7afc61986bec84506e953175e566b2f34acef26e01d31d318f40e235ba"
+          "sha256": "5151665255c1a196803a4cad821ffc12a508209ecab2d8dc090cf6cd9c2a7678"
         },
         "launch_count": 2,
         "stage_order": [
@@ -5923,7 +5923,7 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2",
             "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2.cu",
-            "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56",
+            "sha256": "abe66bd694c1d2f74850bd1ae1e05e182c85fa80ea624beddd809ff60de8a216",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -6014,7 +6014,7 @@
             "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
             "module_ident": "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f",
             "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669",
             "tma_abi": "pointer"
           }
         },
@@ -6112,7 +6112,7 @@
             "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
             "module_ident": "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f",
             "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669",
             "tma_abi": "pointer"
           },
           {
@@ -6313,14 +6313,14 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436",
             "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-            "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f",
+            "sha256": "b025a2543d347f015cf54404315031fdb6608a95d98b795b245854abb8486c63",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
-          "sha256": "df06b17f47eda0f5063a9b89285c3ebad09be593e8ea3c89754ff20ec924ad98"
+          "sha256": "98f8b16bc70688cebdccd23c592a4bdbe1082b713b2c9a939d16c17caf61f766"
         },
         "launch_count": 2,
         "stage_order": [
@@ -6526,7 +6526,7 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436",
             "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-            "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f",
+            "sha256": "b025a2543d347f015cf54404315031fdb6608a95d98b795b245854abb8486c63",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -6617,7 +6617,7 @@
             "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
             "module_ident": "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f",
             "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669",
             "tma_abi": "pointer"
           }
         },
@@ -6713,7 +6713,7 @@
             "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
             "module_ident": "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f",
             "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669",
             "tma_abi": "pointer"
           },
           {
@@ -6914,14 +6914,14 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436",
             "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-            "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f",
+            "sha256": "b025a2543d347f015cf54404315031fdb6608a95d98b795b245854abb8486c63",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
-          "sha256": "0341ab749ce48037a5d3fd1f7e28803a374fd6c4fa97542433ff0926fe86ad78"
+          "sha256": "61d88d05448a877033b3ca8addaf8c2fcfcb5fc4a34e42985d8e03d5c170cd64"
         },
         "launch_count": 2,
         "stage_order": [
@@ -7127,7 +7127,7 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436",
             "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-            "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f",
+            "sha256": "b025a2543d347f015cf54404315031fdb6608a95d98b795b245854abb8486c63",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -7218,7 +7218,7 @@
             "kernel_name": "kernel_prefix_factorized_segment_preprocess_onewarp",
             "module_ident": "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f",
             "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-            "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861",
+            "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669",
             "tma_abi": "pointer"
           }
         },
@@ -7316,7 +7316,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -7517,14 +7517,14 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0",
             "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0.cu",
-            "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a",
+            "sha256": "ef3c6452f362d2d49dce9b5da1016a4bca0d3cd9a657897f4c14053a5b4858d5",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-          "sha256": "6a8dca04e5037f66d730634cca379f5449f1267bed2583ce66f4c76a3bbdce4d"
+          "sha256": "d1749d069dd178aa96417dfa731576cb3c14add994b2dfc1d0fadd27d4288d44"
         },
         "launch_count": 2,
         "stage_order": [
@@ -7730,7 +7730,7 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0",
             "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0.cu",
-            "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a",
+            "sha256": "ef3c6452f362d2d49dce9b5da1016a4bca0d3cd9a657897f4c14053a5b4858d5",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -7821,7 +7821,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -7917,7 +7917,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -8118,14 +8118,14 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0",
             "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0.cu",
-            "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a",
+            "sha256": "ef3c6452f362d2d49dce9b5da1016a4bca0d3cd9a657897f4c14053a5b4858d5",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-          "sha256": "8d9a3be7da43790785dde93ea6a811cfc3739e54a47be81d1dfa5aa71dea0a96"
+          "sha256": "29780c04b31a13024d196eaee8848545a3304de4dfbe7db8695c84d760631925"
         },
         "launch_count": 2,
         "stage_order": [
@@ -8331,7 +8331,7 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0",
             "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0.cu",
-            "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a",
+            "sha256": "ef3c6452f362d2d49dce9b5da1016a4bca0d3cd9a657897f4c14053a5b4858d5",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -8422,7 +8422,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -8520,7 +8520,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -8721,14 +8721,14 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2",
             "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-            "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec",
+            "sha256": "edb74ae5cb5eb3af024e3ebf37e7a709d5266f1c937de3252dc8d5d8e1d13c64",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r7_f16_varlen.cpp",
-          "sha256": "844aa60d4bf2714a5f6ba4ce43eeabcbca17ac76b2fb9edbd0e8fbba2f991b9d"
+          "sha256": "3cff24990b8e88760b5bbb48a6c14db0385edba11bbe516370006e1bc7a277f5"
         },
         "launch_count": 2,
         "stage_order": [
@@ -8934,7 +8934,7 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2",
             "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-            "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec",
+            "sha256": "edb74ae5cb5eb3af024e3ebf37e7a709d5266f1c937de3252dc8d5d8e1d13c64",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -9025,7 +9025,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -9121,7 +9121,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           },
           {
@@ -9322,14 +9322,14 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2",
             "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-            "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec",
+            "sha256": "edb74ae5cb5eb3af024e3ebf37e7a709d5266f1c937de3252dc8d5d8e1d13c64",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r7_f16_varlen.cpp",
-          "sha256": "a5fa3d68368a2843359a067baf8cda6a500d651d8cf5f9f14dee212ba816dd48"
+          "sha256": "5a44029ae8d1604f3ce0d3c12903321ae0597ae29837c612dff74df0cdb88416"
         },
         "launch_count": 2,
         "stage_order": [
@@ -9535,7 +9535,7 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2",
             "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-            "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec",
+            "sha256": "edb74ae5cb5eb3af024e3ebf37e7a709d5266f1c937de3252dc8d5d8e1d13c64",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -9626,7 +9626,7 @@
             "kernel_name": "kernel_factorized_persistent_segment_preprocess",
             "module_ident": "factorized_persistent_segment_preprocess_7ae61d5f32",
             "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217",
             "tma_abi": "pointer"
           }
         },
@@ -9639,155 +9639,155 @@
   "source_inventory": [
     {
       "path": "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-      "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06"
+      "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217"
     },
     {
       "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0.cu",
-      "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a"
+      "sha256": "ef3c6452f362d2d49dce9b5da1016a4bca0d3cd9a657897f4c14053a5b4858d5"
     },
     {
       "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-      "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec"
+      "sha256": "edb74ae5cb5eb3af024e3ebf37e7a709d5266f1c937de3252dc8d5d8e1d13c64"
     },
     {
       "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2.cu",
-      "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56"
+      "sha256": "abe66bd694c1d2f74850bd1ae1e05e182c85fa80ea624beddd809ff60de8a216"
     },
     {
       "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-      "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f"
+      "sha256": "b025a2543d347f015cf54404315031fdb6608a95d98b795b245854abb8486c63"
     },
     {
       "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-      "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6"
+      "sha256": "e21b5df57e4a26decb80b0b710809f69115090612e93f877a587828323232638"
     },
     {
       "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-      "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9"
+      "sha256": "c0a20ebb95fffbde439f649d2e832157bebfb0e1f591ebfe44d2918eb105b3fd"
     },
     {
       "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-      "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692"
+      "sha256": "b9438324d035ce54253f3ae8ec6ad48d049b36248633ebce88db0fd7cd1ffd6c"
     },
     {
       "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-      "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe"
+      "sha256": "d8ebcb3750910ce9e54f186c4f9f2209df46224596caba4c9a1684af7ea6e2ee"
     },
     {
       "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-      "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861"
+      "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669"
     },
     {
       "path": "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-      "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06"
+      "sha256": "3affcf8f2f5b4715268475c0cc613b71bb80d073e54e43778d4f80a2554c9217"
     },
     {
       "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_c551a2b2f0.cu",
-      "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a"
+      "sha256": "ef3c6452f362d2d49dce9b5da1016a4bca0d3cd9a657897f4c14053a5b4858d5"
     },
     {
       "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-      "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec"
+      "sha256": "edb74ae5cb5eb3af024e3ebf37e7a709d5266f1c937de3252dc8d5d8e1d13c64"
     },
     {
       "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_a872ac4eb2.cu",
-      "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56"
+      "sha256": "abe66bd694c1d2f74850bd1ae1e05e182c85fa80ea624beddd809ff60de8a216"
     },
     {
       "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-      "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f"
+      "sha256": "b025a2543d347f015cf54404315031fdb6608a95d98b795b245854abb8486c63"
     },
     {
       "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-      "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6"
+      "sha256": "e21b5df57e4a26decb80b0b710809f69115090612e93f877a587828323232638"
     },
     {
       "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-      "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9"
+      "sha256": "c0a20ebb95fffbde439f649d2e832157bebfb0e1f591ebfe44d2918eb105b3fd"
     },
     {
       "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-      "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692"
+      "sha256": "b9438324d035ce54253f3ae8ec6ad48d049b36248633ebce88db0fd7cd1ffd6c"
     },
     {
       "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-      "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe"
+      "sha256": "d8ebcb3750910ce9e54f186c4f9f2209df46224596caba4c9a1684af7ea6e2ee"
     },
     {
       "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-      "sha256": "a465e58bdecb4c3e9c9d48fa5db612ef9339c5e13e64a0c1c942e0b8cdd28861"
+      "sha256": "f2d7f209c5d6317938b3ce60a7fcddb6c78e66c360c6f9e75b8c6f1c16ec3669"
     },
     {
       "path": "host/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cpp",
-      "sha256": "b90741a2e9fb16e063e9374a699c8cb381277a0b4e2c9307a8c936fe6d489a75"
+      "sha256": "d73872951f87330a911651346db312513dd18bf15100d25acdd485875d398289"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_batched.cpp",
-      "sha256": "4a04d30045670a9f678122324d89c84d3753a6fbbb86a9da341beba7d5a696a6"
+      "sha256": "8a6f2fd74a361d2ead2f8fc0e8470c56f8894eac76caf138dd36ea309068026d"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-      "sha256": "5901c4c02c2f2fe2d6f6f75fbc1a9c33a2649aa88e77a1e62bf725bc714802b9"
+      "sha256": "83f539c95ae83787a47845529f3c3c2c2ae193b651d97934cbcc483b8c778f5f"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_exact_f16_batched.cpp",
-      "sha256": "61596d69ec4bc3c583ff51b6486d0d264b5796adead899cb2f9d1454e983c119"
+      "sha256": "196966ab6d33ba395da5cdcaf270406d6be6df711321ce52df7e225cd71929fd"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_exact_f16_varlen.cpp",
-      "sha256": "e6edfe7fed0aca29c038e6ed037aa3e2732b6949d77e2d8684b3cc8c86058c1e"
+      "sha256": "bdbeac9a7a694f78229a35938cfb7796c403846360c6353e3db8cc61b452632d"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-      "sha256": "951f7367c23a607c7291a2b355921b21ef919c3395d350a471930b88b944a6d2"
+      "sha256": "69878a6c6e2eaf8741becfa8b2a3b298e5c49a155d04a39e62f4a075037c66ee"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
-      "sha256": "df06b17f47eda0f5063a9b89285c3ebad09be593e8ea3c89754ff20ec924ad98"
+      "sha256": "98f8b16bc70688cebdccd23c592a4bdbe1082b713b2c9a939d16c17caf61f766"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-      "sha256": "6a8dca04e5037f66d730634cca379f5449f1267bed2583ce66f4c76a3bbdce4d"
+      "sha256": "d1749d069dd178aa96417dfa731576cb3c14add994b2dfc1d0fadd27d4288d44"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r7_f16_varlen.cpp",
-      "sha256": "844aa60d4bf2714a5f6ba4ce43eeabcbca17ac76b2fb9edbd0e8fbba2f991b9d"
+      "sha256": "3cff24990b8e88760b5bbb48a6c14db0385edba11bbe516370006e1bc7a277f5"
     },
     {
       "path": "host/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cpp",
-      "sha256": "1cedeb99e00930a00bf7da6de61b360c295f0a894e0d623c86cb7287b97210c5"
+      "sha256": "3654e8b207e39217f70ef538c78b48dc6afcfe4f5ac25839b241ab427340e7d2"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_batched.cpp",
-      "sha256": "2c392e97f143807040ae65adecb9e5a325e2df066731c69ca99b68f5c91803c1"
+      "sha256": "a6c37d2431c4ac1a76a7870b046ea3d0639206eeb9d777425a0ec0e524c4732b"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-      "sha256": "bab1905bde254c634c14128132f23132f115ef0c08ebc718079e2d61645029f1"
+      "sha256": "f01f484cf85e86208a418aa22e1191092305da61c3e9012939a3f0cdff7f804e"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_exact_f16_batched.cpp",
-      "sha256": "0421eb5a05be74eb173c8b57cd8ee983f6099f9469294e44e6bcd981004aead9"
+      "sha256": "cf014bbfea541a67af9a7e5c915257f97fde144c455d9b1501975579e669caac"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_exact_f16_varlen.cpp",
-      "sha256": "2e643fb55433c18214315d7c430b2b1da5cb5f8ad719713355adac640fd11744"
+      "sha256": "eda79dfcca2b7b59048e93a4a9a437fc25b226d4189bbc180d101a31be3f3a75"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-      "sha256": "d6339f7afc61986bec84506e953175e566b2f34acef26e01d31d318f40e235ba"
+      "sha256": "5151665255c1a196803a4cad821ffc12a508209ecab2d8dc090cf6cd9c2a7678"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
-      "sha256": "0341ab749ce48037a5d3fd1f7e28803a374fd6c4fa97542433ff0926fe86ad78"
+      "sha256": "61d88d05448a877033b3ca8addaf8c2fcfcb5fc4a34e42985d8e03d5c170cd64"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-      "sha256": "8d9a3be7da43790785dde93ea6a811cfc3739e54a47be81d1dfa5aa71dea0a96"
+      "sha256": "29780c04b31a13024d196eaee8848545a3304de4dfbe7db8695c84d760631925"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r7_f16_varlen.cpp",
-      "sha256": "a5fa3d68368a2843359a067baf8cda6a500d651d8cf5f9f14dee212ba816dd48"
+      "sha256": "5a44029ae8d1604f3ce0d3c12903321ae0597ae29837c612dff74df0cdb88416"
     }
   ],
   "source_status": "terminal"

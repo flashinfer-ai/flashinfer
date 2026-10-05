@@ -597,7 +597,9 @@ class CakeSSDCombined:
                 "lengths": lengths,
                 "sequence_offsets": sequence_offsets,
                 "delta": torch.empty(
-                    (tile_count, _CHUNK_SIZE), dtype=torch.bfloat16, device=device
+                    # Keep transformed dt in FP32 until scaled B / Q is formed.
+                    # BF16 here adds an avoidable rounding before the MMA cast.
+                    (tile_count, _CHUNK_SIZE), dtype=torch.float32, device=device
                 ),
                 "cumsum": torch.empty(
                     (tile_count, _CHUNK_SIZE), dtype=torch.float32, device=device

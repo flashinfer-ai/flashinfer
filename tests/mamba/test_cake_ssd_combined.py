@@ -229,6 +229,32 @@ def test_cake_ssd_combined_route_matrix(
     _assert_cute_parity(actual, expected, nheads=nheads, ngroups=ngroups)
 
 
+@pytest.mark.parametrize("state_dtype", (torch.float16, torch.bfloat16))
+def test_cake_ssd_batched_output_swizzle(state_dtype):
+    """Moving the output tile must preserve the TMA swizzle origin.
+
+    With no recurrent contribution, D=1 and no gate, y=x exactly. This
+    detects the token permutation caused by retaining the old row XOR after
+    widening delta shifts the output tile to a 1024-byte-aligned address.
+    """
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+    constructor, tensors, arguments = _case(state_dtype=state_dtype, d_has_hdim=False)
+    x, _, _, B, C = tensors
+    x.copy_(
+        (torch.arange(x.numel(), device=x.device) % 251).reshape(x.shape).float() / 128
+    )
+    B.zero_()
+    C.zero_()
+    arguments["initial_states"].zero_()
+    arguments["D"].fill_(1)
+    arguments["z"] = None
+    constructor["has_z"] = False
+    out, final = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
+    torch.testing.assert_close(out, x, rtol=0, atol=0)
+    assert torch.count_nonzero(final) == 0
+
+
 def test_cake_ssd_combined_accepts_framework_strided_input_views():
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
