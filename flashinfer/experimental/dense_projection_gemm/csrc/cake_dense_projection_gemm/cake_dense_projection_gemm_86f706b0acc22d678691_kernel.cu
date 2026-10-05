@@ -50,7 +50,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 5
+#define NUM_TMA_PIPE_STAGES 6
 #define NUM_MAINLOOP_PIPE_STAGES 2
 #define NUM_WORK_PIPE_STAGES 4
 #define SMEM_SMEM_A_OFF 1024
@@ -59,7 +59,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_B_OFF 17408
 #define SMEM_SMEM_B_STAGE_BYTES 16384
 #define SMEM_SMEM_B_STRIDE 32768
-#define SMEM_SMEM_OUT_OFF 164864
+#define SMEM_SMEM_OUT_OFF 197632
 #define SMEM_SMEM_OUT_STAGE_BYTES 4096
 #define SMEM_SMEM_OUT_STRIDE 4096
 #define SMEM_WORK_RESPONSE_OFF 230400
@@ -159,21 +159,13 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
 }
 
 
-__device__ __forceinline__ void tma_store_3d(
-    const void *tmap, int x, int y, int z, unsigned smem_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
-        " [%0, {%1, %2, %3}], [%4];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(smem_addr) : "memory");
-}
-
 
 
 
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap OUT32, const __grid_constant__ CUtensorMap OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int group_m, int promo_code, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
+kernel_cake_dense_projection_gemm_86f706b0acc22d678691(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap OUT32, const __grid_constant__ CUtensorMap OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int group_m, int promo_code, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -190,11 +182,11 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
-    #define mma_done_addr (mbar_base + 40)
-    #define mainloop_done_addr (mbar_base + 80)
-    #define epilogue_done_addr (mbar_base + 96)
-    #define work_full_addr (mbar_base + 112)
-    #define work_empty_addr (mbar_base + 144)
+    #define mma_done_addr (mbar_base + 48)
+    #define mainloop_done_addr (mbar_base + 96)
+    #define epilogue_done_addr (mbar_base + 112)
+    #define work_full_addr (mbar_base + 128)
+    #define work_empty_addr (mbar_base + 160)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -210,48 +202,50 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
     const int smem_a_addr = smem + 1024;
     __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
-    __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 164864);
-    const int smem_out_addr = smem + 164864;
+    __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
+    const int smem_out_addr = smem + 197632;
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 230400);
     const int work_response_addr = smem + 230400;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 22 barriers)
-    // Mbarriers at smem_raw[0..176)
+    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 24 barriers)
+    // Mbarriers at smem_raw[0..192)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // tma_full: 5 barriers, init_count=2
+            // tma_full: 6 barriers, init_count=2
             mbarrier_init(smem + 0, 2);
             mbarrier_init(smem + 8, 2);
             mbarrier_init(smem + 16, 2);
             mbarrier_init(smem + 24, 2);
             mbarrier_init(smem + 32, 2);
-            // mma_done: 5 barriers, init_count=1
-            mbarrier_init(smem + 40, 1);
+            mbarrier_init(smem + 40, 2);
+            // mma_done: 6 barriers, init_count=1
             mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
-            // --- pipeline 'mainloop_pipe' ---
-            // mainloop_done: 2 barriers, init_count=1
             mbarrier_init(smem + 80, 1);
             mbarrier_init(smem + 88, 1);
+            // --- pipeline 'mainloop_pipe' ---
+            // mainloop_done: 2 barriers, init_count=1
+            mbarrier_init(smem + 96, 1);
+            mbarrier_init(smem + 104, 1);
             // epilogue_done: 2 barriers, init_count=16
-            mbarrier_init(smem + 96, 16);
-            mbarrier_init(smem + 104, 16);
+            mbarrier_init(smem + 112, 16);
+            mbarrier_init(smem + 120, 16);
             // --- pipeline 'work_pipe' ---
             // work_full: 4 barriers, init_count=1
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 120, 1);
             mbarrier_init(smem + 128, 1);
             mbarrier_init(smem + 136, 1);
+            mbarrier_init(smem + 144, 1);
+            mbarrier_init(smem + 152, 1);
             // work_empty: 4 barriers, init_count=546
-            mbarrier_init(smem + 144, 546);
-            mbarrier_init(smem + 152, 546);
             mbarrier_init(smem + 160, 546);
             mbarrier_init(smem + 168, 546);
+            mbarrier_init(smem + 176, 546);
+            mbarrier_init(smem + 184, 546);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -262,9 +256,9 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 176);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
     if (warp == 0) {
-        int _tmem_hold = smem + 176;
+        int _tmem_hold = smem + 192;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -341,8 +335,12 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
                         int tail_t = ((u_0 < 0) ? -1 : t);
                         int tiles_per_l = m_tiles * n_tiles;
                         int tiles_per_group = group_m * n_tiles;
-                        int head = tile_bid / tiles_per_l;
-                        int rem = tile_bid - head * tiles_per_l;
+                        int pair_x = tile_bid / 2;
+                        int blk_sz = 8 * (tiles_per_l / 2);
+                        int blk = pair_x / blk_sz;
+                        int inb = pair_x - blk * blk_sz;
+                        int head = blk * 8 + inb % 8;
+                        int rem = inb / 8 * 2 + (tile_bid - pair_x * 2);
                         int group = rem / tiles_per_group;
                         int first_m = group * group_m;
                         int remaining = m_tiles - first_m;
@@ -373,7 +371,7 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
                                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                                 :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                             load_stage += 1;
-                            if (load_stage == 5) { load_stage = 0; _phase_mma_done ^= 1; }
+                            if (load_stage == 6) { load_stage = 0; _phase_mma_done ^= 1; }
                         }
                     }
                     mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
@@ -500,7 +498,7 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accum + (mma_epi_stage * 256))), "r"(((init_flag) ? 0 : 1)));
                             elect_commit_cg2_multicast(mma_done_addr + (mma_tma_stage) * 8, (uint16_t)(3));
                             mma_tma_stage += 1;
-                            if (mma_tma_stage == 5) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
+                            if (mma_tma_stage == 6) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                         }
                         elect_commit_cg2_multicast(mainloop_done_addr + (mma_epi_stage) * 8, (uint16_t)(3));
                         mma_epi_stage += 1;
@@ -593,8 +591,12 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
                     int tail_t_2 = ((u_0_2 < 0) ? -1 : t_2);
                     int tiles_per_l_1 = m_tiles * n_tiles;
                     int tiles_per_group_1 = group_m * n_tiles;
-                    int head_1 = tile_bid_2 / tiles_per_l_1;
-                    int rem_1 = tile_bid_2 - head_1 * tiles_per_l_1;
+                    int pair_x_1 = tile_bid_2 / 2;
+                    int blk_sz_1 = 8 * (tiles_per_l_1 / 2);
+                    int blk_1 = pair_x_1 / blk_sz_1;
+                    int inb_1 = pair_x_1 - blk_1 * blk_sz_1;
+                    int head_1 = blk_1 * 8 + inb_1 % 8;
+                    int rem_1 = inb_1 / 8 * 2 + (tile_bid_2 - pair_x_1 * 2);
                     int group_1 = rem_1 / tiles_per_group_1;
                     int first_m_1 = group_1 * group_m;
                     int remaining_1 = m_tiles - first_m_1;
@@ -638,14 +640,14 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
                             _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
-                        unsigned int slot0 = smem_out_addr + (unsigned int)((warp - 2) * 8192);
+                        unsigned int slot0 = smem_out_addr + (unsigned int)((warp - 2) * 4096);
                         unsigned int row_off = (unsigned int)(lane * 128);
                         int swz = lane & 7;
                         #pragma unroll
                         for (int c = 0; c < 2; c++) {
-                            unsigned int slot = slot0 + (unsigned int)(c % 2 * 4096);
+                            unsigned int slot = slot0;
                             if (lane == 0) {
-                                asm volatile("cp.async.bulk.wait_group.read 1;");
+                                asm volatile("cp.async.bulk.wait_group.read 0;");
                             }
                             __syncwarp();
                             #pragma unroll
@@ -657,7 +659,10 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             __syncwarp();
                             if (lane == 0) {
-                                tma_store_3d((&OUT16), off_n_1 + col0 + c * 64, row0, bidx, slot);
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group.L2::cache_hint"
+                                    " [%0, {%1, %2, %3}], [%4], %5;"
+                                    :: "l"((&OUT16)), "r"(off_n_1 + col0 + c * 64), "r"(row0), "r"(bidx), "r"(slot), "l"(0x14F0000000000000ULL) : "memory");
                                 asm volatile("cp.async.bulk.commit_group;");
                             }
                         }
@@ -758,14 +763,14 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
                                 _tmem_load_0_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            unsigned int slot0_1 = smem_out_addr + (unsigned int)((warp - 2) * 8192);
+                            unsigned int slot0_1 = smem_out_addr + (unsigned int)((warp - 2) * 4096);
                             unsigned int row_off_1 = (unsigned int)(lane * 128);
                             int swz_1 = lane & 7;
                             #pragma unroll
                             for (int c_1 = 0; c_1 < 2; c_1++) {
-                                unsigned int slot_1 = slot0_1 + (unsigned int)(c_1 % 2 * 4096);
+                                unsigned int slot_1 = slot0_1;
                                 if (lane == 0) {
-                                    asm volatile("cp.async.bulk.wait_group.read 1;");
+                                    asm volatile("cp.async.bulk.wait_group.read 0;");
                                 }
                                 __syncwarp();
                                 #pragma unroll
@@ -777,7 +782,10 @@ kernel_cake_dense_projection_gemm_6b8319318b79b11342ca(const __grid_constant__ C
                                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                 __syncwarp();
                                 if (lane == 0) {
-                                    tma_store_3d((&OUT16), off_n_1 + col0 + c_1 * 64, row0, bidx, slot_1);
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group.L2::cache_hint"
+                                        " [%0, {%1, %2, %3}], [%4], %5;"
+                                        :: "l"((&OUT16)), "r"(off_n_1 + col0 + c_1 * 64), "r"(row0), "r"(bidx), "r"(slot_1), "l"(0x14F0000000000000ULL) : "memory");
                                     asm volatile("cp.async.bulk.commit_group;");
                                 }
                             }
