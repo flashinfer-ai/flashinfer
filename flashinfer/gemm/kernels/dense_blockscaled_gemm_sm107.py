@@ -29,6 +29,7 @@
 # This file is ported from CUTLASS's Rubin dense_blockscaled_gemm_persistent.py
 # with modifications for FlashInfer integration (alpha scaling, tensor-based API, wrapper method).
 
+import logging
 import os
 import sys
 from typing import Literal, NamedTuple, Optional, Tuple, Type, Union
@@ -49,6 +50,8 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
+logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2316,7 +2319,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                 m, n, k, l, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
             )
         except testing.CantImplementError as e:
-            print(f"[DSL ERROR] CantImplementError: {e}")
+            # Unsupported autotuning candidates are expected, not kernel failures.
+            logger.debug("Skipping unsupported GEMM candidate: %s", e)
             return False
         return True
 

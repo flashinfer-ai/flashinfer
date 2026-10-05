@@ -28,6 +28,8 @@ from flashinfer.prims_ts.moe.runner import (
     PrimsTsMxfp4Mxfp8MoERunner,
     _moe_topk_ids_init_for_routing,
     _routed_token_capacity,
+    _select_expert_weights,
+    _staged_routing_io,
     _torch_views_of_ffi_tensors,
 )
 
@@ -238,3 +240,56 @@ def test_routed_token_capacity_uses_local_expert_count(monkeypatch):
         == 8
     )
     assert captured[0]["num_experts"] == 4
+
+
+def _routing_inputs(*, ids, weights, hidden=None):
+    hidden = hidden if hidden is not None else torch.empty(4, 8)
+    return MoeRunnerInputs(
+        output=hidden,
+        routing_logits=None,
+        topk_ids=ids,
+        expert_weights=weights,
+        hidden_states=hidden,
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+
+
+def test_staged_routing_io_rewrites_from_logits_2d_placeholders():
+    hidden = torch.empty(4, 8)
+    ids = torch.empty(4, 2, dtype=torch.int32)
+    weights = torch.empty(4, 2, dtype=torch.bfloat16)
+    topk_ids, expert_weights = _staged_routing_io(
+        _routing_inputs(ids=ids, weights=weights, hidden=hidden),
+        {"routing_input_mode": RoutingInputMode.FromLogits},
+    )
+    assert topk_ids.ndim == 1 and topk_ids.numel() == 0
+    assert expert_weights.ndim == 1 and expert_weights.numel() == 0
+
+
+def test_staged_routing_io_rewrites_packed_2d_weight_placeholders():
+    hidden = torch.empty(4, 8)
+    ids = torch.zeros(4, 2, dtype=torch.int32)
+    weights = torch.empty(4, 2, dtype=torch.bfloat16)
+    topk_ids, expert_weights = _staged_routing_io(
+        _routing_inputs(ids=ids, weights=weights, hidden=hidden),
+        {"routing_input_mode": RoutingInputMode.PackedPrecomputed},
+    )
+    assert topk_ids is ids
+    assert expert_weights.ndim == 1
+    assert expert_weights.numel() == 0
+
+
+def test_select_expert_weights_ignores_1d_autotune_placeholder():
+    routed = torch.ones(4, 2, dtype=torch.bfloat16)
+    synthesized = torch.ones(8, dtype=torch.bfloat16)
+    picked = _select_expert_weights(
+        _routing_inputs(
+            ids=torch.zeros(4, 2, dtype=torch.int32),
+            weights=synthesized,
+        ),
+        routed,
+        {"routing_input_mode": RoutingInputMode.PackedPrecomputed},
+    )
+    assert picked is routed

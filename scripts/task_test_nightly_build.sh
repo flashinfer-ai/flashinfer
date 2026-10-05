@@ -53,14 +53,18 @@ echo "Verifying installation..."
 # Run from /tmp to avoid importing local flashinfer/ source directory
 (cd /tmp && python -m flashinfer show-config)
 
-# Copy only test sources into an isolated directory so package tests exercise the
-# installed flashinfer distribution instead of shadowing it with /workspace.
+# Copy test sources and their benchmark fixtures into an isolated directory so
+# package tests exercise the installed distribution instead of /workspace.
 cp -a "${SOURCE_WORKSPACE}/tests" "${TEST_RUN_DIR}/"
+cp -a "${SOURCE_WORKSPACE}/benchmarks" "${TEST_RUN_DIR}/"
 cp -a "${SOURCE_WORKSPACE}/pytest.ini" "${TEST_RUN_DIR}/"
 
 # Run test shard
 echo "Running test shard ${TEST_SHARD}..."
 export SKIP_INSTALL=1
+# Converted parameter matrices select representative cases by default. Nightly
+# package validation exercises their complete Cartesian products.
+export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--full"
 
 # Pass through JIT cache report file if set
 if [ -n "${FLASHINFER_JIT_CACHE_REPORT_FILE}" ]; then
