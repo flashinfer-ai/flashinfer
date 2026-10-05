@@ -1,9 +1,8 @@
-"""JIT loader for the versioned standalone Cake FMHA product."""
+"""JIT loader for the standalone Cake FMHA product."""
 
 from __future__ import annotations
 
 import functools
-import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -21,36 +20,11 @@ from .core import (
 CakeFmhaTarget = Literal["sm100a", "sm103a"]
 CakeFmhaContextExactProfile = Literal["q511", "q257"]
 
-CAKE_FMHA_MANIFEST_SHA256 = (
-    "34d36b82be623eeb5ef38669458abdb8a5779049c500ca8f5af4b8d77769e8bd"
-)
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
-CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "48d627ad25ca192b4606630f6a6b4db803208ff930197acb34143c26dc8129ba"
-)
-
-_FLASHINFER_BINDINGS = (
-    "cake_fmha_jit_binding.cu",
-    "jit/cake_fmha_context_bf16_jit_binding.cu",
-    "jit/cake_fmha_context_fp8_jit_binding.cu",
-    "jit/cake_fmha_context_hd256_jit_binding.cu",
-    "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
-    "jit/cake_fmha_decode_balanced_jit_binding.cu",
-    "jit/cake_fmha_decode_balanced_fp8_jit_binding.cu",
-    "jit/cake_fmha_decode_balanced_hd64_jit_binding.cu",
-    "jit/cake_fmha_decode_balanced_hd256_jit_binding.cu",
-    "jit/cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu",
-    "jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
-    "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
-    "jit/cake_fmha_decode_quant_bf16q_jit_binding.cu",
-    "jit/cake_fmha_decode_quant_fp8_jit_binding.cu",
-    "jit/cake_fmha_dcp_spec_bf16_v1_jit_binding.cu",
-    "jit/cake_fmha_dcp_spec_bf16_v4_jit_binding.cu",
-    "jit/cake_fmha_dcp_spec_bf16_fp8_jit_binding.cu",
-    "jit/cake_fmha_dcp_spec_bf16_balanced_jit_binding.cu",
-    "jit/cake_fmha_dcp_spec_bf16_fp8_balanced_jit_binding.cu",
-    "jit/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_jit_binding.cu",
-)
+# Build tag carried by every Cake FMHA JIT module name.  It is the tag of the
+# last pinned source package, kept so the JIT cache and AOT module names do not
+# change; nothing is hashed at runtime (ninja depfiles track source edits).
+CAKE_FMHA_JIT_TAG = "34d36b82be62_48d627ad25ca"
 
 _TARGET_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
@@ -106,91 +80,32 @@ def get_cake_fmha_csrc_dir() -> Path:
     )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _flashinfer_bindings_sha256(csrc_dir: Path) -> str:
-    digest = hashlib.sha256()
-    for relative_path in _FLASHINFER_BINDINGS:
-        binding = csrc_dir / relative_path
-        if not binding.is_file():
-            raise RuntimeError(
-                f"Cake FMHA FlashInfer binding is missing: {relative_path}"
-            )
-        digest.update(relative_path.encode())
-        digest.update(b"\0")
-        digest.update(binding.read_bytes())
-    return digest.hexdigest()
-
-
 @functools.cache
 def get_cake_fmha_manifest() -> dict[str, Any]:
-    """Load and fully authenticate the checked-in Cake source package."""
+    """Load the checked-in core registry (components, routes, capability)."""
 
-    csrc_dir = get_cake_fmha_csrc_dir()
-    manifest_path = csrc_dir / "manifest.json"
-    digest_path = csrc_dir / "manifest.sha256"
-    actual_digest = _sha256(manifest_path)
-    recorded_digest = digest_path.read_text().split()[0]
-    if actual_digest != CAKE_FMHA_MANIFEST_SHA256 or recorded_digest != actual_digest:
-        raise RuntimeError(
-            "Cake FMHA manifest digest mismatch: "
-            f"expected {CAKE_FMHA_MANIFEST_SHA256}, got {actual_digest}"
-        )
-
-    manifest = json.loads(manifest_path.read_text())
-    if manifest.get("product") != "cake_fmha":
-        raise RuntimeError("Cake FMHA package has an invalid product identifier")
+    registry = json.loads((get_cake_fmha_csrc_dir() / "registry.json").read_text())
+    if registry.get("product") != "cake_fmha":
+        raise RuntimeError("Cake FMHA registry has an invalid product identifier")
     if (
-        manifest.get("flashinfer_matrix_revision")
+        registry.get("flashinfer_matrix_revision")
         != CAKE_FMHA_FLASHINFER_MATRIX_REVISION
     ):
         raise RuntimeError(
-            "Cake FMHA package has an unexpected FlashInfer matrix revision"
+            "Cake FMHA registry has an unexpected FlashInfer matrix revision"
         )
-    if manifest.get("publication", {}).get("promotion_ready") is not True:
-        raise RuntimeError("Cake FMHA package is not marked promotion-ready")
-    capability = manifest.get("capability", {})
+    capability = registry.get("capability", {})
     if not capability.get("complete") or capability.get("cake_coverage_ratio") != 1.0:
         raise RuntimeError(
-            "Cake FMHA package does not cover its pinned FlashInfer matrix"
+            "Cake FMHA registry does not cover its pinned FlashInfer matrix"
         )
-    dcp_addon = manifest.get("add_ons", {}).get("cake_fmha_dcp_spec", {})
-    if dcp_addon.get("installed") is not True or not isinstance(
-        dcp_addon.get("manifest"), dict
-    ):
-        raise RuntimeError("Cake FMHA package is missing its authenticated DCP add-on")
-
-    for relative_path, metadata in manifest.get("artifacts", {}).items():
-        artifact = csrc_dir / relative_path
-        if not artifact.is_file():
-            raise RuntimeError(f"Cake FMHA artifact is missing: {relative_path}")
-        if artifact.stat().st_size != metadata["bytes"]:
-            raise RuntimeError(f"Cake FMHA artifact size mismatch: {relative_path}")
-        if _sha256(artifact) != metadata["sha256"]:
-            raise RuntimeError(f"Cake FMHA artifact digest mismatch: {relative_path}")
-    actual_bindings_digest = _flashinfer_bindings_sha256(csrc_dir)
-    if actual_bindings_digest != CAKE_FMHA_FLASHINFER_BINDINGS_SHA256:
-        raise RuntimeError(
-            "Cake FMHA FlashInfer binding digest mismatch: "
-            f"expected {CAKE_FMHA_FLASHINFER_BINDINGS_SHA256}, "
-            f"got {actual_bindings_digest}"
-        )
-    return manifest
+    return registry
 
 
 def get_cake_fmha_compat_uri(target: CakeFmhaTarget) -> str:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
-    return (
-        f"cake_fmha_compat_v1_{target}_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
+    return f"cake_fmha_compat_v1_{target}_{CAKE_FMHA_JIT_TAG}"
 
 
 def _validate_decode_native_specialization(
@@ -377,7 +292,7 @@ def _is_cake_fmha_decode_native_bf16_available(
     use_scale_ptr: bool,
     retain_kv_l2: bool,
 ) -> bool:
-    """Return whether the authenticated manifest contains this BF16 route."""
+    """Return whether the registry contains this BF16 route."""
 
     return (
         _resolve_decode_native_bf16_selector(
@@ -549,8 +464,7 @@ def get_cake_fmha_context_bf16_uri(
         f"_causal{selector['IS_CAUSAL']}_lse{selector['RETURN_LSE']}"
         f"_sink{selector['ENABLE_SINK']}"
         f"_exact{exact_profile or 'generic'}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -687,8 +601,7 @@ def get_cake_fmha_context_fp8_uri(
         f"_pack{pack_g}_page{page_size}_l2{l2_swizzle}"
         f"_causal{selector['IS_CAUSAL']}_lse{selector['RETURN_LSE']}"
         f"_sink{selector['ENABLE_SINK']}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -817,8 +730,7 @@ def get_cake_fmha_context_nvfp4_uri(
         f"_m{num_m_blocks}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_pack{pack_g}_page{page_size}_l2{l2_swizzle}"
         f"_causal{selector['IS_CAUSAL']}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -954,8 +866,7 @@ def _get_cake_fmha_context_hd256_uri(
         f"cake_fmha_context_{kind}_hd256_{target}"
         f"_m{num_m_blocks}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_g{heads_per_group}_page{page_size}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -1155,8 +1066,7 @@ def get_cake_fmha_decode_native_bf16_uri(
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_sink{selector['HAS_SINK']}_window{selector['HAS_WINDOW']}"
         f"_scale{selector['USE_SCALE_PTR']}_retain{selector['RETAIN_KV_L2']}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -1188,7 +1098,7 @@ def gen_cake_fmha_decode_native_bf16_module(
     )
     if selector is None:
         raise RuntimeError(
-            "Cake FMHA decode-native BF16 specialization is absent from the manifest"
+            "Cake FMHA decode-native BF16 specialization is absent from the registry"
         )
     sources = _get_component_sources(
         "decode_native_bf16",
@@ -1292,10 +1202,7 @@ def get_cake_fmha_decode_balanced_uri(
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
     component = cake_fmha_balanced_component_name(q_len, dtype)
-    return (
-        f"cake_fmha_{component}_{target}_q{q_len}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
+    return f"cake_fmha_{component}_{target}_q{q_len}_{CAKE_FMHA_JIT_TAG}"
 
 
 def get_cake_fmha_decode_balanced_bf16_uri(target: CakeFmhaTarget, q_len: int) -> str:
@@ -1395,10 +1302,7 @@ def get_cake_fmha_decode_balanced_fp8_uri(target: CakeFmhaTarget, q_dtype: str) 
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
     component = cake_fmha_balanced_fp8_component_name(q_dtype)
-    return (
-        f"cake_fmha_{component}_{target}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
+    return f"cake_fmha_{component}_{target}_{CAKE_FMHA_JIT_TAG}"
 
 
 @functools.cache
@@ -1445,10 +1349,7 @@ def load_cake_fmha_decode_balanced_fp8_module(target: CakeFmhaTarget, q_dtype: s
 def get_cake_fmha_decode_balanced_hd64_uri(target: CakeFmhaTarget) -> str:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
-    return (
-        f"cake_fmha_decode_balanced_bf16_hd64_{target}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
+    return f"cake_fmha_decode_balanced_bf16_hd64_{target}_{CAKE_FMHA_JIT_TAG}"
 
 
 @functools.cache
@@ -1503,10 +1404,7 @@ def get_cake_fmha_decode_balanced_hd256_uri(
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
     component = cake_fmha_balanced_hd256_component_name(page_size)
-    return (
-        f"cake_fmha_{component}_{target}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
-    )
+    return f"cake_fmha_{component}_{target}_{CAKE_FMHA_JIT_TAG}"
 
 
 @functools.cache
@@ -1585,8 +1483,7 @@ def get_cake_fmha_decode_native_fp16_nhd_uri(
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_sink{selector['HAS_SINK']}_window{selector['HAS_WINDOW']}"
         f"_scale{selector['USE_SCALE_PTR']}_retain{selector['RETAIN_KV_L2']}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -1707,8 +1604,7 @@ def get_cake_fmha_decode_native_fp16_hd512_uri(
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_window{selector['HAS_WINDOW']}_scale{selector['USE_SCALE_PTR']}"
         f"_retain{selector['RETAIN_KV_L2']}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -1926,8 +1822,7 @@ def get_cake_fmha_decode_quant_bf16q_uri(
         f"cake_fmha_decode_quant_bf16q_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_page{selector['PAGE_SIZE']}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -2024,8 +1919,7 @@ def get_cake_fmha_decode_quant_fp8_uri(
         f"cake_fmha_decode_quant_fp8_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_page{selector['PAGE_SIZE']}_full{selector['FULL_BLOCKS']}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -2129,8 +2023,7 @@ def get_cake_fmha_decode_quant_nvfp4_uri(
         f"cake_fmha_decode_quant_nvfp4_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
         f"_page{selector['PAGE_SIZE']}"
-        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_"
-        f"{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+        f"_{CAKE_FMHA_JIT_TAG}"
     )
 
 
@@ -2250,9 +2143,8 @@ __all__ = [
     "CAKE_FMHA_BALANCED_DTYPES",
     "CAKE_FMHA_BALANCED_FP8_Q_DTYPES",
     "CAKE_FMHA_BALANCED_HD256_PAGE_SIZES",
-    "CAKE_FMHA_FLASHINFER_BINDINGS_SHA256",
     "CAKE_FMHA_FLASHINFER_MATRIX_REVISION",
-    "CAKE_FMHA_MANIFEST_SHA256",
+    "CAKE_FMHA_JIT_TAG",
     "CakeFmhaTarget",
     "gen_cake_fmha_context_bf16_module",
     "gen_cake_fmha_context_fp8_module",
