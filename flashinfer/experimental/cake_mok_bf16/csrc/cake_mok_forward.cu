@@ -602,7 +602,7 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                 if (peers[stage_2] >= 0) {
                                     int _min_11 = ((1024) < (hidden - columns[stage_2] * 1024) ? (1024) : (hidden - columns[stage_2] * 1024));
                                     int chunk_cols_1 = _min_11;
-                                    cp_async_bulk_gmem2smem(combine_smem_addr + (unsigned int)((stage_2 * 16 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(y_routed_ptr) + ((unsigned long long)((unsigned long long)rows[stage_2] * (unsigned long long)hidden + (unsigned long long)(columns[stage_2] * 1024)) * (unsigned long long)2)), chunk_cols_1 * 2, combine_arrived_addr + (stage_2) * 8);
+                                    cp_async_bulk_gmem2smem(combine_smem_addr + (unsigned int)((stage_2 * 16 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(y_routed_ptr + ((unsigned long long)macro * (unsigned long long)macro_size * (unsigned long long)hidden)) + ((unsigned long long)((unsigned long long)rows[stage_2] * (unsigned long long)hidden + (unsigned long long)(columns[stage_2] * 1024)) * (unsigned long long)2)), chunk_cols_1 * 2, combine_arrived_addr + (stage_2) * 8);
                                 }
                             }
                             #pragma unroll
@@ -623,6 +623,12 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                         }
                                         asm volatile("cp.async.bulk.commit_group;");
                                     }
+                                }
+                            }
+                            #pragma unroll
+                            for (int stage_4 = 0; stage_4 < 7; stage_4++) {
+                                if (valid_tiles > stage_4 && columns[stage_4] == 0) {
+                                    int route_row = macro_offset_1 + (first_tile + stage_4) / col_blocks_1 * 16;
                                 }
                             }
                             int warp_1 = tid / 32;
@@ -1168,15 +1174,15 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                         int first_col_1 = first_tile_1 % col_blocks_5;
                         if (tid == 0) {
                             #pragma unroll
-                            for (int stage_4 = 0; stage_4 < 3; stage_4++) {
-                                if (tile_end > first_tile_1 + stage_4) {
+                            for (int stage_5 = 0; stage_5 < 3; stage_5++) {
+                                if (tile_end > first_tile_1 + stage_5) {
                                     int row_7 = first_row_1;
-                                    int col_4 = first_col_1 + stage_4;
+                                    int col_4 = first_col_1 + stage_5;
                                     if (col_4 >= col_blocks_5) {
                                         row_7 = row_7 + 1;
                                         col_4 = col_4 - col_blocks_5;
                                     }
-                                    mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_4) * 8, 65536);
+                                    mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_5) * 8, 65536);
                                     int parent = row_7 / 2 * (intermediate / 256) + col_4 / 2;
                                     int32_t _relaxed_ld_4;
                                     asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_4) : "l"(gate_ready + parent) : "memory");
@@ -1191,21 +1197,21 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                        :: "r"(gate_smem_addr + (unsigned int)(stage_4 * 32768)), "l"((&gate_shared_in)), "r"(0), "r"((row_7 - macro_row_offset) * 128), "r"(col_4 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_4) * 8) : "memory");
+                                        :: "r"(gate_smem_addr + (unsigned int)(stage_5 * 32768)), "l"((&gate_shared_in)), "r"(0), "r"((row_7 - macro_row_offset) * 128), "r"(col_4 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_5) * 8) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                        :: "r"(up_smem_addr + (unsigned int)(stage_4 * 32768)), "l"((&up_shared_in)), "r"(0), "r"((row_7 - macro_row_offset) * 128), "r"(col_4 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_4) * 8) : "memory");
+                                        :: "r"(up_smem_addr + (unsigned int)(stage_5 * 32768)), "l"((&up_shared_in)), "r"(0), "r"((row_7 - macro_row_offset) * 128), "r"(col_4 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_5) * 8) : "memory");
                                 }
                             }
                         }
                         #pragma unroll 3
-                        for (int stage_5 = 0; stage_5 < 3; stage_5++) {
-                            if (tile_end > first_tile_1 + stage_5) {
-                                mbarrier_wait(swiglu_arrived_addr + (stage_5) * 8, phase_bits_5 >> (unsigned int)stage_5 & 1);
-                                phase_bits_5 = phase_bits_5 ^ (unsigned int)(1 << stage_5);
+                        for (int stage_6 = 0; stage_6 < 3; stage_6++) {
+                            if (tile_end > first_tile_1 + stage_6) {
+                                mbarrier_wait(swiglu_arrived_addr + (stage_6) * 8, phase_bits_5 >> (unsigned int)stage_6 & 1);
+                                phase_bits_5 = phase_bits_5 ^ (unsigned int)(1 << stage_6);
                                 int row_8 = first_row_1;
-                                int col_5 = first_col_1 + stage_5;
+                                int col_5 = first_col_1 + stage_6;
                                 if (col_5 >= col_blocks_5) {
                                     row_8 = row_8 + 1;
                                     col_5 = col_5 - col_blocks_5;
@@ -1219,7 +1225,7 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                 #pragma unroll
                                 for (int tile_col = 0; tile_col < 8; tile_col++) {
                                     unsigned int packed_2[4];
-                                    unsigned int address_4 = gate_smem_addr + (unsigned int)(stage_5 * 32768) + (unsigned int)(((tile_col * 16 + lane_3 / 16 * 8) / 64 * 128 * 64 + (local_warp * 16 + lane_3 % 16) * 64 + (tile_col * 16 + lane_3 / 16 * 8) % 64) * 2);
+                                    unsigned int address_4 = gate_smem_addr + (unsigned int)(stage_6 * 32768) + (unsigned int)(((tile_col * 16 + lane_3 / 16 * 8) / 64 * 128 * 64 + (local_warp * 16 + lane_3 % 16) * 64 + (tile_col * 16 + lane_3 / 16 * 8) % 64) * 2);
                                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                         : "=r"(packed_2[0]), "=r"(packed_2[1]), "=r"(packed_2[2]), "=r"(packed_2[3])
                                         : "r"(address_4 ^ (address_4 & 1023) >> 7 << 4)
@@ -1237,7 +1243,7 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                 #pragma unroll
                                 for (int tile_col_1 = 0; tile_col_1 < 8; tile_col_1++) {
                                     unsigned int packed_3[4];
-                                    unsigned int address_5 = up_smem_addr + (unsigned int)(stage_5 * 32768) + (unsigned int)(((tile_col_1 * 16 + lane_3_1 / 16 * 8) / 64 * 128 * 64 + (local_warp_2 * 16 + lane_3_1 % 16) * 64 + (tile_col_1 * 16 + lane_3_1 / 16 * 8) % 64) * 2);
+                                    unsigned int address_5 = up_smem_addr + (unsigned int)(stage_6 * 32768) + (unsigned int)(((tile_col_1 * 16 + lane_3_1 / 16 * 8) / 64 * 128 * 64 + (local_warp_2 * 16 + lane_3_1 % 16) * 64 + (tile_col_1 * 16 + lane_3_1 / 16 * 8) % 64) * 2);
                                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                         : "=r"(packed_3[0]), "=r"(packed_3[1]), "=r"(packed_3[2]), "=r"(packed_3[3])
                                         : "r"(address_5 ^ (address_5 & 1023) >> 7 << 4)
@@ -1302,10 +1308,10 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                         if (tid == 0) {
                             asm volatile("cp.async.bulk.wait_group 0;");
                             #pragma unroll
-                            for (int stage_6 = 0; stage_6 < 3; stage_6++) {
-                                if (tile_end > first_tile_1 + stage_6) {
+                            for (int stage_7 = 0; stage_7 < 3; stage_7++) {
+                                if (tile_end > first_tile_1 + stage_7) {
                                     int row_9 = first_row_1;
-                                    if (col_blocks_5 <= first_col_1 + stage_6) {
+                                    if (col_blocks_5 <= first_col_1 + stage_7) {
                                         row_9 = row_9 + 1;
                                     }
                                     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(hidden_ready)) + (row_9 / 2))), "r"(static_cast<unsigned int>(1)) : "memory");
@@ -2016,15 +2022,15 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                 int first_col_2 = first_tile_2 % col_blocks_9;
                                 if (tid == 0) {
                                     #pragma unroll
-                                    for (int stage_7 = 0; stage_7 < 3; stage_7++) {
-                                        if (tile_end_1 > first_tile_2 + stage_7) {
+                                    for (int stage_8 = 0; stage_8 < 3; stage_8++) {
+                                        if (tile_end_1 > first_tile_2 + stage_8) {
                                             int row_16 = first_row_4;
-                                            int col_12 = first_col_2 + stage_7;
+                                            int col_12 = first_col_2 + stage_8;
                                             if (col_12 >= col_blocks_9) {
                                                 row_16 = row_16 + 1;
                                                 col_12 = col_12 - col_blocks_9;
                                             }
-                                            mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_7) * 8, 65536);
+                                            mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_8) * 8, 65536);
                                             int parent_1 = row_16 / 2 * (intermediate / 256) + col_12 / 2;
                                             int32_t _relaxed_ld_12;
                                             asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_12) : "l"(gate_ready + (shared_gate + parent_1)) : "memory");
@@ -2039,21 +2045,21 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                             asm volatile(
                                                 "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                                 " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                                :: "r"(gate_smem_addr + (unsigned int)(stage_7 * 32768)), "l"((&gate_routed_in)), "r"(0), "r"((row_16 - macro_row_offset_1) * 128), "r"(col_12 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_7) * 8) : "memory");
+                                                :: "r"(gate_smem_addr + (unsigned int)(stage_8 * 32768)), "l"((&gate_routed_in)), "r"(0), "r"((row_16 - macro_row_offset_1) * 128), "r"(col_12 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_8) * 8) : "memory");
                                             asm volatile(
                                                 "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                                 " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                                :: "r"(up_smem_addr + (unsigned int)(stage_7 * 32768)), "l"((&up_routed_in)), "r"(0), "r"((row_16 - macro_row_offset_1) * 128), "r"(col_12 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_7) * 8) : "memory");
+                                                :: "r"(up_smem_addr + (unsigned int)(stage_8 * 32768)), "l"((&up_routed_in)), "r"(0), "r"((row_16 - macro_row_offset_1) * 128), "r"(col_12 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_8) * 8) : "memory");
                                         }
                                     }
                                 }
                                 #pragma unroll 1
-                                for (int stage_8 = 0; stage_8 < 3; stage_8++) {
-                                    if (tile_end_1 > first_tile_2 + stage_8) {
-                                        mbarrier_wait(swiglu_arrived_addr + (stage_8) * 8, phase_bits_9 >> (unsigned int)stage_8 & 1);
-                                        phase_bits_9 = phase_bits_9 ^ (unsigned int)(1 << stage_8);
+                                for (int stage_9 = 0; stage_9 < 3; stage_9++) {
+                                    if (tile_end_1 > first_tile_2 + stage_9) {
+                                        mbarrier_wait(swiglu_arrived_addr + (stage_9) * 8, phase_bits_9 >> (unsigned int)stage_9 & 1);
+                                        phase_bits_9 = phase_bits_9 ^ (unsigned int)(1 << stage_9);
                                         int row_17 = first_row_4;
-                                        int col_13 = first_col_2 + stage_8;
+                                        int col_13 = first_col_2 + stage_9;
                                         if (col_13 >= col_blocks_9) {
                                             row_17 = row_17 + 1;
                                             col_13 = col_13 - col_blocks_9;
@@ -2067,7 +2073,7 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                         #pragma unroll
                                         for (int tile_col_3 = 0; tile_col_3 < 8; tile_col_3++) {
                                             unsigned int packed_8[4];
-                                            unsigned int address_13 = gate_smem_addr + (unsigned int)(stage_8 * 32768) + (unsigned int)(((tile_col_3 * 16 + lane_8 / 16 * 8) / 64 * 128 * 64 + (local_warp_1 * 16 + lane_8 % 16) * 64 + (tile_col_3 * 16 + lane_8 / 16 * 8) % 64) * 2);
+                                            unsigned int address_13 = gate_smem_addr + (unsigned int)(stage_9 * 32768) + (unsigned int)(((tile_col_3 * 16 + lane_8 / 16 * 8) / 64 * 128 * 64 + (local_warp_1 * 16 + lane_8 % 16) * 64 + (tile_col_3 * 16 + lane_8 / 16 * 8) % 64) * 2);
                                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                                 : "=r"(packed_8[0]), "=r"(packed_8[1]), "=r"(packed_8[2]), "=r"(packed_8[3])
                                                 : "r"(address_13 ^ (address_13 & 1023) >> 7 << 4)
@@ -2085,7 +2091,7 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                         #pragma unroll
                                         for (int tile_col_4 = 0; tile_col_4 < 8; tile_col_4++) {
                                             unsigned int packed_9[4];
-                                            unsigned int address_14 = up_smem_addr + (unsigned int)(stage_8 * 32768) + (unsigned int)(((tile_col_4 * 16 + lane_3_2 / 16 * 8) / 64 * 128 * 64 + (local_warp_2_1 * 16 + lane_3_2 % 16) * 64 + (tile_col_4 * 16 + lane_3_2 / 16 * 8) % 64) * 2);
+                                            unsigned int address_14 = up_smem_addr + (unsigned int)(stage_9 * 32768) + (unsigned int)(((tile_col_4 * 16 + lane_3_2 / 16 * 8) / 64 * 128 * 64 + (local_warp_2_1 * 16 + lane_3_2 % 16) * 64 + (tile_col_4 * 16 + lane_3_2 / 16 * 8) % 64) * 2);
                                             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                                 : "=r"(packed_9[0]), "=r"(packed_9[1]), "=r"(packed_9[2]), "=r"(packed_9[3])
                                                 : "r"(address_14 ^ (address_14 & 1023) >> 7 << 4)
@@ -2150,10 +2156,10 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                 if (tid == 0) {
                                     asm volatile("cp.async.bulk.wait_group 0;");
                                     #pragma unroll
-                                    for (int stage_9 = 0; stage_9 < 3; stage_9++) {
-                                        if (tile_end_1 > first_tile_2 + stage_9) {
+                                    for (int stage_10 = 0; stage_10 < 3; stage_10++) {
+                                        if (tile_end_1 > first_tile_2 + stage_10) {
                                             int row_18 = first_row_4;
-                                            if (col_blocks_9 <= first_col_2 + stage_9) {
+                                            if (col_blocks_9 <= first_col_2 + stage_10) {
                                                 row_18 = row_18 + 1;
                                             }
                                             asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(hidden_ready)) + (shared_rows + row_18 / 2))), "r"(static_cast<unsigned int>(1)) : "memory");
@@ -2384,7 +2390,7 @@ kernel_cake_mok_forward(const __grid_constant__ CUtensorMap x_shared, const __gr
                                             asm volatile(
                                                 "cp.async.bulk.tensor.5d.global.shared::cta.tile.bulk_group.L2::cache_hint"
                                                 " [%0, {%1, %2, %3, %4, %5}], [%6], %7;"
-                                                :: "l"((&y_routed)), "r"(0), "r"(x_5 * 256 + cta_rank_0 * 128), "r"(y_5 * 8 + chunk_11), "r"(0), "r"(0), "r"(d_smem_addr + (unsigned int)(chunk_11 % 3 * 8192)), "l"(0x12F0000000000000ULL) : "memory");
+                                                :: "l"((&y_routed)), "r"(0), "r"(macro_1 * macro_size + x_5 * 256 + cta_rank_0 * 128), "r"(y_5 * 8 + chunk_11), "r"(0), "r"(0), "r"(d_smem_addr + (unsigned int)(chunk_11 % 3 * 8192)), "l"(0x12F0000000000000ULL) : "memory");
                                             asm volatile("cp.async.bulk.commit_group;");
                                         }
                                     }

@@ -133,6 +133,7 @@ def _check_fused_training():
                     shared[2],
                     routed[2],
                     *context[:7],
+                    context[8],
                     x,
                     [x.data_ptr()],
                     peers,
@@ -192,7 +193,8 @@ def _check_fused_training():
                         ).bfloat16()
                         dx_reference[selected] = rx
                         ds_reference[selected] = (
-                            rh.float() / score[:, None] * unrounded
+                            y_routed_reference[selected].float()
+                            * dy[selected // topk].float()
                         ).sum(-1)
                         first = True
                         for start in range(0, actual_tokens, macro):
@@ -314,6 +316,13 @@ def _check_fused_training():
                 )
                 for values in graph_saved[1:]
             )
+            # d(score) = dot(BF16 expert output, original upstream gradient).
+            # A non-power-of-two score change catches scale/round/unscale errors.
+            router_gradient = ds_peer.clone()
+            scores.add_(0.03125)
+            graph.replay()
+            check(result)
+            assert torch.equal(ds_peer, router_gradient)
             for _ in range(2):
                 x.normal_(std=0.125)
                 dy.normal_(std=0.125)
@@ -336,6 +345,7 @@ def _check_fused_training():
                 capacity=schedule.numel(),
                 three_eager_executions_bitwise_equal=True,
                 three_graph_replays_bitwise_equal=True,
+                router_gradient_independent_of_scores=True,
                 changed_inputs_scores_upstream_gradients=2,
             )
             print(record, flush=True)

@@ -41,6 +41,14 @@ All ranks must execute matching collective calls. Keep workspace allocations
 and peer mappings alive while the adapter or a captured graph can use them.
 Use a separate workspace and adapter for concurrent executions.
 
+Each forward context retains the BF16 routed expert outputs across all
+macrobatches. Backward computes each supplied-score gradient as their FP32
+dot product with the original upstream gradient, inside the fused kernel.
+This requires `2 * schedule_capacity * hidden_size` bytes per live context
+for routed outputs. Other routed activations keep the macrobatch ring and
+recompute policy. Pass the matching context and schedule to backward; retain
+both while any captured graph uses them.
+
 Calling the experimental API is the opt-in; it emits an experimental warning.
 There is no automatic dispatch or AOT registration.
 
@@ -103,7 +111,7 @@ ranks, all-empty inputs, changed counts, three bitwise-identical graph
 replays, earlier-graph reuse, and same-shape input updates.
 
 Owner: Haozheng Fan. Tracking: [#6052](https://github.com/flashinfer-ai/flashinfer/issues/6052).
-This draft needs a maintainer-agreed release target before experimental admission. Graduation requires
+Experimental admission needs a maintainer-agreed release target. Graduation requires
 resolving the remaining sanitizer qualification described below;
 numerical checks alone do not clear that gate. No whole-model or comparative
 performance claim is made.
@@ -159,11 +167,12 @@ Maximum absolute error and global relative L1 remain diagnostics only.
 The driver records mismatch counts and worst normalized errors per rank and
 globally, and preserves failed reports before returning a failing exit status.
 
-Strict requalification completes all seven cases at EP16 and EP64:
-**EP16 5/7 and EP64 2/7 pass**. Router-weight gradients exceed
-the elementwise tolerance in the failing cases below; the other eight tensors
-pass. These numerical failures remain unresolved. All cases retain finite
-outputs, three bitwise-identical replays and earlier-Graph replay.
+Before the router-gradient repair, strict requalification completed all seven
+cases at EP16 and EP64: **EP16 5/7 and EP64 2/7 passed**. Router-weight
+gradients exceeded the elementwise tolerance in the cases below; the other
+eight tensors passed. All cases retained finite outputs, three bitwise-identical
+replays and earlier-Graph replay. This historical matrix does not qualify
+the changed runtime; full EP16/EP64 requalification is pending.
 
 | Source input lengths | Expert routing | EP16 | EP64 |
 | --- | --- | --- | --- |
@@ -176,14 +185,16 @@ outputs, three bitwise-identical replays and earlier-Graph replay.
 | empty | uniform | PASS | PASS |
 
 The previous aggregate-error qualification does not establish a strict pass.
-The independent BF16-rounding reference and runtime sources are unchanged;
-FP32-reference runs remain separate diagnostics.
+The distributed BF16-rounding reference is unchanged. The repaired runtime
+uses saved BF16 forward outputs for the score derivative; FP32-reference
+runs remain separate diagnostics.
 
-Full-shape memcheck passes all six nonempty shape/routing pairs at each scale.
-Full-shape synccheck passes those six pairs at EP16; EP64 requires
-`NCCL_ALGO=Ring` for the reported pass. With the default NCCL selection,
-synccheck reports an NVLS collective barrier error before this adapter runs;
-an independent NCCL-only program reproduces the diagnostic.
+The previous runtime passed full-shape memcheck on all six nonempty
+shape/routing pairs at each scale. The changed runtime requires new checks.
+The previous full-shape synccheck passed those six pairs at EP16 and EP64
+with the recorded communication configuration. A separate default-collective
+diagnostic occurred before the adapter ran and reproduced in a collective-only
+control.
 
 Reduced-shape racecheck passes uniform and imbalanced routing at EP16/EP64
 with 512 source tokens per rank, H=I=256, eight CPU workers per rank and
@@ -198,7 +209,6 @@ example, on each participating node, choose a shared output directory and run:
 ```bash
 export MOK_VALIDATION_OUTPUT=results/synccheck-fixed-uniform
 mkdir -p "$MOK_VALIDATION_OUTPUT"
-# Set NCCL_ALGO=Ring for the reported EP64 synccheck configuration.
 torchrun --nnodes="$NNODES" --nproc-per-node="$GPUS_PER_NODE" \
   --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR" --master-port=29500 \
   --no-python bash -c 'exec compute-sanitizer --tool synccheck \

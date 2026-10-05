@@ -77,9 +77,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SW_UP_OFF 132096
 #define SMEM_SW_UP_STAGE_BYTES 32768
 #define SMEM_SW_UP_STRIDE 32768
-#define SMEM_SW_ROUTER_OFF 197632
-#define SMEM_SW_ROUTER_STAGE_BYTES 1024
-#define SMEM_SW_ROUTER_STRIDE 1024
 #define SMEM_SW_DH_WORDS_OFF 1024
 #define SMEM_SW_DH_WORDS_STAGE_BYTES 65536
 #define SMEM_SW_DH_WORDS_STRIDE 65536
@@ -240,7 +237,7 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 extern "C" {
 
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_constant__ CUtensorMap dy_r, const __grid_constant__ CUtensorMap dg_s, const __grid_constant__ CUtensorMap dg_r, const __grid_constant__ CUtensorMap du_s, const __grid_constant__ CUtensorMap du_r, const __grid_constant__ CUtensorMap x_nt_r, const __grid_constant__ CUtensorMap dy_atb_s, const __grid_constant__ CUtensorMap dy_atb_r, const __grid_constant__ CUtensorMap dg_atb_s, const __grid_constant__ CUtensorMap dg_atb_r, const __grid_constant__ CUtensorMap du_atb_s, const __grid_constant__ CUtensorMap du_atb_r, const __grid_constant__ CUtensorMap x_atb_s, const __grid_constant__ CUtensorMap x_atb_r, const __grid_constant__ CUtensorMap h_atb_s, const __grid_constant__ CUtensorMap h_atb_r, const __grid_constant__ CUtensorMap wg_s, const __grid_constant__ CUtensorMap wu_s, const __grid_constant__ CUtensorMap wd_s, const __grid_constant__ CUtensorMap wg_r, const __grid_constant__ CUtensorMap wu_r, const __grid_constant__ CUtensorMap wd_r, const __grid_constant__ CUtensorMap wg_nt_r, const __grid_constant__ CUtensorMap wu_nt_r, const __grid_constant__ CUtensorMap dh_s, const __grid_constant__ CUtensorMap dh_r, const __grid_constant__ CUtensorMap dx_s, const __grid_constant__ CUtensorMap dx_r, const __grid_constant__ CUtensorMap gate_out_r, const __grid_constant__ CUtensorMap up_out_r, const __grid_constant__ CUtensorMap dwg_s, const __grid_constant__ CUtensorMap dwu_s, const __grid_constant__ CUtensorMap dwd_s, const __grid_constant__ CUtensorMap dwg_r, const __grid_constant__ CUtensorMap dwu_r, const __grid_constant__ CUtensorMap dwd_r, const __grid_constant__ CUtensorMap dh_sw_s, const __grid_constant__ CUtensorMap dh_sw_r, const __grid_constant__ CUtensorMap gate_sw_s, const __grid_constant__ CUtensorMap gate_sw_r, const __grid_constant__ CUtensorMap up_sw_s, const __grid_constant__ CUtensorMap up_sw_r, const __grid_constant__ CUtensorMap dg_sw_s, const __grid_constant__ CUtensorMap dg_sw_r, const __grid_constant__ CUtensorMap du_sw_s, const __grid_constant__ CUtensorMap du_sw_r, const __grid_constant__ CUtensorMap h_sw_r, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ dy_routed_ptr, __nv_bfloat16* __restrict__ dx_routed_ptr, float* __restrict__ weights, float* __restrict__ partials, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ dy_peers, unsigned long long* __restrict__ dx_peers, unsigned long long* __restrict__ weight_peers, unsigned long long* __restrict__ dweight_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ dh_ready, int* __restrict__ dg_ready, int* __restrict__ dy_ready, int* __restrict__ dx_ready, int* __restrict__ replay_x, int* __restrict__ replay_gu, int* __restrict__ replay_h, int* __restrict__ buffers_done, int* __restrict__ weight_ready, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size)
+kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_constant__ CUtensorMap dy_r, const __grid_constant__ CUtensorMap dg_s, const __grid_constant__ CUtensorMap dg_r, const __grid_constant__ CUtensorMap du_s, const __grid_constant__ CUtensorMap du_r, const __grid_constant__ CUtensorMap x_nt_r, const __grid_constant__ CUtensorMap dy_atb_s, const __grid_constant__ CUtensorMap dy_atb_r, const __grid_constant__ CUtensorMap dg_atb_s, const __grid_constant__ CUtensorMap dg_atb_r, const __grid_constant__ CUtensorMap du_atb_s, const __grid_constant__ CUtensorMap du_atb_r, const __grid_constant__ CUtensorMap x_atb_s, const __grid_constant__ CUtensorMap x_atb_r, const __grid_constant__ CUtensorMap h_atb_s, const __grid_constant__ CUtensorMap h_atb_r, const __grid_constant__ CUtensorMap wg_s, const __grid_constant__ CUtensorMap wu_s, const __grid_constant__ CUtensorMap wd_s, const __grid_constant__ CUtensorMap wg_r, const __grid_constant__ CUtensorMap wu_r, const __grid_constant__ CUtensorMap wd_r, const __grid_constant__ CUtensorMap wg_nt_r, const __grid_constant__ CUtensorMap wu_nt_r, const __grid_constant__ CUtensorMap dh_s, const __grid_constant__ CUtensorMap dh_r, const __grid_constant__ CUtensorMap dx_s, const __grid_constant__ CUtensorMap dx_r, const __grid_constant__ CUtensorMap gate_out_r, const __grid_constant__ CUtensorMap up_out_r, const __grid_constant__ CUtensorMap dwg_s, const __grid_constant__ CUtensorMap dwu_s, const __grid_constant__ CUtensorMap dwd_s, const __grid_constant__ CUtensorMap dwg_r, const __grid_constant__ CUtensorMap dwu_r, const __grid_constant__ CUtensorMap dwd_r, const __grid_constant__ CUtensorMap dh_sw_s, const __grid_constant__ CUtensorMap dh_sw_r, const __grid_constant__ CUtensorMap gate_sw_s, const __grid_constant__ CUtensorMap gate_sw_r, const __grid_constant__ CUtensorMap up_sw_s, const __grid_constant__ CUtensorMap up_sw_r, const __grid_constant__ CUtensorMap dg_sw_s, const __grid_constant__ CUtensorMap dg_sw_r, const __grid_constant__ CUtensorMap du_sw_s, const __grid_constant__ CUtensorMap du_sw_r, const __grid_constant__ CUtensorMap h_sw_r, __nv_bfloat16* __restrict__ x_routed_ptr, __nv_bfloat16* __restrict__ dy_routed_ptr, __nv_bfloat16* __restrict__ dx_routed_ptr, __nv_bfloat16* __restrict__ saved_y, float* __restrict__ weights, unsigned long long* __restrict__ x_peers, unsigned long long* __restrict__ dy_peers, unsigned long long* __restrict__ dx_peers, unsigned long long* __restrict__ weight_peers, unsigned long long* __restrict__ dweight_peers, int* __restrict__ schedule_rank, int* __restrict__ schedule_token, int* __restrict__ num_tokens, int* __restrict__ counts, int* __restrict__ dh_ready, int* __restrict__ dg_ready, int* __restrict__ dy_ready, int* __restrict__ dx_ready, int* __restrict__ replay_x, int* __restrict__ replay_gu, int* __restrict__ replay_h, int* __restrict__ buffers_done, int* __restrict__ weight_ready, int local_tokens, int hidden, int intermediate, int experts, int topk, int comm_sms, int macro_size, int mini_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -311,8 +308,6 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
     const int sw_gate_addr = smem + 66560;
     __nv_bfloat16* sw_up = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int sw_up_addr = smem + 132096;
-    float* sw_router = reinterpret_cast<float*>(smem_raw + 197632);
-    const int sw_router_addr = smem + 197632;
     unsigned int* sw_dh_words = reinterpret_cast<unsigned int*>(smem_raw + 1024);
     const int sw_dh_words_addr = smem + 1024;
     unsigned int* sw_gate_words = reinterpret_cast<unsigned int*>(smem_raw + 66560);
@@ -724,13 +719,43 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         : "memory");
                                 }
                                 asm volatile("cp.async.bulk.commit_group;");
-                                if (columns[stage_3] == 0) {
-                                    float gradient = 0.0f;
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int stage_4 = 0; stage_4 < 7; stage_4++) {
+                        if (valid_tiles > stage_4 && columns[stage_4] == 0) {
+                            int route_row = macro_offset_1 + (first_tile + stage_4) / col_blocks_1 * 16;
+                            int lane_1 = tid % 32;
+                            int warp_1 = tid / 32;
+                            #pragma unroll
+                            for (int half = 0; half < 2; half++) {
+                                int row_0 = route_row + warp_1 + half * 8;
+                                int peer_2 = schedule_rank[row_0];
+                                int slot = schedule_token[row_0];
+                                if (peer_2 >= 0) {
+                                    unsigned long long output_offset = (unsigned long long)row_0 * (unsigned long long)hidden;
+                                    unsigned long long input_offset = (unsigned long long)(slot / topk) * (unsigned long long)hidden;
+                                    float total = 0.0f;
                                     #pragma unroll 1
-                                    for (int col = 0; col < intermediate / 128; col++) {
-                                        gradient = gradient + partials[rows_1[stage_3] * (intermediate / 128) + col];
+                                    for (int col = lane_1; col < hidden; col += 32) {
+                                        float output = (float)saved_y[output_offset + (unsigned long long)col];
+                                        float gradient = (float)reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_2])[input_offset + (unsigned long long)col];
+                                        total = total + output * gradient;
                                     }
-                                    reinterpret_cast<float*>(dweight_peers[peers[stage_3]])[tokens_2[stage_3]] = gradient;
+                                    float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, total, 16);
+                                    total = total + _shfl_xor_0;
+                                    float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, total, 8);
+                                    total = total + _shfl_xor_1;
+                                    float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, total, 4);
+                                    total = total + _shfl_xor_2;
+                                    float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, total, 2);
+                                    total = total + _shfl_xor_3;
+                                    float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, total, 1);
+                                    total = total + _shfl_xor_4;
+                                    if (lane_1 == 0) {
+                                        reinterpret_cast<float*>(dweight_peers[peer_2])[slot] = total;
+                                    }
                                 }
                             }
                         }
@@ -770,11 +795,11 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                 int rows_2 = _min_14;
                 #pragma unroll 1
                 for (int row_3 = (cluster * 2 + cta_rank_0) * 256 + tid; row_3 < rows_2; row_3 += comm_sms * 256) {
-                    int peer_2 = schedule_rank[offset_1 + row_3];
+                    int peer_3 = schedule_rank[offset_1 + row_3];
                     int token_1 = schedule_token[offset_1 + row_3];
                     float value_4 = 0.0f;
-                    if (peer_2 >= 0) {
-                        value_4 = reinterpret_cast<float*>(weight_peers[peer_2])[(int)token_1];
+                    if (peer_3 >= 0) {
+                        value_4 = reinterpret_cast<float*>(weight_peers[peer_3])[(int)token_1];
                     }
                     weights[row_3] = value_4;
                 }
@@ -808,13 +833,13 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                         int _min_17 = ((512) < (hidden - col_block_1 * 512) ? (512) : (hidden - col_block_1 * 512));
                         int chunk_cols_2 = _min_17;
                         unsigned int chunk_bytes_3 = (unsigned int)(chunk_cols_2 * 2);
-                        int peer_3 = -1;
+                        int peer_4 = -1;
                         int peer_token_1 = -1;
                         if (tid < 128) {
-                            peer_3 = schedule_rank[macro_offset_2 + row_4 + tid];
+                            peer_4 = schedule_rank[macro_offset_2 + row_4 + tid];
                             peer_token_1 = schedule_token[macro_offset_2 + row_4 + tid];
                         }
-                        uint32_t _cta_count_2 = __syncthreads_count(peer_3 >= 0);
+                        uint32_t _cta_count_2 = __syncthreads_count(peer_4 >= 0);
                         if (tid == 0) {
                             int previous_offset_1 = -1 * macro_size;
                             int _min_18 = ((macro_size) < (tokens - previous_offset_1) ? (macro_size) : (tokens - previous_offset_1));
@@ -829,10 +854,10 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                         }
                         __syncthreads();
                         if (tid < 128) {
-                            dispatch_weights[tid] = ((peer_3 >= 0) ? weights[row_4 + tid] : 0.0f);
+                            dispatch_weights[tid] = ((peer_4 >= 0) ? weights[row_4 + tid] : 0.0f);
                         }
-                        if (peer_3 >= 0) {
-                            cp_async_bulk_gmem2smem(dispatch_smem_addr + (unsigned int)(tid * 512 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_3])) + ((unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_1 * 512)) * (unsigned long long)2)), chunk_cols_2 * 2, dispatch_arrived_addr);
+                        if (peer_4 >= 0) {
+                            cp_async_bulk_gmem2smem(dispatch_smem_addr + (unsigned int)(tid * 512 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_4])) + ((unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_1 * 512)) * (unsigned long long)2)), chunk_cols_2 * 2, dispatch_arrived_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_1 = 0; vec_1 < 64; vec_1++) {
@@ -893,13 +918,13 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                         int _min_21 = ((512) < (hidden - col_block_2 * 512) ? (512) : (hidden - col_block_2 * 512));
                         int chunk_cols_3 = _min_21;
                         unsigned int chunk_bytes_4 = (unsigned int)(chunk_cols_3 * 2);
-                        int peer_4 = -1;
+                        int peer_5 = -1;
                         int peer_token_2 = -1;
                         if (tid < 128) {
-                            peer_4 = schedule_rank[macro_offset_2_1 + row_5 + tid];
+                            peer_5 = schedule_rank[macro_offset_2_1 + row_5 + tid];
                             peer_token_2 = schedule_token[macro_offset_2_1 + row_5 + tid];
                         }
-                        uint32_t _cta_count_3 = __syncthreads_count(peer_4 >= 0);
+                        uint32_t _cta_count_3 = __syncthreads_count(peer_5 >= 0);
                         if (tid == 0) {
                             int previous_offset_2 = -1 * macro_size;
                             int _min_22 = ((macro_size) < (tokens - previous_offset_2) ? (macro_size) : (tokens - previous_offset_2));
@@ -913,8 +938,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                             mbarrier_arrive_expect_tx(dispatch_arrived_addr, _cta_count_3 * chunk_bytes_4);
                         }
                         __syncthreads();
-                        if (peer_4 >= 0) {
-                            cp_async_bulk_gmem2smem(dispatch_smem_addr + (unsigned int)(tid * 512 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_4])) + ((unsigned long long)((unsigned long long)(peer_token_2 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_2 * 512)) * (unsigned long long)2)), chunk_cols_3 * 2, dispatch_arrived_addr);
+                        if (peer_5 >= 0) {
+                            cp_async_bulk_gmem2smem(dispatch_smem_addr + (unsigned int)(tid * 512 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_5])) + ((unsigned long long)((unsigned long long)(peer_token_2 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_2 * 512)) * (unsigned long long)2)), chunk_cols_3 * 2, dispatch_arrived_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_2 = 0; vec_2 < 64; vec_2++) {
@@ -1179,8 +1204,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                             #pragma unroll
                             for (int chunk = 0; chunk < 8; chunk++) {
                                 #pragma unroll
-                                for (int half = 0; half < 2; half++) {
-                                    unsigned int address = taddr_1 + (unsigned int)(tid / 32 * 32 + half * 16 << 16) + (unsigned int)(chunk * 32);
+                                for (int half_1 = 0; half_1 < 2; half_1++) {
+                                    unsigned int address = taddr_1 + (unsigned int)(tid / 32 * 32 + half_1 * 16 << 16) + (unsigned int)(chunk * 32);
                                     float _tmem_load_0[16];
                                     asm volatile(
                                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -1190,7 +1215,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     #pragma unroll
                                     for (int pair_2 = 0; pair_2 < 8; pair_2++) {
                                         __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(_tmem_load_0[pair_2 * 2], _tmem_load_0[pair_2 * 2 + 1]));
-                                        packed[chunk * 16 + half * 8 + pair_2] = __as_u32(_bf16x2_0);
+                                        packed[chunk * 16 + half_1 * 8 + pair_2] = __as_u32(_bf16x2_0);
                                     }
                                 }
                             }
@@ -1213,16 +1238,16 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 }
                                 asm volatile("barrier.sync 1, 128;" ::: "memory");
                                 int warp_0 = tid / 32;
-                                int lane_1 = tid % 32;
+                                int lane_2 = tid % 32;
                                 #pragma unroll
-                                for (int half_1 = 0; half_1 < 2; half_1++) {
+                                for (int half_2 = 0; half_2 < 2; half_2++) {
                                     #pragma unroll
                                     for (int col_tile = 0; col_tile < 2; col_tile++) {
-                                        int row_7 = warp_0 * 32 + half_1 * 16 + lane_1 % 16;
-                                        int col_2 = col_tile * 16 + lane_1 / 16 * 8;
+                                        int row_7 = warp_0 * 32 + half_2 * 16 + lane_2 % 16;
+                                        int col_2 = col_tile * 16 + lane_2 / 16 * 8;
                                         unsigned int address_1 = d_smem_addr + (unsigned int)(chunk_1 % 3 * 8192) + (unsigned int)((row_7 * 32 + col_2) * 2);
                                         address_1 = address_1 ^ (address_1 & 511) >> 7 << 4;
-                                        int offset_2 = chunk_1 * 16 + half_1 * 8 + col_tile * 4;
+                                        int offset_2 = chunk_1 * 16 + half_2 * 8 + col_tile * 4;
                                         uint32_t _stmatrix_addr_6 = static_cast<uint32_t>(address_1);
                                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                             :: "r"(_stmatrix_addr_6), "r"(*reinterpret_cast<const uint32_t*>(&packed[offset_2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[offset_2 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed[offset_2 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed[offset_2 + 3]))
@@ -1269,15 +1294,15 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                         int first_col_1 = first_tile_1 % col_blocks_4;
                         if (tid == 0) {
                             #pragma unroll
-                            for (int stage_4 = 0; stage_4 < 2; stage_4++) {
-                                if (tile_end > first_tile_1 + stage_4) {
+                            for (int stage_5 = 0; stage_5 < 2; stage_5++) {
+                                if (tile_end > first_tile_1 + stage_5) {
                                     int row_8 = first_row_1;
-                                    int col_3 = first_col_1 + stage_4;
+                                    int col_3 = first_col_1 + stage_5;
                                     if (col_3 >= col_blocks_4) {
                                         row_8 = row_8 + 1;
                                         col_3 = col_3 - col_blocks_4;
                                     }
-                                    mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_4) * 8, 98304);
+                                    mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_5) * 8, 98304);
                                     int parent = row_8 / 2 * (intermediate / 256) + col_3 / 2;
                                     int32_t _relaxed_ld_8;
                                     asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_8) : "l"(dh_ready + parent) : "memory");
@@ -1292,25 +1317,25 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                        :: "r"(sw_dh_addr + (unsigned int)(stage_4 * 32768)), "l"((&dh_sw_s)), "r"(0), "r"((row_8 - macro_row_offset) * 128), "r"(col_3 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_4) * 8) : "memory");
+                                        :: "r"(sw_dh_addr + (unsigned int)(stage_5 * 32768)), "l"((&dh_sw_s)), "r"(0), "r"((row_8 - macro_row_offset) * 128), "r"(col_3 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_5) * 8) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                        :: "r"(sw_gate_addr + (unsigned int)(stage_4 * 32768)), "l"((&gate_sw_s)), "r"(0), "r"((row_8 - macro_row_offset) * 128), "r"(col_3 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_4) * 8) : "memory");
+                                        :: "r"(sw_gate_addr + (unsigned int)(stage_5 * 32768)), "l"((&gate_sw_s)), "r"(0), "r"((row_8 - macro_row_offset) * 128), "r"(col_3 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_5) * 8) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                        :: "r"(sw_up_addr + (unsigned int)(stage_4 * 32768)), "l"((&up_sw_s)), "r"(0), "r"((row_8 - macro_row_offset) * 128), "r"(col_3 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_4) * 8) : "memory");
+                                        :: "r"(sw_up_addr + (unsigned int)(stage_5 * 32768)), "l"((&up_sw_s)), "r"(0), "r"((row_8 - macro_row_offset) * 128), "r"(col_3 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_5) * 8) : "memory");
                                 }
                             }
                         }
                         #pragma unroll
-                        for (int stage_5 = 0; stage_5 < 2; stage_5++) {
-                            if (tile_end > first_tile_1 + stage_5) {
-                                mbarrier_wait(swiglu_arrived_addr + (stage_5) * 8, phase_bits_4 >> (unsigned int)stage_5 & 1);
-                                phase_bits_4 = phase_bits_4 ^ (unsigned int)(1 << stage_5);
+                        for (int stage_6 = 0; stage_6 < 2; stage_6++) {
+                            if (tile_end > first_tile_1 + stage_6) {
+                                mbarrier_wait(swiglu_arrived_addr + (stage_6) * 8, phase_bits_4 >> (unsigned int)stage_6 & 1);
+                                phase_bits_4 = phase_bits_4 ^ (unsigned int)(1 << stage_6);
                                 int row_9 = first_row_1;
-                                int col_4 = first_col_1 + stage_5;
+                                int col_4 = first_col_1 + stage_6;
                                 if (col_4 >= col_blocks_4) {
                                     row_9 = row_9 + 1;
                                     col_4 = col_4 - col_blocks_4;
@@ -1320,11 +1345,11 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 float dhidden[64];
                                 int warp_0_1 = tid / 32;
                                 int local_warp = warp_0_1 / 4 + warp_0_1 % 4 * 2;
-                                int lane_2 = tid % 32;
+                                int lane_3 = tid % 32;
                                 #pragma unroll
                                 for (int tile_col = 0; tile_col < 8; tile_col++) {
                                     unsigned int packed_1[4];
-                                    unsigned int address_2 = sw_gate_addr + (unsigned int)(stage_5 * 32768) + (unsigned int)(((tile_col * 16 + lane_2 / 16 * 8) / 64 * 128 * 64 + (local_warp * 16 + lane_2 % 16) * 64 + (tile_col * 16 + lane_2 / 16 * 8) % 64) * 2);
+                                    unsigned int address_2 = sw_gate_addr + (unsigned int)(stage_6 * 32768) + (unsigned int)(((tile_col * 16 + lane_3 / 16 * 8) / 64 * 128 * 64 + (local_warp * 16 + lane_3 % 16) * 64 + (tile_col * 16 + lane_3 / 16 * 8) % 64) * 2);
                                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                         : "=r"(packed_1[0]), "=r"(packed_1[1]), "=r"(packed_1[2]), "=r"(packed_1[3])
                                         : "r"(address_2 ^ (address_2 & 1023) >> 7 << 4)
@@ -1369,13 +1394,13 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 for (int elem_7 = 0; elem_7 < 64; elem_7++) {
                                     up[elem_7] = up[elem_7] + gate[elem_7];
                                 }
-                                int warp_1 = tid / 32;
-                                int local_warp_2 = warp_1 / 4 + warp_1 % 4 * 2;
-                                int lane_3 = tid % 32;
+                                int warp_1_1 = tid / 32;
+                                int local_warp_2 = warp_1_1 / 4 + warp_1_1 % 4 * 2;
+                                int lane_3_1 = tid % 32;
                                 #pragma unroll
                                 for (int tile_col_1 = 0; tile_col_1 < 8; tile_col_1++) {
                                     unsigned int packed_2[4];
-                                    unsigned int address_3 = sw_dh_addr + (unsigned int)(stage_5 * 32768) + (unsigned int)(((tile_col_1 * 16 + lane_3 / 16 * 8) / 64 * 128 * 64 + (local_warp_2 * 16 + lane_3 % 16) * 64 + (tile_col_1 * 16 + lane_3 / 16 * 8) % 64) * 2);
+                                    unsigned int address_3 = sw_dh_addr + (unsigned int)(stage_6 * 32768) + (unsigned int)(((tile_col_1 * 16 + lane_3_1 / 16 * 8) / 64 * 128 * 64 + (local_warp_2 * 16 + lane_3_1 % 16) * 64 + (tile_col_1 * 16 + lane_3_1 / 16 * 8) % 64) * 2);
                                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                         : "=r"(packed_2[0]), "=r"(packed_2[1]), "=r"(packed_2[2]), "=r"(packed_2[3])
                                         : "r"(address_3 ^ (address_3 & 1023) >> 7 << 4)
@@ -1401,7 +1426,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 #pragma unroll
                                 for (int tile_col_2 = 0; tile_col_2 < 8; tile_col_2++) {
                                     unsigned int packed_3[4];
-                                    unsigned int address_4 = sw_up_addr + (unsigned int)(stage_5 * 32768) + (unsigned int)(((tile_col_2 * 16 + lane_6 / 16 * 8) / 64 * 128 * 64 + (local_warp_5 * 16 + lane_6 % 16) * 64 + (tile_col_2 * 16 + lane_6 / 16 * 8) % 64) * 2);
+                                    unsigned int address_4 = sw_up_addr + (unsigned int)(stage_6 * 32768) + (unsigned int)(((tile_col_2 * 16 + lane_6 / 16 * 8) / 64 * 128 * 64 + (local_warp_5 * 16 + lane_6 % 16) * 64 + (tile_col_2 * 16 + lane_6 / 16 * 8) % 64) * 2);
                                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                         : "=r"(packed_3[0]), "=r"(packed_3[1]), "=r"(packed_3[2]), "=r"(packed_3[3])
                                         : "r"(address_4 ^ (address_4 & 1023) >> 7 << 4)
@@ -1428,7 +1453,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         __nv_bfloat162 _bf16x2_1 = __float22bfloat162_rn(make_float2(dhidden[tile_col_3 * 8 + pair_6 * 2], dhidden[tile_col_3 * 8 + pair_6 * 2 + 1]));
                                         packed_4[pair_6] = __as_u32(_bf16x2_1);
                                     }
-                                    unsigned int address_5 = sw_gate_addr + (unsigned int)(stage_5 * 32768) + (unsigned int)(((tile_col_3 * 16 + lane_9 / 16 * 8) / 64 * 128 * 64 + (local_warp_8 * 16 + lane_9 % 16) * 64 + (tile_col_3 * 16 + lane_9 / 16 * 8) % 64) * 2);
+                                    unsigned int address_5 = sw_gate_addr + (unsigned int)(stage_6 * 32768) + (unsigned int)(((tile_col_3 * 16 + lane_9 / 16 * 8) / 64 * 128 * 64 + (local_warp_8 * 16 + lane_9 % 16) * 64 + (tile_col_3 * 16 + lane_9 / 16 * 8) % 64) * 2);
                                     uint32_t _stmatrix_addr_7 = static_cast<uint32_t>(address_5 ^ (address_5 & 1023) >> 7 << 4);
                                     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                         :: "r"(_stmatrix_addr_7), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_4[3]))
@@ -1445,7 +1470,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         __nv_bfloat162 _bf16x2_2 = __float22bfloat162_rn(make_float2(gate[tile_col_4 * 8 + pair_7 * 2], gate[tile_col_4 * 8 + pair_7 * 2 + 1]));
                                         packed_5[pair_7] = __as_u32(_bf16x2_2);
                                     }
-                                    unsigned int address_6 = sw_up_addr + (unsigned int)(stage_5 * 32768) + (unsigned int)(((tile_col_4 * 16 + lane_12 / 16 * 8) / 64 * 128 * 64 + (local_warp_11 * 16 + lane_12 % 16) * 64 + (tile_col_4 * 16 + lane_12 / 16 * 8) % 64) * 2);
+                                    unsigned int address_6 = sw_up_addr + (unsigned int)(stage_6 * 32768) + (unsigned int)(((tile_col_4 * 16 + lane_12 / 16 * 8) / 64 * 128 * 64 + (local_warp_11 * 16 + lane_12 % 16) * 64 + (tile_col_4 * 16 + lane_12 / 16 * 8) % 64) * 2);
                                     uint32_t _stmatrix_addr_8 = static_cast<uint32_t>(address_6 ^ (address_6 & 1023) >> 7 << 4);
                                     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                         :: "r"(_stmatrix_addr_8), "r"(*reinterpret_cast<const uint32_t*>(&packed_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_5[1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_5[2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_5[3]))
@@ -1454,10 +1479,10 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 __syncthreads();
                                 if (tid == 0) {
                                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                    tma_store_5d((&dg_sw_s), 0, (row_9 - macro_row_offset) * 128, col_4 * 2, 0, 0, sw_gate_addr + (unsigned int)(stage_5 * 32768));
+                                    tma_store_5d((&dg_sw_s), 0, (row_9 - macro_row_offset) * 128, col_4 * 2, 0, 0, sw_gate_addr + (unsigned int)(stage_6 * 32768));
                                     asm volatile("cp.async.bulk.commit_group;");
                                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                    tma_store_5d((&du_sw_s), 0, (row_9 - macro_row_offset) * 128, col_4 * 2, 0, 0, sw_up_addr + (unsigned int)(stage_5 * 32768));
+                                    tma_store_5d((&du_sw_s), 0, (row_9 - macro_row_offset) * 128, col_4 * 2, 0, 0, sw_up_addr + (unsigned int)(stage_6 * 32768));
                                     asm volatile("cp.async.bulk.commit_group;");
                                 }
                             }
@@ -1465,10 +1490,10 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                         if (tid == 0) {
                             asm volatile("cp.async.bulk.wait_group 0;");
                             #pragma unroll
-                            for (int stage_6 = 0; stage_6 < 2; stage_6++) {
-                                if (tile_end > first_tile_1 + stage_6) {
+                            for (int stage_7 = 0; stage_7 < 2; stage_7++) {
+                                if (tile_end > first_tile_1 + stage_7) {
                                     int row_10 = first_row_1;
-                                    if (col_blocks_4 <= first_col_1 + stage_6) {
+                                    if (col_blocks_4 <= first_col_1 + stage_7) {
                                         row_10 = row_10 + 1;
                                     }
                                     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dg_ready)) + (row_10 / 2))), "r"(static_cast<unsigned int>(1)) : "memory");
@@ -1634,8 +1659,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 #pragma unroll
                                 for (int chunk_2 = 0; chunk_2 < 8; chunk_2++) {
                                     #pragma unroll
-                                    for (int half_2 = 0; half_2 < 2; half_2++) {
-                                        unsigned int address_7 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_2 * 16 << 16) + (unsigned int)(chunk_2 * 32);
+                                    for (int half_3 = 0; half_3 < 2; half_3++) {
+                                        unsigned int address_7 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_3 * 16 << 16) + (unsigned int)(chunk_2 * 32);
                                         float _tmem_load_1[16];
                                         asm volatile(
                                             "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -1645,7 +1670,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         #pragma unroll
                                         for (int pair_8 = 0; pair_8 < 8; pair_8++) {
                                             __nv_bfloat162 _bf16x2_3 = __float22bfloat162_rn(make_float2(_tmem_load_1[pair_8 * 2], _tmem_load_1[pair_8 * 2 + 1]));
-                                            packed_6[chunk_2 * 16 + half_2 * 8 + pair_8] = __as_u32(_bf16x2_3);
+                                            packed_6[chunk_2 * 16 + half_3 * 8 + pair_8] = __as_u32(_bf16x2_3);
                                         }
                                     }
                                 }
@@ -1670,14 +1695,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     int warp_0_2 = tid / 32;
                                     int lane_4 = tid % 32;
                                     #pragma unroll
-                                    for (int half_3 = 0; half_3 < 2; half_3++) {
+                                    for (int half_4 = 0; half_4 < 2; half_4++) {
                                         #pragma unroll
                                         for (int col_tile_1 = 0; col_tile_1 < 2; col_tile_1++) {
-                                            int row_12 = warp_0_2 * 32 + half_3 * 16 + lane_4 % 16;
+                                            int row_12 = warp_0_2 * 32 + half_4 * 16 + lane_4 % 16;
                                             int col_6 = col_tile_1 * 16 + lane_4 / 16 * 8;
                                             unsigned int address_8 = d_smem_addr + (unsigned int)(chunk_3 % 3 * 8192) + (unsigned int)((row_12 * 32 + col_6) * 2);
                                             address_8 = address_8 ^ (address_8 & 511) >> 7 << 4;
-                                            int offset_3 = chunk_3 * 16 + half_3 * 8 + col_tile_1 * 4;
+                                            int offset_3 = chunk_3 * 16 + half_4 * 8 + col_tile_1 * 4;
                                             uint32_t _stmatrix_addr_9 = static_cast<uint32_t>(address_8);
                                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                                 :: "r"(_stmatrix_addr_9), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[offset_3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[offset_3 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[offset_3 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_6[offset_3 + 3]))
@@ -1844,8 +1869,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 #pragma unroll
                                 for (int chunk_4 = 0; chunk_4 < 8; chunk_4++) {
                                     #pragma unroll
-                                    for (int half_4 = 0; half_4 < 2; half_4++) {
-                                        unsigned int address_9 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_4 * 16 << 16) + (unsigned int)(chunk_4 * 32);
+                                    for (int half_5 = 0; half_5 < 2; half_5++) {
+                                        unsigned int address_9 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_5 * 16 << 16) + (unsigned int)(chunk_4 * 32);
                                         float _tmem_load_2[16];
                                         asm volatile(
                                             "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -1855,7 +1880,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         #pragma unroll
                                         for (int pair_9 = 0; pair_9 < 8; pair_9++) {
                                             __nv_bfloat162 _bf16x2_4 = __float22bfloat162_rn(make_float2(_tmem_load_2[pair_9 * 2], _tmem_load_2[pair_9 * 2 + 1]));
-                                            packed_7[chunk_4 * 16 + half_4 * 8 + pair_9] = __as_u32(_bf16x2_4);
+                                            packed_7[chunk_4 * 16 + half_5 * 8 + pair_9] = __as_u32(_bf16x2_4);
                                         }
                                     }
                                 }
@@ -1880,14 +1905,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     int warp_0_3 = tid / 32;
                                     int lane_5 = tid % 32;
                                     #pragma unroll
-                                    for (int half_5 = 0; half_5 < 2; half_5++) {
+                                    for (int half_6 = 0; half_6 < 2; half_6++) {
                                         #pragma unroll
                                         for (int col_tile_2 = 0; col_tile_2 < 2; col_tile_2++) {
-                                            int row_14 = warp_0_3 * 32 + half_5 * 16 + lane_5 % 16;
+                                            int row_14 = warp_0_3 * 32 + half_6 * 16 + lane_5 % 16;
                                             int col_8 = col_tile_2 * 16 + lane_5 / 16 * 8;
                                             unsigned int address_10 = d_smem_addr + (unsigned int)(chunk_5 % 3 * 8192) + (unsigned int)((row_14 * 32 + col_8) * 2);
                                             address_10 = address_10 ^ (address_10 & 511) >> 7 << 4;
-                                            int offset_4 = chunk_5 * 16 + half_5 * 8 + col_tile_2 * 4;
+                                            int offset_4 = chunk_5 * 16 + half_6 * 8 + col_tile_2 * 4;
                                             uint32_t _stmatrix_addr_10 = static_cast<uint32_t>(address_10);
                                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                                 :: "r"(_stmatrix_addr_10), "r"(*reinterpret_cast<const uint32_t*>(&packed_7[offset_4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_7[offset_4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_7[offset_4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_7[offset_4 + 3]))
@@ -2078,8 +2103,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     #pragma unroll
                                     for (int chunk_6 = 0; chunk_6 < 8; chunk_6++) {
                                         #pragma unroll
-                                        for (int half_6 = 0; half_6 < 2; half_6++) {
-                                            unsigned int address_11 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_6 * 16 << 16) + (unsigned int)(chunk_6 * 32);
+                                        for (int half_7 = 0; half_7 < 2; half_7++) {
+                                            unsigned int address_11 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_7 * 16 << 16) + (unsigned int)(chunk_6 * 32);
                                             float _tmem_load_3[16];
                                             asm volatile(
                                                 "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -2089,7 +2114,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                             #pragma unroll
                                             for (int pair_10 = 0; pair_10 < 8; pair_10++) {
                                                 __nv_bfloat162 _bf16x2_5 = __float22bfloat162_rn(make_float2(_tmem_load_3[pair_10 * 2], _tmem_load_3[pair_10 * 2 + 1]));
-                                                packed_8[chunk_6 * 16 + half_6 * 8 + pair_10] = __as_u32(_bf16x2_5);
+                                                packed_8[chunk_6 * 16 + half_7 * 8 + pair_10] = __as_u32(_bf16x2_5);
                                             }
                                         }
                                     }
@@ -2114,14 +2139,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         int warp_0_4 = tid / 32;
                                         int lane_7 = tid % 32;
                                         #pragma unroll
-                                        for (int half_7 = 0; half_7 < 2; half_7++) {
+                                        for (int half_8 = 0; half_8 < 2; half_8++) {
                                             #pragma unroll
                                             for (int col_tile_3 = 0; col_tile_3 < 2; col_tile_3++) {
-                                                int row_16 = warp_0_4 * 32 + half_7 * 16 + lane_7 % 16;
+                                                int row_16 = warp_0_4 * 32 + half_8 * 16 + lane_7 % 16;
                                                 int col_10 = col_tile_3 * 16 + lane_7 / 16 * 8;
                                                 unsigned int address_12 = d_smem_addr + (unsigned int)(chunk_7 % 3 * 8192) + (unsigned int)((row_16 * 32 + col_10) * 2);
                                                 address_12 = address_12 ^ (address_12 & 511) >> 7 << 4;
-                                                int offset_5 = chunk_7 * 16 + half_7 * 8 + col_tile_3 * 4;
+                                                int offset_5 = chunk_7 * 16 + half_8 * 8 + col_tile_3 * 4;
                                                 uint32_t _stmatrix_addr_11 = static_cast<uint32_t>(address_12);
                                                 asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                                     :: "r"(_stmatrix_addr_11), "r"(*reinterpret_cast<const uint32_t*>(&packed_8[offset_5])), "r"(*reinterpret_cast<const uint32_t*>(&packed_8[offset_5 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_8[offset_5 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_8[offset_5 + 3]))
@@ -2311,8 +2336,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     #pragma unroll
                                     for (int chunk_8 = 0; chunk_8 < 8; chunk_8++) {
                                         #pragma unroll
-                                        for (int half_8 = 0; half_8 < 2; half_8++) {
-                                            unsigned int address_13 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_8 * 16 << 16) + (unsigned int)(chunk_8 * 32);
+                                        for (int half_9 = 0; half_9 < 2; half_9++) {
+                                            unsigned int address_13 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_9 * 16 << 16) + (unsigned int)(chunk_8 * 32);
                                             float _tmem_load_4[16];
                                             asm volatile(
                                                 "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -2322,7 +2347,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                             #pragma unroll
                                             for (int pair_11 = 0; pair_11 < 8; pair_11++) {
                                                 __nv_bfloat162 _bf16x2_6 = __float22bfloat162_rn(make_float2(_tmem_load_4[pair_11 * 2], _tmem_load_4[pair_11 * 2 + 1]));
-                                                packed_9[chunk_8 * 16 + half_8 * 8 + pair_11] = __as_u32(_bf16x2_6);
+                                                packed_9[chunk_8 * 16 + half_9 * 8 + pair_11] = __as_u32(_bf16x2_6);
                                             }
                                         }
                                     }
@@ -2347,14 +2372,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         int warp_0_5 = tid / 32;
                                         int lane_8 = tid % 32;
                                         #pragma unroll
-                                        for (int half_9 = 0; half_9 < 2; half_9++) {
+                                        for (int half_10 = 0; half_10 < 2; half_10++) {
                                             #pragma unroll
                                             for (int col_tile_4 = 0; col_tile_4 < 2; col_tile_4++) {
-                                                int row_18 = warp_0_5 * 32 + half_9 * 16 + lane_8 % 16;
+                                                int row_18 = warp_0_5 * 32 + half_10 * 16 + lane_8 % 16;
                                                 int col_12 = col_tile_4 * 16 + lane_8 / 16 * 8;
                                                 unsigned int address_14 = d_smem_addr + (unsigned int)(chunk_9 % 3 * 8192) + (unsigned int)((row_18 * 32 + col_12) * 2);
                                                 address_14 = address_14 ^ (address_14 & 511) >> 7 << 4;
-                                                int offset_6 = chunk_9 * 16 + half_9 * 8 + col_tile_4 * 4;
+                                                int offset_6 = chunk_9 * 16 + half_10 * 8 + col_tile_4 * 4;
                                                 uint32_t _stmatrix_addr_12 = static_cast<uint32_t>(address_14);
                                                 asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                                     :: "r"(_stmatrix_addr_12), "r"(*reinterpret_cast<const uint32_t*>(&packed_9[offset_6])), "r"(*reinterpret_cast<const uint32_t*>(&packed_9[offset_6 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_9[offset_6 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_9[offset_6 + 3]))
@@ -2550,8 +2575,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                         #pragma unroll
                         for (int chunk_10 = 0; chunk_10 < 8; chunk_10++) {
                             #pragma unroll
-                            for (int half_10 = 0; half_10 < 2; half_10++) {
-                                unsigned int address_15 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_10 * 16 << 16) + (unsigned int)(chunk_10 * 32);
+                            for (int half_11 = 0; half_11 < 2; half_11++) {
+                                unsigned int address_15 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_11 * 16 << 16) + (unsigned int)(chunk_10 * 32);
                                 float _tmem_load_5[16];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -2561,7 +2586,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 #pragma unroll
                                 for (int pair_12 = 0; pair_12 < 8; pair_12++) {
                                     __nv_bfloat162 _bf16x2_7 = __float22bfloat162_rn(make_float2(_tmem_load_5[pair_12 * 2], _tmem_load_5[pair_12 * 2 + 1]));
-                                    packed_10[chunk_10 * 16 + half_10 * 8 + pair_12] = __as_u32(_bf16x2_7);
+                                    packed_10[chunk_10 * 16 + half_11 * 8 + pair_12] = __as_u32(_bf16x2_7);
                                 }
                             }
                         }
@@ -2586,14 +2611,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                             int warp_0_6 = tid / 32;
                             int lane_10 = tid % 32;
                             #pragma unroll
-                            for (int half_11 = 0; half_11 < 2; half_11++) {
+                            for (int half_12 = 0; half_12 < 2; half_12++) {
                                 #pragma unroll
                                 for (int col_tile_5 = 0; col_tile_5 < 2; col_tile_5++) {
-                                    int row_20 = warp_0_6 * 32 + half_11 * 16 + lane_10 % 16;
+                                    int row_20 = warp_0_6 * 32 + half_12 * 16 + lane_10 % 16;
                                     int col_14 = col_tile_5 * 16 + lane_10 / 16 * 8;
                                     unsigned int address_16 = d_smem_addr + (unsigned int)(chunk_11 % 3 * 8192) + (unsigned int)((row_20 * 32 + col_14) * 2);
                                     address_16 = address_16 ^ (address_16 & 511) >> 7 << 4;
-                                    int offset_0 = chunk_11 * 16 + half_11 * 8 + col_tile_5 * 4;
+                                    int offset_0 = chunk_11 * 16 + half_12 * 8 + col_tile_5 * 4;
                                     uint32_t _stmatrix_addr_13 = static_cast<uint32_t>(address_16);
                                     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                         :: "r"(_stmatrix_addr_13), "r"(*reinterpret_cast<const uint32_t*>(&packed_10[offset_0])), "r"(*reinterpret_cast<const uint32_t*>(&packed_10[offset_0 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_10[offset_0 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_10[offset_0 + 3]))
@@ -2782,8 +2807,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                             #pragma unroll
                             for (int chunk_12 = 0; chunk_12 < 8; chunk_12++) {
                                 #pragma unroll
-                                for (int half_12 = 0; half_12 < 2; half_12++) {
-                                    unsigned int address_17 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_12 * 16 << 16) + (unsigned int)(chunk_12 * 32);
+                                for (int half_13 = 0; half_13 < 2; half_13++) {
+                                    unsigned int address_17 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_13 * 16 << 16) + (unsigned int)(chunk_12 * 32);
                                     float _tmem_load_6[16];
                                     asm volatile(
                                         "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -2793,7 +2818,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     #pragma unroll
                                     for (int pair_13 = 0; pair_13 < 8; pair_13++) {
                                         __nv_bfloat162 _bf16x2_8 = __float22bfloat162_rn(make_float2(_tmem_load_6[pair_13 * 2], _tmem_load_6[pair_13 * 2 + 1]));
-                                        packed_11[chunk_12 * 16 + half_12 * 8 + pair_13] = __as_u32(_bf16x2_8);
+                                        packed_11[chunk_12 * 16 + half_13 * 8 + pair_13] = __as_u32(_bf16x2_8);
                                     }
                                 }
                             }
@@ -2818,14 +2843,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 int warp_0_7 = tid / 32;
                                 int lane_11 = tid % 32;
                                 #pragma unroll
-                                for (int half_13 = 0; half_13 < 2; half_13++) {
+                                for (int half_14 = 0; half_14 < 2; half_14++) {
                                     #pragma unroll
                                     for (int col_tile_6 = 0; col_tile_6 < 2; col_tile_6++) {
-                                        int row_22 = warp_0_7 * 32 + half_13 * 16 + lane_11 % 16;
+                                        int row_22 = warp_0_7 * 32 + half_14 * 16 + lane_11 % 16;
                                         int col_16 = col_tile_6 * 16 + lane_11 / 16 * 8;
                                         unsigned int address_18 = d_smem_addr + (unsigned int)(chunk_13 % 3 * 8192) + (unsigned int)((row_22 * 32 + col_16) * 2);
                                         address_18 = address_18 ^ (address_18 & 511) >> 7 << 4;
-                                        int offset_0_1 = chunk_13 * 16 + half_13 * 8 + col_tile_6 * 4;
+                                        int offset_0_1 = chunk_13 * 16 + half_14 * 8 + col_tile_6 * 4;
                                         uint32_t _stmatrix_addr_14 = static_cast<uint32_t>(address_18);
                                         asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                             :: "r"(_stmatrix_addr_14), "r"(*reinterpret_cast<const uint32_t*>(&packed_11[offset_0_1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_11[offset_0_1 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_11[offset_0_1 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_11[offset_0_1 + 3]))
@@ -2879,15 +2904,15 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                         int first_col_2 = first_tile_2 % col_blocks_11;
                         if (tid == 0) {
                             #pragma unroll
-                            for (int stage_7 = 0; stage_7 < 3; stage_7++) {
-                                if (tile_end_1 > first_tile_2 + stage_7) {
+                            for (int stage_8 = 0; stage_8 < 3; stage_8++) {
+                                if (tile_end_1 > first_tile_2 + stage_8) {
                                     int row_23 = first_row_4;
-                                    int col_17 = first_col_2 + stage_7;
+                                    int col_17 = first_col_2 + stage_8;
                                     if (col_17 >= col_blocks_11) {
                                         row_23 = row_23 + 1;
                                         col_17 = col_17 - col_blocks_11;
                                     }
-                                    mbarrier_arrive_expect_tx(replay_arrived_addr + (stage_7) * 8, 65536);
+                                    mbarrier_arrive_expect_tx(replay_arrived_addr + (stage_8) * 8, 65536);
                                     int parent_1 = row_23 / 2 * (intermediate / 256) + col_17 / 2;
                                     int32_t _relaxed_ld_24;
                                     asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_24) : "l"(replay_gu + parent_1) : "memory");
@@ -2902,21 +2927,21 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                        :: "r"(replay_gate_addr + (unsigned int)(stage_7 * 32768)), "l"((&gate_sw_r)), "r"(0), "r"((row_23 - macro_row_offset_1) * 128), "r"(col_17 * 2), "r"(0), "r"(0), "r"(replay_arrived_addr + (stage_7) * 8) : "memory");
+                                        :: "r"(replay_gate_addr + (unsigned int)(stage_8 * 32768)), "l"((&gate_sw_r)), "r"(0), "r"((row_23 - macro_row_offset_1) * 128), "r"(col_17 * 2), "r"(0), "r"(0), "r"(replay_arrived_addr + (stage_8) * 8) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                         " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                        :: "r"(replay_up_addr + (unsigned int)(stage_7 * 32768)), "l"((&up_sw_r)), "r"(0), "r"((row_23 - macro_row_offset_1) * 128), "r"(col_17 * 2), "r"(0), "r"(0), "r"(replay_arrived_addr + (stage_7) * 8) : "memory");
+                                        :: "r"(replay_up_addr + (unsigned int)(stage_8 * 32768)), "l"((&up_sw_r)), "r"(0), "r"((row_23 - macro_row_offset_1) * 128), "r"(col_17 * 2), "r"(0), "r"(0), "r"(replay_arrived_addr + (stage_8) * 8) : "memory");
                                 }
                             }
                         }
                         #pragma unroll 1
-                        for (int stage_8 = 0; stage_8 < 3; stage_8++) {
-                            if (tile_end_1 > first_tile_2 + stage_8) {
-                                mbarrier_wait(replay_arrived_addr + (stage_8) * 8, phase_bits_11 >> (unsigned int)stage_8 & 1);
-                                phase_bits_11 = phase_bits_11 ^ (unsigned int)(1 << stage_8);
+                        for (int stage_9 = 0; stage_9 < 3; stage_9++) {
+                            if (tile_end_1 > first_tile_2 + stage_9) {
+                                mbarrier_wait(replay_arrived_addr + (stage_9) * 8, phase_bits_11 >> (unsigned int)stage_9 & 1);
+                                phase_bits_11 = phase_bits_11 ^ (unsigned int)(1 << stage_9);
                                 int row_24 = first_row_4;
-                                int col_18 = first_col_2 + stage_8;
+                                int col_18 = first_col_2 + stage_9;
                                 if (col_18 >= col_blocks_11) {
                                     row_24 = row_24 + 1;
                                     col_18 = col_18 - col_blocks_11;
@@ -2930,7 +2955,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 #pragma unroll
                                 for (int tile_col_5 = 0; tile_col_5 < 8; tile_col_5++) {
                                     unsigned int packed_12[4];
-                                    unsigned int address_19 = replay_gate_addr + (unsigned int)(stage_8 * 32768) + (unsigned int)(((tile_col_5 * 16 + lane_13 / 16 * 8) / 64 * 128 * 64 + (local_warp_1 * 16 + lane_13 % 16) * 64 + (tile_col_5 * 16 + lane_13 / 16 * 8) % 64) * 2);
+                                    unsigned int address_19 = replay_gate_addr + (unsigned int)(stage_9 * 32768) + (unsigned int)(((tile_col_5 * 16 + lane_13 / 16 * 8) / 64 * 128 * 64 + (local_warp_1 * 16 + lane_13 % 16) * 64 + (tile_col_5 * 16 + lane_13 / 16 * 8) % 64) * 2);
                                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                         : "=r"(packed_12[0]), "=r"(packed_12[1]), "=r"(packed_12[2]), "=r"(packed_12[3])
                                         : "r"(address_19 ^ (address_19 & 1023) >> 7 << 4)
@@ -2942,13 +2967,13 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         gate_1[tile_col_5 * 8 + pair_14 * 2 + 1] = _cvt_f32_3.y;
                                     }
                                 }
-                                int warp_1_1 = tid / 32;
-                                int local_warp_2_1 = warp_1_1 / 4 + warp_1_1 % 4 * 2;
-                                int lane_3_1 = tid % 32;
+                                int warp_1_2 = tid / 32;
+                                int local_warp_2_1 = warp_1_2 / 4 + warp_1_2 % 4 * 2;
+                                int lane_3_2 = tid % 32;
                                 #pragma unroll
                                 for (int tile_col_6 = 0; tile_col_6 < 8; tile_col_6++) {
                                     unsigned int packed_13[4];
-                                    unsigned int address_20 = replay_up_addr + (unsigned int)(stage_8 * 32768) + (unsigned int)(((tile_col_6 * 16 + lane_3_1 / 16 * 8) / 64 * 128 * 64 + (local_warp_2_1 * 16 + lane_3_1 % 16) * 64 + (tile_col_6 * 16 + lane_3_1 / 16 * 8) % 64) * 2);
+                                    unsigned int address_20 = replay_up_addr + (unsigned int)(stage_9 * 32768) + (unsigned int)(((tile_col_6 * 16 + lane_3_2 / 16 * 8) / 64 * 128 * 64 + (local_warp_2_1 * 16 + lane_3_2 % 16) * 64 + (tile_col_6 * 16 + lane_3_2 / 16 * 8) % 64) * 2);
                                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                                         : "=r"(packed_13[0]), "=r"(packed_13[1]), "=r"(packed_13[2]), "=r"(packed_13[3])
                                         : "r"(address_20 ^ (address_20 & 1023) >> 7 << 4)
@@ -3013,10 +3038,10 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                         if (tid == 0) {
                             asm volatile("cp.async.bulk.wait_group 0;");
                             #pragma unroll
-                            for (int stage_9 = 0; stage_9 < 3; stage_9++) {
-                                if (tile_end_1 > first_tile_2 + stage_9) {
+                            for (int stage_10 = 0; stage_10 < 3; stage_10++) {
+                                if (tile_end_1 > first_tile_2 + stage_10) {
                                     int row_25 = first_row_4;
-                                    if (col_blocks_11 <= first_col_2 + stage_9) {
+                                    if (col_blocks_11 <= first_col_2 + stage_10) {
                                         row_25 = row_25 + 1;
                                     }
                                     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(replay_h)) + (row_25 / 2))), "r"(static_cast<unsigned int>(1)) : "memory");
@@ -3186,8 +3211,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                 #pragma unroll
                                 for (int chunk_14 = 0; chunk_14 < 8; chunk_14++) {
                                     #pragma unroll
-                                    for (int half_14 = 0; half_14 < 2; half_14++) {
-                                        unsigned int address_22 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_14 * 16 << 16) + (unsigned int)(chunk_14 * 32);
+                                    for (int half_15 = 0; half_15 < 2; half_15++) {
+                                        unsigned int address_22 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_15 * 16 << 16) + (unsigned int)(chunk_14 * 32);
                                         float _tmem_load_7[16];
                                         asm volatile(
                                             "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -3197,7 +3222,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         #pragma unroll
                                         for (int pair_17 = 0; pair_17 < 8; pair_17++) {
                                             __nv_bfloat162 _bf16x2_10 = __float22bfloat162_rn(make_float2(_tmem_load_7[pair_17 * 2], _tmem_load_7[pair_17 * 2 + 1]));
-                                            packed_15[chunk_14 * 16 + half_14 * 8 + pair_17] = __as_u32(_bf16x2_10);
+                                            packed_15[chunk_14 * 16 + half_15 * 8 + pair_17] = __as_u32(_bf16x2_10);
                                         }
                                     }
                                 }
@@ -3222,14 +3247,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     int warp_0_9 = tid / 32;
                                     int lane_14 = tid % 32;
                                     #pragma unroll
-                                    for (int half_15 = 0; half_15 < 2; half_15++) {
+                                    for (int half_16 = 0; half_16 < 2; half_16++) {
                                         #pragma unroll
                                         for (int col_tile_7 = 0; col_tile_7 < 2; col_tile_7++) {
-                                            int row_27 = warp_0_9 * 32 + half_15 * 16 + lane_14 % 16;
+                                            int row_27 = warp_0_9 * 32 + half_16 * 16 + lane_14 % 16;
                                             int col_20 = col_tile_7 * 16 + lane_14 / 16 * 8;
                                             unsigned int address_23 = d_smem_addr + (unsigned int)(chunk_15 % 3 * 8192) + (unsigned int)((row_27 * 32 + col_20) * 2);
                                             address_23 = address_23 ^ (address_23 & 511) >> 7 << 4;
-                                            int offset_0_2 = chunk_15 * 16 + half_15 * 8 + col_tile_7 * 4;
+                                            int offset_0_2 = chunk_15 * 16 + half_16 * 8 + col_tile_7 * 4;
                                             uint32_t _stmatrix_addr_16 = static_cast<uint32_t>(address_23);
                                             asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                                 :: "r"(_stmatrix_addr_16), "r"(*reinterpret_cast<const uint32_t*>(&packed_15[offset_0_2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_15[offset_0_2 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_15[offset_0_2 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_15[offset_0_2 + 3]))
@@ -3291,15 +3316,15 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                             int first_col_3 = first_tile_3 % col_blocks_13;
                             if (tid == 0) {
                                 #pragma unroll
-                                for (int stage_10 = 0; stage_10 < 2; stage_10++) {
-                                    if (tile_end_2 > first_tile_3 + stage_10) {
+                                for (int stage_11 = 0; stage_11 < 2; stage_11++) {
+                                    if (tile_end_2 > first_tile_3 + stage_11) {
                                         int row_28 = first_row_6;
-                                        int col_21 = first_col_3 + stage_10;
+                                        int col_21 = first_col_3 + stage_11;
                                         if (col_21 >= col_blocks_13) {
                                             row_28 = row_28 + 1;
                                             col_21 = col_21 - col_blocks_13;
                                         }
-                                        mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_10) * 8, 98304);
+                                        mbarrier_arrive_expect_tx(swiglu_arrived_addr + (stage_11) * 8, 98304);
                                         int parent_2 = row_28 / 2 * (intermediate / 256) + col_21 / 2;
                                         int32_t _relaxed_ld_28;
                                         asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_relaxed_ld_28) : "l"(dh_ready + (local_tokens / 256 * (intermediate / 256) + parent_2)) : "memory");
@@ -3327,42 +3352,37 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         asm volatile(
                                             "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                             " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                            :: "r"(sw_dh_addr + (unsigned int)(stage_10 * 32768)), "l"((&dh_sw_r)), "r"(0), "r"((row_28 - macro_row_offset_2) * 128), "r"(col_21 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_10) * 8) : "memory");
+                                            :: "r"(sw_dh_addr + (unsigned int)(stage_11 * 32768)), "l"((&dh_sw_r)), "r"(0), "r"((row_28 - macro_row_offset_2) * 128), "r"(col_21 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_11) * 8) : "memory");
                                         asm volatile(
                                             "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                             " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                            :: "r"(sw_gate_addr + (unsigned int)(stage_10 * 32768)), "l"((&gate_sw_r)), "r"(0), "r"((row_28 - macro_row_offset_2) * 128), "r"(col_21 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_10) * 8) : "memory");
+                                            :: "r"(sw_gate_addr + (unsigned int)(stage_11 * 32768)), "l"((&gate_sw_r)), "r"(0), "r"((row_28 - macro_row_offset_2) * 128), "r"(col_21 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_11) * 8) : "memory");
                                         asm volatile(
                                             "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                                             " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
-                                            :: "r"(sw_up_addr + (unsigned int)(stage_10 * 32768)), "l"((&up_sw_r)), "r"(0), "r"((row_28 - macro_row_offset_2) * 128), "r"(col_21 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_10) * 8) : "memory");
+                                            :: "r"(sw_up_addr + (unsigned int)(stage_11 * 32768)), "l"((&up_sw_r)), "r"(0), "r"((row_28 - macro_row_offset_2) * 128), "r"(col_21 * 2), "r"(0), "r"(0), "r"(swiglu_arrived_addr + (stage_11) * 8) : "memory");
                                     }
                                 }
                             }
                             #pragma unroll
-                            for (int stage_11 = 0; stage_11 < 2; stage_11++) {
-                                if (tile_end_2 > first_tile_3 + stage_11) {
-                                    mbarrier_wait(swiglu_arrived_addr + (stage_11) * 8, phase_bits_13 >> (unsigned int)stage_11 & 1);
-                                    phase_bits_13 = phase_bits_13 ^ (unsigned int)(1 << stage_11);
+                            for (int stage_12 = 0; stage_12 < 2; stage_12++) {
+                                if (tile_end_2 > first_tile_3 + stage_12) {
+                                    mbarrier_wait(swiglu_arrived_addr + (stage_12) * 8, phase_bits_13 >> (unsigned int)stage_12 & 1);
+                                    phase_bits_13 = phase_bits_13 ^ (unsigned int)(1 << stage_12);
                                     int row_29 = first_row_6;
-                                    int col_22 = first_col_3 + stage_11;
+                                    int col_22 = first_col_3 + stage_12;
                                     if (col_22 >= col_blocks_13) {
                                         row_29 = row_29 + 1;
                                         col_22 = col_22 - col_blocks_13;
                                     }
                                     int tile_row = tid % 128;
-                                    int half_16 = tid / 128;
-                                    int local_row_3 = (row_29 - macro_row_offset_2) * 128 + tile_row;
-                                    int peer_5 = schedule_rank[row_29 * 128 + tile_row];
-                                    float weight_2 = weights[local_row_3];
-                                    float inverse = ((weight_2 > 0.0f) ? 1.0f / weight_2 : 0.0f);
-                                    float router_gradient = 0.0f;
+                                    int half_17 = tid / 128;
                                     #pragma unroll
                                     for (int group = 0; group < 16; group++) {
-                                        int tile_col_8 = half_16 * 64 + group * 4;
-                                        unsigned int address_24 = sw_gate_addr + (unsigned int)(stage_11 * 32768) + (unsigned int)((tile_col_8 / 64 * 128 * 64 + tile_row * 64 + tile_col_8 % 64) * 2);
-                                        unsigned int address_0 = sw_up_addr + (unsigned int)(stage_11 * 32768) + (unsigned int)((tile_col_8 / 64 * 128 * 64 + tile_row * 64 + tile_col_8 % 64) * 2);
-                                        unsigned int address_1_1 = sw_dh_addr + (unsigned int)(stage_11 * 32768) + (unsigned int)((tile_col_8 / 64 * 128 * 64 + tile_row * 64 + tile_col_8 % 64) * 2);
+                                        int tile_col_8 = half_17 * 64 + group * 4;
+                                        unsigned int address_24 = sw_gate_addr + (unsigned int)(stage_12 * 32768) + (unsigned int)((tile_col_8 / 64 * 128 * 64 + tile_row * 64 + tile_col_8 % 64) * 2);
+                                        unsigned int address_0 = sw_up_addr + (unsigned int)(stage_12 * 32768) + (unsigned int)((tile_col_8 / 64 * 128 * 64 + tile_row * 64 + tile_col_8 % 64) * 2);
+                                        unsigned int address_1_1 = sw_dh_addr + (unsigned int)(stage_12 * 32768) + (unsigned int)((tile_col_8 / 64 * 128 * 64 + tile_row * 64 + tile_col_8 % 64) * 2);
                                         uint32_t _sw_gate_words_reg_0[2];
                                         uint64_t _smem_raw_17;
                                         asm volatile("ld.weak.shared::cta.b64 %0, [%1];" : "=l"(_smem_raw_17) : "r"(sw_gate_words_addr + (((address_24 ^ (address_24 & 1023) >> 7 << 4) - sw_gate_words_addr) / 4) * 4) : "memory");
@@ -3397,28 +3417,17 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                             __nv_bfloat162 _bf16x2_12 = __float22bfloat162_rn(make_float2(silu_x * _cvt_f32_7.x, silu_y * _cvt_f32_7.y));
                                             dgate_packed[pair_18] = __as_u32(_bf16x2_11);
                                             dup_packed[pair_18] = __as_u32(_bf16x2_12);
-                                            float hidden_x = silu_x * _cvt_f32_6.x;
-                                            float hidden_y = silu_y * _cvt_f32_6.y;
-                                            router_gradient = router_gradient + (_cvt_f32_7.x * inverse * hidden_x + _cvt_f32_7.y * inverse * hidden_y);
                                         }
                                         asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(sw_gate_words_addr + ((address_24 ^ (address_24 & 1023) >> 7 << 4) - sw_gate_words_addr)), "r"(dgate_packed[0]), "r"(dgate_packed[1]) : "memory");
                                         asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"(sw_up_words_addr + ((address_0 ^ (address_0 & 1023) >> 7 << 4) - sw_up_words_addr)), "r"(dup_packed[0]), "r"(dup_packed[1]) : "memory");
                                     }
-                                    if (half_16 != 0) {
-                                        sw_router[stage_11 * 128 + tile_row] = router_gradient;
-                                    }
-                                    __syncthreads();
-                                    if (half_16 == 0 && peer_5 >= 0) {
-                                        router_gradient = router_gradient + sw_router[stage_11 * 128 + tile_row];
-                                        partials[local_row_3 * col_blocks_13 + col_22] = router_gradient;
-                                    }
                                     __syncthreads();
                                     if (tid == 0) {
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        tma_store_5d((&dg_sw_r), 0, (row_29 - macro_row_offset_2) * 128, col_22 * 2, 0, 0, sw_gate_addr + (unsigned int)(stage_11 * 32768));
+                                        tma_store_5d((&dg_sw_r), 0, (row_29 - macro_row_offset_2) * 128, col_22 * 2, 0, 0, sw_gate_addr + (unsigned int)(stage_12 * 32768));
                                         asm volatile("cp.async.bulk.commit_group;");
                                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                        tma_store_5d((&du_sw_r), 0, (row_29 - macro_row_offset_2) * 128, col_22 * 2, 0, 0, sw_up_addr + (unsigned int)(stage_11 * 32768));
+                                        tma_store_5d((&du_sw_r), 0, (row_29 - macro_row_offset_2) * 128, col_22 * 2, 0, 0, sw_up_addr + (unsigned int)(stage_12 * 32768));
                                         asm volatile("cp.async.bulk.commit_group;");
                                     }
                                 }
@@ -3426,10 +3435,10 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                             if (tid == 0) {
                                 asm volatile("cp.async.bulk.wait_group 0;");
                                 #pragma unroll
-                                for (int stage_12 = 0; stage_12 < 2; stage_12++) {
-                                    if (tile_end_2 > first_tile_3 + stage_12) {
+                                for (int stage_13 = 0; stage_13 < 2; stage_13++) {
+                                    if (tile_end_2 > first_tile_3 + stage_13) {
                                         int row_30 = first_row_6;
-                                        if (col_blocks_13 <= first_col_3 + stage_12) {
+                                        if (col_blocks_13 <= first_col_3 + stage_13) {
                                             row_30 = row_30 + 1;
                                         }
                                         asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(dg_ready)) + (local_tokens / 256 + row_30 / 2))), "r"(static_cast<unsigned int>(1)) : "memory");
@@ -3618,8 +3627,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     #pragma unroll
                                     for (int chunk_16 = 0; chunk_16 < 8; chunk_16++) {
                                         #pragma unroll
-                                        for (int half_17 = 0; half_17 < 2; half_17++) {
-                                            unsigned int address_25 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_17 * 16 << 16) + (unsigned int)(chunk_16 * 32);
+                                        for (int half_18 = 0; half_18 < 2; half_18++) {
+                                            unsigned int address_25 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_18 * 16 << 16) + (unsigned int)(chunk_16 * 32);
                                             float _tmem_load_8[16];
                                             asm volatile(
                                                 "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -3629,7 +3638,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                             #pragma unroll
                                             for (int pair_19 = 0; pair_19 < 8; pair_19++) {
                                                 __nv_bfloat162 _bf16x2_13 = __float22bfloat162_rn(make_float2(_tmem_load_8[pair_19 * 2], _tmem_load_8[pair_19 * 2 + 1]));
-                                                packed_16[chunk_16 * 16 + half_17 * 8 + pair_19] = __as_u32(_bf16x2_13);
+                                                packed_16[chunk_16 * 16 + half_18 * 8 + pair_19] = __as_u32(_bf16x2_13);
                                             }
                                         }
                                     }
@@ -3654,14 +3663,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         int warp_0_10 = tid / 32;
                                         int lane_15 = tid % 32;
                                         #pragma unroll
-                                        for (int half_18 = 0; half_18 < 2; half_18++) {
+                                        for (int half_19 = 0; half_19 < 2; half_19++) {
                                             #pragma unroll
                                             for (int col_tile_8 = 0; col_tile_8 < 2; col_tile_8++) {
-                                                int row_32 = warp_0_10 * 32 + half_18 * 16 + lane_15 % 16;
+                                                int row_32 = warp_0_10 * 32 + half_19 * 16 + lane_15 % 16;
                                                 int col_24 = col_tile_8 * 16 + lane_15 / 16 * 8;
                                                 unsigned int address_26 = d_smem_addr + (unsigned int)(chunk_17 % 3 * 8192) + (unsigned int)((row_32 * 32 + col_24) * 2);
                                                 address_26 = address_26 ^ (address_26 & 511) >> 7 << 4;
-                                                int offset_0_3 = chunk_17 * 16 + half_18 * 8 + col_tile_8 * 4;
+                                                int offset_0_3 = chunk_17 * 16 + half_19 * 8 + col_tile_8 * 4;
                                                 uint32_t _stmatrix_addr_20 = static_cast<uint32_t>(address_26);
                                                 asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                                     :: "r"(_stmatrix_addr_20), "r"(*reinterpret_cast<const uint32_t*>(&packed_16[offset_0_3])), "r"(*reinterpret_cast<const uint32_t*>(&packed_16[offset_0_3 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_16[offset_0_3 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_16[offset_0_3 + 3]))
@@ -3804,16 +3813,16 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                                 }
                                             }
                                             mbarrier_wait(gemm_finished_addr + (ring_18) * 8, phase_bits_15 >> (unsigned int)(16 + ring_18) & 1);
-                                            int local_row_4 = k_start_9 + idx_18 * 64 - macro_1 * macro_size;
+                                            int local_row_3 = k_start_9 + idx_18 * 64 - macro_1 * macro_size;
                                             asm volatile(
                                                 "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                                 " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                                :: "r"(a_atb_addr + (unsigned int)(ring_18 * 16384)), "l"((&dy_atb_r)), "r"(0), "r"(local_row_4), "r"(x_9 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
+                                                :: "r"(a_atb_addr + (unsigned int)(ring_18 * 16384)), "l"((&dy_atb_r)), "r"(0), "r"(local_row_3), "r"(x_9 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
                                                    "r"(((gemm_arrived_addr + (ring_18) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
                                             asm volatile(
                                                 "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                                 " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                                :: "r"(b_ab_addr + (unsigned int)(ring_18 * 16384)), "l"((&h_atb_r)), "r"(0), "r"(local_row_4), "r"(y_9 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
+                                                :: "r"(b_ab_addr + (unsigned int)(ring_18 * 16384)), "l"((&h_atb_r)), "r"(0), "r"(local_row_3), "r"(y_9 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
                                                    "r"(((gemm_arrived_addr + (ring_18) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
                                             phase_bits_15 = phase_bits_15 ^ (unsigned int)(1 << 16 + ring_18);
                                             ring_18 = (ring_18 + 1) % 6;
@@ -3882,8 +3891,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                     #pragma unroll
                                     for (int chunk_18 = 0; chunk_18 < 8; chunk_18++) {
                                         #pragma unroll
-                                        for (int half_19 = 0; half_19 < 2; half_19++) {
-                                            unsigned int address_27 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_19 * 16 << 16) + (unsigned int)(chunk_18 * 32);
+                                        for (int half_20 = 0; half_20 < 2; half_20++) {
+                                            unsigned int address_27 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_20 * 16 << 16) + (unsigned int)(chunk_18 * 32);
                                             float _tmem_load_9[16];
                                             asm volatile(
                                                 "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -3893,7 +3902,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                             #pragma unroll
                                             for (int pair_20 = 0; pair_20 < 8; pair_20++) {
                                                 __nv_bfloat162 _bf16x2_14 = __float22bfloat162_rn(make_float2(_tmem_load_9[pair_20 * 2], _tmem_load_9[pair_20 * 2 + 1]));
-                                                packed_17[chunk_18 * 16 + half_19 * 8 + pair_20] = __as_u32(_bf16x2_14);
+                                                packed_17[chunk_18 * 16 + half_20 * 8 + pair_20] = __as_u32(_bf16x2_14);
                                             }
                                         }
                                     }
@@ -3918,14 +3927,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         int warp_0_11 = tid / 32;
                                         int lane_16 = tid % 32;
                                         #pragma unroll
-                                        for (int half_20 = 0; half_20 < 2; half_20++) {
+                                        for (int half_21 = 0; half_21 < 2; half_21++) {
                                             #pragma unroll
                                             for (int col_tile_9 = 0; col_tile_9 < 2; col_tile_9++) {
-                                                int row_34 = warp_0_11 * 32 + half_20 * 16 + lane_16 % 16;
+                                                int row_34 = warp_0_11 * 32 + half_21 * 16 + lane_16 % 16;
                                                 int col_26 = col_tile_9 * 16 + lane_16 / 16 * 8;
                                                 unsigned int address_28 = d_smem_addr + (unsigned int)(chunk_19 % 3 * 8192) + (unsigned int)((row_34 * 32 + col_26) * 2);
                                                 address_28 = address_28 ^ (address_28 & 511) >> 7 << 4;
-                                                int offset_0_4 = chunk_19 * 16 + half_20 * 8 + col_tile_9 * 4;
+                                                int offset_0_4 = chunk_19 * 16 + half_21 * 8 + col_tile_9 * 4;
                                                 uint32_t _stmatrix_addr_21 = static_cast<uint32_t>(address_28);
                                                 asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                                     :: "r"(_stmatrix_addr_21), "r"(*reinterpret_cast<const uint32_t*>(&packed_17[offset_0_4])), "r"(*reinterpret_cast<const uint32_t*>(&packed_17[offset_0_4 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_17[offset_0_4 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_17[offset_0_4 + 3]))
@@ -4074,16 +4083,16 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                                     }
                                                 }
                                                 mbarrier_wait(gemm_finished_addr + (ring_20) * 8, phase_bits_16 >> (unsigned int)(16 + ring_20) & 1);
-                                                int local_row_5 = k_start_10 + idx_20 * 64 - macro_1 * macro_size;
+                                                int local_row_4 = k_start_10 + idx_20 * 64 - macro_1 * macro_size;
                                                 asm volatile(
                                                     "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                                    :: "r"(a_atb_addr + (unsigned int)(ring_20 * 16384)), "l"((&dg_atb_r)), "r"(0), "r"(local_row_5), "r"(x_10 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
+                                                    :: "r"(a_atb_addr + (unsigned int)(ring_20 * 16384)), "l"((&dg_atb_r)), "r"(0), "r"(local_row_4), "r"(x_10 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
                                                        "r"(((gemm_arrived_addr + (ring_20) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
                                                 asm volatile(
                                                     "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                                    :: "r"(b_ab_addr + (unsigned int)(ring_20 * 16384)), "l"((&x_atb_r)), "r"(0), "r"(local_row_5), "r"(y_10 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
+                                                    :: "r"(b_ab_addr + (unsigned int)(ring_20 * 16384)), "l"((&x_atb_r)), "r"(0), "r"(local_row_4), "r"(y_10 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
                                                        "r"(((gemm_arrived_addr + (ring_20) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
                                                 phase_bits_16 = phase_bits_16 ^ (unsigned int)(1 << 16 + ring_20);
                                                 ring_20 = (ring_20 + 1) % 6;
@@ -4152,8 +4161,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         #pragma unroll
                                         for (int chunk_20 = 0; chunk_20 < 8; chunk_20++) {
                                             #pragma unroll
-                                            for (int half_21 = 0; half_21 < 2; half_21++) {
-                                                unsigned int address_29 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_21 * 16 << 16) + (unsigned int)(chunk_20 * 32);
+                                            for (int half_22 = 0; half_22 < 2; half_22++) {
+                                                unsigned int address_29 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_22 * 16 << 16) + (unsigned int)(chunk_20 * 32);
                                                 float _tmem_load_10[16];
                                                 asm volatile(
                                                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -4163,7 +4172,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                                 #pragma unroll
                                                 for (int pair_21 = 0; pair_21 < 8; pair_21++) {
                                                     __nv_bfloat162 _bf16x2_15 = __float22bfloat162_rn(make_float2(_tmem_load_10[pair_21 * 2], _tmem_load_10[pair_21 * 2 + 1]));
-                                                    packed_18[chunk_20 * 16 + half_21 * 8 + pair_21] = __as_u32(_bf16x2_15);
+                                                    packed_18[chunk_20 * 16 + half_22 * 8 + pair_21] = __as_u32(_bf16x2_15);
                                                 }
                                             }
                                         }
@@ -4188,14 +4197,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                             int warp_0_12 = tid / 32;
                                             int lane_17 = tid % 32;
                                             #pragma unroll
-                                            for (int half_22 = 0; half_22 < 2; half_22++) {
+                                            for (int half_23 = 0; half_23 < 2; half_23++) {
                                                 #pragma unroll
                                                 for (int col_tile_10 = 0; col_tile_10 < 2; col_tile_10++) {
-                                                    int row_36 = warp_0_12 * 32 + half_22 * 16 + lane_17 % 16;
+                                                    int row_36 = warp_0_12 * 32 + half_23 * 16 + lane_17 % 16;
                                                     int col_28 = col_tile_10 * 16 + lane_17 / 16 * 8;
                                                     unsigned int address_30 = d_smem_addr + (unsigned int)(chunk_21 % 3 * 8192) + (unsigned int)((row_36 * 32 + col_28) * 2);
                                                     address_30 = address_30 ^ (address_30 & 511) >> 7 << 4;
-                                                    int offset_0_5 = chunk_21 * 16 + half_22 * 8 + col_tile_10 * 4;
+                                                    int offset_0_5 = chunk_21 * 16 + half_23 * 8 + col_tile_10 * 4;
                                                     uint32_t _stmatrix_addr_22 = static_cast<uint32_t>(address_30);
                                                     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                                         :: "r"(_stmatrix_addr_22), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_5])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_5 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_5 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_18[offset_0_5 + 3]))
@@ -4343,16 +4352,16 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                                     }
                                                 }
                                                 mbarrier_wait(gemm_finished_addr + (ring_22) * 8, phase_bits_17 >> (unsigned int)(16 + ring_22) & 1);
-                                                int local_row_6 = k_start_11 + idx_22 * 64 - macro_1 * macro_size;
+                                                int local_row_5 = k_start_11 + idx_22 * 64 - macro_1 * macro_size;
                                                 asm volatile(
                                                     "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                                    :: "r"(a_atb_addr + (unsigned int)(ring_22 * 16384)), "l"((&du_atb_r)), "r"(0), "r"(local_row_6), "r"(x_11 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
+                                                    :: "r"(a_atb_addr + (unsigned int)(ring_22 * 16384)), "l"((&du_atb_r)), "r"(0), "r"(local_row_5), "r"(x_11 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
                                                        "r"(((gemm_arrived_addr + (ring_22) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
                                                 asm volatile(
                                                     "cp.async.bulk.tensor.5d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2"
                                                     " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
-                                                    :: "r"(b_ab_addr + (unsigned int)(ring_22 * 16384)), "l"((&x_atb_r)), "r"(0), "r"(local_row_6), "r"(y_11 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
+                                                    :: "r"(b_ab_addr + (unsigned int)(ring_22 * 16384)), "l"((&x_atb_r)), "r"(0), "r"(local_row_5), "r"(y_11 * 4 + cta_rank_0 * 2), "r"(0), "r"(0),
                                                        "r"(((gemm_arrived_addr + (ring_22) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(1 << cta_rank_0)) : "memory");
                                                 phase_bits_17 = phase_bits_17 ^ (unsigned int)(1 << 16 + ring_22);
                                                 ring_22 = (ring_22 + 1) % 6;
@@ -4421,8 +4430,8 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                         #pragma unroll
                                         for (int chunk_22 = 0; chunk_22 < 8; chunk_22++) {
                                             #pragma unroll
-                                            for (int half_23 = 0; half_23 < 2; half_23++) {
-                                                unsigned int address_31 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_23 * 16 << 16) + (unsigned int)(chunk_22 * 32);
+                                            for (int half_24 = 0; half_24 < 2; half_24++) {
+                                                unsigned int address_31 = taddr_1 + (unsigned int)(tid / 32 * 32 + half_24 * 16 << 16) + (unsigned int)(chunk_22 * 32);
                                                 float _tmem_load_11[16];
                                                 asm volatile(
                                                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -4432,7 +4441,7 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                                 #pragma unroll
                                                 for (int pair_22 = 0; pair_22 < 8; pair_22++) {
                                                     __nv_bfloat162 _bf16x2_16 = __float22bfloat162_rn(make_float2(_tmem_load_11[pair_22 * 2], _tmem_load_11[pair_22 * 2 + 1]));
-                                                    packed_19[chunk_22 * 16 + half_23 * 8 + pair_22] = __as_u32(_bf16x2_16);
+                                                    packed_19[chunk_22 * 16 + half_24 * 8 + pair_22] = __as_u32(_bf16x2_16);
                                                 }
                                             }
                                         }
@@ -4457,14 +4466,14 @@ kernel_cake_mok_backward(const __grid_constant__ CUtensorMap dy_s, const __grid_
                                             int warp_0_13 = tid / 32;
                                             int lane_18 = tid % 32;
                                             #pragma unroll
-                                            for (int half_24 = 0; half_24 < 2; half_24++) {
+                                            for (int half_25 = 0; half_25 < 2; half_25++) {
                                                 #pragma unroll
                                                 for (int col_tile_11 = 0; col_tile_11 < 2; col_tile_11++) {
-                                                    int row_38 = warp_0_13 * 32 + half_24 * 16 + lane_18 % 16;
+                                                    int row_38 = warp_0_13 * 32 + half_25 * 16 + lane_18 % 16;
                                                     int col_30 = col_tile_11 * 16 + lane_18 / 16 * 8;
                                                     unsigned int address_32 = d_smem_addr + (unsigned int)(chunk_23 % 3 * 8192) + (unsigned int)((row_38 * 32 + col_30) * 2);
                                                     address_32 = address_32 ^ (address_32 & 511) >> 7 << 4;
-                                                    int offset_0_6 = chunk_23 * 16 + half_24 * 8 + col_tile_11 * 4;
+                                                    int offset_0_6 = chunk_23 * 16 + half_25 * 8 + col_tile_11 * 4;
                                                     uint32_t _stmatrix_addr_23 = static_cast<uint32_t>(address_32);
                                                     asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                                                         :: "r"(_stmatrix_addr_23), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_6])), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_6 + 1])), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_6 + 2])), "r"(*reinterpret_cast<const uint32_t*>(&packed_19[offset_0_6 + 3]))

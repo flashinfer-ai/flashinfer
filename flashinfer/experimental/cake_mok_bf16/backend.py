@@ -43,8 +43,9 @@ class MoKSourceSchedule(native.MoKSchedule):
 
 
 @dataclass(frozen=True, slots=True)
-class MoKSourceForwardContext(native.MoKForwardContext):
-    schedule: MoKSourceSchedule
+class MoKForwardContext(native.MoKForwardContext):
+    schedule: native.MoKSchedule
+    y_routed: torch.Tensor
 
 
 class MoKFunctional:
@@ -339,15 +340,7 @@ class MoKFunctional:
             config.macrobatch_size,
             config.minibatch_size,
         )
-        context_type = (
-            MoKSourceForwardContext
-            if isinstance(schedule, MoKSourceSchedule)
-            else native.MoKForwardContext
-        )
-        context_metadata = (
-            {"schedule": schedule} if isinstance(schedule, MoKSourceSchedule) else {}
-        )
-        context = context_type(
+        context = MoKForwardContext(
             x_routed=values[0],
             gate_shared=values[1],
             gate_routed=values[2],
@@ -355,7 +348,8 @@ class MoKFunctional:
             up_routed=values[4],
             hidden_shared=values[5],
             hidden_routed=values[6],
-            **context_metadata,
+            schedule=schedule,
+            y_routed=values[8],
         )
         self._barrier(workspace)
         output = self.epilogues.forward(
@@ -383,18 +377,13 @@ class MoKFunctional:
         workspace, source_count = self._inputs(
             config, workspace, schedule, x, router_weights, grad_output
         )
-        if isinstance(schedule, MoKSourceSchedule):
-            if (
-                not isinstance(forward_context, MoKSourceForwardContext)
-                or forward_context.schedule is not schedule
-            ):
-                raise ValueError(
-                    "Backward requires the matching variable-source forward context"
-                )
-        elif isinstance(forward_context, MoKSourceForwardContext):
-            raise ValueError("A variable-source context requires its matching schedule")
-        if not isinstance(forward_context, native.MoKForwardContext):
-            raise TypeError("A native MoKForwardContext is required")
+        if (
+            not isinstance(forward_context, MoKForwardContext)
+            or forward_context.schedule is not schedule
+        ):
+            raise ValueError(
+                "Backward requires the matching forward context and schedule"
+            )
         self._check_device(workspace)
         self._weights(
             x,
@@ -434,6 +423,7 @@ class MoKFunctional:
             forward_context.up_routed,
             forward_context.hidden_shared,
             forward_context.hidden_routed,
+            forward_context.y_routed,
             workspace.x_buffer,
             workspace.x_buffer_ptrs,
             *self._schedule(schedule),

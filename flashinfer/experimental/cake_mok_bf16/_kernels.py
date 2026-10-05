@@ -77,7 +77,10 @@ class MoKForward:
             torch.empty_like(gate_shared),
             torch.empty_like(gate_routed),
         )
-        y_shared, y_routed = torch.empty_like(x), torch.empty_like(x_routed)
+        # Preserve every routed BF16 output for the exact score derivative.
+        # Other expert activations retain the existing macrobatch ring policy.
+        y_shared = torch.empty_like(x)
+        y_routed = torch.empty((capacity, hidden), **options)
         shared_rows, routed_rows = local_tokens // 256, capacity // 256
         shared_gate_tasks = shared_rows * (intermediate // 256)
         mini_gate_tasks = (mini_size // 256) * (intermediate // 256)
@@ -191,6 +194,7 @@ class MoKBackward:
         up_routed,
         hidden_shared,
         hidden_routed,
+        saved_y,
         x,
         x_ptrs,
         peer_rank,
@@ -229,6 +233,15 @@ class MoKBackward:
             raise ValueError(
                 "MoK native BF16 tile and communication geometry is required"
             )
+        if (
+            saved_y.shape != (capacity, hidden)
+            or saved_y.dtype != torch.bfloat16
+            or saved_y.device != x.device
+            or not saved_y.is_contiguous()
+        ):
+            raise ValueError(
+                "Backward requires the matching complete routed forward output"
+            )
         key = (
             tuple(x_ptrs),
             tuple(dy_ptrs),
@@ -247,9 +260,6 @@ class MoKBackward:
         ]
         options = dict(device=x.device, dtype=torch.bfloat16)
         router_weights = torch.empty(macro_size, dtype=torch.float32, device=x.device)
-        partials = torch.empty(
-            macro_size, intermediate // 128, dtype=torch.float32, device=x.device
-        )
         dy_routed = torch.empty((macro_size, hidden), **options)
         dh_shared = torch.empty((local_tokens, intermediate), **options)
         dh_routed = torch.empty((macro_size, intermediate), **options)
@@ -354,8 +364,8 @@ class MoKBackward:
                 x_routed_ptr=x_routed,
                 dy_routed_ptr=dy_routed,
                 dx_routed_ptr=dx_routed,
+                saved_y=saved_y,
                 weights=router_weights,
-                partials=partials,
                 x_peers=x_peers,
                 dy_peers=dy_peers,
                 dx_peers=dx_peers,

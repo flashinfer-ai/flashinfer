@@ -5,8 +5,8 @@
       "cake_mok_forward_binding.cu"
     ],
     "sha256": [
-      "793b803ea86e5e67d693f798b703aad477f0134628de4195af2f42034efa698d",
-      "8f9ed1f3edaa0da32933ea637da55858b888551239f9d49c4956fa408947f108"
+      "3a1498aefc7089827e3b585d37a22f9ac67cfc1d57e25356244129b3e84c0ecf",
+      "4bd894ed033db46a98a7ec940c8258258aef6be76f359bea05761412326a2495"
     ],
     "arguments": [
       [
@@ -204,8 +204,8 @@
       "cake_mok_backward_binding.cu"
     ],
     "sha256": [
-      "f9f8060efaa411e76875b8ee27546c513f93d407ba8fb463124f5372e5359d51",
-      "a2232c2009d56e7fdbc129c61c7cbf4e5a22287b5a841e130efa09a24296ab6c"
+      "3e94e23be778e9161ab5e4db01edbac8520c96b5c505572ad6b39e502d7768cf",
+      "092b5f1c0e8e2cafc89527b9aabe5ba4e5205b655f5f607591a496562e9626c6"
     ],
     "arguments": [
       [
@@ -414,11 +414,11 @@
       ],
       [
         "buffer",
-        "weights"
+        "saved_y"
       ],
       [
         "buffer",
-        "partials"
+        "weights"
       ],
       [
         "buffer",
