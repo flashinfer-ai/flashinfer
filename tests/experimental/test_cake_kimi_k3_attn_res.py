@@ -189,7 +189,7 @@ def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
     dense family's M table, the persistent write variant above it (also where the dense cell
     runs a native port, e.g. sm_100a K4 M1024 / sm_103a K4 M256)."""
     plan = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl, block_write_idx=K)
-    dense = cb._persistent_plan_exact(arch, SM_COUNT, M, K, pdl)
+    dense = cb._persistent_plan_exact(arch, SM_COUNT, M, K, pdl, write=True)
     max_m = cb._SMALL_M_DIRECT_MAX_M[arch].get(K)
     assert plan.fallback_from is None
     assert f".k{K}.delta1.write1.norm1.pdl{int(pdl)}." in plan.route_id

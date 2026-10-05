@@ -117,6 +117,7 @@ _SM100_HELD_CONSUMED_RELEASE_CELLS = frozenset({(4096, 5)})
 _SM100_HELD_CONSUMED_RELEASE_MAX_M = {2: 768, 3: 384, 4: 255, 7: 255}
 # Round r4 (direction 2): sm_103a bands that release early (K -> first M).
 _SM103_EARLY_CONSUMED_RELEASE_MIN_M = {6: 384, 7: 256, 8: 384}
+_WRITE_HELD_CONSUMED_RELEASE_MIN_M = {"sm_100a": {4: 1024}, "sm_103a": {}}
 # K = 0 TMA route: grid multiple of the SM count on the promoted mid-M cells.
 _K0_TMA_GRID_MULTIPLIER_M = {
     "sm_100a": {256: 2, 512: 2, 1024: 3},
@@ -309,7 +310,11 @@ def _grid(M: int, num_sms: int, sources_per_chunk: int) -> tuple[int, str]:
     return min(M, num_sms), "token_or_full_sm"
 
 
-def _early_consumed_release(arch: str, M: int, K: int, grid_x: int) -> bool:
+def _early_consumed_release(
+    arch: str, M: int, K: int, grid_x: int, write: bool = False
+) -> bool:
+    if write and _WRITE_HELD_CONSUMED_RELEASE_MIN_M[arch].get(K, M + 1) <= M:
+        return False
     if arch == "sm_100a":
         return (
             K > 0
@@ -623,7 +628,7 @@ def _plan_route_exact(
         else:
             # Above the table the write runs the persistent write variant even where the dense
             # cell runs a native port (Cake select_route persistent_dense_only).
-            dense = _persistent_plan_exact(arch, num_sms, M, K, use_pdl)
+            dense = _persistent_plan_exact(arch, num_sms, M, K, use_pdl, write=True)
         if dense is None or dense.kind != "persistent":
             return _small_m_plan(
                 arch,
@@ -696,14 +701,15 @@ def _plan_route_exact(
 
 
 def _persistent_plan_exact(
-    arch: str, num_sms: int, M: int, K: int, use_pdl: bool
+    arch: str, num_sms: int, M: int, K: int, use_pdl: bool, write: bool = False
 ) -> RoutePlan:
     """The persistent program of a cell (the dense tail of ``_plan_route_exact``), mirrored from the
-    Cake dispatcher's persistent policies."""
+    Cake dispatcher's persistent policies (``write``: the program the snapshot-write variant is
+    derived from; it holds the release from ``_WRITE_HELD_CONSUMED_RELEASE_MIN_M``)."""
     defer = _wait_policy(arch)
     nc, depth = _schedule(arch, M, K)
     grid_x, grid_policy = _grid(M, num_sms, nc)
-    ecr = _early_consumed_release(arch, M, K, grid_x)
+    ecr = _early_consumed_release(arch, M, K, grid_x, write)
     pwa = _producer_wait_acquire(arch, M, K)
     prefix_bf16_add = (
         (
