@@ -647,13 +647,16 @@ def _native_twin_tactic(native, native_packed, cake_space, tactic, full_path: bo
 
 
 def _bitwise_matches(native, native_packed, native_kwargs, tile, output):
-    """Native tactics of ``tile`` whose output equals ``output`` byte for byte (diagnostics)."""
+    """Native tactics of ``tile`` (every FC1 x FC2 pair) whose output equals ``output`` byte for
+    byte, as (tactic, FC1, FC2) triples (failure diagnostics)."""
     native_space = _native_space_for_tile(native, native_packed, tile)
+    anchor = native_space.anchor(tile)
     matches = []
-    for t in native_space.fc2_sweep(tile, native_space.anchor(tile).fc1):
-        nout = _forward(native, native_packed, native_kwargs, list(t.tactic))
-        if torch.equal(output, nout):
-            matches.append([int(v) for v in t.tactic])
+    for fc1 in sorted({t.fc1 for t in native_space.fc1_sweep(tile, anchor.fc2)}):
+        for t in native_space.fc2_sweep(tile, fc1):
+            nout = _forward(native, native_packed, native_kwargs, list(t.tactic))
+            if torch.equal(output, nout):
+                matches.append(([int(v) for v in t.tactic], t.fc1, t.fc2))
     return matches
 
 
@@ -1073,8 +1076,8 @@ def test_stepfun_reproduces_native_fc1_twin_bitwise(
             )
             pytest.fail(
                 f"{precision} T={num_tokens}: Cake tactic {tactic} differs from its native twin "
-                f"{twin} (max |diff| {diff}); native tactics of tile {tactic[0]} matching "
-                f"bitwise: {matches or 'none'}"
+                f"{twin} (max |diff| {diff}); native (tactic, FC1, FC2) of tile {tactic[0]} "
+                f"matching bitwise: {matches or 'none'}"
             )
         checked += 1
     assert checked, (
