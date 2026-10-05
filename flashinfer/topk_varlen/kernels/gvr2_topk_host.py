@@ -1273,6 +1273,12 @@ def _launch_prefill(
             # register rung ABI: (logits, row_starts, window lengths, out, n_clamp, CMP, QC, smem)
             lc[1](lg[r0:r1], row_starts[r0:r1], kv_lens[r0:r1], idx[r0:r1], n_clamp, *lc[2])
             continue
+        if ws is None:
+            # only the streaming main family takes the per-(device, stream)
+            # slab; resolved here so register-rung launches never need one
+            ws = _ws_hot.get(_ws_key(lg.get_device()))
+            if ws is None:
+                ws = default_workspace(lg)  # eager only: raises under capture
         _, fn, (scap, cmp_), tail = lc
         pre = (n_clamp, npad, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
         fn(lg[r0:r1], row_starts[r0:r1], idx[r0:r1], ws, *pre, kv_lens[r0:r1], *tail)
@@ -1282,6 +1288,33 @@ _PREFILL_WARMUP_DONE: set = set()
 _PREFILL_WARMUP_LOCK = threading.Lock()
 
 
+def _prefill_warm_launch(lc: tuple, k: int, n_h: int, row_stride: int | None) -> None:
+    """Launch a compiled windowed engine once, eagerly, on a one-row window of
+    ``n_h`` columns at ``ks = 0``. The engines compile with symbolic shapes, so
+    this exercises exactly the object a full-size slab launches: its first-call
+    init (``_gate_first_call``) and, for the slab family, the CURRENT stream's
+    default workspace slab both happen here instead of inside a later
+    CUDA-graph capture."""
+    dev = torch.cuda.current_device()
+    n_w = (n_h + 3) // 4 * 4  # launch width: a 1-row view keys npad on shape[1]
+    stride = row_stride if row_stride is not None else ((n_w + 256 + 255) // 256 * 256)
+    if stride < n_w or stride % 4:
+        stride = (max(stride, n_w) + 256 + 255) // 256 * 256
+    logits = torch.zeros((1, stride), dtype=torch.float32, device=dev)
+    lg = logits[:, :n_w]
+    ks = torch.zeros((1,), dtype=_I32, device=dev)
+    lens = torch.full((1,), n_h, dtype=_I32, device=dev)
+    out = torch.empty((1, k), dtype=_I32, device=dev)
+    if lc[0] == "reg":
+        # register rung ABI (see _launch_prefill)
+        lc[1](lg, ks, lens, out, n_w, *lc[2])
+        return
+    ws = default_workspace(lg)  # eager: creates this stream's slab when missing
+    _, fn, (scap, cmp_), tail = lc
+    pre = (n_w, stride, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
+    fn(lg, ks, out, ws, *pre, lens, *tail)
+
+
 def warmup_prefill(
     top_k: int,
     max_cols: int,
@@ -1289,14 +1322,25 @@ def warmup_prefill(
     row_stride: int | None = None,
     absolute_indices: bool = False,
 ) -> None:
-    """Compile the windowed (prefill) engine set before serving (<= 6 per k):
-    the tier-0 arm walks the pow2 envelope buckets up to 32768, tiers 1/2 need
-    one launch each. ``max_cols`` is the compressed max column count (the
-    logits width the serving producer emits); idempotent per done-key. Also
-    creates the calling stream's default workspace slab (the windowed engine
-    is the streaming ``main`` family). TRT-LLM #18702 ``warmup_prefill`` mirror.
-    ``absolute_indices`` warms the absolute-column output variants (a
-    distinct compiled set); call once per output frame the server uses."""
+    """Compile and first-launch the windowed (prefill) engine set before
+    serving. For every launch-slab size a count in ``num_rows_list`` is cut
+    into (``_PREFILL_ROW_SLAB`` rows per launch, each slab routes on its own
+    row count) and every pow2 envelope bucket up to ``max_cols``, at both
+    edges of the bucket (the slab tier promotes and the register classes
+    2048 / 4096 / 8192 step exactly at the edges), this warms the slab tier
+    that width takes (unhinted calls, and hinted calls the rung table sends
+    to the slab) plus the register rung the table admits for a hint at that
+    edge: about six slab engines plus the admitted rungs per k.
+    ``max_cols`` is the compressed max column count (the logits width the
+    serving producer emits). Every engine is compiled for the exact launcher
+    key the serving call will look up and launched once on a one-row window,
+    so its first-call init and, for the slab family, THIS stream's default
+    workspace slab exist before a CUDA-graph capture on this stream; warm up
+    on the stream that captures. Idempotent per (device, stream, k,
+    max_cols, rows list, stride, output frame). TRT-LLM #18702
+    ``warmup_prefill`` mirror. ``absolute_indices`` warms the absolute-column
+    output variants (a distinct compiled set); call once per output frame the
+    server uses."""
     dev = torch.cuda.current_device()
     k = int(top_k)
     max_cols = int(max_cols)
@@ -1309,19 +1353,18 @@ def warmup_prefill(
         b <<= 1
     if not buckets:
         buckets = [hi]
-    # (rows, max window hint) representatives: every bucket at both edges (the
-    # slab tier and the register rung both depend on the hint inside a bucket:
-    # tier-0 -> tier-1 promotion, VPT 1/2/4 capacity steps at 2045/4093/8189)
-    reps = {}
+    # the launch slabs a requested row count is cut into (_launch_prefill)
+    slabs = set()
     for rows in num_rows_list:
+        rows = max(int(rows), 1)
+        for r0 in range(0, rows, _PREFILL_ROW_SLAB):
+            slabs.add(min(_PREFILL_ROW_SLAB, rows - r0))
+    # one representative (family, plan, hint) per launcher key
+    reps: dict = {}
+    for rows in sorted(slabs):
         for bk in buckets:
-            hints = {max(bk // 2 + 1, k + 1), bk}
-            for cap in (2048, 4096, 8192):  # register capacity classes (bound <= cap)
-                if bk // 2 < cap <= bk:
-                    hints.add(cap)
-                    hints.add(min(cap + 1, bk))
-            for n_h in sorted(hints):
-                plan = _prefill_reg_route(int(rows), k, n_h)
+            for n_h in sorted({max(bk // 2 + 1, k + 1), bk}):
+                plan = _prefill_reg_route(rows, k, n_h)
                 if plan is not None:
                     key = _prefill_cache_key(
                         "reg",
@@ -1330,20 +1373,15 @@ def warmup_prefill(
                         0,
                         absolute_indices,
                     )
-                else:
-                    key = _prefill_cache_key(
-                        "main", _prefill_tier(int(rows), n_h, k), k, bk, absolute_indices
-                    )
-                reps.setdefault(key, (int(rows), n_h, True))
-            # an unhinted call (max_seq_len=None) of a width in this bucket takes
-            # the slab tier whatever the register table admits: warm it too
-            for n_h in (max(bk // 2 + 1, k + 1), bk):  # both sides of the tier promotion
-                key = _prefill_cache_key(
-                    "main", _prefill_tier(int(rows), n_h, k), k, bk, absolute_indices
-                )
-                reps.setdefault(key, (int(rows), n_h, False))
+                    reps.setdefault(key, ("reg", plan, n_h))
+                # the slab tier of this width: unhinted calls take it whatever
+                # the table admits, hinted calls take it where the table says so
+                tier = _prefill_tier(rows, n_h, k)
+                key = _prefill_cache_key("main", tier, k, bk, absolute_indices)
+                reps.setdefault(key, ("main", (tier, bk), n_h))
     done_key = (
         dev,
+        torch.cuda.current_stream(dev).cuda_stream,
         k,
         max_cols,
         tuple(sorted(int(r) for r in num_rows_list)),
@@ -1353,29 +1391,13 @@ def warmup_prefill(
     with _PREFILL_WARMUP_LOCK:
         if done_key in _PREFILL_WARMUP_DONE:
             return
-    for rows, n_h, hinted in reps.values():
-        rows = _PREFILL_TIER_ROWS[_prefill_tier(rows, n_h, k)] if rows > 297 else rows
-        n_w = (n_h + 3) // 4 * 4  # launch width: a 1-row view keys npad on shape[1]
-        stride = row_stride if row_stride is not None else ((n_w + 256 + 255) // 256 * 256)
-        if stride < n_w or stride % 4:
-            stride = (max(stride, n_w) + 256 + 255) // 256 * 256
-        logits = torch.zeros((rows, stride), dtype=torch.float32, device=dev)
-        ks = torch.zeros((rows,), dtype=_I32, device=dev)
-        lens = torch.full((rows,), n_h, dtype=_I32, device=dev)
-        out = torch.empty((rows, k), dtype=_I32, device=dev)
-        # hinted reps: max_seq_len = the exact hint the serving call will use
-        # (key parity); unhinted reps: the slab tier of the bucket's width
-        run_varlen(
-            logits[:, :n_w],
-            None,
-            lens,
-            out,
-            top_k=k,
-            row_starts=ks,
-            max_seq_len=n_h if hinted else None,
-            absolute_indices=absolute_indices,
-        )
-        del logits, ks, lens, out
+    for fam, spec, n_h in reps.values():
+        if fam == "reg":
+            lc = _prefill_reg_launcher(spec, k, absolute_indices)
+        else:
+            tier, bk = spec
+            lc = _prefill_launcher(tier, k, bk, absolute_indices)
+        _prefill_warm_launch(lc, k, n_h, row_stride)
     torch.cuda.synchronize()
     with _PREFILL_WARMUP_LOCK:
         _PREFILL_WARMUP_DONE.add(done_key)
@@ -1395,13 +1417,20 @@ def prefill_ready(
     width = int(n_env) if width is None else int(width)
     n_env = min(max(int(n_env), 1), width)
     n_bucket = _prefill_bucket(n_env)
+    # a slab (streaming main) launch also needs this (device, CURRENT stream)'s
+    # default workspace slab, which only an eager launch on this stream creates
+    # (warmup_prefill or one eager windowed call); register rungs never need it
+    slab_ok = _ws_hot.get(_ws_key(torch.cuda.current_device())) is not None
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         rows = min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0
         if hinted:
-            if _prefill_get(rows, k, n_env, n_bucket, compile_ok=False, abs_out=absolute_indices) is None:
+            lc = _prefill_get(rows, k, n_env, n_bucket, compile_ok=False, abs_out=absolute_indices)
+            if lc is None or (lc[0] == "main" and not slab_ok):
                 return False
             continue
         tier = _prefill_tier(rows, n_env, k)  # unhinted: slab only
+        if not slab_ok:
+            return False
         if _prefill_cache_key("main", tier, k, n_bucket, absolute_indices) not in _PREFILL_CACHE:
             return False
     return True
@@ -2227,14 +2256,14 @@ def run_varlen(
             vals = values
             if vals is not None and vals.shape[1] != k:
                 vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
-            if ws is None:
-                ws = _ws_hot.get(_ws_key(d))
-                if ws is None:
-                    ws = default_workspace(logits)  # raises under capture
-            # the kernel clamps every window to the logits WIDTH (memory
-            # safety; a caller's max_seq_len must never truncate a window);
-            # max_seq_len, if given, is the max window length used only to
-            # pick the plan tier / envelope bucket
+            # ws stays None here: _launch_prefill resolves the default slab only
+            # for a slab (streaming main) launch, so a hinted register-rung
+            # capture needs no eager call on the capturing stream
+            # (prefill_ready mirrors the same rule)
+            # every engine clamps windows to the logits WIDTH (memory safety);
+            # max_seq_len, if given, is the caller's window-length bound and
+            # picks the engine (register rung or slab tier / envelope bucket);
+            # a register rung reports rows beyond its capacity as all -1
             _launch_prefill(
                 lg,
                 row_starts,

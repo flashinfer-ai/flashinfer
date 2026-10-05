@@ -826,6 +826,154 @@ def test_prefill_skip_check_refuses_other_backends():
         _check_windowed(lg, out, rs, le, k)
 
 
+@requires_gvr2
+def test_prefill_cuda_graph_replay_grows_windows():
+    """Capture with every window short (identity rows at ks=0); replay with
+    misaligned starts of every lead class and full-width windows: the slab
+    engine reads starts and lengths on device, so the grown windows rank
+    exactly (the opposite direction of the shrink replay above)."""
+    top_k, n, rows = 512, 8192, 64
+    _host.warmup_prefill(top_k, n)
+    stride = ((n + 256 + 255) // 256) * 256
+    full = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)
+    lg = full[:, :n]
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    le = torch.full((rows,), 300, dtype=torch.int32, device=_DEV)  # 300 < k
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        flashinfer.top_k_varlen(
+            lg, le, top_k, row_starts=rs, out_indices=out, backend="gvr_2"
+        )
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        flashinfer.top_k_varlen(
+            lg, le, top_k, row_starts=rs, out_indices=out, backend="gvr_2"
+        )
+    torch.cuda.current_stream().wait_stream(s)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_windowed(lg, out, rs, le, top_k)
+    ks2 = [(r % 4) + (r // 16) * 1001 for r in range(rows)]  # every lead class
+    le2 = [n - ks2[r] for r in range(rows)]  # full-width windows
+    rs.copy_(torch.tensor(ks2, dtype=torch.int32))
+    le.copy_(torch.tensor(le2, dtype=torch.int32))
+    full.normal_()
+    g.replay()
+    torch.cuda.synchronize()
+    _check_windowed(lg, out, rs, le, top_k)
+
+
+@requires_gvr2
+def test_prefill_hinted_cuda_graph_replay_shifts_starts():
+    """Hinted (register rung) capture at aligned starts; each replay shifts
+    every request's start by 1, 2 and 3 columns (every lead class) with the
+    windows at the bound."""
+    top_k, L, R = 512, 2045, 4
+    rows = R * L
+    ncols = R * L + 4
+    _host.warmup_prefill(top_k, ncols)
+    stride = (ncols + 256 + 255) // 256 * 256
+    full = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)
+    lg = full[:, :ncols]
+    base = [(r * L) for r in range(R) for _ in range(L)]
+    rs = torch.tensor(base, dtype=torch.int32, device=_DEV)
+    le = torch.tensor(
+        [i + 1 for _ in range(R) for i in range(L)], dtype=torch.int32, device=_DEV
+    )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        flashinfer.top_k_varlen(
+            lg,
+            le,
+            top_k,
+            row_starts=rs,
+            out_indices=out,
+            backend="gvr_2",
+            max_seq_len=L,
+        )
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        flashinfer.top_k_varlen(
+            lg,
+            le,
+            top_k,
+            row_starts=rs,
+            out_indices=out,
+            backend="gvr_2",
+            max_seq_len=L,
+        )
+    torch.cuda.current_stream().wait_stream(s)
+    for shift in (1, 2, 3):
+        rs.copy_(torch.tensor([b + shift for b in base], dtype=torch.int32))
+        full.normal_()
+        g.replay()
+        torch.cuda.synchronize()
+        _check_windowed(lg, out, rs, le, top_k)
+
+
+@requires_gvr2
+def test_prefill_hinted_capture_on_fresh_stream_needs_no_slab():
+    """A hinted register-rung call never needs the per-stream workspace slab:
+    after warm-up it captures on a stream that ran no eager gvr_2 call, and
+    ``prefill_ready`` says so; the slab engine on that stream is not ready."""
+    top_k, L, R = 512, 2045, 2
+    rows = R * L
+    _host.warmup_prefill(top_k, R * L)  # on the current (default) stream
+    stride = (R * L + 256 + 255) // 256 * 256
+    full = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)
+    lg = full[:, : R * L]
+    rs = torch.tensor(
+        [(r * L) for r in range(R) for _ in range(L)], dtype=torch.int32, device=_DEV
+    )
+    le = torch.tensor(
+        [i + 1 for _ in range(R) for i in range(L)], dtype=torch.int32, device=_DEV
+    )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        assert _host.prefill_ready(rows, top_k, L, width=R * L)
+        assert not _host.prefill_ready(rows, top_k, R * L)  # slab: no slab on s
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        flashinfer.top_k_varlen(
+            lg,
+            le,
+            top_k,
+            row_starts=rs,
+            out_indices=out,
+            backend="gvr_2",
+            max_seq_len=L,
+        )
+    torch.cuda.current_stream().wait_stream(s)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_windowed(lg, out, rs, le, top_k)
+
+
+@requires_gvr2
+def test_prefill_warmup_custom_rows_cover_slabs_and_rungs():
+    """A custom ``num_rows_list`` is decomposed into launch slabs and warmed for
+    the key the serving call looks up (not a substituted row count): a count
+    with a small remainder slab and a count above every Rubin gate both report
+    ready for the hinted and the unhinted call."""
+    top_k, n = 512, 2048
+    _host._PREFILL_CACHE.clear()
+    _host._PREFILL_WARMUP_DONE.clear()
+    rows = _host._PREFILL_ROW_SLAB + 100  # tail slab of 100 rows
+    _host.warmup_prefill(top_k, n, num_rows_list=(rows, 17000))
+    for r in (rows, 17000):
+        assert _host.prefill_ready(r, top_k, n)
+        assert _host.prefill_ready(r, top_k, n, width=n)
+        assert _host.prefill_ready(r, top_k, n // 2 + 1, width=n)
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
 def test_prefill_absolute_indices_on_non_current_device():
     """logits on a device that is not the current one: the host re-enters
