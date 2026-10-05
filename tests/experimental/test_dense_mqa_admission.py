@@ -17,7 +17,14 @@ from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa as _runtime
 
 H64_TIERS = ("le8", "le64", "le1024", "any")
 H64_ROUTES = frozenset(
-    {"fp8:h64:q1", *(f"fp8:h64:{kind}:{tier}" for kind in ("full", "partial") for tier in H64_TIERS)}
+    {
+        "fp8:h64:q1",
+        *(
+            f"fp8:h64:{kind}:{tier}"
+            for kind in ("full", "partial")
+            for tier in H64_TIERS
+        ),
+    }
 )
 # One or two query counts per 64-head route (K = 4137 is a legal 64-head KV length: any K >= 1).
 QUERIES_BY_ROUTE = {
@@ -33,8 +40,14 @@ QUERIES_BY_ROUTE = {
 }
 # Synthetic per-arch admission: sm_100a admits nothing, sm_103a admits two tiers (the shape of the export's
 # ``policy.dense_admission``); one tier is therefore admitted on some architectures only.
-ADMITTED_FIXTURE = {"sm_100a": (), "sm_103a": ("fp8:h64:partial:any", "fp8:h64:full:le64")}
-REASON_FIXTURE = {"sm_100a": "not converged: partial:any blocked by one row", "sm_103a": "not converged"}
+ADMITTED_FIXTURE = {
+    "sm_100a": (),
+    "sm_103a": ("fp8:h64:partial:any", "fp8:h64:full:le64"),
+}
+REASON_FIXTURE = {
+    "sm_100a": "not converged: partial:any blocked by one row",
+    "sm_103a": "not converged",
+}
 
 
 def _h64_catalog(shipped):
@@ -56,8 +69,13 @@ def _h64_catalog(shipped):
             "stages": [["logits", "cake_deepgemm_dense_mqa_fixture"]],
         }
     policy["dense_admission"] = dict(
-        admitted_routes={arch: sorted(routes) for arch, routes in ADMITTED_FIXTURE.items()},
-        withheld_routes={arch: sorted(H64_ROUTES - set(routes)) for arch, routes in ADMITTED_FIXTURE.items()},
+        admitted_routes={
+            arch: sorted(routes) for arch, routes in ADMITTED_FIXTURE.items()
+        },
+        withheld_routes={
+            arch: sorted(H64_ROUTES - set(routes))
+            for arch, routes in ADMITTED_FIXTURE.items()
+        },
         reason=dict(REASON_FIXTURE),
     )
     return catalog
@@ -85,8 +103,15 @@ def test_dense_admission_is_per_arch_disjoint_and_complete(catalog_variant):
     for arch in _arches():
         admission = dense_mqa.dense_admission(arch)
         assert admission == everything[arch]
-        admitted, withheld = set(admission["admitted_routes"]), set(admission["withheld_routes"])
-        assert admitted <= H64_ROUTES and withheld <= H64_ROUTES and not admitted & withheld
+        admitted, withheld = (
+            set(admission["admitted_routes"]),
+            set(admission["withheld_routes"]),
+        )
+        assert (
+            admitted <= H64_ROUTES
+            and withheld <= H64_ROUTES
+            and not admitted & withheld
+        )
         assert admitted <= set(_runtime._catalog()["routes"])
         assert bool(withheld) == (admission["reason"] is not None)
         if 64 in _runtime.heads():
@@ -94,8 +119,13 @@ def test_dense_admission_is_per_arch_disjoint_and_complete(catalog_variant):
         else:
             assert not admitted and not withheld
     if catalog_variant == "h64_fixture":
-        assert everything["sm_100a"]["admitted_routes"] == [] and everything["sm_100a"]["reason"] == REASON_FIXTURE["sm_100a"]
-        assert everything["sm_103a"]["admitted_routes"] == sorted(ADMITTED_FIXTURE["sm_103a"])
+        assert (
+            everything["sm_100a"]["admitted_routes"] == []
+            and everything["sm_100a"]["reason"] == REASON_FIXTURE["sm_100a"]
+        )
+        assert everything["sm_103a"]["admitted_routes"] == sorted(
+            ADMITTED_FIXTURE["sm_103a"]
+        )
 
 
 @pytest.mark.parametrize("route", sorted(H64_ROUTES))
@@ -112,10 +142,14 @@ def test_dense_route_available_follows_the_per_arch_admission(catalog_variant, r
                 assert _runtime.route_name("fp8", queries, 4137, 64) == route, queries
             available = dense_mqa.dense_route_available(64, queries, 4137, arch=arch)
             assert available == admitted, (arch, route, queries)
-            assert available == _runtime.dense_route_available(64, queries, 4137, arch=arch)
+            assert available == _runtime.dense_route_available(
+                64, queries, 4137, arch=arch
+            )
     queries = QUERIES_BY_ROUTE[route][0]
     if len(set(verdicts.values())) == 1:
-        assert dense_mqa.dense_route_available(64, queries, 4137) == next(iter(verdicts.values()))
+        assert dense_mqa.dense_route_available(64, queries, 4137) == next(
+            iter(verdicts.values())
+        )
     else:
         with pytest.raises(ValueError, match="pass arch"):
             dense_mqa.dense_route_available(64, queries, 4137)
@@ -138,6 +172,8 @@ def test_plan_refuses_a_withheld_route_by_name(monkeypatch):
     """``route_record`` (the plan's gate) names the withheld arch instead of a generic missing-route error."""
     synthetic = _h64_catalog(_runtime._catalog())
     monkeypatch.setattr(_runtime, "_catalog", functools.cache(lambda: synthetic))
-    assert _runtime.route_record("fp8", 16231, 4137, 64, arch="sm_103a")["num_heads"] == 64
+    assert (
+        _runtime.route_record("fp8", 16231, 4137, 64, arch="sm_103a")["num_heads"] == 64
+    )
     with pytest.raises(ValueError, match="sm_100a"):
         _runtime.route_record("fp8", 16231, 4137, 64, arch="sm_100a")
