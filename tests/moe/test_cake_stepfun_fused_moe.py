@@ -43,6 +43,7 @@ from flashinfer.fused_moe import (
     ExpertConfig,
     MoEActivationPack,
     MoEConfig,
+    MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
     QuantConfig,
@@ -156,11 +157,11 @@ PRECISIONS = {
         fused_shared_experts=True,
     ),
 }
-# (precision, num_tokens) seed rows whose FC1 tile candidates have no exported Cake kernel and
-# therefore run the native FC1. Every family now ships a Cake kernel for every tile the FlashInfer
-# tactic list offers at the seed token counts, so the set is empty; a row that still lacks a Cake
-# tile fails instead of being excused.
-KNOWN_NATIVE_FALLBACK: set[tuple[str, int]] = set()
+# The Cake backend has no native FC1 fallback: a token count whose FC1 tile window has no exported
+# Cake kernel is a hard failure of the inventory, never an excused row.
+LIMIT_MODES = ("7", "16", "mixed")
+ROUTING_REGIMES = ("uniform", "ragged", "randperm")
+ROUTING_SEED = 20261004
 
 # Rows whose FC1 tile candidates all have a bitwise Cake twin (bf16, per-tensor fp8 and mxfp8
 # reproduce the native FC1 twin bit for bit; nvfp4 does not and is checked by tolerance).
@@ -210,6 +211,7 @@ def _config(
     routed_scaling=None,
     backend=CAKE,
     enable_pdl=True,
+    do_finalize=True,
 ) -> MoEConfig:
     return MoEConfig(
         routing=RoutingConfig(
@@ -231,6 +233,7 @@ def _config(
         execution=ExecutionConfig(
             enable_pdl=enable_pdl, tune_max_num_tokens=num_tokens
         ),
+        finalize=MoEFinalizeConfig(do_finalize=do_finalize),
     )
 
 
@@ -315,6 +318,8 @@ def _build_case(
     has_routing_bias: bool = False,
     seed: int = 0,
     enable_pdl: bool = True,
+    logits: torch.Tensor | None = None,
+    do_finalize: bool = True,
 ):
     """Generate the trtllm-gen StepFun test data, its reference and the unified-API inputs.
 
@@ -331,6 +336,8 @@ def _build_case(
     expert_logits = torch.randn((num_tokens, NUM_EXPERTS), device="cuda").to(
         torch.bfloat16
     )
+    if logits is not None:
+        expert_logits = logits.to(device="cuda", dtype=torch.bfloat16)
     routing_bias = (
         torch.randn(NUM_EXPERTS, device="cuda", dtype=torch.bfloat16)
         if has_routing_bias
@@ -433,6 +440,7 @@ def _build_case(
         top_k_groups=top_k_groups,
         routed_scaling=routed_scaling,
         enable_pdl=enable_pdl,
+        do_finalize=do_finalize,
     )
     return SimpleNamespace(
         precision=precision,
@@ -447,12 +455,23 @@ def _build_case(
     )
 
 
-def _layer_runner(config, device, runner_cls, act, weights):
+def _layer_runner(config, device, runner_cls, act, weights, *, native=False):
     layer = MoELayer(config, device)
     assert len(layer.runners) == 1
     runner = layer.runners[0]
     assert isinstance(runner, runner_cls), type(runner)
-    runner.check_support()
+    try:
+        runner.check_support()
+    except NotImplementedError as error:
+        if native and "SwiGLUStep" in str(error):
+            # The public trtllm-gen artifact ships no StepFun kernels, so the native
+            # runners do not advertise SwiGLUStep; the comparison needs a tree with
+            # the native StepFun path.
+            pytest.skip(
+                f"native {runner_cls.__name__} does not advertise SwiGLUStep "
+                f"(no native StepFun path in this tree): {error}"
+            )
+        raise
     runner.build()
     packed = runner.pack_inputs(act, weights)
     kwargs = runner.launch_kwargs_for(packed)
@@ -480,7 +499,82 @@ def _native_runner(case, device):
         PRECISIONS[case.precision].native_runner,
         case.act,
         case.weights,
+        native=True,
     )
+
+
+def _target(device) -> str:
+    major, minor = get_compute_capability(device)
+    return f"sm_{major}{minor}a"
+
+
+def _full_path_unavailable_reason(device) -> str | None:
+    """None when the module for this device runs the full Cake path, else why not."""
+    from flashinfer.jit.cake_stepfun_moe import (
+        cake_stepfun_missing_stages,
+        resolve_cake_stepfun_full_path,
+    )
+
+    target = _target(device)
+    missing = cake_stepfun_missing_stages(target)
+    if missing:
+        return (
+            f"Cake StepFun full path unavailable for {target}: the generated inventory "
+            f"has no {', '.join(missing)} kernel(s)"
+        )
+    if not resolve_cake_stepfun_full_path(target):
+        return "Cake StepFun full path disabled by FLASHINFER_CAKE_STEPFUN_FULL_PATH"
+    return None
+
+
+def _require_full_path() -> torch.device:
+    device = _require_cake_device()
+    reason = _full_path_unavailable_reason(device)
+    if reason is not None:
+        pytest.skip(reason)
+    return device
+
+
+def _limits(mode: str, num_fused_shared_experts: int = 0) -> torch.Tensor:
+    if mode == "mixed":
+        values = [7.0 if expert % 2 == 0 else 16.0 for expert in range(NUM_EXPERTS)]
+    else:
+        values = [float(mode)] * NUM_EXPERTS
+    values += [16.0] * num_fused_shared_experts
+    return torch.tensor(values, device="cuda", dtype=torch.float32)
+
+
+def _routing_logits(num_tokens: int, regime: str, seed: int = ROUTING_SEED) -> torch.Tensor:
+    """Routing logits of a load regime.
+
+    ``uniform``: i.i.d. normal logits (balanced expert loads). ``ragged``: token ``t`` prefers
+    the experts around ``(t * E / T)^2 / E`` so the per-expert loads are ragged and ascend
+    with the token index (expert 0 heavy, high experts sparse). ``randperm``: the ragged
+    rows in a random token order (same multiset of tokens, scrambled permutation).
+    """
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    base = torch.randn(num_tokens, NUM_EXPERTS, device="cuda", generator=generator)
+    if regime == "uniform":
+        return base.to(torch.bfloat16)
+    centers = (
+        torch.arange(num_tokens, device="cuda", dtype=torch.float32) * NUM_EXPERTS / num_tokens
+    )
+    centers = (centers * centers / NUM_EXPERTS).floor()
+    experts = torch.arange(NUM_EXPERTS, device="cuda", dtype=torch.float32)
+    logits = base - 0.25 * (experts[None, :] - centers[:, None]).abs()
+    if regime == "randperm":
+        logits = logits[torch.randperm(num_tokens, device="cuda", generator=generator)]
+    elif regime != "ragged":
+        raise KeyError(regime)
+    return logits.to(torch.bfloat16)
+
+
+def _unfinalized_forward(runner, packed, kwargs, tactic):
+    """[gemm2_output (permuted rows), expert_weights, expanded_idx_to_permuted_idx] of one forward."""
+    result = runner.forward(packed, tactic=tactic, do_preparation=True, **kwargs)
+    torch.cuda.synchronize()
+    assert isinstance(result, (list, tuple)) and len(result) >= 3, type(result)
+    return [tensor.clone() for tensor in result[:3]]
 
 
 def _cake_tiles(runner, family: str) -> set:
@@ -704,7 +798,15 @@ def test_prepare_weights_adds_step_limits_and_matches_trtllm_backend(precision):
             execution=ExecutionConfig(enable_pdl=True, tune_max_num_tokens=num_tokens),
         )
         runner = runner_cls(config, device)
-        runner.check_support()
+        try:
+            runner.check_support()
+        except NotImplementedError as error:
+            if runner_cls is spec.native_runner and "SwiGLUStep" in str(error):
+                pytest.skip(
+                    f"native {runner_cls.__name__} does not advertise SwiGLUStep "
+                    f"(no native StepFun path in this tree): {error}"
+                )
+            raise
         runner.build()
         packed = runner.pack_inputs(act, weights)
         outputs[runner_cls.__name__] = _forward(
@@ -731,14 +833,10 @@ def test_stepfun_matches_trtllm_reference_for_every_tactic(
     )
     layer, runner, packed, kwargs, tactics = _cake_runner(case, device)
     cake_tiles = _cake_tiles(runner, PRECISIONS[precision].family)
-    if not any(tactic[0] in cake_tiles for tactic in tactics):
-        message = (
-            f"no FC1 tile candidate of T={num_tokens} has a Cake {precision} kernel: "
-            f"tactics {tactics}, Cake tiles {sorted(cake_tiles)}"
-        )
-        if (precision, num_tokens) in KNOWN_NATIVE_FALLBACK:
-            pytest.xfail(message)
-        pytest.fail(message)
+    assert tactics and all(tactic[0] in cake_tiles for tactic in tactics), (
+        f"every tactic of T={num_tokens} must run an exported Cake {precision} kernel: "
+        f"tactics {tactics}, Cake tiles {sorted(cake_tiles)}"
+    )
     for tactic in tactics:
         output = _forward(runner, packed, kwargs, tactic)
         check_accuracy(case.reference, output.float(), **case.tolerances)
@@ -940,7 +1038,14 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
             activation=activation,
             backend=BackendOptions(candidates=(backend,)),
         )
-        runners[runner_cls] = _layer_runner(config, device, runner_cls, act, weights)
+        runners[runner_cls] = _layer_runner(
+            config,
+            device,
+            runner_cls,
+            act,
+            weights,
+            native=runner_cls is TrtllmFp4RoutedRunner,
+        )
     _, cake, cake_packed, cake_kwargs, cake_tactics = runners[CakeStepFunNvfp4Runner]
     _, native, native_packed, native_kwargs, _ = runners[TrtllmFp4RoutedRunner]
     assert cake._inner.use_per_token_scaling is True
@@ -962,6 +1067,469 @@ def test_stepfun_per_token_nvfp4_matches_native(num_tokens):
     check_accuracy(
         reference, _forward(cake, cake_packed, cake_kwargs, -1).float(), **tolerances
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Module variants, inventory and full-path resolution (CPU)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_inventory_v3_lists_a_stage_per_kernel():
+    """Every inventory record names its pipeline stage; fc1 is present for every target."""
+    from flashinfer.jit.cake_stepfun_moe import (
+        CAKE_STEPFUN_STAGES,
+        load_cake_stepfun_inventory,
+    )
+
+    inventory = load_cake_stepfun_inventory()
+    records = json.loads(inventory.path.read_text(encoding="utf-8"))["kernels"]
+    assert records and all(record["stage"] in CAKE_STEPFUN_STAGES for record in records)
+    for target, stages in inventory.stages.items():
+        if inventory.device_sources[target]:
+            assert "fc1" in stages, (target, sorted(stages))
+            assert set(inventory.missing_stages(target)).isdisjoint(stages)
+
+
+@pytest.mark.parametrize("target", ["sm_100a", "sm_103a"])
+def test_full_path_resolution_names_missing_stages(target, monkeypatch):
+    """Requesting the full path with a stage missing fails naming the stage; auto never does."""
+    from flashinfer.jit.cake_stepfun_moe import (
+        CAKE_STEPFUN_FULL_PATH_ENV,
+        cake_stepfun_missing_stages,
+        get_cake_stepfun_fused_moe_uri,
+        resolve_cake_stepfun_full_path,
+    )
+
+    missing = cake_stepfun_missing_stages(target)
+    monkeypatch.delenv(CAKE_STEPFUN_FULL_PATH_ENV, raising=False)
+    assert resolve_cake_stepfun_full_path(target) is (not missing)
+    assert resolve_cake_stepfun_full_path(target, False) is False
+    monkeypatch.setenv(CAKE_STEPFUN_FULL_PATH_ENV, "0")
+    assert resolve_cake_stepfun_full_path(target) is False
+    monkeypatch.setenv(CAKE_STEPFUN_FULL_PATH_ENV, "1")
+    if missing:
+        with pytest.raises(ValueError) as excinfo:
+            resolve_cake_stepfun_full_path(target)
+        for stage in missing:
+            assert stage in str(excinfo.value)
+        with pytest.raises(ValueError):
+            resolve_cake_stepfun_full_path(target, True)
+    else:
+        assert resolve_cake_stepfun_full_path(target) is True
+    monkeypatch.setenv(CAKE_STEPFUN_FULL_PATH_ENV, "sometimes")
+    with pytest.raises(ValueError, match="auto, 0 or 1"):
+        resolve_cake_stepfun_full_path(target)
+    assert get_cake_stepfun_fused_moe_uri(target, False).endswith(target[3:7])
+    assert "_full_" in get_cake_stepfun_fused_moe_uri(target, True)
+    assert "_full_" not in get_cake_stepfun_fused_moe_uri(target, False)
+
+
+def test_module_build_matches_the_resolved_variant():
+    """The loaded module reports the variant the loader resolved and the stages it serves."""
+    device = _require_cake_device()
+    limits = torch.full((NUM_EXPERTS,), 7.0, device="cuda", dtype=torch.float32)
+    case = _build_case({}, precision="bf16", num_tokens=8, limits=limits)
+    _, runner, _, _, _ = _cake_runner(case, device)
+    moe_op = runner._module.moe_op
+    assert bool(moe_op.cake_stepfun_full_path()) is runner.full_path
+    stages = [str(stage) for stage in moe_op.cake_stepfun_stages()]
+    expected = (
+        ["routing", "fc1", "requant", "fc2", "finalize"] if runner.full_path else ["fc1"]
+    )
+    assert stages == expected
+
+
+# ---------------------------------------------------------------------------------------------
+# Full Cake path (routing + FC1 + requantization + FC2 + finalize on Cake kernels)
+# ---------------------------------------------------------------------------------------------
+
+
+def _full_path_case(cache_permute_indices, precision, num_tokens, limit_mode, regime, input_set):
+    return _build_case(
+        cache_permute_indices,
+        precision=precision,
+        num_tokens=num_tokens,
+        limits=_limits(limit_mode),
+        seed=input_set,
+        logits=_routing_logits(num_tokens, regime, seed=ROUTING_SEED + input_set),
+    )
+
+
+@pytest.mark.parametrize("regime", ROUTING_REGIMES)
+@pytest.mark.parametrize("limit_mode", LIMIT_MODES)
+@pytest.mark.parametrize("num_tokens", TOKENS)
+@pytest.mark.parametrize("precision", list(PRECISIONS))
+def test_full_path_matches_native_pipeline(
+    precision, num_tokens, limit_mode, regime, cache_permute_indices
+):
+    """Every Cake full-path tactic reproduces the native pipeline: bitwise where the FC1 twin
+    is bitwise (some native tactic of the same tile), within the harness tolerance otherwise,
+    on two input sets per (precision, T, limit, routing regime)."""
+    device = _require_full_path()
+    spec = PRECISIONS[precision]
+    bitwise = (precision, num_tokens) in BITWISE_ROWS
+    for input_set in (0, 1):
+        case = _full_path_case(
+            cache_permute_indices, precision, num_tokens, limit_mode, regime, input_set
+        )
+        _, cake, cake_packed, cake_kwargs, cake_tactics = _cake_runner(case, device)
+        _, native, native_packed, native_kwargs, native_tactics = _native_runner(
+            case, device
+        )
+        assert cake.full_path
+        cake_tiles = _cake_tiles(cake, spec.family)
+        assert cake_tactics and all(t[0] in cake_tiles for t in cake_tactics)
+        native_outputs = {}
+        for tactic in native_tactics:
+            if tactic[0] in cake_tiles:
+                native_outputs.setdefault(tactic[0], []).append(
+                    (tactic, _forward(native, native_packed, native_kwargs, tactic))
+                )
+        for tactic in cake_tactics:
+            output = _forward(cake, cake_packed, cake_kwargs, tactic)
+            check_accuracy(case.reference, output.float(), **case.tolerances)
+            candidates = native_outputs.get(tactic[0], [])
+            assert candidates, f"no native tactic of tile {tactic[0]} to compare against"
+            if bitwise:
+                matches = [nt for nt, nout in candidates if torch.equal(output, nout)]
+                closest = min(
+                    (output.float() - nout.float()).abs().max().item()
+                    for _, nout in candidates
+                )
+                assert matches, (
+                    f"{precision} T={num_tokens} limit={limit_mode} {regime} set {input_set}: "
+                    f"Cake tactic {tactic} matches no native tactic of tile {tactic[0]} "
+                    f"bitwise (closest max |diff| {closest})"
+                )
+            else:
+                for _, nout in candidates:
+                    check_accuracy(nout.float(), output.float(), **case.tolerances)
+        default = _forward(cake, cake_packed, cake_kwargs, -1)
+        check_accuracy(case.reference, default.float(), **case.tolerances)
+
+
+def _staged_routing(moe_op, case, tile: int, num_tokens: int, logits: torch.Tensor):
+    """Routing tables of the module's staged bf16 routing op for one FC1 tile."""
+    view = case.weights.get_view("cake_stepfun")
+    hidden = case.act.hidden_states_q
+    empty_ids = hidden.new_empty((0,), dtype=torch.int32)
+    empty_weights = hidden.new_empty((0,), dtype=torch.bfloat16)
+    out = moe_op.trtllm_moe_run_routing(
+        logits,
+        None,
+        empty_ids,
+        empty_weights,
+        hidden,
+        view["gemm1_weights"],
+        view["gemm2_weights"],
+        NUM_EXPERTS,
+        TOP_K,
+        None,
+        None,
+        INTERMEDIATE_SIZE,
+        0,
+        NUM_EXPERTS,
+        None,
+        int(RoutingMethodType.Renormalize),
+        True,
+        int(WeightLayout.BlockMajorK),
+        True,
+        [tile, -1],
+        int(ActivationType.Swiglu),
+        True,
+        None,
+    )
+    tensors = [
+        t if isinstance(t, torch.Tensor) else torch.from_dlpack(t) for t in out
+    ]
+    torch.cuda.synchronize()
+    (
+        expert_weights,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_token_idx,
+        tile_idx,
+        mn_limit,
+        num_non_exiting_ctas,
+        total_num_padded_tokens,
+    ) = tensors[:7]
+    num_ctas = int(num_non_exiting_ctas.item())
+    num_padded = int(total_num_padded_tokens.item())
+    return {
+        "expert_weights": expert_weights.clone(),
+        "expanded_idx_to_permuted_idx": expanded_idx_to_permuted_idx.clone(),
+        "permuted_idx_to_token_idx": permuted_idx_to_token_idx[:num_padded].clone(),
+        "cta_idx_xy_to_batch_idx": tile_idx[:num_ctas].clone(),
+        "cta_idx_xy_to_mn_limit": mn_limit[:num_ctas].clone(),
+        "num_non_exiting_ctas": num_non_exiting_ctas.clone(),
+        "total_num_padded_tokens": total_num_padded_tokens.clone(),
+        "tile": tile,
+    }
+
+
+# Routing tables the trtllm-gen router writes deterministically. The two permutation maps are
+# assigned by atomic arrival order inside the cluster / cooperative kernels (T >= 17), so the
+# native router is not bitwise reproducible against itself there; they are compared canonically.
+_DETERMINISTIC_ROUTING_TABLES = (
+    "expert_weights",
+    "cta_idx_xy_to_batch_idx",
+    "cta_idx_xy_to_mn_limit",
+    "num_non_exiting_ctas",
+    "total_num_padded_tokens",
+)
+
+
+def _assert_routing_tables_match(ours, theirs, num_tokens: int, context: str) -> None:
+    for name in _DETERMINISTIC_ROUTING_TABLES:
+        assert torch.equal(ours[name], theirs[name]), (
+            f"{context}: {name} differs (ours {ours[name].flatten()[:8].tolist()} vs native "
+            f"{theirs[name].flatten()[:8].tolist()})"
+        )
+    e2p_ours, e2p_theirs = (
+        ours["expanded_idx_to_permuted_idx"],
+        theirs["expanded_idx_to_permuted_idx"],
+    )
+    p2t_ours, p2t_theirs = ours["permuted_idx_to_token_idx"], theirs["permuted_idx_to_token_idx"]
+    if num_tokens <= 16:
+        assert torch.equal(e2p_ours, e2p_theirs), f"{context}: expanded_idx_to_permuted_idx differs"
+        assert torch.equal(p2t_ours, p2t_theirs), f"{context}: permuted_idx_to_token_idx differs"
+        return
+    assert torch.equal(e2p_ours < 0, e2p_theirs < 0), f"{context}: locality mask differs"
+    assert torch.equal(p2t_ours < 0, p2t_theirs < 0), f"{context}: padding mask differs"
+    tile = ours["tile"]
+    for label, e2p, p2t in (("ours", e2p_ours, p2t_ours), ("native", e2p_theirs, p2t_theirs)):
+        valid = (e2p >= 0).nonzero().flatten()
+        slots = e2p[valid].long()
+        assert torch.equal(p2t[slots], (valid // TOP_K).to(p2t.dtype)), (
+            f"{context}: {label} permutation maps are inconsistent"
+        )
+        assert slots.unique().numel() == slots.numel(), f"{context}: {label} slots collide"
+    experts_ours = ours["cta_idx_xy_to_batch_idx"][e2p_ours[e2p_ours >= 0].long() // tile]
+    experts_theirs = theirs["cta_idx_xy_to_batch_idx"][e2p_theirs[e2p_theirs >= 0].long() // tile]
+    assert torch.equal(experts_ours, experts_theirs), (
+        f"{context}: (token, k) -> expert assignment differs"
+    )
+
+
+@pytest.mark.parametrize("regime", ROUTING_REGIMES)
+@pytest.mark.parametrize("num_tokens", TOKENS)
+def test_full_path_routing_tables_match_native(num_tokens, regime, cache_permute_indices):
+    """The Cake router writes the trtllm-gen routing tables byte for byte (every exported tile)."""
+    from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+
+    device = _require_full_path()
+    limits = torch.full((NUM_EXPERTS,), 7.0, device="cuda", dtype=torch.float32)
+    logits = _routing_logits(num_tokens, regime)
+    case = _build_case(
+        cache_permute_indices, precision="bf16", num_tokens=num_tokens, limits=limits, logits=logits
+    )
+    _, cake, _, _, _ = _cake_runner(case, device)
+    native_op = get_trtllm_moe_sm100_module().moe_op
+    tiles = sorted(_cake_tiles(cake, "bf16"))
+    for tile in tiles:
+        ours = _staged_routing(cake._module.moe_op, case, tile, num_tokens, logits)
+        theirs = _staged_routing(native_op, case, tile, num_tokens, logits)
+        _assert_routing_tables_match(ours, theirs, num_tokens, f"T={num_tokens} {regime} tile {tile}")
+
+
+@pytest.mark.parametrize("num_tokens", [8, 512])
+@pytest.mark.parametrize("precision", list(PRECISIONS))
+def test_full_path_fc2_permuted_output_matches_native(
+    precision, num_tokens, cache_permute_indices
+):
+    """With do_finalize=False the permuted FC2 output and the routing weights/map match native."""
+    device = _require_full_path()
+    spec = PRECISIONS[precision]
+    case = _build_case(
+        cache_permute_indices,
+        precision=precision,
+        num_tokens=num_tokens,
+        limits=_limits("mixed"),
+        logits=_routing_logits(num_tokens, "ragged"),
+        do_finalize=False,
+    )
+    try:
+        _, cake, cake_packed, cake_kwargs, cake_tactics = _cake_runner(case, device)
+        _, native, native_packed, native_kwargs, native_tactics = _native_runner(
+            case, device
+        )
+    except NotImplementedError as error:
+        if "finalize" in str(error).lower():
+            pytest.skip(f"unfinalized output unsupported: {error}")
+        raise
+    cake_tiles = _cake_tiles(cake, spec.family)
+    native_results = {}
+    for tactic in native_tactics:
+        if tactic[0] in cake_tiles:
+            native_results.setdefault(tactic[0], []).append(
+                _unfinalized_forward(native, native_packed, native_kwargs, tactic)
+            )
+    bitwise = (precision, num_tokens) in BITWISE_ROWS
+    for tactic in cake_tactics:
+        gemm2_output, expert_weights, expanded = _unfinalized_forward(
+            cake, cake_packed, cake_kwargs, tactic
+        )
+        candidates = native_results[tactic[0]]
+        # The expert weights and the locality mask are deterministic; the slot of a (token, k)
+        # inside its expert segment is not (atomic arrival order), so rows are compared in
+        # expanded-index order through each arm's own permutation map.
+        assert all(torch.equal(expert_weights, c[1]) for c in candidates)
+        assert all(torch.equal(expanded >= 0, c[2] >= 0) for c in candidates)
+        valid = (expanded >= 0).nonzero().flatten()
+        ours = gemm2_output[expanded[valid].long()]
+        rows = [c[0][c[2][valid].long()] for c in candidates]
+        if bitwise:
+            assert any(torch.equal(ours, theirs) for theirs in rows), (
+                f"{precision} T={num_tokens}: permuted FC2 rows of Cake tactic {tactic} match no "
+                f"native tactic of tile {tactic[0]} bitwise"
+            )
+        else:
+            for theirs in rows:
+                check_accuracy(theirs.float(), ours.float(), **case.tolerances)
+
+
+@pytest.mark.parametrize("num_tokens", TOKENS)
+def test_full_path_finalize_matches_native_kernel(num_tokens, cache_permute_indices):
+    """The standalone Cake finalize equals the public finalize op (scalar and vector variants)."""
+    from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+
+    device = _require_full_path()
+    limits = torch.full((NUM_EXPERTS,), 7.0, device="cuda", dtype=torch.float32)
+    logits = _routing_logits(num_tokens, "ragged")
+    case = _build_case(
+        cache_permute_indices, precision="bf16", num_tokens=num_tokens, limits=limits, logits=logits
+    )
+    _, cake, _, _, _ = _cake_runner(case, device)
+    native_op = get_trtllm_moe_sm100_module().moe_op
+    tile = min(_cake_tiles(cake, "bf16"))
+    tables = _staged_routing(native_op, case, tile, num_tokens, logits)
+    max_padded = int(tables["total_num_padded_tokens"].item())
+    full = {
+        "expanded_idx_to_permuted_idx": tables["expanded_idx_to_permuted_idx"],
+        "expert_weights": tables["expert_weights"].reshape(num_tokens, TOP_K),
+        "total_num_padded_tokens": tables["total_num_padded_tokens"],
+    }
+    torch.manual_seed(ROUTING_SEED + num_tokens)
+    gemm2_output = torch.randn(
+        max_padded, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
+    )
+    ours = torch.full((num_tokens, HIDDEN_SIZE), float("nan"), device=device, dtype=torch.bfloat16)
+    theirs = ours.clone()
+    cake._module.moe_op.cake_stepfun_finalize(
+        gemm2_output,
+        full["expert_weights"],
+        full["expanded_idx_to_permuted_idx"],
+        full["total_num_padded_tokens"],
+        ours,
+        NUM_EXPERTS,
+        True,
+    )
+    native_op.trtllm_moe_run_finalize(
+        gemm2_output,
+        theirs,
+        full["expert_weights"],
+        full["expanded_idx_to_permuted_idx"],
+        full["total_num_padded_tokens"],
+        num_tokens,
+        NUM_EXPERTS,
+        TOP_K,
+        HIDDEN_SIZE,
+        True,
+        False,
+    )
+    torch.cuda.synchronize()
+    assert not torch.isnan(theirs).any()
+    assert torch.equal(ours, theirs), (
+        f"T={num_tokens}: finalize differs, max |diff| "
+        f"{(ours.float() - theirs.float()).abs().max().item()}"
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [8, 512])
+def test_full_path_requant_matches_native_kernel(num_tokens, cache_permute_indices):
+    """The standalone Cake NVFP4 per-token requantization equals the public per-token quant op
+    in the block-scale layout the exported FC2 kernels read."""
+    from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+    from flashinfer.quantization import SfLayout
+    from flashinfer.quantization.fp4_quantization import get_fp4_quantization_module
+
+    device = _require_full_path()
+    if os.environ.get("FLASHINFER_NVFP4_4OVER6", "0") not in ("", "0"):
+        pytest.skip("the comparison fixes the default NVFP4 recipe (448 * 6)")
+    limits = torch.full((NUM_EXPERTS,), 7.0, device="cuda", dtype=torch.float32)
+    logits = _routing_logits(num_tokens, "ragged")
+    case = _build_case(
+        cache_permute_indices, precision="bf16", num_tokens=num_tokens, limits=limits, logits=logits
+    )
+    _, cake, _, _, _ = _cake_runner(case, device)
+    moe_op = cake._module.moe_op
+    native_op = get_trtllm_moe_sm100_module().moe_op
+    quant = get_fp4_quantization_module("100")
+    layouts = {
+        "linear": SfLayout.layout_linear.value,
+        "r8c4": SfLayout.layout_8x4.value,
+        "r128c4": SfLayout.layout_128x4.value,
+    }
+    checked = 0
+    for tile in sorted(int(t) for t in moe_op.cake_stepfun_fc2_tiles("nvfp4_bf16tok")):
+        layout = str(moe_op.cake_stepfun_fc2_activation_sf_layout("nvfp4_bf16tok", tile))
+        tables = _staged_routing(native_op, case, tile, num_tokens, logits)
+        expanded = tables["expanded_idx_to_permuted_idx"]
+        max_padded = int(tables["total_num_padded_tokens"].item())
+        torch.manual_seed(ROUTING_SEED + tile)
+        gemm1_output = torch.randn(
+            max_padded, INTERMEDIATE_SIZE, device=device, dtype=torch.bfloat16
+        )
+        scale_inv = 1.0 / (448.0 * 6.0)
+        ref_out, ref_scale, ref_token = quant.nvfp4_quant_and_per_token_scale_sm100(
+            gemm1_output, scale_inv, expanded, layouts[layout]
+        )
+        out = torch.zeros_like(ref_out)
+        out_scale = torch.zeros_like(ref_scale)
+        token_scale = torch.zeros_like(ref_token)
+        moe_op.cake_stepfun_requant(
+            gemm1_output, expanded, out, out_scale, token_scale, layout, True
+        )
+        torch.cuda.synchronize()
+        valid = expanded[expanded >= 0].long()
+        assert torch.equal(out[valid], ref_out[valid]), f"tile {tile} {layout}: fp4 rows differ"
+        assert torch.equal(token_scale[valid], ref_token[valid]), (
+            f"tile {tile} {layout}: per-token scales differ"
+        )
+        assert torch.equal(out_scale, ref_scale), f"tile {tile} {layout}: block scales differ"
+        checked += 1
+    assert checked
+
+
+@pytest.mark.parametrize("precision", list(PRECISIONS))
+def test_full_path_launches_only_cake_kernels(precision, cache_permute_indices):
+    """A full-path forward launches Cake kernels only (no trtllm-gen routing, GEMM or finalize)."""
+    device = _require_full_path()
+    case = _build_case(
+        cache_permute_indices,
+        precision=precision,
+        num_tokens=64,
+        limits=_limits("mixed"),
+        logits=_routing_logits(64, "ragged"),
+    )
+    _, runner, packed, kwargs, tactics = _cake_runner(case, device)
+    tactic = tactics[0]
+    _forward(runner, packed, kwargs, tactic)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        runner.forward(packed, tactic=tactic, **kwargs)
+        torch.cuda.synchronize()
+    names = sorted(
+        {
+            event.name
+            for event in profile.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+            and not event.name.startswith(("Memcpy", "Memset"))
+        }
+    )
+    assert names, "the profiler captured no kernels"
+    offenders = [name for name in names if "cake_stepfun" not in name]
+    assert not offenders, f"non-Cake kernels in a Cake full-path forward: {offenders}"
 
 
 def _first_replay_probe(precision: str, num_tokens: int, tactic_index: int) -> dict:

@@ -180,8 +180,6 @@ void RoutingRunner::run(void* routingLogits, void* routingBias, int32_t numToken
   FLASHINFER_CHECK(!useRoutingScalesOnInput && !useDeepSeekFp8,
                    "Cake StepFun routing does not support routing scales on the input or "
                    "DeepSeek FP8");
-  FLASHINFER_CHECK(numTokensPerExpert == nullptr,
-                   "Cake StepFun routing does not write num_tokens_per_expert");
   FLASHINFER_CHECK(dtypeLogits == btg::Dtype::Fp32 || dtypeLogits == btg::Dtype::Bfloat16,
                    "Cake StepFun routing reads float32 or bfloat16 routing logits");
   int const logitsDtype = dtypeLogits == btg::Dtype::Fp32 ? 0 : 1;
@@ -209,6 +207,7 @@ void RoutingRunner::run(void* routingLogits, void* routingBias, int32_t numToken
   args.cta_idx_xy_to_batch_idx = ctaIdxXyToBatchIdx;
   args.cta_idx_xy_to_mn_limit = ctaIdxXyToMnLimit;
   args.num_non_exiting_ctas = numNonExitingCtas;
+  args.num_tokens_per_expert = numTokensPerExpert;
   args.num_tokens = numTokens;
   args.num_experts = numExperts;
   args.top_k = topK;
@@ -485,16 +484,19 @@ void run(int32_t numExpanded, int32_t innerDim, __nv_bfloat16 const* input, floa
   FLASHINFER_CHECK(input != nullptr && expandedIdxToPermutedIdx != nullptr && output != nullptr &&
                        outputScale != nullptr && perTokenScaleOut != nullptr,
                    "Cake StepFun requantization requires every operand");
+  int const e4m3MaxInt = static_cast<int>(e4m3Max);
   generated::RequantKernelSpec const* spec = nullptr;
   for (size_t index = 0; index < generated::kRequantKernelCount; ++index) {
-    if (generated::kRequantKernels[index].sf_layout == layout) {
-      spec = &generated::kRequantKernels[index];
+    auto const& candidate = generated::kRequantKernels[index];
+    if (candidate.sf_layout == layout && candidate.e4m3_max == e4m3MaxInt) {
+      spec = &candidate;
       break;
     }
   }
   FLASHINFER_CHECK(spec != nullptr,
                    "No Cake StepFun requantization kernel writes block-scale layout ",
-                   static_cast<int>(layout), " (the layout the selected FC2 kernel reads)");
+                   static_cast<int>(layout), " (the layout the selected FC2 kernel reads) for the "
+                   "NVFP4 recipe with e4m3_max=", e4m3MaxInt);
   FLASHINFER_CHECK(spec->rows_per_cta > 0, "Cake StepFun requantization kernel ", spec->symbol,
                    " declares no rows_per_cta");
   generated::RequantArgs args{};
@@ -562,6 +564,9 @@ void run(moe::dev::finalize::Data const& data, cudaStream_t stream) {
   FLASHINFER_CHECK(spec->max_top_k <= 0 || data.topK <= spec->max_top_k,
                    "Cake StepFun finalize kernel ", spec->symbol, " supports top_k <= ",
                    spec->max_top_k, ", got ", data.topK);
+  FLASHINFER_CHECK(variant == generated::FinalizeVariant::kScalar || data.hiddenDim % 8 == 0,
+                   "Cake StepFun vector finalize needs an output row width that is a whole number "
+                   "of 16-byte chunks, got hidden_dim=", data.hiddenDim);
 
   generated::FinalizeArgs args{};
   args.input = static_cast<__nv_bfloat16 const*>(data.inPtr);

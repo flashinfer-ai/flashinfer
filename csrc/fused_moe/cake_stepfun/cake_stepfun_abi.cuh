@@ -59,6 +59,7 @@ struct RoutingArgs {
   int* cta_idx_xy_to_batch_idx;       // [max_num_ctas] local expert per CTA tile
   int* cta_idx_xy_to_mn_limit;        // [max_num_ctas]
   int* num_non_exiting_ctas;          // [1]
+  int* num_tokens_per_expert;         // [num_experts] tokens routed to each expert, or nullptr
   int num_tokens;
   int num_experts;
   int top_k;
@@ -182,6 +183,9 @@ using RequantSubmitFn = cudaError_t (*)(const cudaLaunchConfig_t*, const Requant
 struct RequantKernelSpec {
   const char* symbol;
   SfLayout sf_layout;
+  // E4M3 maximum the unit is specialized on (448, or 256 for the 4/6 recipe); the host selects the
+  // kernel whose value matches the recipe of the forward.
+  int e4m3_max;
   int rows_per_cta;      // grid.x = ceil(num_expanded / rows_per_cta)
   uint32_t block[3];
   size_t dynamic_smem_bytes;

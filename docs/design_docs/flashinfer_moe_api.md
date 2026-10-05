@@ -795,6 +795,22 @@ TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
 has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
 silently dropping the parameter.
 
+### Cake StepFun backend (`cake_stepfun`)
+
+`CakeStepFunConfig(backend="cake_stepfun")` is an opt-in Blackwell (exact SM100 /
+SM103) backend for the StepFun fused MoE: `SwiGLUStep(limit)` with a per-expert
+`gemm1_clamp_limit`, over `BF16×BF16`, `FP8PerTensor×FP8PerTensor`, `MXFP8×MXFP8`
+and `NVFP4×NVFP4` (also with `per_token_scale`). It runs the trtllm-gen
+fused-MoE pipeline with exported Cake kernels in the FC1 stage and, when the
+generated inventory covers them (`fused_moe_cake_stepfun_full_*`), in the
+routing, FC2, requantization and finalize stages as well. It is not in the
+default backend list; weights must come from `CakeStepFunConfig.prepare_weights`
+(view `cake_stepfun`). A tactic is the FC1 tile x GEMM configuration; tiles
+without an exported kernel have no tactic and `tactic=-1` picks the smallest
+exported tile of the token window. The full path routes `Renormalize` from
+logits only and has no fused shared experts. The host contract lives in
+`csrc/fused_moe/cake_stepfun/README.md`.
+
 The class-level matrix below is generated from the registered runner classes.
 The Quantization column is always the MMA pair ``weight×activation``
 (``NVFP4×NVFP4``, not ``NVFP4``). The two W4A16 encodings appear as
