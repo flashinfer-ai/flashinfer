@@ -4799,3 +4799,157 @@ def test_localized_streams_are_joined_on_failure(
         main_stream.wait_event.assert_not_called()
     if failed_gemm == "fc1":
         finalize.assert_not_called()
+
+
+def _quantize_nvfp4_weight(w_bf16: torch.Tensor):
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+    from flashinfer.fp4_quantization import fp4_quantize
+
+    e, n, k = w_bf16.shape
+    q, sf = fp4_quantize(
+        w_bf16.reshape(e * n, k).contiguous(),
+        global_scale=torch.ones(1, dtype=torch.float32, device=w_bf16.device),
+        sf_vec_size=16,
+        is_sf_swizzled_layout=True,
+    )
+    return q.view(e, n, k // 2), convert_sf_to_mma_layout(
+        sf, m=n, k=k, num_groups=e, sf_vec_size=16
+    )
+
+
+def _fork_join_executor(streams, fn):
+    # Same fork/join contract as execute_in_green_contexts, on ordinary
+    # streams, so the partitioned kernels run without that PyTorch API.
+    main = torch.cuda.current_stream()
+    for stream in streams:
+        stream.wait_stream(main)
+    try:
+        for i, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                fn(i)
+    finally:
+        for stream in streams:
+            main.wait_stream(stream)
+
+
+@cute_dsl_available
+@pytest.mark.skipif(not is_sm107(), reason="localized MoE is Rubin (SM107) only")
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,intermediate_size,num_experts,top_k",
+    [(128, 256, 512, 8, 1), (515, 1024, 2048, 32, 8)],
+)
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("use_memset_stream", [False, True])
+def test_localized_moe_matches_full_width(
+    monkeypatch,
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    top_k,
+    output_dtype,
+    use_memset_stream,
+):
+    """Run the real localized kernels against the full-width path.
+
+    Each domain computes its columns with the full reduction, so top_k=1 must
+    match bitwise; larger top_k differs only by atomic-add order. The
+    full-width weights handed to the localized call have released storage,
+    and autotuning runs first, so neither the GEMMs nor the tuner may read them.
+    """
+    import sys
+    from types import SimpleNamespace
+
+    from flashinfer import autotune, cute_dsl_fused_moe
+    from flashinfer.cute_dsl import is_rubin_cute_dsl_available
+
+    from .utils import interleave_linear_and_gate
+
+    if not is_rubin_cute_dsl_available():
+        pytest.skip("Rubin requires CuTe DSL 4.8")
+    try:
+        from torch.cuda.green_contexts import execute_in_green_contexts  # noqa: F401
+    except ImportError:
+        monkeypatch.setitem(
+            sys.modules,
+            "torch.cuda.green_contexts",
+            SimpleNamespace(execute_in_green_contexts=_fork_join_executor),
+        )
+
+    t = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        top_k=top_k,
+    )
+    # Domain d owns FC1 rows [d*I, (d+1)*I) of the interleaved gate/up layout
+    # and FC2 rows [d*H/2, (d+1)*H/2).
+    w1_interleaved = interleave_linear_and_gate(t["w1_weight_bf16"], 64, dim=1)
+    half_h = hidden_size // 2
+    shards = []
+    for d in range(2):
+        w1, w1_sf = _quantize_nvfp4_weight(
+            w1_interleaved[:, d * intermediate_size : (d + 1) * intermediate_size]
+        )
+        w2, w2_sf = _quantize_nvfp4_weight(
+            t["w2_weight_bf16"][:, d * half_h : (d + 1) * half_h]
+        )
+        shards.append(
+            {
+                "w1_weight": w1,
+                "w1_weight_sf": w1_sf,
+                "w2_weight": w2,
+                "w2_weight_sf": w2_sf,
+            }
+        )
+
+    common = dict(
+        x=t["x"],
+        x_sf=t["x_sf"],
+        token_selected_experts=t["token_selected_experts"],
+        token_final_scales=t["token_final_scales"],
+        w1_alpha=t["w1_alpha"],
+        fc2_input_scale=t["fc2_input_scale"],
+        w2_alpha=t["w2_alpha"],
+        num_experts=num_experts,
+        top_k=top_k,
+        output_dtype=output_dtype,
+    )
+    full = cute_dsl_fused_moe(
+        w1_weight=t["w1_weight"],
+        w1_weight_sf=t["w1_weight_sf"],
+        w2_weight=t["w2_weight"],
+        w2_weight_sf=t["w2_weight_sf"],
+        **common,
+    )
+
+    placeholders = {}
+    for name in ("w1_weight", "w1_weight_sf", "w2_weight", "w2_weight_sf"):
+        placeholder = t[name].clone()
+        placeholder.untyped_storage().resize_(0)
+        placeholders[name] = placeholder
+    localized_kwargs = dict(
+        localized_weights=shards,
+        localized_streams=[torch.cuda.Stream(), torch.cuda.Stream()],
+        localized_sm_count=torch.cuda.get_device_properties(0).multi_processor_count
+        // 2,
+        localized_memset_stream=torch.cuda.Stream() if use_memset_stream else None,
+    )
+    # Default tactic first: same per-column math as the full-width control.
+    localized = cute_dsl_fused_moe(**placeholders, **localized_kwargs, **common)
+    with autotune(True):
+        cute_dsl_fused_moe(**placeholders, **localized_kwargs, **common)
+    tuned = cute_dsl_fused_moe(**placeholders, **localized_kwargs, **common)
+    torch.cuda.synchronize()
+
+    assert localized.dtype == output_dtype
+    assert localized.abs().max() > 0
+    if top_k == 1:
+        torch.testing.assert_close(localized, full, atol=0, rtol=0)
+    else:
+        torch.testing.assert_close(
+            localized.float(), full.float(), atol=2e-2, rtol=2e-2
+        )
+    torch.testing.assert_close(tuned.float(), full.float(), atol=2e-2, rtol=2e-2)

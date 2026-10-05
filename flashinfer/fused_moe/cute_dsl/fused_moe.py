@@ -1604,9 +1604,12 @@ def cute_dsl_fused_moe(
         Continue passing the original full-width ``w1_weight``, ``w2_weight``,
         and their ``*_sf`` tensors to the regular arguments; do not pass ``None``
         or shard tensors there. With ``localized_allow_nonlocalized=False``,
-        these supply tensor metadata to the tuner; GEMMs read only the shards.
-        With ``True``, retain their valid contents because autotuning may run
-        and select the full-width path. ``w1_alpha``, ``w2_alpha``, and
+        neither the GEMMs nor the autotuner read them, so a placeholder that
+        keeps the full-width metadata but releases its storage (for example
+        ``w.untyped_storage().resize_(0)``) is valid; only
+        ``FLASHINFER_LOGLEVEL=5`` statistics would touch its data. With
+        ``True``, retain their valid contents because autotuning may run and
+        select the full-width path. ``w1_alpha``, ``w2_alpha``, and
         ``fc2_input_scale`` remain shared across domains.
 
         Example with shards already allocated in their domain pools and
@@ -1740,6 +1743,12 @@ def cute_dsl_fused_moe(
             w2_weight_sf,
             w2_alpha,
         ]
+        if localized_weights is not None and not localized_allow_nonlocalized:
+            # Only the shards are read on this path. Cold-L2 profiling clones
+            # every tensor input, so keep the unused full-width weights out of
+            # the tuner inputs; callers may then release their storage.
+            for idx in (4, 5, 8, 9):
+                inputs[idx] = None
         if use_per_token_activation:
             inputs.append(per_token_scale)
         inputs.append(moe_output)
