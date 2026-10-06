@@ -108,7 +108,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 - GDN (Gated Delta Net linear attention, SM90+):
     - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (CuTe-DSL) and `triton` (reference).
     - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. `--state_dtype float32` uses `gated_delta_rule_mtp`; `--state_dtype bfloat16` uses the BF16 MTP kernel via `gated_delta_rule_decode_pretranspose`. Backends: `flashinfer`, `triton`.
-    - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
+    - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: the API's `backend=` values `flashinfer` (default; SM90 C++ / SM100 CuTe-DSL), `auto`, `cake_gdn` (source-only Cake kernels, SM100a/SM103a) and `cudnn` (cuDNN fused linear-attention engine, needs `nvidia-cudnn-frontend[cutedsl]` >= 1.29), plus `fla` (flash-linear-attention Triton baseline, perf-only). `cake_gdn` and `cudnn` are probed with one call and skipped with the reason when they cannot serve the case.
 - KDA (Kimi Delta Attention):
     - `recurrent_kda_prefill` - Ordinary multi-token recurrent KDA prefill with fixed or packed inputs (SM120a). Backends: `flashinfer` (automatic variant policy), `flashinfer-decomp`, `flashinfer-fused`, and optional external `cutekda` / `flash-kda` baselines.
     - `fused_kda_decode` - Fused Kimi KDA decode (`flashinfer.kda_decode.fused_kda_decode`): causal convolution + SiLU, one recurrent KDA update and gated RMSNorm per row, with paged convolution and recurrent-state caches updated in place (SM100/SM103/SM107). `--batch_size` is the number of decode rows, `--num_q_heads` one of 8, 12, 24, 32, 48, 96, `--state_dtype` `bfloat16` (default) or `float32`. Backends: `cute-dsl` (default), `cake` (exported Cake kernels, SM100a/SM103a only) and `auto`. `--refcheck` compares against a torch reference.
@@ -546,7 +546,7 @@ Applies to `gated_delta_rule_decode`, `gated_delta_rule_mtp`, and `chunk_gated_d
 | `--update_state`              | MTP only: write the final state back (`disable_state_update=False`). BF16 state always updates in-place    |
 | `--cache_intermediate_states` | MTP with `float32` state only: cache per-token intermediate states                                         |
 | `--no_qk_l2norm`              | Decode/MTP: disable in-kernel Q/K L2 normalization                                                         |
-| `--backends`                  | Decode/MTP: `flashinfer` (default), `triton`. Prefill: `flashinfer` (default), `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
+| `--backends`                  | Decode/MTP: `flashinfer` (default), `triton`. Prefill: `flashinfer` (default), `auto`, `cake_gdn`, `cudnn` (passed as `chunk_gated_delta_rule(backend=...)`; `cake_gdn`/`cudnn` skipped with a reason when unavailable), `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
 
 Notes:
 - Refcheck compares against the torch reference in `tests/gdn/reference_delta_rule.py`.
@@ -638,7 +638,7 @@ Legend:
 | **selective_state_update** | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton |
 | **gated_delta_rule_decode** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
 | **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
-| **chunk_gated_delta_rule** |  |  |  |  | flashinfer, fla | flashinfer, fla | flashinfer, fla |  |
+| **chunk_gated_delta_rule** |  |  |  |  | flashinfer, auto, fla | flashinfer, auto, cake_gdn, cudnn, fla | flashinfer, auto, cake_gdn, cudnn, fla |  |
 | **recurrent_kda_prefill** |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
 | **fused_kda_decode** |  |  |  |  |  | cute-dsl, cake, auto | cute-dsl, cake, auto |  |
 
@@ -689,3 +689,4 @@ python benchmarks/flashinfer_benchmark.py \
 - flashinfer-decomp / flashinfer-fused: pinned SM120 KDA prefill variants
 - cutekda / flash-kda: optional external SM120 KDA prefill baselines
 - cake: exported Cake kernels (`fused_kda_decode`, SM100a/SM103a)
+- cake_gdn: source-only Cake GDN prefill kernels (`chunk_gated_delta_rule`, SM100a/SM103a)

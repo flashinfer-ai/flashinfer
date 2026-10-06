@@ -1415,15 +1415,18 @@ routine_cc_to_supported_backends = {
         "12.0": ["triton"],
         "12.1": ["triton"],
     },
+    # cake_gdn is a source-only optional build and cudnn needs the cudnn
+    # frontend's linear-attention engine; the routine probes both and skips
+    # them with a reason when they cannot serve the case.
     "chunk_gated_delta_rule": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
-        "9.0": ["flashinfer", "fla"],
-        "10.0": ["flashinfer", "fla"],
-        "10.3": ["flashinfer", "fla"],
-        "10.7": ["flashinfer"],
+        "9.0": ["flashinfer", "auto", "fla"],
+        "10.0": ["flashinfer", "auto", "cake_gdn", "cudnn", "fla"],
+        "10.3": ["flashinfer", "auto", "cake_gdn", "cudnn", "fla"],
+        "10.7": ["flashinfer", "auto", "cudnn"],
         "11.0": [],
         "12.0": [],
         "12.1": [],
