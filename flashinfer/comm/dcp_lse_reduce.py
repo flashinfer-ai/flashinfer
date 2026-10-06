@@ -16,9 +16,11 @@ limitations under the License.
 
 Public names follow https://github.com/flashinfer-ai/flashinfer/issues/4575.
 
-The implementation is self-contained in FlashInfer and uses NCCL's device-side
-LSA APIs over a tensor allocated by torch's NCCL symmetric-memory backend. It
-does not call ``libnccl_longseq`` and does not use the Helix/MNNVL A2A kernel.
+The implementation is self-contained in FlashInfer. Each rank writes straight
+into its peers' workspaces, a tensor allocated by torch symmetric memory on
+whichever backend the process uses (CUDA, NCCL, or NVSHMEM); it never selects a
+backend itself. It does not call ``libnccl_longseq`` and does not use the
+Helix/MNNVL A2A kernel.
 """
 
 import functools
@@ -100,7 +102,7 @@ def decode_cp_a2a_lse_reduce_workspace_size(
     head_dim: int,
     dtype: torch.dtype,
 ) -> int:
-    """Return the required NCCL symmetric workspace size in bytes."""
+    """Return the required symmetric-memory workspace size in bytes."""
     if min(max_tokens, local_heads, cp_size, head_dim) <= 0:
         raise ValueError("workspace geometry must be positive")
     if cp_size > 64:
@@ -129,14 +131,19 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     dtype: torch.dtype,
     group: Any,
 ) -> torch.Tensor:
-    """Create and rendezvous the fused op's NCCL symmetric workspace.
+    """Create and rendezvous the fused op's symmetric-memory workspace.
 
-    All ranks in ``group`` must call this function collectively. The group must
-    fit in one NCCL load/store-accessible (LSA) NVLink domain; multi-node groups
-    spanning LSA domains are not supported. Allocate one workspace per group
-    and reuse it for every invocation and CUDA graph replay. A workspace may
-    only be used from one ordered CUDA stream; allocate a workspace per
-    concurrent stream.
+    All ranks in ``group`` must call this function collectively. The workspace
+    is allocated on the process's current torch symmetric-memory backend
+    (``torch.distributed._symmetric_memory.get_backend``; CUDA unless the
+    application selected another one), which this function never changes. Every
+    rank's workspace must be mapped for load/store over NVLink: the group must
+    fit in one node or one multi-node NVLink domain. With the NCCL backend,
+    ``group`` must be an NCCL group whose communicator already exists (e.g. after
+    one collective on it), and cuMem must not be disabled. Allocate one
+    workspace per group and reuse it for every invocation and CUDA graph
+    replay. A workspace may only be used from one ordered CUDA stream; allocate
+    a workspace per concurrent stream.
 
     Parameters
     ----------
@@ -156,18 +163,16 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     Returns
     -------
     torch.Tensor
-        A rendezvoused NCCL symmetric-memory ``uint8`` tensor. Allocate it once
+        A rendezvoused symmetric-memory ``uint8`` tensor. Allocate it once
         before CUDA graph capture and reuse it.
     """
-    # Build/load on every rank before entering either NCCL collective below.
-    # The JIT cache lock may otherwise leave one rank creating the devcomm
-    # while another rank is still compiling.
+    # Build/load on every rank before the collective rendezvous below, so that
+    # no rank waits there on another that is still compiling.
     get_dcp_lse_reduce_module()
     size_bytes = decode_cp_a2a_lse_reduce_workspace_size(
         max_tokens, local_heads, cp_size, head_dim, dtype
     )
     group_name = group if isinstance(group, str) else group.group_name
-    symm_mem.set_backend("NCCL")
     # PyTorch's NCCL symmetric-memory communicator registry is keyed by the
     # concrete CUDA device. Do not use the unindexed ``"cuda"`` device here:
     # it would rendezvous through a separate registry entry from the process
@@ -179,8 +184,15 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     workspace.zero_()
     # Initialization must complete before rendezvous; afterwards any peer may
     # enter the first fused kernel and write lines into this workspace.
-    torch.cuda.current_stream().synchronize()
+    torch.cuda.current_stream(device).synchronize()
     handle = symm_mem.rendezvous(workspace, group)
+    peer_ptrs = handle.buffer_ptrs
+    if len(peer_ptrs) != handle.world_size or not all(peer_ptrs):
+        raise RuntimeError(
+            "decode_cp_a2a_lse_reduce needs every rank's workspace mapped for "
+            f"load/store, but the {symm_mem.get_backend(device)} symmetric-memory "
+            "backend could not map all of them; the group must share one NVLink domain"
+        )
     state = _WorkspaceState(handle=handle, group_name=group_name, device=device)
     data_ptr = workspace.data_ptr()
     _workspace_keepalive[data_ptr] = state
@@ -197,7 +209,7 @@ def decode_cp_a2a_lse_reduce(
     cp_size: int,
     lse_mode: Literal["base2", "basee"] = "base2",
 ) -> torch.Tensor:
-    """Fuse an NCCL LSA DCP A2A exchange with the LSE-weighted reduce.
+    """Fuse the DCP A2A exchange with the LSE-weighted reduce.
 
     Send, receive synchronization, and reduction execute in one cooperative
     CUDA kernel. Data moves in 128-byte lines that carry their own readiness
@@ -205,7 +217,7 @@ def decode_cp_a2a_lse_reduce(
 
     This is a collective operation. Every rank must invoke it in the same order
     and the same number of times, including CUDA graph replays. All ranks must
-    belong to one NCCL LSA/NVLink domain.
+    share one NVLink domain.
 
     Parameters
     ----------
@@ -224,7 +236,7 @@ def decode_cp_a2a_lse_reduce(
         ``heads`` is simply the number of heads present in the input; it may
         be local or total because this operation does not shard the head axis.
     workspace : torch.Tensor
-        Rendezvoused NCCL symmetric-memory tensor from
+        Rendezvoused symmetric-memory tensor from
         :func:`decode_cp_a2a_lse_reduce_create_workspace`. Reuse it only from
         one ordered CUDA stream.
     cp_rank : int

@@ -37,16 +37,17 @@
 // before the softmax.
 //
 // Transport. Each rank stores every (row, destination) slice straight into the
-// destination's registered symmetric window (ncclGetLsaPointer) using the LL128
-// protocol: a row's 8-byte data words are packed 15 per 128-byte line, and the
-// line's last word is a per-call flag. A warp stores four lines per 16-byte
-// vector store (lane = 8 * line + part); lane part 7 carries data word 14 and
-// the flag. Readiness relies on a warp-coalesced 128-byte store becoming visible
-// atomically, as NCCL's LL128 protocol does over NVLink: once a receiver sees a
-// line's flag, it sees the whole line. The row's LSE travels separately as a
-// 16-byte LL line ({lse, flag, 0, flag}; each 8-byte half carries its own flag)
-// once per group of four lines. Data and readiness therefore arrive together:
-// there is no fence, readiness word or grid-wide barrier on the critical path.
+// destination's workspace, at the address torch symmetric memory mapped for it
+// on this device, using the LL128 protocol: a row's 8-byte data words are
+// packed 15 per 128-byte line, and the line's last word is a per-call flag. A
+// warp stores four lines per 16-byte vector store (lane = 8 * line + part);
+// lane part 7 carries data word 14 and the flag. Readiness relies on a
+// warp-coalesced 128-byte store becoming visible atomically, as NCCL's LL128
+// protocol does over NVLink: once a receiver sees a line's flag, it sees the
+// whole line. The row's LSE travels separately as a 16-byte LL line
+// ({lse, flag, 0, flag}; each 8-byte half carries its own flag) once per group
+// of four lines. Data and readiness therefore arrive together: there is no
+// fence, readiness word or grid-wide barrier on the critical path.
 //
 // Work split. One warp sends each (row, destination). One warp receives each
 // (row, group of four lines): each lane polls its 16-byte part of the line from
@@ -64,8 +65,8 @@
 // workspace is zeroed once at creation.
 //
 // The launch is cooperative only to guarantee that every block is co-resident:
-// receivers spin on data that co-resident blocks on the peers send first. All
-// ranks must belong to one load/store-accessible (NVLink) domain.
+// receivers spin on data that co-resident blocks on the peers send first. Every
+// rank's workspace must be mapped for load/store over NVLink.
 
 #ifndef FLASHINFER_COMM_DCP_LSE_REDUCE_CUH_
 #define FLASHINFER_COMM_DCP_LSE_REDUCE_CUH_
@@ -74,7 +75,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
-#include <nccl_device.h>
+
+#include <cstddef>
+#include <cstdint>
 
 namespace flashinfer {
 namespace comm {
@@ -196,6 +199,13 @@ struct Word4<__half> {
   }
 };
 
+// Workspace of rank `peer` as mapped on this device; the array is written once at
+// rendezvous.
+__device__ __forceinline__ unsigned char* peer_workspace(unsigned char* const* peers, int peer) {
+  return reinterpret_cast<unsigned char*>(
+      __ldg(reinterpret_cast<const unsigned long long*>(peers) + peer));
+}
+
 // Sanitise an incoming LSE. A shard that contributed nothing reports -inf; some
 // backends emit NaN or +inf instead, and both must fold to "no weight" rather
 // than poisoning the whole merge.
@@ -217,8 +227,9 @@ __global__ void __launch_bounds__(kFusedBlockSize)
     FusedKernel(const T* __restrict__ partial_o, const float* __restrict__ partial_lse,
                 int64_t o_s_tok, int64_t o_s_head, int64_t o_s_peer, int64_t lse_s_tok,
                 int64_t lse_s_head, int64_t lse_s_peer, unsigned char* __restrict__ workspace,
-                ncclWindow_t window, size_t payload_window_offset, T* __restrict__ combined_out,
-                int rank, int nranks, int num_tokens, int local_heads, int max_rows, int head_dim) {
+                unsigned char* const* __restrict__ peer_workspaces, size_t peer_payload_offset,
+                T* __restrict__ combined_out, int rank, int nranks, int num_tokens, int local_heads,
+                int max_rows, int head_dim) {
   const int lane = threadIdx.x & 31;
   const int warp = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);
   const int total_warps = gridDim.x * kWarpsPerBlock;
@@ -250,8 +261,8 @@ __global__ void __launch_bounds__(kFusedBlockSize)
     const uint64_t* src = reinterpret_cast<const uint64_t*>(partial_o + token * o_s_tok +
                                                             head * o_s_head + dst * o_s_peer);
     const size_t src_row = static_cast<size_t>(rank) * max_rows + row;
-    auto* dst_row = reinterpret_cast<unsigned char*>(ncclGetLsaPointer(
-        window, payload_window_offset + slot * data_slot_bytes + src_row * row_bytes, dst));
+    unsigned char* const dst_payload = peer_workspace(peer_workspaces, dst) + peer_payload_offset;
+    unsigned char* const dst_row = dst_payload + slot * data_slot_bytes + src_row * row_bytes;
     for (int g0 = 0; g0 < groups; g0 += kSendGroups) {
       uint64_t lo[kSendGroups], hi[kSendGroups];
 #pragma unroll
@@ -271,11 +282,8 @@ __global__ void __launch_bounds__(kFusedBlockSize)
     }
     if (lane < groups) {
       const float lse = partial_lse[token * lse_s_tok + head * lse_s_head + dst * lse_s_peer];
-      auto* lse_line = reinterpret_cast<unsigned char*>(
-          ncclGetLsaPointer(window,
-                            payload_window_offset + lse_region + slot * lse_slot_bytes +
-                                src_row * lse_row_bytes + lane * kLseLineBytes,
-                            dst));
+      unsigned char* const lse_line = dst_payload + lse_region + slot * lse_slot_bytes +
+                                      src_row * lse_row_bytes + lane * kLseLineBytes;
       store_lse_line(lse_line, __float_as_uint(lse), lse_flag);
     }
   }

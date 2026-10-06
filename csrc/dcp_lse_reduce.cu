@@ -9,25 +9,16 @@
 #include <cstdint>
 #include <flashinfer/comm/dcp_lse_reduce.cuh>
 #include <string>
-#include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
-#include <torch/csrc/distributed/c10d/symm_mem/NCCLSymmetricMemory.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
-#include <torch/csrc/distributed/c10d/symm_mem/nccl_dev_cap.hpp>
-#include <torch/csrc/distributed/c10d/symm_mem/nccl_devcomm_manager.hpp>
 #include <vector>
 
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer::comm::dcp {
 
-using c10d::symmetric_memory::NCCLDevCommManager;
-using c10d::symmetric_memory::NCCLSymmetricMemory;
+namespace symm = c10d::symmetric_memory;
 
 namespace {
-
-void CheckNccl(ncclResult_t result, const char* operation) {
-  TORCH_CHECK(result == ncclSuccess, operation, ": ", ncclGetErrorString(result));
-}
 
 // Element strides of the [tokens, heads, cp_size, head_dim] view the kernel reads.
 struct InputGeometry {
@@ -66,11 +57,52 @@ InputGeometry DescribeInput(const at::Tensor& partial_o, const at::Tensor& parti
   return g;
 }
 
+// Every rank's workspace as mapped on this device.
+struct PeerWorkspaces {
+  c10::intrusive_ptr<symm::SymmetricMemory> handle;  // keeps the mappings alive for the call
+  unsigned char* const* bases;                       // device array [cp_size]
+  size_t payload_offset;  // workspace offset within its buffer + kPayloadOffset
+};
+
+// Works with any torch symmetric-memory backend (CUDA, NCCL, NVSHMEM): each exposes
+// every rank's buffer base, null for a rank it cannot map for load/store.
+PeerWorkspaces LookUpPeers(const at::Tensor& workspace, int64_t cp_rank, int64_t cp_size,
+                           const std::string& group_name) {
+  // create_workspace already rendezvoused (workspace, group_name): this returns the
+  // cached handle and is not a collective.
+  auto handle = symm::rendezvous(workspace, group_name);
+  TORCH_CHECK(handle.defined(),
+              "workspace must be allocated via torch symmetric memory and rendezvoused first");
+  // Only evaluated when a check fails.
+  const auto backend = [&] { return symm::get_backend(workspace.device()).value_or("unknown"); };
+  TORCH_CHECK(handle->get_world_size() == cp_size, "cp_size (", cp_size,
+              ") does not match the workspace group size (", handle->get_world_size(), ")");
+  TORCH_CHECK(handle->get_rank() == cp_rank, "cp_rank (", cp_rank,
+              ") does not match this rank in the workspace group (", handle->get_rank(), ")");
+  const size_t offset = handle->get_offset();
+  TORCH_CHECK(offset + static_cast<size_t>(workspace.numel()) <= handle->get_buffer_size(),
+              "workspace extends past its symmetric-memory buffer");
+  const std::vector<void*> bases = handle->get_buffer_ptrs();
+  void** bases_dev = handle->get_buffer_ptrs_dev();
+  TORCH_CHECK(static_cast<int64_t>(bases.size()) == cp_size && bases_dev != nullptr, "the ",
+              backend(), " symmetric-memory backend exposes no peer buffer pointers");
+  const size_t payload_offset = offset + kPayloadOffset;
+  for (int64_t r = 0; r < cp_size; ++r) {
+    TORCH_CHECK(bases[r] != nullptr, "rank ", r,
+                "'s workspace is not mapped for load/store by the ", backend(),
+                " symmetric-memory backend; all ranks must share one NVLink domain");
+    // LL128 lines must not straddle a 128-byte boundary in any rank's workspace.
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(bases[r]) + payload_offset) % kLineBytes == 0, "rank ",
+                r, "'s workspace payload is not 128-byte aligned");
+  }
+  return {std::move(handle), reinterpret_cast<unsigned char* const*>(bases_dev), payload_offset};
+}
+
 template <typename T, bool BaseE>
 void LaunchFused(const at::Tensor& partial_o, const at::Tensor& partial_lse, const InputGeometry& g,
-                 unsigned char* workspace, ncclWindow_t window, size_t payload_window_offset,
-                 at::Tensor& output, int rank, int cp_size, int max_rows, int head_dim,
-                 cudaStream_t stream) {
+                 unsigned char* workspace, unsigned char* const* peer_workspaces,
+                 size_t peer_payload_offset, at::Tensor& output, int rank, int cp_size,
+                 int max_rows, int head_dim, cudaStream_t stream) {
   auto* kernel = FusedKernel<T, BaseE>;
   int blocks_per_sm = 0;
   C10_CUDA_CHECK(
@@ -104,8 +136,8 @@ void LaunchFused(const at::Tensor& partial_o, const at::Tensor& partial_lse, con
       &lse_s_head,
       &lse_s_peer,
       &workspace,
-      &window,
-      &payload_window_offset,
+      &peer_workspaces,
+      &peer_payload_offset,
       &output_ptr,
       &rank,
       &cp_size,
@@ -123,7 +155,6 @@ void LaunchFused(const at::Tensor& partial_o, const at::Tensor& partial_lse, con
 at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial_lse,
                           const at::Tensor& workspace, int64_t cp_rank, int64_t cp_size,
                           bool is_lse_base_on_e, const std::string& group_name) {
-#ifdef NCCL_HAS_DEVCOMM
   TORCH_CHECK(partial_o.is_cuda(), "partial_o must be a CUDA tensor");
   TORCH_CHECK(partial_lse.is_cuda(), "partial_lse must be a CUDA tensor");
   TORCH_CHECK(workspace.is_cuda(), "workspace must be a CUDA tensor");
@@ -165,43 +196,14 @@ at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial
   const int64_t num_rows_i64 = geometry.num_tokens * geometry.local_heads;
   TORCH_CHECK(num_rows_i64 > 0, "zero-token inputs are not supported");
 
-  auto symm_mem = c10d::symmetric_memory::rendezvous(workspace, group_name);
-  TORCH_CHECK(symm_mem != nullptr,
-              "workspace must be allocated via torch symmetric memory and rendezvoused first");
-  auto* nccl_hdl = dynamic_cast<NCCLSymmetricMemory*>(symm_mem.get());
-  TORCH_CHECK(nccl_hdl != nullptr, "workspace requires the NCCL torch symmetric-memory backend");
+  TORCH_CHECK(workspace.storage_offset() == 0,
+              "workspace must be the base symmetric-memory tensor, not a view");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % kLineBytes == 0,
+              "workspace must be 128-byte aligned");
+  const PeerWorkspaces peers = LookUpPeers(workspace, cp_rank, cp_size, group_name);
 
   c10::cuda::CUDAGuard guard(partial_o.device());
   const auto stream = at::cuda::getCurrentCUDAStream();
-  TORCH_CHECK(nccl_hdl->get_group_name() == group_name,
-              "workspace was rendezvoused with a different process group");
-  auto& manager = NCCLDevCommManager::get(partial_o.device());
-  ncclComm_t comm = manager.get_comm(group_name);
-
-  static constexpr char kDevcommKey[] = "flashinfer_decode_cp_a2a_lse_reduce";
-  auto devcomm_opt = manager.get_devcomm(group_name, kDevcommKey);
-  if (!devcomm_opt) {
-    ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    ncclDevComm devcomm;
-    CheckNccl(ncclDevCommCreate(comm, &reqs, &devcomm),
-              "ncclDevCommCreate failed in decode_cp_a2a_lse_reduce");
-    devcomm_opt = manager.register_devcomm(group_name, devcomm, kDevcommKey);
-  }
-  ncclDevComm& devcomm = devcomm_opt->get();
-  TORCH_CHECK(devcomm.nRanks == cp_size, "cp_size does not match the workspace group");
-  TORCH_CHECK(devcomm.rank == cp_rank, "cp_rank does not match the workspace group");
-  TORCH_CHECK(devcomm.lsaSize == cp_size,
-              "decode_cp_a2a_lse_reduce requires one NCCL LSA/NVLink domain");
-
-  ncclWindow_t window = nccl_hdl->get_window();
-  TORCH_CHECK(window != nullptr, "NCCL symmetric-memory window is null");
-  TORCH_CHECK(workspace.storage_offset() == 0,
-              "workspace must be the base symmetric-memory tensor, not a view");
-  // LL128 lines must not straddle a 128-byte boundary, locally or in the window.
-  TORCH_CHECK(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % kLineBytes == 0,
-              "workspace must be 128-byte aligned");
-  TORCH_CHECK((nccl_hdl->get_window_offset() + kPayloadOffset) % kLineBytes == 0,
-              "payload offset within the NCCL symmetric window must be 128-byte aligned");
 
   const int head_dim = static_cast<int>(head_dim_i64);
   const size_t row_bytes = RowBytes(head_dim, static_cast<int>(element_size));
@@ -220,38 +222,32 @@ at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial
   output_shape.push_back(head_dim_i64);
   at::Tensor output = at::empty(output_shape, partial_o.options());  // contiguous
   auto* workspace_ptr = static_cast<unsigned char*>(workspace.data_ptr());
-  const size_t payload_window_offset = nccl_hdl->get_window_offset() + kPayloadOffset;
   const int rank = static_cast<int>(cp_rank);
   const int cp = static_cast<int>(cp_size);
   const int max_rows = static_cast<int>(max_rows_i64);
 
   if (partial_o.scalar_type() == at::kHalf) {
     if (is_lse_base_on_e) {
-      LaunchFused<__half, true>(partial_o, partial_lse, geometry, workspace_ptr, window,
-                                payload_window_offset, output, rank, cp, max_rows, head_dim,
-                                stream);
+      LaunchFused<__half, true>(partial_o, partial_lse, geometry, workspace_ptr, peers.bases,
+                                peers.payload_offset, output, rank, cp, max_rows, head_dim, stream);
     } else {
-      LaunchFused<__half, false>(partial_o, partial_lse, geometry, workspace_ptr, window,
-                                 payload_window_offset, output, rank, cp, max_rows, head_dim,
+      LaunchFused<__half, false>(partial_o, partial_lse, geometry, workspace_ptr, peers.bases,
+                                 peers.payload_offset, output, rank, cp, max_rows, head_dim,
                                  stream);
     }
   } else {
     if (is_lse_base_on_e) {
-      LaunchFused<__nv_bfloat16, true>(partial_o, partial_lse, geometry, workspace_ptr, window,
-                                       payload_window_offset, output, rank, cp, max_rows, head_dim,
+      LaunchFused<__nv_bfloat16, true>(partial_o, partial_lse, geometry, workspace_ptr, peers.bases,
+                                       peers.payload_offset, output, rank, cp, max_rows, head_dim,
                                        stream);
     } else {
-      LaunchFused<__nv_bfloat16, false>(partial_o, partial_lse, geometry, workspace_ptr, window,
-                                        payload_window_offset, output, rank, cp, max_rows, head_dim,
-                                        stream);
+      LaunchFused<__nv_bfloat16, false>(partial_o, partial_lse, geometry, workspace_ptr,
+                                        peers.bases, peers.payload_offset, output, rank, cp,
+                                        max_rows, head_dim, stream);
     }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
-#else
-  TORCH_CHECK(false,
-              "decode_cp_a2a_lse_reduce requires NCCL >= 2.29 with device communicator support");
-#endif
 }
 
 }  // namespace flashinfer::comm::dcp

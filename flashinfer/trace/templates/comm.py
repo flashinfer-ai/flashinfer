@@ -432,7 +432,7 @@ pcie_ipc_reduce_scatter_trace_dispatch.templates = tuple(  # type: ignore[attr-d
 )
 
 
-# ── Fused NCCL-LSA DCP all-to-all + LSE reduce ───────────────────────────────
+# ── Fused DCP all-to-all + LSE reduce ────────────────────────────────────────
 
 
 @torch.no_grad()
@@ -494,7 +494,7 @@ decode_cp_a2a_lse_reduce_trace = TraceTemplate(
     op_type="comm",
     name_prefix="decode_cp_a2a_lse_reduce",
     description=(
-        "Fused context-parallel NCCL-LSA all-to-all and LSE-weighted "
+        "Fused context-parallel all-to-all and LSE-weighted "
         "attention-output reduction. The trace reference models the local "
         "LSE merge; multi-rank exchange correctness is exercised by tests/comm."
     ),
