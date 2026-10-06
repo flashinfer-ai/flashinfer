@@ -331,10 +331,6 @@ def test_decode_resolver_fails_closed_for_unpromoted_fp32_mtp_rows() -> None:
 def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
     rows = (
         (
-            dict(batch_size=4, seq_len=1, num_v_heads=32, strided_inputs=True),
-            "indexed_bf16_t1.wide32",
-        ),
-        (
             dict(
                 batch_size=4,
                 seq_len=2,
@@ -414,8 +410,8 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
     tp4_rows = (
         (
             dict(batch_size=4, seq_len=1),
-            "indexed_bf16_t1.tile16_fullwarp",
-            "t1_bf16state_tile16",
+            "indexed_bf16_t1.vec8_t16",
+            "t1_bf16state_vec8",
         ),
         *(
             (
@@ -446,23 +442,118 @@ def test_decode_resolver_selects_exact_promoted_bf16_rows() -> None:
         assert variant_fragment in route.variant_name
 
 
-def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
-    with pytest.raises(
-        cake_gdn.CakeGDNUnsupportedError,
-        match="exact promoted indexed/verify rows",
-    ):
+_QWEN35_BF16_T1_GEOMETRIES = (
+    # (H, HV): Qwen3.5-35B-A3B TP1/TP2/TP4, Qwen3.5-397B-A17B TP2/TP4/TP8
+    (16, 32),
+    (8, 16),
+    (4, 8),
+    (8, 32),
+    (4, 16),
+    (2, 8),
+)
+_SGLANG_GRAPH_BATCHES = (1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1000)
+
+
+def test_bf16_t1_route_rule_follows_the_state_head_count() -> None:
+    bands = cake_gdn.CAKE_GDN_BF16_T1_ROUTE_BANDS
+    bounds = [band[0] for band in bands]
+    assert bounds[-1] is None and None not in bounds[:-1]
+    assert bounds[:-1] == sorted(bounds[:-1])
+    for _, body, tile_v in bands:
+        assert body in cake_gdn.CAKE_GDN_BF16_T1_BODIES and tile_v in (16, 32, 64, 128)
+    rule = cake_gdn.cake_gdn_bf16_t1_route
+    previous = 0
+    for max_state_heads, body, tile_v in bands[:-1]:
+        assert rule(1, previous + 1) == (body, tile_v)
+        assert rule(1, max_state_heads) == (body, tile_v)
+        previous = max_state_heads
+    assert rule(1, previous + 1) == bands[-1][1:]
+    assert rule(512, 32) == ("wide", 128)
+    assert rule(1, 32) == ("vec8", 16)
+    assert rule(16, 32) == ("vec8occ", 64)
+    assert rule(24, 32) == ("vec8", 64)
+    assert rule(32, 32) == ("wide", 128)
+    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_t1.vec8_t16") == 16
+    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_t1.vec8occ_t64") == 64
+    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_t1.wide128") == 128
+    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_verify_t4.tile16_fullwarp") == 16
+    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_verify_t4.wide64") == 64
+    assert cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32") == 32
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="carries no grid tile"):
+        cake_gdn.cake_gdn_bf16_route_tile_v("flashinfer.gdn_decode.indexed_fp32_t1_splitv8")
+
+
+@pytest.mark.parametrize("heads", _QWEN35_BF16_T1_GEOMETRIES)
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+def test_decode_resolver_admits_every_qwen35_bf16_t1_geometry_at_any_batch(arch, heads) -> None:
+    num_q_heads, num_v_heads = heads
+    for batch_size in _SGLANG_GRAPH_BATCHES:
+        for strided_inputs in (True, False):
+            route = _decode(
+                arch=arch,
+                state_dtype="bfloat16",
+                layout="pretranspose",
+                batch_size=batch_size,
+                num_k_heads=num_q_heads,
+                num_q_heads=num_q_heads,
+                num_v_heads=num_v_heads,
+                seq_len=1,
+                strided_inputs=strided_inputs,
+            )
+            body, tile_v = cake_gdn.cake_gdn_bf16_t1_route(batch_size, num_v_heads)
+            if body == "wide":
+                assert route.route_id == f"flashinfer.gdn_decode.indexed_bf16_t1.wide{tile_v}"
+                assert "mtp_t4_bf16state_wide128" in route.variant_name
+            else:
+                assert route.route_id == f"flashinfer.gdn_decode.indexed_bf16_t1.{body}_t{tile_v}"
+                assert f"t1_bf16state_{body}_" in route.variant_name
+            assert cake_gdn.cake_gdn_bf16_route_tile_v(route.route_id) == tile_v
+            record = cake_gdn._kernel_record(route.variant_name)
+            assert record["specializations"]["H"] == num_q_heads
+            assert record["specializations"]["HV"] == num_v_heads
+            assert record["specializations"]["STRIDED_INPUTS"] == 1
+            assert record["specializations"].get("TILE_V_WIDE", record["specializations"].get("TILE_V")) == tile_v
+            assert record["specializations"].get("T_STEPS", 1) == 1
+            assert record["specializations"].get("UPDATE_STATE", 1) == 1
+            assert arch in record["architectures"]
+
+
+def test_decode_resolver_fails_closed_for_unlisted_bf16_t1_geometry_and_controls() -> None:
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="no exact frozen Cake GDN variant"):
         _decode(
             state_dtype="bfloat16",
             layout="pretranspose",
-            batch_size=5,
-            num_v_heads=32,
+            batch_size=4,
+            num_k_heads=16,
+            num_q_heads=16,
+            num_v_heads=64,
             seq_len=1,
             strided_inputs=True,
         )
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="updates the state and caches nothing"):
+        _decode(
+            state_dtype="bfloat16",
+            layout="pretranspose",
+            batch_size=4,
+            num_v_heads=32,
+            seq_len=1,
+            strided_inputs=True,
+            disable_state_update=True,
+        )
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError, match="pretranspose state-pool layout"):
+        _decode(
+            state_dtype="bfloat16",
+            layout="nontranspose",
+            batch_size=4,
+            num_v_heads=32,
+            seq_len=1,
+        )
 
+
+def test_decode_resolver_fails_closed_for_unpromoted_bf16_shape() -> None:
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="exact promoted indexed/verify rows",
+        match="exact promoted verify/update rows",
     ):
         _decode(
             state_dtype="bfloat16",

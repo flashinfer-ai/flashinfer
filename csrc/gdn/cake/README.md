@@ -53,3 +53,27 @@ rows (H=8 / HV=16, BF16 state pool, seven-step BF16 checkpoint cache,
 specialized to `T_STEPS=7` and `T_STEPS=8` for B<=4 and
 `gdn_decode_pretranspose_mtp_t4_bf16state_wide128` with `T_STEPS=7`,
 `TILE_V_WIDE=32` for B>=5 (H=8/HV=16) and TP=1 (H=16/HV=32).
+
+Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
+geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)
+and 8/32, 4/16, 2/8 (Qwen3.5-397B-A17B TP2/TP4/TP8). The resolver picks the
+body and grid tile from the state-head count `B * HV`
+(`cake_gdn_bf16_t1_route`): up to 768 state heads one of two launch-bound
+instances of `gdn_decode_pretranspose_t1_bf16state_vec8` -- eight 16-lane
+groups per CTA, one 16-byte load per lane and state row, `TILE_V` 16 / 32 /
+64 -- where the `vec8` instance (`__launch_bounds__(128, 1)`) issues every
+first-block load ahead of the Q/K normalization for the latency-bound small
+pools and the `vec8occ` instance (default launch bounds, eight CTAs per SM)
+takes the 256- and 512-head bands whose 1024-CTA grids then run in a single
+wave; above 768 state heads the MTP wide-tile body
+`gdn_decode_pretranspose_mtp_t4_bf16state_wide128` at `T_STEPS=1`,
+`TILE_V_WIDE=128` (one CTA per state head) streams the bandwidth-bound pools.
+The route id carries the body and tile and the host launches
+`B * HV * 128 / tile_v` CTAs. Every body reads its input strides at runtime,
+so packed SGLang QKV views and contiguous tensors share one variant. An
+unlisted (geometry, body, tile) triple fails closed.
+
+The BF16-I/O + BF16-state prefill kernels (`..._dvsplit_initial_bf16state`
+and the full-DV `..._initial_bf16state`, gathered state, no checkpoints)
+are specialized for the same per-rank head splits:
+`HEAD_GROUP_LOG2`/`NUM_O_HEADS_LOG2` = 1/4, 1/3, 2/5, 2/4 and 2/3.
