@@ -61,8 +61,8 @@ export protocol measured end to end.
 | --- | --- | --- | --- |
 | NVIDIA B200 | `sm_100a` | 148 | qualified (export protocol, 148-SM configuration) |
 | NVIDIA B300 | `sm_103a` | 148 | qualified (export protocol, 148-SM configuration) |
-| NVIDIA GB300 | `sm_103a` | 152 | __GB300_STATUS__ |
-| NVIDIA GB200 | `sm_100a` | 152 | admitted by the same policy and programs (host-side route enumeration + tests without a device); not benchmarked |
+| NVIDIA GB300 | `sm_103a` | 152 | qualified (export protocol, 152-SM configuration; the rows below the per-row gate against the pinned vLLM op are listed in the delivery summary) |
+| NVIDIA GB200 | `sm_100a` | 152 | admitted by the same policy and programs; on GB200 hardware the package GPU tests pass and the native ports were timed against the persistent fallback at 152 SMs (faster on every measured cell); no export stage of this delivery |
 
 Any other SM count is served by the persistent / small-M / `K = 0` families with
 grids derived from the actual count; no such configuration has been benchmarked.
