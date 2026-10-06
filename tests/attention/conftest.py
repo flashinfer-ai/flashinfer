@@ -146,10 +146,8 @@ def _fmha_v2_specs(items):
     The attention-sink tests additionally compile an fa2/fa3 customize batch
     prefill module (the AttentionSink variant) as reference.
     """
-    from flashinfer.jit import (
-        gen_batch_prefill_attention_sink_module,
-        gen_fmha_v2_module,
-    )
+    from flashinfer.jit import gen_fmha_v2_module
+    from flashinfer.jit.attention import gen_batch_prefill_attention_sink_module
     from flashinfer.utils import is_sm12x_supported, is_sm90a_supported
 
     device = torch.device("cuda")
