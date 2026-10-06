@@ -24,7 +24,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(32) void
-kernel_cake_all_gather_matmul_43e256e956ee81d48de7(int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
+kernel_cake_all_gather_matmul_ffe749098469b859325c(int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -37,6 +37,7 @@ kernel_cake_all_gather_matmul_43e256e956ee81d48de7(int32_t pg_world, int32_t pg_
     const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     // nvlink_barrier(pg_flags) phase=0 owner_warp=0
     {
         const int __ws = pg_world;
