@@ -94,12 +94,12 @@ re-launch and CUDA-graph replay, complete-call CUPTI cold-L2 benchmarks of the
 exported route against the production launcher and the contract baseline) was
 run on the configurations below.  Other SM counts are refused by `prepare_*`.
 
-| device | architecture | SMs | status |
-| --- | --- | ---: | --- |
-| NVIDIA B200 | `sm_100a` | 148 | qualified (export protocol, every denominator row) |
-| NVIDIA B300 SXM6 | `sm_103a` | 148 | qualified (export protocol, every denominator row) |
-| NVIDIA GB300 (NVL72) | `sm_103a` | 152 | qualified (export protocol, every denominator row of the 152-SM configuration; complete-call speedup over the torch / cuBLAS chain measured per row) |
-| NVIDIA GB200 (NVL72) | `sm_100a` | 152 | admitted: host plan and program registry verified for every route on 152 SMs (the same programs as GB300); on GB200 hardware the package GPU tests pass and the complete-call contract rows were timed against the torch / cuBLAS chain (front: every row faster; tail: see the delivery summary); no export stage of this delivery |
+| device | architecture | SMs | driver | status |
+| --- | --- | ---: | --- | --- |
+| NVIDIA B200 | `sm_100a` | 148 | 580.82.07 | qualified (export protocol, every denominator row) |
+| NVIDIA B300 SXM6 | `sm_103a` | 148 | 580.126.09 | qualified (export protocol, every denominator row) |
+| NVIDIA GB300 (NVL72) | `sm_103a` | 152 | 580.159.03 | qualified (export protocol, every denominator row of the 152-SM configuration; complete-call speedup over the torch / cuBLAS chain measured per row) |
+| NVIDIA GB200 (NVL72) | `sm_100a` | 152 | not recorded (no export stage) | admitted: host plan and program registry verified for every route on 152 SMs (the same programs as GB300); on GB200 hardware the package GPU tests pass and the complete-call contract rows were timed against the torch / cuBLAS chain (front: every row faster; tail: see the delivery summary); no export stage of this delivery |
 
 ## Limits
 
