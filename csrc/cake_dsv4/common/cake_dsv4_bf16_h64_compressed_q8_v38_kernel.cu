@@ -275,7 +275,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_af12cd6d62befdf27b81(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_splits, int has_sinks)
+kernel_cake_dsv4_c4b4973e524f0c21c6e6(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_splits, int has_sinks, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -399,6 +399,33 @@ kernel_cake_dsv4_af12cd6d62befdf27b81(const __grid_constant__ CUtensorMap tmap_q
             int _max_0 = ((sparse_topk_lens[query_idx] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx] + sparse_topk_lens_offset) : (0));
             int _min_0 = ((_max_0) < (sparse_topk) ? (_max_0) : (sparse_topk));
             int active_topk = _min_0;
+            int query_batch = query_idx / max_q_len;
+            int query_offset = query_idx - query_batch * max_q_len;
+            int query_length = max_q_len;
+            if (ragged_query != 0) {
+                query_batch = 0;
+                #pragma unroll 2
+                for (int chunk = 0; chunk < (batch_size + 31) / 32; chunk++) {
+                    int lane_entry = chunk * 32 + lane + 1;
+                    int _min_1 = ((lane_entry) < (batch_size) ? (lane_entry) : (batch_size));
+                    int lane_load = _min_1;
+                    unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, lane_entry <= batch_size && query_idx >= cum_seq_lens_q[lane_load]);
+                    unsigned int started = _vote_1;
+                    int _popc_0 = __popc(started);
+                    query_batch = query_batch + _popc_0;
+                }
+                int query_begin = cum_seq_lens_q[query_batch];
+                query_length = cum_seq_lens_q[query_batch + 1] - query_begin;
+                query_offset = query_idx - query_begin;
+            }
+            int visible = seq_lens[query_batch] - query_length + query_offset + 1;
+            if (visible < 0) {
+                visible = 0;
+            }
+            if (visible > 128) {
+                visible = 128;
+            }
+            int swa_visible = visible;
             const int warp_in_compute = warp;
             const int tmem_row_origin = warp_in_compute * 32;
             const int logical_row_origin = warp_in_compute * 16;
@@ -423,8 +450,11 @@ kernel_cake_dsv4_af12cd6d62befdf27b81(const __grid_constant__ CUtensorMap tmap_q
             int valid_cols = active_topk - split_idx * 128 - col_half * 64;
             valid_cols = ((valid_cols < 0) ? 0 : valid_cols);
             valid_cols = ((valid_cols > 64) ? 64 : valid_cols);
-            int causal_cols = smem_index_flags[col_half * 2 + 1];
-            valid_cols = ((valid_cols < causal_cols) ? valid_cols : causal_cols);
+            if (split_idx == 0) {
+                int visible_cols = swa_visible - col_half * 64;
+                visible_cols = ((visible_cols < 0) ? 0 : visible_cols);
+                valid_cols = ((valid_cols < visible_cols) ? valid_cols : visible_cols);
+            }
             uint32_t _slice_lo_mask_0;
             {
                 int _lim_0 = valid_cols;
@@ -515,6 +545,22 @@ kernel_cake_dsv4_af12cd6d62befdf27b81(const __grid_constant__ CUtensorMap tmap_q
             if (!(_slice_lo_mask_1 & (1u << 29))) _tmem_load_0[61] = -CAKE_INF;
             if (!(_slice_lo_mask_1 & (1u << 30))) _tmem_load_0[62] = -CAKE_INF;
             if (!(_slice_lo_mask_1 & (1u << 31))) _tmem_load_0[63] = -CAKE_INF;
+            int first_invalid = smem_index_flags[col_half * 2 + 1];
+            if (first_invalid < valid_cols) {
+                int chunk_rows[4];
+                #pragma unroll
+                for (int chunk_1 = 0; chunk_1 < 64; chunk_1 += 4) {
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&chunk_rows[0])), "=r"(*reinterpret_cast<uint32_t*>(&chunk_rows[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&chunk_rows[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&chunk_rows[(0) + 3]))
+                        : "r"(smem_indices_addr + (unsigned int)((col_half * 64 + chunk_1) * 4)));
+                    #pragma unroll
+                    for (int chunk_i = 0; chunk_i < 4; chunk_i++) {
+                        if (chunk_rows[chunk_i] < 0) {
+                            _tmem_load_0[chunk_1 + chunk_i] = -CAKE_INF;
+                        }
+                    }
+                }
+            }
             float2 _reg_reduce_max2_2 = {-CAKE_INF, -CAKE_INF};
             row_max_x32_accum(&_tmem_load_0[0], _reg_reduce_max2_2);
             row_max_x32_accum(&_tmem_load_0[32], _reg_reduce_max2_2);
@@ -992,13 +1038,13 @@ kernel_cake_dsv4_af12cd6d62befdf27b81(const __grid_constant__ CUtensorMap tmap_q
                         int gathered_groups = 0;
                         #pragma unroll
                         for (int zf_group = 0; zf_group < 8; zf_group++) {
-                            if ((invalid_indices >> (unsigned int)(zf_group * 4) & 1) == 0) {
+                            if ((invalid_indices >> (unsigned int)(zf_group * 4) & 15) != 15) {
                                 gathered_groups = gathered_groups + 1;
                             }
                         }
                         #pragma unroll
                         for (int zf_group_1 = 0; zf_group_1 < 8; zf_group_1++) {
-                            if ((invalid_indices >> (unsigned int)(zf_group_1 * 4) & 1) != 0) {
+                            if ((invalid_indices >> (unsigned int)(zf_group_1 * 4) & 15) == 15) {
                                 int zf_off = k_stage_2 * 32768 + (load_warp_rank * 8 + zf_group_1) * 512 + lane * 16;
                                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_kv_addr + (unsigned int)zf_off), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
                                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_kv_addr + (unsigned int)(zf_off + 16384)), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
@@ -1025,7 +1071,7 @@ kernel_cake_dsv4_af12cd6d62befdf27b81(const __grid_constant__ CUtensorMap tmap_q
                             int row1 = ((raw1 >= 0) ? raw1 : 0);
                             int row2 = ((raw2 >= 0) ? raw2 : 0);
                             int row3 = ((raw3 >= 0) ? raw3 : 0);
-                            if (raw0 >= 0) {
+                            if (raw0 >= 0 || raw1 >= 0 || raw2 >= 0 || raw3 >= 0) {
                                 if (elect_sync()) {
                                     tma_gather4_gmem2smem(dst_k + group * 512, (&tmap_swa_kv), k_stage_2 * 128, row0, row1, row2, row3, kv_full_addr + (k_stage_2) * 8);
                                     tma_gather4_gmem2smem(dst_k + 16384 + group * 512, (&tmap_swa_kv), k_stage_2 * 128 + 64, row0, row1, row2, row3, kv_full_addr + (k_stage_2) * 8);
@@ -1068,13 +1114,13 @@ kernel_cake_dsv4_af12cd6d62befdf27b81(const __grid_constant__ CUtensorMap tmap_q
                         int gathered_groups_1 = 0;
                         #pragma unroll
                         for (int zf_group_2 = 0; zf_group_2 < 8; zf_group_2++) {
-                            if ((invalid_indices >> (unsigned int)(zf_group_2 * 4) & 1) == 0) {
+                            if ((invalid_indices >> (unsigned int)(zf_group_2 * 4) & 15) != 15) {
                                 gathered_groups_1 = gathered_groups_1 + 1;
                             }
                         }
                         #pragma unroll
                         for (int zf_group_3 = 0; zf_group_3 < 8; zf_group_3++) {
-                            if ((invalid_indices >> (unsigned int)(zf_group_3 * 4) & 1) != 0) {
+                            if ((invalid_indices >> (unsigned int)(zf_group_3 * 4) & 15) == 15) {
                                 int zf_off_1 = k_stage_3 * 32768 + (load_warp_rank * 8 + zf_group_3) * 512 + lane * 16;
                                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_kv_addr + (unsigned int)zf_off_1), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
                                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_kv_addr + (unsigned int)(zf_off_1 + 16384)), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
@@ -1101,7 +1147,7 @@ kernel_cake_dsv4_af12cd6d62befdf27b81(const __grid_constant__ CUtensorMap tmap_q
                             int row1_2 = ((raw1_2 >= 0) ? raw1_2 : 0);
                             int row2_2 = ((raw2_2 >= 0) ? raw2_2 : 0);
                             int row3_2 = ((raw3_2 >= 0) ? raw3_2 : 0);
-                            if (raw0_2 >= 0) {
+                            if (raw0_2 >= 0 || raw1_2 >= 0 || raw2_2 >= 0 || raw3_2 >= 0) {
                                 if (elect_sync()) {
                                     tma_gather4_gmem2smem(dst_k_2 + group_2 * 512, (&tmap_compressed_kv), k_stage_3 * 128, row0_2, row1_2, row2_2, row3_2, kv_full_addr + (k_stage_3) * 8);
                                     tma_gather4_gmem2smem(dst_k_2 + 16384 + group_2 * 512, (&tmap_compressed_kv), k_stage_3 * 128 + 64, row0_2, row1_2, row2_2, row3_2, kv_full_addr + (k_stage_3) * 8);

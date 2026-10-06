@@ -1251,6 +1251,45 @@ def _check_dsv4_sparse_mla_inputs(
     )
 
 
+_DSV4_KV_CACHE_FORMATS = ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca")
+
+
+def _check_dsv4_kv_cache_format_backend(
+    kv_cache_format: str,
+    backend: Literal["trtllm-gen", "cute-dsl", "sparse", "cake"],
+    *,
+    sm120_cake: bool = False,
+) -> None:
+    """Pair a resolved DSv4 backend with the sparse-cache storage format.
+
+    ``fp8_dsv41`` is SM120/SM121 ``backend="sparse"`` only; ``fp8_dsv41_fp4_ca``
+    additionally accepts the Cake mixed-cache decode on SM120/SM121
+    (``sm120_cake=True``: ``backend="cake"`` resolved on an SM120-family
+    device). The 384-byte NVFP4 ABI runs on SM120/SM121 through
+    ``backend="sparse"`` or ``backend="cake"`` and on SM100/SM103 through the
+    CAKE NVFP4 route (``backend="cake"``); the architecture itself is enforced
+    by :func:`_resolve_dsv4_sparse_mla_backend`.
+    """
+    if kv_cache_format not in _DSV4_KV_CACHE_FORMATS:
+        raise ValueError(
+            "kv_cache_format must be 'fp8', 'fp8_dsv41', 'fp8_dsv41_fp4_ca', "
+            f"or 'nvfp4', got {kv_cache_format!r}"
+        )
+    if kv_cache_format == "fp8_dsv41" and backend != "sparse":
+        raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
+    if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
+        if backend != "cake" or not sm120_cake:
+            raise ValueError(
+                "kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse' (or "
+                "backend='cake' on SM120/SM121)"
+            )
+    if kv_cache_format == "nvfp4" and backend not in ("sparse", "cake"):
+        raise ValueError(
+            "kv_cache_format='nvfp4' requires backend='sparse' (SM120/SM121) or "
+            f"backend='cake' (SM120/SM121 or SM100/SM103), got backend={backend!r}"
+        )
+
+
 def _resolve_dsv4_sparse_mla_backend(
     device: torch.device,
     requested_backend: Literal[
@@ -1969,15 +2008,25 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     use ``clamp(len + sparse_topk_lens_offset, 0, sparse_topk)`` entries of
     each row. No copies are made: tables must be int32 with unit column stride
     (row strides are free), and ``query``/``out``/KV pools must be densely
-    packed. ``workspace_buffer`` is carved deterministically; size it with
-    :func:`flashinfer.mla.get_cake_dsv4_workspace_bytes` and zero its
-    split-merge counters once with
-    :func:`flashinfer.mla.cake_dsv4_workspace_reset` (the first eager call
-    with a workspace tensor also does this; the kernels self-reset, so CUDA
-    graph replays need no host state). The only allocation on the call path is
-    the output when ``out`` is omitted; with ``out`` provided, captured graphs
-    replay with unchanged ``torch.cuda.memory_allocated()``. Warm up eagerly
-    before capture (JIT build, descriptor slab, counters).
+    packed. ``workspace_buffer`` is carved deterministically and exactly per
+    route (:func:`flashinfer.mla.cake_dsv4_workspace_requirement`); any
+    buffer from the one-row minimum up works: when one launch over all
+    metadata rows does not fit, the rows are tiled into consecutive launches
+    (a fixed 128 MiB buffer admits every row count on every route).
+    :func:`flashinfer.mla.get_cake_dsv4_workspace_bytes` is the single-launch
+    upper bound. The split-merge counters are zeroed as part of the launch
+    (first eager use through a workspace, or a zero fill recorded into the
+    graph when a capture reaches an unprimed workspace); no host priming
+    step is required and none raises inside capture. ``seq_lens`` bounds the
+    128 SWA columns of every row exactly as TRTLLM-GEN does: with ``b`` the
+    request of a row, ``q_len_b`` its query length and ``q_off`` the row's
+    position in it, only the first ``clamp(seq_lens[b] - (q_len_b - 1 -
+    q_off), 0, 128)`` SWA columns are attended; ``-1`` slots and columns at
+    or beyond the active length are never attended. The only allocation on
+    the call path is the output when ``out`` is omitted; with ``out``
+    provided, captured graphs replay with unchanged
+    ``torch.cuda.memory_allocated()``. Warm up eagerly before capture (JIT
+    build, descriptor storage).
 
     Parameters
     ----------
@@ -2001,10 +2050,14 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         This scratch rule is separate from the documented output allocation
         when ``out`` is omitted; provide ``out`` to avoid that allocation.
         A changed tuning profile requires eager warmup and recapture.
-        ``backend="cake"`` carves this buffer as ``[TMA descriptor slab |
-        split-merge counters | partial_O | partial_lse]``; see
-        :func:`flashinfer.mla.get_cake_dsv4_workspace_bytes` for the formula
-        and :func:`flashinfer.mla.cake_dsv4_workspace_reset` for the one-time
+        ``backend="cake"`` carves this buffer as ``[reserved slab |
+        split-merge counters | partial_O (split routes) | partial_lse]`` and
+        tiles the metadata rows over several launches when one launch does
+        not fit; see :func:`flashinfer.mla.get_cake_dsv4_workspace_bytes` for
+        the single-launch bound,
+        :func:`flashinfer.mla.cake_dsv4_workspace_requirement` for the exact
+        per-route numbers and
+        :func:`flashinfer.mla.cake_dsv4_workspace_reset` for the optional
         counter reset. CAKE never allocates scratch.
     sparse_indices : Optional[torch.Tensor]
         TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
@@ -2031,7 +2084,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     seq_lens : Optional[torch.Tensor]
         Original KV sequence lengths, shape ``[batch_size]`` INT32. Required
         by ``trtllm-gen`` and by compressed-page-aligned HCA metadata
-        conversion.
+        conversion. ``backend="cake"`` derives the per-token SWA validity
+        window from it (see above) and binds it, with ``cum_seq_lens_q`` /
+        ``max_q_len`` / the dense batch layout, to every kernel variant.
     out : Optional[torch.Tensor]
         Optional preallocated output. The default path expects the same shape
         as ``query`` and BF16 dtype. RopeQuant expects FP8 E4M3 shape
@@ -2195,25 +2250,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         both caches dequantized exactly on chip).
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
-    if kv_cache_format not in ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"):
-        raise ValueError(
-            "kv_cache_format must be 'fp8', 'fp8_dsv41', 'fp8_dsv41_fp4_ca', "
-            f"or 'nvfp4', got {kv_cache_format!r}"
-        )
-    if kv_cache_format == "fp8_dsv41" and backend != "sparse":
-        raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
-    if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
-        if backend != "cake" or not _is_sm120_family(query.device):
-            raise ValueError(
-                "kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse' (or "
-                "backend='cake' on SM120/SM121)"
-            )
-    if kv_cache_format == "nvfp4" and backend != "sparse":
-        if backend != "cake" or not _is_sm120_family(query.device):
-            raise ValueError(
-                "kv_cache_format='nvfp4' requires backend='sparse' (or "
-                "backend='cake' on SM120/SM121)"
-            )
+    _check_dsv4_kv_cache_format_backend(
+        kv_cache_format, backend, sm120_cake=_is_sm120_family(query.device)
+    )
 
     rope_quant = dsv4_inv_rope_cos_sin_cache is not None
     if dsv4_output_scale is not None and not rope_quant:
@@ -2439,6 +2478,65 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             kv_cache_format=kv_cache_format,
             backend="cake" if cake_sm120 else "sparse",
             enable_pdl=enable_pdl if cake_sm120 else None,
+        )
+
+    if backend == "cake" and kv_cache_format == "nvfp4":
+        # SM100/SM103 NVFP4 cache route. Two independent tables
+        # (``sparse_indices`` over ``swa_kv_cache``, ``extra_sparse_indices``
+        # over ``compressed_kv_cache``) as in the SM120 NVFP4 ABI; the main
+        # active length is ``sparse_topk_lens`` (``swa_topk_lens`` is accepted
+        # as the SM120 spelling of the same vector). No combined-table offset.
+        from .cake_dsv4 import run_cake_dsv4_nvfp4
+
+        if sparse_indices is None:
+            raise ValueError("backend='cake' requires sparse_indices")
+        if sparse_topk_lens is not None and swa_topk_lens is not None:
+            raise ValueError(
+                "kv_cache_format='nvfp4' takes either sparse_topk_lens or "
+                "swa_topk_lens for the main table, not both"
+            )
+        if sparse_topk_lens_offset != 0:
+            raise ValueError(
+                "kv_cache_format='nvfp4' uses independent tables; "
+                "sparse_topk_lens_offset must be 0"
+            )
+        if multi_ctas_kv_counter_buffer is not None:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is only used by backend='trtllm-gen'"
+            )
+        if query.ndim == 4:
+            if max_q_len is not None and max_q_len != query.shape[1]:
+                raise ValueError(
+                    f"Expected max_q_len == {query.shape[1]} for dense query input, "
+                    f"got {max_q_len}"
+                )
+            query_flat = query.flatten(0, 1)
+        elif query.ndim == 3:
+            query_flat = query
+        else:
+            raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
+        if out is None:
+            out = torch.empty(query.shape, dtype=torch.bfloat16, device=query.device)
+        return run_cake_dsv4_nvfp4(
+            query=query_flat,
+            swa_kv_cache=swa_kv_cache,
+            compressed_kv_cache=compressed_kv_cache,
+            workspace_buffer=workspace_buffer,
+            sparse_indices=sparse_indices,
+            sparse_topk_lens=(
+                sparse_topk_lens if sparse_topk_lens is not None else swa_topk_lens
+            ),
+            extra_sparse_indices=extra_sparse_indices,
+            extra_sparse_topk_lens=extra_sparse_topk_lens,
+            out=out,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cum_seq_lens_q,
+            seq_lens=seq_lens,
+            kv_layout=kv_layout,
+            backend="cake",
         )
 
     if backend != "cake":
