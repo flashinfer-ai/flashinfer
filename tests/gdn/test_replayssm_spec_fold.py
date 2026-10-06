@@ -71,8 +71,13 @@ def _inputs(batch=4, steps=8, heads=2, value_heads=8, dtype=torch.bfloat16):
     return args, cache
 
 
-def _reference(args):
-    """FP64 recurrence independent of the CuTe layouts and TF32 contractions."""
+def _reference(args, rows=None):
+    """FP64 recurrence independent of the CuTe layouts and TF32 contractions.
+
+    ``rows`` is an optional ``[B, T]`` index of the draft rows each request
+    replays, in order; ``None`` replays ``0..T-1``. Element ``j`` of the
+    returned states is the state after replaying ``rows[:, j]``.
+    """
     q, k, v = (args[n].to(torch.bfloat16).double() for n in ("q", "k", "v"))
     batch, steps, heads, _ = q.shape
     hv = v.shape[2]
@@ -88,13 +93,18 @@ def _reference(args):
     beta = b.sigmoid()
     indices = args["initial_state_indices"].long().clamp_min(0)
     state = args["initial_state"][indices].double()
+    if rows is None:
+        rows = torch.arange(steps, device=q.device).expand(batch, steps)
+    rows = rows.to(q.device).long()
+    request = torch.arange(batch, device=q.device)
     outputs, states = [], []
-    for t in range(steps):
-        state = state * log_g[:, t, :, None, None].exp()
-        prediction = (state * k[:, t, :, None, :]).sum(-1)
-        delta = (v[:, t] - prediction) * beta[:, t, :, None]
-        state = state + delta[..., None] * k[:, t, :, None, :]
-        outputs.append((state * q[:, t, :, None, :]).sum(-1))
+    for position in range(steps):
+        t = rows[:, position]
+        state = state * log_g[request, t, :, None, None].exp()
+        prediction = (state * k[request, t, :, None, :]).sum(-1)
+        delta = (v[request, t] - prediction) * beta[request, t, :, None]
+        state = state + delta[..., None] * k[request, t, :, None, :]
+        outputs.append((state * q[request, t, :, None, :]).sum(-1))
         states.append(state.clone())
     return torch.stack(outputs, 1), torch.stack(states, 1), log_g, beta
 
@@ -333,6 +343,254 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
             atol=1e-4 if tcgen else 2e-6,
             rtol=1e-3 if tcgen else 1e-5,
         )
+
+
+def _commit_single(args, cache, accepts, backend, accept_paths=None):
+    """Commit one layer's window pool in place, as a [1, slots, ...] view."""
+    gated_delta_rule_replayssm_commit(
+        args["initial_state"].unsqueeze(0),
+        cache["replayssm_rawv"].unsqueeze(0),
+        cache["replayssm_rawk"].unsqueeze(0),
+        cache["replayssm_g"].unsqueeze(0),
+        cache["replayssm_beta"].unsqueeze(0),
+        args["initial_state_indices"],
+        accepts,
+        accept_paths=accept_paths,
+        backend=backend,
+    )
+
+
+def _poison_unaccepted(cache, slots, counts, paths):
+    """NaN every window row a correct commit must not read."""
+    rows = paths.tolist()
+    for slot, count, path in zip(slots, counts, rows, strict=True):
+        if slot < 0:
+            continue
+        keep = set(path[:count])
+        for row in range(paths.shape[1]):
+            if row not in keep:
+                for window in cache.values():
+                    window[slot, :, row] = float("nan")
+
+
+def _sample_paths(batch, steps, counts, seed):
+    """One ordered draft-row subset per request, zero-padded to ``steps``."""
+    generator = torch.Generator().manual_seed(seed)
+    paths = torch.zeros(batch, steps, dtype=torch.int32)
+    unsorted = batch - 2
+    for row, count in enumerate(counts):
+        subset = torch.randperm(steps, generator=generator)[:count]
+        # One full-length row keeps randperm order: rows need not be ascending.
+        paths[row, :count] = subset if row == unsorted else subset.sort().values
+    return paths
+
+
+@pytest.mark.parametrize("backend", ["simt", "tcgen05"])
+def test_replayssm_commit_non_prefix_path(backend):
+    """A tree accept of {0, 2} must not read the rejected sibling at row 1."""
+    args, cache = _inputs(batch=1, steps=4)
+    paths = torch.tensor([[0, 2, 0, 0]], device="cuda", dtype=torch.int32)
+    accepts = torch.tensor([2], device="cuda", dtype=torch.int32)
+    _, expected_states, _, _ = _reference(args, rows=paths)
+    slot = args["initial_state_indices"].item()
+    gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
+    for window in cache.values():
+        window[slot, :, 1] = float("nan")
+        window[slot, :, 3] = float("nan")
+    _commit_single(args, cache, accepts, backend, accept_paths=paths)
+    committed = args["initial_state"][slot]
+    assert torch.isfinite(committed).all(), "the rejected sibling reached the state"
+    torch.testing.assert_close(
+        committed.double(),
+        expected_states[0, 1],
+        atol=2e-6 if backend == "simt" else 1e-4,
+        rtol=1e-5 if backend == "simt" else 1e-3,
+    )
+
+
+@pytest.mark.parametrize("steps", [3, 4, 5, 6, 7, 8], ids=lambda t: f"T{t}")
+@pytest.mark.parametrize("backend", ["simt", "tcgen05"])
+@pytest.mark.parametrize("track", [False, True])
+def test_replayssm_commit_path_cycles(steps, backend, track):
+    """Every accepted length over a non-prefix path, with null and zero rows."""
+    if backend == "tcgen05" and (steps < 4 or track):
+        pytest.skip("tcgen commit requires T=4..8 without tracking")
+    counts = list(range(steps + 1)) + [steps, 0]
+    batch = len(counts)
+    args, cache = _inputs(batch, steps)
+    # The last request is null (see _inputs); the one before it has the unsorted path.
+    paths = _sample_paths(batch, steps, counts, seed=steps).cuda()
+    accepts = torch.tensor(counts, device="cuda", dtype=torch.int32)
+    slots = args["initial_state_indices"].tolist()
+    track_ids = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
+    track_steps = torch.zeros(batch, device="cuda", dtype=torch.int32)
+    if track:
+        track_ids = torch.arange(
+            batch + 1, 2 * batch + 1, device="cuda", dtype=torch.int32
+        )
+        track_steps = (accepts - 1).clamp_min(0)
+        track_steps[3] = 1
+        track_steps[2] = accepts[2]  # out of range: must leave the slot alone
+
+    layers = 2
+    pool_slots, hv, v, k = args["initial_state"].shape
+    checkpoint = torch.randn(layers, pool_slots * 3, hv, v, k, device="cuda") * 0.1
+    windows = {
+        name: torch.empty(
+            (layers, pool_slots * 3, *value.shape[1:]), device="cuda", dtype=value.dtype
+        )
+        for name, value in cache.items()
+    }
+    expected = checkpoint.clone()
+    for layer in range(layers):
+        args["initial_state"] = checkpoint[layer]
+        args["v"] = torch.randn_like(args["v"]) * 0.1
+        gated_delta_rule_mtp(
+            **args,
+            cache_replayssm=True,
+            **{name: value[layer] for name, value in windows.items()},
+        )
+        _, states, _, _ = _reference(args, rows=paths)
+        layer_cache = {name: value[layer] for name, value in windows.items()}
+        _poison_unaccepted(layer_cache, slots, counts, paths.cpu())
+        for row, (slot, count) in enumerate(zip(slots, counts, strict=True)):
+            if slot < 0 or count == 0:
+                continue
+            expected[layer, slot] = states[row, count - 1].float()
+            if track and track_ids[row] >= 0 and track_steps[row] < count:
+                expected[layer, track_ids[row]] = states[row, track_steps[row]].float()
+
+    gated_delta_rule_replayssm_commit(
+        checkpoint,
+        windows["replayssm_rawv"],
+        windows["replayssm_rawk"],
+        windows["replayssm_g"],
+        windows["replayssm_beta"],
+        args["initial_state_indices"],
+        accepts,
+        accept_paths=paths,
+        track_state_indices=track_ids if track else None,
+        track_steps=track_steps if track else None,
+        backend=backend,
+    )
+    assert torch.isfinite(checkpoint).all(), "a rejected row reached the checkpoint"
+    torch.testing.assert_close(
+        checkpoint,
+        expected,
+        atol=2e-6 if backend == "simt" else 1e-4,
+        rtol=1e-5 if backend == "simt" else 1e-3,
+    )
+
+
+@pytest.mark.parametrize("steps", [3, 4, 5, 6, 7, 8], ids=lambda t: f"T{t}")
+@pytest.mark.parametrize("backend", ["simt", "tcgen05"])
+@pytest.mark.parametrize("batch", [1, 5])
+def test_replayssm_commit_identity_path_is_bitwise_identical(batch, steps, backend):
+    """The no-gather fast path and an explicit identity path must agree exactly."""
+    if backend == "tcgen05" and steps < 4:
+        pytest.skip("tcgen commit requires T=4..8")
+    identity = (
+        torch.arange(steps, device="cuda", dtype=torch.int32)
+        .repeat(batch, 1)
+        .contiguous()
+    )
+    accepts = torch.tensor(
+        [(row * 3) % (steps + 1) for row in range(batch)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    committed = []
+    for paths in (None, identity):
+        args, cache = _inputs(batch, steps)
+        gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
+        _commit_single(args, cache, accepts, backend, accept_paths=paths)
+        committed.append(args["initial_state"].clone())
+    torch.testing.assert_close(committed[0], committed[1], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["auto", "simt"])
+def test_replayssm_commit_path_cuda_graph(backend):
+    args, cache = _inputs()
+    output = torch.empty_like(args["v"])
+    before = args["initial_state"].clone()
+    accepts = torch.tensor([0, 1, 3, 8], device="cuda", dtype=torch.int32)
+    paths = torch.tensor(
+        [[0] * 8, [5] + [0] * 7, [1, 4, 7] + [0] * 5, list(range(8))],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    def cycle():
+        gated_delta_rule_mtp(**args, output=output, cache_replayssm=True, **cache)
+        _commit_single(args, cache, accepts, backend, accept_paths=paths)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cycle()
+    torch.cuda.current_stream().wait_stream(stream)
+    expected_output, expected_state = output.clone(), args["initial_state"].clone()
+    # Commit is in place, so rewind the eager cycle before replaying it.
+    args["initial_state"].copy_(before)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cycle()
+    output.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output[:-1], expected_output[:-1], atol=0, rtol=0)
+    torch.testing.assert_close(args["initial_state"], expected_state, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["auto", "simt", "tcgen05"])
+@pytest.mark.parametrize(
+    "invalid", ["dtype", "shape", "row_count", "strided", "cpu", "unaligned"]
+)
+def test_replayssm_commit_path_validation(invalid, backend):
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    args = gdn_replayssm_commit_trace.init()
+    batch, steps = args["accept_lens"].shape[0], args["rawk_cache"].shape[3]
+    paths = torch.zeros(batch, steps, device="cuda", dtype=torch.int32)
+    match = "contiguous int32 with shape"
+    if invalid == "dtype":
+        paths = paths.long()
+    if invalid == "shape":
+        paths = paths[:, :-1].contiguous()
+    if invalid == "row_count":
+        paths = paths[:-1].contiguous()
+    if invalid == "strided":
+        paths = torch.zeros(batch, steps * 2, device="cuda", dtype=torch.int32)[:, ::2]
+    if invalid == "cpu":
+        paths, match = paths.cpu(), "checkpoint device"
+    if invalid == "unaligned":
+        paths, match = _offset_copy(paths, 1), "aligned"
+    with pytest.raises(ValueError, match=match):
+        gated_delta_rule_replayssm_commit(**args, accept_paths=paths, backend=backend)
+
+
+@pytest.mark.parametrize("backend", ["simt", "tcgen05"])
+def test_replayssm_commit_path_clamps_out_of_range_rows(backend):
+    """Row values are a caller contract; a bad row must stay in bounds."""
+    args, cache = _inputs(batch=1, steps=4)
+    accepts = torch.tensor([2], device="cuda", dtype=torch.int32)
+    clamped = torch.tensor([[0, 3, 0, 0]], device="cuda", dtype=torch.int32)
+    _, expected_states, _, _ = _reference(args, rows=clamped)
+    slot = args["initial_state_indices"].item()
+    gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
+    _commit_single(
+        args,
+        cache,
+        accepts,
+        backend,
+        accept_paths=torch.tensor([[0, 99, 0, 0]], device="cuda", dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        args["initial_state"][slot].double(),
+        expected_states[0, 1],
+        atol=2e-6 if backend == "simt" else 1e-4,
+        rtol=1e-5 if backend == "simt" else 1e-3,
+    )
 
 
 @pytest.mark.parametrize(

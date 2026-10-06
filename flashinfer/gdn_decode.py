@@ -1554,6 +1554,7 @@ def gated_delta_rule_replayssm_commit(
     beta_cache: torch.Tensor,
     state_indices: torch.Tensor,
     accept_lens: torch.Tensor,
+    accept_paths: Optional[torch.Tensor] = None,
     *,
     track_state_indices: Optional[torch.Tensor] = None,
     track_steps: Optional[torch.Tensor] = None,
@@ -1587,13 +1588,23 @@ def gated_delta_rule_replayssm_commit(
     accept_lens : torch.Tensor
         Contiguous int32 ``[B]`` accepted token counts in [0, T]. Zero is a
         no-op, including for optional track writes.
+    accept_paths : torch.Tensor, optional
+        Contiguous int32 ``[B, T]`` cache rows to replay, in order. Row ``j``
+        of request ``i`` is replayed only when ``j < accept_lens[i]``; later
+        entries are padding and may hold any value. Lets tree speculation
+        commit a root-to-node path that is not a contiguous prefix. Rows must
+        lie in [0, T) and must not repeat within a request. Default ``None``
+        replays rows ``0..accept_lens[i]-1`` and compiles a variant with no
+        gather.
     track_state_indices : torch.Tensor, optional
         Contiguous int32 ``[B]`` destinations for an additional checkpoint.
         Live track slots must be in range, mutually distinct, and disjoint
         from every live ``state_indices`` slot. Paired with ``track_steps``.
     track_steps : torch.Tensor, optional
         Contiguous int32 ``[B]`` zero-based token indices to save. A step
-        outside the accepted prefix leaves the destination unchanged.
+        outside the accepted prefix leaves the destination unchanged. Steps
+        count positions along the accepted sequence, so under ``accept_paths``
+        step ``j`` saves the state after replaying ``accept_paths[i, j]``.
     use_qk_l2norm : bool
         Normalize cached K with epsilon 1e-6. Must match verify. Default True.
     null_block_id : int
@@ -1609,8 +1620,10 @@ def gated_delta_rule_replayssm_commit(
 
     Notes
     -----
-    Index values, accepted lengths and non-aliasing are caller contracts;
-    they are not read back to the host. All tensor base addresses must be
+    Index values, accepted lengths, ``accept_paths`` rows and non-aliasing are
+    caller contracts; they are not read back to the host. Out-of-range path
+    rows are clamped into [0, T) rather than rejected, since checking them
+    would need a device synchronization. All tensor base addresses must be
     16-byte aligned for vectorized loads and TMA. Contiguous storage-offset
     views must also satisfy this alignment. Warm up before CUDA graph capture.
     """
@@ -1634,5 +1647,6 @@ def gated_delta_rule_replayssm_commit(
         track_steps=track_steps,
         use_qk_l2norm_in_kernel=use_qk_l2norm,
         null_block_id=null_block_id,
+        accept_paths=accept_paths,
         backend=backend,
     )
