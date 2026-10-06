@@ -43,10 +43,6 @@ namespace kernels {
 namespace trtllmgen_moe {
 namespace cake_stepfun {
 
-// True when every exported routing kernel of this module writes the benign routing tail, so the
-// GEMM stages never launch the tail-padding kernel.
-bool routingWritesBenignTail();
-
 // Routing stage. Same constructor and run() argument list as Routing::Runner; serves
 // RoutingMethodType::Renormalize from float32 / bfloat16 logits or from pre-computed top-k ids
 // (+ weights, the trtllm-gen launcher's unpacked pre-routed protocol) and rejects (does not fall
@@ -107,12 +103,6 @@ class Fc2Runner {
   // requantization stage must write for the per-token NVFP4 family).
   [[nodiscard]] flashinfer::cake_stepfun::generated::SfLayout sfLayoutA(int32_t configIndex) const;
 
-  // Same meaning as Fc1Runner::setRoutingTailPadding: write the benign routing tail before kernels
-  // that do not bound cluster-launch-control acquired tiles (false only when the caller's routing
-  // arrays already carry that tail).
-  void setRoutingTailPadding(bool enabled) { mPadRoutingTail = enabled; }
-  [[nodiscard]] bool routingTailPadding() const { return mPadRoutingTail; }
-
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
            void* weightScale, void* perTokenScales, void* perChannelScales,
            float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK,
@@ -134,7 +124,6 @@ class Fc2Runner {
   int mFamily{-1};
   std::vector<int32_t> mKernels;
   mutable std::vector<bool> mSmemConfigured;
-  bool mPadRoutingTail{true};
 };
 
 namespace requant {

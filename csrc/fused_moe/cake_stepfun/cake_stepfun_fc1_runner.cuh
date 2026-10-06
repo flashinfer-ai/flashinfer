@@ -75,16 +75,10 @@ class Fc1Runner {
   // Generated-manifest family index of this runner (-1 when the dtype combination has no family).
   [[nodiscard]] int family() const { return mFamily; }
 
-  // Whether run() writes the benign routing tail before kernels that do not bound the tiles they
-  // acquire through cluster launch control (default on; a caller whose routing arrays already carry
-  // a benign tail, such as the Cake export parity measurement, turns it off).
-  void setRoutingTailPadding(bool enabled) { mPadRoutingTail = enabled; }
-  [[nodiscard]] bool routingTailPadding() const { return mPadRoutingTail; }
-
-  // Same argument list as PermuteGemm1::Runner::run. Kernels whose manifest entry does not bound
-  // the tiles acquired through cluster launch control by num_non_exiting_ctas are preceded by a
-  // small in-stream kernel that writes a benign routing tail (expert 0, zero valid rows, padded
-  // token slots) into the entries beyond that count, which trtllm-gen routing leaves unwritten.
+  // Same argument list as PermuteGemm1::Runner::run. Every exported kernel bounds the tiles it
+  // acquires through cluster launch control by num_non_exiting_ctas, like the native kernels, so
+  // the routing entries beyond that count (which trtllm-gen routing leaves unwritten) are never
+  // read.
   // Per family the Cake kernels consume:
   //  NVFP4            hiddenState E2m1, hiddenStateScale linear E4m3 blocks, weight / weightScale
   //                   (trtllm-shuffled E2m1 + 128x4 block scales), outputScalesScalar /
@@ -127,7 +121,6 @@ class Fc1Runner {
   std::vector<int32_t> mKernels;
   // Dynamic shared memory opt-in done once per kernel on this runner's device.
   mutable std::vector<bool> mSmemConfigured;
-  bool mPadRoutingTail{true};
 };
 
 }  // namespace cake_stepfun

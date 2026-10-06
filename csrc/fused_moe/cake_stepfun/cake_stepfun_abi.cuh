@@ -122,10 +122,6 @@ struct RoutingKernelSpec {
   // Launch `symbol` with cudaLaunchAttributeCooperative (grid-wide synchronization); the grid must
   // be co-resident, which the kCoopSms rule guarantees.
   bool cooperative;
-  // True when the kernel writes benign entries into the routing tail [num_non_exiting_ctas,
-  // max_num_ctas) (expert 0, mn_limit = tile * tile_tokens_dim, permuted slots -1), so no padding
-  // kernel is needed before GEMM units that acquire surplus tiles through cluster launch control.
-  bool writes_benign_tail;
   size_t dynamic_smem_bytes;
   ConfigureFn configure;
   RoutingSubmitFn submit;
@@ -194,8 +190,6 @@ struct Fc2KernelSpec {
   uint32_t block[3];
   uint32_t cluster[3];
   bool cluster_attribute;
-  // Same meaning as Fc1KernelSpec::bounds_acquired_tiles.
-  bool bounds_acquired_tiles;
   size_t dynamic_smem_bytes;
   EncodeTensorMapFn encode_a;
   EncodeTensorMapFn encode_b;

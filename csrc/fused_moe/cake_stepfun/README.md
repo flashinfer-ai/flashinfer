@@ -38,7 +38,6 @@ map ("missing ... launcher for tile_N").
 | file | role |
 |---|---|
 | `cake_stepfun_fc1_runner.{cuh,cu}` | `cake_stepfun::Fc1Runner`, the GEMM1 slot of `MoE::Runner` (same surface as `PermuteGemm1::Runner`) |
-| `cake_stepfun_routing_tail.cuh` | benign routing tail for GEMM units that do not bound cluster-launch-control acquired tiles |
 | `cake_stepfun_abi.cuh` | kernel ABI of the routing, FC2, requantization and finalize stages (`*Args`, `*KernelSpec`) |
 | `cake_stepfun_stages.{cuh,cu}` | full-path stage runners: `RoutingRunner`, `Fc2Runner`, `requant::run`, `finalize::run` |
 | `cake_stepfun_moe_binding.cu` | standalone TVM-FFI operations (`cake_stepfun_fc1*`, `cake_stepfun_fc2*`, `cake_stepfun_requant`, `cake_stepfun_finalize`, `cake_stepfun_stages`, `cake_stepfun_full_path`) |
@@ -50,7 +49,7 @@ Hooks outside this directory: `include/flashinfer/trtllm/fused_moe/runner.h`
 routing call sites). Buffer allocation, workspace layout and the FFI surface are
 those of the public module.
 
-## Inventory (`flashinfer.cake_stepfun.inventory.v3`)
+## Inventory (`flashinfer.cake_stepfun.inventory.v4`)
 
 Top-level keys: `schema`, `manifest` (path of the launch manifest), optional
 `stages_manifest` (path of the generated stage-table header, see below), `files`
@@ -67,8 +66,8 @@ pairs of the kernel signature), `block`, `cluster`, `dynamic_smem_bytes` and
 
 | stage | record keys | uniqueness |
 |---|---|---|
-| `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`, `bounds_acquired_tiles`; `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`) and `split_k` (1, or the cluster split-K factor) | one record per (arch, stage, family, tile), every tile of the family mapping present |
-| `routing` | `variant`, `input` (`scores` / `topk_ids`), `logits_dtype` (`float32` / `bfloat16`; `none` for `topk_ids`), `min_tokens`, `max_tokens`, `grid_rule` (`fixed` / `token_blocks` / `coop_sms`), `grid`, `tokens_per_cta`, `max_expanded_per_thread`, `cooperative`, `writes_benign_tail`, optional `pre_kernel` (`{kernel_symbol, device, grid, block, dynamic_smem_bytes}`: the leading kernel of the two-kernel large-token path; its `device` unit is listed in `files` and compiled with the record's `compile_flags`) | one record per (arch, stage, variant) |
+| `fc1`, `fc2` | `family`, `tile_n`, `output_rows_per_cta`, `block_k`; `fc2` adds `sf_layout_a` (`none`, `linear`, `r8c4`, `r128c4`) and `split_k` (1, or the cluster split-K factor) | one record per (arch, stage, family, tile), every tile of the family mapping present |
+| `routing` | `variant`, `input` (`scores` / `topk_ids`), `logits_dtype` (`float32` / `bfloat16`; `none` for `topk_ids`), `min_tokens`, `max_tokens`, `grid_rule` (`fixed` / `token_blocks` / `coop_sms`), `grid`, `tokens_per_cta`, `max_expanded_per_thread`, `cooperative`, optional `pre_kernel` (`{kernel_symbol, device, grid, block, dynamic_smem_bytes}`: the leading kernel of the two-kernel large-token path; its `device` unit is listed in `files` and compiled with the record's `compile_flags`) | one record per (arch, stage, variant) |
 | `requant` | `variant`, `sf_layout`, `rows_per_cta` | one record per (arch, stage, variant) |
 | `finalize` | `variant` (`scalar` / `vector`, unique per dtype, e.g. `scalar_bf16`), `expert_weights_dtype` (`float32` / `bfloat16`), `max_top_k` | one record per (arch, stage, variant) |
 
@@ -145,10 +144,11 @@ SMs through the trtllm-gen helper `getCoopLaunchSMCounts`: 152 -> 144 on B300,
 148 -> 140 on B200, `FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS` honoured); the
 table carries the rule, never a device-specific number. With
 `max_expanded_per_thread > 0` the host requires `T * top_k <= grid.x * block.x *
-max_expanded_per_thread` (the cooperative capacity rule). A kernel with
-`writes_benign_tail` fills `[num_non_exiting_ctas, max_num_ctas)` with expert 0
-/ `mn_limit = tile_idx * tile` / slot -1 so the GEMM stages never launch the
-routing-tail kernel; the Cake router sets it.
+max_expanded_per_thread` (the cooperative capacity rule). Like the trtllm-gen
+router, the kernels write `[0, num_non_exiting_ctas)` of the tile arrays,
+`[0, total_num_padded_tokens)` of the route map and every expanded slot, and
+nothing beyond: every GEMM unit bounds the tiles it acquires through cluster
+launch control by `num_non_exiting_ctas`, so the tile-table tail is never read.
 
 Rejected (not supported, no fallback): every other `RoutingMethodType`, the
 packed pre-computed protocol (`PackedPrecomputed`), fused shared experts,
@@ -174,9 +174,9 @@ block scales), `nvfp4_bf16tok` (E2m1 in with fp32 per-token scales, bf16 out),
 Grid `(grid_m = 2I / output_rows_per_cta, grid_n = max_ctas)`; the routing arrays
 are `route_map = permuted_idx_to_token_idx`, `tile_expert =
 cta_idx_xy_to_batch_idx`, `tile_mn_limit = cta_idx_xy_to_mn_limit`,
-`num_non_exiting_ctas`. Kernels with `bounds_acquired_tiles == false` get the
-benign routing tail written by `cake_stepfun_routing_tail_kernel` before the
-launch (unless the routing kernels of the module write it).
+`num_non_exiting_ctas`. Every kernel bounds the tiles it acquires through cluster
+launch control by `num_non_exiting_ctas` (like the native kernels); the entries
+beyond that count are never read.
 
 ### Requantization (`RequantArgs`, `RequantKernelSpec`)
 
@@ -203,7 +203,7 @@ GEMM2 over the permuted FC1 output, bf16 output in permuted order
 
 Grid `(grid_m = H / output_rows_per_cta, grid_n = max_ctas, split_k)`; routing arrays
 `tile_expert`, `tile_mn_limit`, `total_tiles = num_non_exiting_ctas`,
-`total_num_padded_tokens`; the same routing-tail rule as FC1. GEMM2 bias,
+`total_num_padded_tokens`; the same bound on acquired tiles as FC1. GEMM2 bias,
 per-channel scales, output scales and valid (unpadded) dimensions smaller than
 `H` / `I` are rejected.
 
@@ -227,10 +227,7 @@ are rejected (the error names the variant and dtype).
 the stages of the build in pipeline order and `cake_stepfun_full_path()` tells the
 variant. On the full path the module adds `cake_stepfun_routing_inputs()`,
 `cake_stepfun_finalize_weight_dtypes()`, `cake_stepfun_fc2_tiles(family)`,
-`cake_stepfun_fc2_activation_sf_layout(family, tile)`, `cake_stepfun_fc2(...)` (same
-`pad_routing_tail` flag as `cake_stepfun_fc1`; `false` is valid only because every exported
-FC2 kernel consumes `num_non_exiting_ctas` exactly like the native kernels, so a caller whose
-routing arrays already carry the benign tail launches no tail kernel), `cake_stepfun_requant(...)`,
+`cake_stepfun_fc2_activation_sf_layout(family, tile)`, `cake_stepfun_fc2(...)`, `cake_stepfun_requant(...)`,
 `cake_stepfun_finalize(...)` and
 `cake_stepfun_routing(...)` (the router on caller-owned tables, both input
 kinds); routing is also reachable through the module's `trtllm_moe_run_routing*`

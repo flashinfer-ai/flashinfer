@@ -26,7 +26,6 @@
 #include <string>
 #include <vector>
 
-#include "cake_stepfun_routing_tail.cuh"
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
 #include "flashinfer/trtllm/fused_moe/runner.h"
@@ -159,13 +158,6 @@ void configureSmem(Spec const& spec, std::vector<bool>& configured, size_t index
 // ------------------------------------------------------------------------------------------------
 // Routing
 // ------------------------------------------------------------------------------------------------
-
-bool routingWritesBenignTail() {
-  for (size_t index = 0; index < generated::kRoutingKernelCount; ++index) {
-    if (!generated::kRoutingKernels[index].writes_benign_tail) return false;
-  }
-  return generated::kRoutingKernelCount > 0;
-}
 
 void RoutingRunner::run(
     void* routingLogits, void* routingBias, int32_t numTokens, int32_t numExperts, int32_t topK,
@@ -543,14 +535,6 @@ void Fc2Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, v
   args.K_tiles = kTiles;
 
   configureSmem(spec, mSmemConfigured, static_cast<size_t>(configIndex), "FC2");
-
-  if (mPadRoutingTail && !spec.bounds_acquired_tiles && !routingWritesBenignTail()) {
-    cudaError_t const padded =
-        launchRoutingTail(ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, /*routeMap=*/nullptr,
-                          ptrNumNonExitingCtas, gridN, mTileTokensDim, enable_pdl, stream);
-    FLASHINFER_CHECK(padded == cudaSuccess, "Cake StepFun FC2 routing-tail launch failed for ",
-                     spec.symbol, " grid_n=", gridN, " : ", cudaGetErrorString(padded));
-  }
 
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(gridM), static_cast<unsigned>(gridN),

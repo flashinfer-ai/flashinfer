@@ -151,9 +151,7 @@ Array<int64_t> cake_stepfun_fc1_tiles(String const& family) {
  * scales of the ``nvfp4_bf16tok`` family) and the routing arrays produced by the module's
  * routing operation for ``tile_tokens_dim``. ``gemm1_output`` is the GEMM2 input of the family
  * ([max_padded_tokens, intermediate storage]); ``gemm1_output_scale`` receives its block scales
- * where the family has them. ``pad_routing_tail`` keeps the runner's benign routing tail for the
- * kernels that do not bound cluster-launch-control acquired tiles (false only when the caller's
- * routing arrays already carry that tail, as the Cake export parity measurement's do).
+ * where the family has them.
  */
 void cake_stepfun_fc1(
     String const& family, TensorView const& hidden_states,
@@ -165,7 +163,7 @@ void cake_stepfun_fc1(
     TensorView const& cta_idx_xy_to_batch_idx, TensorView const& cta_idx_xy_to_mn_limit,
     TensorView const& num_non_exiting_ctas, TensorView const& total_num_padded_tokens,
     TensorView const& gemm1_output, Optional<TensorView> const& gemm1_output_scale, int64_t top_k,
-    int64_t tile_tokens_dim, bool enable_pdl, bool pad_routing_tail) {
+    int64_t tile_tokens_dim, bool enable_pdl) {
   FamilySpec const& spec = familySpec(family);
   DLDevice const device = hidden_states.device();
   TVM_FFI_ICHECK(device.device_type == kDLCUDA)
@@ -253,7 +251,6 @@ void cake_stepfun_fc1(
       << "cake_stepfun_fc1: no exported Cake kernel accepts hidden_size " << hidden_size
       << " and intermediate_size " << intermediate_size << ".";
 
-  runner.setRoutingTailPadding(pad_routing_tail);
   cudaStream_t const stream = get_stream(device);
   runner.run(hidden_states.data_ptr(), optionalPtr(hidden_states_scale), gemm1_weights.data_ptr(),
              optionalPtr(gemm1_weights_scale), /*perTokenScales=*/token_scales,
@@ -359,20 +356,19 @@ String cake_stepfun_fc2_activation_sf_layout(String const& family, int64_t tile_
  * block scales, ``gemm2_weights`` the trtllm-prepared weights with optional block scales,
  * ``output2_scale_scalar`` the optional per-expert FP32 output scales and ``per_token_scale``
  * the fp32 per-token scales of the ``nvfp4_bf16tok`` family. ``gemm2_output`` receives bf16
- * rows in permuted order ([max_padded_tokens, hidden_size]). ``pad_routing_tail`` has the meaning
- * of cake_stepfun_fc1's flag; ``false`` is valid because every exported FC2 kernel consumes
- * ``num_non_exiting_ctas`` exactly like the native kernels (surplus CTAs exit), so routing arrays
- * that already carry the benign tail need no tail kernel.
+ * rows in permuted order ([max_padded_tokens, hidden_size]).
  */
-void cake_stepfun_fc2(
-    String const& family, TensorView const& gemm2_input,
-    Optional<TensorView> const& gemm2_input_scale, TensorView const& gemm2_weights,
-    Optional<TensorView> const& gemm2_weights_scale,
-    Optional<TensorView> const& output2_scale_scalar, Optional<TensorView> const& per_token_scale,
-    TensorView const& cta_idx_xy_to_batch_idx, TensorView const& cta_idx_xy_to_mn_limit,
-    TensorView const& num_non_exiting_ctas, TensorView const& total_num_padded_tokens,
-    TensorView const& gemm2_output, int64_t num_tokens, int64_t top_k, int64_t tile_tokens_dim,
-    bool enable_pdl, bool pad_routing_tail) {
+void cake_stepfun_fc2(String const& family, TensorView const& gemm2_input,
+                      Optional<TensorView> const& gemm2_input_scale,
+                      TensorView const& gemm2_weights,
+                      Optional<TensorView> const& gemm2_weights_scale,
+                      Optional<TensorView> const& output2_scale_scalar,
+                      Optional<TensorView> const& per_token_scale,
+                      TensorView const& cta_idx_xy_to_batch_idx,
+                      TensorView const& cta_idx_xy_to_mn_limit,
+                      TensorView const& num_non_exiting_ctas,
+                      TensorView const& total_num_padded_tokens, TensorView const& gemm2_output,
+                      int64_t num_tokens, int64_t top_k, int64_t tile_tokens_dim, bool enable_pdl) {
   FamilySpec const& spec = familySpec(family);
   DLDevice const device = gemm2_input.device();
   TVM_FFI_ICHECK(device.device_type == kDLCUDA)
@@ -435,7 +431,6 @@ void cake_stepfun_fc2(
   TVM_FFI_ICHECK(runner.hasKernels())
       << "cake_stepfun_fc2: no exported Cake " << spec.name << " FC2 kernel serves tile_tokens_dim "
       << tile_tokens_dim << ".";
-  runner.setRoutingTailPadding(pad_routing_tail);
   int32_t const config_index = runner.getDefaultValidConfigIndex(
       static_cast<int32_t>(top_k), static_cast<int32_t>(hidden_size),
       static_cast<int32_t>(intermediate_size), static_cast<int32_t>(num_experts),
