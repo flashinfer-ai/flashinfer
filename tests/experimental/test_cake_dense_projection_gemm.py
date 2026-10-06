@@ -543,9 +543,17 @@ def _expected(table, key, T, sm_count):
 ARCH_OF_SM = {148: "sm_100a", 212: "sm_107a"}
 
 
+_TRANSPOSED_STEM = re.compile(
+    r"_t(?:_tma[12])?(?:_s\d+)?(?:_box\d+)?(?:_skx)?(?:_b(?:f|g\d+))?(?:_so[flnd])?(?:_pd\d+)?(?:_sh\d+)?$"
+)
+
+
 def _transposed_template(template: str) -> bool:
-    """``_t`` (transposed register epilogue) or ``_t_tma1`` / ``_t_tma2`` (round-14 transposed TMA-store epilogue)."""
-    return template.endswith("_t") or template.endswith(("_t_tma1", "_t_tma2"))
+    """``_t`` (transposed register epilogue) or ``_t_tma1`` / ``_t_tma2`` (round-14 transposed TMA-store epilogue),
+    followed by the knob suffixes ``instance_symbol`` emits after the epilogue term (``_s<stages>``, ``_box<rows>``,
+    ``_skx``, ``_bf`` / ``_bg<n>``, ``_so<x>``, ``_pd<n>``, ``_sh<n>``) - e.g. the round-16 six-stage swapped MLA
+    weight-gradient templates ``..._hee_t_tma1_s6``."""
+    return _TRANSPOSED_STEM.search(template) is not None
 
 
 def _rule_of(plan, sm_count):
