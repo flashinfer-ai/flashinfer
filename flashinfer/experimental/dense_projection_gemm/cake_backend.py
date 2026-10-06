@@ -554,7 +554,11 @@ def instance_key(
             f"htail (half-height tail wave) needs cta_rows=256 or 128 and no pf / box_rows / a_mcast (got cta_rows={cta_rows}, "
             f"pf={pf}, box_rows={box_rows})"
         )
-    if htail and cta_rows == 128 and (block_n != 256 or out_t or int(pd) or "no_tmem" in diag):
+    if (
+        htail
+        and cta_rows == 128
+        and (block_n != 256 or out_t or int(pd) or "no_tmem" in diag)
+    ):
         # round 16 (Cake W2): the half-height tail wave on the standard family (M=128 cta_group::2 half items, TMEM Layout B)
         # needs the 256-column row-major tile with the plain drain  [Cake instance_key]
         raise ValueError(
@@ -1381,7 +1385,12 @@ def plan_dense_projection_gemm(
         # pipelined drain / prefetch; the planner never emits box_rows or diag probes, so the launcher's remaining conditions
         # hold by construction  [Cake launcher]
         pf_eff = pf if pf is not None else rule.get("pf", default_pf(M, N, K))
-        htail = int(block_n) == 256 and not transposed_out and int(pd) == 0 and not int(pf_eff)
+        htail = (
+            int(block_n) == 256
+            and not transposed_out
+            and int(pd) == 0
+            and not int(pf_eff)
+        )
     if htail:
         tail_h = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
         htail = bool(tail_h) and 2 * tail_h <= pairs
