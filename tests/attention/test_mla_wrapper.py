@@ -13,11 +13,13 @@ import weakref
 import pytest
 import torch
 
+import flashinfer
 from flashinfer.mla._batch_mla import _wrapper
 from flashinfer.mla._batch_mla._backends._capabilities import (
     MLAPlanCapabilities,
     _BackendPlanUnsupportedError,
 )
+from flashinfer.utils import is_sm90a_supported
 
 
 COMMON_PLAN_KWARGS = dict(
@@ -3668,3 +3670,166 @@ def test_wrapper_warns_once_after_successful_backend_plan(
                     {"automatic": backend == "auto"},
                 ),
             ]
+
+
+@pytest.mark.parametrize("head_dim_ckv", [128, 256], ids=["ckv128", "ckv256"])
+@pytest.mark.parametrize(
+    "dtype,head_dim_kpe,causal,max_kv_len",
+    [(torch.bfloat16, 64, False, 257), (torch.float16, 0, True, 129)],
+    ids=["bf16-multi-tile", "fp16-causal-no-pe"],
+)
+def test_mla_fa3_ckv_width(head_dim_ckv, dtype, head_dim_kpe, causal, max_kv_len):
+    # PV must advance its value descriptor by the actual row width. A fixed
+    # CKV512 stride silently corrupts CKV256 and reads out of bounds for CKV128.
+    device = torch.device("cuda:0")
+    if not is_sm90a_supported(device):
+        pytest.skip("fa3 backend requires SM90a")
+    torch.manual_seed(917)
+    num_heads, page_size = 16, 16
+    kv_lengths = [max_kv_len - 12, max_kv_len]
+    page_counts = [(n + page_size - 1) // page_size for n in kv_lengths]
+    query = (
+        torch.randn(
+            4, num_heads, head_dim_ckv + head_dim_kpe, device=device, dtype=dtype
+        )
+        * 0.5
+    )
+    kv = (
+        torch.randn(
+            sum(page_counts),
+            page_size,
+            head_dim_ckv + head_dim_kpe,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.5
+    )
+    indices = torch.arange(sum(page_counts), device=device, dtype=torch.int32).flip(0)
+    kv_offsets = [0, page_counts[0], sum(page_counts)]
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(128 * 1024**2, device=device, dtype=torch.uint8), backend="fa3"
+    )
+    wrapper.plan(
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            torch.tensor([0, 1, 4], device=device, dtype=torch.int32),
+            torch.tensor(kv_offsets, device=device, dtype=torch.int32),
+            indices,
+            torch.tensor(kv_lengths, device=device, dtype=torch.int32),
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=0.125,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        lse_mode="basee",
+        enable_pdl=False,
+    )
+    out, lse = wrapper.run(
+        query=query, kv_cache=kv, return_lse=True, return_lse_base_on_e=True
+    )
+    torch.cuda.synchronize()
+    for batch, (start, end) in enumerate(((0, 1), (1, 4))):
+        pages = indices[kv_offsets[batch] : kv_offsets[batch + 1]].long()
+        keys = (
+            kv[pages]
+            .reshape(-1, head_dim_ckv + head_dim_kpe)[: kv_lengths[batch]]
+            .float()
+        )
+        scores = torch.einsum("qhd,kd->qhk", query[start:end].float(), keys) * 0.125
+        if causal:
+            positions = (
+                torch.arange(end - start, device=device) + len(keys) - (end - start)
+            )
+            mask = torch.arange(len(keys), device=device)[None, :] > positions[:, None]
+            scores.masked_fill_(mask[:, None, :], -float("inf"))
+        expected = scores.softmax(-1) @ keys[:, :head_dim_ckv]
+        torch.testing.assert_close(
+            out[start:end].float(), expected, rtol=1e-2, atol=1e-2
+        )
+        torch.testing.assert_close(
+            lse[start:end], scores.logsumexp(-1), rtol=1e-2, atol=1e-2
+        )
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_mla_page_index_uint32_overflow_regression(backend):
+    # Regression for the int64 widening in mla.cuh / mla_hopper.cuh
+    # (`indices[q] * ckv_stride_page`). For a contiguous
+    # [num_pages, page_size, head_dim_ckv] cache with page_size=32 and
+    # head_dim_ckv=512, ckv_stride_page = 16384 elements. Any page index
+    # >= 2^32 / 16384 = 262144 makes the multiplication overflow uint32 and
+    # — pre-fix — silently wraps to the wrong page (no crash, wrong output).
+    device = torch.device("cuda:0")
+    if backend == "fa3" and not is_sm90a_supported(device):
+        pytest.skip("fa3 backend requires SM90a")
+
+    page_size, head_dim_ckv, head_dim_kpe, num_heads = 32, 512, 64, 128
+    # 262144 * (32 * 512) = 2^32 exactly — the smallest index that overflows.
+    OVERFLOW_START = 262144
+    NUM_PAGES = 26  # matches the 26-page decode scenario from the original repro
+    total_num_pages = OVERFLOW_START + NUM_PAGES  # 262170
+    kv_len = NUM_PAGES * page_size
+
+    # Big cache alone is ~9.66 GiB (bf16/fp16). Skip on small-memory runners.
+    if torch.cuda.mem_get_info(device)[0] < 12 * (1 << 30):
+        pytest.skip("needs ≥12 GiB free VRAM to force the 32-bit overflow")
+
+    torch.manual_seed(0)
+    torch.set_grad_enabled(False)
+    dtype = torch.float16
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)
+
+    real_ckv = torch.randn(
+        NUM_PAGES, page_size, head_dim_ckv, device=device, dtype=dtype
+    )
+    real_kpe = torch.randn(
+        NUM_PAGES, page_size, head_dim_kpe, device=device, dtype=dtype
+    )
+    q_nope = torch.randn(1, num_heads, head_dim_ckv, device=device, dtype=dtype)
+    q_pe = torch.randn(1, num_heads, head_dim_kpe, device=device, dtype=dtype)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    def _run(ckv_cache, kpe_cache, page_indices):
+        w = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
+        w.plan(
+            torch.tensor([0, 1], dtype=torch.int32, device=device),  # qo_indptr
+            torch.tensor([0, len(page_indices)], dtype=torch.int32, device=device),
+            page_indices,
+            torch.tensor([kv_len], dtype=torch.int32, device=device),
+            num_heads,
+            head_dim_ckv,
+            head_dim_kpe,
+            page_size,
+            False,
+            sm_scale,
+            dtype,
+            dtype,
+        )
+        return w.run(q_nope, q_pe, ckv_cache, kpe_cache)
+
+    # Overflow path: big contiguous cache; real data lives at [OVERFLOW_START, end).
+    # stride(0) = page_size * head_dim_ckv = 16384 matches the reference below,
+    # so only the page-index arithmetic differs between the two runs.
+    ckv_big = torch.zeros(
+        total_num_pages, page_size, head_dim_ckv, device=device, dtype=dtype
+    )
+    kpe_big = torch.zeros(
+        total_num_pages, page_size, head_dim_kpe, device=device, dtype=dtype
+    )
+    ckv_big[OVERFLOW_START:] = real_ckv
+    kpe_big[OVERFLOW_START:] = real_kpe
+    big_indices = torch.arange(
+        OVERFLOW_START, total_num_pages, dtype=torch.int32, device=device
+    )
+    out = _run(ckv_big, kpe_big, big_indices)
+    del ckv_big, kpe_big
+    torch.cuda.empty_cache()
+
+    # Reference: same data, same stride(0), but page indices < overflow threshold.
+    ref_indices = torch.arange(NUM_PAGES, dtype=torch.int32, device=device)
+    ref = _run(real_ckv, real_kpe, ref_indices)
+
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)

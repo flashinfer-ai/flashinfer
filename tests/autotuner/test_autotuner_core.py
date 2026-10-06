@@ -19,8 +19,13 @@ from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
 )
+from flashinfer.mla._batch_mla._backends.cute_dsl_modular_backend import (
+    _BatchMLAPagedAttentionCuteDslModularBackend,
+)
+from flashinfer.mla._batch_mla._backends.cute_dsl_monolithic_backend import (
+    _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+)
 from flashinfer.mla._core import (
-    CuteDslMlaDecodeRunner,
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
@@ -705,8 +710,8 @@ def test_rank_tactics_records_winner_policy(monkeypatch):
     monkeypatch.setattr(
         AutoTuner,
         "_profile_single_kernel",
-        lambda self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw: (
-            float(tactic)
+        lambda self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw: float(
+            tactic
         ),
     )
     with autotune(tune_mode=True):
@@ -1200,7 +1205,9 @@ def test_tuning_config_profiling_repeat_override(monkeypatch):
 
     assert tuner._get_profiling_repeat(default_config) == 10
     assert tuner._get_profiling_repeat(override_config) == 3
-    assert len(tuner._prepare_input_tensors_with_batches(inputs, override_config)) == 4
+    batches = tuner._prepare_input_tensors_with_batches(inputs, override_config)
+    assert len(batches) == 1
+    assert batches[0] is inputs
 
     default_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), default_config)
     override_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), override_config)
@@ -1403,6 +1410,75 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
 
     assert latency >= 0
     assert allocations == [(8192, inputs[0].device)]
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_cold_l2_batches_preserve_strides_alignment_and_aliases(
+    monkeypatch, use_cuda_graph
+):
+    tuner = reset_autotuner()
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4096
+    )
+    storage = torch.arange(4 * 40, dtype=torch.float32).reshape(4, 40)
+    packed = storage[:, 1:33]
+    left, right = packed.split(16, dim=-1)
+    inputs = [packed, left, right, (left, right), None]
+
+    batches = tuner._prepare_input_tensors_with_batches(
+        inputs,
+        TuningConfig(use_cold_l2_cache=True, use_cuda_graph=use_cuda_graph),
+    )
+
+    for batch in batches:
+        for actual, expected in zip(batch[:3], inputs[:3], strict=True):
+            assert actual.stride() == expected.stride()
+            assert actual.data_ptr() % 16 == expected.data_ptr() % 16
+            torch.testing.assert_close(actual, expected)
+        assert batch[1].data_ptr() == batch[0].data_ptr()
+        assert batch[2].data_ptr() == batch[0].data_ptr() + 16 * packed.element_size()
+        assert batch[3][0] is batch[1]
+        assert batch[3][1] is batch[2]
+        assert batch[4] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_cold_l2_choose_one_profiles_original_layout(monkeypatch, use_cuda_graph):
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "repeat", 2)
+    monkeypatch.setattr(tuner, "warmup", 1)
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4096
+    )
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
+    )
+    storage = torch.arange(4 * 40, dtype=torch.float32, device="cuda").reshape(4, 40)
+    packed = storage[:, 1:33]
+    out = torch.empty_strided(packed.shape, packed.stride(), device="cuda")
+    observed = []
+
+    class LayoutRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            observed.append((inputs[0].stride(), inputs[0].data_ptr() % 16))
+            torch.add(inputs[0], 1, out=inputs[1])
+            return inputs[1]
+
+    runner = LayoutRunner(valid_tactics=(0,))
+    config = TuningConfig(use_cold_l2_cache=True, use_cuda_graph=use_cuda_graph)
+    with autotune(tune_mode=True):
+        selected, tactic = tuner.choose_one(
+            "cold_l2_layout", [runner], config, [packed, out]
+        )
+
+    assert selected is runner
+    assert tactic == 0
+    assert observed
+    assert set(observed) == {(packed.stride(), packed.data_ptr() % 16)}
+    torch.testing.assert_close(out, packed + 1)
 
 
 def test_autotune_context_rejects_invalid_cuda_graph_profile_replays():
@@ -1870,7 +1946,7 @@ def test_prepare_input_tensors_none_input_preserved():
 def test_prepare_input_tensors_with_batches_preserves_non_tensor(
     monkeypatch, non_tensor
 ):
-    """Cold-L2 batches clone tensors while preserving scalar and optional inputs."""
+    """Explicit cache flushing preserves tensor, scalar, and optional inputs."""
     tuner = reset_autotuner()
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4)
     inputs = [torch.ones(1), non_tensor]
@@ -1880,11 +1956,9 @@ def test_prepare_input_tensors_with_batches_preserves_non_tensor(
     )
 
     assert batches[0] is inputs
-    assert len(batches) > 1
-    for batch in batches[1:]:
-        assert batch[0] is not inputs[0]
-        torch.testing.assert_close(batch[0], inputs[0])
-        assert batch[1] is non_tensor
+    assert len(batches) == 1
+    assert batches[0][0] is inputs[0]
+    assert batches[0][1] is non_tensor
 
 
 def test_choose_one_with_none_input_no_crash():
@@ -2610,10 +2684,11 @@ def test_find_nearest_profile_cache_dedups_mla_decode_config():
         _mla_decode_tuning_config.cache_clear()
 
 
-def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
-    runner = object.__new__(CuteDslMlaDecodeRunner)
+def _cute_dsl_runner_cache_extras(backend_type, max_seq_len: int, workspace_bytes: int):
+    runner = object.__new__(backend_type)
+    runner._is_planned = False
     runner.kv_cache = torch.empty((1, 32, 576), dtype=torch.bfloat16)
-    runner.workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8)
+    runner._float_workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8)
     runner.qk_nope_head_dim = 512
     runner.kv_lora_rank = 512
     runner.qk_rope_head_dim = 64
@@ -2624,18 +2699,28 @@ def _cute_dsl_runner_cache_extras(max_seq_len: int, workspace_bytes: int):
     runner.enable_pdl = False
     runner.sinks = None
     runner.cute_dsl_impl = "auto"
-    runner._resolved_cute_dsl_impl = "monolithic"
+    runner.enable_dcp = False
+    runner.cp_world = 1
 
     query = torch.empty((1, 1, 128, 576), dtype=torch.bfloat16)
     out = torch.empty((1, 1, 128, 512), dtype=torch.bfloat16)
     return runner.get_cache_key_extras([query, None, None, out])
 
 
-def test_cute_dsl_runner_cache_tracks_split_workspace_geometry():
+@pytest.mark.parametrize(
+    "backend_type,other_seq_len",
+    [
+        (_BatchMLAPagedAttentionCuteDslMonolithicBackend, 385),
+        (_BatchMLAPagedAttentionCuteDslModularBackend, 513),
+    ],
+)
+def test_cute_dsl_runner_cache_tracks_split_workspace_geometry(
+    backend_type, other_seq_len
+):
     """Cache hits must not bypass sequence- or capacity-dependent validity."""
-    key_257 = _cute_dsl_runner_cache_extras(257, 1_000_000)
-    key_385 = _cute_dsl_runner_cache_extras(385, 1_000_000)
-    assert key_257 != key_385
+    key_257 = _cute_dsl_runner_cache_extras(backend_type, 257, 1_000_000)
+    key_other = _cute_dsl_runner_cache_extras(backend_type, other_seq_len, 1_000_000)
+    assert key_257 != key_other
 
-    key_small_workspace = _cute_dsl_runner_cache_extras(257, 800_000)
+    key_small_workspace = _cute_dsl_runner_cache_extras(backend_type, 257, 800_000)
     assert key_257 != key_small_workspace
