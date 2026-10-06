@@ -171,7 +171,7 @@ PROFILES: dict[str, Profile] = {
         source="cake_vsa_blk64_balanced.cu",
         kernel="kernel_flashinfer_vsa_blk64_balanced_m64n256_ws_sm100",
         threads=384,
-        smem_bytes=232448,
+        smem_bytes=232320,
         defines=("CAKE_VSA_ABI=4",),
     ),
     "fp16_direct": Profile(
