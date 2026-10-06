@@ -41,7 +41,7 @@ from .mla import (
 from .xqa import xqa, xqa_mla as xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .cudnn.decode import CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE
-from .cudnn_frost import frost_decode_engines_available
+from .cudnn.utils import cudnn_frontend_serves_frost_decode
 from .cudnn.decode import CudnnDecodeGraph, prepare_cudnn_batch_decode
 from .jit import (
     gen_batch_decode_module,
@@ -638,18 +638,30 @@ def get_trtllm_gen_fmha_module():
 
 # Granularity (in tokens) at which the cudnn decode backend rounds up
 # max_seq_len_kv / block-table width, so one built cuDNN graph serves many steps.
-_CUDNN_DECODE_MAX_KV_BUCKET = 1024
+# 2048 is also where cudnn-frontend 1.30's placement starts ranking its FROST decode
+# tile ahead of the backend's prefill-class engine for multi-token rows (that engine
+# is ~8x slower than fa2 there); declaring at least that keeps short caches fast.
+_CUDNN_DECODE_MAX_KV_BUCKET = 2048
 
 # backend="auto" on the decode wrapper: "0" never resolves to cudnn, "1" applies
-# the cudnn rule even without the FROST engines (benchmarking / bisection),
-# unset applies the rule below when the FROST engines serve this process.
+# the cudnn rule on an older cudnn-frontend too (benchmarking / bisection),
+# unset applies the rule below on cudnn-frontend 1.30+.
 _DECODE_AUTO_CUDNN_ENV = "FLASHINFER_DECODE_AUTO_CUDNN"
+
+
+# The auto rule's envelope (B200 matrix in _auto_decode_prefers_cudnn): the FROST
+# decode tile packs q_len_per_req * group query rows into one 128-row CTA per
+# (batch, KV head) unit, and wins once it has at least 32 of them and at least
+# 64 CTAs.
+_AUTO_CUDNN_MIN_ROWS = 32
+_AUTO_CUDNN_MAX_ROWS = 128
+_AUTO_CUDNN_MIN_UNITS = 64
 
 
 def _auto_decode_prefers_cudnn(
     *,
     compute_capability: Tuple[int, int],
-    frost_available: bool,
+    frontend_serves_frost_decode: bool,
     cudnn_available: bool,
     q_data_type: torch.dtype,
     kv_data_type: torch.dtype,
@@ -663,38 +675,47 @@ def _auto_decode_prefers_cudnn(
     window_left: int,
     logits_soft_cap: float,
     q_len_per_req: int,
-    sm_count: int,
+    fa2_available: bool = True,
     override: Optional[str] = None,
 ) -> bool:
     """Whether ``backend="auto"`` should run this decode plan on cuDNN.
 
-    The rule is the envelope where cuDNN's FROST d128 decode tile (cudnn-
-    frontend 1.30) measured at or ahead of fa2's tensor-core decode on B200
-    (KV 4096, page 16, bf16, CUDA-graph replay, ``benchmarks/
-    flashinfer_benchmark.py`` and the wrapper under ``bench_gpu_time``). The
-    tile launches one CTA per (batch, KV head) unit and wins while those
-    units fill about one wave of SMs: 64/4 at b=32 (128 units) 65 vs 68 us
-    at one row, 67 vs 131 us at two rows and 67 vs 143 us at four (fa2 runs
-    its prefill kernel for multi-token rows); at b=8 it ties (33 vs 32 us).
-    Past a wave the fa2 kernel pulls ahead: 64/4 at b=128 (512 units) 472
-    vs 334 us, 64/8 at b=32 (256 units) 194 vs 160 us and at b=128 931 vs
-    669 us. Hence ``batch_size * num_kv_heads <= sm_count``. The d256
-    (swap-AB) decode tile is left to fa2 for now: at 32/2 it ties at b=8
-    (38 vs 35 us) but loses at b=32 (89 vs 70 us) and only leads at b=128
-    (256 vs 338 us), so it needs its own rule once it leads across the
-    batch range. Also outside the envelope: a GQA group that does not
-    divide the 128-row tile (GLM-4.5's 96/8 packs 4 of 12 heads per row
-    group: 424 vs 212 us), d64 (rides the d128 tile at half occupancy),
-    b < 8 (launch-bound: 31 vs 24 us at b=4), a sliding window (the tile's
-    window path is unmeasured), RoPE / soft-cap (the cudnn path does not
-    apply them), and multi-token rows past the tile's row budget
-    (``S_q * G <= 128``), where cuDNN serves the graph with its prefill tile.
+    cuDNN takes multi-token decode rows (speculative / MTP verification,
+    ``2 <= q_len_per_req <= 4``) of fp16 / bf16 head_dim-128 GQA models on
+    SM100 / SM103 when cudnn-frontend's default SM100 engine serves them with
+    its FROST decode tile and that tile has enough work: one 128-row CTA per
+    (batch, KV head) unit packing the group's rows, so the envelope is
+    ``q_len_per_req * group`` in [32, 128] rows per CTA and ``batch_size *
+    num_kv_heads >= 64`` CTAs. Measured on B200 (cudnn-frontend 1.30.0 default
+    placement, cuDNN 9.26, bf16, page 16, CUDA-graph replay, kernel time
+    through the wrapper, cuDNN vs fa2's tensor-core decode, 1k / 4k / 16k
+    caches): 64/4 two rows at b=32, 24 vs 50, 65 vs 139 and 480 vs 533 us;
+    four rows, 24 vs 65, 65 vs 184 and 220 vs 529 us; 64/8 four rows at b=8,
+    26 vs 29, 47 vs 69 and 217 vs 251 us; 64/4 two rows at b=128, 82 vs 126,
+    482 vs 530 and 1878 vs 2046 us. Below the envelope the tile loses: 16 rows
+    per CTA (64/8 at two rows) 1.0-1.7x at every batch from 8 and every cache,
+    32 CTAs (64/4 at b=8) 1.2x at a 1k cache and a win only from 4k, b=1 about
+    2x. Also outside: single-token decode (the frontend ranks its backend
+    decode engine ahead of the tile there, and that engine's standing against
+    fa2 is mixed: 64/4 at b=32 0.7-1.1x, at b=128 0.9-1.8x), a GQA group that
+    does not divide 128 (96/8 packs 4 of 12 heads per row group: 1.1-1.9x),
+    d64 / d256 (32/2 is 0.65-1.1x at b=32 and 1.2-3x below), a sliding window
+    (the tile's window path is unmeasured), RoPE / soft-cap (the cudnn path
+    does not apply them), and more than 128 rows per CTA, where cuDNN serves
+    the graph with its prefill tile.
 
-    The FROST engines are required unless forced: the classic backend engine
-    is 20x slower on multi-token rows and rejects an attention sink at
-    ``q_len_per_req == 1``, and sinks are only known at ``run()``, so auto
-    must never route a sink-carrying model there. ``FLASHINFER_DECODE_AUTO_CUDNN``
-    overrides: ``0`` never, ``1`` also without the FROST engines.
+    ``fa2_available=False`` says the plan has no fa2 kernel at all (multi-token
+    rows without tensor cores: the CUDA-core decode kernel is single-token);
+    cudnn then takes every plan its decode path can run (fp16 / bf16 d128 /
+    d256, no RoPE / soft-cap), whatever the envelope says, where the wrapper
+    used to raise.
+
+    cudnn-frontend 1.30+ is required unless forced: an older frontend serves
+    the graph with the backend engine, which is ~8x slower than fa2 on
+    multi-token rows and rejects a sink at ``q_len_per_req == 1`` (1.30+ falls
+    through to the FROST row for that). ``FLASHINFER_DECODE_AUTO_CUDNN``
+    overrides: ``0`` never, ``1`` also on an older frontend (benchmarking /
+    bisection).
     """
     if override is None:
         override = os.environ.get(_DECODE_AUTO_CUDNN_ENV, "")
@@ -702,7 +723,7 @@ def _auto_decode_prefers_cudnn(
     if override in ("0", "false", "no", "off"):
         return False
     forced = override in ("1", "true", "yes", "on")
-    if not cudnn_available or not (frost_available or forced):
+    if not cudnn_available or not (frontend_serves_frost_decode or forced):
         return False
     if tuple(compute_capability) not in ((10, 0), (10, 3)):
         return False
@@ -710,31 +731,37 @@ def _auto_decode_prefers_cudnn(
         q_data_type == kv_data_type == o_data_type
     ):
         return False
-    if head_dim != 128:
-        return False
     if num_kv_heads <= 0 or num_qo_heads % num_kv_heads != 0:
+        return False
+    if pos_encoding_mode != "NONE" or (logits_soft_cap or 0.0) > 0:
+        return False
+    if not fa2_available:
+        # Nothing else can run these rows: take cudnn wherever its decode
+        # path serves the plan (window included), envelope or not.
+        return q_len_per_req >= 2 and head_dim in (128, 256)
+    if head_dim != 128:
         return False
     group = num_qo_heads // num_kv_heads
     if group > 128 or 128 % group != 0:
-        return False
-    if batch_size < 8:
-        return False
-    # One CTA per (batch, KV head) unit: the decode tile wins while the units
-    # fill about one wave of SMs.
-    if sm_count <= 0 or batch_size * num_kv_heads > sm_count:
         return False
     if page_size <= 0 or page_size % 8 != 0:
         return False
     if not (128 % page_size == 0 or page_size % 128 == 0):
         return False
-    if pos_encoding_mode != "NONE" or (logits_soft_cap or 0.0) > 0 or window_left >= 0:
+    if window_left >= 0:
         return False
-    if not 1 <= q_len_per_req <= 4:
+    # Multi-token rows only: single-token decode is served by cuDNN's backend
+    # decode engine (the frontend ranks it ahead of the FROST tile), whose
+    # standing against fa2 is mixed; see the docstring.
+    if not 2 <= q_len_per_req <= 4:
         return False
-    # The FROST decode tile has to be the kernel that serves the graph: it
-    # packs S_q * G <= 128 rows; beyond that cuDNN falls back to its prefill
-    # tile and loses to fa2.
-    return q_len_per_req * group <= 128
+    # The FROST decode tile has to be the kernel that serves the graph (it
+    # packs at most 128 rows; past that cuDNN runs its prefill tile and loses)
+    # and has to have enough rows per CTA and enough CTAs to beat fa2.
+    rows = q_len_per_req * group
+    if not _AUTO_CUDNN_MIN_ROWS <= rows <= _AUTO_CUDNN_MAX_ROWS:
+        return False
+    return batch_size * num_kv_heads >= _AUTO_CUDNN_MIN_UNITS
 
 
 _TRTLLM_GEN_BF16Q_FP8KV_TRANSFORM_MODES = {
@@ -1184,20 +1211,22 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``trtllm-gen``/
             ``cute-dsl``/``cudnn``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
-            device architecture and kernel availability. On SM100-class GPUs with cuDNN's
-            FROST engines switched on (``FLASHINFER_CUDNN_FROST_ENGINES=1`` before importing
-            flashinfer, cudnn-frontend 1.30+), ``auto`` resolves to ``cudnn`` for the decode
-            shapes where cuDNN's d128 decode tile measures at or ahead of fa2 (fp16/bf16,
-            head_dim 128, a GQA group dividing 128, batch >= 8 with ``batch * num_kv_heads``
-            within one wave of SMs, no RoPE / soft-cap / window, ``q_len_per_req <= 4`` with
-            ``q_len_per_req * group <= 128``; see ``_auto_decode_prefers_cudnn``);
-            ``resolved_backend``
-            reports the choice after :meth:`plan`. ``FLASHINFER_DECODE_AUTO_CUDNN=0`` keeps
-            fa2, ``=1`` applies the rule without the FROST engines. Under CUDA graphs
-            (``use_cuda_graph=True``) ``auto`` takes ``cudnn`` only when :meth:`plan`
-            receives a caller-owned ``block_tables`` (the auto-built table is captured
-            at its first width and cannot grow) or when fa2 cannot serve the rows
-            (``q_len_per_req > 1`` without tensor cores); the resolution then becomes
+            device architecture and kernel availability. On SM100 / SM103 with
+            cudnn-frontend 1.30+ installed, ``auto`` resolves to ``cudnn`` for multi-token
+            decode rows (``2 <= q_len_per_req <= 4``, speculative / MTP verification) of
+            fp16 / bf16 head_dim-128 GQA models whose group divides 128, without RoPE /
+            soft-cap / window, when cuDNN's default SM100 engine serves them with its FROST
+            decode tile and that tile has enough work: ``q_len_per_req * group`` in
+            [32, 128] rows per CTA and ``batch_size * num_kv_heads >= 64`` CTAs, where it
+            measures at 0.35-0.95x fa2 (see ``_auto_decode_prefers_cudnn``); single-token
+            decode stays on fa2. Multi-token rows without tensor cores have no fa2 kernel,
+            so there ``auto`` takes ``cudnn`` for every plan its decode path can run (such a
+            plan used to raise). ``resolved_backend`` reports the choice after :meth:`plan`.
+            ``FLASHINFER_DECODE_AUTO_CUDNN=0`` keeps fa2, ``=1`` applies the rule on an older
+            frontend too. Under CUDA graphs (``use_cuda_graph=True``) ``auto`` takes ``cudnn``
+            only when :meth:`plan` receives a caller-owned ``block_tables`` (the auto-built
+            table is captured at its first width and cannot grow) or when fa2 cannot serve
+            the rows (``q_len_per_req > 1`` without tensor cores); the resolution then becomes
             part of the frozen graph shape and a later :meth:`plan` may not change it.
             The ``cute-dsl`` backend uses the CuTe DSL GQA decode kernel for Blackwell
             (SM100+) and only supports a subset of features (equal head_dim_qk/vo,
@@ -1379,7 +1408,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         cc = get_compute_capability(self.device)
         return _auto_decode_prefers_cudnn(
             compute_capability=cc,
-            frost_available=frost_decode_engines_available(cc),
+            frontend_serves_frost_decode=cudnn_frontend_serves_frost_decode(cc),
             cudnn_available=_CUDNN_GRAPH_AVAILABLE,
             q_data_type=q_data_type,
             kv_data_type=kv_data_type,
@@ -1393,9 +1422,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             window_left=window_left,
             logits_soft_cap=logits_soft_cap,
             q_len_per_req=q_len_per_req,
-            sm_count=torch.cuda.get_device_properties(
-                self.device
-            ).multi_processor_count,
+            # The CUDA-core decode kernel is single-token: multi-token rows
+            # without tensor cores have no fa2 kernel to compare against.
+            fa2_available=self.use_tensor_cores or q_len_per_req <= 1,
         )
 
     @property

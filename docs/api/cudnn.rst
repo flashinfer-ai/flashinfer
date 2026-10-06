@@ -11,20 +11,22 @@ backend covers fp16/bf16 GQA with ``return_lse``, CUDA graphs, multi-token
 decode (``q_len_per_req > 1``, bottom-right causal), a left sliding window
 (``window_left``) and attention ``sinks``; it does not support RoPE, soft-cap
 or fp8/NVFP4 KV. A sink at ``q_len_per_req == 1`` is served when the cuDNN
-stack's SDPA engines accept it (cudnn-frontend 1.30+ with the FROST engines
-enabled); the backend engine raises a not-supported error at the first run.
+stack's SDPA engines accept it (cudnn-frontend 1.30+, whose default SM100 engine
+takes the graph the backend engine declines); older frontends raise a
+not-supported error at the first run.
 
-cuDNN's FROST (CuTe-DSL) SDPA engines are opt-in in cudnn-frontend and are what
-make cuDNN decode fast on Blackwell (the d128 / d256 decode tiles, multi-token
-rows, sinks at ``q_len_per_req == 1``). Set ``FLASHINFER_CUDNN_FROST_ENGINES=1``
-before importing flashinfer to switch them on for the process (FlashInfer forwards
-it to the frontend's ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` before its first
-``import cudnn``; cudnn-frontend 1.30.0+). With the engines on, the decode
-wrapper's ``backend="auto"`` resolves to ``cudnn`` on SM100 for the d128 decode
-shapes where the decode tile measures at or ahead of fa2; ``FLASHINFER_DECODE_AUTO_CUDNN``
-overrides that choice. Under CUDA graphs ``auto`` takes cuDNN only with a caller-owned
-``block_tables`` (the auto-built table cannot grow once captured), and the resolution
-is frozen after the first plan.
+cuDNN's CuTe-DSL ("FROST") SDPA engine for SM100 is a default engine of
+cudnn-frontend 1.30+: it serves multi-token decode rows with a decode tile, and
+an attention sink at ``q_len_per_req == 1`` falls through to it when the backend
+engine declines. No environment variable is involved. With that frontend
+installed, the decode wrapper's ``backend="auto"`` resolves to ``cudnn`` on
+SM100 / SM103 for the multi-token rows (``2 <= q_len_per_req <= 4``) of fp16/bf16
+head_dim-128 GQA models when that tile has at least 32 packed rows per CTA and 64
+CTAs, where it measures at 0.35-0.95x fa2 (multi-token rows without tensor cores,
+which have no fa2 kernel, take cuDNN whenever its decode path can run them);
+``FLASHINFER_DECODE_AUTO_CUDNN`` overrides the choice. Under CUDA graphs ``auto``
+takes cuDNN only with a caller-owned ``block_tables`` (the auto-built table cannot
+grow once captured), and the resolution is frozen after the first plan.
 
 Compatible decode runs and replans retain the prepared cuDNN graph. Planning
 still stages changing KV lengths and, unless the caller supplies a dense GPU
