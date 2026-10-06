@@ -14,6 +14,8 @@
 
 """Public SiTU backend correctness and caller-owned graph/workspace behavior."""
 
+import re
+
 import pytest
 import torch
 import tvm_ffi
@@ -29,6 +31,7 @@ from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.cake_kimi_k3_situ import (
+    _N8_W2A_M16_FC2_GRID_N_SM_FACTOR,
     _cake_situ_flat_args,
     _cake_situ_stage_bindings,
     _cake_situ_workspace_views,
@@ -36,13 +39,89 @@ from flashinfer.fused_moe.cake_kimi_k3_situ import (
     _prepared,
     _workspace_layout,
 )
-from flashinfer.jit.cake_kimi_k3_situ import PROGRAMS, ROUTES, get_cake_situ_module
+from flashinfer.jit.cake_kimi_k3_situ import (
+    PROGRAMS,
+    ROUTES,
+    _source_path,
+    get_cake_situ_module,
+)
 from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 from flashinfer.utils import device_support_pdl
 
 
 HIDDEN, INTERMEDIATE, EXPERTS, TOP_K = 3584, 384, 896, 16
 NVFP4_QUANT = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+
+
+def _small_row_selector(arch, num_tokens):
+    # Route selectors of the small token counts: the two-CTA-per-SM FC2 route
+    # for 16 tokens on both architectures, the single-token route for 1 token
+    # and the fused quantization + router route for 8 tokens.
+    if num_tokens == 16:
+        return "n8_w2a_m16"
+    if num_tokens == 1:
+        return "m1"
+    if num_tokens in (8, 16):
+        return "n8_feature"
+    return None
+
+
+def _declares_fused_quant_route(program_key):
+    return any(
+        name == "quant_route.s2b_num_tokens"
+        for _, name in PROGRAMS[program_key]["arg_plan"]
+    )
+
+
+def _stage_kernel_source(program_key, stage):
+    # A prepared launch sequence binds one generated kernel per stage inside a
+    # `namespace stage_<name> { ... }` block of its binding translation unit.
+    record = PROGRAMS[program_key]
+    binding = _source_path(record["sources"][-1]).read_text()
+    block = re.search(
+        rf"namespace stage_{stage} \{{(.*?)\}}  // namespace stage_{stage}",
+        binding,
+        re.S,
+    )
+    assert block is not None, (
+        f"{program_key}: the sequence binding no longer has a "
+        f"`namespace stage_{stage} {{ ... }}  // namespace stage_{stage}` block"
+    )
+    names = set(
+        re.findall(
+            r"kernel_(cake_kimi_k3_nvfp4_situ_routed_moe_[0-9a-f]{20})", block[1]
+        )
+    )
+    assert len(names) == 1, (
+        f"{program_key}: stage {stage} should launch exactly one "
+        f"`kernel_cake_kimi_k3_nvfp4_situ_routed_moe_<20 hex>` symbol, found {names}"
+    )
+    (name,) = names
+    kernels = [
+        source for source in record["sources"] if source.endswith(f"/{name}_kernel.cu")
+    ]
+    assert len(kernels) == 1, (
+        f"{program_key}: expected one `{name}_kernel.cu` among the record's sources, "
+        f"found {kernels}"
+    )
+    return _source_path(kernels[0]).read_text()
+
+
+def _fc2_launch_footprint(arch, selector):
+    program_key = ROUTES[(arch, selector)]
+    source = _stage_kernel_source(program_key, "fc2")
+    bounds = re.search(r"__launch_bounds__\((\d+),\s*(\d+)\)", source)
+    assert bounds is not None, (
+        f"{program_key}: the FC2 kernel no longer declares "
+        "`__launch_bounds__(<threads>, <min blocks>)`"
+    )
+    smem = re.search(r"#define SMEM_TOTAL (\d+)", source)
+    assert smem is not None, (
+        f"{program_key}: the FC2 kernel no longer defines `SMEM_TOTAL`"
+    )
+    threads, min_blocks = map(int, bounds.groups())
+    return threads, min_blocks, int(smem.group(1))
 
 
 def _workspace_size(**overrides):
@@ -104,6 +183,73 @@ def test_cake_situ_workspace_layout_adds_pre_shuffled_scale_factors():
     assert nbytes >= offset + size
     assert "sfb_shuffled" not in _workspace_layout(8192)[0]
     assert "sfb_shuffled" not in _workspace_layout(2048)[0]
+
+
+# SM100 and SM103 shared memory per SM and the per-CTA reservation (CUDA C
+# Programming Guide, compute capability 10.x), and the register file per SM.
+# These are the values of the two architectures this backend supports; revisit
+# them if another SM is ever added to `cake_fused_moe_prepare_workspace`.
+SMEM_PER_SM_BYTES = 228 * 1024
+SMEM_RESERVED_PER_CTA_BYTES = 1024
+REGISTERS_PER_SM = 65536
+
+
+def test_cake_situ_two_cta_fc2_program_fits_two_ctas_per_sm():
+    # The 16-token routes size their FC2 device-workfeed pool as
+    # _N8_W2A_M16_FC2_GRID_N_SM_FACTOR CTAs per SM. That is only correct if the
+    # generated FC2 program really fits that many CTAs per SM, so pin the
+    # program's launch bounds and shared-memory footprint to the host factor on
+    # both architectures.
+    for arch in ("sm_103a", "sm_100a"):
+        threads, min_blocks, smem_bytes = _fc2_launch_footprint(arch, "n8_w2a_m16")
+        assert (threads, min_blocks) == (512, _N8_W2A_M16_FC2_GRID_N_SM_FACTOR)
+        assert (
+            min_blocks * (smem_bytes + SMEM_RESERVED_PER_CTA_BYTES) <= SMEM_PER_SM_BYTES
+        )
+        # __launch_bounds__(512, 2) caps ptxas at this many registers per thread.
+        assert REGISTERS_PER_SM // (threads * min_blocks) >= 64
+    # The single-CTA FC2 program of the other small routes does not fit twice.
+    for arch, selector in (("sm_103a", "n8_feature"), ("sm_100a", "n8_feature")):
+        threads, min_blocks, smem_bytes = _fc2_launch_footprint(arch, selector)
+        assert (threads, min_blocks) == (512, 1)
+        assert 2 * (smem_bytes + SMEM_RESERVED_PER_CTA_BYTES) > SMEM_PER_SM_BYTES
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("num_tokens", [1, 8, 16], ids=["m1", "m8", "m16"])
+def test_cake_situ_small_row_routes_declare_fused_quant_route(arch, num_tokens):
+    # The fused quantization + router stage is part of the 8- and 16-token
+    # programs on both architectures and of no other small-row program.
+    program_key = ROUTES[(arch, _small_row_selector(arch, num_tokens))]
+    assert _declares_fused_quant_route(program_key) is (num_tokens in (8, 16))
+
+
+def test_cake_situ_program_records_are_consistent():
+    # Every program record names its generated sources, which must be present,
+    # and its JIT cache name is derived from the record's closure hash.
+    for program_key, record in PROGRAMS.items():
+        name = program_key.split(":")[1]
+        assert record["cache_name"] == (
+            f"cake_situ_{record['arch']}_{name}_{record['closure_sha256'][:16]}"
+        ), program_key
+        assert len(record["closure_sha256"]) == 64, program_key
+        for source in record["sources"]:
+            assert f"/{record['arch']}/" in source, (program_key, source)
+            assert _source_path(source).is_file(), (program_key, source)
+    for (arch, _selector), program_key in ROUTES.items():
+        assert PROGRAMS[program_key]["arch"] == arch, (arch, program_key)
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_cake_situ_two_cta_fc2_route_is_sixteen_tokens_only(arch):
+    # Only 16 tokens reach the two-CTA-per-SM FC2 route on either architecture:
+    # 8 tokens keep the fused-router route and the larger counts their own.
+    two_cta = ROUTES[(arch, "n8_w2a_m16")]
+    assert PROGRAMS[two_cta]["arch"] == arch
+    assert _small_row_selector(arch, 16) == "n8_w2a_m16"
+    assert _small_row_selector(arch, 8) == "n8_feature"
+    assert ROUTES[(arch, "n8_feature")] != two_cta
+    assert two_cta not in (ROUTES[(arch, 8)], ROUTES[(arch, 16)])
 
 
 @pytest.fixture(scope="module")
@@ -248,8 +394,8 @@ def _trtllm_reference(x, ids, route_weights, prepared):
 
 @pytest.mark.parametrize(
     "num_tokens",
-    [64, 256, 512, 2048, 16384],
-    ids=["n8", "n16", "n32", "n128", "m16384"],
+    [1, 8, 16, 64, 256, 512, 2048, 16384],
+    ids=["m1", "m8", "m16", "n8", "n16", "n32", "n128", "m16384"],
 )
 def test_cake_situ_output_workspace_and_external_graph(
     num_tokens,
@@ -331,6 +477,30 @@ def test_cake_situ_output_workspace_and_external_graph(
         )
         is workspace
     )
+    # The prepared shape must select the expected route: the two-CTA-per-SM
+    # FC2 route for 16 tokens, the single-token and fused-router routes for
+    # the other small counts, and the fused quantization + router stage
+    # exactly for 8 and 16 tokens, on both architectures.
+    arch = ARCH_BY_CAPABILITY[torch.cuda.get_device_capability(device)]
+    prepared_shape = workspace._flashinfer_cake_situ_workspace["shapes"][num_tokens]
+    selector = _small_row_selector(arch, num_tokens)
+    assert prepared_shape["n8_w2a_m16"] is (selector == "n8_w2a_m16")
+    if selector is not None:
+        assert prepared_shape["program_key"] == ROUTES[(arch, selector)]
+    assert prepared_shape["fused_quant_route"] is (num_tokens in (8, 16))
+    assert _declares_fused_quant_route(prepared_shape["program_key"]) is (
+        num_tokens in (8, 16)
+    )
+    if prepared_shape["n8_w2a_m16"]:
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        assert prepared_shape["fc2_grid_n"] == min(
+            prepared_shape["max_tiles"],
+            _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * sm_count // (HIDDEN // 128),
+        )
+        assert (
+            prepared_shape["fc2_pool_ctas"]
+            == (HIDDEN // 128) * prepared_shape["fc2_grid_n"]
+        )
 
     expected = _trtllm_reference(x, ids, route_weights, prepared)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.
@@ -352,8 +522,10 @@ def test_cake_situ_output_workspace_and_external_graph(
     graph.replay()
     torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
 
-    # Retain every input address while changing values and expert load balance.
-    # Replay must consume these values, not stale routing or hidden states.
+    # Retain every input address while changing values and expert load balance:
+    # every token now routes to the same 16 experts (the other 880 receive no
+    # token), the maximally skewed pattern. Replay must consume these values,
+    # not stale routing or hidden states.
     x.mul_(-0.75)
     ids.copy_(slots[None, :].expand_as(ids))
     route_weights.copy_(route_weights.flip(-1))
