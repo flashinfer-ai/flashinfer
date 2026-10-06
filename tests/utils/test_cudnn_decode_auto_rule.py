@@ -46,6 +46,25 @@ def test_cudnn_frontend_version_parsing(clean_env, raw, expected):
     assert cudnn_utils.cudnn_frontend_version() == expected
 
 
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ("1.30.0", False),
+        ("1.31.0", True),
+        ("1.31.0.dev7", True),
+        ("1.31", True),
+        ("2.0.0", True),
+        (None, False),
+    ],
+)
+def test_cudnn_frontend_leads_short_caches(clean_env, version, expected):
+    if version is None:
+        clean_env.setitem(sys.modules, "cudnn", None)
+    else:
+        _fake_cudnn(clean_env, version)
+    assert cudnn_utils.cudnn_frontend_leads_short_caches() is expected
+
+
 def test_cudnn_frontend_version_without_package(clean_env):
     clean_env.setitem(sys.modules, "cudnn", None)  # makes `import cudnn` fail
     assert cudnn_utils.cudnn_frontend_version() is None
@@ -95,6 +114,8 @@ def _base():
         logits_soft_cap=0.0,
         q_len_per_req=2,
         fa2_available=True,
+        declared_kv_len=None,
+        frontend_leads_short_caches=False,
         override="",
     )
 
@@ -125,6 +146,9 @@ def _base():
         {"page_size": 128},
         {"page_size": 256},
         {"logits_soft_cap": None},
+        {"declared_kv_len": 2048},  # a caller-owned table as wide as the bucket
+        {"declared_kv_len": 65536},
+        {"declared_kv_len": 512, "frontend_leads_short_caches": True},  # 1.31+
         {"frontend_serves_frost_decode": False, "override": "1"},  # forced
         {"override": "true"},
     ],
@@ -169,6 +193,8 @@ def test_auto_prefers_cudnn_inside_the_envelope(changes):
         {"num_qo_heads": 48, "num_kv_heads": 8},  # group 6
         {"num_qo_heads": 30, "num_kv_heads": 8},  # not a multiple
         {"num_kv_heads": 0},
+        {"declared_kv_len": 512},  # 1.30 ranks the backend's prefill engine first
+        {"declared_kv_len": 2047},
         {"page_size": 24},
         {"page_size": 4},
         {"page_size": 96},
@@ -199,6 +225,7 @@ def test_auto_keeps_fa2_outside_the_envelope(changes):
         {"head_dim": 256, "num_qo_heads": 32, "num_kv_heads": 2},
         {"window_left": 128},
         {"page_size": 24},
+        {"declared_kv_len": 512},  # slow cudnn still beats no kernel
     ],
 )
 def test_auto_takes_cudnn_when_fa2_cannot_serve_the_rows(changes):

@@ -9,7 +9,10 @@ import torch
 
 import flashinfer
 import flashinfer.cudnn.decode as cudnn_decode
-from flashinfer.cudnn.utils import cudnn_frontend_serves_frost_decode
+from flashinfer.cudnn.utils import (
+    cudnn_frontend_leads_short_caches,
+    cudnn_frontend_serves_frost_decode,
+)
 from flashinfer.decode import _DECODE_AUTO_CUDNN_ENV
 from flashinfer.utils import get_compute_capability
 
@@ -1587,7 +1590,10 @@ def test_auto_cudnn_fast_plan_capture_reuses_prepared(
     kwargs = dict(q_data_type=q.dtype, q_len_per_req=q_len_per_req)
     table = None
     if caller_block_table:
-        table = torch.zeros((b, 8), dtype=torch.int32, device=q.device)
+        # As wide as the wrapper's declared-cache bucket: a narrower caller
+        # table keeps fa2 on cudnn-frontend 1.30 (see
+        # test_auto_backend_short_caller_table_keeps_fa2).
+        table = torch.zeros((b, 2048 // page), dtype=torch.int32, device=q.device)
         offsets = indptr.cpu().tolist()
         for i in range(b):
             table[i, : offsets[i + 1] - offsets[i]] = indices[
@@ -1777,7 +1783,7 @@ def test_auto_backend_cuda_graph_resolution_is_frozen(monkeypatch):
         b, 512, page, hk, h, d, torch.bfloat16, "HND", device, 4
     )
     offsets = indptr.tolist()
-    table = torch.zeros((b, 512 // page), dtype=torch.int32, device=device)
+    table = torch.zeros((b, 2048 // page), dtype=torch.int32, device=device)
     for i in range(b):
         table[i, : offsets[i + 1] - offsets[i]] = indices[offsets[i] : offsets[i + 1]]
     ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
@@ -1858,3 +1864,66 @@ def test_auto_backend_fast_plan_reevaluates_per_plan(monkeypatch):
         )
         torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
         torch.testing.assert_close(lse, ref_lse, rtol=1e-3, atol=1e-2)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("table_tokens,expect_cudnn", [(512, False), (2048, True)])
+def test_auto_backend_short_caller_table_keeps_fa2(
+    monkeypatch, table_tokens, expect_cudnn
+):
+    """A caller-owned block table declares its own cache length to cuDNN. Below
+    2048 tokens cudnn-frontend 1.30 ranks the backend's prefill-class engine
+    ahead of the decode tile for multi-token rows (~8x fa2), so auto keeps fa2
+    there; a table as wide as the bucket takes cudnn."""
+    if not _sm100_class():
+        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
+    if cudnn_frontend_leads_short_caches():
+        pytest.skip(
+            "this cudnn-frontend ranks the decode tile first at every cache length"
+        )
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+    torch.manual_seed(0)
+    device = "cuda:0"
+    b, h, hk, d, page = 8, 64, 8, 128, 16
+    q, cache, indptr, indices, last = _wrapper_inputs(
+        b, 512, page, hk, h, d, torch.bfloat16, "HND", device, 4
+    )
+    offsets = indptr.tolist()
+    table = torch.zeros((b, table_tokens // page), dtype=torch.int32, device=device)
+    for i in range(b):
+        table[i, : offsets[i + 1] - offsets[i]] = indices[offsets[i] : offsets[i + 1]]
+    ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, "HND", backend="auto", use_tensor_cores=True
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last,
+        h,
+        hk,
+        d,
+        page,
+        q_data_type=q.dtype,
+        q_len_per_req=4,
+        block_tables=table,
+    )
+    assert (wrapper.resolved_backend == "cudnn") is expect_cudnn
+    out, lse = wrapper.run(q, cache, return_lse=True)
+    ref, ref_lse = _run_wrapper(
+        "fa2",
+        q,
+        cache,
+        indptr,
+        indices,
+        last,
+        page,
+        hk,
+        h,
+        d,
+        q.dtype,
+        "HND",
+        q_len_per_req=4,
+    )
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, rtol=1e-3, atol=1e-2)

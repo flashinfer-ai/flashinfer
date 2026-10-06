@@ -105,3 +105,21 @@ def cudnn_frontend_serves_frost_decode(compute_capability: Tuple[int, int]) -> b
     if (tuple(version) + (0, 0, 0))[:3] < CUDNN_FRONTEND_FROST_DECODE_MIN_VERSION:
         return False
     return tuple(compute_capability) in ((10, 0), (10, 3))
+
+
+# cudnn-frontend 1.30 ranks its FROST decode tile ahead of the backend engine for
+# multi-token rows only from a declared 2048-token cache; below that the backend's
+# prefill-class engine goes first (~8x fa2's time). 1.31 ranks the tile first at
+# every cache length (NVIDIA/cudnn-frontend#1420).
+CUDNN_FRONTEND_SHORT_CACHE_LEAD_MIN_VERSION: Tuple[int, int, int] = (1, 31, 0)
+
+
+def cudnn_frontend_leads_short_caches() -> bool:
+    """Whether the installed cudnn-frontend ranks its decode tile first for
+    multi-token rows at every declared cache length (1.31+)."""
+    version = cudnn_frontend_version()
+    if version is None:
+        return False
+    return (tuple(version) + (0, 0, 0))[
+        :3
+    ] >= CUDNN_FRONTEND_SHORT_CACHE_LEAD_MIN_VERSION
