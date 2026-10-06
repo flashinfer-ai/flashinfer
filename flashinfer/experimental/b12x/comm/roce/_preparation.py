@@ -142,6 +142,7 @@ def query_from_runtime(
     peer_hosts,
     hca_names=None,
 ):
+    """Build the RoCE query for an established runtime; ``hca_count`` is the runtime's rail count."""
     return RoceQuery(
         surface=surface,
         world_size=runtime.world_size,
@@ -155,7 +156,7 @@ def query_from_runtime(
                 "threads": runtime._threads,
                 "slots": runtime._layout.slots,
                 "flag_stride": runtime._layout.flag_stride,
-                "hca_count": len(runtime.hca_names),
+                "hca_count": runtime.rail_count,
             }
         ),
     )

@@ -8,8 +8,8 @@ One launch performs a complete all-reduce for one message:
    that the RDMA proxy thread polls.  The doorbell is a level, not a queue:
    a proxy that was descheduled across two doorbells finds ``seq`` two ahead
    and posts both slots, which is why the byte count lives per slot;
-3. wait: spin on ``flag[peer][seq & 1][hca] == seq`` for every peer and HCA
-   (the peer's proxy writes each flag after that HCA's payload stripe on the
+3. wait: spin on ``flag[peer][seq & 1][rail] == seq`` for every peer and rail
+   (the peer's proxy writes each flag after that rail's payload stripe on the
    same reliable QP); a wait that exceeds ``spin_limit`` polls records ``seq``
    in the control record's error word and the host raises instead of hanging;
 4. reduce: sum the local input and every peer slot in fixed rank order, so all

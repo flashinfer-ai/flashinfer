@@ -27,3 +27,29 @@ def test_invalid_traffic_class_rejected(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=name):
         _traffic_class()
+
+
+def test_route_table_matches_native_peer_rail_pair_order():
+    from b12x.comm.roce._proxy import Proxy
+
+    class Native:
+        def roce_blob_bytes(self):
+            return 4
+
+        def roce_connect(self, ctx, blobs, size, table, rails):
+            assert ctx == 123
+            assert blobs.raw == b"aaaabbbbcccc"
+            assert size == 12 and rails == 2
+            assert list(table) == [0, 0, 0, 0, 0, 1, 2, 3, 1, 0, 3, 2]
+            return 0
+
+    proxy = Proxy.__new__(Proxy)
+    proxy._ctx = 123
+    proxy._lib = Native()
+    proxy.world_size, proxy.rank = 3, 0
+    try:
+        proxy.connect([b"aaaa", b"bbbb", b"cccc"], [[], [(0, 1), (2, 3)], [(1, 0), (3, 2)]])
+        with pytest.raises(RuntimeError, match="rails"):
+            proxy.connect([b"aaaa", b"bbbb", b"cccc"], [[], [(0, 1)], [(1, 0), (3, 2)]])
+    finally:
+        proxy._ctx = None

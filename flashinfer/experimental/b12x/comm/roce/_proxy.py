@@ -125,7 +125,7 @@ def load() -> ctypes.CDLL:
         lib.roce_local_blob.restype = ctypes.c_int
         lib.roce_local_blob.argtypes = [p, p, u64]
         lib.roce_connect.restype = ctypes.c_int
-        lib.roce_connect.argtypes = [p, p, u64]
+        lib.roce_connect.argtypes = [p, p, u64, ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
         lib.roce_start.restype = ctypes.c_int
         lib.roce_start.argtypes = [p]
         lib.roce_stop.restype = None
@@ -140,7 +140,7 @@ def load() -> ctypes.CDLL:
         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
         lib.roce_destroy.restype = None
         lib.roce_destroy.argtypes = [p]
-        if lib.roce_abi_version() != 4:
+        if lib.roce_abi_version() != 5:
             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
         _LIB = lib
         return lib
@@ -226,14 +226,28 @@ class Proxy:
             raise RuntimeError(BLOB_STRUCT_ERR)
         return buf.raw
 
-    def connect(self, blobs: list[bytes]) -> None:
-        """Connect the queue pairs from every rank's ``local_blob``, in rank order."""
+    def connect(self, blobs: list[bytes], routes: list[list[tuple[int, int]]]) -> None:
+        """Connect the queue pairs from every rank's ``local_blob``, in rank order.
+
+        ``routes[peer]`` lists, per rail, the ``(local HCA index, peer HCA index)`` link that carries
+        it (see ``_routes.plan_routes``); the entry for this rank is ignored.
+        """
         n = int(self._lib.roce_blob_bytes())
         if len(blobs) != self.world_size or any(len(b) != n for b in blobs):
             raise RuntimeError(BLOB_STRUCT_ERR)
+        if len(routes) != self.world_size:
+            raise RuntimeError("RoCE routes must list every rank")
+        rails = max(len(r) for r in routes)
+        flat = []
+        for peer, rail_links in enumerate(routes):
+            if peer != self.rank and len(rail_links) != rails:
+                raise RuntimeError(f"RoCE routes to rank {peer} have {len(rail_links)} rails, expected {rails}")
+            for k in range(rails):
+                flat.extend(rail_links[k] if peer != self.rank else (0, 0))
+        table = (ctypes.c_int32 * len(flat))(*flat)
         joined = b"".join(blobs)
         buf = ctypes.create_string_buffer(joined, len(joined))
-        if self._lib.roce_connect(self._ctx, buf, len(joined)) != 0:
+        if self._lib.roce_connect(self._ctx, buf, len(joined), table, rails) != 0:
             raise RuntimeError(f"RoCE queue-pair connect failed: {self.error()}")
 
     def start(self) -> None:

@@ -33,6 +33,7 @@ from torch.distributed import ProcessGroup
 from . import _allgather_cute
 from ._oneshot_cute import PACK_BYTES, get_launcher
 from ._proxy import Layout, Proxy, load as _load_proxy_library
+from ._routes import MAX_RAILS, local_endpoints, plan_routes
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,9 @@ DEFAULT_MAX_GATHER_BYTES = 16 * 1024 * 1024
 DEFAULT_THREADS = 512
 DEFAULT_BLOCKS = 8
 DEFAULT_GID_INDEX = 3
+# Devices one rank may open (a switchless DGX Spark ring uses all four functions of
+# its two cabled ports); each peer is reached over at most MAX_RAILS of them.
+MAX_HCAS = 4
 # Polls of a peer flag before the kernel gives up (each poll is a system-scope
 # load of host memory, roughly a microsecond): about 20 s.
 DEFAULT_SPIN_LIMIT = 20_000_000
@@ -90,15 +94,16 @@ def default_gid_index() -> int:
 
 
 def discover_hcas(gid_index: Optional[int] = None) -> tuple[str, ...]:
-    """Return the RDMA devices to use, at most two.
+    """Return the RDMA devices to open, at most four.
 
     ``B12X_ROCE_HCA`` (or NCCL's ``NCCL_IB_HCA``) selects explicitly; otherwise
-    every active device with a populated GID at ``gid_index`` is used.
+    every active device with a populated GID at ``gid_index`` is used. Each peer
+    is then reached over at most two of them (rails); see ``_routes``.
     """
 
     explicit = _env_list("B12X_ROCE_HCA", "NCCL_IB_HCA")
     if explicit:
-        return explicit[:2]
+        return explicit[:MAX_HCAS]
     gid_index = default_gid_index() if gid_index is None else int(gid_index)
     found = []
     root = Path("/sys/class/infiniband")
@@ -113,7 +118,7 @@ def discover_hcas(gid_index: Optional[int] = None) -> tuple[str, ...]:
         except OSError:
             continue
         found.append(dev.name)
-    return tuple(found[:2])
+    return tuple(found[:MAX_HCAS])
 
 
 def is_supported(device: torch.device | int | str | None = None) -> bool:
@@ -238,7 +243,10 @@ class RoceOneshotAllReduce:
         names = tuple(hca_names) if hca_names else discover_hcas(self.gid_index)
         if not names:
             raise RuntimeError("no active RDMA device found for the RoCE all-reduce")
-        self.hca_names = names[:2]
+        self.hca_names = names[:MAX_HCAS]
+        # Stripes per peer; set from every rank's devices once they are exchanged.
+        self.rail_count = 0
+        self.routes: list[list[tuple[int, int]]] = []
 
         slot_bytes = _align_up(
             max(self.max_size, self.max_gather_bytes), _SLOT_ALIGNMENT
@@ -273,7 +281,7 @@ class RoceOneshotAllReduce:
         self._ctrl_base = host_ptr + self._layout.ctrl_off
         # ctrl record (kernel-written): seq, nbytes, error seq, missing peer,
         # nbytes per slot (the proxy uses these when it has to catch up), and
-        # the missing HCA index for timeout diagnostics.
+        # the missing rail index for timeout diagnostics (reported as error_hca).
         self._ctrl_words = self._region[
             self._layout.ctrl_off : self._layout.ctrl_off + 28
         ].view(torch.int32)
@@ -296,9 +304,11 @@ class RoceOneshotAllReduce:
                 slot_bytes=slot_bytes,
             )
             blob = self._proxy.local_blob()
+            endpoints = local_endpoints(self.hca_names, self.gid_index)
         except Exception as exc:  # noqa: BLE001 - reported collectively below
             error = str(exc)
             blob = b""
+            endpoints = ()
         # Every rank publishes the configuration the protocol depends on; the
         # ranks must agree exactly, and all of them see the same verdict.
         config = {
@@ -307,7 +317,7 @@ class RoceOneshotAllReduce:
             if error is None
             else None,
             "world_size": self.world_size,
-            "hca_count": len(self.hca_names),
+            "max_rails": MAX_RAILS,
             "traffic_class": self._proxy.traffic_class if error is None else None,
             "slot_bytes": slot_bytes,
             "slots": self._layout.slots,
@@ -318,7 +328,7 @@ class RoceOneshotAllReduce:
             "threads": self._threads,
             "blocks": self._blocks,
         }
-        statuses = _exchange((error, blob, config), exchange_group)
+        statuses = _exchange((error, blob, config, endpoints), exchange_group)
         failures = [
             f"rank {i}: {s[0]}" for i, s in enumerate(statuses) if s[0] is not None
         ]
@@ -338,7 +348,10 @@ class RoceOneshotAllReduce:
             self.close()
             raise RuntimeError("RoCE all-reduce setup failed: " + "; ".join(failures))
         try:
-            self._proxy.connect([s[1] for s in statuses])
+            all_endpoints = [s[3] for s in statuses]
+            self.rail_count = min(MAX_RAILS, *(len(e) for e in all_endpoints))
+            self.routes = plan_routes(all_endpoints, self.rank, self.rail_count)
+            self._proxy.connect([s[1] for s in statuses], self.routes)
             self._proxy.start()
         except Exception as exc:  # noqa: BLE001
             error = str(exc)
@@ -349,13 +362,23 @@ class RoceOneshotAllReduce:
             raise RuntimeError("RoCE all-reduce connect failed: " + "; ".join(failures))
         if self.rank == 0:
             logger.info(
-                "RoCEnante ready: world=%d hcas=%s gid_index=%d max_size=%d traffic_class=%d",
+                "RoCEnante ready: world=%d hcas=%s rails=%d gid_index=%d max_size=%d traffic_class=%d",
                 self.world_size,
                 ",".join(self.hca_names),
+                self.rail_count,
                 self.gid_index,
                 self.max_size,
                 self._proxy.traffic_class,
             )
+        logger.debug(
+            "RoCEnante rank %d routes (peer: [(local, remote) HCA per rail]): %s",
+            self.rank,
+            {
+                p: [(self.hca_names[l], r) for l, r in links]
+                for p, links in enumerate(self.routes)
+                if links
+            },
+        )
 
     @staticmethod
     def _device_pointer(host_ptr: int) -> int:
@@ -447,7 +470,7 @@ class RoceOneshotAllReduce:
             self._threads,
             self._layout.slots,
             self._layout.flag_stride,
-            len(self.hca_names),
+            self.rail_count,
             self.device.index,
         )
 
@@ -459,7 +482,7 @@ class RoceOneshotAllReduce:
             self._threads,
             self._layout.slots,
             self._layout.flag_stride,
-            len(self.hca_names),
+            self.rail_count,
             self.device.index,
         )
 
@@ -903,7 +926,8 @@ class RoceOneshotAllReduce:
             "error_hca": int(self._ctrl_words[6].item()),
             "ctrl_seq": int(self._ctrl_words[0].item()),
             "spin_limit": self.spin_limit,
-            "stripe_hcas": list(range(len(self.hca_names))),
+            "rails": self.rail_count,
+            "routes": [list(links) for links in self.routes],
         }
         if self._proxy is not None:
             info.update(self._proxy.stats())
