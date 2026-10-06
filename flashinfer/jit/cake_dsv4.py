@@ -874,10 +874,10 @@ _ARCH_REGISTRATIONS = {
             "fp8_lowhead_h64": {
                 "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "b092d98fb4bd86027bf690e60c3aebcc5d788ec288eba2b2989e5818cf5ba13a",
+                "identity": "18b376b088304a230db235bc08090a4814b86ead9adceb52e0880b4357a8d48e",
                 "sources": [
-                    "common/cake_dsv4_fp8_lowhead_h64_kernel.cu",
-                    "common/cake_dsv4_fp8_lowhead_h64_binding.cu",
+                    "sm_103a/cake_dsv4_830111dd426c3f1ecb82_kernel.cu",
+                    "sm_103a/cake_dsv4_830111dd426c3f1ecb82_binding.cu",
                 ],
             },
             "fp8_lowhead_one_partition": {
