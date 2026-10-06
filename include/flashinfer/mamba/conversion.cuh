@@ -198,8 +198,7 @@ __device__ __forceinline__ uint16_t cvt_rs_f16_sw(float x, uint32_t rand13) {
     uint64_t mantissa = (abs_bits & 0x7FFFFFu) | 0x800000u;
     uint64_t noise = static_cast<uint64_t>(rand13 & 0x1FFFu) << (shift - 13);
     // The carry may produce 0x400: the smallest normal fp16 value.
-    return static_cast<uint16_t>(sign >> 16) |
-           static_cast<uint16_t>((mantissa + noise) >> shift);
+    return static_cast<uint16_t>(sign >> 16) | static_cast<uint16_t>((mantissa + noise) >> shift);
   }
 
   // fp32 has 23 mantissa bits, fp16 has 10. The 13 LSBs are the remainder.
