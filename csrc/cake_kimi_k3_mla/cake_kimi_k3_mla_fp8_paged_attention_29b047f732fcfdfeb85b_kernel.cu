@@ -86,6 +86,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_FLAGS_W_STRIDE 128
 #define SMEM_TOTAL 220800
 #define THREADS 384
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -253,8 +254,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) void
-kernel_cake_kimi_k3_mla_fp8_paged_attention_def8106415e373567c7e(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_qr, const __grid_constant__ CUtensorMap tmap_k, const __grid_constant__ CUtensorMap tmap_kr, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int* __restrict__ page_table, float softmax_scale_log2, float bmm2_scale, int num_heads, int num_split, int max_pages_per_seq)
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
+kernel_cake_kimi_k3_mla_fp8_paged_attention_29b047f732fcfdfeb85b(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_qr, const __grid_constant__ CUtensorMap tmap_k, const __grid_constant__ CUtensorMap tmap_kr, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int* __restrict__ page_table, float softmax_scale_log2, float bmm2_scale, int num_heads, int num_split, int max_pages_per_seq)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -447,6 +448,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_def8106415e373567c7e(const __grid_co
                 int q_tok = (row0 + red_col) / num_heads;
                 smem_vis[red_col] = kv_len - q_len_b + q_tok + 1;
                 smem_stats[384 + red_col] = 1031.8073549220576f;
+                smem_stats[448 + red_col] = -CAKE_INF;
             }
             asm volatile("barrier.sync 8, 128;" ::: "memory");
             int vis_min = smem_vis[0];
@@ -535,10 +537,18 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_def8106415e373567c7e(const __grid_co
                     float tr = _max_2;
                     float cr_old = smem_stats[384 + red_col];
                     float cr_upd = 7.8073549220576f - tr * softmax_scale_log2;
-                    float cr_new = ((tr > -CAKE_INF) ? cr_upd : cr_old);
+                    float run_old_r = smem_stats[448 + red_col];
+                    float t_tile_r = tr * softmax_scale_log2;
+                    float _max_3 = max_noftz(run_old_r, t_tile_r);
+                    float run_grown_r = _max_3;
+                    float run_new_r = ((tr > -CAKE_INF) ? run_grown_r : run_old_r);
+                    float cr_floor = 7.8073549220576f - run_new_r + 32.0f;
+                    float cr_bounded = ((cr_upd <= cr_floor) ? cr_upd : cr_floor);
+                    float cr_new = ((tr > -CAKE_INF) ? cr_bounded : cr_old);
                     float _exp2_0 = approx_exp2(cr_new - cr_old);
                     float alpha_r = _exp2_0;
                     smem_stats[384 + red_col] = cr_new;
+                    smem_stats[448 + red_col] = run_new_r;
                     smem_stats[red_col] = alpha_r;
                 }
                 asm volatile("barrier.sync 8, 128;" ::: "memory");
@@ -799,7 +809,6 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_def8106415e373567c7e(const __grid_co
                 float s2 = smem_stats[192 + red_col];
                 float s3 = smem_stats[224 + red_col];
                 float csum = s0 + s1 + (s2 + s3);
-                smem_stats[448 + red_col] = csum;
                 float safe_sum = ((csum > 0.0f) ? csum : 1.0f);
                 float out_scale = ((num_split == 1) ? bmm2_scale : 1.0f);
                 float _rcp_0 = approx_rcp(safe_sum);
@@ -910,6 +919,7 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_def8106415e373567c7e(const __grid_co
                 int q_tok_1 = (row0_1 + red_col_1) / num_heads;
                 smem_vis[red_col_1] = kv_len_1 - q_len_b_1 + q_tok_1 + 1;
                 smem_stats[384 + red_col_1] = 1031.8073549220576f;
+                smem_stats[448 + red_col_1] = -CAKE_INF;
             }
             asm volatile("barrier.sync 9, 128;" ::: "memory");
             int vis_min_1 = smem_vis[32];
@@ -992,16 +1002,24 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_def8106415e373567c7e(const __grid_co
                     float r1_1 = smem_stats[288 + (red_col_1 - 32)];
                     float r2_1 = smem_stats[320 + (red_col_1 - 32)];
                     float r3_1 = smem_stats[352 + (red_col_1 - 32)];
-                    float _max_3 = max_noftz(r0_1, r1_1);
-                    float _max_4 = max_noftz(r2_1, r3_1);
-                    float _max_5 = max_noftz(_max_3, _max_4);
-                    float tr_1 = _max_5;
+                    float _max_4 = max_noftz(r0_1, r1_1);
+                    float _max_5 = max_noftz(r2_1, r3_1);
+                    float _max_6 = max_noftz(_max_4, _max_5);
+                    float tr_1 = _max_6;
                     float cr_old_1 = smem_stats[384 + red_col_1];
                     float cr_upd_1 = 7.8073549220576f - tr_1 * softmax_scale_log2;
-                    float cr_new_1 = ((tr_1 > -CAKE_INF) ? cr_upd_1 : cr_old_1);
+                    float run_old_r_1 = smem_stats[448 + red_col_1];
+                    float t_tile_r_1 = tr_1 * softmax_scale_log2;
+                    float _max_7 = max_noftz(run_old_r_1, t_tile_r_1);
+                    float run_grown_r_1 = _max_7;
+                    float run_new_r_1 = ((tr_1 > -CAKE_INF) ? run_grown_r_1 : run_old_r_1);
+                    float cr_floor_1 = 7.8073549220576f - run_new_r_1 + 32.0f;
+                    float cr_bounded_1 = ((cr_upd_1 <= cr_floor_1) ? cr_upd_1 : cr_floor_1);
+                    float cr_new_1 = ((tr_1 > -CAKE_INF) ? cr_bounded_1 : cr_old_1);
                     float _exp2_3 = approx_exp2(cr_new_1 - cr_old_1);
                     float alpha_r_1 = _exp2_3;
                     smem_stats[384 + red_col_1] = cr_new_1;
+                    smem_stats[448 + red_col_1] = run_new_r_1;
                     smem_stats[red_col_1] = alpha_r_1;
                 }
                 asm volatile("barrier.sync 9, 128;" ::: "memory");
@@ -1262,7 +1280,6 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_def8106415e373567c7e(const __grid_co
                 float s2_1 = smem_stats[320 + (red_col_1 - 32)];
                 float s3_1 = smem_stats[352 + (red_col_1 - 32)];
                 float csum_1 = s0_1 + s1_1 + (s2_1 + s3_1);
-                smem_stats[448 + red_col_1] = csum_1;
                 float safe_sum_1 = ((csum_1 > 0.0f) ? csum_1 : 1.0f);
                 float out_scale_1 = ((num_split == 1) ? bmm2_scale : 1.0f);
                 float _rcp_1 = approx_rcp(safe_sum_1);

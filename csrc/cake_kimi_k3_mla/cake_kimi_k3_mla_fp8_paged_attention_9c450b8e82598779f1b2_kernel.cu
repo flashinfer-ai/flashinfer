@@ -86,7 +86,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_kimi_k3_mla_fp8_paged_attention_037deeabf96bd0d2d769(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, int m_tiles, int n_full_items, int tile_rows)
+kernel_cake_kimi_k3_mla_fp8_paged_attention_9c450b8e82598779f1b2(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ cum_seq_lens_q, int batch, int num_heads, int num_split, float bmm2_scale, int m_tiles, int n_full_items, int tile_rows)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -245,13 +245,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_037deeabf96bd0d2d769(__nv_bfloat16* 
                     uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_1[_pair]));
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                        (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
                     }
                 }
             }
