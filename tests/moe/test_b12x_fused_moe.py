@@ -2804,3 +2804,23 @@ class TestWorkspaceBucketing:
         assert ws_big.max_rows >= 256
         ws_big2 = md._get_cached_workspace(routed_rows=200, **kwargs)
         assert ws_big2 is ws_big
+
+    def test_dynamic_workspace_not_bucketed(self):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        md._WORKSPACE_CACHE.clear()
+        kwargs = dict(
+            backend="dynamic",
+            state_E=8,
+            weight_E=8,
+            k=512,
+            n=256,
+            num_topk=4,
+            device=torch.device("cuda"),
+        )
+        # The dynamic kernel does not key on max_rows, and its M-tile is
+        # derived from routed_rows; bucketing 100 -> 128 rows would cross a
+        # tile band and mismatch the workspace cache key on the next call.
+        ws = md._get_cached_workspace(routed_rows=100, **kwargs)
+        assert ws.routed_rows_capacity == 100
+        assert md._get_cached_workspace(routed_rows=100, **kwargs) is ws
