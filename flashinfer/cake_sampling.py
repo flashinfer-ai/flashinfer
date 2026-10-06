@@ -30,8 +30,8 @@ Two frozen kernels per row of probabilities:
    prologue overlaps the tail of stage 1.
 
 Semantics follow :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` with
-``filter_apply_order="top_k_first"`` (same support, same Philox stream advancement) with these
-guarantees on top:
+``filter_apply_order="top_k_first"`` (same support, same Philox stream advancement outside
+CUDA-graph capture) with these guarantees on top:
 
 * **Strict determinism.** Ties at the top-k boundary are resolved toward the lower vocabulary
   index (the support is exactly the first ``k`` entries of ``lexsort(-prob, index)``), every
@@ -252,10 +252,43 @@ _RAGGED_CHUNK_FILL = 0.75
 _WORKSPACES: dict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ] = {}
+# (device index, id(generator)) -> next Philox offset handed to a call captured into a CUDA graph.
+_CAPTURE_PHILOX_OFFSETS: dict[tuple[int, int], int] = {}
 
 
 def _device_index(device: torch.device) -> int:
     return torch.cuda.current_device() if device.index is None else int(device.index)
+
+
+def _philox_params(
+    batch: int,
+    generator: Optional[torch.Generator],
+    device: torch.device,
+    philox_seed: Optional[int],
+    philox_offset: Optional[int],
+) -> tuple[int, int]:
+    """Philox ``(seed, offset)`` for one call (32 reserved draws per row, the ``top_k_first`` stride).
+
+    Outside CUDA-graph capture the generator is read and advanced exactly like
+    :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`, so a generator shared with the
+    ``top_k_first`` route stays in lockstep.  Inside capture the generator is never touched: reading
+    its state there makes PyTorch register it with the graph, and every replay then runs two
+    ``FillFunctor`` kernels that refresh device-side seed/offset words the Cake kernels do not read
+    (both routes take the Philox parameters by value, so a replay reproduces the captured draws
+    either way; measured +46 us per replay on GB300).  The capture path uses the generator's
+    initial seed and a host-side per-(device, generator) offset counter, so distinct captures draw
+    from distinct Philox streams while replays stay bitwise reproducible.
+    """
+    if philox_seed is not None:
+        return int(philox_seed), int(philox_offset)
+    if not torch.cuda.is_current_stream_capturing():
+        return get_seed_and_offset(batch * 32, generator, device)
+    index = _device_index(device)
+    gen = generator if generator is not None else torch.cuda.default_generators[index]
+    key = (index, id(gen))
+    offset = _CAPTURE_PHILOX_OFFSETS.get(key, 0)
+    _CAPTURE_PHILOX_OFFSETS[key] = offset + (batch * 32 + 3) // 4 * 4
+    return int(gen.initial_seed()), offset
 
 
 def _capability(device: torch.device) -> Optional[tuple[int, int]]:
@@ -483,6 +516,20 @@ _SLAB_TAIL_MAX_CHUNKS = 5
 # tree orders with same-node in-process A/Bs of 1.022-1.056 (the pushed stores grow with the chunk count, the two
 # dependent select round trips they replace do not).
 _FLAG_COARSE_PUSH = 256
+# Stage-1 launch_flags bit 9 (round 9, lever L-P): the leader-push exchange form of the default or sample build of a
+# multi-CTA streaming variant (`_lp` / `_cs_lp` / `_sp_lp` twins).  Every CTA stores its compacted candidate list straight
+# into rank 0's receive buffer (one st.shared::cluster.v2.b32 per pair) and its length into every CTA before the single
+# exchange barrier; rank 0 gathers locally, so the pull form's DSM read rounds and exit rendezvous disappear.  Taken on
+# the capabilities in _LEADER_PUSH_CAPABILITIES for any ept-16 stream and for an ept-32 (_LEADER_PUSH_WIDE_EPT) stream only
+# when the row is at most _LEADER_PUSH_WIDE_MAX_CHUNKS register chunks per CTA (round-9 ledger: R200 ept-16 `_cs` cells
+# 0.88-0.94, H100 c8 e16 `_cs` 0.82-0.86 / `_sp` 0.92-0.96, B200 `_sp` 0.89-0.97, GB300 ept-16 `_sp` cells 0.96-0.99 against the slab form; the two-chunk and longer ept-32 rows 1.02-1.31 on
+# R200).  It displaces the slab tail (bit 7) and the pushed coarse sums (bit 8) where both would apply; never with bit 3.
+_FLAG_LEADER_PUSH = 512
+_LEADER_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
+    {(9, 0), (10, 0), (10, 3), (10, 7)}
+)
+_LEADER_PUSH_WIDE_EPT = 32
+_LEADER_PUSH_WIDE_MAX_CHUNKS = 1
 _COARSE_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(9, 0), (10, 3)})
 _COARSE_PUSH_MIN_EPT = 32
 _SPEC_SAMPLE_WIDE_EPT = 32
@@ -730,6 +777,62 @@ def _coarse_push_flag(
     ):
         return 0
     return _FLAG_COARSE_PUSH if _stage1_has_coarse_push(cluster, ept, True) else 0
+
+
+@functools.cache
+def _stage1_has_leader_push(
+    cluster: int, ept: int, stream: bool, coarse: bool, spec: bool
+) -> bool:
+    """Whether the frozen variant ships the leader-push exchange form of its default (neither flag), coarse-sample
+    (``coarse``) or speculative-sample (``spec``) build (a manifest entry with ``leader_push`` and the matching sample
+    flags): the kernel taken by launch_flags bit 9.  Every output is bit-identical to the pull form."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if (
+                v.get("leader_push", False)
+                and bool(v["coarse_sample"]) == bool(coarse)
+                and bool(v["spec_sample"]) == bool(spec)
+            ):
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _leader_push_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    launch_flags: int,
+    vocab: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> int:
+    """Stage-1 ``launch_flags`` bit 9 for a launch whose other bits are ``launch_flags``: the leader-push exchange form
+    of the build the sample bits select, on a multi-CTA streaming variant that ships it, on the capabilities in
+    ``_LEADER_PUSH_CAPABILITIES`` (``capability`` None: every capability), for any row on an ept-16 stream and for a
+    row of at most ``_LEADER_PUSH_WIDE_MAX_CHUNKS`` register chunks per CTA on an ept-``_LEADER_PUSH_WIDE_EPT`` stream.
+    Never with the whole-CTA tail (bit 3); the caller drops the slab tail (bit 7) and the pushed coarse sums (bit 8)
+    when this bit is taken."""
+    if not stream or int(cluster) < 2 or (launch_flags & _FLAG_FUSE_BLOCK_TAIL) != 0:
+        return 0
+    if (
+        capability is not None
+        and (int(capability[0]), int(capability[1])) not in _LEADER_PUSH_CAPABILITIES
+    ):
+        return 0
+    if int(ept) >= _LEADER_PUSH_WIDE_EPT:
+        chunks = -(-int(vocab) // (_THREADS * int(ept) * int(cluster)))
+        if chunks > _LEADER_PUSH_WIDE_MAX_CHUNKS:
+            return 0
+    coarse = (launch_flags & _FLAG_COARSE_SAMPLE) != 0
+    spec = (launch_flags & _FLAG_SPEC_SAMPLE) != 0
+    return (
+        _FLAG_LEADER_PUSH
+        if _stage1_has_leader_push(cluster, ept, True, coarse, spec)
+        else 0
+    )
 
 
 def _sample_build_flag(
@@ -1099,10 +1202,12 @@ def _launch_plan(
         sample_flag = _sample_build_flag(
             cluster, ept, stream, top_k_max, vocab, batch, capability
         )
-        launch_flags = (
-            _FLAG_FUSE_TAIL
-            | sample_flag
-            | _slab_tail_flag(cluster, ept, stream, sample_flag, vocab, capability)
+        launch_flags = _FLAG_FUSE_TAIL | sample_flag
+        leader = _leader_push_flag(
+            cluster, ept, stream, launch_flags, vocab, capability
+        )
+        launch_flags |= leader or _slab_tail_flag(
+            cluster, ept, stream, sample_flag, vocab, capability
         )
     elif fused_block:
         launch_flags = _FLAG_FUSE_BLOCK_TAIL
@@ -1116,7 +1221,10 @@ def _launch_plan(
             launch_flags |= _spec_sample_flag(
                 cluster, ept, True, vocab, top_k_max, batch, capability
             )
-            launch_flags |= _coarse_push_flag(
+            leader = _leader_push_flag(
+                cluster, ept, True, launch_flags, vocab, capability
+            )
+            launch_flags |= leader or _coarse_push_flag(
                 cluster, ept, True, launch_flags, capability
             )
     return _LaunchPlan(
@@ -1150,6 +1258,7 @@ def _slab_plan(
     flags = _sample_build_flag(
         cluster, ept, stream, top_k_max, vocab, batch, capability
     ) | _row_span_diet_flag(cluster, stream, top_k_max, device_index)
+    flags |= _leader_push_flag(cluster, ept, stream, flags, vocab, capability)
     return cluster, ept, stream, flags
 
 
@@ -1247,7 +1356,10 @@ def top_k_top_p_sampling_from_probs(
         Upper bound of ``top_k`` when it is a tensor (avoids a device synchronization).
     generator: Optional[torch.Generator]
         Source of the Philox seed/offset (default CUDA generator when omitted), advanced exactly
-        like :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`.
+        like :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs`.  While a CUDA graph is
+        being captured the generator is not read or advanced (that would register it with the
+        graph and add two fill kernels to every replay); the captured launch uses the generator's
+        initial seed with a host-side offset that differs between captures.
     philox_seed, philox_offset: Optional[int]
         Explicit Philox parameters (both required together); ``generator`` is then not touched.
     out: Optional[torch.Tensor]
@@ -1311,12 +1423,9 @@ def top_k_top_p_sampling_from_probs(
     )
     if out is None:
         out = torch.empty(batch, device=probs.device, dtype=torch.int32)
-    if philox_seed is None:
-        # Same stride as top_p_sampling_from_probs (32 reserved draws per row): a generator shared with
-        # the top_k_first route stays in lockstep.
-        philox_seed, philox_offset = get_seed_and_offset(
-            batch * 32, generator, probs.device
-        )
+    philox_seed, philox_offset = _philox_params(
+        batch, generator, probs.device, philox_seed, philox_offset
+    )
     if isinstance(top_k, int):
         k_arr, k_scalar, k_kind = cnt, int(top_k), _TOPK_SCALAR
     else:

@@ -713,6 +713,10 @@ class CakeWarpDecodeConfig:
             (SwiGLU(), (3072, 1536, 256)),
             (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), (6144, 3072, 128)),
             (SiTU(gate_scale=4.0, linear_scale=25.0), (3584, 3072, 896)),
+            (SwiGLU(), (4096, 512, 512)),
+            (SwiGLU(), (4096, 256, 512)),
+            (SwiGLU(), (3072, 768, 256)),
+            (SwiGLU(), (3072, 384, 256)),
         )
         if not any(
             activation == supported_activation and geometry == supported_geometry
@@ -723,7 +727,8 @@ class CakeWarpDecodeConfig:
                 "SwiGLU() with (hidden_size, intermediate_size, num_local_experts) "
                 "= (2048, 512, 512), (2048, 1536, 60), (2560, 768, 384), "
                 "(2048, 768, 128), (4096, 1536, 128), (2048, 512, 256), "
-                "(4096, 1024, 512), or (3072, 1536, 256), "
+                "(4096, 1024, 512), (3072, 1536, 256), (4096, 512, 512), "
+                "(4096, 256, 512), (3072, 768, 256), or (3072, 384, 256), "
                 "and SiLU() with "
                 "(6144, 1536, 192), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
                 "with (6144, 3072, 128), or SiTU(gate_scale=4.0, linear_scale=25.0) "

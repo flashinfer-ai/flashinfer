@@ -453,13 +453,14 @@ def _prepare_cute_dsl(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Dispatch weight preparation to the architecture-specific DSL kernel."""
     major, minor = get_compute_capability(b.device)
-    if (major, minor) in ((10, 0), (10, 3)):
+    if (major, minor) in ((10, 0), (10, 3), (10, 7)):
         return _prepare_cute_dsl_sm100(b, b_descale, alpha, block_size)
     elif major == 12:
         return _prepare_cute_dsl_sm12x(b, b_descale, alpha, block_size)
     else:
         raise NotImplementedError(
-            f"cute-dsl w4a16 GEMM only supports SM100/103 and SM12x; got {major}.{minor}"
+            "cute-dsl w4a16 GEMM only supports SM100/103/107 and SM12x; "
+            f"got {major}.{minor}"
         )
 
 
@@ -1176,7 +1177,7 @@ def _compute_cute_dsl(
     ``(K // block_size, N)`` uint8 SF in S0E5M3 format (reformatted from FP8-E4M3
     by :func:`_e4m3_to_s0e5m3`) returned by :func:`_prepare_cute_dsl`.
     """
-    if get_compute_capability(a.device) in ((10, 0), (10, 3)):
+    if get_compute_capability(a.device) in ((10, 0), (10, 3), (10, 7)):
         return _compute_cute_dsl_sm100(
             a,
             b,
