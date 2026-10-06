@@ -60,10 +60,6 @@ __device__ inline unsigned int laneId()
     return id;
 }
 } // namespace cake_trtllm_moe_finalize
-template <typename F, size_t... _i> __device__ __forceinline__ void poll_expand(F&& f, std::index_sequence<_i...>) {
-    (f(std::integral_constant<int, static_cast<int>(_i)>{}), ...);
-}
-
 template <typename W, size_t... _i> __device__ __forceinline__ bool poll_any_0(const W* _sysv_poll_group_0, std::index_sequence<_i...>) {
     return (... || ((((_sysv_poll_group_0[_i] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[_i] >> 16) & 0xffffu) == 0x8000u)));
 }
@@ -437,19 +433,35 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
     }
     long long clear_base = (long long)clear_epoch * comm_stride_elems;
     #pragma unroll 4
-    for (int access_1 = first_access; access_1 < clear_size / 8; access_1 += access_stride) {
-        reinterpret_cast<int4*>(workspace_local + (clear_base + (long long)access_1 * 8))[0] = reinterpret_cast<int4*>(clear_words)[0];
+    for (int clear_access = first_access; clear_access < clear_size / 8; clear_access += access_stride) {
+        reinterpret_cast<int4*>(workspace_local + (clear_base + (long long)clear_access * 8))[0] = reinterpret_cast<int4*>(clear_words)[0];
     }
-    int access_2 = first_access;
+    int access_1 = first_access;
     int rms_parity = 0;
     #pragma unroll 1
     for (int token_1 = token_begin; token_1 < token_end; token_1 += token_stride) {
         uint32_t _sysv_poll_group_0[4 * WS];
         do {
-            poll_expand([&](auto _pc) {
-                constexpr int p = decltype(_pc)::value;
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4 * p]), "=r"(_sysv_poll_group_0[(4 * p + 1)]), "=r"(_sysv_poll_group_0[(4 * p + 2)]), "=r"(_sysv_poll_group_0[(4 * p + 3)]) : "l"(peer[p] + (p * total_access * 8 + access_2 * 8)) : "memory");
-            }, std::make_index_sequence<WS>{});
+            if constexpr (WS == 2) {
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + (long long)(access_1 * 8))) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4]), "=r"(_sysv_poll_group_0[5]), "=r"(_sysv_poll_group_0[6]), "=r"(_sysv_poll_group_0[7]) : "l"(workspace_local + (data_base + (long long)(total_access * 8) + (long long)(access_1 * 8))) : "memory");
+            }
+            if constexpr (WS == 4) {
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + (long long)(access_1 * 8))) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4]), "=r"(_sysv_poll_group_0[5]), "=r"(_sysv_poll_group_0[6]), "=r"(_sysv_poll_group_0[7]) : "l"(workspace_local + (data_base + (long long)(total_access * 8) + (long long)(access_1 * 8))) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[8]), "=r"(_sysv_poll_group_0[9]), "=r"(_sysv_poll_group_0[10]), "=r"(_sysv_poll_group_0[11]) : "l"(workspace_local + (data_base + (long long)(2 * total_access * 8) + (long long)(access_1 * 8))) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[12]), "=r"(_sysv_poll_group_0[13]), "=r"(_sysv_poll_group_0[14]), "=r"(_sysv_poll_group_0[15]) : "l"(workspace_local + (data_base + (long long)(3 * total_access * 8) + (long long)(access_1 * 8))) : "memory");
+            }
+            if constexpr (WS == 8) {
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(peer[0] + (access_1 * 8)) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4]), "=r"(_sysv_poll_group_0[5]), "=r"(_sysv_poll_group_0[6]), "=r"(_sysv_poll_group_0[7]) : "l"(peer[1] + (total_access * 8 + access_1 * 8)) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[8]), "=r"(_sysv_poll_group_0[9]), "=r"(_sysv_poll_group_0[10]), "=r"(_sysv_poll_group_0[11]) : "l"(peer[2] + (2 * total_access * 8 + access_1 * 8)) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[12]), "=r"(_sysv_poll_group_0[13]), "=r"(_sysv_poll_group_0[14]), "=r"(_sysv_poll_group_0[15]) : "l"(peer[3] + (3 * total_access * 8 + access_1 * 8)) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[16]), "=r"(_sysv_poll_group_0[17]), "=r"(_sysv_poll_group_0[18]), "=r"(_sysv_poll_group_0[19]) : "l"(peer[4] + (4 * total_access * 8 + access_1 * 8)) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[20]), "=r"(_sysv_poll_group_0[21]), "=r"(_sysv_poll_group_0[22]), "=r"(_sysv_poll_group_0[23]) : "l"(peer[5] + (5 * total_access * 8 + access_1 * 8)) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[24]), "=r"(_sysv_poll_group_0[25]), "=r"(_sysv_poll_group_0[26]), "=r"(_sysv_poll_group_0[27]) : "l"(peer[6] + (6 * total_access * 8 + access_1 * 8)) : "memory");
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[28]), "=r"(_sysv_poll_group_0[29]), "=r"(_sysv_poll_group_0[30]), "=r"(_sysv_poll_group_0[31]) : "l"(peer[7] + (7 * total_access * 8 + access_1 * 8)) : "memory");
+            }
         } while (poll_any_0(_sysv_poll_group_0, std::make_index_sequence<4 * WS>{}));
         float _sysv_poll_group_0_f32[8];
         #pragma unroll
@@ -484,7 +496,7 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
             }
         }
         int access_in_token = cluster_thread;
-        int elem = access_2 * 8;
+        int elem = access_1 * 8;
         float _vec_load_9[8];
         {
             const uint4* _vptr_6 = reinterpret_cast<const uint4*>(residual + elem + 0);
@@ -654,7 +666,7 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
             }
             uint32_t _fp4_0[1];
             asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_0[0]) : "f"(norm_value_elem_f32[0]), "f"(norm_value_elem_f32[1]), "f"(norm_value_elem_f32[2]), "f"(norm_value_elem_f32[3]), "f"(norm_value_elem_f32[4]), "f"(norm_value_elem_f32[5]), "f"(norm_value_elem_f32[6]), "f"(norm_value_elem_f32[7]));
-            *(reinterpret_cast<int*>(reinterpret_cast<unsigned int*>(quant_out)) + (access_2)) = _fp4_0[0];
+            *(reinterpret_cast<int*>(reinterpret_cast<unsigned int*>(quant_out)) + (access_1)) = _fp4_0[0];
             if (lane % 2 == 0) {
                 int scale_col = access_in_token / 2;
                 int inner_k = scale_col % 4;
@@ -670,7 +682,7 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
                 }
             }
         }
-        access_2 += access_stride;
+        access_1 += access_stride;
         rms_parity = 1 - rms_parity;
     }
     if (bid == 0) {
