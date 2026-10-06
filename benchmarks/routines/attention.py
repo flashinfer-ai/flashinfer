@@ -332,6 +332,8 @@ def run_attention_test(args):
         return testBatchMLAPagedAttentionWrapper(args)
     elif args.routine == "trtllm_batch_decode_sparse_mla_dsv4":
         return testTrtllmBatchDecodeSparseMlaDsv4(args)
+    elif args.routine == "fp8_paged_mqa_logits":
+        return testFp8PagedMqaLogits(args)
     else:
         print(f"[ERROR] Unsupported routine: {args.routine}")
         return []
@@ -371,7 +373,7 @@ def parse_attention_args(line, parser):
             "prims_ts",  # Accepted alias for the Python module spelling.
             "cute-dsl-prims",
         ],
-        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, BatchPrefillWithRaggedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl); the backend the library selects is reported in the resolved_backend output column. fa2_tc (BatchDecodeWithPagedKVCacheWrapper only) is an alias for backend=fa2 with use_tensor_cores=True, i.e. the FA2 prefill kernel reused for decode; plain fa2 uses the dedicated CUDA-core decode kernel. Decode rows report the choice in the use_tensor_cores output column.",
+        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen and fp8_paged_mqa_logits to cute-dsl. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, BatchPrefillWithRaggedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl); the backend the library selects is reported in the resolved_backend output column. fa2_tc (BatchDecodeWithPagedKVCacheWrapper only) is an alias for backend=fa2 with use_tensor_cores=True, i.e. the FA2 prefill kernel reused for decode; plain fa2 uses the dedicated CUDA-core decode kernel. Decode rows report the choice in the use_tensor_cores output column.",
     )
     parser.add_argument(
         "--page_size",
@@ -571,14 +573,15 @@ def parse_attention_args(line, parser):
     args = parser.parse_args(line)
 
     if args.backends is None:
-        args.backends = (
-            ["trtllm-gen"]
-            if args.routine == "trtllm_batch_decode_sparse_mla_dsv4"
-            else ["fa2"]
-        )
+        args.backends = {
+            "trtllm_batch_decode_sparse_mla_dsv4": ["trtllm-gen"],
+            "fp8_paged_mqa_logits": ["cute-dsl"],
+        }.get(args.routine, ["fa2"])
 
     if args.routine == "trtllm_batch_decode_sparse_mla_dsv4" and args.page_size == 0:
         args.page_size = 256
+    if args.routine == "fp8_paged_mqa_logits" and args.page_size == 0:
+        args.page_size = 64
     if args.routine == "trtllm_batch_decode_sparse_mla_dsv4":
         # The sparse tables encode causal visibility; there is no non-causal
         # mode in this DSV4 generation-form API.
@@ -4531,6 +4534,231 @@ def testTrtllmBatchDecodeSparseMlaDsv4(args):
             "compressed_kv_len": compressed_kv_len,
             "compressed_page_size": args.compressed_page_size,
             "kv_layout": args.kv_layout,
+            "case_tag": args.case_tag,
+        }
+    )
+    return [result]
+
+
+_PAGED_MQA_HEAD_DIM = 128
+_PAGED_MQA_SCALE_BYTES = 4
+
+
+def _reference_fp8_paged_mqa_logits(q, kv_vals, kv_scales, weights, seq_lens):
+    """FP32 torch reference over the API-defined region of each output row.
+
+    ``kv_vals`` / ``kv_scales`` are the per-request contiguous views the test
+    builds its identity block table from. Row ``b * next_n + t`` is defined for
+    positions ``0 .. seq_lens[b] - next_n + t``; everything else is ``nan``.
+    """
+    batch_size, next_n, num_heads, _ = q.shape
+    max_len = kv_vals.shape[1]
+    ref = torch.full(
+        (batch_size * next_n, max_len),
+        float("nan"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    positions = torch.arange(max_len, device=q.device)
+    for b in range(batch_size):
+        seq_len = int(seq_lens[b].item())
+        k = kv_vals[b, :seq_len].float()
+        scores = torch.relu(torch.einsum("thd,pd->thp", q[b].float(), k))
+        rows = weights[b * next_n : (b + 1) * next_n].float()
+        logits = torch.einsum("th,thp->tp", rows, scores) * kv_scales[b, :seq_len]
+        limits = seq_len - next_n + torch.arange(next_n, device=q.device)
+        defined = positions[None, :seq_len] <= limits[:, None]
+        ref[b * next_n : (b + 1) * next_n, :seq_len] = torch.where(
+            defined, logits, torch.full_like(logits, float("nan"))
+        )
+    return ref
+
+
+def testFp8PagedMqaLogits(args):
+    """Benchmark the FP8 paged MQA indexer logits (``fp8_paged_mqa_logits``).
+
+    This is the sparse-attention indexer of DeepSeek-V3.2/V4 and GLM: per
+    request it scores ``--s_qo`` (``next_n``) query positions with
+    ``--num_qo_heads`` index heads against a paged FP8 KV cache of
+    ``--s_kv`` tokens. The top-k selection that consumes the logits is a
+    separate op (``top_k_page_table_transform``) and is not timed here.
+
+    Returns:
+        list[dict]: one row per backend.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testFp8PagedMqaLogits")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            "[INFO] To reproduce this test case, run the following command: "
+            f"{args.repro_command}"
+        )
+
+    backends = filter_backends_by_compute_capability(
+        list(args.backends), args.routine, device
+    )
+    if not backends:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
+
+    batch_size = args.batch_size
+    next_n = args.s_qo
+    num_heads = args.num_qo_heads
+    head_dim = (
+        _PAGED_MQA_HEAD_DIM if args.head_dim_qk is None else int(args.head_dim_qk)
+    )
+    page_size = args.page_size
+    if args.num_kv_heads != 1:
+        raise ValueError("fp8_paged_mqa_logits is MQA: requires --num_kv_heads 1")
+    if head_dim != _PAGED_MQA_HEAD_DIM:
+        raise ValueError("fp8_paged_mqa_logits requires --head_dim_qk 128")
+    if batch_size <= 0 or next_n <= 0 or args.s_kv < next_n:
+        raise ValueError("fp8_paged_mqa_logits requires 0 < s_qo <= s_kv")
+    if args.q_dtype != "fp8_e4m3" or args.kv_dtype != "fp8_e4m3":
+        raise ValueError(
+            "fp8_paged_mqa_logits requires --q_dtype fp8_e4m3 --kv_dtype fp8_e4m3"
+        )
+    out_dtype = dtype_str_to_torch_dtype(args.out_dtype or "float32")
+    if out_dtype not in (torch.float32, torch.float16):
+        raise ValueError("fp8_paged_mqa_logits output dtype is float32 or float16")
+
+    seq_lens = (
+        sample_actual_seq_lens(
+            args.s_kv, batch_size, device, args.random_actual_seq_len
+        )
+        .flatten()
+        .clamp_(min=next_n)
+    )
+    max_seq_len = args.s_kv
+    blocks_per_seq = flashinfer.min_block_table_width(max_seq_len, page_size)
+    num_blocks = batch_size * blocks_per_seq
+    block_tables = torch.arange(num_blocks, dtype=torch.int32, device=device).view(
+        batch_size, blocks_per_seq
+    )
+
+    q = torch.randn(
+        batch_size, next_n, num_heads, head_dim, dtype=torch.float32, device=device
+    ).to(torch.float8_e4m3fn)
+    kv_vals = torch.randn(
+        num_blocks, page_size, head_dim, dtype=torch.float32, device=device
+    ).to(torch.float8_e4m3fn)
+    kv_scales = (
+        torch.rand(num_blocks, page_size, dtype=torch.float32, device=device) + 0.5
+    )
+    # Per block: all FP8 values first, then the per-token float32 scales.
+    kv_fused = torch.cat(
+        [kv_vals.view(torch.uint8).flatten(1), kv_scales.view(torch.uint8).flatten(1)],
+        dim=1,
+    ).view(num_blocks, page_size, 1, head_dim + _PAGED_MQA_SCALE_BYTES)
+    weights = torch.randn(
+        batch_size * next_n, num_heads, dtype=torch.float32, device=device
+    )
+    out = torch.empty(
+        batch_size * next_n,
+        flashinfer.padded_seq_len(max_seq_len),
+        dtype=out_dtype,
+        device=device,
+    )
+
+    def run_backend(q_arg, kv_arg, weights_arg, block_tables_arg, seq_lens_arg):
+        return flashinfer.fp8_paged_mqa_logits(
+            q_arg,
+            kv_arg,
+            weights_arg,
+            block_tables_arg,
+            seq_lens_arg,
+            max_seq_len,
+            output_dtype=out_dtype,
+            out=out,
+        )
+
+    runtime_args = (q, kv_fused, weights, block_tables, seq_lens)
+    backend = backends[0]
+    refcheck_passed = ""
+    if args.refcheck:
+        logits = run_backend(*runtime_args).float()
+        ref = _reference_fp8_paged_mqa_logits(
+            q,
+            kv_vals.view(batch_size, blocks_per_seq * page_size, head_dim),
+            kv_scales.view(batch_size, blocks_per_seq * page_size),
+            weights,
+            seq_lens,
+        )
+        defined = ~torch.isnan(ref)
+        tested = logits[:, : ref.shape[1]][defined]
+        expected = ref[defined]
+        rtol, atol = (1e-3, 1e-3) if out_dtype == torch.float32 else (1e-2, 1e-2)
+        num_different, num_elements, pct = is_close_stats(
+            expected, tested, rtol=rtol, atol=atol
+        )
+        mismatch_threshold_pct = 0.01
+        refcheck_passed = pct <= mismatch_threshold_pct
+        if not refcheck_passed:
+            print(
+                f"[ERROR] Output tensor mismatch from backend {backend}: "
+                f"{num_different}/{num_elements} ({pct:.4f}%) elements differ "
+                f"(threshold: {mismatch_threshold_pct}%)"
+            )
+            if not args.allow_output_mismatch:
+                raise AssertionError(
+                    f"[ERROR] Backend {backend} output mismatch with "
+                    f"{num_different} elements"
+                )
+        elif args.verbose >= 1:
+            print(
+                f"[REFCHECK] Backend {backend}: PASSED ({num_different}/"
+                f"{num_elements} defined logits differ from the FP32 reference)"
+            )
+
+    times = bench_gpu_time(
+        fn=run_backend,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=not args.no_cuda_graph,
+        cold_l2_cache=True,
+        input_args=runtime_args,
+    )
+    median_time = float(np.median(times))
+    std_time = float(np.std(times))
+    total_kv = int(seq_lens.sum().item())
+    flops = 2 * total_kv * next_n * num_heads * head_dim
+    logical_bytes = (
+        q.numel() * q.element_size()
+        + total_kv * (head_dim + _PAGED_MQA_SCALE_BYTES)
+        + weights.numel() * weights.element_size()
+        + total_kv * next_n * out.element_size()
+    )
+    tflops = flops / (median_time * 1e9)
+    tb_per_sec = logical_bytes / (median_time * 1e9)
+    print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+    result = defaultdict(str)
+    result.update(
+        {
+            "routine": args.routine,
+            "median_time": median_time,
+            "std_time": std_time,
+            "tflops": tflops,
+            "tb_per_sec": tb_per_sec,
+            "backend": backend,
+            "page_size": page_size,
+            "batch_size": batch_size,
+            "s_qo": next_n,
+            "s_kv": args.s_kv,
+            "num_qo_heads": num_heads,
+            "num_kv_heads": 1,
+            "head_dim_qk": head_dim,
+            "q_dtype": args.q_dtype,
+            "kv_dtype": args.kv_dtype,
+            "out_dtype": str(out_dtype),
+            "avg_actual_seq_len": total_kv / batch_size,
+            "random_actual_seq_len": args.random_actual_seq_len,
+            "refcheck_passed": refcheck_passed,
             "case_tag": args.case_tag,
         }
     )

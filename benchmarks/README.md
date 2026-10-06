@@ -38,6 +38,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
         - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla` (trtllm-native) and CuTe DSL MLA decode kernel (cute-dsl, SM100+).
     - `trtllm_batch_decode_sparse_mla_dsv4` - DeepSeek-V4 sparse MLA using the public TRTLLM-GEN API on SM100/SM103. Supports varlen prefill-style query lengths, causal SWA and compressed-cache sparse tables, FP8/BF16 inputs, sampled FP32 reference checking, and hot-path Q-tile selector benchmarks.
     - All four wrapper attention routines above accept `--backends prims-ts` on SM100/SM103. The standalone `trtllm_batch_decode_sparse_mla_dsv4` routine supports only `trtllm-gen`.
+    - `fp8_paged_mqa_logits` - FP8 paged MQA indexer logits (`flashinfer.fp8_paged_mqa_logits`), the DeepSeek-V3.2/V4 and GLM sparse-attention indexer, on SM100/SM103/SM107 (`cute-dsl`). `--num_qo_heads` is the number of index heads (e.g. 64 or 32), `--s_qo` is `next_n` (draft positions scored per request), `--s_kv` the KV length, `--page_size` the KV block size (default 64); requires `--num_kv_heads 1`, `--head_dim_qk 128`, and `--q_dtype fp8_e4m3 --kv_dtype fp8_e4m3`. `--out_dtype` is `float32` (default) or `float16`. The top-k that consumes the logits is a separate routine (`top_k_page_table_transform`). `--refcheck` compares the API-defined logits region against an FP32 torch reference.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `gemm_fp8_nt_blockscaled` - GEMM with FP8 data types using 128x128 block scaling for both operands (`m`, `n`, `k` must be multiples of 128).
@@ -575,6 +576,7 @@ Legend:
 | **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
 | **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2 |
 | **trtllm_batch_decode_sparse_mla_dsv4** |  |  |  |  |  | trtllm-gen | trtllm-gen |  |
+| **fp8_paged_mqa_logits** |  |  |  |  |  | cute-dsl | cute-dsl |  |
 | **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **gemm_fp8_nt_blockscaled** |  |  |  |  |  | cutlass | cutlass |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
