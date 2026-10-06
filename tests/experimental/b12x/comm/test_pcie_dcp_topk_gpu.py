@@ -9,6 +9,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import runtime as cudart
 
+from b12x.comm.pcie import _owner_preparation as preparation
+from b12x.preparation import PreparationSession
+
 from b12x.comm.pcie.pcie_dcp_topk import (
     PCIeDCPTopKOwnerExchange,
     owner_stage_reference,
@@ -119,7 +122,44 @@ def _worker(
         max_rows=max_rows,
         topk=TOPK,
     )
+
+    def barrier(key, ranks):
+        assert tuple(ranks) == tuple(dcp_global_ranks)
+        with torch.cuda.device(device):
+            dist.barrier(group=dcp_group, device_ids=[rank])
+
+    session = PreparationSession(
+        device=device,
+        autotune=False,
+        compile_workers=1,
+        collective_barrier=barrier,
+    )
+
+    def prepare(runtime, rows, name):
+        indices, scores = _inputs(0, rank, rows, device)
+        call = dict(local_indices=indices, local_scores=scores)
+        query = preparation.query_from_runtime(runtime, call=call)
+        plan = preparation.plan(query, runtime=runtime)
+        session.prepare(
+            (
+                plan.request(
+                    name=name,
+                    collective=preparation.collective(runtime, key=name),
+                    prepare_call=lambda state: preparation.prepared_call(state, **call),
+                ),
+            ),
+            coordinator=lambda state: (
+                state.ready_collectives[0].key if state.ready_collectives else None
+            ),
+        )
+        return plan
+
     try:
+        eager_plans = {
+            rows: prepare(owner, rows, f"topk-eager-{rows}") for rows in test_rows
+        }
+        graph_plan = prepare(graph_owner, max_rows, "topk-graph")
+        session.freeze()
         eager_output_ptrs = []
         for step, rows in enumerate(test_rows):
             local_indices, local_scores = _inputs(step, rank, rows, device)
@@ -127,7 +167,7 @@ def _worker(
             if step == 0:
                 torch.cuda.set_device(wrong_device)
             candidate_indices, candidate_scores = owner.stage_candidates(
-                local_indices, local_scores
+                local_indices, local_scores, plan=eager_plans[rows]
             )
             if step == 0:
                 assert torch.cuda.current_device() == wrong_device
@@ -182,9 +222,15 @@ def _worker(
         )
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         dist.barrier()
-        with graph_owner.capture(), torch.cuda.graph(graph):
+        with (
+            session.capture(),
+            graph_owner.capture(plan=graph_plan),
+            torch.cuda.graph(graph),
+        ):
             graph_candidate_indices, graph_candidate_scores = (
-                graph_owner.stage_candidates(graph_indices, graph_scores)
+                graph_owner.stage_candidates(
+                    graph_indices, graph_scores, plan=graph_plan
+                )
             )
             # Force one owner per DCP group to remain in its consumer while
             # faster peers are ready to replay and write its staging slab.
@@ -199,17 +245,12 @@ def _worker(
         assert _cuda_graph_kernel_count(graph) == 1 + int(dcp_rank == 0)
         assert graph_owner._graph_slot is not None
         graph_views = graph_owner._candidate_views[graph_owner._graph_slot]
+        assert graph_candidate_indices.data_ptr() == graph_views[0].data_ptr()
+        assert graph_candidate_scores.data_ptr() == graph_views[1].data_ptr()
         assert (
             graph_candidate_indices.data_ptr()
-            == graph_views[0].data_ptr()
+            == graph_owner._staging_ptrs[graph_owner._graph_slot][dcp_rank]
         )
-        assert (
-            graph_candidate_scores.data_ptr()
-            == graph_views[1].data_ptr()
-        )
-        assert graph_candidate_indices.data_ptr() == graph_owner._staging_ptrs[
-            graph_owner._graph_slot
-        ][dcp_rank]
 
         # Queue several replays without host/device synchronization. Every
         # replay writes the capture-stable slab, then consumes it on the same
@@ -252,6 +293,7 @@ def _worker(
         dist.barrier()
         torch.cuda.synchronize(device)
     finally:
+        session.close()
         graph_owner.close_coordinated()
         owner.close_coordinated()
         dist.destroy_process_group()

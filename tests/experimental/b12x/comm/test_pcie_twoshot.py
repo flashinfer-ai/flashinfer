@@ -1,9 +1,9 @@
-"""Correctness + micro-benchmark for PCIe two-shot fp8 SP collectives.
+"""Correctness tests for PCIe two-shot fp8 SP collectives.
 
 Run with torchrun on 2, 4 or 8 GPUs:
 
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.run \
-        --nproc-per-node=8 tests/distributed/test_pcie_twoshot.py
+        --nproc-per-node=8 tests/experimental/b12x/comm/test_pcie_twoshot.py
 """
 
 import ctypes
@@ -13,6 +13,9 @@ import time
 import pytest
 import torch
 import torch.distributed as dist
+
+from b12x.comm.pcie import _twoshot_preparation as preparation
+from b12x.preparation import CollectiveRequirement, PreparationSession
 
 from b12x.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReduce,
@@ -130,9 +133,7 @@ def _local_staging_words(
         scale_offset + pool.world_size * scale_stride * 4,
         256,
     )
-    signal_bytes = (
-        pool._staging_ptrs[0][pool.rank] - pool._signal_ptrs[pool.rank]
-    )
+    signal_bytes = pool._staging_ptrs[0][pool.rank] - pool._signal_ptrs[pool.rank]
     remote_source = (pool.rank + 1) % pool.world_size
     source_offset = remote_source * pack_stride * 16
     words = (ctypes.c_uint64(), ctypes.c_uint64())
@@ -179,8 +180,49 @@ def _partial(seed: int, rows: int, device: torch.device) -> torch.Tensor:
     return x.to(device=device, dtype=torch.bfloat16)
 
 
+def _prepare(
+    session, pool, operation, payload, scale, out=None, *, threads=512, block_limit=64
+):
+    if out is None:
+        rows = (
+            payload.shape[0] // pool.world_size
+            if operation == "reduce_scatter"
+            else payload.shape[0] * pool.world_size
+        )
+        out = torch.empty(
+            rows, pool.row_elems, dtype=torch.bfloat16, device=pool.device
+        )
+    call = dict(
+        payload=payload, scale=scale, out=out, threads=threads, block_limit=block_limit
+    )
+    query = preparation.query_from_runtime(
+        pool,
+        surface=f"TwoShotReduceScatter.{operation}_fp8",
+        call=call,
+    )
+    plan = preparation.plan(query, runtime=pool)
+    name = f"{operation}-{block_limit}"
+    session.prepare(
+        (
+            plan.request(
+                name=name,
+                collective=CollectiveRequirement(
+                    key=name, ranks=tuple(range(pool.world_size))
+                ),
+                prepare_call=lambda state: preparation.prepared_call(
+                    state, payload=payload, scale=scale, out=out
+                ),
+            ),
+        ),
+        coordinator=lambda state: (
+            state.ready_collectives[0].key if state.ready_collectives else None
+        ),
+    )
+    return plan
+
+
 def _check_reduce_scatter(
-    pool: PCIeTwoShotSP, rank: int, world: int, step: int
+    pool: PCIeTwoShotSP, plan, rank: int, world: int, step: int
 ) -> None:
     device = pool.device
     payloads = []
@@ -193,7 +235,7 @@ def _check_reduce_scatter(
     if step == 0:
         wrong_device = (rank + 1) % world
         torch.cuda.set_device(wrong_device)
-    out = pool.reduce_scatter_fp8(payloads[rank], scales[rank])
+    out = pool.reduce_scatter_fp8(payloads[rank], scales[rank], plan=plan)
     if step == 0:
         assert torch.cuda.current_device() == wrong_device
         torch.cuda.set_device(rank)
@@ -206,7 +248,9 @@ def _check_reduce_scatter(
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
 
 
-def _check_all_gather(pool: PCIeTwoShotSP, rank: int, world: int, step: int) -> None:
+def _check_all_gather(
+    pool: PCIeTwoShotSP, plan, rank: int, world: int, step: int
+) -> None:
     device = pool.device
     rows_per_rank = ROWS // world
     shards = []
@@ -216,7 +260,7 @@ def _check_all_gather(pool: PCIeTwoShotSP, rank: int, world: int, step: int) -> 
         shards.append(q)
         scales.append(s)
 
-    out = pool.all_gather_fp8(shards[rank], scales[rank])
+    out = pool.all_gather_fp8(shards[rank], scales[rank], plan=plan)
 
     ref = torch.cat(
         [
@@ -227,7 +271,7 @@ def _check_all_gather(pool: PCIeTwoShotSP, rank: int, world: int, step: int) -> 
     assert torch.equal(out, ref), "all_gather must be exact (dequant only)"
 
 
-def _check_graph_capture(pool: PCIeTwoShotSP, rank: int, world: int) -> None:
+def _check_graph_capture(pool: PCIeTwoShotSP, session, rank: int, world: int) -> None:
     device = pool.device
     rows_per_rank = ROWS // world
     q_in = torch.zeros(ROWS, ROW_ELEMS, dtype=torch.float8_e4m3fn, device=device)
@@ -239,25 +283,31 @@ def _check_graph_capture(pool: PCIeTwoShotSP, rank: int, world: int) -> None:
     ag_s = torch.zeros(rows_per_rank, dtype=torch.float32, device=device)
     ag_out = torch.empty(ROWS, ROW_ELEMS, dtype=torch.bfloat16, device=device)
 
+    rs_plan = _prepare(
+        session, pool, "reduce_scatter", q_in, s_in, rs_out, block_limit=7
+    )
+    ag_plan = _prepare(session, pool, "all_gather", ag_q, ag_s, ag_out, block_limit=3)
+    rs_default = _prepare(session, pool, "reduce_scatter", q_in, s_in, rs_out)
+    ag_default = _prepare(session, pool, "all_gather", ag_q, ag_s, ag_out)
     graph = torch.cuda.CUDAGraph()
     # Warmup on a side stream, then capture.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        pool.reduce_scatter_fp8(q_in, s_in, rs_out, block_limit=7)
-        pool.all_gather_fp8(ag_q, ag_s, ag_out, block_limit=3)
+        pool.reduce_scatter_fp8(q_in, s_in, rs_out, plan=rs_plan, block_limit=7)
+        pool.all_gather_fp8(ag_q, ag_s, ag_out, plan=ag_plan, block_limit=3)
         # Leave the host selector on odd parity before first capture. The
         # graph specialization must seed that exact next slot, not assume 0.
-        pool.reduce_scatter_fp8(q_in, s_in, rs_out, block_limit=7)
+        pool.reduce_scatter_fp8(q_in, s_in, rs_out, plan=rs_plan, block_limit=7)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     dist.barrier()
 
-    with pool.capture(), torch.cuda.graph(graph):
+    with session.capture(), pool.capture(plan=rs_plan), torch.cuda.graph(graph):
         # Deliberately use different grid sizes: slot selection is driven by
         # one channel-wide epoch, never by per-CTA barrier-counter parity.
-        pool.reduce_scatter_fp8(q_in, s_in, rs_out, block_limit=7)
-        pool.all_gather_fp8(ag_q, ag_s, ag_out, block_limit=3)
+        pool.reduce_scatter_fp8(q_in, s_in, rs_out, plan=rs_plan, block_limit=7)
+        pool.all_gather_fp8(ag_q, ag_s, ag_out, plan=ag_plan, block_limit=3)
 
     for step in (11, 12):
         payloads, scales, shards, sscales = [], [], [], []
@@ -293,13 +343,13 @@ def _check_graph_capture(pool: PCIeTwoShotSP, rank: int, world: int) -> None:
     # Capture a single collective so adjacent replays must alternate the
     # device-selected staging slot. The two-op graph above has even parity.
     odd_graph = torch.cuda.CUDAGraph()
-    with pool.capture(operations=("all_gather",)), torch.cuda.graph(odd_graph):
-        pool.all_gather_fp8(ag_q, ag_s, ag_out)
+    with session.capture(), pool.capture(plan=ag_default), torch.cuda.graph(odd_graph):
+        pool.all_gather_fp8(ag_q, ag_s, ag_out, plan=ag_default)
 
     for value in (11, 12):
         ag_q.fill_(float(value + rank))
         ag_s.fill_(1.0)
-        pool.all_gather_fp8(ag_q, ag_s, ag_out)
+        pool.all_gather_fp8(ag_q, ag_s, ag_out, plan=ag_default)
     torch.cuda.synchronize()
     snapshots = [_local_staging_words(pool, torch.cuda.current_stream(device))]
 
@@ -318,13 +368,13 @@ def _check_graph_capture(pool: PCIeTwoShotSP, rank: int, world: int) -> None:
     _assert_alternating_slots(snapshots)
 
     rs_graph = torch.cuda.CUDAGraph()
-    with pool.capture(operations=("reduce_scatter",)), torch.cuda.graph(rs_graph):
-        pool.reduce_scatter_fp8(q_in, s_in, rs_out)
+    with session.capture(), pool.capture(plan=rs_default), torch.cuda.graph(rs_graph):
+        pool.reduce_scatter_fp8(q_in, s_in, rs_out, plan=rs_default)
 
     for value in (21, 22):
         q_in.fill_(float(value + rank))
         s_in.fill_(1.0)
-        pool.reduce_scatter_fp8(q_in, s_in, rs_out)
+        pool.reduce_scatter_fp8(q_in, s_in, rs_out, plan=rs_default)
     torch.cuda.synchronize()
     snapshots = [_local_staging_words(pool, torch.cuda.current_stream(device))]
 
@@ -343,6 +393,7 @@ def _check_graph_capture(pool: PCIeTwoShotSP, rank: int, world: int) -> None:
 
 def _check_queued_graph_replay(
     pool: PCIeTwoShotSP,
+    session,
     rank: int,
     world: int,
     operation: str,
@@ -354,13 +405,9 @@ def _check_queued_graph_replay(
     rows_per_rank = graph_rows // world
     input_rows = graph_rows if operation == "reduce_scatter" else rows_per_rank
     output_rows = rows_per_rank if operation == "reduce_scatter" else graph_rows
-    q_in = torch.empty(
-        input_rows, ROW_ELEMS, dtype=torch.float8_e4m3fn, device=device
-    )
+    q_in = torch.empty(input_rows, ROW_ELEMS, dtype=torch.float8_e4m3fn, device=device)
     s_in = torch.empty(input_rows, dtype=torch.float32, device=device)
-    out = torch.empty(
-        output_rows, ROW_ELEMS, dtype=torch.bfloat16, device=device
-    )
+    out = torch.empty(output_rows, ROW_ELEMS, dtype=torch.bfloat16, device=device)
     snapshots = [torch.empty_like(out) for _ in range(3)]
 
     payload_steps: list[list[torch.Tensor]] = []
@@ -387,6 +434,9 @@ def _check_queued_graph_replay(
     # following replay's remote push before rank zero has drained its prior
     # slot, deterministically exercising the double-slot graph protocol.
     rank_threads = 32 if rank == 0 else 512
+    plan = _prepare(
+        session, pool, operation, q_in, s_in, out, threads=rank_threads, block_limit=3
+    )
     if operation == "reduce_scatter":
 
         def launch():
@@ -394,6 +444,7 @@ def _check_queued_graph_replay(
                 q_in,
                 s_in,
                 out,
+                plan=plan,
                 threads=rank_threads,
                 block_limit=3,
             )
@@ -405,17 +456,17 @@ def _check_queued_graph_replay(
                 q_in,
                 s_in,
                 out,
+                plan=plan,
                 threads=rank_threads,
                 block_limit=3,
             )
+
     launch()
     torch.cuda.synchronize()
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
-    with pool.capture(
-        operations=(operation,), threads=rank_threads
-    ), torch.cuda.graph(graph):
+    with session.capture(), pool.capture(plan=plan), torch.cuda.graph(graph):
         launch()
 
     # Queue three replays without a cross-rank host barrier. Rank zero pauses
@@ -462,48 +513,6 @@ def _check_queued_graph_replay(
             assert torch.equal(snapshots[step], ref)
 
 
-def _bench(pool: PCIeTwoShotSP, rank: int, world: int) -> None:
-    device = pool.device
-    rows_per_rank = ROWS // world
-    x = torch.randn(ROWS, ROW_ELEMS, dtype=torch.bfloat16, device=device)
-    q, s = quantize_per_row(x)
-    qs, ss = quantize_per_row(x[:rows_per_rank])
-    rs_out = torch.empty(rows_per_rank, ROW_ELEMS, dtype=torch.bfloat16, device=device)
-    ag_out = torch.empty(ROWS, ROW_ELEMS, dtype=torch.bfloat16, device=device)
-    nccl_rs_out = torch.empty(
-        rows_per_rank, ROW_ELEMS, dtype=torch.bfloat16, device=device
-    )
-    nccl_ag_out = torch.empty(ROWS, ROW_ELEMS, dtype=torch.bfloat16, device=device)
-    shard_bf16 = x[:rows_per_rank].contiguous()
-
-    def timeit(fn, iters=30) -> float:
-        for _ in range(5):
-            fn()
-        torch.cuda.synchronize()
-        dist.barrier()
-        start = time.perf_counter()
-        for _ in range(iters):
-            fn()
-        torch.cuda.synchronize()
-        return (time.perf_counter() - start) / iters * 1e6
-
-    results = {
-        "b12x rs_fp8": timeit(lambda: pool.reduce_scatter_fp8(q, s, rs_out)),
-        "b12x ag_fp8": timeit(lambda: pool.all_gather_fp8(qs, ss, ag_out)),
-        "nccl rs bf16": timeit(lambda: dist.reduce_scatter_tensor(nccl_rs_out, x)),
-        "nccl ag bf16": timeit(
-            lambda: dist.all_gather_into_tensor(nccl_ag_out, shard_bf16)
-        ),
-    }
-    if rank == 0:
-        payload_mb = ROWS * ROW_ELEMS / 1e6
-        print(
-            f"[{world} ranks, {ROWS}x{ROW_ELEMS}, payload {payload_mb:.0f} MB bf16-equiv]"
-        )
-        for name, us in results.items():
-            print(f"  {name:14s} {us:9.1f} us")
-
-
 def main() -> None:
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -519,20 +528,36 @@ def main() -> None:
         row_elems=ROW_ELEMS,
     )
 
-    for step in range(4):  # exercises double-buffer slot alternation
-        _check_reduce_scatter(pool, rank, world, step)
-        _check_all_gather(pool, rank, world, step)
-    _check_graph_capture(pool, rank, world)
-    _check_queued_graph_replay(pool, rank, world, "reduce_scatter")
-    _check_queued_graph_replay(pool, rank, world, "all_gather")
-    dist.barrier()
-    if rank == 0:
-        print("pcie_twoshot correctness OK")
-    if os.getenv("B12X_TEST_TWOSHOT_SKIP_BENCH", "0") != "1":
-        _bench(pool, rank, world)
+    def barrier(key, ranks):
+        assert tuple(ranks) == tuple(range(world))
+        with torch.cuda.device(device):
+            dist.barrier(device_ids=[local_rank])
 
-    pool.close()
-    dist.destroy_process_group()
+    session = PreparationSession(
+        device=device,
+        autotune=False,
+        compile_workers=1,
+        collective_barrier=barrier,
+    )
+    try:
+        q, scales = quantize_per_row(_partial(rank, ROWS, device))
+        rs_plan = _prepare(session, pool, "reduce_scatter", q, scales)
+        ag_plan = _prepare(
+            session, pool, "all_gather", q[: ROWS // world], scales[: ROWS // world]
+        )
+        for step in range(4):
+            _check_reduce_scatter(pool, rs_plan, rank, world, step)
+            _check_all_gather(pool, ag_plan, rank, world, step)
+        _check_graph_capture(pool, session, rank, world)
+        _check_queued_graph_replay(pool, session, rank, world, "reduce_scatter")
+        _check_queued_graph_replay(pool, session, rank, world, "all_gather")
+        dist.barrier()
+        if rank == 0:
+            print("pcie_twoshot correctness OK")
+    finally:
+        session.close()
+        pool.close()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

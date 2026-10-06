@@ -11,6 +11,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import b12x.comm.pcie.pcie_dcp_a2a as pcie_dcp_a2a
+from b12x.comm.pcie import _dcp_preparation as preparation
+from b12x.preparation import CollectiveRequirement, PreparationSession
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
 from b12x.comm.pcie.pcie_dcp_a2a import (
     PCIeDCPA2A,
@@ -132,12 +134,89 @@ def _local_staging_words(channel, stream: torch.cuda.Stream) -> tuple[int, int]:
     return words[0].value, words[1].value
 
 
+def _prepare_channel(session, channel):
+    plans = {}
+    for operation, dtypes in (
+        ("all_gather_heads", (torch.bfloat16, torch.float16, torch.float8_e4m3fn)),
+        ("lse_reduce_scatter", (torch.bfloat16, torch.float16)),
+    ):
+        for dtype in dtypes:
+            if operation == "all_gather_heads":
+                call = dict(
+                    local_input=torch.zeros(
+                        MAX_BATCH,
+                        channel.heads_per_rank,
+                        QUERY_HEAD_DIM,
+                        dtype=dtype,
+                        device=channel.device,
+                    ),
+                    out=torch.empty(
+                        MAX_BATCH,
+                        TOTAL_HEADS,
+                        QUERY_HEAD_DIM,
+                        dtype=dtype,
+                        device=channel.device,
+                    ),
+                )
+            else:
+                call = dict(
+                    partial_output=torch.zeros(
+                        MAX_BATCH,
+                        TOTAL_HEADS,
+                        HEAD_DIM,
+                        dtype=dtype,
+                        device=channel.device,
+                    ),
+                    partial_lse=torch.zeros(
+                        MAX_BATCH,
+                        TOTAL_HEADS,
+                        device=channel.device,
+                    ),
+                    out=torch.empty(
+                        MAX_BATCH,
+                        channel.heads_per_rank,
+                        HEAD_DIM,
+                        dtype=dtype,
+                        device=channel.device,
+                    ),
+                )
+            query = preparation.query_from_runtime(
+                channel,
+                surface=f"DcpAllToAll.{operation}",
+                call=call,
+            )
+            plan = preparation.plan(query, runtime=channel)
+            name = f"{operation}-{dtype}"
+            session.prepare(
+                (
+                    plan.request(
+                        name=name,
+                        collective=CollectiveRequirement(
+                            key=name,
+                            ranks=tuple(range(channel.world_size)),
+                        ),
+                        prepare_call=lambda state, call=call: preparation.prepare_call(
+                            state, **call
+                        ),
+                    ),
+                ),
+                coordinator=lambda state: (
+                    state.ready_collectives[0].key if state.ready_collectives else None
+                ),
+            )
+            plans[operation, dtype] = plan
+    return plans
+
+
 def _check_eager(
     pool: PCIeDCPA2APool,
+    session: PreparationSession,
     rank: int,
     world_size: int,
     device: torch.device,
 ) -> None:
+    channel = pool.for_stream(channel_id="eager:dcp")
+    plans = _prepare_channel(session, channel)
     for dtype in (torch.bfloat16, torch.float16):
         for step, batch in enumerate(TEST_BATCHES, start=1):
             local_q = _rank_query(
@@ -153,7 +232,9 @@ def _check_eager(
             if guard_gather:
                 torch.cuda.set_device(wrong_device)
             gathered_q = pool.all_gather_heads(
-                local_q, channel_id="eager:dcp"
+                local_q,
+                plan=plans["all_gather_heads", local_q.dtype],
+                channel_id="eager:dcp",
             )
             if guard_gather:
                 assert torch.cuda.current_device() == wrong_device
@@ -179,7 +260,10 @@ def _check_eager(
             if guard_reduce:
                 torch.cuda.set_device(wrong_device)
             out = pool.lse_reduce_scatter(
-                partial_output, partial_lse, channel_id="eager:dcp"
+                partial_output,
+                partial_lse,
+                plan=plans["lse_reduce_scatter", dtype],
+                channel_id="eager:dcp",
             )
             if guard_reduce:
                 assert torch.cuda.current_device() == wrong_device
@@ -216,6 +300,7 @@ def _check_eager(
                 head_major_input,
                 partial_lse,
                 out=head_major_output,
+                plan=plans["lse_reduce_scatter", dtype],
                 channel_id="eager:dcp",
             )
             torch.cuda.synchronize(device)
@@ -232,7 +317,11 @@ def _check_eager(
             torch.float8_e4m3fn,
             device,
         )
-        gathered_q = pool.all_gather_heads(local_q, channel_id="eager:dcp")
+        gathered_q = pool.all_gather_heads(
+            local_q,
+            plan=plans["all_gather_heads", local_q.dtype],
+            channel_id="eager:dcp",
+        )
         expected_q = torch.cat(
             [
                 _rank_query(
@@ -257,11 +346,13 @@ def _check_eager(
 
 def _check_eager_adjacency(
     pool: PCIeDCPA2APool,
+    session: PreparationSession,
     rank: int,
     world_size: int,
     device: torch.device,
 ) -> None:
     channel = pool.for_stream(channel_id="eager:dcp")
+    plans = _prepare_channel(session, channel)
     first_query = _rank_query(700, rank, world_size, MAX_BATCH, torch.bfloat16, device)
     second_query = _rank_query(701, rank, world_size, MAX_BATCH, torch.bfloat16, device)
     partial_output, partial_lse = _rank_inputs(702, rank, 1, torch.bfloat16, device)
@@ -283,9 +374,18 @@ def _check_eager_adjacency(
 
     # Issue large-grid AG -> small-grid RS -> large-grid AG without a host
     # synchronization so adjacent eager executions exercise slot advancement.
-    channel.all_gather_heads(first_query, first_gather)
-    channel.lse_reduce_scatter(partial_output, partial_lse, reduced)
-    channel.all_gather_heads(second_query, second_gather)
+    channel.all_gather_heads(
+        first_query, first_gather, plan=plans["all_gather_heads", first_query.dtype]
+    )
+    channel.lse_reduce_scatter(
+        partial_output,
+        partial_lse,
+        reduced,
+        plan=plans["lse_reduce_scatter", partial_output.dtype],
+    )
+    channel.all_gather_heads(
+        second_query, second_gather, plan=plans["all_gather_heads", second_query.dtype]
+    )
     torch.cuda.synchronize(device)
 
     expected_first = torch.cat(
@@ -314,6 +414,7 @@ def _check_eager_adjacency(
 
 def _check_graph(
     pool: PCIeDCPA2APool,
+    session: PreparationSession,
     rank: int,
     world_size: int,
     device: torch.device,
@@ -372,22 +473,38 @@ def _check_graph(
     ]
 
     with torch.cuda.stream(stream):
-        channel.all_gather_heads(local_queries[0], gathered_queries[0])
-        channel.lse_reduce_scatter(inputs[0], lses[0], outputs[0])
+        plans = _prepare_channel(session, channel)
+        channel.all_gather_heads(
+            local_queries[0],
+            gathered_queries[0],
+            plan=plans["all_gather_heads", local_queries[0].dtype],
+        )
+        channel.lse_reduce_scatter(
+            inputs[0],
+            lses[0],
+            outputs[0],
+            plan=plans["lse_reduce_scatter", inputs[0].dtype],
+        )
     stream.synchronize()
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
-    with pool.capture(
-        stream, channel_id="graph:layer-stack"
-    ) as graph_channel, torch.cuda.graph(graph, stream=stream):
-        for layer in range(layers):
-            graph_channel.all_gather_heads(
-                local_queries[layer], gathered_queries[layer]
-            )
-            graph_channel.lse_reduce_scatter(
-                inputs[layer], lses[layer], outputs[layer]
-            )
+    with pool.capture(stream, channel_id="graph:layer-stack") as graph_channel:
+        with torch.cuda.stream(stream):
+            graph_plans = _prepare_channel(session, graph_channel)
+        with session.capture(), torch.cuda.graph(graph, stream=stream):
+            for layer in range(layers):
+                graph_channel.all_gather_heads(
+                    local_queries[layer],
+                    gathered_queries[layer],
+                    plan=graph_plans["all_gather_heads", local_queries[layer].dtype],
+                )
+                graph_channel.lse_reduce_scatter(
+                    inputs[layer],
+                    lses[layer],
+                    outputs[layer],
+                    plan=graph_plans["lse_reduce_scatter", inputs[layer].dtype],
+                )
     stream.synchronize()
 
     replay_count = int(os.getenv("B12X_PCIE_DCP_GRAPH_REPLAYS", "8"))
@@ -473,13 +590,17 @@ def _check_graph(
         device=device,
     )
     with torch.cuda.stream(stream):
-        channel.all_gather_heads(odd_input, odd_output)
+        channel.all_gather_heads(
+            odd_input, odd_output, plan=plans["all_gather_heads", odd_input.dtype]
+        )
     stream.synchronize()
     dist.barrier()
 
     odd_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(odd_graph, stream=stream):
-        channel.all_gather_heads(odd_input, odd_output)
+    with session.capture(), torch.cuda.graph(odd_graph, stream=stream):
+        channel.all_gather_heads(
+            odd_input, odd_output, plan=plans["all_gather_heads", odd_input.dtype]
+        )
     stream.synchronize()
 
     # Prime both slots after capture, then observe them read-only. A graph with
@@ -488,7 +609,9 @@ def _check_graph(
     with torch.cuda.stream(stream):
         for value in (11.0, 12.0):
             odd_input.fill_(value)
-            channel.all_gather_heads(odd_input, odd_output)
+            channel.all_gather_heads(
+                odd_input, odd_output, plan=plans["all_gather_heads", odd_input.dtype]
+            )
     snapshots = [_local_staging_words(channel, stream)]
     for value in (1.0, 2.0):
         with torch.cuda.stream(stream):
@@ -515,6 +638,7 @@ def _check_graph(
 
 def _check_semantic_capture_warmup(
     pool: PCIeDCPA2APool,
+    session: PreparationSession,
     rank: int,
     world_size: int,
     device: torch.device,
@@ -557,14 +681,19 @@ def _check_semantic_capture_warmup(
         torch.cuda.stream(stream),
         pool.capture(stream, channel_id="graph:warmup") as graph_channel,
     ):
+        plans = _prepare_channel(session, graph_channel)
         warmup_channel = pool.for_stream(stream, channel_id="eager:dcp")
         assert warmup_channel is graph_channel
-        warmup_channel.all_gather_heads(local_query, gathered)
+        warmup_channel.all_gather_heads(
+            local_query, gathered, plan=plans["all_gather_heads", local_query.dtype]
+        )
         stream.synchronize()
         torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
 
-        with torch.cuda.graph(graph, stream=stream):
-            graph_channel.all_gather_heads(local_query, gathered)
+        with session.capture(), torch.cuda.graph(graph, stream=stream):
+            graph_channel.all_gather_heads(
+                local_query, gathered, plan=plans["all_gather_heads", local_query.dtype]
+            )
 
     # The eager DCP channel was already bound to vLLM's default stream. Its
     # original mapping must be usable again after the graph-owner scope exits.
@@ -618,6 +747,7 @@ def _check_teardown_retry(
 
 def _check_queued_mixed_grid_graph(
     pool: PCIeDCPA2APool,
+    session: PreparationSession,
     rank: int,
     world_size: int,
     device: torch.device,
@@ -672,12 +802,21 @@ def _check_queued_mixed_grid_graph(
 
     graph = torch.cuda.CUDAGraph()
     dist.barrier()
-    with pool.capture(channel_id="graph:mixed-grid") as channel, torch.cuda.graph(
-        graph
-    ):
-        channel.all_gather_heads(query_a, gathered_a)
-        channel.lse_reduce_scatter(partial_output, partial_lse, reduced)
-        channel.all_gather_heads(query_b, gathered_b)
+    with pool.capture(channel_id="graph:mixed-grid") as channel:
+        plans = _prepare_channel(session, channel)
+        with session.capture(), torch.cuda.graph(graph):
+            channel.all_gather_heads(
+                query_a, gathered_a, plan=plans["all_gather_heads", query_a.dtype]
+            )
+            channel.lse_reduce_scatter(
+                partial_output,
+                partial_lse,
+                reduced,
+                plan=plans["lse_reduce_scatter", partial_output.dtype],
+            )
+            channel.all_gather_heads(
+                query_b, gathered_b, plan=plans["all_gather_heads", query_b.dtype]
+            )
 
     replay_steps = (4100, 4200, 4300)
     local_payloads = []
@@ -802,24 +941,36 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         query_head_dim=QUERY_HEAD_DIM,
         max_concurrent_channels=2,
     )
+
+    def barrier(key, ranks):
+        assert tuple(ranks) == tuple(range(world_size))
+        with torch.cuda.device(device):
+            dist.barrier(device_ids=[rank])
+
+    session = PreparationSession(
+        device=device,
+        autotune=False,
+        compile_workers=1,
+        collective_barrier=barrier,
+    )
     closed = False
     try:
         pool.prepare_channels(("eager:dcp", "graph"))
         if rank == 0:
             print("A2A GPU gate: eager", flush=True)
-        _check_eager(pool, rank, world_size, device)
+        _check_eager(pool, session, rank, world_size, device)
         dist.barrier()
-        _check_eager_adjacency(pool, rank, world_size, device)
+        _check_eager_adjacency(pool, session, rank, world_size, device)
         dist.barrier()
-        _check_semantic_capture_warmup(pool, rank, world_size, device)
+        _check_semantic_capture_warmup(pool, session, rank, world_size, device)
         dist.barrier()
         if rank == 0:
             print("A2A GPU gate: graph replay", flush=True)
-        _check_graph(pool, rank, world_size, device)
+        _check_graph(pool, session, rank, world_size, device)
         dist.barrier()
         if rank == 0:
             print("A2A GPU gate: queued mixed-grid skew", flush=True)
-        _check_queued_mixed_grid_graph(pool, rank, world_size, device)
+        _check_queued_mixed_grid_graph(pool, session, rank, world_size, device)
         if rank == 0:
             print("A2A GPU gate: complete", flush=True)
         torch.cuda.synchronize(device)
@@ -827,6 +978,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             _check_teardown_retry(pool, rank, device)
             closed = True
     finally:
+        session.close()
         if not closed:
             pool.close()
         dist.destroy_process_group()
