@@ -1267,7 +1267,21 @@ def _combined_metadata(rows: int, compressed: int, *, value_base: int = 0):
 
 # Tensors run_cake_dsv4 places in the host value table that a generated TMA
 # descriptor may alias (see cake._TMA_SOURCE_ALIASES).
-_HOST_TMA_SOURCE_TENSORS = frozenset({"Q", "SWA_cache", "compressed_KV_cache", "O"})
+_HOST_TMA_SOURCE_TENSORS = frozenset(
+    {
+        "Q",
+        "SWA_cache",
+        "compressed_KV_cache",
+        "O",
+        # NVFP4 route: the partial-O tile view and the gather4 cache views are
+        # tensor values of run_cake_dsv4_nvfp4 (see _TENSOR_VALUE_NAMES).
+        "partial_O_tiles",
+        "main_cache_g4d",
+        "main_cache_g4f",
+        "extra_cache_g4d",
+        "extra_cache_g4f",
+    }
+)
 
 
 @pytest.mark.parametrize("arch", _ARCHES)

@@ -69,6 +69,40 @@ Host contract (flashinfer#4671 hardening)
   Successive calls through one workspace (the layers of a model) therefore do
   not collide, and a stream of fresh query tensors does not grow memory
   without bound. Nothing else allocates device memory.
+
+NVFP4 cache route (``kv_cache_format="nvfp4"``)
+---------------------------------------------------------
+
+:func:`run_cake_dsv4_nvfp4` hosts the DeepSeek-V4 NVFP4 sparse-MLA decode
+family (Cake ``flashinfer_blackwell_sparse_mla_dsv4_nvfp4_decode`` and
+``..._decode_tile`` plus their shared split merge). The pools are the SM120
+NVFP4 cache ABI: opaque ``uint8`` pages of ``page_size * 352`` data bytes
+(224 B E2M1 NoPE + 128 B BF16 RoPE per token) followed by ``page_size * 32``
+scale bytes, i.e. 384 bytes per token; indices are flat token coordinates
+``page * page_size + slot``, ``-1`` masks a candidate, and the optional length
+vectors clamp the active prefix of each table. The two tables are
+independent (``sparse_indices`` over ``swa_kv_cache``, ``extra_sparse_indices``
+over ``compressed_kv_cache``); there is no combined-table column offset.
+
+The launch plan (:func:`_nvfp4_plan`) reproduces the Cake family ``plan()``:
+128-wide candidate tiles; rows with ``H <= 32`` run the persistent SwapsAB
+member (``pv``) when its wave-aware split rule gives more than one tile per
+CTA and the one-tile SwapsAB member (``swap``) otherwise; rows with ``H >= 64``
+pick the member and split count with the lowest modelled chain cost among the
+one-tile ``tile`` member, the persistent member, the 2-CTA ``cluster`` member
+and the tile64 member (``t64``, 64 heads per CTA). The one-tile members run
+``o_chunks`` CTAs per work item; the split merge runs on
+``merge_heads_per_cta`` heads per CTA. Each (member, retrace knobs) pair is one
+registered variant (``_nvfp4_variant_name``: ``nvfp4_decode_persistent``,
+``nvfp4_decode_cluster``, ``nvfp4_decode_t64_n64_oc1``,
+``nvfp4_decode_pv_n{16,32}_oc1``, ``nvfp4_decode_swap_n{16,32}_oc{1,2,4}``,
+``nvfp4_decode_tile_oc{1,2,4}``) plus ``nvfp4_merge``, bound through the same
+registration machinery as the BF16/FP8 routes from the generated sources under
+``csrc/cake_dsv4/sm_100a`` and ``csrc/cake_dsv4/sm_103a``; a plan that selects
+an unexported variant raises ``NotImplementedError``. Splits write
+``partial_O [T, H, S, 512]`` BF16 and ``partial_lse [T, H, S]`` FP32 into the
+workspace; the final base-2 LSE lives in an extra ``lse`` region appended
+after ``partial_lse`` (:func:`cake_dsv4_workspace_layout` ``with_lse=True``).
 """
 
 from __future__ import annotations
@@ -121,6 +155,51 @@ _FP8_ONE_PARTITION_MAX_WIDTH = 384
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
 _PRIMED_ATTR = "_cake_dsv4_counters_primed"
+
+# NVFP4 cache route. Mirrors the Cake kernel module constants
+# (flashinfer_blackwell_sparse_mla_dsv4_nvfp4_decode: TOKEN_DATA_BYTES +
+# TOKEN_SF_BYTES, TILE_Q, MAX_SPLITS, SUPPORTED_HEAD_COUNTS).
+_NVFP4_TOKEN_BYTES = 384
+_NVFP4_TILE_Q = 128
+_NVFP4_MAX_SPLITS = 12
+_NVFP4_HEAD_COUNTS = (8, 16, 32, 64, 128)
+_NVFP4_HEAD_DIM = 512
+_NVFP4_VARIANT_PERSISTENT = "nvfp4_decode_persistent"
+_NVFP4_VARIANT_CLUSTER = "nvfp4_decode_cluster"
+_NVFP4_VARIANT_MERGE = "nvfp4_merge"
+_NVFP4_CLUSTER_CTAS = (
+    2  # CTAs per cluster of the cluster member (each owns 256 of the 512 output dims)
+)
+# Family planner (Cake flashinfer_blackwell_sparse_mla_dsv4_nvfp4_decode.plan, round 43 / 45).  Multi-tile rows
+# with H <= _NVFP4_PV_MAX_HEADS take the persistent SwapsAB member ("pv") when its wave-aware split rule gives more
+# than one tile per CTA; H > _NVFP4_PV_MAX_HEADS rows pick (member, splits) with the lowest modelled chain cost among
+# the one-tile "tile" member, the persistent member, the 2-CTA cluster member (H >= _NVFP4_CLUSTER_MIN_HEADS) and
+# the tile64 member "t64" (_NVFP4_T64_HEAD_COUNTS); one-tile rows take the SwapsAB one-tile member "swap" (H <=
+# _NVFP4_SWAP_MAX_HEADS) or the "tile" member, each with its own CTAs-per-work-item split (o_chunks).
+_NVFP4_PV_MAX_HEADS = 32
+_NVFP4_SWAP_MAX_HEADS = 32
+_NVFP4_CLUSTER_MIN_HEADS = 64
+_NVFP4_T64_HEAD_COUNTS = (64, 128)
+_NVFP4_T64_TILE_Q = 64  # heads per CTA of the tile64 member (H128 runs two head tiles)
+# Round-43 chain model (Cake PLAN_CHAIN_US / PLAN_MERGE_US / PLAN_MERGE_US_PER_MB): member -> (HEAD, TILE, LOAD) us;
+# a row costs waves * (HEAD + (tiles_per_split - 1) * TILE + LOAD * min(grid, slots) / slots) plus, with more than
+# one split, MERGE + MERGE_PER_MB * (T * H * (splits + 1) * 512 * 2 bytes / 1e6).
+_NVFP4_PLAN_CHAIN_US: Mapping[str, tuple[float, float, float]] = {
+    "persistent": (11.4, 4.5, 3.1),
+    "cluster": (10.6, 3.9, 0.2),
+    "t64": (8.2, 3.5, 3.4),
+    "tile": (8.8, 0.0, 1.7),
+}
+_NVFP4_PLAN_MERGE_US = 3.9
+_NVFP4_PLAN_MERGE_US_PER_MB = 0.20
+# Persistent SwapsAB member split rule (Cake flashinfer_blackwell_sparse_mla_dsv4_nvfp4_decode_swap_pv.plan):
+# waves * (HEAD + (tiles_per_split - 1) * TILE) + MERGE over every split count, first minimum wins.
+_NVFP4_PV_PLAN_HEAD_US = 8.6
+_NVFP4_PV_PLAN_TILE_US = 3.0
+_NVFP4_PV_PLAN_MERGE_US = 1.5
+# Split merge (Cake MERGE_HEADS_PER_CTA / merge_heads_per_cta): 16 warps per CTA, one (token, head) per warp;
+# heads_per_cta is the smallest power of two whose grid T x ceil(H / hpc) stays within one CTA per SM (round 45).
+_NVFP4_MERGE_HEADS_PER_CTA = 16
 
 
 # Work feed of the BF16/H128 persistent prefill body (mirrors the Cake seed's
@@ -426,12 +505,23 @@ class WorkspaceLayout:
     partial_o: tuple[int, int]
     partial_lse: tuple[int, int]
     total_bytes: int
+    # Final base-2 LSE f32 [T * H]; only carved for the NVFP4 route
+    # (``with_lse=True``), otherwise an empty region at the layout end.
+    lse: tuple[int, int] = (0, 0)
 
 
 def cake_dsv4_workspace_layout(
-    num_query_tokens: int, num_heads: int, num_splits: int
+    num_query_tokens: int,
+    num_heads: int,
+    num_splits: int,
+    *,
+    with_lse: bool = False,
 ) -> WorkspaceLayout:
-    """Deterministic carve of ``workspace_buffer`` for one launch shape."""
+    """Deterministic carve of ``workspace_buffer`` for one launch shape.
+
+    ``with_lse`` appends the NVFP4 route's final-LSE region after
+    ``partial_lse``; the default layout is unchanged.
+    """
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
     splits = _positive_int(num_splits, "num_splits")
@@ -440,12 +530,17 @@ def cake_dsv4_workspace_layout(
     lse_bytes = _align_up(partial_elems * torch.float32.itemsize)
     o_offset = _PARTIAL_OFFSET
     lse_offset = o_offset + o_bytes
+    final_lse_offset = lse_offset + lse_bytes
+    final_lse_bytes = (
+        _align_up(tokens * heads * torch.float32.itemsize) if with_lse else 0
+    )
     return WorkspaceLayout(
         descriptor_slab=(_DESCRIPTOR_SLAB_OFFSET, _DESCRIPTOR_SLAB_BYTES),
         counters=(_COUNTER_OFFSET, _COUNTER_REGION_BYTES),
         partial_o=(o_offset, o_bytes),
         partial_lse=(lse_offset, lse_bytes),
-        total_bytes=lse_offset + lse_bytes,
+        total_bytes=final_lse_offset + final_lse_bytes,
+        lse=(final_lse_offset, final_lse_bytes),
     )
 
 
@@ -456,6 +551,8 @@ def get_cake_dsv4_workspace_bytes(
     dtype: torch.dtype,
     *,
     num_splits: Optional[int] = None,
+    kv_cache_format: Literal["fp8", "nvfp4"] = "fp8",
+    extra_topk: int = 0,
 ) -> int:
     """Bytes ``workspace_buffer`` needs for ``backend="cake"`` at this shape.
 
@@ -471,10 +568,40 @@ def get_cake_dsv4_workspace_bytes(
     Partial buffers are BF16/FP32 for both BF16 and FP8 inputs; ``dtype`` is
     validated only. Pass ``num_splits`` to size for a known route (routes use
     ``ceil(sparse_topk / 128)`` or a fixed 1..5 splits).
+
+    ``kv_cache_format="nvfp4"`` sizes the NVFP4 cache route instead: ``S`` is
+    ``num_splits`` if given, else ``min(ceil(sparse_topk / 128) +
+    ceil(extra_topk / 128), 12)`` (the plan never exceeds the candidate tile
+    count or the kernel's 12-split cap), and a final-LSE region
+    ``align128(num_query_tokens * num_heads * 4)`` is appended.
     """
     if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(f"unsupported CAKE DSv4 dtype: {dtype}")
     topk = _positive_int(sparse_topk, "sparse_topk")
+    if kv_cache_format == "nvfp4":
+        if dtype != torch.bfloat16:
+            raise ValueError("the CAKE DSv4 NVFP4 route takes a BF16 query")
+        if (
+            isinstance(extra_topk, bool)
+            or not isinstance(extra_topk, int)
+            or extra_topk < 0
+        ):
+            raise ValueError(
+                f"extra_topk must be a non-negative int, got {extra_topk!r}"
+            )
+        splits = (
+            min(
+                _ceil_div(topk, _TILE_KV) + _ceil_div(extra_topk, _TILE_KV),
+                _NVFP4_MAX_SPLITS,
+            )
+            if num_splits is None
+            else _positive_int(num_splits, "num_splits")
+        )
+        return cake_dsv4_workspace_layout(
+            num_query_tokens, num_heads, splits, with_lse=True
+        ).total_bytes
+    if kv_cache_format != "fp8":
+        raise ValueError(f"unsupported CAKE DSv4 kv_cache_format: {kv_cache_format!r}")
     if topk < _SWA_WIDTH or topk % 4:
         raise ValueError(
             f"sparse_topk must be a multiple of 4 and at least {_SWA_WIDTH}, got {topk}"
@@ -696,6 +823,15 @@ _TMA_SOURCE_ALIASES: Mapping[str, str] = {
     # ("tma_buffer", "O"): the same output rows, encoded by the grid_constant
     # binding -- no descriptor workspace and no host copy.
     "O": "O",
+    # NVFP4 decode members store their (partial) output through a TMA
+    # descriptor over the [tokens, heads, splits, 512] view of partial_O.
+    "tmap_out": "partial_O_tiles",
+    # The gather4 members (pv / t64) read the pools through TMA gather descriptors over 32-byte-pitch int32 row
+    # views of each flat pool (data rows and footer rows; ``_nvfp4_gather4_views``).
+    "tmap_g4d": "main_cache_g4d",
+    "tmap_g4f": "main_cache_g4f",
+    "tmap_g4dx": "extra_cache_g4d",
+    "tmap_g4fx": "extra_cache_g4f",
 }
 _SCALAR_ALIASES: Mapping[str, str] = {
     "num_q_heads": "num_heads",
@@ -720,8 +856,25 @@ _TENSOR_VALUE_NAMES = frozenset(
         "sparse_topk_lens",
         # Pre-hardening combined table; bound only for combined metadata.
         "sparse_indices",
+        # NVFP4 cache route (two independent tables over two uint8 pools).
+        "q_rows",
+        "main_cache",
+        "extra_cache",
+        "main_indices",
+        "extra_indices",
+        "main_lengths",
+        "extra_lengths",
+        "partial_O_tiles",
+        "lse_out",
+        "main_cache_g4d",
+        "main_cache_g4f",
+        "extra_cache_g4d",
+        "extra_cache_g4f",
     }
 )
+# Kernel parameters bound as Python floats (the NVFP4 members take the LSE
+# scales by value); every other parameter is an int.
+_FLOAT_SCALAR_VALUE_NAMES = frozenset({"lse_partial_scale", "lse_scale"})
 _SCALAR_VALUE_NAMES = frozenset(
     {
         "swa_index_stride",
@@ -737,6 +890,22 @@ _SCALAR_VALUE_NAMES = frozenset(
         "batch_size",
         "max_q_len",
         "ragged_query",
+        # NVFP4 cache route.
+        "num_main_tiles",
+        "tiles_per_split",
+        "total_tiles",
+        "main_width",
+        "extra_width",
+        "main_index_stride",
+        "extra_index_stride",
+        "has_main_lengths",
+        "has_extra_lengths",
+        "main_page_shift",
+        "extra_page_shift",
+        "main_page_stride",
+        "extra_page_stride",
+        "heads_per_cta",
+        *_FLOAT_SCALAR_VALUE_NAMES,
     }
 )
 _GRID_NAMES = ("grid_x", "grid_y", "grid_z")
@@ -870,6 +1039,12 @@ def _bind_argument(
         hint = _UNAVAILABLE_HINTS.get(canonical, "it is not available for this call")
         raise ValueError(f"CAKE DSv4 {variant} argument {name!r}: {hint}")
     if kind == "parameter":
+        if canonical in _FLOAT_SCALAR_VALUE_NAMES:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(
+                    f"CAKE DSv4 {variant} parameter {name!r} must be a float, got {type(value).__name__}"
+                )
+            return float(value)
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(
                 f"CAKE DSv4 {variant} parameter {name!r} must be an int, got {type(value).__name__}"
@@ -1717,8 +1892,783 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
     raise RuntimeError(f"unhandled CAKE DSv4 route: {route}")
 
 
+# --------------------------------------------------------------------------- #
+# NVFP4 cache route                                                           #
+# --------------------------------------------------------------------------- #
+
+
+NVFP4Member = Literal["persistent", "cluster", "t64", "pv", "swap", "tile"]
+
+
+@dataclass(frozen=True)
+class NVFP4Plan:
+    """Launch plan of the NVFP4 decode family (Cake ``plan()`` output)."""
+
+    num_query_tokens: int
+    num_heads: int
+    num_head_tiles: int
+    main_width: int
+    extra_width: int
+    num_main_tiles: int
+    num_extra_tiles: int
+    total_tiles: int
+    num_splits: int
+    tiles_per_split: int
+    member: NVFP4Member
+    sm_count: int
+    tile_n: Optional[int] = (
+        None  # heads on the MMA N side of the SwapsAB / tile64 members (retrace knob)
+    )
+    o_chunks: int = 1  # CTAs per work item of the one-tile members (retrace knob)
+    merge_heads_per_cta: int = _NVFP4_MERGE_HEADS_PER_CTA
+
+    @property
+    def cluster_ctas(self) -> int:
+        return _NVFP4_CLUSTER_CTAS if self.member == "cluster" else 1
+
+    @property
+    def grid(self) -> int:
+        return (
+            self.num_query_tokens
+            * self.num_splits
+            * self.num_head_tiles
+            * self.cluster_ctas
+            * self.o_chunks
+        )
+
+    @property
+    def merge_groups(self) -> int:
+        return self.num_query_tokens * self.num_head_tiles
+
+    @property
+    def merge_grid(self) -> tuple[int, int, int]:
+        return (
+            self.num_query_tokens,
+            _ceil_div(self.num_heads, self.merge_heads_per_cta),
+            1,
+        )
+
+    @property
+    def variant(self) -> str:
+        return _nvfp4_variant_name(
+            self.member, tile_n=self.tile_n, o_chunks=self.o_chunks
+        )
+
+
+# Retrace knobs each member's generated program is specialised on, in variant-name order (Cake
+# flashinfer_blackwell_sparse_mla_dsv4_nvfp4_program.MEMBER_VARIANT_KNOBS).
+_NVFP4_VARIANT_KNOBS: Mapping[str, tuple[str, ...]] = {
+    "persistent": (),
+    "cluster": (),
+    "t64": ("tile_n", "o_chunks"),
+    "pv": ("tile_n", "o_chunks"),
+    "swap": ("tile_n", "o_chunks"),
+    "tile": ("o_chunks",),
+}
+_NVFP4_KNOB_TAGS = {"tile_n": "n", "o_chunks": "oc"}
+
+
+def _nvfp4_variant_name(
+    member: str, *, tile_n: Optional[int] = None, o_chunks: int = 1
+) -> str:
+    """Registered variant name of a member's physical program:
+    ``nvfp4_decode_<member>[_n<tile_n>][_oc<o_chunks>]`` (the merge is ``nvfp4_merge``)."""
+    if member not in _NVFP4_VARIANT_KNOBS:
+        raise ValueError(f"unknown NVFP4 family member {member!r}")
+    values = {"tile_n": tile_n, "o_chunks": o_chunks}
+    tags = []
+    for knob in _NVFP4_VARIANT_KNOBS[member]:
+        if values[knob] is None:
+            raise ValueError(f"{member}: variant knob {knob} is required")
+        tags.append(f"_{_NVFP4_KNOB_TAGS[knob]}{int(values[knob])}")
+    return "nvfp4_decode_" + member + "".join(tags)
+
+
+# Every decode variant a plan can select (the host names them statically so the export can check that each
+# generated program is bindable): persistent, cluster, t64 n64, pv n16 / n32, swap n{16,32} x oc{1,2,4},
+# tile oc{1,2,4}.
+_NVFP4_DECODE_VARIANTS = (
+    _NVFP4_VARIANT_PERSISTENT,
+    _NVFP4_VARIANT_CLUSTER,
+    "nvfp4_decode_t64_n64_oc1",
+    "nvfp4_decode_pv_n16_oc1",
+    "nvfp4_decode_pv_n32_oc1",
+    "nvfp4_decode_swap_n16_oc1",
+    "nvfp4_decode_swap_n16_oc2",
+    "nvfp4_decode_swap_n16_oc4",
+    "nvfp4_decode_swap_n32_oc1",
+    "nvfp4_decode_swap_n32_oc2",
+    "nvfp4_decode_swap_n32_oc4",
+    "nvfp4_decode_tile_oc1",
+    "nvfp4_decode_tile_oc2",
+    "nvfp4_decode_tile_oc4",
+)
+_NVFP4_VARIANTS = (*_NVFP4_DECODE_VARIANTS, _NVFP4_VARIANT_MERGE)
+
+
+def _nvfp4_split_shape(total_tiles: int, num_splits: int) -> tuple[int, int]:
+    """Canonical (splits, tiles per split): contiguous tile ranges, the split count is the number of non-empty
+    ranges (Cake ``_split_shape``)."""
+    num_splits = max(1, min(int(num_splits), total_tiles))
+    tiles_per_split = _ceil_div(total_tiles, num_splits)
+    num_splits = _ceil_div(total_tiles, tiles_per_split)
+    if num_splits > _NVFP4_MAX_SPLITS:
+        raise ValueError(
+            f"num_splits {num_splits} exceeds the NVFP4 route cap {_NVFP4_MAX_SPLITS}"
+        )
+    return num_splits, tiles_per_split
+
+
+def _nvfp4_plan_cost_us(
+    member: str,
+    *,
+    num_tokens: int,
+    num_heads: int,
+    head_tiles: int,
+    total_tiles: int,
+    num_splits: int,
+    sm_count: int,
+) -> float:
+    """Round-43 chain model of ``member`` running the row with ``num_splits`` splits (Cake ``plan_cost_us``)."""
+    head_us, tile_us, load_us = _NVFP4_PLAN_CHAIN_US[member]
+    num_splits, tiles_per_split = _nvfp4_split_shape(total_tiles, num_splits)
+    ctas_per_unit = _NVFP4_CLUSTER_CTAS if member == "cluster" else 1
+    grid = num_tokens * head_tiles * num_splits * ctas_per_unit
+    slots = sm_count - (sm_count % ctas_per_unit)
+    waves = _ceil_div(grid, slots)
+    chain = (
+        head_us + (tiles_per_split - 1) * tile_us + load_us * min(grid, slots) / slots
+    )
+    cost = waves * chain
+    if num_splits > 1:
+        cost += _NVFP4_PLAN_MERGE_US + _NVFP4_PLAN_MERGE_US_PER_MB * (
+            num_tokens * num_heads * (num_splits + 1) * _NVFP4_HEAD_DIM * 2 / 1e6
+        )
+    return cost
+
+
+def _nvfp4_plan_large_heads(
+    num_tokens: int, num_heads: int, total_tiles: int, sm_count: int
+) -> tuple[NVFP4Member, int]:
+    """(member, splits) with the lowest modelled cost for an H > _NVFP4_PV_MAX_HEADS row (Cake ``_plan_large_heads``):
+    the tile member at one tile per CTA, then persistent / cluster / tile64 over every canonical split count that
+    leaves >= 2 tiles per CTA; ties keep the earlier candidate."""
+    common = dict(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        total_tiles=total_tiles,
+        sm_count=sm_count,
+    )
+    head_tiles = _ceil_div(num_heads, _NVFP4_TILE_Q)
+    cands: list[tuple[NVFP4Member, int, float]] = [
+        (
+            "tile",
+            total_tiles,
+            _nvfp4_plan_cost_us(
+                "tile", head_tiles=head_tiles, num_splits=total_tiles, **common
+            ),
+        )
+    ]
+    for splits in range(1, min(total_tiles - 1, _NVFP4_MAX_SPLITS) + 1):
+        if _ceil_div(total_tiles, _ceil_div(total_tiles, splits)) != splits:
+            continue  # not a canonical split count
+        cands.append(
+            (
+                "persistent",
+                splits,
+                _nvfp4_plan_cost_us(
+                    "persistent", head_tiles=head_tiles, num_splits=splits, **common
+                ),
+            )
+        )
+        if num_heads >= _NVFP4_CLUSTER_MIN_HEADS:
+            cands.append(
+                (
+                    "cluster",
+                    splits,
+                    _nvfp4_plan_cost_us(
+                        "cluster", head_tiles=head_tiles, num_splits=splits, **common
+                    ),
+                )
+            )
+        if num_heads in _NVFP4_T64_HEAD_COUNTS:
+            cands.append(
+                (
+                    "t64",
+                    splits,
+                    _nvfp4_plan_cost_us(
+                        "t64",
+                        head_tiles=_ceil_div(num_heads, _NVFP4_T64_TILE_Q),
+                        num_splits=splits,
+                        **common,
+                    ),
+                )
+            )
+    best = min(cands, key=lambda c: c[2])
+    return best[0], best[1]
+
+
+def _nvfp4_pv_splits(
+    num_tokens: int, total_tiles: int, sm_count: int
+) -> tuple[int, int]:
+    """Split count of the persistent SwapsAB member for an H <= 32 row (Cake swap_pv ``plan``: one CTA per SM, the
+    chain ``waves * (HEAD + (tiles - 1) * TILE) + MERGE`` minimised over the split count; first minimum wins)."""
+    best = None
+    for cand in range(1, min(total_tiles, _NVFP4_MAX_SPLITS) + 1):
+        tiles_per_split = _ceil_div(total_tiles, cand)
+        splits = _ceil_div(total_tiles, tiles_per_split)
+        waves = _ceil_div(num_tokens * splits, sm_count)
+        cost = waves * (
+            _NVFP4_PV_PLAN_HEAD_US + (tiles_per_split - 1) * _NVFP4_PV_PLAN_TILE_US
+        ) + (_NVFP4_PV_PLAN_MERGE_US if splits > 1 else 0.0)
+        if best is None or cost < best[0] - 1e-9:
+            best = (cost, splits, tiles_per_split)
+    return best[1], best[2]
+
+
+def _nvfp4_swap_o_chunks(work_items: int, sm_count: int) -> int:
+    """CTAs per work item of the one-tile SwapsAB member: the largest of 4 / 2 / 1 whose grid fits one wave."""
+    if 4 * work_items <= sm_count:
+        return 4
+    if 2 * work_items <= sm_count:
+        return 2
+    return 1
+
+
+def _nvfp4_tile_o_chunks(work_items: int, sm_count: int) -> int:
+    """CTAs per work item of the one-tile member (two CTAs per SM at its footprint: half the SM count)."""
+    if 4 * work_items <= sm_count // 2:
+        return 4
+    if 2 * work_items <= sm_count // 2:
+        return 2
+    return 1
+
+
+def _nvfp4_merge_heads_per_cta(num_tokens: int, num_heads: int, sm_count: int) -> int:
+    """Heads (warps) per merge CTA: the smallest power of two <= 16 whose grid stays within one CTA per SM, else 16
+    (Cake ``merge_heads_per_cta``, round 45)."""
+    for hpc in (1, 2, 4, 8, 16):
+        if num_tokens * _ceil_div(num_heads, hpc) <= sm_count:
+            return hpc
+    return _NVFP4_MERGE_HEADS_PER_CTA
+
+
+def _nvfp4_plan(
+    *,
+    num_query_tokens: int,
+    num_heads: int,
+    sparse_topk: int,
+    extra_topk: int,
+    sm_count: int,
+) -> NVFP4Plan:
+    """Reproduce the Cake NVFP4 family ``plan()`` and member dispatch.
+
+    Candidate tiles are 128 wide (``total_tiles`` over both tables).  Rows with
+    ``H <= 32`` run the persistent SwapsAB member (``pv``) when its wave-aware
+    split rule gives more than one tile per CTA, otherwise the one-tile SwapsAB
+    member (``swap``, ``o_chunks`` CTAs per work item).  Rows with ``H >= 64``
+    pick (member, splits) from the round-43 chain model over the one-tile
+    ``tile`` member, the persistent member, the 2-CTA ``cluster`` member and the
+    tile64 member ``t64`` (64 heads per CTA; ``H128`` runs two head tiles).  The
+    split merge runs behind any member with ``num_splits > 1`` on
+    ``merge_heads_per_cta`` heads per CTA.
+    """
+    tokens = _positive_int(num_query_tokens, "num_query_tokens")
+    heads = _positive_int(num_heads, "num_heads")
+    if heads not in _NVFP4_HEAD_COUNTS:
+        raise ValueError(f"num_heads must be one of {_NVFP4_HEAD_COUNTS}, got {heads}")
+    sms = _positive_int(sm_count, "sm_count")
+    main_width = _positive_int(sparse_topk, "sparse_topk")
+    if (
+        isinstance(extra_topk, bool)
+        or not isinstance(extra_topk, int)
+        or extra_topk < 0
+    ):
+        raise ValueError(f"extra_topk must be a non-negative int, got {extra_topk!r}")
+    main_tiles = _ceil_div(main_width, _TILE_KV)
+    extra_tiles = _ceil_div(extra_topk, _TILE_KV)
+    total_tiles = main_tiles + extra_tiles
+    if total_tiles < 1:
+        raise ValueError("at least one candidate tile is required")
+    if total_tiles > _NVFP4_MAX_SPLITS:
+        raise ValueError(
+            f"total candidate tiles {total_tiles} exceeds the NVFP4 route cap {_NVFP4_MAX_SPLITS}"
+        )
+    num_head_tiles = _ceil_div(heads, _NVFP4_TILE_Q)
+    common = dict(
+        num_query_tokens=tokens,
+        num_heads=heads,
+        main_width=main_width,
+        extra_width=extra_topk,
+        num_main_tiles=main_tiles,
+        num_extra_tiles=extra_tiles,
+        total_tiles=total_tiles,
+        sm_count=sms,
+        merge_heads_per_cta=_nvfp4_merge_heads_per_cta(tokens, heads, sms),
+    )
+    # the persistent member's own split rule: enough CTAs to cover the SMs
+    p_splits, p_tiles = _nvfp4_split_shape(
+        total_tiles, max(1, min(total_tiles, _ceil_div(sms, tokens * num_head_tiles)))
+    )
+    if heads > _NVFP4_PV_MAX_HEADS:
+        member, splits = _nvfp4_plan_large_heads(tokens, heads, total_tiles, sms)
+        if member == "t64":
+            splits, tiles_per_split = _nvfp4_split_shape(total_tiles, splits)
+            return NVFP4Plan(
+                num_head_tiles=_ceil_div(heads, _NVFP4_T64_TILE_Q),
+                num_splits=splits,
+                tiles_per_split=tiles_per_split,
+                member="t64",
+                tile_n=_NVFP4_T64_TILE_Q,
+                o_chunks=1,
+                **common,
+            )
+        if member in ("cluster", "persistent"):
+            splits, tiles_per_split = _nvfp4_split_shape(total_tiles, splits)
+            return NVFP4Plan(
+                num_head_tiles=num_head_tiles,
+                num_splits=splits,
+                tiles_per_split=tiles_per_split,
+                member=member,
+                **common,
+            )
+        # the one-tile member: one candidate tile per CTA, o_chunks CTAs per work item
+        return NVFP4Plan(
+            num_head_tiles=num_head_tiles,
+            num_splits=total_tiles,
+            tiles_per_split=1,
+            member="tile",
+            o_chunks=_nvfp4_tile_o_chunks(tokens * total_tiles * num_head_tiles, sms),
+            **common,
+        )
+    pv_splits, pv_tiles = _nvfp4_pv_splits(tokens, total_tiles, sms)
+    if pv_tiles > 1:
+        return NVFP4Plan(
+            num_head_tiles=num_head_tiles,
+            num_splits=pv_splits,
+            tiles_per_split=pv_tiles,
+            member="pv",
+            tile_n=16 if heads <= 16 else 32,
+            o_chunks=1,
+            **common,
+        )
+    if p_tiles == 1:
+        # one-tile rows with H <= _NVFP4_SWAP_MAX_HEADS: the one-tile SwapsAB member
+        return NVFP4Plan(
+            num_head_tiles=num_head_tiles,
+            num_splits=total_tiles,
+            tiles_per_split=1,
+            member="swap",
+            tile_n=16 if heads <= 16 else 32,
+            o_chunks=_nvfp4_swap_o_chunks(tokens * total_tiles * num_head_tiles, sms),
+            **common,
+        )
+    return NVFP4Plan(
+        num_head_tiles=num_head_tiles,
+        num_splits=p_splits,
+        tiles_per_split=p_tiles,
+        member="persistent",
+        **common,
+    )
+
+
+def _nvfp4_sm_count(device: torch.device) -> int:
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+def _require_nvfp4_variant(variant: str, *, arch: str) -> None:
+    """Fail early and clearly while the NVFP4 sources are not exported yet."""
+    from ..jit.cake_dsv4 import get_cake_dsv4_spec
+
+    try:
+        get_cake_dsv4_spec(variant, arch=arch)
+    except ValueError as exc:
+        raise NotImplementedError(
+            "cake_dsv4 NVFP4 generated sources not yet exported: variant "
+            f"{variant!r} has no registered contract for {arch} "
+            "(csrc/cake_dsv4/<arch>/ and flashinfer/jit/cake_dsv4.py)"
+        ) from exc
+
+
+def _log2_page_size(page_size: int, *, name: str) -> int:
+    if page_size <= 0 or page_size & (page_size - 1):
+        raise ValueError(f"{name}: page_size must be a power of two, got {page_size}")
+    return page_size.bit_length() - 1
+
+
+def _nvfp4_cache_geometry(
+    cache: torch.Tensor,
+    *,
+    name: str,
+    kv_layout: Literal["HND", "NHD"],
+    page_size: Optional[int],
+    device: torch.device,
+) -> tuple[torch.Tensor, int, int]:
+    """``(flat uint8 [pages, page_stride] view, page_size, page_stride_bytes)`` of an NVFP4 pool.
+
+    Mirrors the Cake ``_cache_geometry``: accepts ``[P, bytes]`` (needs the
+    logical ``page_size``), HND ``[P, 1, page_size, 384]``, NHD
+    ``[P, page_size, 1, 384]`` and ``[P, page_size, 384]`` tensors. Tokens of a
+    page are contiguous 384-byte records; the page stride may be padded. No
+    copy is made.
+    """
+    if not isinstance(cache, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if cache.dtype != torch.uint8:
+        raise TypeError(f"{name} must be uint8, got {cache.dtype}")
+    if cache.device != device:
+        raise ValueError(f"{name} must be on {device}, got {cache.device}")
+    if cache.dim() == 2:
+        if not cache.is_contiguous():
+            raise ValueError(f"{name}: a 2-D packed pool must be contiguous")
+        if page_size is None:
+            raise ValueError(
+                f"{name}: a 2-D [pages, bytes] pool needs the logical page_size"
+            )
+        logical = _positive_int(page_size, f"{name} page_size")
+        page_stride = int(cache.shape[1])
+        if page_stride < logical * _NVFP4_TOKEN_BYTES:
+            raise ValueError(
+                f"{name}: page byte count {page_stride} is smaller than "
+                f"page_size {logical} x {_NVFP4_TOKEN_BYTES}"
+            )
+        return cache, logical, page_stride
+    if cache.dim() == 4:
+        if kv_layout == "HND":
+            if cache.shape[1] != 1:
+                raise ValueError(
+                    f"{name}: expected HND [P, 1, page_size, {_NVFP4_TOKEN_BYTES}], "
+                    f"got {tuple(cache.shape)}"
+                )
+            page_dim = 2
+        elif kv_layout == "NHD":
+            if cache.shape[2] != 1:
+                raise ValueError(
+                    f"{name}: expected NHD [P, page_size, 1, {_NVFP4_TOKEN_BYTES}], "
+                    f"got {tuple(cache.shape)}"
+                )
+            page_dim = 1
+        else:
+            raise ValueError(
+                f"kv_layout must be either 'HND' or 'NHD', got {kv_layout}"
+            )
+    elif cache.dim() == 3:
+        page_dim = 1
+    else:
+        raise ValueError(f"{name}: unsupported rank {cache.dim()}")
+    geometry_page_size = int(cache.shape[page_dim])
+    if (
+        int(cache.shape[-1]) != _NVFP4_TOKEN_BYTES
+        or int(cache.stride(-1)) != 1
+        or int(cache.stride(page_dim)) != _NVFP4_TOKEN_BYTES
+    ):
+        raise ValueError(
+            f"{name}: tokens must be contiguous {_NVFP4_TOKEN_BYTES}-byte records "
+            f"(shape {tuple(cache.shape)}, strides {cache.stride()})"
+        )
+    page_stride = int(cache.stride(0))
+    if page_stride < geometry_page_size * _NVFP4_TOKEN_BYTES:
+        raise ValueError(
+            f"{name}: page stride {page_stride} B is smaller than page_size * {_NVFP4_TOKEN_BYTES}"
+        )
+    if page_size is not None and int(page_size) != geometry_page_size:
+        raise ValueError(
+            f"{name}: page_size {page_size} does not match the cache geometry ({geometry_page_size})"
+        )
+    flat = cache.as_strided((int(cache.shape[0]), page_stride), (page_stride, 1))
+    return flat, geometry_page_size, page_stride
+
+
+def _nvfp4_lengths(
+    tensor: Optional[torch.Tensor], name: str, *, rows: int, device: torch.device
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    if tensor.dtype != torch.int32:
+        raise ValueError(f"{name} must be int32, got {tensor.dtype}")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if not tensor.is_contiguous() or tensor.numel() < rows:
+        raise ValueError(
+            f"{name} must be a contiguous int32 tensor with >= {rows} entries"
+        )
+    return tensor
+
+
+def run_cake_dsv4_nvfp4(
+    *,
+    query: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    compressed_kv_cache: Optional[torch.Tensor],
+    workspace_buffer: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    sparse_topk_lens: Optional[torch.Tensor],
+    out: torch.Tensor,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    sinks: Optional[torch.Tensor],
+    max_q_len: Optional[int],
+    cum_seq_lens_q: Optional[torch.Tensor],
+    seq_lens: Optional[torch.Tensor],
+    backend: Literal["cake"],
+    extra_sparse_indices: Optional[torch.Tensor] = None,
+    extra_sparse_topk_lens: Optional[torch.Tensor] = None,
+    kv_layout: Literal["HND", "NHD"] = "HND",
+    swa_page_size: Optional[int] = None,
+    compressed_page_size: Optional[int] = None,
+    lse_scale: float = 1.0,
+) -> torch.Tensor:
+    """Launch the CAKE DSv4 NVFP4 decode for ``query [rows, num_heads, 512]`` BF16.
+
+    ``sparse_indices [T, topk]`` (int32, unit inner stride) indexes
+    ``swa_kv_cache``; ``sparse_topk_lens`` (optional, int32 ``>= T``) clamps its
+    active prefix. ``extra_sparse_indices [T, extra_topk]`` indexes
+    ``compressed_kv_cache`` with ``extra_sparse_topk_lens``; without it the
+    compressed pool is unused. Both pools are opaque ``uint8`` NVFP4 pages (see
+    the module docstring); ``swa_page_size`` / ``compressed_page_size`` are
+    required for 2-D ``[pages, bytes]`` pools and otherwise checked against the
+    geometry. ``query`` / ``out`` may carry more rows than ``T``; rows ``>= T``
+    are untouched. ``max_q_len``, ``cum_seq_lens_q`` and ``seq_lens`` are
+    accepted for surface parity with :func:`run_cake_dsv4` but unused: the
+    kernels consume flat token coordinates. The base-2 LSE is written to the
+    workspace (not returned). No device memory is allocated.
+    """
+    if backend != "cake":
+        raise ValueError(f"expected backend='cake', got {backend!r}")
+    if query.ndim != 3:
+        raise ValueError(
+            f"query must be [num_tokens, num_heads, {_HEAD_DIM}], got shape {tuple(query.shape)}"
+        )
+    query_capacity, num_heads, head_dim = (int(d) for d in query.shape)
+    if head_dim != _HEAD_DIM:
+        raise ValueError(f"CAKE DSv4 requires head dim {_HEAD_DIM}, got {head_dim}")
+    if query.dtype != torch.bfloat16:
+        raise ValueError(
+            f"the CAKE DSv4 NVFP4 route takes a BF16 query, got {query.dtype}"
+        )
+    if not query.is_contiguous():
+        raise ValueError("query must be contiguous; backend='cake' makes no host copy")
+    if num_heads not in _NVFP4_HEAD_COUNTS:
+        raise ValueError(
+            f"num_heads must be one of {_NVFP4_HEAD_COUNTS}, got {num_heads}"
+        )
+    device = query.device
+    arch = _target_arch(device)
+
+    main_indices = _int32_table(sparse_indices, "sparse_indices")
+    if main_indices.device != device:
+        raise ValueError(
+            f"sparse_indices must be on {device}, got {main_indices.device}"
+        )
+    num_query_tokens = int(main_indices.shape[0])
+    if not 1 <= num_query_tokens <= query_capacity:
+        raise ValueError(
+            f"sparse_indices must describe 1..{query_capacity} query rows, got {num_query_tokens}"
+        )
+    main_width = int(main_indices.shape[1])
+    if extra_sparse_topk_lens is not None and extra_sparse_indices is None:
+        raise ValueError("extra_sparse_topk_lens requires extra_sparse_indices")
+    if extra_sparse_indices is not None:
+        extra_indices = _int32_table(
+            extra_sparse_indices, "extra_sparse_indices", rows=num_query_tokens
+        )
+        if extra_indices.device != device:
+            raise ValueError(
+                f"extra_sparse_indices must be on {device}, got {extra_indices.device}"
+            )
+        extra_width = int(extra_indices.shape[1])
+        if compressed_kv_cache is None:
+            raise ValueError("extra_sparse_indices requires compressed_kv_cache")
+    else:
+        extra_indices = main_indices
+        extra_width = 0
+    main_lengths = _nvfp4_lengths(
+        sparse_topk_lens, "sparse_topk_lens", rows=num_query_tokens, device=device
+    )
+    extra_lengths = _nvfp4_lengths(
+        extra_sparse_topk_lens,
+        "extra_sparse_topk_lens",
+        rows=num_query_tokens,
+        device=device,
+    )
+    if seq_lens is not None and seq_lens.dtype != torch.int32:
+        raise ValueError(f"seq_lens must be int32, got {seq_lens.dtype}")
+    if cum_seq_lens_q is not None and cum_seq_lens_q.dtype != torch.int32:
+        raise ValueError(f"cum_seq_lens_q must be int32, got {cum_seq_lens_q.dtype}")
+
+    main_flat, main_page_size, main_page_stride = _nvfp4_cache_geometry(
+        swa_kv_cache,
+        name="swa_kv_cache",
+        kv_layout=kv_layout,
+        page_size=swa_page_size,
+        device=device,
+    )
+    if extra_width:
+        extra_flat, extra_page_size, extra_page_stride = _nvfp4_cache_geometry(
+            compressed_kv_cache,
+            name="compressed_kv_cache",
+            kv_layout=kv_layout,
+            page_size=compressed_page_size,
+            device=device,
+        )
+    else:
+        extra_flat, extra_page_size, extra_page_stride = (
+            main_flat,
+            main_page_size,
+            main_page_stride,
+        )
+
+    if out.dtype != torch.bfloat16:
+        raise ValueError(f"out must be bfloat16, got {out.dtype}")
+    if out.device != device:
+        raise ValueError(f"out must be on {device}, got {out.device}")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous; backend='cake' makes no host copy")
+    row_elems = num_heads * _HEAD_DIM
+    if out.numel() % row_elems or out.numel() < num_query_tokens * row_elems:
+        raise ValueError(
+            f"out must hold at least {num_query_tokens} rows of [{num_heads}, {_HEAD_DIM}], "
+            f"got {tuple(out.shape)}"
+        )
+    query_rows = query[:num_query_tokens]
+    out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
+
+    scale1 = _device_scale(bmm1_scale, device=device, name="bmm1_scale")
+    scale2 = _device_scale(bmm2_scale, device=device, name="bmm2_scale")
+    if sinks is not None:
+        if (
+            sinks.dtype != torch.float32
+            or sinks.device != device
+            or not sinks.is_contiguous()
+            or sinks.numel() < num_heads
+        ):
+            raise ValueError(
+                f"sinks must be a contiguous FP32 tensor with >= {num_heads} entries on {device}"
+            )
+    sink_tensor = sinks if sinks is not None else scale1
+    lse_scale = float(lse_scale)
+
+    plan = _nvfp4_plan(
+        num_query_tokens=num_query_tokens,
+        num_heads=num_heads,
+        sparse_topk=main_width,
+        extra_topk=extra_width,
+        sm_count=_nvfp4_sm_count(device),
+    )
+    num_splits = plan.num_splits
+
+    if workspace_buffer.device != device:
+        raise ValueError(
+            f"workspace_buffer must be on {device}, got {workspace_buffer.device}"
+        )
+    raw = _workspace_bytes(workspace_buffer)
+    layout = cake_dsv4_workspace_layout(
+        num_query_tokens, num_heads, num_splits, with_lse=True
+    )
+    _require_workspace_bytes(raw, layout.total_bytes)
+    partial_o, partial_lse = _partial_views(
+        raw, out_rows, num_query_tokens, num_heads, num_splits
+    )
+    lse_offset, lse_bytes = layout.lse
+    lse_out = raw[
+        lse_offset : lse_offset + num_query_tokens * num_heads * torch.float32.itemsize
+    ].view(torch.float32)
+    if num_splits == 1:
+        # The decode member writes the final output and base-2 LSE directly.
+        partial_lse = lse_out
+        lse_partial_scale = lse_scale
+        partial_o_tiles = out_rows.view(num_query_tokens, num_heads, 1, _HEAD_DIM)
+    else:
+        lse_partial_scale = 1.0
+        partial_o_tiles = partial_o.view(
+            num_query_tokens, num_heads, num_splits, _HEAD_DIM
+        )
+
+    _require_nvfp4_variant(plan.variant, arch=arch)
+    if num_splits > 1:
+        _require_nvfp4_variant(_NVFP4_VARIANT_MERGE, arch=arch)
+    main_g4d, main_g4f = _nvfp4_gather4_views(main_flat)
+    extra_g4d, extra_g4f = _nvfp4_gather4_views(extra_flat)
+
+    values: dict[str, Any] = {
+        "Q": query_rows,
+        "q_rows": query_rows,
+        "partial_O_tiles": partial_o_tiles,
+        "main_cache": main_flat,
+        "extra_cache": extra_flat,
+        "main_cache_g4d": main_g4d,
+        "main_cache_g4f": main_g4f,
+        "extra_cache_g4d": extra_g4d,
+        "extra_cache_g4f": extra_g4f,
+        "main_indices": main_indices,
+        "extra_indices": extra_indices,
+        "main_lengths": main_lengths if main_lengths is not None else main_indices,
+        "extra_lengths": extra_lengths if extra_lengths is not None else main_indices,
+        "sinks": sink_tensor,
+        "bmm1_scale": scale1,
+        "bmm2_scale": scale2,
+        "partial_O": partial_o,
+        "partial_lse": partial_lse,
+        "O": out_rows,
+        "lse_out": lse_out,
+        "num_query_tokens": num_query_tokens,
+        "num_heads": num_heads,
+        "num_head_tiles": plan.num_head_tiles,
+        "num_splits": num_splits,
+        "num_main_tiles": plan.num_main_tiles,
+        "tiles_per_split": plan.tiles_per_split,
+        "total_tiles": plan.total_tiles,
+        "main_width": main_width,
+        "extra_width": extra_width,
+        "main_index_stride": int(main_indices.stride(0)),
+        "extra_index_stride": int(extra_indices.stride(0)),
+        "has_main_lengths": int(main_lengths is not None),
+        "has_extra_lengths": int(extra_lengths is not None),
+        "main_page_shift": _log2_page_size(main_page_size, name="swa_kv_cache"),
+        "extra_page_shift": _log2_page_size(
+            extra_page_size, name="compressed_kv_cache"
+        ),
+        "main_page_stride": int(main_page_stride),
+        "extra_page_stride": int(extra_page_stride),
+        "has_sinks": int(sinks is not None),
+        "heads_per_cta": plan.merge_heads_per_cta,
+        "lse_partial_scale": float(lse_partial_scale),
+        "lse_scale": lse_scale,
+    }
+    launcher = _Launcher(
+        arch=arch,
+        workspace=workspace_buffer,
+        raw=raw,
+        values=values,
+    )
+    launches = [launcher.variant(plan.variant, grid=(plan.grid, 1, 1))]
+    if num_splits > 1:
+        # Split merge: one CTA per (token, heads_per_cta heads) over partial_O / partial_lse.
+        launches.append(launcher.variant(_NVFP4_VARIANT_MERGE, grid=plan.merge_grid))
+    # One host-side critical section per call, as for the BF16 / FP8 routes
+    # (descriptor-pool bookkeeping, descriptor checks, launch enqueues).
+    with _descriptor_lock:
+        launcher.run(*launches)
+    return out
+
+
+def _nvfp4_gather4_views(flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """TMA gather views of a flat NVFP4 pool (``[pages, page_stride]`` uint8) for the gather4 members: 32-byte-pitch
+    int32 rows -- data rows (88 x int32, overlapping: token ``t`` of page ``p`` is row ``p * page_stride / 32 + 11 t``)
+    and footer rows (8 x int32).  Mirrors the Cake members' ``_gather4_views``."""
+    f32 = flat.view(torch.int32).reshape(-1)
+    n_rows = f32.numel() // 8
+    n_data_rows = (
+        f32.numel() - 88
+    ) // 8 + 1  # the overlapping 88-element rows must stay inside the storage
+    return f32.as_strided((n_data_rows, 88), (8, 1)), f32.as_strided(
+        (n_rows, 8), (8, 1)
+    )
+
+
 __all__ = [
     "KERNEL_METADATA_PARAMS",
+    "NVFP4Plan",
     "SparseMetadata",
     "WorkspaceLayout",
     "cake_dsv4_workspace_layout",
@@ -1728,4 +2678,5 @@ __all__ = [
     "is_bindable_arg",
     "resolve_cake_dsv4_sparse_metadata",
     "run_cake_dsv4",
+    "run_cake_dsv4_nvfp4",
 ]
