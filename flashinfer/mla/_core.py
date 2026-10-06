@@ -2885,11 +2885,12 @@ def _call_cute_dsl_workspace_sizer(
     kv_lora_rank: int,
     max_active_blocks: int,
     max_seq_len: int,
+    split_kv_override: Optional[int] = None,
 ):
     """Call an implementation's workspace policy with its supported arguments."""
     args = (batch_size, q_len, num_heads, kv_lora_rank, max_active_blocks)
     if resolved_impl == "monolithic":
-        return workspace_sizer(*args, max_seq_len)
+        return workspace_sizer(*args, max_seq_len, split_kv_override=split_kv_override)
     return workspace_sizer(*args)
 
 
@@ -3628,6 +3629,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         enable_dcp: bool = False,
         cp_world: int = 1,
         cp_rank: int = 0,
+        split_kv: Optional[int] = None,
     ):
         from ..cute_dsl.attention import cute_dsl_mla_decode
 
@@ -3656,6 +3658,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         self.enable_dcp = enable_dcp
         self.cp_world = cp_world
         self.cp_rank = cp_rank
+        self.split_kv = split_kv
         self._profile_lse: Optional[torch.Tensor] = None
         self._workspace_sizer, self._resolved_cute_dsl_impl = (
             _resolve_cute_dsl_workspace_sizer(cute_dsl_impl, sinks, enable_dcp)
@@ -3686,6 +3689,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             self.kv_lora_rank,
             get_num_sm(q.device),
             self.max_seq_len,
+            split_kv_override=self.split_kv,
         )
         workspace_bytes = (
             self.workspace_buffer.numel() * self.workspace_buffer.element_size()
@@ -3730,6 +3734,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             self.cute_dsl_impl,
             getattr(self, "enable_dcp", False),
             getattr(self, "cp_world", 1),
+            self.split_kv,
         )
 
     def forward(
@@ -3789,6 +3794,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
             cp_world=self.cp_world,
             cp_rank=self.cp_rank,
             causal_seqlens_kv_global=causal_seqlens_kv_global,
+            split_kv=self.split_kv,
         )
 
 
@@ -3826,6 +3832,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    split_kv: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with Blackwell, TRTLLM-GEN, CuteDSL, XQA, or sparse kernels.
 
@@ -3994,6 +4001,12 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         * ``"monolithic"`` — strict.  Always run the monolithic kernels;
           raise :class:`ValueError` if the call uses any modular-only
           feature (e.g. ``sinks``).
+    split_kv : Optional[int] = None
+        Requested upper bound on the number of KV partitions for the monolithic
+        CuTeDSL backend. The final count may be reduced when ``max_seq_len``
+        cannot fill every partition. This option requires
+        ``backend="cute-dsl"`` and the monolithic implementation. ``None``
+        preserves the default occupancy heuristic.
     kv_scale_format : str = "auto"
         Scale semantics for the SM120/SM121 packed v32/GLM sparse backend.
         ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32 inline
@@ -4096,6 +4109,13 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             "return_lse_base must be 'basee', 'base2', or None; "
             f"got {return_lse_base!r}"
         )
+    if split_kv is not None:
+        if not isinstance(split_kv, int) or isinstance(split_kv, bool) or split_kv <= 0:
+            raise ValueError(f"split_kv must be a positive integer, got {split_kv!r}")
+        if backend != "cute-dsl":
+            raise ValueError("split_kv requires backend='cute-dsl'")
+        if cute_dsl_impl != "monolithic" or sinks is not None:
+            raise ValueError("split_kv is supported only by monolithic CuTeDSL MLA")
     if isinstance(bmm1_scale, torch.Tensor):
         if bmm1_scale.dtype != torch.float32:
             raise TypeError("bmm1_scale tensor must have dtype torch.float32")
@@ -4577,6 +4597,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
                 cp_world=cp_world,
                 cp_rank=cp_rank,
                 causal_seqlens_kv_global=causal_seqlens_kv_global,
+                split_kv=split_kv,
             )
 
         multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
@@ -4790,6 +4811,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
                 enable_dcp=enable_dcp,
                 cp_world=cp_world,
                 cp_rank=cp_rank,
+                split_kv=split_kv,
             )
         )
 
@@ -4874,6 +4896,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    split_kv: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """See :func:`_trtllm_batch_decode_with_kv_cache_mla_impl` for parameter documentation."""
     return _trtllm_batch_decode_with_kv_cache_mla_impl(
@@ -4910,6 +4933,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
         return_lse_base=return_lse_base,
+        split_kv=split_kv,
     )
 
 
