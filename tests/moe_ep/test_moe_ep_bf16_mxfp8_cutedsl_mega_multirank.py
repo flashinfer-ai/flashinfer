@@ -17,7 +17,7 @@ cuda_13_required = pytest.mark.skipif(
     reason="bf16_mxfp8 requires CUDA 13+",
 )
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -186,7 +186,7 @@ def _reference_mixed_mega_moe(
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         bf16_mxfp8_mega_moe,
         get_symm_buffer_for_bf16_mxfp8_mega_moe,
     )
@@ -340,7 +340,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8ScaleDtype,
         bf16_mxfp8_mega_moe,
         compute_megamoe_reference_bf16_mxfp8,

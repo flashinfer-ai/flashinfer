@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import ast
+from collections import OrderedDict
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -11,10 +18,20 @@ from flashinfer.fused_moe import (
     BackendOptions,
     CuTileBf16Config,
     CuTileBf16Runner,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorBf16Runner,
+    CuTileFp8PerTensorConfig,
+    CuTileFp8PerTensorRunner,
     CuTileMxfp4Bf16Config,
     CuTileMxfp4Bf16Runner,
     CuTileMxfp4Config,
     CuTileMxfp4Runner,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp4Mxfp8Runner,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Bf16Runner,
+    CuTileMxfp8Config,
+    CuTileMxfp8Runner,
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Config,
@@ -35,12 +52,20 @@ from flashinfer.fused_moe import (
     ReLU,
     ReLU2,
     RoutingConfig,
+    SM12xNvfp4Bf16Config,
+    SM12xNvfp4Bf16Runner,
     SiLU,
     SiTU,
     SwiGLU,
     SwiGLUStep,
 )
-from flashinfer.fused_moe.runners import _validate_cutile_int32_routing
+from flashinfer.fused_moe.runners import (
+    _CuTileGemmProblem,
+    _cutile_bucket_compile_token_counts,
+    _cutile_fp8_gemm_candidates,
+    _validate_cutile_int32_routing,
+)
+from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
 from flashinfer.tllm_enums import ActivationType
 
 from .utils import compute_reference_activation, compute_reference_moe
@@ -63,6 +88,74 @@ _CUTILE_ACTIVATIONS = (
     ReLU(),
     SiLU(),
 )
+
+
+def test_cutile_moe_workload_sizes_are_runtime_kernel_parameters():
+    """Prevent exact request sizes from becoming unbounded JIT cache keys."""
+    runtime_parameters = {
+        "assignments",
+        "grid_m",
+        "live_rows",
+        "num_assignments",
+        "num_blocks",
+        "num_rows",
+        "num_tokens",
+        "numel",
+        "rows",
+        "tokens",
+        "valid_rows",
+    }
+    cutile_dir = Path(__file__).parents[2] / "flashinfer" / "fused_moe" / "cutile"
+    violations = []
+    for path in sorted(cutile_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            arguments = (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            )
+            for argument in arguments:
+                if argument.arg.lower() not in runtime_parameters:
+                    continue
+                annotation = (
+                    ""
+                    if argument.annotation is None
+                    else ast.unparse(argument.annotation)
+                )
+                if "Constant" in annotation or "ConstInt" in annotation:
+                    violations.append(
+                        f"{path.name}:{node.lineno} {node.name}({argument.arg})"
+                    )
+    assert not violations, (
+        "token-dependent cuTile MoE parameters must remain runtime values: "
+        + ", ".join(violations)
+    )
+
+
+def test_cutile_autotune_uses_bounded_dispatch_representatives():
+    max_num_tokens = 8192
+    buckets = get_hybrid_num_tokens_buckets(max_num_tokens)
+    counts = tuple(
+        count
+        for bucket in buckets
+        for count in _cutile_bucket_compile_token_counts(
+            bucket,
+            tune_max_num_tokens=max_num_tokens,
+            num_experts=256,
+            top_k=8,
+            hidden_size=4096,
+            intermediate_size=1024,
+            block_size=32,
+        )
+    )
+
+    assert set(buckets).issubset(counts)
+    assert len(counts) < max_num_tokens // 16
+    assert len(counts) == len(set(counts))
+    assert all(1 <= count <= max_num_tokens for count in counts)
 
 
 @pytest.mark.parametrize("arch", (80, 86, 89, 90, 100, 103, 120, 121))
@@ -104,6 +197,16 @@ def test_cutile_activation_capabilities_and_scalar_lowering():
     assert set(CuTileNvfp4Bf16Runner.supported_activation_classes) == expected_classes
     assert set(CuTileMxfp4Runner.supported_activation_classes) == expected_classes
     assert set(CuTileMxfp4Bf16Runner.supported_activation_classes) == expected_classes
+    assert (
+        set(CuTileFp8PerTensorRunner.supported_activation_classes) == expected_classes
+    )
+    assert (
+        set(CuTileFp8PerTensorBf16Runner.supported_activation_classes)
+        == expected_classes
+    )
+    assert set(CuTileMxfp8Runner.supported_activation_classes) == expected_classes
+    assert set(CuTileMxfp8Bf16Runner.supported_activation_classes) == expected_classes
+    assert set(CuTileMxfp4Mxfp8Runner.supported_activation_classes) == expected_classes
     assert _activation_kernel_args(SwiGLU(alpha=1.7, beta=0.25, limit=6.0)) == (
         int(ActivationType.Swiglu),
         1.7,
@@ -197,6 +300,71 @@ def _config(
     return MoEConfig(**values)
 
 
+@pytest.mark.parametrize("precompile_fails", (False, True))
+def test_cutile_single_runner_precompiles_bucket_before_caching(
+    monkeypatch, precompile_fails
+):
+    from flashinfer.testing import utils as testing_utils
+
+    inputs = [torch.empty((17, 128), dtype=torch.bfloat16)]
+    tactic = (32, 1, 128, 64, 2, 128, 64, 2)
+    output = object()
+    launch_kwargs = {"enable_pdl": False}
+    tuning_config = object()
+    runner = SimpleNamespace(
+        backend_key=CuTileBf16Runner.backend_key,
+        supported_routing_modes=("pre_routed",),
+        pack_inputs=Mock(return_value=inputs),
+        launch_kwargs_for=Mock(return_value=launch_kwargs),
+        tuning_config_for=Mock(return_value=tuning_config),
+        forward=Mock(return_value=output),
+    )
+    layer = MoELayer.__new__(MoELayer)
+    layer.config = _config()
+    layer.runners = [runner]
+    layer.tuner = SimpleNamespace(choose_one=Mock(return_value=(runner, tactic)))
+    layer._winners = OrderedDict()
+    monkeypatch.setattr(layer, "_additional_candidates", lambda *_: [])
+
+    def precompile(packed_inputs, selected_tactic):
+        assert packed_inputs is inputs
+        assert selected_tactic is tactic
+        assert not layer._winners
+        if precompile_fails:
+            raise RuntimeError("bucket compilation failed")
+
+    runner._precompile_bucket_variants = Mock(side_effect=precompile)
+    benchmark = Mock(
+        side_effect=AssertionError("single runner must not be benchmarked")
+    )
+    monkeypatch.setattr(testing_utils, "bench_gpu_time", benchmark)
+    activations = SimpleNamespace(num_tokens=17, routing_input_mode="pre_routed")
+    weights = object()
+
+    if precompile_fails:
+        with pytest.raises(RuntimeError, match="bucket compilation failed"):
+            layer(activations, weights)
+        assert not layer._winners
+        runner.forward.assert_not_called()
+    else:
+        assert layer(activations, weights) is output
+        assert list(layer._winners.values()) == [(runner, tactic)]
+        # Reusing the winner must not repeat either tuning or compilation.
+        assert layer(activations, weights) is output
+        assert runner.forward.call_count == 2
+        runner.forward.assert_called_with(inputs, tactic=tactic, **launch_kwargs)
+
+    runner._precompile_bucket_variants.assert_called_once_with(inputs, tactic)
+    layer.tuner.choose_one.assert_called_once_with(
+        custom_op=f"moe_{runner.backend_key}",
+        runners=[runner],
+        tuning_config=tuning_config,
+        inputs=inputs,
+        **launch_kwargs,
+    )
+    benchmark.assert_not_called()
+
+
 @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_bf16_workspace_cache_uses_token_buckets(activation):
     class KernelModule:
@@ -232,6 +400,26 @@ def test_cutile_bf16_workspace_cache_uses_token_buckets(activation):
     assert module.calls[0]["block_sizes"] == (32, 64, 128)
     assert module.calls[0]["is_gated"] is activation.is_gated
     assert set(runner._workspace_cache) == {(32, 128), (64, 128)}
+
+
+def test_cutile_workspace_allocation_is_rejected_during_cuda_graph_capture(
+    monkeypatch,
+):
+    class KernelModule:
+        def allocate_workspace(self, **kwargs):
+            raise AssertionError("workspace allocation must not run during capture")
+
+    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
+    runner.config = _config()
+    runner.device = torch.device("cpu")
+    runner._built = True
+    runner._kernel_module = KernelModule()
+    runner._workspace_cache = {}
+    runner._workspace = None
+    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="warm this bucket first"):
+        runner._ensure_workspace(17, 128)
 
 
 def test_prepare_cutile_bf16_weights_rejects_invalid_source_contract():
@@ -427,6 +615,40 @@ def test_cutile_workspace_covers_all_permute_shapes_in_bucket(
 
 @cutile_bf16_required
 @pytest.mark.parametrize(
+    ("num_assignments", "num_experts", "block_size", "expected_rows"),
+    (
+        (8, 256, 32, 256),
+        (256, 256, 32, 8192),
+        (257, 256, 32, 8193),
+    ),
+)
+def test_cutile_permute_workspace_does_not_pad_empty_experts(
+    num_assignments, num_experts, block_size, expected_rows
+):
+    from flashinfer.fused_moe.cutile import moe
+
+    assert (
+        moe._max_permuted_rows(num_assignments, num_experts, block_size)
+        == expected_rows
+    )
+    workspace = moe.allocate_workspace(
+        num_tokens=num_assignments,
+        hidden_size=64,
+        intermediate_size=64,
+        num_experts=num_experts,
+        top_k=1,
+        is_gated=True,
+        block_sizes=(block_size,),
+        device=torch.device("cuda"),
+    )
+    assert workspace.sorted_slots.numel() == expected_rows
+    assert (
+        workspace.block_expert.numel() == (expected_rows + block_size - 1) // block_size
+    )
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize(
     (
         "activation",
         "num_tokens",
@@ -549,6 +771,96 @@ def test_cutile_bf16_runner_matches_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-1)
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+def test_cutile_bf16_sorted_io_matches_unsorted(activation, monkeypatch):
+    from flashinfer.fused_moe import runners as runners_module
+
+    device = torch.device("cuda")
+    # 192 and 96 leave partial tiles on every GEMM edge, and 64 tokens x top_k 2
+    # over 4 experts fill several routing blocks per expert.
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k = 64, 192, 96, 4, 2
+    torch.manual_seed(1)
+    hidden_states = torch.randn(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    w1 = (
+        torch.randn(
+            num_experts,
+            intermediate_size * (2 if activation.is_gated else 1),
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / hidden_size**0.5
+    )
+    w2 = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / intermediate_size**0.5
+    )
+    ids = torch.stack(
+        [torch.randperm(num_experts, device=device)[:top_k] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    routing_weights = torch.softmax(
+        torch.randn(num_tokens, top_k, device=device), dim=-1
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(
+        "cutile_bf16",
+        CuTileBf16Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+        ),
+    )
+    act = MoEActivationPack(hidden_states, None, ids, routing_weights)
+
+    def run(min_assignments: int) -> torch.Tensor:
+        monkeypatch.setattr(
+            runners_module, "_CUTILE_BF16_SORTED_IO_MIN_ASSIGNMENTS", min_assignments
+        )
+        monkeypatch.setattr(
+            runners_module, "_CUTILE_BF16_SORTED_IO_MIN_INTERMEDIATE", 0
+        )
+        config = _config(
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            tune_max_num_tokens=num_tokens,
+            activation=activation,
+        )
+        runner = CuTileBf16Runner(config, device)
+        runner.check_support()
+        runner.build()
+        inputs = runner.pack_inputs(act, weights)
+        tactic = runner._fallback_tactic(inputs)
+        out = runner.forward(inputs, tactic=tactic).clone()
+        assert runner._use_sorted_io(num_tokens * top_k) is (min_assignments == 0)
+        assert runner._workspace.activation_out.shape[0] >= (
+            num_tokens * top_k
+            + (
+                num_experts * (max(runner._block_sizes) - 1)
+                if min_assignments == 0
+                else 0
+            )
+        )
+        return out
+
+    unsorted = run(1 << 30)
+    sorted_io = run(0)
+    assert torch.isfinite(sorted_io).all()
+    torch.testing.assert_close(sorted_io, unsorted, rtol=0, atol=0)
 
 
 @cutile_bf16_required
@@ -1779,3 +2091,816 @@ def test_cutile_nvfp4_runs_through_unified_layer(activation):
 
     assert layer.winner_backend == "cutile_nvfp4"
     torch.testing.assert_close(actual, expected, rtol=0.25, atol=1.0)
+
+
+# ---------------------------------------------------------------------------
+# cuTile FP8 and MXFP8 precision pairs
+# ---------------------------------------------------------------------------
+
+
+_CUTILE_FP8_MODES = (
+    (
+        CuTileFp8PerTensorBf16Config,
+        CuTileFp8PerTensorBf16Runner,
+        QuantFormat.FP8PerTensor,
+        QuantFormat.BF16,
+    ),
+    (
+        CuTileFp8PerTensorConfig,
+        CuTileFp8PerTensorRunner,
+        QuantFormat.FP8PerTensor,
+        QuantFormat.FP8PerTensor,
+    ),
+    (
+        CuTileMxfp8Bf16Config,
+        CuTileMxfp8Bf16Runner,
+        QuantFormat.MXFP8,
+        QuantFormat.BF16,
+    ),
+    (
+        CuTileMxfp8Config,
+        CuTileMxfp8Runner,
+        QuantFormat.MXFP8,
+        QuantFormat.MXFP8,
+    ),
+    (
+        CuTileMxfp4Mxfp8Config,
+        CuTileMxfp4Mxfp8Runner,
+        QuantFormat.MXFP4,
+        QuantFormat.MXFP8,
+    ),
+)
+
+
+def _require_cutile_fp8(config_type):
+    if not torch.cuda.is_available() or not is_cuda_tile_available():
+        pytest.skip("requires CUDA and cuTile")
+    major, minor = torch.cuda.get_device_capability()
+    arch = major * 10 + minor
+    if not config_type.supported(arch):
+        pytest.skip(f"{config_type.__name__} does not support SM{arch}")
+
+
+def _quantize_fp8_reference(x, block_scaled, *, weight=False):
+    shape = x.shape
+    values = x.float().reshape(*shape[:-1], -1, 32) if block_scaled else x.float()
+    dims = -1 if block_scaled else ((1, 2) if weight else (0, 1))
+    amax = values.abs().amax(dims, keepdim=True)
+    scale = (amax / 448).clamp_min(2.0 ** (-127 if block_scaled else -126))
+    if block_scaled:
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
+    q = (values / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    dequantized = (q.float() * scale).reshape(shape)
+    scale = (
+        scale.squeeze(-1).to(torch.float8_e8m0fnu)
+        if block_scaled
+        else scale.reshape(-1)
+    )
+    return q.reshape(shape), scale, dequantized
+
+
+def _make_cutile_fp8_case(mode, activation, tokens=4, hidden=128, inter=128):
+    config_type, runner_type, weight_format, activation_format = mode
+    _require_cutile_fp8(config_type)
+    torch.manual_seed(17)
+    experts, top_k = 4, 2
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(experts, (tokens, top_k), device="cuda", dtype=torch.int32)
+    scores = torch.softmax(torch.randn(tokens, top_k, device="cuda"), -1)
+    w1 = (
+        torch.randn(
+            experts,
+            inter * (2 if activation.is_gated else 1),
+            hidden,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * 0.08
+    )
+    w2 = torch.randn(experts, hidden, inter, device="cuda", dtype=torch.bfloat16) * 0.08
+    block_scaled = weight_format != QuantFormat.FP8PerTensor
+    if weight_format == QuantFormat.MXFP4:
+        q1, s1, d1 = _quantize_weights(w1, scale_block_size=32)
+        q2, s2, d2 = _quantize_weights(w2, scale_block_size=32)
+    else:
+        q1, s1, d1 = _quantize_fp8_reference(w1, block_scaled, weight=True)
+        q2, s2, d2 = _quantize_fp8_reference(w2, block_scaled, weight=True)
+    view = config_type.prepare_weights(
+        q1,
+        s1,
+        q2,
+        s2,
+        num_local_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        activation=activation,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(runner_type.backend_key, view)
+    activations = MoEActivationPack(x, None, ids, scores)
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=experts, top_k=top_k),
+        quant=QuantConfig(weight_format, activation_format),
+        activation=activation,
+        experts=ExpertConfig(intermediate_size=inter),
+        backend=BackendOptions((config_type(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=128),
+    )
+    runner = runner_type(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+
+    reference_x = (
+        x.float()
+        if activation_format == QuantFormat.BF16
+        else _quantize_fp8_reference(x, block_scaled)[2]
+    )
+    selected_w1 = d1[ids.long().flatten()].float()
+    selected_w2 = d2[ids.long().flatten()].float()
+    gemm1 = (
+        torch.bmm(selected_w1, reference_x.repeat_interleave(top_k, 0).unsqueeze(-1))
+        .squeeze(-1)
+        .bfloat16()
+    )
+    activated = compute_reference_activation(gemm1, activation, inter)
+    reference_a = (
+        activated.float()
+        if activation_format == QuantFormat.BF16
+        else _quantize_fp8_reference(activated, block_scaled)[2]
+    )
+    gemm2 = torch.bmm(selected_w2, reference_a.unsqueeze(-1)).squeeze(-1).bfloat16()
+    expected = (
+        (gemm2.float().reshape(tokens, top_k, hidden) * scores.unsqueeze(-1))
+        .sum(1)
+        .bfloat16()
+    )
+    return runner, inputs, expected, activations, weights
+
+
+@pytest.mark.parametrize(
+    ("mode", "activation"),
+    (
+        (_CUTILE_FP8_MODES[0], SwiGLU()),
+        (_CUTILE_FP8_MODES[1], ReLU2()),
+        (_CUTILE_FP8_MODES[2], ReLU2()),
+        (_CUTILE_FP8_MODES[3], SwiGLU()),
+        (_CUTILE_FP8_MODES[4], SwiGLU()),
+    ),
+    ids=lambda value: value[0].__name__ if isinstance(value, tuple) else repr(value),
+)
+def test_cutile_fp8_precision_pairs(mode, activation):
+    runner, inputs, expected, _, _ = _make_cutile_fp8_case(mode, activation)
+    torch.testing.assert_close(runner.forward(inputs), expected, atol=0.03, rtol=0.03)
+
+
+def test_cutile_fp8_tail_graph_and_int64(monkeypatch):
+    mode = _CUTILE_FP8_MODES[4]
+    runner, inputs, expected, _, _ = _make_cutile_fp8_case(
+        mode, ReLU2(), tokens=33, hidden=160, inter=160
+    )
+    from flashinfer.fused_moe.cutile import fp8
+
+    actual = runner.forward(inputs).clone()
+    torch.testing.assert_close(actual, expected, atol=0.06, rtol=0.04)
+    monkeypatch.setattr(fp8, "needs_int64_indexing", lambda *_: True)
+    wide = runner.forward(inputs).clone()
+    torch.testing.assert_close(actual, wide, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner.forward(inputs)
+    inputs[3].mul_(0.5)
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, wide * 0.5, atol=0, rtol=0)
+
+
+def test_cutile_fp8_gated_tail_uses_unfused_path():
+    mode = _CUTILE_FP8_MODES[4]
+    runner, inputs, expected, _, _ = _make_cutile_fp8_case(
+        mode, SwiGLU(), tokens=4, hidden=160, inter=160
+    )
+    tactic = (1, *runner._fallback_tactic(inputs))
+
+    actual = runner.forward(inputs, tactic)
+
+    torch.testing.assert_close(actual, expected, atol=0.06, rtol=0.04)
+
+
+def test_cutile_fp8_gated_tail_rejects_fused_gemm1_quant(monkeypatch):
+    mode = _CUTILE_FP8_MODES[4]
+    runner, inputs, _, _, _ = _make_cutile_fp8_case(
+        mode, SwiGLU(), tokens=128, hidden=160, inter=160
+    )
+    fallback = runner._fallback_tactic(inputs)
+    ranked = (1, *fallback)
+    monkeypatch.setattr(
+        runner, "_factorized_sorted_tactics", lambda inputs, mode: [ranked]
+    )
+
+    assert all(tactic[0] != 5 for tactic in runner.get_valid_tactics(inputs, None))
+
+    tactic = [5, *fallback]
+    tactic[2:5] = (128, 128, 2)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "gated fused GEMM1 quantization requires intermediate_size=160 "
+            "to be divisible by tile_n=128"
+        ),
+    ):
+        runner.forward(inputs, tuple(tactic))
+
+
+@pytest.mark.parametrize("mode", (_CUTILE_FP8_MODES[1], _CUTILE_FP8_MODES[3]))
+def test_cutile_fp8_gated_activation_int64_matches_int32(monkeypatch, mode):
+    runner, inputs, _, _, _ = _make_cutile_fp8_case(mode, SwiGLU())
+    from flashinfer.fused_moe.cutile import fp8
+
+    expected = runner.forward(inputs).clone()
+    # Materializing the natural >=2^31-element trigger is too memory-intensive
+    # for CI; force dispatch to compile and execute the same int64 kernels.
+    monkeypatch.setattr(fp8, "needs_int64_indexing", lambda *_: True)
+    actual = runner.forward(inputs).clone()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("mode", "activation", "execution_modes"),
+    (
+        (_CUTILE_FP8_MODES[1], ReLU2(), (1, 2, 3, 4)),
+        (_CUTILE_FP8_MODES[2], SwiGLU(), (1,)),
+        (_CUTILE_FP8_MODES[4], SwiGLU(), (5,)),
+    ),
+)
+def test_cutile_fp8_sorted_execution(mode, activation, execution_modes):
+    runner, inputs, expected, _, _ = _make_cutile_fp8_case(mode, activation)
+    fallback = runner._fallback_tactic(inputs)
+    for execution_mode in execution_modes:
+        tactic = list((execution_mode, *fallback))
+        if execution_mode == 5:
+            tactic[2:5] = (128, 128, 2)
+        actual = runner.forward(inputs, tuple(tactic))
+        torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+
+
+def test_cutile_fp8_capabilities_and_shortlist():
+    from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+
+    for config_type, runner_type, weight_format, activation_format in _CUTILE_FP8_MODES:
+        assert _BACKEND_RUNNERS[config_type] is runner_type
+        assert runner_type.supports_quant(QuantConfig(weight_format, activation_format))
+        for arch in (80, 86, 89, 90, 100, 103, 107, 110, 120, 121):
+            assert config_type.supported(arch) == (arch in runner_type._supported_archs)
+
+    for arch in (89, 90, 120, 121):
+        for stage in (1, 2):
+            for block_size in (16, 32, 64, 128):
+                problem = _CuTileGemmProblem(
+                    stage=stage,
+                    arch=arch,
+                    block_size=block_size,
+                    n=2688,
+                    k=1856,
+                )
+                candidates = _cutile_fp8_gemm_candidates(problem)
+                assert len(candidates) <= 7
+                assert len(candidates) == len(set(candidates))
+
+
+def test_cutile_fp8_runs_through_unified_layer():
+    mode = _CUTILE_FP8_MODES[4]
+    runner, _, expected, activations, weights = _make_cutile_fp8_case(mode, SwiGLU())
+    layer = MoELayer(runner.config, torch.device("cuda"))
+
+    actual = layer(activations, weights)
+
+    assert layer.winner_backend == runner.backend_key
+    torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.parametrize(
+    ("a16", "a8"),
+    (
+        (_CUTILE_FP8_MODES[0], _CUTILE_FP8_MODES[1]),
+        (_CUTILE_FP8_MODES[2], _CUTILE_FP8_MODES[3]),
+    ),
+)
+def test_cutile_fp8_shared_weight_views(a16, a8):
+    _require_cutile_fp8(a8[0])
+    runner, inputs, _, activations, weights = _make_cutile_fp8_case(a16, SwiGLU())
+    config = replace(
+        runner.config,
+        quant=QuantConfig(a8[2], a8[3]),
+        backend=BackendOptions((a8[0](),)),
+    )
+    other = a8[1](config, runner.device)
+    other.check_support()
+    other.build()
+    other_inputs = other.pack_inputs(activations, weights)
+    assert all(a is b for a, b in zip(inputs[4:], other_inputs[4:], strict=True))
+
+
+@pytest.mark.parametrize("block_scaled", (False, True), ids=("per_tensor", "mxfp8"))
+def test_cutile_fp8_quantization_tails(block_scaled):
+    _require_cutile_fp8(CuTileMxfp8Config if block_scaled else CuTileFp8PerTensorConfig)
+    from flashinfer.fused_moe.cutile.fp8 import quantize
+
+    x = torch.linspace(-448, 448, 33 * 160, device="cuda").bfloat16().reshape(33, 160)
+    for values in (x, torch.zeros_like(x)):
+        expected_q, expected_s, _ = _quantize_fp8_reference(values, block_scaled)
+        q = torch.empty_like(expected_q)
+        scale = torch.empty_like(expected_s)
+        partials = torch.empty((values.numel() + 4095) // 4096, device="cuda")
+        quantize(values, q, scale, partials, block_scaled=block_scaled)
+        torch.testing.assert_close(q.float(), expected_q.float(), atol=0, rtol=0)
+        torch.testing.assert_close(scale.float(), expected_s.float(), atol=0, rtol=0)
+
+
+def test_cutile_fp8_prepare_rejects_invalid_weights():
+    for mode in (_CUTILE_FP8_MODES[0], _CUTILE_FP8_MODES[2]):
+        config_type, _, weight_format, _ = mode
+        weight = torch.ones(4, 128, 128, dtype=torch.float8_e4m3fn)
+        scales = (
+            torch.ones(4, 128, 4).to(torch.float8_e8m0fnu)
+            if weight_format == QuantFormat.MXFP8
+            else torch.ones(4)
+        )
+        kwargs = dict(
+            num_local_experts=4,
+            hidden_size=128,
+            intermediate_size=128,
+            activation=ReLU2(),
+        )
+        with pytest.raises(TypeError, match="float8_e4m3fn"):
+            config_type.prepare_weights(
+                weight.bfloat16(), scales, weight, scales, **kwargs
+            )
+        with pytest.raises(ValueError, match="scale must have shape"):
+            config_type.prepare_weights(weight, scales[:2], weight, scales, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# SM12x CuTe-DSL NVFP4 x BF16 over the shared cuTile NVFP4 weight view
+# ---------------------------------------------------------------------------
+
+
+def _sm12x_nvfp4_bf16_is_supported() -> bool:
+    if not torch.cuda.is_available() or torch.version.cuda is None:
+        return False
+    from flashinfer.cute_dsl import is_cute_dsl_available
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    major, minor = torch.cuda.get_device_capability()
+    return (
+        SM12xNvfp4Bf16Config.supported(major * 10 + minor)
+        and get_cuda_version().major >= 13
+        and is_cute_dsl_available()
+    )
+
+
+sm12x_nvfp4_bf16_required = pytest.mark.skipif(
+    not _sm12x_nvfp4_bf16_is_supported(),
+    reason="requires SM120/SM121, CUDA 13 and the CuTe DSL package",
+)
+
+
+def _make_sm12x_nvfp4_bf16_case(
+    activation: ActivationConfig,
+    *,
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    seed: int = 0,
+):
+    """Random routing and weights; the reference uses the dequantized weights."""
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    w1_rows = intermediate_size * (2 if activation.is_gated else 1)
+    global_scales = []
+    dequantized = []
+    packed = []
+    for rows, cols in ((w1_rows, hidden_size), (hidden_size, intermediate_size)):
+        weight = torch.randn(
+            num_experts, rows, cols, dtype=torch.bfloat16, device=device
+        )
+        weight /= cols**0.5
+        q, scale, dequant = _quantize_weights(weight)
+        del weight
+        global_scale = torch.rand(num_experts, device=device) + 0.5
+        packed.append((q, scale))
+        global_scales.append(global_scale)
+        dequantized.append(dequant * global_scale.to(dequant.dtype)[:, None, None])
+    view = SM12xNvfp4Bf16Config.prepare_weights(
+        packed[0][0],
+        packed[0][1],
+        global_scales[0],
+        packed[1][0],
+        packed[1][1],
+        global_scales[1],
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+    )
+
+    def make_activations(step: int) -> MoEActivationPack:
+        gen = torch.Generator(device=device).manual_seed(seed + 1000 * step)
+        hidden_states = torch.randn(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=device, generator=gen
+        )
+        logits = torch.rand(num_tokens, num_experts, device=device, generator=gen)
+        top = torch.topk(logits, top_k, dim=-1)
+        return MoEActivationPack(
+            hidden_states,
+            None,
+            top.indices.to(torch.int32),
+            torch.softmax(top.values, dim=-1),
+        )
+
+    def reference(act: MoEActivationPack) -> torch.Tensor:
+        return compute_reference_moe(
+            act.hidden_states_q,
+            act.topk_ids,
+            act.topk_weights,
+            dequantized[0],
+            dequantized[1],
+            activation,
+        )
+
+    return view, make_activations, reference
+
+
+def _sm12x_nvfp4_bf16_config(
+    activation: ActivationConfig,
+    *,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    max_num_tokens: int,
+    backends: tuple = (SM12xNvfp4Bf16Config(),),
+) -> MoEConfig:
+    return MoEConfig(
+        routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
+        backend=BackendOptions(backends),
+        finalize=MoEFinalizeConfig(do_finalize=True),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=max_num_tokens),
+    )
+
+
+def _assert_moe_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    # The kernel keeps GEMM1 and the per-expert GEMM2 results in FP32 where the
+    # reference rounds them to BF16; the gap is a few BF16 ulps of the output.
+    torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
+
+
+def test_sm12x_nvfp4_bf16_rejects_non_default_swiglu():
+    config = _sm12x_nvfp4_bf16_config(
+        SwiGLU(limit=7.0),
+        num_experts=4,
+        top_k=2,
+        intermediate_size=128,
+        max_num_tokens=8,
+    )
+    runner = SM12xNvfp4Bf16Runner(config, torch.device("cpu"))
+    with pytest.raises(NotImplementedError, match="default SwiGLU"):
+        runner._check_activation_parameters()
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+def test_sm12x_nvfp4_bf16_reads_the_shared_cutile_view(activation):
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=4,
+        hidden_size=256,
+        intermediate_size=192,
+        num_experts=8,
+        top_k=2,
+    )
+    weights = MoEWeightPack()
+    # Registered only under the cuTile key: the view is shared, not copied.
+    weights.prepare_for(CuTileNvfp4Runner.backend_key, view)
+    config = _sm12x_nvfp4_bf16_config(
+        activation, num_experts=8, top_k=2, intermediate_size=192, max_num_tokens=8
+    )
+    runner = SM12xNvfp4Bf16Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    act = make_activations(0)
+    inputs = runner.pack_inputs(act, weights)
+    for tensor, key in zip(
+        inputs[4:],
+        ("w1", "w1_scale", "w1_global_scale", "w2", "w2_scale", "w2_global_scale"),
+        strict=True,
+    ):
+        assert tensor.data_ptr() == view[key].data_ptr(), key
+    _assert_moe_close(runner.forward(inputs), reference(act))
+
+
+_SM12X_NVFP4_BF16_GEOMETRIES = (
+    # (case, num_tokens, hidden, intermediate, experts, top_k, activation)
+    ("qwen3.8_flash_next_t1", 1, 2560, 640, 512, 10, SwiGLU()),
+    ("qwen3.8_flash_next_t3", 3, 2560, 640, 512, 10, SwiGLU()),
+    ("qwen3.8_flash_next_t16", 16, 2560, 640, 512, 10, SwiGLU()),
+    ("qwen3.8_flash_next_t128", 128, 2560, 640, 512, 10, SwiGLU()),
+    # MoE geometries of benchmarks/samples/sample_testlist.txt
+    ("trtllm_e256_k8", 1024, 1024, 1024, 256, 8, SwiGLU()),
+    ("trtllm_e128_k8", 1024, 1024, 1024, 128, 8, SwiGLU()),
+    ("trtllm_e128_k1", 1024, 1024, 1024, 128, 1, SwiGLU()),
+    ("cutlass_e2_k2", 32, 128, 128, 2, 2, SwiGLU()),
+    ("cutlass_e8_k2", 32, 128, 128, 8, 2, SwiGLU()),
+    ("qwen3.6_35b_a3b_t8", 8, 2048, 512, 256, 8, SwiGLU()),
+    ("qwen3.6_35b_a3b_t128", 128, 2048, 512, 256, 8, SwiGLU()),
+    ("nemotron_3.5_relu2_t8", 8, 2688, 1856, 128, 6, ReLU2()),
+    ("nemotron_3.5_relu2_t128", 128, 2688, 1856, 128, 6, ReLU2()),
+    ("cute_dsl_large", 1024, 7168, 2048, 256, 8, SwiGLU()),
+    ("cute_dsl_small", 256, 1024, 512, 256, 2, SwiGLU()),
+    ("qwen3_30b_decode", 1, 2048, 768, 128, 8, SwiGLU()),
+    ("qwen3_30b_prefill", 4096, 2048, 768, 128, 8, SwiGLU()),
+    ("qwen3_235b_tp4", 256, 4096, 384, 128, 8, SwiGLU()),
+    ("qwen3_next_e512_k10", 1024, 2048, 512, 512, 10, SwiGLU()),
+    ("mixtral_8x7b", 256, 4096, 14336, 8, 2, SwiGLU()),
+    ("b12x_swiglu_k22", 1024, 1024, 2688, 512, 22, SwiGLU()),
+    ("b12x_relu2_k22", 1, 1024, 2688, 512, 22, ReLU2()),
+)
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,intermediate_size,num_experts,top_k,activation",
+    [case[1:] for case in _SM12X_NVFP4_BF16_GEOMETRIES],
+    ids=[case[0] for case in _SM12X_NVFP4_BF16_GEOMETRIES],
+)
+def test_sm12x_nvfp4_bf16_matches_reference(
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k, activation
+):
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            max_num_tokens=max(8, num_tokens),
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    actual = layer(act, weights)
+    assert actual.shape == (num_tokens, hidden_size)
+    assert layer.winner_backend == SM12xNvfp4Bf16Runner.backend_key
+    _assert_moe_close(actual, reference(act))
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("num_tokens", (1, 4, 16, 128))
+def test_sm12x_nvfp4_bf16_ignores_out_of_range_expert_ids(num_tokens):
+    # Serving frameworks route padding rows to expert -1 and expert-parallel
+    # non-local slots to num_experts; such slots contribute nothing. With one
+    # token, every row is padding, as in a CUDA-graph warmup forward.
+    activation = SwiGLU()
+    num_experts, top_k = 128, 8
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=768,
+            max_num_tokens=num_tokens,
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    num_valid = num_tokens // 2
+    act.topk_ids[num_valid:] = -1
+    act.topk_ids[:num_valid, -1] = num_experts
+
+    actual = layer(act, weights)
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(actual[num_valid:]) == 0
+    if num_valid:
+        ids = act.topk_ids[:num_valid].clone()
+        ids[:, -1] = 0
+        topk_weights = act.topk_weights[:num_valid].clone()
+        topk_weights[:, -1] = 0
+        expected = reference(
+            MoEActivationPack(act.hidden_states_q[:num_valid], None, ids, topk_weights)
+        )
+        _assert_moe_close(actual[:num_valid], expected)
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("num_tokens", (1, 16, 128))
+def test_sm12x_nvfp4_bf16_dead_slots_stay_finite_on_overflowing_fallback(num_tokens):
+    # Dead slots run expert 0 under a zero weight. With expert 0 overflowing the
+    # FP16 activation, multiplying its inf partial by zero would write NaN; so
+    # would a non-finite router weight left on a dead slot.
+    activation = ReLU2()
+    num_experts, top_k = 64, 4
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    view["w1_global_scale"][0] = 1.0e4
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=768,
+            max_num_tokens=num_tokens,
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    logits = torch.rand(num_tokens, num_experts - 1, device="cuda")
+    act.topk_ids.copy_(torch.topk(logits, top_k, dim=-1).indices.to(torch.int32) + 1)
+    num_valid = num_tokens // 2
+    act.topk_ids[num_valid:] = -1
+    act.topk_ids[:num_valid, -1] = num_experts
+    act.topk_weights[num_valid:] = float("nan")
+    act.topk_weights[:num_valid, -1] = float("inf")
+
+    actual = layer(act, weights)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[num_valid:]) == 0
+    if num_valid:
+        ids = act.topk_ids[:num_valid].clone()
+        ids[:, -1] = 1
+        topk_weights = act.topk_weights[:num_valid].clone()
+        topk_weights[:, -1] = 0
+        expected = reference(
+            MoEActivationPack(act.hidden_states_q[:num_valid], None, ids, topk_weights)
+        )
+        _assert_moe_close(actual[:num_valid], expected)
+
+
+@sm12x_nvfp4_bf16_required
+def test_sm12x_nvfp4_bf16_layers_do_not_share_scratch():
+    # Two layers of the same geometry interleaved on two streams must not race
+    # on routing lists or persistent-kernel counters.
+    activation = SwiGLU()
+    num_experts, top_k, num_tokens = 128, 8, 4
+    cases = [
+        _make_sm12x_nvfp4_bf16_case(
+            activation,
+            num_tokens=num_tokens,
+            hidden_size=2048,
+            intermediate_size=768,
+            num_experts=num_experts,
+            top_k=top_k,
+            seed=seed,
+        )
+        for seed in (0, 1)
+    ]
+    layers, packs = [], []
+    for view, _, _ in cases:
+        pack = MoEWeightPack()
+        pack.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+        packs.append(pack)
+        layers.append(
+            MoELayer(
+                _sm12x_nvfp4_bf16_config(
+                    activation,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    intermediate_size=768,
+                    max_num_tokens=num_tokens,
+                ),
+                torch.device("cuda"),
+            )
+        )
+    acts = [make(step) for step, (_, make, _) in enumerate(cases)]
+    for layer, act, pack in zip(layers, acts, packs, strict=True):
+        layer(act, pack)
+    torch.cuda.synchronize()
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    outs: list[list[torch.Tensor]] = [[], []]
+    for _ in range(20):
+        for i, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                outs[i].append(layers[i](acts[i], packs[i]).clone())
+    torch.cuda.synchronize()
+
+    for i, (_, _, reference) in enumerate(cases):
+        expected = reference(acts[i])
+        for actual in outs[i]:
+            _assert_moe_close(actual, expected)
+
+
+@sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,intermediate_size,num_experts,top_k,activation",
+    (
+        (4, 2560, 640, 512, 10, SwiGLU()),
+        (64, 2048, 512, 256, 8, SwiGLU()),
+        (8, 2688, 1856, 128, 6, ReLU2()),
+    ),
+)
+def test_sm12x_nvfp4_bf16_cuda_graph_replays_new_inputs_and_routing(
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k, activation
+):
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            max_num_tokens=num_tokens,
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    _assert_moe_close(layer(act, weights), reference(act))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = layer(act, weights)
+    for step in (1, 2):
+        update = make_activations(step)
+        act.hidden_states_q.copy_(update.hidden_states_q)
+        act.topk_ids.copy_(update.topk_ids)
+        act.topk_weights.copy_(update.topk_weights)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_moe_close(captured, reference(update))
+
+
+@sm12x_nvfp4_bf16_required
+def test_sm12x_nvfp4_bf16_competes_with_cutile_in_one_layer():
+    if not _cutile_nvfp4_is_supported():
+        pytest.skip("requires a working cuTile toolchain")
+    activation = SwiGLU()
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=4,
+        hidden_size=2560,
+        intermediate_size=640,
+        num_experts=512,
+        top_k=10,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(CuTileNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=512,
+            top_k=10,
+            intermediate_size=640,
+            max_num_tokens=16,
+            backends=(CuTileNvfp4Bf16Config(), SM12xNvfp4Bf16Config()),
+        ),
+        torch.device("cuda"),
+    )
+    assert {r.backend_key for r in layer.runners} == {
+        CuTileNvfp4Bf16Runner.backend_key,
+        SM12xNvfp4Bf16Runner.backend_key,
+    }
+    act = make_activations(0)
+    _assert_moe_close(layer(act, weights), reference(act))

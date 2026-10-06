@@ -2812,6 +2812,11 @@ class GvrTopKKernel:
         n_cols = input_data.shape[1]
         if N > n_cols:
             N = n_cols
+        # A padded / evicted request (seq_len < next_n - nn) gives a negative
+        # numerator: the row has no valid columns, not a negative length
+        # (which would place the identity epilogue's writes before the row).
+        if N < cutlass.Int32(0):
+            N = cutlass.Int32(0)
 
         # Slice per-row views.
         input_row = input_data[row_idx, None]

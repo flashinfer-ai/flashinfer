@@ -37,6 +37,12 @@
 #ifndef FLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND
 #error "FLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND must identify the target"
 #endif
+// The two batch-fallback bodies (tile8/tile16) keep the earlier kernel ABI:
+// one mixed Q/K/V pointer, no scale argument, and the state base alignment
+// passed as a residue instead of being required at the binding boundary.
+#ifndef CAKE_KDA_PACKED_T1_LEGACY_ABI
+#define CAKE_KDA_PACKED_T1_LEGACY_ABI 0
+#endif
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -95,6 +101,12 @@ static_assert(CAKE_KDA_PACKED_T1_THREADS == 32 || CAKE_KDA_PACKED_T1_THREADS == 
 static_assert(CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 0 ||
                   CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 1,
               "packed KDA T=1 auxiliary alignment must be boolean");
+static_assert(CAKE_KDA_PACKED_T1_LEGACY_ABI == 0 || CAKE_KDA_PACKED_T1_LEGACY_ABI == 1,
+              "packed KDA T=1 legacy ABI switch must be boolean");
+static_assert(CAKE_KDA_PACKED_T1_LEGACY_ABI == 0 ||
+                  (CAKE_KDA_PACKED_T1_THREADS == 32 && CAKE_KDA_PACKED_T1_SMEM_BYTES == 0 &&
+                   CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 0),
+              "legacy packed KDA T=1 bodies run one warp without dynamic shared memory");
 
 inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
@@ -223,10 +235,16 @@ void Run(TensorView mixed_qkv, TensorView raw_gate, TensorView raw_beta, TensorV
   TVM_FFI_ICHECK(state.stride(2) == kHeadDim && state.stride(1) == kHeadDim * kHeadDim &&
                  state.stride(0) >= kHeads * kHeadDim * kHeadDim)
       << "state must have compact [H,V,K] blocks and a positive, disjoint outer slot stride";
-  TVM_FFI_ICHECK(state.stride(0) > 0 && state.stride(0) % 8 == 0)
-      << "optimized state slot stride must be positive and eight-element aligned";
-  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0)
-      << "optimized state base must be 16-byte aligned";
+  if constexpr (CAKE_KDA_PACKED_T1_LEGACY_ABI != 0) {
+    TVM_FFI_ICHECK(state.stride(0) > 0) << "state outer slot stride must be positive";
+    TVM_FFI_ICHECK(state.size(0) <= std::numeric_limits<int64_t>::max() / state.stride(0))
+        << "state indexed extent overflows int64";
+  } else {
+    TVM_FFI_ICHECK(state.stride(0) > 0 && state.stride(0) % 8 == 0)
+        << "optimized state slot stride must be positive and eight-element aligned";
+    TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0)
+        << "optimized state base must be 16-byte aligned";
+  }
 
   TVM_FFI_ICHECK(state_indices.ndim() == 1 && state_indices.numel() == batch)
       << "state_indices must have shape [B]";
@@ -257,12 +275,24 @@ void Run(TensorView mixed_qkv, TensorView raw_gate, TensorView raw_beta, TensorV
   }
 
   auto* mixed = reinterpret_cast<__nv_bfloat16*>(mixed_qkv.data_ptr());
-  auto* q = mixed;
-  auto* k = mixed + kHeads * kHeadDim;
-  auto* v = mixed + 2 * kHeads * kHeadDim;
   const dim3 grid(kHeads * CAKE_KDA_PACKED_T1_VALUE_TILES, static_cast<uint32_t>(batch), 1);
   const dim3 block(CAKE_KDA_PACKED_T1_THREADS, 1, 1);
   const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+#if CAKE_KDA_PACKED_T1_LEGACY_ABI
+  const int32_t state_base_mod8 = static_cast<int32_t>(
+      (reinterpret_cast<uintptr_t>(state.data_ptr()) / sizeof(__nv_bfloat16)) & 7);
+  CAKE_KDA_PACKED_T1_KERNEL<<<grid, block, 0, stream>>>(
+      mixed, reinterpret_cast<__nv_bfloat16*>(raw_gate.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(raw_beta.data_ptr()),
+      reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(state.data_ptr()),
+      reinterpret_cast<int*>(state_indices.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), mixed_qkv.stride(0), raw_gate.stride(0),
+      raw_beta.stride(0), state.stride(0), state_base_mod8);
+#else
+  auto* q = mixed;
+  auto* k = mixed + kHeads * kHeadDim;
+  auto* v = mixed + 2 * kHeads * kHeadDim;
   CAKE_KDA_PACKED_T1_KERNEL<<<grid, block, CAKE_KDA_PACKED_T1_SMEM_BYTES, stream>>>(
       q, k, v, reinterpret_cast<__nv_bfloat16*>(raw_gate.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(raw_beta.data_ptr()),
@@ -272,6 +302,7 @@ void Run(TensorView mixed_qkv, TensorView raw_gate, TensorView raw_beta, TensorV
       reinterpret_cast<int*>(state_indices.data_ptr()), 0.08838834764831845F, mixed_qkv.stride(0),
       mixed_qkv.stride(0), mixed_qkv.stride(0), raw_gate.stride(0), raw_beta.stride(0),
       state.stride(0));
+#endif
   CheckCuda(cudaGetLastError(), "frozen packed KDA T=1 launch");
 }
 

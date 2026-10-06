@@ -646,7 +646,9 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
+    @pytest.fixture(autouse=True)
+    def _rand_seed(self):
+        self.rand_seed = torch.tensor(42, dtype=torch.int64, device="cuda")
 
     def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
         """Create test inputs with fp16 state."""
@@ -671,7 +673,7 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
         # on unsupported GPUs the Triton reference falls back to regular
         # rounding while the CUDA kernel still exercises its software
         # stochastic rounding path.
-        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
+        rand_seed = self.rand_seed if is_cvt_rs_supported() else None
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
@@ -706,7 +708,7 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
             pad_slot_id=-1,
             out=out,
             algorithm=algorithm,
-            rand_seed=self.RAND_SEED,
+            rand_seed=self.rand_seed,
         )
 
     def assert_states_match(

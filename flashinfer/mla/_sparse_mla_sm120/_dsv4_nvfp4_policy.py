@@ -74,9 +74,9 @@ _STATIC_FORMAT: _StaticFormat = {
     "bytes_per_token": 384,
     "chunk_width": 64,
     "page_size": 64,
-    "heads": (16, 32, 64, 128),
+    "heads": (8, 16, 32, 64, 128),
     "topks": (128, 512),
-    "extra_page_sizes": (2, 64),
+    "extra_page_sizes": (2, 32, 64),
 }
 
 
@@ -691,6 +691,7 @@ def _make_calibration_calls(
                 extra_topk_length,
                 cpb,
                 False,
+                1.0,
             )
 
         return call
@@ -708,6 +709,7 @@ def _make_calibration_calls(
             extra_cache,
             extra_indices,
             extra_topk_length,
+            1.0,
         )
 
     return build_decode, prefill

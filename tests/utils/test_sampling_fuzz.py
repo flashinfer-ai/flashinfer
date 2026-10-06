@@ -38,7 +38,7 @@ from __future__ import annotations
 import math
 import os
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
 
 import pytest
@@ -61,9 +61,10 @@ _GPU_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA not available"
 )
 
-# The sampling entry points document float32 in / int32 out; the renorm helpers also take
-# fp16/bf16, but the sampling path is float32, so a wider dtype axis would be out of contract.
+# Probabilities are float32; outputs follow indices.dtype when indices is supplied,
+# and default to int32 otherwise. The renorm helpers also accept fp16/bf16 inputs.
 _DTYPE = torch.float32
+_INDICES_DTYPES = (torch.int32, torch.int64)
 _DEVICE = "cuda:0"
 _SAMPLES_PER_CASE = 4096
 
@@ -383,6 +384,7 @@ class Cfg:
     top_p: List[float] = field(default_factory=list)
     per_request: bool = False  # thresholds as (batch,) tensors vs a python scalar
     use_indices: bool = False  # draw through the indices remap
+    indices_dtype: torch.dtype = torch.int32
     p_boundary: str = (
         "-"  # "below" / "at" / "above" a cumulative-mass boundary, else "-"
     )
@@ -403,7 +405,9 @@ class Cfg:
             for t in (
                 self.order if self.order != "-" else "",
                 f"b{self.p_boundary}" if self.p_boundary != "-" else "",
-                "idx" if self.use_indices else "",
+                f"idx{str(self.indices_dtype).removeprefix('torch.')}"
+                if self.use_indices
+                else "",
             )
             if t
         )
@@ -510,31 +514,21 @@ if _ONLY_SEEDS.strip():
 else:
     _CONFIGS = [_gen(BASE_SEED + i) for i in range(NUM_CASES)]
 
+# Pair the same indexed case across dtypes, preserving seeded shapes and thresholds.
+_CONFIGS = [
+    replace(cfg, indices_dtype=dtype)
+    for cfg in _CONFIGS
+    for dtype in (_INDICES_DTYPES if cfg.use_indices else (torch.int32,))
+]
+
 
 def _indexed_per_request_top_k(cfg: Cfg) -> bool:
     """The combination gh #5339 gets wrong: per-row top_k reached through indices."""
     return cfg.api == "top_k" and cfg.per_request and cfg.use_indices
 
 
-# Tracked wrong-answer findings for this API, applied through the shared ledger.
-# These cases still run: they are kept to one output per probs row (see
-# _draw_samples), which keeps the buggy top_k_arr[output_position] read inside the
-# array, so no unpatched build is asked to read out of bounds. Once gh #5340 lands,
-# test_per_request_top_k_follows_indices fails with "remove its ledger entry";
-# delete the Finding below and both it and the generated cases are asserted normally.
-_LEDGER = FuzzLedger(
-    "sampling",
-    findings=(
-        Finding(
-            match=_indexed_per_request_top_k,
-            reason=(
-                "gh #5339: top_k_sampling_from_probs reads a per-request top_k by "
-                "output position instead of by the probs row indices selects; fixed "
-                "by gh #5340. Probe: test_per_request_top_k_follows_indices."
-            ),
-        ),
-    ),
-)
+# #5339 was fixed in #5340; every dtype now runs without a known-failure waiver.
+_LEDGER = FuzzLedger("sampling")
 
 # One output per probs row keeps top_k_arr[output_position] in bounds on a build
 # without gh #5340; repeat the launch instead of widening it.
@@ -550,7 +544,8 @@ def _describe(cfg: Cfg) -> str:
         f"CONFIG {cfg.label}\n"
         f"  api={cfg.api} order={cfg.order} shapes={cfg.shapes} vocab={cfg.vocab}\n"
         f"  top_k={cfg.top_k} top_p={cfg.top_p} per_request={cfg.per_request} "
-        f"indices={cfg.use_indices} p_boundary={cfg.p_boundary}\n"
+        f"indices={cfg.use_indices} indices_dtype={cfg.indices_dtype} "
+        f"p_boundary={cfg.p_boundary}\n"
         f"  dtype={_DTYPE} device={torch.cuda.get_device_name(0)} sm={cc[0]}{cc[1]} "
         f"seed={cfg.seed}"
     )
@@ -629,9 +624,7 @@ def _call(cfg: Cfg, probs, k, p, indices, seed, offset, generator=None):
 @_GPU_ONLY
 @pytest.mark.parametrize("cfg", _CONFIGS, ids=[c.label for c in _CONFIGS])
 def test_sampling_fuzz(cfg: Cfg):
-    # Consulted before any CUDA work, so a quarantined config could never reach a
-    # kernel launch. Nothing is quarantined today; the entry below is a tolerated
-    # wrong answer, applied after the checks run.
+    # Consult the ledger before CUDA work; no findings are currently registered.
     _LEDGER.xfail_if_quarantined(cfg)
     finding = _LEDGER.find(cfg)
     try:
@@ -640,9 +633,7 @@ def test_sampling_fuzz(cfg: Cfg):
         if finding is not None and exc.category == "row_threshold":
             pytest.xfail(f"[sampling] {cfg.label}: {finding.reason}\n{exc}")
         pytest.fail(str(exc), pytrace=False)
-    # A passing case is not reported as an unexpected pass: one generated case is not
-    # guaranteed to exercise the tracked defect. test_per_request_top_k_follows_indices
-    # is the probe that fails loudly once the entry is stale.
+    # The indexed top-k probe checks row remapping directly as well.
 
 
 def _run_case(cfg: Cfg) -> None:
@@ -678,8 +669,11 @@ def _run_case(cfg: Cfg) -> None:
             cfg,
             f"output shape {tuple(samples.shape)}, expected {tuple(dist_idx.shape)}",
         )
-    if samples.dtype != torch.int32:
-        _fail(cfg, f"output dtype {samples.dtype}, expected int32")
+    expected_dtype = cfg.indices_dtype if cfg.use_indices else torch.int32
+    if samples.dtype != expected_dtype:
+        _fail(cfg, f"output dtype {samples.dtype}, expected {expected_dtype}")
+    if not bool(((dist_idx >= 0) & (dist_idx < nd)).all()):
+        _fail(cfg, f"distribution index out of range [0,{nd})")
     if not (torch.all(samples >= 0) and torch.all(samples < cfg.vocab)):
         _fail(cfg, f"sample index out of range [0,{cfg.vocab})")
 
@@ -744,7 +738,9 @@ def _run_case(cfg: Cfg) -> None:
                 _fail(
                     cfg,
                     f"dist {d}: observed {distinct} classes, need at least {minimum}",
-                    category="row_threshold" if wrong_row_signature else "support_cardinality",
+                    category="row_threshold"
+                    if wrong_row_signature
+                    else "support_cardinality",
                 )
 
 
@@ -765,7 +761,7 @@ def _draw_samples(cfg: Cfg, probs, seed, single_chunk: bool = False):
         p = _threshold(cfg.top_p, "p", cfg) if cfg.top_p else None
         if _indexed_per_request_top_k(cfg):
             launches = 1 if single_chunk else _ROW_LIMITED_LAUNCHES
-            idx = order.to(torch.int32)
+            idx = order.to(cfg.indices_dtype)
             chunks = [
                 _call(cfg, probs, k, p, idx, seed + i, 0) for i in range(launches)
             ]
@@ -773,7 +769,7 @@ def _draw_samples(cfg: Cfg, probs, seed, single_chunk: bool = False):
             return torch.cat(chunks), order.repeat(launches)
         reps = 1 if single_chunk else -(-_SAMPLES_PER_CASE // nd)
         dist_idx = order.repeat(reps)
-        s = _call(cfg, probs, k, p, dist_idx.to(torch.int32), seed, 0)
+        s = _call(cfg, probs, k, p, dist_idx.to(cfg.indices_dtype), seed, 0)
         torch.cuda.synchronize()
         return s, dist_idx
     reps = 1 if single_chunk else -(-_SAMPLES_PER_CASE // nd)
@@ -790,7 +786,7 @@ def _draw_samples(cfg: Cfg, probs, seed, single_chunk: bool = False):
 
 def _check_generator_replay(cfg: Cfg, probs) -> None:
     nd = cfg.num_dist
-    dist_idx = torch.arange(nd - 1, -1, -1, device=_DEVICE).to(torch.int32)
+    dist_idx = torch.arange(nd - 1, -1, -1, device=_DEVICE).to(cfg.indices_dtype)
     k = _threshold(cfg.top_k, "k", cfg) if cfg.top_k else None
     p = _threshold(cfg.top_p, "p", cfg) if cfg.top_p else None
     g1 = torch.Generator(_DEVICE).manual_seed(1234)
@@ -798,6 +794,8 @@ def _check_generator_replay(cfg: Cfg, probs) -> None:
     s1 = _call(cfg, probs, k, p, dist_idx, None, None, generator=g1)
     s2 = _call(cfg, probs, k, p, dist_idx, None, None, generator=g2)
     torch.cuda.synchronize()
+    if s1.dtype != cfg.indices_dtype or s2.dtype != cfg.indices_dtype:
+        _fail(cfg, f"generator output dtype must be {cfg.indices_dtype}")
     if not torch.equal(s1, s2):
         _fail(cfg, "same generator state did not produce identical output")
 
@@ -823,7 +821,7 @@ _PROBE_CFG = Cfg(
 )
 
 
-def _run_indexed_top_k_probe() -> Optional[str]:
+def _run_indexed_top_k_probe(indices_dtype=torch.int32) -> Optional[str]:
     """Return a detail only for #5339's swapped-threshold signature.
 
     Other failures are not known failures, even when this configuration matches
@@ -832,7 +830,7 @@ def _run_indexed_top_k_probe() -> Optional[str]:
     sampling = _flashinfer().sampling
     probs = torch.tensor([_PROBE_ROW, _PROBE_ROW], dtype=_DTYPE, device=_DEVICE)
     top_k = torch.tensor(_PROBE_K, dtype=torch.int64, device=_DEVICE)
-    indices = torch.tensor(_PROBE_INDICES, dtype=torch.int32, device=_DEVICE)
+    indices = torch.tensor(_PROBE_INDICES, dtype=indices_dtype, device=_DEVICE)
     seen = torch.zeros(2, len(_PROBE_ROW), dtype=torch.bool, device=_DEVICE)
     lanes = torch.arange(2, device=_DEVICE)
     for launch in range(_PROBE_LAUNCHES):
@@ -863,17 +861,11 @@ def _run_indexed_top_k_probe() -> Optional[str]:
 
 
 @_GPU_ONLY
-def test_per_request_top_k_follows_indices():
-    """A per-request top_k must be read from the probs row, not the output position.
-
-    While the ledger tracks gh #5339 this is an expected failure; once the kernel is
-    fixed the ledger's own xpass rule turns the pass into a loud failure, and the
-    maintainer removes the Finding from _LEDGER (the generated
-    top_k/per-request/indices cases then stop being tolerated and are asserted like
-    every other case).
-    """
-    finding = _LEDGER.find(_PROBE_CFG)
-    detail = _run_indexed_top_k_probe()
+@pytest.mark.parametrize("indices_dtype", _INDICES_DTYPES, ids=["int32", "int64"])
+def test_per_request_top_k_follows_indices(indices_dtype):
+    """A per-request top_k must be read from the probs row, not the output position."""
+    finding = _LEDGER.find(replace(_PROBE_CFG, indices_dtype=indices_dtype))
+    detail = _run_indexed_top_k_probe(indices_dtype)
     if finding is not None:
         if detail is not None:
             pytest.xfail(f"[sampling] {finding.reason}\n{detail}")
@@ -915,7 +907,7 @@ _STAT_CONFIGS = [
     ("top_k_top_p", "joint", 8, 1.0, 8, 8, 0.7),  # both no-op
     ("top_k_top_p", "top_k_first", 8, 1.0, 8, 8, 0.7),  # both no-op
 ]
-_ALPHA_PER = ALPHA_FAMILY / len(_STAT_CONFIGS)
+_ALPHA_PER = ALPHA_FAMILY / (len(_STAT_CONFIGS) * len(_INDICES_DTYPES))
 
 
 def _stat_row(vocab: int, active: int, ratio: float) -> torch.Tensor:
@@ -923,11 +915,13 @@ def _stat_row(vocab: int, active: int, ratio: float) -> torch.Tensor:
     return _geometric(vocab, active, ratio).to(_DTYPE)
 
 
-def _draw_counts(api, order, top_k, top_p, probs_row, seed) -> torch.Tensor:
+def _draw_counts(
+    api, order, top_k, top_p, probs_row, seed, indices_dtype
+) -> torch.Tensor:
     sampling = _flashinfer().sampling
     vocab = probs_row.numel()
     probs = probs_row.to(_DTYPE).to(_DEVICE).unsqueeze(0)
-    indices = torch.zeros(SAMPLE_COUNT, dtype=torch.int32, device=_DEVICE)
+    indices = torch.zeros(SAMPLE_COUNT, dtype=indices_dtype, device=_DEVICE)
     if api == "sampling_from_probs":
         s = sampling.sampling_from_probs(probs, indices=indices, seed=seed, offset=0)
     elif api == "top_k":
@@ -949,23 +943,28 @@ def _draw_counts(api, order, top_k, top_p, probs_row, seed) -> torch.Tensor:
             offset=0,
         )
     torch.cuda.synchronize()
+    assert s.shape == indices.shape and s.dtype == indices_dtype
+    assert bool(((s >= 0) & (s < vocab)).all())
     return torch.bincount(s.long(), minlength=vocab).cpu()
 
 
 @_GPU_ONLY
+@pytest.mark.parametrize("indices_dtype", _INDICES_DTYPES, ids=["int32", "int64"])
 @pytest.mark.parametrize(
     "sc",
     _STAT_CONFIGS,
     ids=[f"{c[0]}_{c[1]}_v{c[4]}_k{c[2]}_p{c[3]}" for c in _STAT_CONFIGS],
 )
-def test_sampling_distribution(sc):
+def test_sampling_distribution(sc, indices_dtype):
     api, order, top_k, top_p, vocab, active, ratio = sc
     probs_row = _stat_row(vocab, active, ratio)
     target = reference_target_distribution(
         api, reference_normalize(probs_row), top_k, top_p, order
     )
 
-    counts = _draw_counts(api, order, top_k, top_p, probs_row, seed=0xBEEF)
+    counts = _draw_counts(
+        api, order, top_k, top_p, probs_row, seed=0xBEEF, indices_dtype=indices_dtype
+    )
     drew_forbidden = int(counts[target == 0].sum().item())
     assert drew_forbidden == 0, (
         f"{api}/{order} v{vocab}: {drew_forbidden} draws on zero-target classes\n"
@@ -1169,6 +1168,94 @@ def test_indexed_per_request_top_k_is_generated_and_kept_in_bounds():
             assert not finding.quarantine
 
 
+def test_indices_dtype_axis_preserves_generated_cases():
+    """Each indexed seed exercises both dtypes with identical sampling inputs."""
+    for seed in {cfg.seed for cfg in _CONFIGS}:
+        cases = [cfg for cfg in _CONFIGS if cfg.seed == seed]
+        original = _gen(seed)
+        expected = _INDICES_DTYPES if original.use_indices else (torch.int32,)
+        assert {cfg.indices_dtype for cfg in cases} == set(expected)
+        assert all(replace(cfg, indices_dtype=torch.int32) == original for cfg in cases)
+    assert _LEDGER.find(replace(_PROBE_CFG, indices_dtype=torch.int64)) is None
+
+
+@pytest.mark.parametrize("use_indices", [False, True])
+@pytest.mark.parametrize("indices_dtype", _INDICES_DTYPES, ids=["int32", "int64"])
+@pytest.mark.parametrize("wrong_dtype", [False, True])
+def test_output_dtype_contract(monkeypatch, use_indices, indices_dtype, wrong_dtype):
+    """Indexed outputs follow indices; unindexed outputs retain the int32 default."""
+    cfg = Cfg(
+        0,
+        "sampling_from_probs",
+        "-",
+        ["one_hot"],
+        2,
+        use_indices=use_indices,
+        indices_dtype=indices_dtype,
+    )
+    expected = indices_dtype if use_indices else torch.int32
+    actual = (
+        (torch.int64 if expected == torch.int32 else torch.int32)
+        if wrong_dtype
+        else expected
+    )
+
+    def draw(*_args, **_kwargs):
+        return torch.zeros(4096, dtype=actual), torch.zeros(4096, dtype=torch.int64)
+
+    monkeypatch.setitem(globals(), "_DEVICE", "cpu")
+    monkeypatch.setitem(
+        globals(), "_build_probs", lambda *_: torch.tensor([[1.0, 0.0]])
+    )
+    monkeypatch.setitem(globals(), "_draw_samples", draw)
+    monkeypatch.setitem(globals(), "_check_generator_replay", lambda *_: None)
+    monkeypatch.setitem(globals(), "_describe", lambda _: "CPU dtype fixture")
+    if wrong_dtype:
+        with pytest.raises(_CaseFailure, match="output dtype"):
+            _run_case(cfg)
+    else:
+        _run_case(cfg)
+
+
+@pytest.mark.parametrize("indices_dtype", _INDICES_DTYPES, ids=["int32", "int64"])
+@pytest.mark.parametrize("api", _APIS)
+def test_indexed_draw_layout_and_dtype(monkeypatch, api, indices_dtype):
+    """Repeated non-monotonic row mappings survive both index storage types."""
+    cfg = Cfg(
+        0,
+        api,
+        "joint",
+        ["sparse"] * 4,
+        8,
+        top_k=[1, 2, 4, 8] if "top_k" in api else [],
+        top_p=[0.5, 0.8, 0.9, 1.0] if "top_p" in api else [],
+        per_request=True,
+        use_indices=True,
+        indices_dtype=indices_dtype,
+    )
+    calls = []
+
+    def sample(_cfg, probs, k, p, indices, *_args):
+        assert indices.dtype == indices_dtype
+        assert bool(((indices >= 0) & (indices < probs.size(0))).all())
+        calls.append(indices.clone())
+        return indices.clone()
+
+    monkeypatch.setitem(globals(), "_DEVICE", "cpu")
+    monkeypatch.setitem(globals(), "_call", sample)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    samples, rows = _draw_samples(cfg, torch.ones(4, 8), seed=0)
+    assert samples.dtype == indices_dtype
+    assert torch.equal(samples.long(), rows)
+    assert rows.tolist() == [3, 2, 1, 0] * (rows.numel() // 4)
+    assert rows.numel() > cfg.num_dist
+    if api == "top_k":
+        assert len(calls) == _ROW_LIMITED_LAUNCHES
+        assert all(indices.numel() == cfg.num_dist for indices in calls)
+    else:
+        assert len(calls) == 1 and calls[0].numel() != cfg.num_dist
+
+
 def test_gof_rejects_invalid_inputs():
     """Invalid statistics raise instead of returning a number a caller would compare."""
     bad = [
@@ -1337,9 +1424,7 @@ def test_wrong_row_diagnosis_uses_the_observations():
     )
     rows = torch.tensor([[0.5, 0.25, 0.125, 0.125]] * 2, dtype=torch.float64)
     idx = torch.tensor([1, 0] * 64)
-    wrong = torch.tensor(
-        [x for i in range(64) for x in (0, i % 4)], dtype=torch.int32
-    )
+    wrong = torch.tensor([x for i in range(64) for x in (0, i % 4)], dtype=torch.int32)
     correct = torch.tensor(
         [x for i in range(64) for x in (i % 4, 0)], dtype=torch.int32
     )
@@ -1391,9 +1476,7 @@ def test_top_k_cardinality_requires_an_adequate_sampling_budget():
     row = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float64)
     assert reference_top_k_min_observed(row, 2, 4096) == 2
     assert reference_top_k_min_observed(row, 2, 2) == 0
-    assert (
-        reference_top_k_min_observed(torch.tensor([1.0, 0.0]), 2, 4096) == 0
-    )
+    assert reference_top_k_min_observed(torch.tensor([1.0, 0.0]), 2, 4096) == 0
 
 
 @pytest.mark.parametrize("failure", ["seed", "generator"])
@@ -1439,7 +1522,10 @@ def test_replay_checks_precede_a_known_support_failure(monkeypatch, failure):
 
 
 @pytest.mark.parametrize("mode", ["correct", "swapped", "unrelated", "bad_dtype"])
-def test_probe_distinguishes_known_and_unrelated_failures(monkeypatch, mode):
+@pytest.mark.parametrize("indices_dtype", _INDICES_DTYPES, ids=["int32", "int64"])
+def test_probe_distinguishes_known_and_unrelated_failures(
+    monkeypatch, mode, indices_dtype
+):
     """Only the swapped-threshold signature is eligible for an expected failure."""
     from types import SimpleNamespace
 
@@ -1451,7 +1537,7 @@ def test_probe_distinguishes_known_and_unrelated_failures(monkeypatch, mode):
         out = [value, 0] if mode == "correct" else [0, value]
         if mode == "unrelated":
             out = [0, 0]
-        dtype = torch.float64 if mode == "bad_dtype" else torch.int32
+        dtype = torch.float64 if mode == "bad_dtype" else indices_dtype
         return torch.tensor(out, dtype=dtype), torch.ones(2, dtype=torch.bool)
 
     monkeypatch.setitem(globals(), "_DEVICE", "cpu")
@@ -1469,11 +1555,11 @@ def test_probe_distinguishes_known_and_unrelated_failures(monkeypatch, mode):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     if mode == "unrelated":
         with pytest.raises(_CaseFailure) as err:
-            _run_indexed_top_k_probe()
+            _run_indexed_top_k_probe(indices_dtype)
         assert err.value.category == "probe_support"
     elif mode == "bad_dtype":
         with pytest.raises(AssertionError):
-            _run_indexed_top_k_probe()
+            _run_indexed_top_k_probe(indices_dtype)
     else:
-        detail = _run_indexed_top_k_probe()
+        detail = _run_indexed_top_k_probe(indices_dtype)
         assert (detail is None) == (mode == "correct")
