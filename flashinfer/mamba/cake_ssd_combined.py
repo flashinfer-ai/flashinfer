@@ -461,8 +461,12 @@ class CakeSSDCombined:
     128, BF16 inputs/outputs, BF16, FP16, or FP32 states, and SM100/SM103.
     Head and group counts are runtime values and may be any positive pair for
     which ``nheads`` is divisible by ``ngroups``.  Any positive sequence
-    length is accepted; the kernels handle a partial trailing chunk.  The
-    output is token-major ``[batch, seqlen, nheads, 64]`` (packed varlen:
+    length is accepted: the kernels handle a partial trailing chunk, and a
+    call shorter than one 128-token chunk (batched ``seqlen < 128`` or packed
+    varlen ``total < 128``) runs on zero-padded one-chunk copies of x/B/C and
+    a staged output owned by the runner, because the generated host pins a
+    128-row TMA box on the token axis (CAKE-1063; see ``run``).  The output
+    is token-major ``[batch, seqlen, nheads, 64]`` (packed varlen:
     ``[1, total_seqlen, nheads, 64]``), written directly by the kernels.
     Every call issues one launcher call: the preprocess (which also derives
     ``seq_chunk_cumsum`` from the packed-varlen metadata unless the caller
@@ -627,6 +631,37 @@ class CakeSSDCombined:
                     device=device,
                 ),
             }
+            if seqlen < _CHUNK_SIZE:
+                # CAKE-1063: a call shorter than one chunk binds the x/B/C/out
+                # tensor maps to these one-chunk buffers (see ``run``).  The
+                # key fixes ``seqlen``, and ``run`` only ever writes rows
+                # ``[:seqlen]`` of the input buffers, so the pad rows
+                # ``[seqlen, 128)`` keep the zeros of this allocation for the
+                # lifetime of the workspace: no per-call re-zeroing.  The
+                # output stage is never read past ``seqlen``.
+                padded = (batch, _CHUNK_SIZE)
+                self._workspace.update(
+                    padded_x=torch.zeros(
+                        (*padded, self.nheads, _HEADDIM),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                    padded_B=torch.zeros(
+                        (*padded, self.ngroups, _DSTATE),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                    padded_C=torch.zeros(
+                        (*padded, self.ngroups, _DSTATE),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                    padded_out=torch.empty(
+                        (*padded, self.nheads, _HEADDIM),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                )
             self._workspace_key = key
         workspace = self._workspace
         assert workspace is not None
@@ -893,6 +928,34 @@ class CakeSSDCombined:
         checkpoint_state_slots = packed(
             "checkpoint_state_slots", checkpoint_state_slots
         )
+        # CAKE-1063: calls shorter than one chunk.  The x/B/C/out tensor maps
+        # carry a fixed 128-row box on the token axis and the generated host
+        # rejects a global extent below the box, so when ``seqlen < 128`` the
+        # maps are bound to the runner-owned one-chunk buffers of the
+        # workspace: x/B/C are zero padded (valid rows copied in with the
+        # other pending copies), ``out`` is staged and its valid rows are
+        # copied back after the launch.  Every other argument stays logical
+        # (``seqlen``, ``nchunks = 1``, dt, z, the preprocess tables, the
+        # sequence metadata), so the kernel sees exactly the state of a
+        # partial trailing chunk of a longer call: the TMA zero fill past
+        # ``seqlen`` becomes explicit zero rows, the loader publishes a flat
+        # cumsum and a zero delta for those slots (batched) or clips the
+        # segment to ``seqlen`` (varlen), and ``z`` -- read through its
+        # pointer with the logical ``seqlen`` stride -- is guarded by
+        # ``row < chunk_tokens``.  The pad rows contribute exact zeros and
+        # the final states are unchanged.
+        staged_out = None
+        if seqlen < _CHUNK_SIZE:
+
+            def padded(name: str, value: torch.Tensor) -> torch.Tensor:
+                buffer = workspace[f"padded_{name}"]
+                pending_copies.append((buffer[:, :seqlen], value))
+                return buffer
+
+            x = padded("x", x)
+            B = padded("B", B)
+            C = padded("C", C)
+            staged_out = workspace["padded_out"]
         assert x is not None and dt is not None and A is not None
         assert B is not None and C is not None
         device_index = _cuda_device_index(x)
@@ -1006,11 +1069,12 @@ class CakeSSDCombined:
         # same buffers; pass a valid packed dummy so the host checks do
         # not reject the descriptor-compatible public views.
         unused_bf16 = self._dummy(x.device, torch.bfloat16)
+        kernel_out = out if staged_out is None else staged_out
         main_values: dict[str, object] = {
             "x_map": x,
             "b_map": B,
             "c_map": C,
-            "out_map": out,
+            "out_map": kernel_out,
             "x": unused_bf16,
             "dt": dt_float,
             "delta_precomputed": workspace["delta"],
@@ -1031,7 +1095,7 @@ class CakeSSDCombined:
             "chunk_indices": chunk_indices_arg,
             "chunk_offsets": chunk_offsets_arg,
             "seq_chunk_cumsum": cumsum_arg,
-            "out_native": out,
+            "out_native": kernel_out,
             "nheads": self.nheads,
             "ngroups": self.ngroups,
             "batch": batch,
@@ -1051,7 +1115,8 @@ class CakeSSDCombined:
         }
         # Every host-side decision is made; from here on only device work is
         # issued: the packed-input copies, then the single launcher call that
-        # runs the preprocess and the scan.
+        # runs the preprocess and the scan, then (calls shorter than one
+        # chunk only) the stream-ordered copy of the staged output rows.
         with torch.cuda.device(x.device):
             for destination, source in pending_copies:
                 destination.copy_(source)
@@ -1064,6 +1129,8 @@ class CakeSSDCombined:
                 main_grid=(grid, 1, 1),
                 cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
             )
+            if staged_out is not None:
+                out.copy_(staged_out[:, :seqlen])
         final = final_states_arg if return_final_states else None
         return out, final
 

@@ -268,7 +268,9 @@ class SSDCombined:
     ``[batch, nheads, headdim, nchunks, chunk_size]`` buffer and ``run``
     returns a token-major view of it; the Cake kernels write the token-major
     ``[batch, seqlen, nheads, headdim]`` buffer directly and return it.  The
-    Cake backend also accepts any positive ``seqlen`` and, in varlen mode,
+    Cake backend also accepts any positive ``seqlen``, including fewer than
+    ``chunk_size`` tokens per call (the host zero-pads x/B/C to one chunk and
+    stages the output; the kernels are unchanged), and, in varlen mode,
     ``initial_states=None`` with the sequence count from ``seq_chunk_cumsum``
     or ``num_seqs``.
 
@@ -526,7 +528,8 @@ class SSDCombined:
         Args:
             x: Input tensor of shape ``[batch, seqlen, nheads, headdim]``.
                 The CuTe backend requires ``seqlen`` to be a multiple of
-                ``chunk_size``; the Cake backend accepts any positive length.
+                ``chunk_size``; the Cake backend accepts any positive length,
+                including fewer than ``chunk_size`` tokens.
             dt: Per-token step sizes of shape ``[batch, seqlen, nheads]``.
             A: Float32 state-transition coefficients of shape ``[nheads]``.
             B: Input projection of shape
@@ -962,7 +965,9 @@ def ssd_combined_fwd(
     Args:
         x: BF16 input tensor of shape
             ``[batch, seqlen, nheads, headdim]``; any positive ``seqlen`` is
-            accepted (a partial trailing 128-token chunk is handled in-kernel).
+            accepted (a partial trailing 128-token chunk is handled in-kernel;
+            a call shorter than one chunk is zero-padded to one chunk by the
+            host, which also stages its output).
         dt: Per-token step sizes of shape ``[batch, seqlen, nheads]``.
         A: Float32 state-transition coefficients of shape ``[nheads]``.
         B: BF16 input projection of shape

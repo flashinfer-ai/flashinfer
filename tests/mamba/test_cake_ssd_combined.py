@@ -295,12 +295,13 @@ def _case(
     lengths=(96, 160),
     initial_states=True,
     seed=7,
+    batch=2,
 ):
     torch.manual_seed(seed)
     if varlen:
         batch, seqlen = 1, sum(lengths)
     else:
-        batch, seqlen = 2, 128 if seqlen is None else seqlen
+        seqlen = 128 if seqlen is None else seqlen
     x = torch.randn(batch, seqlen, nheads, 64, device="cuda").to(torch.bfloat16)
     dt = torch.randn(batch, seqlen, nheads, device="cuda").to(preprocess_dtype)
     A = -torch.rand(nheads, device="cuda", dtype=torch.float32) - 1.0
@@ -858,6 +859,123 @@ def test_cake_ssd_combined_accepts_unaligned_seqlen(varlen, lengths):
 
     assert tuple(actual[0].shape) == tuple(tensors[0].shape)
     _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
+
+
+_SHORT_TOTAL_TOKEN_CASES = (
+    (True, (1,)),
+    (True, (8,)),
+    (True, (127,)),
+    (True, (64, 60)),
+    (False, (50, 50)),
+    (False, (1,)),
+)
+_SHORT_TOTAL_TOKEN_IDS = (
+    "varlen_1",
+    "varlen_8",
+    "varlen_127",
+    "varlen_64_60",
+    "batched_2x50",
+    "batched_1x1",
+)
+
+
+def _short_total_tokens_case(varlen, lengths, state_dtype, seed=7):
+    """A ``_case`` with fewer than 128 tokens per call (packed varlen
+    ``lengths`` or batched ``len(lengths) x lengths[0]``) and its CuTe padded
+    oracle.  CuTe has no fp32 state, so an fp32 row starts both backends from
+    the same bf16-representable initial states (as the fp32-state parity test
+    does)."""
+
+    if varlen:
+        constructor, tensors, arguments = _case(
+            varlen=True, lengths=lengths, state_dtype=state_dtype, seed=seed
+        )
+    else:
+        assert len(set(lengths)) == 1
+        constructor, tensors, arguments = _case(
+            batch=len(lengths), seqlen=lengths[0], state_dtype=state_dtype, seed=seed
+        )
+    assert tensors[0].shape[1] < 128
+    cute_constructor = constructor
+    cute_arguments = arguments
+    if state_dtype == torch.float32:
+        bf16_states = arguments["initial_states"].to(torch.bfloat16)
+        cute_constructor = {**constructor, "state_dtype": torch.bfloat16}
+        cute_arguments = {**arguments, "initial_states": bf16_states}
+        arguments["initial_states"] = bf16_states.to(torch.float32)
+    expected = _cute_padded_reference(
+        cute_constructor, tensors, cute_arguments, lengths
+    )
+    return constructor, tensors, arguments, expected
+
+
+@pytest.mark.parametrize(
+    "state_dtype",
+    (torch.bfloat16, torch.float16, torch.float32),
+    ids=("bf16", "f16", "f32"),
+)
+@pytest.mark.parametrize(
+    "varlen,lengths", _SHORT_TOTAL_TOKEN_CASES, ids=_SHORT_TOTAL_TOKEN_IDS
+)
+def test_cake_ssd_combined_accepts_short_total_tokens(varlen, lengths, state_dtype):
+    """CAKE-1063: fewer than 128 tokens per call (batched ``seqlen < 128``,
+    packed varlen ``total < 128``, down to a single token).  The generated
+    host pins a 128-row TMA box on the token axis, so the runner binds the
+    x/B/C/out maps to zero-padded one-chunk buffers and copies the valid
+    output rows back; the result must match the fp64 recurrence at least as
+    well as CuTe on the zero-padded packed stream."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments, expected = _short_total_tokens_case(
+        varlen, lengths, state_dtype
+    )
+
+    actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
+
+    assert tuple(actual[0].shape) == tuple(tensors[0].shape)
+    assert tuple(actual[1].shape) == (len(lengths), constructor["nheads"], 64, 128)
+    assert actual[1].dtype == state_dtype
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
+
+
+def test_cake_ssd_combined_short_call_after_nan_injection_is_clean():
+    """CAKE-1063 stale-SMEM check in one process: a long call whose x/B/C rows
+    carry NaN leaves NaN in every SMEM input/output stage of the persistent
+    kernel; the short call that follows on the same runner must be NaN-free
+    and match the reference, i.e. the pad rows the kernel consumes come from
+    the zero-padded buffers, never from stale SMEM."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments = _case(varlen=True, lengths=(300,), seed=11)
+    x, dt, A, B, C = tensors
+    x, B, C = x.clone(), B.clone(), C.clone()
+    x[:, 100:] = float("nan")
+    B[:, 100:] = float("nan")
+    C[:, 100:] = float("nan")
+    runner = SSDCombined(**constructor, backend="cake")
+    poisoned = runner.run(x, dt, A, B, C, **arguments)
+    # The poison reached the pipeline (output and final state carry NaN).
+    assert not torch.isfinite(poisoned[0].float()).all()
+    assert not torch.isfinite(poisoned[1].float()).all()
+
+    short_constructor, short_tensors, short_arguments, expected = (
+        _short_total_tokens_case(True, (8,), torch.bfloat16, seed=12)
+    )
+    assert short_constructor == constructor
+
+    actual = runner.run(*short_tensors, **short_arguments)
+
+    assert torch.isfinite(actual[0].float()).all()
+    assert torch.isfinite(actual[1].float()).all()
+    _assert_cake_accuracy(
+        actual, expected, short_constructor, short_tensors, short_arguments
+    )
 
 
 @pytest.mark.parametrize("count_source", ("num_seqs", "seq_chunk_cumsum"))
@@ -2481,6 +2599,93 @@ def test_source_batched_unaligned_seqlen_binding_without_gpu(monkeypatch):
     assert preprocess["dt_bias"] is main["dt_bias"]
     assert preprocess["dt_bias"].dtype == torch.float32
     assert not preprocess["dt_bias"].any()
+
+
+@pytest.mark.parametrize("varlen", (False, True), ids=("batched_2x50", "varlen_8"))
+def test_source_short_total_tokens_binding_without_gpu(monkeypatch, varlen):
+    """CAKE-1063: with fewer than 128 tokens the x/B/C/out tensor maps are
+    bound to runner-owned one-chunk buffers (valid rows copied in, pad rows
+    zero, staged output copied back to the returned ``out``) while every
+    logical argument -- ``seqlen``, ``nchunks``, the preprocess tables -- keeps
+    the caller's extent; a 128-token call binds the caller's tensors."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module, monkeypatch, calls, nheads=2, ngroups=1, has_varlen=varlen
+    )
+
+    def launch(name, _arch, **launch_kwargs):
+        calls.append((name, launch_kwargs))
+        # Stand in for the kernel: write a row pattern into the bound output.
+        staged = launch_kwargs["main"]["out_map"]
+        rows = torch.arange(staged.shape[1], dtype=torch.float32) + 1.0
+        staged.copy_(rows.reshape(1, -1, 1, 1).expand(staged.shape).to(staged.dtype))
+
+    monkeypatch.setattr(module, "_launch_program", launch)
+    batch, seqlen = (1, 8) if varlen else (2, 50)
+
+    def inputs(seqlen):
+        x = (torch.arange(batch * seqlen * 2 * 64) % 251).reshape(batch, seqlen, 2, 64)
+        B = (torch.arange(batch * seqlen * 128) % 241).reshape(batch, seqlen, 1, 128)
+        return (
+            x.to(torch.bfloat16),
+            torch.zeros((batch, seqlen, 2), dtype=torch.float32),
+            torch.zeros((2,), dtype=torch.float32),
+            B.to(torch.bfloat16),
+            -B.to(torch.bfloat16),
+        )
+
+    def kwargs(seqlen):
+        if not varlen:
+            return {}
+        return {
+            "seq_idx": torch.zeros((1, seqlen), dtype=torch.int32),
+            "chunk_indices": torch.tensor([0], dtype=torch.int32),
+            "chunk_offsets": torch.tensor([0], dtype=torch.int32),
+            "num_seqs": 1,
+        }
+
+    x, dt, A, B, C = inputs(seqlen)
+    out, final = runner.run(x, dt, A, B, C, **kwargs(seqlen))
+
+    assert tuple(out.shape) == (batch, seqlen, 2, 64)
+    assert tuple(final.shape) == (batch if not varlen else 1, 2, 64, 128)
+    ((_, launch_args),) = calls
+    preprocess, main = launch_args["preprocess"], launch_args["main"]
+    for key, source in (("x_map", x), ("b_map", B), ("c_map", C)):
+        bound = main[key]
+        assert tuple(bound.shape) == (batch, 128, *source.shape[2:])
+        assert bound.dtype == torch.bfloat16
+        torch.testing.assert_close(bound[:, :seqlen], source, rtol=0, atol=0)
+        assert not bound[:, seqlen:].any(), key
+    staged = main["out_map"]
+    assert staged is main["out_native"]
+    assert tuple(staged.shape) == (batch, 128, 2, 64)
+    torch.testing.assert_close(out, staged[:, :seqlen], rtol=0, atol=0)
+    assert float(out[0, -1, 0, 0]) == float(seqlen)
+    # Logical extents are untouched by the padding.
+    assert main["seqlen"] == seqlen and main["nchunks"] == 1
+    assert main["batch"] == batch and main["num_logical_chunks"] == 1
+    assert preprocess["seqlen"] == seqlen and preprocess["num_segments"] == batch
+    if not varlen:
+        assert preprocess["segment_lengths"].tolist() == [seqlen] * batch
+    assert main["dt"].shape == (batch, seqlen, 2)
+
+    # A second call of the same extent reuses the buffers and leaves the pad
+    # rows zero (nothing but the first ``seqlen`` rows is ever written).
+    x2, dt2, A2, B2, C2 = inputs(seqlen)
+    runner.run(x2, dt2, A2, B2, C2, **kwargs(seqlen))
+    main2 = calls[-1][1]["main"]
+    assert main2["x_map"] is main["x_map"] and main2["out_map"] is staged
+    assert not main2["x_map"][:, seqlen:].any()
+
+    # One full chunk: the caller's tensors are bound directly.
+    x3, dt3, A3, B3, C3 = inputs(128)
+    out3, _ = runner.run(x3, dt3, A3, B3, C3, **kwargs(128))
+    main3 = calls[-1][1]["main"]
+    assert main3["x_map"] is x3 and main3["b_map"] is B3 and main3["c_map"] is C3
+    assert main3["out_map"] is out3 and main3["out_native"] is out3
 
 
 def test_source_direct_preprocess_and_sequence_argument_order():
