@@ -23,32 +23,33 @@
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 32
 #define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 12
+#define NUM_TMA_PIPE_STAGES 10
 #define NUM_EPI_PIPE_STAGES 2
 #define SMEM_SX_OFF 1024
 #define SMEM_SX_STAGE_BYTES 2048
 #define SMEM_SX_STRIDE 2048
-#define SMEM_SW_OFF 25600
+#define SMEM_SW_OFF 21504
 #define SMEM_SW_STAGE_BYTES 16384
 #define SMEM_SW_STRIDE 16384
-#define SMEM_METADATA_OFF 222208
+#define SMEM_METADATA_OFF 185344
 #define SMEM_METADATA_STAGE_BYTES 3072
 #define SMEM_METADATA_STRIDE 3072
-#define SMEM_REDUCE_PARTIALS_OFF 225280
-#define SMEM_REDUCE_PARTIALS_STAGE_BYTES 4096
-#define SMEM_REDUCE_PARTIALS_STRIDE 4096
-#define SMEM_CACHED_COUNTS_OFF 223744
+#define SMEM_REDUCE_PARTIALS_OFF 188416
+#define SMEM_REDUCE_PARTIALS_STAGE_BYTES 32768
+#define SMEM_REDUCE_PARTIALS_STRIDE 32768
+#define SMEM_CACHED_COUNTS_OFF 186880
 #define SMEM_CACHED_COUNTS_STAGE_BYTES 1536
 #define SMEM_CACHED_COUNTS_STRIDE 1536
-#define SMEM_TOUCH_SINK_OFF 229376
+#define SMEM_TOUCH_SINK_OFF 221184
 #define SMEM_TOUCH_SINK_STAGE_BYTES 128
 #define SMEM_TOUCH_SINK_STRIDE 128
-#define SMEM_TOTAL 229504
+#define SMEM_TOTAL 221312
+#define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) __cluster_dims__(8,1,1) void
-kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride, int num_workers, int route_flags, int num_split_k)
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) __cluster_dims__(16,1,1) void
+kernel_cake_deepgemm_mega_gate_8b22b176f3db4b110d56(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride, int num_workers, int route_flags, int num_split_k)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -65,16 +66,16 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
 
     const int mbar_base = smem;
     #define full_addr (mbar_base + 0)
-    #define empty_addr (mbar_base + 96)
-    #define tmem_full_addr (mbar_base + 192)
-    #define tmem_empty_addr (mbar_base + 208)
-    #define metadata_ready_addr (mbar_base + 224)
-    #define reduce_full_addr (mbar_base + 232)
+    #define empty_addr (mbar_base + 80)
+    #define tmem_full_addr (mbar_base + 160)
+    #define tmem_empty_addr (mbar_base + 176)
+    #define metadata_ready_addr (mbar_base + 192)
+    #define reduce_full_addr (mbar_base + 200)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 8;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 8;
+    const unsigned int clusters_x = gridDim.x / 16;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 16;
     const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
 
     int cta_rank;
@@ -83,23 +84,23 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
     // Kernel setup ops
     __nv_bfloat16* sx = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int sx_addr = smem + 1024;
-    __nv_bfloat16* sw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 25600);
-    const int sw_addr = smem + 25600;
-    float* metadata = reinterpret_cast<float*>(smem_raw + 222208);
-    const int metadata_addr = smem + 222208;
-    float* reduce_partials = reinterpret_cast<float*>(smem_raw + 225280);
-    const int reduce_partials_addr = smem + 225280;
-    int* cached_counts = reinterpret_cast<int*>(smem_raw + 223744);
-    const int cached_counts_addr = smem + 223744;
-    int* touch_sink = reinterpret_cast<int*>(smem_raw + 229376);
-    const int touch_sink_addr = smem + 229376;
+    __nv_bfloat16* sw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 21504);
+    const int sw_addr = smem + 21504;
+    float* metadata = reinterpret_cast<float*>(smem_raw + 185344);
+    const int metadata_addr = smem + 185344;
+    float* reduce_partials = reinterpret_cast<float*>(smem_raw + 188416);
+    const int reduce_partials_addr = smem + 188416;
+    int* cached_counts = reinterpret_cast<int*>(smem_raw + 186880);
+    const int cached_counts_addr = smem + 186880;
+    int* touch_sink = reinterpret_cast<int*>(smem_raw + 221184);
+    const int touch_sink_addr = smem + 221184;
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 30 barriers)
-    // Mbarriers at smem_raw[0..240)
+    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 26 barriers)
+    // Mbarriers at smem_raw[0..208)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -110,20 +111,20 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 64, 1);
             // empty: stages (0, 4, 8), init_count=1
-            mbarrier_init(smem + 96, 1);
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 160, 1);
+            mbarrier_init(smem + 80, 1);
+            mbarrier_init(smem + 112, 1);
+            mbarrier_init(smem + 144, 1);
             // --- pipeline 'epi_pipe' ---
             // tmem_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 192, 1);
-            mbarrier_init(smem + 200, 1);
+            mbarrier_init(smem + 160, 1);
+            mbarrier_init(smem + 168, 1);
             // tmem_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 208, 1);
-            mbarrier_init(smem + 216, 1);
+            mbarrier_init(smem + 176, 1);
+            mbarrier_init(smem + 184, 1);
             // metadata_ready: 1 barriers, init_count=32
-            mbarrier_init(smem + 224, 32);
+            mbarrier_init(smem + 192, 32);
             // reduce_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 232, 1);
+            mbarrier_init(smem + 200, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -136,9 +137,9 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
             mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 72, 1);
             // empty: stages (1, 5, 9), init_count=1
-            mbarrier_init(smem + 104, 1);
-            mbarrier_init(smem + 136, 1);
-            mbarrier_init(smem + 168, 1);
+            mbarrier_init(smem + 88, 1);
+            mbarrier_init(smem + 120, 1);
+            mbarrier_init(smem + 152, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -146,14 +147,12 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // full: stages (2, 6, 10), init_count=1
+            // full: stages (2, 6), init_count=1
             mbarrier_init(smem + 16, 1);
             mbarrier_init(smem + 48, 1);
-            mbarrier_init(smem + 80, 1);
-            // empty: stages (2, 6, 10), init_count=1
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 144, 1);
-            mbarrier_init(smem + 176, 1);
+            // empty: stages (2, 6), init_count=1
+            mbarrier_init(smem + 96, 1);
+            mbarrier_init(smem + 128, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -161,14 +160,12 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // full: stages (3, 7, 11), init_count=1
+            // full: stages (3, 7), init_count=1
             mbarrier_init(smem + 24, 1);
             mbarrier_init(smem + 56, 1);
-            mbarrier_init(smem + 88, 1);
-            // empty: stages (3, 7, 11), init_count=1
-            mbarrier_init(smem + 120, 1);
-            mbarrier_init(smem + 152, 1);
-            mbarrier_init(smem + 184, 1);
+            // empty: stages (3, 7), init_count=1
+            mbarrier_init(smem + 104, 1);
+            mbarrier_init(smem + 136, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -176,9 +173,9 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 240);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 208);
     if (warp == 2) {
-        int _tmem_hold = smem + 240;
+        int _tmem_hold = smem + 208;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
         __syncwarp();
     }
@@ -198,22 +195,22 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
     if (warp == 0) {
         { // load_main
             unsigned int ls = 0;
-            int logical = bid % 24;
+            int logical = bid % 48;
             int expert_group = logical % 3;
             int split = logical / 3;
-            split = logical % 8;
-            expert_group = logical / 8;
+            split = logical % 16;
+            expert_group = logical / 16;
             int num_blocks = (num_tokens + 15) / 16;
             int tail_n = (num_tokens - (num_blocks - 1) * 16 + 15) / 16 * 16;
             unsigned int _phase_empty = 1;
             if (elect_sync()) {
                 #pragma unroll 1
-                for (int tile = bid / 24; tile < 1; tile += 6) {
+                for (int tile = bid / 48; tile < 1; tile += 3) {
                     int effective_n = 16;
                     #pragma unroll 4
-                    for (int kb = 0; kb < 10; kb++) {
+                    for (int kb = 0; kb < 5; kb++) {
                         mbarrier_wait(empty_addr + (ls) * 8, _phase_empty);
-                        int ko = split * 10 * 64 + kb * 64;
+                        int ko = split * 5 * 64 + kb * 64;
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
@@ -222,7 +219,7 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
                         tma_3d_gmem2smem(sw_addr + ls * 16384, (&W), 0, expert_group * 128, ko / 64, full_addr + (ls) * 8);
                         mbarrier_arrive_expect_tx(full_addr + (ls) * 8, 18432);
                         ls += 1;
-                        if (ls == 12) { ls = 0; _phase_empty ^= 1; }
+                        if (ls == 10) { ls = 0; _phase_empty ^= 1; }
                     }
                 }
             }
@@ -238,12 +235,12 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
             unsigned int _phase_tmem_empty = 1;
             unsigned int _phase_full = 0;
             #pragma unroll 1
-            for (int tile_1 = bid / 24; tile_1 < 1; tile_1 += 6) {
+            for (int tile_1 = bid / 48; tile_1 < 1; tile_1 += 3) {
                 int effective_n_1 = 16;
                 mbarrier_wait(tmem_empty_addr + (me) * 8, _phase_tmem_empty);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 #pragma unroll 1
-                for (int kb_1 = 0; kb_1 < 10; kb_1++) {
+                for (int kb_1 = 0; kb_1 < 5; kb_1++) {
                     mbarrier_wait(full_addr + (ms) * 8, _phase_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int init = ((kb_1 == 0) ? 1 : 0);
@@ -272,13 +269,13 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
                         }
                     }
                     __syncwarp();
-                    if (kb_1 + 1 == 10) {
+                    if (kb_1 + 1 == 5) {
                         elect_commit(tmem_full_addr + (me) * 8);
                     }
                     __syncwarp();
                     elect_commit(empty_addr + (ms) * 8);
                     ms += 1;
-                    if (ms == 12) { ms = 0; _phase_full ^= 1; }
+                    if (ms == 10) { ms = 0; _phase_full ^= 1; }
                 }
                 me += 1;
                 if (me == 2) { me = 0; _phase_tmem_empty ^= 1; }
@@ -317,18 +314,18 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
         { // gate_main
             unsigned int ge = 0;
             int gw = warp - 4;
-            int logical_1 = bid % 24;
+            int logical_1 = bid % 48;
             int expert_group_1 = logical_1 % 3;
             int split_1 = logical_1 / 3;
-            split_1 = logical_1 % 8;
-            expert_group_1 = logical_1 / 8;
+            split_1 = logical_1 % 16;
+            expert_group_1 = logical_1 / 16;
             uint64_t _grid_id_0;
             asm volatile("mov.u64 %0, %%gridid;" : "=l"(_grid_id_0));
             unsigned long long epoch = (_grid_id_0 + 1) * 64;
             mbarrier_wait(metadata_ready_addr, 0);
             if (split_1 == 0) {
                 if (gw == 0 && lane == 0) {
-                    mbarrier_arrive_expect_tx(reduce_full_addr, 3584);
+                    mbarrier_arrive_expect_tx(reduce_full_addr, 30720);
                 }
             }
             uint32_t _mapa_0;
@@ -345,9 +342,9 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
             int tail_n_2 = (num_tokens - (num_blocks_2 - 1) * 16 + 15) / 16 * 16;
             unsigned int _phase_tmem_full = 0;
             #pragma unroll 1
-            for (int tile_2 = bid / 24; tile_2 < 1; tile_2 += 6) {
+            for (int tile_2 = bid / 48; tile_2 < 1; tile_2 += 3) {
                 int effective_n_2 = 16;
-                int _min_0 = ((1 - tile_2 * 16) < (16) ? (1 - tile_2 * 16) : (16));
+                int _min_0 = ((num_tokens - tile_2 * 16) < (16) ? (num_tokens - tile_2 * 16) : (16));
                 int valid_tokens = _min_0;
                 if (gw == 7 && lane == 31) {
                     if (logical_1 == 0) {
@@ -379,13 +376,13 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
                     for (int item = 0; item < 8; item++) {
                         float stored = _tmem_load_0[item];
                         int partial_token = token_base + col + item;
-                        if (partial_token < 1) {
+                        if (partial_token < 4) {
                             if (split_1 == 0) {
                                 reduce_partials[partial_token * 128 + expert_local] = stored;
                             } else {
                                 asm volatile(
                                     "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                                    :: "r"(remote_partials + (unsigned int)(((split_1 + partial_token) * 128 + expert_local) * 4)), "f"(stored), "r"(remote_reduce_full) : "memory");
+                                    :: "r"(remote_partials + (unsigned int)(((split_1 * 4 + partial_token) * 128 + expert_local) * 4)), "f"(stored), "r"(remote_reduce_full) : "memory");
                             }
                         }
                     }
@@ -393,55 +390,53 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
                 asm volatile("bar.sync 8, 256;" ::: "memory");
                 if (split_1 == 0) {
                     mbarrier_wait(reduce_full_addr, 0);
-                    if (gw < 4) {
-                        float leader_total = reduce_partials[expert_local];
-                        #pragma unroll
-                        for (int sp = 1; sp < 8; sp++) {
-                            leader_total = leader_total + reduce_partials[sp * 128 + expert_local];
-                        }
-                        float leader_unbiased = leader_total;
-                        float result = leader_total;
-                        float _exp_0 = expf(leader_total);
-                        float _log1p_0 = log1pf(_exp_0);
-                        float softplus = _log1p_0;
-                        float _sqrt_0;
-                        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_0) : "f"(((leader_total > 20.0f) ? leader_total : softplus)));
-                        result = _sqrt_0;
-                        leader_unbiased = result;
-                        float leader_bias = 0.0f;
-                        leader_bias = metadata[expert_1];
-                        float leader_ranking = ((expert_1 < 384) ? leader_unbiased + leader_bias : -CUDART_INF_F);
-                        unsigned int leader_id = (unsigned int)expert_1;
-                        float leader_record[4];
-                        leader_record[1] = leader_unbiased;
-                        leader_record[2] = (float)expert_1;
-                        leader_record[3] = 0.0f;
-                        float pad_record[4];
-                        pad_record[0] = -CUDART_INF_F;
-                        pad_record[1] = 0.0f;
-                        pad_record[2] = -1.0f;
-                        pad_record[3] = 0.0f;
-                        #pragma unroll
-                        for (int oi = 0; oi < 6; oi++) {
-                            float _warp_redux_f32_0;
-                            asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_f32_0) : "f"(leader_ranking));
-                            unsigned int leader_tied = ((leader_ranking == _warp_redux_f32_0 && leader_ranking > -CUDART_INF_F) ? leader_id : (unsigned int)4294967295);
-                            unsigned int _warp_redux_u32_0;
-                            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(leader_tied));
-                            if (_warp_redux_u32_0 == (unsigned int)4294967295) {
-                                if (lane == oi) {
-                                    {
-                                        float4 _v4 = make_float4(pad_record[0 + 0], pad_record[0 + 1], pad_record[0 + 2], pad_record[0 + 3]);
-                                        *reinterpret_cast<float4*>(scratch + (tile_2 * 8 * 16 * 384 + expert_group_1 * 128 + (gw * 6 + oi) * 4) + 0) = _v4;
-                                    }
+                    int wg_tp = gw / 4;
+                    #pragma unroll
+                    for (int g_tp = 0; g_tp < 2; g_tp++) {
+                        if (wg_tp == g_tp) {
+                            #pragma unroll
+                            for (int reduced_token = g_tp; reduced_token < 4; reduced_token += 2) {
+                                float tp[16];
+                                #pragma unroll
+                                for (int sp = 0; sp < 16; sp++) {
+                                    tp[sp] = reduce_partials[(sp * 4 + reduced_token) * 128 + expert_local];
                                 }
-                            } else if (leader_tied == _warp_redux_u32_0) {
-                                leader_record[0] = leader_ranking;
-                                {
-                                    float4 _v4 = make_float4(leader_record[0 + 0], leader_record[0 + 1], leader_record[0 + 2], leader_record[0 + 3]);
-                                    *reinterpret_cast<float4*>(scratch + (tile_2 * 8 * 16 * 384 + expert_group_1 * 128 + (gw * 6 + oi) * 4) + 0) = _v4;
+                                float ts1[8];
+                                float tb1[8];
+                                float te1[8];
+                                #pragma unroll
+                                for (int i = 0; i < 8; i++) {
+                                    ts1[i] = tp[2 * i] + tp[2 * i + 1];
+                                    tb1[i] = ts1[i] - tp[2 * i];
+                                    te1[i] = tp[2 * i] - (ts1[i] - tb1[i]) + (tp[2 * i + 1] - tb1[i]);
                                 }
-                                leader_ranking = -CUDART_INF_F;
+                                float ts2[4];
+                                float tb2[4];
+                                float te2[4];
+                                #pragma unroll
+                                for (int i_1 = 0; i_1 < 4; i_1++) {
+                                    ts2[i_1] = ts1[2 * i_1] + ts1[2 * i_1 + 1];
+                                    tb2[i_1] = ts2[i_1] - ts1[2 * i_1];
+                                    te2[i_1] = ts1[2 * i_1] - (ts2[i_1] - tb2[i_1]) + (ts1[2 * i_1 + 1] - tb2[i_1]);
+                                    te1[i_1] = te1[2 * i_1] + te1[2 * i_1 + 1];
+                                }
+                                float ts3[2];
+                                float tb3[2];
+                                float te3[2];
+                                #pragma unroll
+                                for (int i_2 = 0; i_2 < 2; i_2++) {
+                                    ts3[i_2] = ts2[2 * i_2] + ts2[2 * i_2 + 1];
+                                    tb3[i_2] = ts3[i_2] - ts2[2 * i_2];
+                                    te3[i_2] = ts2[2 * i_2] - (ts3[i_2] - tb3[i_2]) + (ts2[2 * i_2 + 1] - tb3[i_2]);
+                                    te1[i_2] = te1[2 * i_2] + te1[2 * i_2 + 1];
+                                    te2[i_2] = te2[2 * i_2] + te2[2 * i_2 + 1];
+                                }
+                                float total_sum4 = ts3[0] + ts3[1];
+                                float total_bp4 = total_sum4 - ts3[0];
+                                float total_err4 = ts3[0] - (total_sum4 - total_bp4) + (ts3[1] - total_bp4);
+                                float total_err = te1[0] + te1[1] + (te2[0] + te2[1]) + (te3[0] + te3[1] + total_err4);
+                                float total_score = total_sum4 + total_err;
+                                scratch[(tile_2 * 16 * 16 + reduced_token) * 384 + expert_1] = total_score;
                             }
                         }
                     }
@@ -459,7 +454,7 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
                     }
                 }
                 if (gw == 0 && lane == 0) {
-                    if (logical_1 == 0) {
+                    if (logical_1 < valid_tokens) {
                         {
                         unsigned long long _acquire_observed;
                         do {
@@ -470,99 +465,148 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
                 }
                 asm volatile("bar.sync 8, 256;" ::: "memory");
                 #pragma unroll 1
-                for (int token_local = gw * 24 + logical_1; token_local < valid_tokens; token_local += 192) {
+                for (int token_local = gw * 48 + logical_1; token_local < valid_tokens; token_local += 384) {
                     int token = tile_2 * 16 + token_local;
                     int handled = 0;
                     if (handled == 0) {
-                        float cand_ranking[3];
-                        float cand_unbiased[3];
-                        unsigned int cand_id[3];
+                        float rankings[12];
+                        float unbiased_values[12];
+                        unsigned int permutations[3];
+                        int is_image = 0;
                         #pragma unroll
-                        for (int cand_slot = 0; cand_slot < 3; cand_slot++) {
-                            cand_ranking[cand_slot] = -CUDART_INF_F;
-                            cand_unbiased[cand_slot] = 0.0f;
-                            cand_id[cand_slot] = (unsigned int)4294967295;
-                            int cand_index = cand_slot * 32 + lane;
-                            if (cand_index < 72) {
-                                float _vec_load_0[4];
-                                {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(scratch + ((tile_2 * 8 * 16 + token_local) * 384 + cand_index / 24 * 128 + cand_index % 24 * 4) + 0);
-                                    _vec_load_0[0 + 0] = _v4.x;
-                                    _vec_load_0[0 + 1] = _v4.y;
-                                    _vec_load_0[0 + 2] = _v4.z;
-                                    _vec_load_0[0 + 3] = _v4.w;
-                                }
-                                cand_ranking[cand_slot] = _vec_load_0[0];
-                                cand_unbiased[cand_slot] = _vec_load_0[1];
-                                cand_id[cand_slot] = (unsigned int)(int)_vec_load_0[2];
+                        for (int wave_1 = 0; wave_1 < 3; wave_1++) {
+                            int expert_base = wave_1 * 128 + lane * 4;
+                            float _vec_load_0[4];
+                            {
+                                float4 _v4 = *reinterpret_cast<const float4*>(scratch + ((tile_2 * 16 * 16 + token_local) * 384 + expert_base) + 0);
+                                _vec_load_0[0 + 0] = _v4.x;
+                                _vec_load_0[0 + 1] = _v4.y;
+                                _vec_load_0[0 + 2] = _v4.z;
+                                _vec_load_0[0 + 3] = _v4.w;
                             }
-                        }
-                        if (cand_ranking[1] > cand_ranking[0] || cand_ranking[1] == cand_ranking[0] && cand_id[1] < cand_id[0]) {
-                            float swapped_ranking = cand_ranking[0];
-                            float swapped_unbiased = cand_unbiased[0];
-                            unsigned int swapped_id = cand_id[0];
-                            cand_ranking[0] = cand_ranking[1];
-                            cand_unbiased[0] = cand_unbiased[1];
-                            cand_id[0] = cand_id[1];
-                            cand_ranking[1] = swapped_ranking;
-                            cand_unbiased[1] = swapped_unbiased;
-                            cand_id[1] = swapped_id;
-                        }
-                        if (cand_ranking[2] > cand_ranking[1] || cand_ranking[2] == cand_ranking[1] && cand_id[2] < cand_id[1]) {
-                            float swapped_ranking_1 = cand_ranking[1];
-                            float swapped_unbiased_1 = cand_unbiased[1];
-                            unsigned int swapped_id_1 = cand_id[1];
-                            cand_ranking[1] = cand_ranking[2];
-                            cand_unbiased[1] = cand_unbiased[2];
-                            cand_id[1] = cand_id[2];
-                            cand_ranking[2] = swapped_ranking_1;
-                            cand_unbiased[2] = swapped_unbiased_1;
-                            cand_id[2] = swapped_id_1;
-                        }
-                        if (cand_ranking[1] > cand_ranking[0] || cand_ranking[1] == cand_ranking[0] && cand_id[1] < cand_id[0]) {
-                            float swapped_ranking_2 = cand_ranking[0];
-                            float swapped_unbiased_2 = cand_unbiased[0];
-                            unsigned int swapped_id_2 = cand_id[0];
-                            cand_ranking[0] = cand_ranking[1];
-                            cand_unbiased[0] = cand_unbiased[1];
-                            cand_id[0] = cand_id[1];
-                            cand_ranking[1] = swapped_ranking_2;
-                            cand_unbiased[1] = swapped_unbiased_2;
-                            cand_id[1] = swapped_id_2;
-                        }
-                        int merge_cursor = 0;
-                        int selected = -1;
-                        float selected_score = 0.0f;
-                        #pragma unroll
-                        for (int oi_1 = 0; oi_1 < 6; oi_1++) {
-                            float proposed_ranking = -CUDART_INF_F;
-                            float proposed_unbiased = 0.0f;
-                            unsigned int proposed_id = (unsigned int)4294967295;
                             #pragma unroll
-                            for (int cand_slot_1 = 0; cand_slot_1 < 3; cand_slot_1++) {
-                                if (merge_cursor == cand_slot_1) {
-                                    proposed_ranking = cand_ranking[cand_slot_1];
-                                    proposed_unbiased = cand_unbiased[cand_slot_1];
-                                    proposed_id = cand_id[cand_slot_1];
+                            for (int value = 0; value < 4; value++) {
+                                rankings[wave_1 * 4 + value] = _vec_load_0[value];
+                            }
+                        }
+                        #pragma unroll
+                        for (int wave_2 = 0; wave_2 < 3; wave_2++) {
+                            float exponentials[4];
+                            float softplus_values[4];
+                            #pragma unroll
+                            for (int value_1 = 0; value_1 < 4; value_1++) {
+                                float _exp_0 = expf(rankings[wave_2 * 4 + value_1]);
+                                exponentials[value_1] = _exp_0;
+                            }
+                            #pragma unroll
+                            for (int value_2 = 0; value_2 < 4; value_2++) {
+                                float _log1p_0 = log1pf(exponentials[value_2]);
+                                softplus_values[value_2] = _log1p_0;
+                            }
+                            #pragma unroll
+                            for (int value_3 = 0; value_3 < 4; value_3++) {
+                                float raw_score = rankings[wave_2 * 4 + value_3];
+                                float _sqrt_0;
+                                asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_0) : "f"(((raw_score > 20.0f) ? raw_score : softplus_values[value_3])));
+                                rankings[wave_2 * 4 + value_3] = _sqrt_0;
+                            }
+                            #pragma unroll
+                            for (int value_4 = 0; value_4 < 4; value_4++) {
+                                int expert_id = wave_2 * 128 + lane * 4 + value_4;
+                                float raw = rankings[wave_2 * 4 + value_4];
+                                unbiased_values[wave_2 * 4 + value_4] = raw;
+                                float ranking_bias = 0.0f;
+                                ranking_bias = metadata[expert_id];
+                                rankings[wave_2 * 4 + value_4] = ((expert_id < 384) ? raw + ranking_bias : -CUDART_INF_F);
+                            }
+                        }
+                        #pragma unroll
+                        for (int wave_3 = 0; wave_3 < 3; wave_3++) {
+                            int local_indices[4];
+                            #pragma unroll
+                            for (int value_5 = 0; value_5 < 4; value_5++) {
+                                local_indices[value_5] = value_5;
+                            }
+                            if (rankings[wave_3 * 4 + 1] > rankings[wave_3 * 4] || rankings[wave_3 * 4 + 1] == rankings[wave_3 * 4] && local_indices[1] < local_indices[0]) {
+                                float saved_score = rankings[wave_3 * 4];
+                                int saved_idx = local_indices[0];
+                                rankings[wave_3 * 4] = rankings[wave_3 * 4 + 1];
+                                local_indices[0] = local_indices[1];
+                                rankings[wave_3 * 4 + 1] = saved_score;
+                                local_indices[1] = saved_idx;
+                            }
+                            if (rankings[wave_3 * 4 + 3] > rankings[wave_3 * 4 + 2] || rankings[wave_3 * 4 + 3] == rankings[wave_3 * 4 + 2] && local_indices[3] < local_indices[2]) {
+                                float saved_score_1 = rankings[wave_3 * 4 + 2];
+                                int saved_idx_1 = local_indices[2];
+                                rankings[wave_3 * 4 + 2] = rankings[wave_3 * 4 + 3];
+                                local_indices[2] = local_indices[3];
+                                rankings[wave_3 * 4 + 3] = saved_score_1;
+                                local_indices[3] = saved_idx_1;
+                            }
+                            if (rankings[wave_3 * 4 + 2] > rankings[wave_3 * 4] || rankings[wave_3 * 4 + 2] == rankings[wave_3 * 4] && local_indices[2] < local_indices[0]) {
+                                float saved_score_2 = rankings[wave_3 * 4];
+                                int saved_idx_2 = local_indices[0];
+                                rankings[wave_3 * 4] = rankings[wave_3 * 4 + 2];
+                                local_indices[0] = local_indices[2];
+                                rankings[wave_3 * 4 + 2] = saved_score_2;
+                                local_indices[2] = saved_idx_2;
+                            }
+                            if (rankings[wave_3 * 4 + 3] > rankings[wave_3 * 4 + 1] || rankings[wave_3 * 4 + 3] == rankings[wave_3 * 4 + 1] && local_indices[3] < local_indices[1]) {
+                                float saved_score_3 = rankings[wave_3 * 4 + 1];
+                                int saved_idx_3 = local_indices[1];
+                                rankings[wave_3 * 4 + 1] = rankings[wave_3 * 4 + 3];
+                                local_indices[1] = local_indices[3];
+                                rankings[wave_3 * 4 + 3] = saved_score_3;
+                                local_indices[3] = saved_idx_3;
+                            }
+                            if (rankings[wave_3 * 4 + 2] > rankings[wave_3 * 4 + 1] || rankings[wave_3 * 4 + 2] == rankings[wave_3 * 4 + 1] && local_indices[2] < local_indices[1]) {
+                                float saved_score_4 = rankings[wave_3 * 4 + 1];
+                                int saved_idx_4 = local_indices[1];
+                                rankings[wave_3 * 4 + 1] = rankings[wave_3 * 4 + 2];
+                                local_indices[1] = local_indices[2];
+                                rankings[wave_3 * 4 + 2] = saved_score_4;
+                                local_indices[2] = saved_idx_4;
+                            }
+                            permutations[wave_3] = (unsigned int)(local_indices[0] | local_indices[1] << 2 | local_indices[2] << 4 | local_indices[3] << 6);
+                        }
+                        unsigned int cursors = 0;
+                        int selected = -1;
+                        #pragma unroll
+                        for (int oi = 0; oi < 6; oi++) {
+                            float best_score = -CUDART_INF_F;
+                            int best_expert = -1;
+                            unsigned int best_wave = 0;
+                            #pragma unroll
+                            for (int wave_4 = 0; wave_4 < 3; wave_4++) {
+                                unsigned int cursor = cursors >> (unsigned int)(wave_4 * 3) & 7;
+                                float candidate_score = ((cursor == 4) ? -CUDART_INF_F : (((cursor & 2) != 0) ? (((cursor & 1) != 0) ? rankings[wave_4 * 4 + 3] : rankings[wave_4 * 4 + 2]) : (((cursor & 1) != 0) ? rankings[wave_4 * 4 + 1] : rankings[wave_4 * 4])));
+                                unsigned int candidate_offset = permutations[wave_4] >> cursor * 2 & 3;
+                                if (candidate_score > best_score) {
+                                    best_score = candidate_score;
+                                    best_expert = wave_4 * 128 + lane * 4 + (int)candidate_offset;
+                                    best_wave = wave_4;
                                 }
                             }
-                            float _warp_redux_f32_1;
-                            asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_f32_1) : "f"(proposed_ranking));
-                            unsigned int merge_tied = ((proposed_ranking == _warp_redux_f32_1 && proposed_ranking > -CUDART_INF_F) ? proposed_id : (unsigned int)4294967295);
-                            unsigned int _warp_redux_u32_1;
-                            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(merge_tied));
-                            float _warp_redux_f32_2;
-                            asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_f32_2) : "f"(((merge_tied == _warp_redux_u32_1) ? proposed_unbiased : -CUDART_INF_F)));
-                            if (_warp_redux_u32_1 != (unsigned int)4294967295) {
-                                if (merge_tied == _warp_redux_u32_1) {
-                                    merge_cursor = merge_cursor + 1;
-                                }
-                                if (lane == oi_1) {
-                                    selected_score = _warp_redux_f32_2;
-                                }
+                            float _warp_redux_f32_0;
+                            asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(_warp_redux_f32_0) : "f"(best_score));
+                            unsigned int tied = ((best_score == _warp_redux_f32_0 && best_expert >= 0) ? (unsigned int)best_expert : (unsigned int)4294967295);
+                            unsigned int _warp_redux_u32_0;
+                            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(tied));
+                            if ((unsigned int)best_expert == _warp_redux_u32_0) {
+                                cursors = cursors + (1 << best_wave * 3);
                             }
-                            if (lane == oi_1) {
-                                selected = (int)_warp_redux_u32_1;
+                            if (lane == oi) {
+                                selected = (int)_warp_redux_u32_0;
+                            }
+                        }
+                        float selected_score = 0.0f;
+                        int selected_value = ((selected >= 0) ? selected / 128 * 4 + selected % 4 : -1);
+                        int source_lane = ((selected >= 0) ? selected % 128 / 4 : 0);
+                        #pragma unroll
+                        for (int vi = 0; vi < 12; vi++) {
+                            float _shfl_0 = __shfl_sync(0xFFFFFFFF, unbiased_values[vi], source_lane);
+                            if (selected_value == vi) {
+                                selected_score = _shfl_0;
                             }
                         }
                         int chosen = selected;
@@ -588,15 +632,15 @@ kernel_cake_deepgemm_mega_gate_6443777451076c4eaabb(const __grid_constant__ CUte
                                 total = total + _shfl_xor_0;
                             }
                         }
-                        float result_1 = selected_score;
+                        float result = selected_score;
                         if (lane < 6) {
-                            result_1 = selected_score / (total + 1e-20f) * routed_scale;
+                            result = selected_score / (total + 1e-20f) * routed_scale;
                         } else if (lane < 6 + num_shared) {
-                            result_1 = 1.0f;
+                            result = 1.0f;
                         }
                         if (lane < 6 + num_shared) {
                             topk_idx[token * (6 + num_shared) + lane] = (long long)physical;
-                            topk_weights[token * (6 + num_shared) + lane] = result_1;
+                            topk_weights[token * (6 + num_shared) + lane] = result;
                         }
                     }
                 }
