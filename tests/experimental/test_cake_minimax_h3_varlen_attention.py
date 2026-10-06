@@ -116,7 +116,9 @@ def _decode_unit_table(plan):
     table = plan.unit_table.tolist()
     # ``num_clusters`` zero records of padding follow the scheduled units.
     assert len(table) == UNIT_WORDS * (plan.total_tiles + plan.num_clusters)
-    assert table[UNIT_WORDS * plan.total_tiles :] == [0] * (UNIT_WORDS * plan.num_clusters)
+    assert table[UNIT_WORDS * plan.total_tiles :] == [0] * (
+        UNIT_WORDS * plan.num_clusters
+    )
     begins = plan.seg_begin.tolist()
     lens = plan.seg_len.tolist()
     decoded = []

@@ -597,7 +597,16 @@ def build_bf16_segment_plan(
     for unit in assign_unit_slots(costs, num_clusters):
         seg, head, c, begin, count, slot = units[unit]
         table.extend(
-            (begins[seg], lens[seg], (head << 16) | c, (begin << 16) | count, slot, 0, 0, 0)
+            (
+                begins[seg],
+                lens[seg],
+                (head << 16) | c,
+                (begin << 16) | count,
+                slot,
+                0,
+                0,
+                0,
+            )
         )
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
     return BF16SegmentPlan(
