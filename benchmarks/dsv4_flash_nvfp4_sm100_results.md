@@ -2,6 +2,8 @@
 
 The current public candidate beats `flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe` at every integer T=1..32: **1.025160423562× geometric-mean speedup**, **32/32 shapes faster**. The minimum is **1.006047396915× at T14**, with public **161.422111112 µs** and baseline **162.398294689 µs**. The matched source implementation measures **1.025096697119×**. Hardware-limit evidence and broader promotion remain incomplete.
 
+Additional [hardware evidence and scheduling probes](dsv4_flash_nvfp4_sm100_hardware_evidence.md) concern the generated source schedule in separate cohorts; they do not constitute a new public-export qualification.
+
 NVIDIA B200 (sm_100a), H=4096, I=2048, 256 routed experts, top-k=6, clamped SwiGLU limit 10.0. The measured routed-expert call includes FC1 gate/up, clamped activation and activation quantization, FC2, and routing-weighted finalization. The shared expert is outside this kernel. The established NVFP4 shuffled MajorK / R128c4 weight-and-scale ABI and matched NVFP4 activations produce BF16 output.
 
 This update selects cooperative barrier initialization for FC1 at T4, T5, T6 and T8. Two generated device units are added to the public JIT build (15 units total). The existing 13 device units and other 28 route records remain unchanged. This does not enable CUDA cooperative-launch mode. Launch geometry, descriptors, PDL, workspace layout, clamp placement, scaling, quantization, rounding and routing semantics are preserved.
