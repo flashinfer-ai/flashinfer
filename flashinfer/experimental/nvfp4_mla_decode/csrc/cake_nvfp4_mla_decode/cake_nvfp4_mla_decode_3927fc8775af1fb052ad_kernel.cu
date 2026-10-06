@@ -163,7 +163,10 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_PAGES_OFF 188928
 #define SMEM_SMEM_PAGES_STAGE_BYTES 128
 #define SMEM_SMEM_PAGES_STRIDE 128
-#define SMEM_TOTAL 189440
+#define SMEM_SMEM_EPI_OFF 189440
+#define SMEM_SMEM_EPI_STAGE_BYTES 32768
+#define SMEM_SMEM_EPI_STRIDE 32768
+#define SMEM_TOTAL 222208
 #define THREADS 512
 #define SKIP_XFORM 0
 #define LAZY_RESCALE 1
@@ -174,6 +177,9 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SKIP_QK 0
 #define SKIP_PV 0
 #define SKIP_SMATH 0
+#define SKIP_EPISTORE 0
+#define SKIP_EPISTS 0
+#define EPI_DIRECT 0
 #define TRACE 0
 
 #include <math_constants.h>
@@ -216,13 +222,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
 
 
 
@@ -371,7 +370,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(2,1,1) void
-kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap QS, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KVS, const __grid_constant__ CUtensorMap OT, const __grid_constant__ CUtensorMap PO, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, __nv_bfloat16* __restrict__ partial_o, float* __restrict__ partial_lse, int* __restrict__ work_table, int* __restrict__ unit_first, int* __restrict__ page_table, int* __restrict__ seq_lens, int* __restrict__ q_indptr, float* __restrict__ sinks, int rows_total, int num_heads, int q_len, int max_pages, int max_splits, float scale_log2)
+kernel_cake_nvfp4_mla_decode_3927fc8775af1fb052ad(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap QS, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap KVS, const __grid_constant__ CUtensorMap OT, const __grid_constant__ CUtensorMap PO, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, __nv_bfloat16* __restrict__ partial_o, float* __restrict__ partial_lse, int* __restrict__ work_table, int* __restrict__ unit_first, int* __restrict__ page_table, int* __restrict__ seq_lens, int* __restrict__ q_indptr, float* __restrict__ sinks, int rows_total, int num_heads, int q_len, int max_pages, int max_splits, float scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -484,6 +483,8 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
     const int smem_xchg_sum_addr = smem + 188416;
     int* smem_pages = reinterpret_cast<int*>(smem_raw + 188928);
     const int smem_pages_addr = smem + 188928;
+    uint8_t* smem_epi = reinterpret_cast<uint8_t*>(smem_raw + 189440);
+    const int smem_epi_addr = smem + 189440;
 
     // Mbarrier init (18 pipeline groups, 0 ordered-sequence groups, 30 barriers)
     // Mbarriers at smem_raw[0..240)
@@ -610,11 +611,11 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
             int item_lo_s = unit_first[unit_s];
             int item_hi_s = unit_first[unit_s + 1];
             int tr_s = blockIdx.x == 0 && warp == 0 && lane == 0;
+            int gt_s = 0;
             unsigned int _phase_corr_empty_0 = 1;
             unsigned int _phase_o_full_0 = 0;
             #pragma unroll 1
             for (int item_s = item_lo_s; item_s < item_hi_s; item_s += 2) {
-                int tr_item_s = tr_s & (int)(item_s == item_lo_s);
                 int b_s = work_table[item_s * 8];
                 int m_tile_s = work_table[item_s * 8 + 1];
                 int tile_start_s = work_table[item_s * 8 + 3];
@@ -1250,8 +1251,16 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                 int out_row_base = out_row - row_c;
                 int epi_bulk = valid_rows_cta == 64;
                 int warp_tile0 = smem_p_addr + (unsigned int)(quadrant * 4096);
-                int warp_tile1 = warp_tile0 + 2048;
+                int warp_epi_base = smem_epi_addr + (unsigned int)(quadrant * 8192);
+                int warp_tile1 = warp_epi_base;
+                int warp_tile2 = warp_epi_base + 4096;
                 int warp_row0 = out_row_base + quadrant % 2 * 32;
+                if (epi_bulk != 0) {
+                    if (elect_sync()) {
+                        asm volatile("cp.async.bulk.wait_group.read 0;");
+                    }
+                    __syncwarp();
+                }
                 float o_ra[32];
                 float o_rb[32];
                 asm volatile(
@@ -1268,31 +1277,28 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         : "r"(taddr + (unsigned int)lane_base + 64 + 32));
                 }
                 if (epi_bulk != 0) {
-                    const float2 _scale2_42 = {inv_sum, inv_sum};
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>(o_ra)[_ls], _scale2_42);
-                    uint32_t o_ra_bf16[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_ra[_lp*2 + 0], o_ra[_lp*2+1 + 0]));
-                        o_ra_bf16[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 ^ (lane * 64 >> 7 & 3) << 4))), "r"(o_ra_bf16[0]), "r"(o_ra_bf16[1]), "r"(o_ra_bf16[2]), "r"(o_ra_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 16 ^ (lane * 64 + 16 >> 7 & 3) << 4))), "r"(o_ra_bf16[4]), "r"(o_ra_bf16[5]), "r"(o_ra_bf16[6]), "r"(o_ra_bf16[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 32 ^ (lane * 64 + 32 >> 7 & 3) << 4))), "r"(o_ra_bf16[8]), "r"(o_ra_bf16[9]), "r"(o_ra_bf16[10]), "r"(o_ra_bf16[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 48 ^ (lane * 64 + 48 >> 7 & 3) << 4))), "r"(o_ra_bf16[12]), "r"(o_ra_bf16[13]), "r"(o_ra_bf16[14]), "r"(o_ra_bf16[15]) : "memory");
                     {
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        __syncwarp();
-                        if (elect_sync()) {
-                            if (direct_out != 0) {
-                                tma_store_2d((&OT), n_half * 128, warp_row0, warp_tile0);
-                            } else {
-                                tma_store_2d((&PO), n_half * 128, split_s * rows_total + warp_row0, warp_tile0);
-                            }
-                            asm volatile("cp.async.bulk.commit_group;");
+                        #if __CUDA_ARCH__ >= 1000
+                        const float2 _scale2_42 = {inv_sum, inv_sum};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(o_ra)[_ls], _scale2_42);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            o_ra[_ls] = o_ra[_ls] * inv_sum;
                         }
+                        #endif
+                        uint32_t o_ra_bf16[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_ra[_lp*2 + 0], o_ra[_lp*2+1 + 0]));
+                            o_ra_bf16[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 128 ^ (lane * 128 >> 7 & 7) << 4))), "r"(o_ra_bf16[0]), "r"(o_ra_bf16[1]), "r"(o_ra_bf16[2]), "r"(o_ra_bf16[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 128 + 16 ^ (lane * 128 + 16 >> 7 & 7) << 4))), "r"(o_ra_bf16[4]), "r"(o_ra_bf16[5]), "r"(o_ra_bf16[6]), "r"(o_ra_bf16[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 128 + 32 ^ (lane * 128 + 32 >> 7 & 7) << 4))), "r"(o_ra_bf16[8]), "r"(o_ra_bf16[9]), "r"(o_ra_bf16[10]), "r"(o_ra_bf16[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 128 + 48 ^ (lane * 128 + 48 >> 7 & 7) << 4))), "r"(o_ra_bf16[12]), "r"(o_ra_bf16[13]), "r"(o_ra_bf16[14]), "r"(o_ra_bf16[15]) : "memory");
                     }
                 } else if (row_valid != 0) {
                     if (direct_out != 0) {
@@ -1400,30 +1406,39 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         : "r"(taddr + (unsigned int)lane_base + 64 + 64));
                 }
                 if (epi_bulk != 0) {
-                    const float2 _scale2_47 = {inv_sum, inv_sum};
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>(o_rb)[_ls], _scale2_47);
-                    uint32_t o_rb_bf16[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_rb[_lp*2 + 0], o_rb[_lp*2+1 + 0]));
-                        o_rb_bf16[_lp] = *(uint32_t*)&_bf2;
-                    }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 ^ (lane * 64 >> 7 & 3) << 4))), "r"(o_rb_bf16[0]), "r"(o_rb_bf16[1]), "r"(o_rb_bf16[2]), "r"(o_rb_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 16 ^ (lane * 64 + 16 >> 7 & 3) << 4))), "r"(o_rb_bf16[4]), "r"(o_rb_bf16[5]), "r"(o_rb_bf16[6]), "r"(o_rb_bf16[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 32 ^ (lane * 64 + 32 >> 7 & 3) << 4))), "r"(o_rb_bf16[8]), "r"(o_rb_bf16[9]), "r"(o_rb_bf16[10]), "r"(o_rb_bf16[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 48 ^ (lane * 64 + 48 >> 7 & 3) << 4))), "r"(o_rb_bf16[12]), "r"(o_rb_bf16[13]), "r"(o_rb_bf16[14]), "r"(o_rb_bf16[15]) : "memory");
                     {
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        __syncwarp();
-                        if (elect_sync()) {
-                            if (direct_out != 0) {
-                                tma_store_2d((&OT), n_half * 128 + 32, warp_row0, warp_tile1);
-                            } else {
-                                tma_store_2d((&PO), n_half * 128 + 32, split_s * rows_total + warp_row0, warp_tile1);
+                        #if __CUDA_ARCH__ >= 1000
+                        const float2 _scale2_47 = {inv_sum, inv_sum};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(o_rb)[_ls], _scale2_47);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            o_rb[_ls] = o_rb[_ls] * inv_sum;
+                        }
+                        #endif
+                        uint32_t o_rb_bf16[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_rb[_lp*2 + 0], o_rb[_lp*2+1 + 0]));
+                            o_rb_bf16[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 128 + 64 ^ (lane * 128 + 64 >> 7 & 7) << 4))), "r"(o_rb_bf16[0]), "r"(o_rb_bf16[1]), "r"(o_rb_bf16[2]), "r"(o_rb_bf16[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 128 + 80 ^ (lane * 128 + 80 >> 7 & 7) << 4))), "r"(o_rb_bf16[4]), "r"(o_rb_bf16[5]), "r"(o_rb_bf16[6]), "r"(o_rb_bf16[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 128 + 96 ^ (lane * 128 + 96 >> 7 & 7) << 4))), "r"(o_rb_bf16[8]), "r"(o_rb_bf16[9]), "r"(o_rb_bf16[10]), "r"(o_rb_bf16[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 128 + 112 ^ (lane * 128 + 112 >> 7 & 7) << 4))), "r"(o_rb_bf16[12]), "r"(o_rb_bf16[13]), "r"(o_rb_bf16[14]), "r"(o_rb_bf16[15]) : "memory");
+                        {
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                            __syncwarp();
+                            if (elect_sync()) {
+                                if (direct_out != 0) {
+                                    tma_store_2d((&OT), n_half * 128 + 32 - 32, warp_row0, warp_tile0);
+                                } else {
+                                    tma_store_2d((&PO), n_half * 128 + 32 - 32, split_s * rows_total + warp_row0, warp_tile0);
+                                }
+                                asm volatile("cp.async.bulk.commit_group;");
                             }
-                            asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
                 } else if (row_valid != 0) {
@@ -1532,37 +1547,28 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         : "r"(taddr + (unsigned int)lane_base + 64 + 96));
                 }
                 if (epi_bulk != 0) {
-                    const float2 _scale2_52 = {inv_sum, inv_sum};
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>(o_ra)[_ls], _scale2_52);
-                    uint32_t o_ra_bf16_1[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_ra[_lp*2 + 0], o_ra[_lp*2+1 + 0]));
-                        o_ra_bf16_1[_lp] = *(uint32_t*)&_bf2;
-                    }
                     {
-                        if (elect_sync()) {
-                            asm volatile("cp.async.bulk.wait_group.read 1;");
+                        #if __CUDA_ARCH__ >= 1000
+                        const float2 _scale2_52 = {inv_sum, inv_sum};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(o_ra)[_ls], _scale2_52);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            o_ra[_ls] = o_ra[_ls] * inv_sum;
                         }
-                        __syncwarp();
-                    }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 ^ (lane * 64 >> 7 & 3) << 4))), "r"(o_ra_bf16_1[0]), "r"(o_ra_bf16_1[1]), "r"(o_ra_bf16_1[2]), "r"(o_ra_bf16_1[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 16 ^ (lane * 64 + 16 >> 7 & 3) << 4))), "r"(o_ra_bf16_1[4]), "r"(o_ra_bf16_1[5]), "r"(o_ra_bf16_1[6]), "r"(o_ra_bf16_1[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 32 ^ (lane * 64 + 32 >> 7 & 3) << 4))), "r"(o_ra_bf16_1[8]), "r"(o_ra_bf16_1[9]), "r"(o_ra_bf16_1[10]), "r"(o_ra_bf16_1[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 48 ^ (lane * 64 + 48 >> 7 & 3) << 4))), "r"(o_ra_bf16_1[12]), "r"(o_ra_bf16_1[13]), "r"(o_ra_bf16_1[14]), "r"(o_ra_bf16_1[15]) : "memory");
-                    {
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        __syncwarp();
-                        if (elect_sync()) {
-                            if (direct_out != 0) {
-                                tma_store_2d((&OT), n_half * 128 + 64, warp_row0, warp_tile0);
-                            } else {
-                                tma_store_2d((&PO), n_half * 128 + 64, split_s * rows_total + warp_row0, warp_tile0);
-                            }
-                            asm volatile("cp.async.bulk.commit_group;");
+                        #endif
+                        uint32_t o_ra_bf16_1[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_ra[_lp*2 + 0], o_ra[_lp*2+1 + 0]));
+                            o_ra_bf16_1[_lp] = *(uint32_t*)&_bf2;
                         }
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 ^ (lane * 128 >> 7 & 7) << 4))), "r"(o_ra_bf16_1[0]), "r"(o_ra_bf16_1[1]), "r"(o_ra_bf16_1[2]), "r"(o_ra_bf16_1[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 16 ^ (lane * 128 + 16 >> 7 & 7) << 4))), "r"(o_ra_bf16_1[4]), "r"(o_ra_bf16_1[5]), "r"(o_ra_bf16_1[6]), "r"(o_ra_bf16_1[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 32 ^ (lane * 128 + 32 >> 7 & 7) << 4))), "r"(o_ra_bf16_1[8]), "r"(o_ra_bf16_1[9]), "r"(o_ra_bf16_1[10]), "r"(o_ra_bf16_1[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 48 ^ (lane * 128 + 48 >> 7 & 7) << 4))), "r"(o_ra_bf16_1[12]), "r"(o_ra_bf16_1[13]), "r"(o_ra_bf16_1[14]), "r"(o_ra_bf16_1[15]) : "memory");
                     }
                 } else if (row_valid != 0) {
                     if (direct_out != 0) {
@@ -1670,36 +1676,39 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         : "r"(taddr + (unsigned int)lane_base + 64 + 128));
                 }
                 if (epi_bulk != 0) {
-                    const float2 _scale2_57 = {inv_sum, inv_sum};
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>(o_rb)[_ls], _scale2_57);
-                    uint32_t o_rb_bf16_1[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_rb[_lp*2 + 0], o_rb[_lp*2+1 + 0]));
-                        o_rb_bf16_1[_lp] = *(uint32_t*)&_bf2;
-                    }
                     {
-                        if (elect_sync()) {
-                            asm volatile("cp.async.bulk.wait_group.read 1;");
+                        #if __CUDA_ARCH__ >= 1000
+                        const float2 _scale2_57 = {inv_sum, inv_sum};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(o_rb)[_ls], _scale2_57);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            o_rb[_ls] = o_rb[_ls] * inv_sum;
                         }
-                        __syncwarp();
-                    }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 ^ (lane * 64 >> 7 & 3) << 4))), "r"(o_rb_bf16_1[0]), "r"(o_rb_bf16_1[1]), "r"(o_rb_bf16_1[2]), "r"(o_rb_bf16_1[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 16 ^ (lane * 64 + 16 >> 7 & 3) << 4))), "r"(o_rb_bf16_1[4]), "r"(o_rb_bf16_1[5]), "r"(o_rb_bf16_1[6]), "r"(o_rb_bf16_1[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 32 ^ (lane * 64 + 32 >> 7 & 3) << 4))), "r"(o_rb_bf16_1[8]), "r"(o_rb_bf16_1[9]), "r"(o_rb_bf16_1[10]), "r"(o_rb_bf16_1[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 48 ^ (lane * 64 + 48 >> 7 & 3) << 4))), "r"(o_rb_bf16_1[12]), "r"(o_rb_bf16_1[13]), "r"(o_rb_bf16_1[14]), "r"(o_rb_bf16_1[15]) : "memory");
-                    {
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        __syncwarp();
-                        if (elect_sync()) {
-                            if (direct_out != 0) {
-                                tma_store_2d((&OT), n_half * 128 + 96, warp_row0, warp_tile1);
-                            } else {
-                                tma_store_2d((&PO), n_half * 128 + 96, split_s * rows_total + warp_row0, warp_tile1);
+                        #endif
+                        uint32_t o_rb_bf16_1[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_rb[_lp*2 + 0], o_rb[_lp*2+1 + 0]));
+                            o_rb_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 64 ^ (lane * 128 + 64 >> 7 & 7) << 4))), "r"(o_rb_bf16_1[0]), "r"(o_rb_bf16_1[1]), "r"(o_rb_bf16_1[2]), "r"(o_rb_bf16_1[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 80 ^ (lane * 128 + 80 >> 7 & 7) << 4))), "r"(o_rb_bf16_1[4]), "r"(o_rb_bf16_1[5]), "r"(o_rb_bf16_1[6]), "r"(o_rb_bf16_1[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 96 ^ (lane * 128 + 96 >> 7 & 7) << 4))), "r"(o_rb_bf16_1[8]), "r"(o_rb_bf16_1[9]), "r"(o_rb_bf16_1[10]), "r"(o_rb_bf16_1[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 112 ^ (lane * 128 + 112 >> 7 & 7) << 4))), "r"(o_rb_bf16_1[12]), "r"(o_rb_bf16_1[13]), "r"(o_rb_bf16_1[14]), "r"(o_rb_bf16_1[15]) : "memory");
+                        {
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                            __syncwarp();
+                            if (elect_sync()) {
+                                if (direct_out != 0) {
+                                    tma_store_2d((&OT), n_half * 128 + 96 - 32, warp_row0, warp_tile1);
+                                } else {
+                                    tma_store_2d((&PO), n_half * 128 + 96 - 32, split_s * rows_total + warp_row0, warp_tile1);
+                                }
+                                asm volatile("cp.async.bulk.commit_group;");
                             }
-                            asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
                 } else if (row_valid != 0) {
@@ -1808,37 +1817,28 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         : "r"(taddr + (unsigned int)lane_base + 64 + 128 + 32));
                 }
                 if (epi_bulk != 0) {
-                    const float2 _scale2_62 = {inv_sum, inv_sum};
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>(o_ra)[_ls], _scale2_62);
-                    uint32_t o_ra_bf16_2[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_ra[_lp*2 + 0], o_ra[_lp*2+1 + 0]));
-                        o_ra_bf16_2[_lp] = *(uint32_t*)&_bf2;
-                    }
                     {
-                        if (elect_sync()) {
-                            asm volatile("cp.async.bulk.wait_group.read 1;");
+                        #if __CUDA_ARCH__ >= 1000
+                        const float2 _scale2_62 = {inv_sum, inv_sum};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(o_ra)[_ls], _scale2_62);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            o_ra[_ls] = o_ra[_ls] * inv_sum;
                         }
-                        __syncwarp();
-                    }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 ^ (lane * 64 >> 7 & 3) << 4))), "r"(o_ra_bf16_2[0]), "r"(o_ra_bf16_2[1]), "r"(o_ra_bf16_2[2]), "r"(o_ra_bf16_2[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 16 ^ (lane * 64 + 16 >> 7 & 3) << 4))), "r"(o_ra_bf16_2[4]), "r"(o_ra_bf16_2[5]), "r"(o_ra_bf16_2[6]), "r"(o_ra_bf16_2[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 32 ^ (lane * 64 + 32 >> 7 & 3) << 4))), "r"(o_ra_bf16_2[8]), "r"(o_ra_bf16_2[9]), "r"(o_ra_bf16_2[10]), "r"(o_ra_bf16_2[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 48 ^ (lane * 64 + 48 >> 7 & 3) << 4))), "r"(o_ra_bf16_2[12]), "r"(o_ra_bf16_2[13]), "r"(o_ra_bf16_2[14]), "r"(o_ra_bf16_2[15]) : "memory");
-                    {
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        __syncwarp();
-                        if (elect_sync()) {
-                            if (direct_out != 0) {
-                                tma_store_2d((&OT), n_half * 128 + 256, warp_row0, warp_tile0);
-                            } else {
-                                tma_store_2d((&PO), n_half * 128 + 256, split_s * rows_total + warp_row0, warp_tile0);
-                            }
-                            asm volatile("cp.async.bulk.commit_group;");
+                        #endif
+                        uint32_t o_ra_bf16_2[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_ra[_lp*2 + 0], o_ra[_lp*2+1 + 0]));
+                            o_ra_bf16_2[_lp] = *(uint32_t*)&_bf2;
                         }
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile2 + (lane * 128 ^ (lane * 128 >> 7 & 7) << 4))), "r"(o_ra_bf16_2[0]), "r"(o_ra_bf16_2[1]), "r"(o_ra_bf16_2[2]), "r"(o_ra_bf16_2[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile2 + (lane * 128 + 16 ^ (lane * 128 + 16 >> 7 & 7) << 4))), "r"(o_ra_bf16_2[4]), "r"(o_ra_bf16_2[5]), "r"(o_ra_bf16_2[6]), "r"(o_ra_bf16_2[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile2 + (lane * 128 + 32 ^ (lane * 128 + 32 >> 7 & 7) << 4))), "r"(o_ra_bf16_2[8]), "r"(o_ra_bf16_2[9]), "r"(o_ra_bf16_2[10]), "r"(o_ra_bf16_2[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile2 + (lane * 128 + 48 ^ (lane * 128 + 48 >> 7 & 7) << 4))), "r"(o_ra_bf16_2[12]), "r"(o_ra_bf16_2[13]), "r"(o_ra_bf16_2[14]), "r"(o_ra_bf16_2[15]) : "memory");
                     }
                 } else if (row_valid != 0) {
                     if (direct_out != 0) {
@@ -1946,36 +1946,39 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         : "r"(taddr + (unsigned int)lane_base + 64 + 128 + 64));
                 }
                 if (epi_bulk != 0) {
-                    const float2 _scale2_67 = {inv_sum, inv_sum};
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>(o_rb)[_ls], _scale2_67);
-                    uint32_t o_rb_bf16_2[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_rb[_lp*2 + 0], o_rb[_lp*2+1 + 0]));
-                        o_rb_bf16_2[_lp] = *(uint32_t*)&_bf2;
-                    }
                     {
-                        if (elect_sync()) {
-                            asm volatile("cp.async.bulk.wait_group.read 1;");
+                        #if __CUDA_ARCH__ >= 1000
+                        const float2 _scale2_67 = {inv_sum, inv_sum};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(o_rb)[_ls], _scale2_67);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            o_rb[_ls] = o_rb[_ls] * inv_sum;
                         }
-                        __syncwarp();
-                    }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 ^ (lane * 64 >> 7 & 3) << 4))), "r"(o_rb_bf16_2[0]), "r"(o_rb_bf16_2[1]), "r"(o_rb_bf16_2[2]), "r"(o_rb_bf16_2[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 16 ^ (lane * 64 + 16 >> 7 & 3) << 4))), "r"(o_rb_bf16_2[4]), "r"(o_rb_bf16_2[5]), "r"(o_rb_bf16_2[6]), "r"(o_rb_bf16_2[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 32 ^ (lane * 64 + 32 >> 7 & 3) << 4))), "r"(o_rb_bf16_2[8]), "r"(o_rb_bf16_2[9]), "r"(o_rb_bf16_2[10]), "r"(o_rb_bf16_2[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 48 ^ (lane * 64 + 48 >> 7 & 3) << 4))), "r"(o_rb_bf16_2[12]), "r"(o_rb_bf16_2[13]), "r"(o_rb_bf16_2[14]), "r"(o_rb_bf16_2[15]) : "memory");
-                    {
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        __syncwarp();
-                        if (elect_sync()) {
-                            if (direct_out != 0) {
-                                tma_store_2d((&OT), n_half * 128 + 256 + 32, warp_row0, warp_tile1);
-                            } else {
-                                tma_store_2d((&PO), n_half * 128 + 256 + 32, split_s * rows_total + warp_row0, warp_tile1);
+                        #endif
+                        uint32_t o_rb_bf16_2[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_rb[_lp*2 + 0], o_rb[_lp*2+1 + 0]));
+                            o_rb_bf16_2[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile2 + (lane * 128 + 64 ^ (lane * 128 + 64 >> 7 & 7) << 4))), "r"(o_rb_bf16_2[0]), "r"(o_rb_bf16_2[1]), "r"(o_rb_bf16_2[2]), "r"(o_rb_bf16_2[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile2 + (lane * 128 + 80 ^ (lane * 128 + 80 >> 7 & 7) << 4))), "r"(o_rb_bf16_2[4]), "r"(o_rb_bf16_2[5]), "r"(o_rb_bf16_2[6]), "r"(o_rb_bf16_2[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile2 + (lane * 128 + 96 ^ (lane * 128 + 96 >> 7 & 7) << 4))), "r"(o_rb_bf16_2[8]), "r"(o_rb_bf16_2[9]), "r"(o_rb_bf16_2[10]), "r"(o_rb_bf16_2[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile2 + (lane * 128 + 112 ^ (lane * 128 + 112 >> 7 & 7) << 4))), "r"(o_rb_bf16_2[12]), "r"(o_rb_bf16_2[13]), "r"(o_rb_bf16_2[14]), "r"(o_rb_bf16_2[15]) : "memory");
+                        {
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                            __syncwarp();
+                            if (elect_sync()) {
+                                if (direct_out != 0) {
+                                    tma_store_2d((&OT), n_half * 128 + 256 + 32 - 32, warp_row0, warp_tile2);
+                                } else {
+                                    tma_store_2d((&PO), n_half * 128 + 256 + 32 - 32, split_s * rows_total + warp_row0, warp_tile2);
+                                }
+                                asm volatile("cp.async.bulk.commit_group;");
                             }
-                            asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
                 } else if (row_valid != 0) {
@@ -2084,37 +2087,34 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         : "r"(taddr + (unsigned int)lane_base + 64 + 128 + 96));
                 }
                 if (epi_bulk != 0) {
-                    const float2 _scale2_72 = {inv_sum, inv_sum};
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>(o_ra)[_ls], _scale2_72);
-                    uint32_t o_ra_bf16_3[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_ra[_lp*2 + 0], o_ra[_lp*2+1 + 0]));
-                        o_ra_bf16_3[_lp] = *(uint32_t*)&_bf2;
-                    }
                     {
-                        if (elect_sync()) {
-                            asm volatile("cp.async.bulk.wait_group.read 1;");
+                        #if __CUDA_ARCH__ >= 1000
+                        const float2 _scale2_72 = {inv_sum, inv_sum};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(o_ra)[_ls], _scale2_72);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            o_ra[_ls] = o_ra[_ls] * inv_sum;
                         }
-                        __syncwarp();
-                    }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 ^ (lane * 64 >> 7 & 3) << 4))), "r"(o_ra_bf16_3[0]), "r"(o_ra_bf16_3[1]), "r"(o_ra_bf16_3[2]), "r"(o_ra_bf16_3[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 16 ^ (lane * 64 + 16 >> 7 & 3) << 4))), "r"(o_ra_bf16_3[4]), "r"(o_ra_bf16_3[5]), "r"(o_ra_bf16_3[6]), "r"(o_ra_bf16_3[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 32 ^ (lane * 64 + 32 >> 7 & 3) << 4))), "r"(o_ra_bf16_3[8]), "r"(o_ra_bf16_3[9]), "r"(o_ra_bf16_3[10]), "r"(o_ra_bf16_3[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile0 + (lane * 64 + 48 ^ (lane * 64 + 48 >> 7 & 3) << 4))), "r"(o_ra_bf16_3[12]), "r"(o_ra_bf16_3[13]), "r"(o_ra_bf16_3[14]), "r"(o_ra_bf16_3[15]) : "memory");
-                    {
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        __syncwarp();
-                        if (elect_sync()) {
-                            if (direct_out != 0) {
-                                tma_store_2d((&OT), n_half * 128 + 256 + 64, warp_row0, warp_tile0);
-                            } else {
-                                tma_store_2d((&PO), n_half * 128 + 256 + 64, split_s * rows_total + warp_row0, warp_tile0);
+                        #endif
+                        uint32_t o_ra_bf16_3[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_ra[_lp*2 + 0], o_ra[_lp*2+1 + 0]));
+                            o_ra_bf16_3[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        {
+                            if (elect_sync()) {
+                                asm volatile("cp.async.bulk.wait_group.read 1;");
                             }
-                            asm volatile("cp.async.bulk.commit_group;");
+                            __syncwarp();
                         }
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 ^ (lane * 128 >> 7 & 7) << 4))), "r"(o_ra_bf16_3[0]), "r"(o_ra_bf16_3[1]), "r"(o_ra_bf16_3[2]), "r"(o_ra_bf16_3[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 16 ^ (lane * 128 + 16 >> 7 & 7) << 4))), "r"(o_ra_bf16_3[4]), "r"(o_ra_bf16_3[5]), "r"(o_ra_bf16_3[6]), "r"(o_ra_bf16_3[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 32 ^ (lane * 128 + 32 >> 7 & 7) << 4))), "r"(o_ra_bf16_3[8]), "r"(o_ra_bf16_3[9]), "r"(o_ra_bf16_3[10]), "r"(o_ra_bf16_3[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 48 ^ (lane * 128 + 48 >> 7 & 7) << 4))), "r"(o_ra_bf16_3[12]), "r"(o_ra_bf16_3[13]), "r"(o_ra_bf16_3[14]), "r"(o_ra_bf16_3[15]) : "memory");
                     }
                 } else if (row_valid != 0) {
                     if (direct_out != 0) {
@@ -2225,36 +2225,39 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         :: "r"(o_empty_addr), "r"(0) : "memory");
                 }
                 if (epi_bulk != 0) {
-                    const float2 _scale2_77 = {inv_sum, inv_sum};
-                    #pragma unroll
-                    for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_inplace(&reinterpret_cast<float2*>(o_rb)[_ls], _scale2_77);
-                    uint32_t o_rb_bf16_3[16];
-                    #pragma unroll
-                    for (int _lp = 0; _lp < 16; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_rb[_lp*2 + 0], o_rb[_lp*2+1 + 0]));
-                        o_rb_bf16_3[_lp] = *(uint32_t*)&_bf2;
-                    }
                     {
-                        if (elect_sync()) {
-                            asm volatile("cp.async.bulk.wait_group.read 1;");
+                        #if __CUDA_ARCH__ >= 1000
+                        const float2 _scale2_77 = {inv_sum, inv_sum};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 16; _ls++)
+                            mul_f32x2_inplace(&reinterpret_cast<float2*>(o_rb)[_ls], _scale2_77);
+                        #else
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 32; _ls++) {
+                            o_rb[_ls] = o_rb[_ls] * inv_sum;
                         }
-                        __syncwarp();
-                    }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 ^ (lane * 64 >> 7 & 3) << 4))), "r"(o_rb_bf16_3[0]), "r"(o_rb_bf16_3[1]), "r"(o_rb_bf16_3[2]), "r"(o_rb_bf16_3[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 16 ^ (lane * 64 + 16 >> 7 & 3) << 4))), "r"(o_rb_bf16_3[4]), "r"(o_rb_bf16_3[5]), "r"(o_rb_bf16_3[6]), "r"(o_rb_bf16_3[7]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 32 ^ (lane * 64 + 32 >> 7 & 3) << 4))), "r"(o_rb_bf16_3[8]), "r"(o_rb_bf16_3[9]), "r"(o_rb_bf16_3[10]), "r"(o_rb_bf16_3[11]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 64 + 48 ^ (lane * 64 + 48 >> 7 & 3) << 4))), "r"(o_rb_bf16_3[12]), "r"(o_rb_bf16_3[13]), "r"(o_rb_bf16_3[14]), "r"(o_rb_bf16_3[15]) : "memory");
-                    {
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        __syncwarp();
-                        if (elect_sync()) {
-                            if (direct_out != 0) {
-                                tma_store_2d((&OT), n_half * 128 + 256 + 96, warp_row0, warp_tile1);
-                            } else {
-                                tma_store_2d((&PO), n_half * 128 + 256 + 96, split_s * rows_total + warp_row0, warp_tile1);
+                        #endif
+                        uint32_t o_rb_bf16_3[16];
+                        #pragma unroll
+                        for (int _lp = 0; _lp < 16; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_rb[_lp*2 + 0], o_rb[_lp*2+1 + 0]));
+                            o_rb_bf16_3[_lp] = *(uint32_t*)&_bf2;
+                        }
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 64 ^ (lane * 128 + 64 >> 7 & 7) << 4))), "r"(o_rb_bf16_3[0]), "r"(o_rb_bf16_3[1]), "r"(o_rb_bf16_3[2]), "r"(o_rb_bf16_3[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 80 ^ (lane * 128 + 80 >> 7 & 7) << 4))), "r"(o_rb_bf16_3[4]), "r"(o_rb_bf16_3[5]), "r"(o_rb_bf16_3[6]), "r"(o_rb_bf16_3[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 96 ^ (lane * 128 + 96 >> 7 & 7) << 4))), "r"(o_rb_bf16_3[8]), "r"(o_rb_bf16_3[9]), "r"(o_rb_bf16_3[10]), "r"(o_rb_bf16_3[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((warp_tile1 + (lane * 128 + 112 ^ (lane * 128 + 112 >> 7 & 7) << 4))), "r"(o_rb_bf16_3[12]), "r"(o_rb_bf16_3[13]), "r"(o_rb_bf16_3[14]), "r"(o_rb_bf16_3[15]) : "memory");
+                        {
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                            __syncwarp();
+                            if (elect_sync()) {
+                                if (direct_out != 0) {
+                                    tma_store_2d((&OT), n_half * 128 + 256 + 96 - 32, warp_row0, warp_tile1);
+                                } else {
+                                    tma_store_2d((&PO), n_half * 128 + 256 + 96 - 32, split_s * rows_total + warp_row0, warp_tile1);
+                                }
+                                asm volatile("cp.async.bulk.commit_group;");
                             }
-                            asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
                 } else if (row_valid != 0) {
@@ -2356,7 +2359,7 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                 }
                 if (epi_bulk != 0) {
                     if (elect_sync()) {
-                        asm volatile("cp.async.bulk.wait_group.read 0;");
+                        asm volatile("cp.async.bulk.wait_group.read 3;");
                     }
                     __syncwarp();
                 }
@@ -2371,6 +2374,7 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         }
                     }
                 }
+                gt_s = gt_s + num_tiles_s;
             }
         }
     }
@@ -2391,12 +2395,12 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
             int item_lo_c = unit_first[unit_c];
             int item_hi_c = unit_first[unit_c + 1];
             int tr_c = blockIdx.x == 0 && warp == 4 && lane == 0;
+            int gt_c = 0;
             unsigned int _phase_q_full_0 = 0;
             unsigned int _phase_corr_sig_0 = 0;
             unsigned int _phase_pv_done_0 = 0;
             #pragma unroll 1
             for (int item_c = item_lo_c; item_c < item_hi_c; item_c += 2) {
-                int tr_item_c = tr_c & (int)(item_c == item_lo_c);
                 int tile_start_c = work_table[item_c * 8 + 3];
                 int tile_end_c = work_table[item_c * 8 + 4];
                 int num_tiles_c = tile_end_c - tile_start_c;
@@ -2882,10 +2886,17 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                                 : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31])
                                 : "r"(o_addr));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
+                            #if __CUDA_ARCH__ >= 1000
                             const float2 _scale2_0 = {alpha_c, alpha_c};
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_ls], _scale2_0);
+                            #else
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 32; _ls++) {
+                                _tmem_load_0[_ls] = _tmem_load_0[_ls] * alpha_c;
+                            }
+                            #endif
                             tmem_st_x32_f32(o_addr, _tmem_load_0);
                         }
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -3030,6 +3041,7 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                 }
                 mbarrier_wait(pv_done_addr, _phase_pv_done_0);
                 _phase_pv_done_0 ^= 1;
+                gt_c = gt_c + num_tiles_c;
             }
         }
     }
@@ -3070,9 +3082,9 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
             int item_lo_t = unit_first[unit_t];
             int item_hi_t = unit_first[unit_t + 1];
             int tr_t = blockIdx.x == 0 && warp == 8 && lane == 0;
+            int gt_t = 0;
             #pragma unroll 1
             for (int item_t = item_lo_t; item_t < item_hi_t; item_t += 2) {
-                int tr_item_t = tr_t & (int)(item_t == item_lo_t);
                 int tile_start_t = work_table[item_t * 8 + 3];
                 int tile_end_t = work_table[item_t * 8 + 4];
                 int num_tiles_t = tile_end_t - tile_start_t;
@@ -3607,6 +3619,7 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                     v_stage_t += 1;
                     if (v_stage_t == 2) { v_stage_t = 0; v_phase_t ^= 1; }
                 }
+                gt_t = gt_t + num_tiles_t;
             }
         }
     }
@@ -3620,10 +3633,10 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
             int item_lo_l = unit_first[unit_l];
             int item_hi_l = unit_first[unit_l + 1];
             int tr_l = blockIdx.x == 0 && lane == 0;
+            int gt_l = 0;
             unsigned int _phase_q_empty_0 = 1;
             #pragma unroll 1
             for (int item_l = item_lo_l; item_l < item_hi_l; item_l += 2) {
-                int tr_item_l = tr_l & (int)(item_l == item_lo_l);
                 int b_l = work_table[item_l * 8];
                 int m_tile_l = work_table[item_l * 8 + 1];
                 int tile_start_l = work_table[item_l * 8 + 3];
@@ -3692,6 +3705,7 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                     raw_stage_l += 1;
                     if (raw_stage_l == 3) { raw_stage_l = 0; raw_phase_l ^= 1; }
                 }
+                gt_l = gt_l + num_tiles_l;
             }
         }
     }
@@ -3712,12 +3726,12 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
             int item_lo_m = unit_first[unit_m];
             int item_hi_m = unit_first[unit_m + 1];
             int tr_m = blockIdx.x == 0 && lane == 0;
+            int gt_m = 0;
             unsigned int _phase_q_full_0_1 = 0;
             unsigned int _phase_sfa_full_0 = 0;
             unsigned int _phase_o_empty_0 = 1;
             #pragma unroll 1
             for (int item_m = item_lo_m; item_m < item_hi_m; item_m += 2) {
-                int tr_item_m = tr_m & (int)(item_m == item_lo_m);
                 int tile_start_m = work_table[item_m * 8 + 3];
                 int tile_end_m = work_table[item_m * 8 + 4];
                 int num_tiles_m = tile_end_m - tile_start_m;
@@ -4044,6 +4058,7 @@ kernel_cake_nvfp4_mla_decode_b777c32b356f30dc993a(const __grid_constant__ CUtens
                         if (num_tiles_m - 1 + 1 == num_tiles_m) {
                             tcgen05_commit_cg2_multicast(o_full_addr, (uint16_t)(3));
                         }
+                        gt_m = gt_m + num_tiles_m;
                     }
                 }
             }
