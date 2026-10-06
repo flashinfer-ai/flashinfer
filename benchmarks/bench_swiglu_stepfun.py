@@ -70,6 +70,7 @@ from flashinfer.fused_moe.runners import (
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
 )
+from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.testing.utils import bench_gpu_time
 
 
@@ -244,11 +245,19 @@ def make_activations(args, tokens, backend, quant, hidden_states_scale_global=No
     return pack, hashes
 
 
-def make_candidate(
-    args, tokens, runner_cls, backend, quant, activation, base_view, act, arm="trtllm"
-):
-    config = MoEConfig(
-        routing=RoutingConfig(num_experts=args.experts, top_k=args.top_k),
+# StepFun routes with Renormalize (top-k, then softmax over the selected experts):
+# the production StepFun path and tests/moe/test_cake_stepfun_fused_moe.py use it,
+# the Cake full path serves it only (CakeStepFunRunner._check_support), and the
+# native trtllm runners accept it for every precision measured here. Both arms
+# share it so the pair compares the same routing semantics.
+ROUTING_METHOD = RoutingMethodType.Renormalize
+
+
+def make_config(args, tokens, backend, quant, activation):
+    return MoEConfig(
+        routing=RoutingConfig(
+            num_experts=args.experts, top_k=args.top_k, method=ROUTING_METHOD
+        ),
         quant=quant,
         experts=ExpertConfig(
             intermediate_size=args.intermediate, local_num_experts=args.experts
@@ -257,6 +266,12 @@ def make_candidate(
         backend=BackendOptions(candidates=(backend(),)),
         execution=ExecutionConfig(enable_pdl=args.pdl, tune_max_num_tokens=tokens),
     )
+
+
+def make_candidate(
+    args, tokens, runner_cls, backend, quant, activation, base_view, act, arm="trtllm"
+):
+    config = make_config(args, tokens, backend, quant, activation)
     runner = runner_cls(config, torch.device("cuda", torch.cuda.current_device()))
     runner.check_support()
     runner.build()
@@ -427,7 +442,7 @@ def main():
         "nvidia_smi": command_output("nvidia-smi"),
         "nvcc": command_output("nvcc", "--version"),
         "timing_scope": "native unified runner forward: routing, fused FC1 activation, FC2, finalize; preparation and input quantization excluded",
-        "routing": "uniform round-robin expert ids; normalized FP32 weights; UnpackedPrecomputed",
+        "routing": "uniform round-robin expert ids; normalized FP32 weights; UnpackedPrecomputed; RoutingMethodType.Renormalize on both arms",
         "cold_l2_cache": args.cache_policy == "cold",
         "autotune": "independent per activation, precision, backend, token count",
         "backends": list(args.backends),
