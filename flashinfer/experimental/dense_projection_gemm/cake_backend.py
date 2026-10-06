@@ -811,7 +811,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64},
     ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "stages": 6, "b_swz": 64},
     ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "stages": 6},
-    ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "sk_parts": 3, "b_swz": 64},
+    ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "epi": 'reg', "sk_parts": 3, "b_swz": 64, "f32_v8": True, "store_ef": True},
     ('sm_107a', True, True, True, False, False, 2048, None, 6144): {"cta_rows": 256},
     ('sm_107a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', True, True, True, False, False, 6144, None, 2048): {"cta_rows": 256},
