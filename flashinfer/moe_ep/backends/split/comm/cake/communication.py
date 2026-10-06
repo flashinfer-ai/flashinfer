@@ -20,12 +20,18 @@ from .....core.comm.communication import (
     MoEEpDispatchResult,
     register_communication,
 )
-from ..nvlink_common import mnnvl_mapping_and_config, nvlink_platform_supported
+from ..nvlink_common import (
+    mnnvl_mapping_and_config,
+    nvlink_platform_supported,
+    remap_mnnvl_memory,
+    unmap_mnnvl_memory,
+)
 from .config import CakeAlltoAllConfig
 
 if TYPE_CHECKING:
     import torch
 
+    from ......comm.abstractions import CommBackend
     from ......comm.mapping import Mapping
     from .....config import BootstrapConfig
 
@@ -336,6 +342,52 @@ class CakeAlltoAll(MoEEpCommunication):
         )
         self._round = None
         return combined
+
+    def checkpoint_prepare(self) -> None:
+        """Release the workspace's physical memory, e.g. so that the process
+        can be checkpointed.
+
+        The virtual addresses stay reserved: CUDA graphs captured on the
+        workspace replay correctly after :meth:`checkpoint_restore`. Collective
+        over the EP group and only valid between rounds. Instances sharing the
+        workspace may call it again, which does nothing.
+        """
+        state = self._live_state()
+        if self._round is not None:
+            raise RuntimeError("checkpoint_prepare called between dispatch and combine")
+        unmap_mnnvl_memory(state["mnnvl_mem"])
+
+    def checkpoint_restore(self, comm_backend: "CommBackend") -> None:
+        """Back the workspace with new memory after :meth:`checkpoint_prepare`
+        and re-initialize it.
+
+        Collective over ``comm_backend``, which must span the EP group with
+        the original ranks. Does nothing when the workspace is mapped.
+        """
+        import torch
+
+        from ......comm.trtllm_moe_alltoall import moe_a2a_initialize
+
+        state = self._live_state()
+        if not remap_mnnvl_memory(state["mnnvl_mem"], comm_backend):
+            return
+        metainfo = moe_a2a_initialize(
+            self.workspace,
+            self.ep_rank,
+            self.ep_size,
+            self.params.max_tokens_per_rank,
+            self.config.eplb_stats_num_experts,
+            backend=_BACKEND,
+        )
+        if not torch.equal(metainfo, self.metainfo):
+            raise RuntimeError(
+                "Cake workspace layout changed across the checkpoint; CUDA graphs "
+                "captured before it are not safe to replay"
+            )
+        # No peer may publish into this workspace until every rank has
+        # cleared its own slice.
+        comm_backend.barrier()
+        self._round = None
 
     def destroy(self) -> None:
         """Release this instance's share of the workspace.

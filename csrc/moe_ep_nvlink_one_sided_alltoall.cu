@@ -266,7 +266,8 @@ int64_t moeA2ACftHandleBytesOp() { return static_cast<int64_t>(tl::CftLeManager:
 
 // Create this rank's logical endpoint bound to its workspace slice and export it
 // into handleOut. Returns false when the driver or device cannot provide one; the
-// EP group must then agree to fall back before exchanging endpoints.
+// EP group must then agree to fall back before exchanging endpoints. After
+// moe_a2a_cft_release_endpoints, it recreates the endpoints under their previous IDs.
 //
 // Args:
 //   workspaceMemHandle: CUmemGenericAllocationHandle (as int64) backing this rank's slice
@@ -290,29 +291,30 @@ bool moeA2ACftCreateEndpointOp(TensorView workspace, int64_t workspaceMemHandle,
   CHECK_INPUT_TYPE(handleOut, dl_uint8);
   TVM_FFI_ICHECK_EQ(handleOut.numel(), static_cast<int64_t>(tl::CftLeManager::handleBytes()))
       << "handle_out must hold exactly one exported endpoint handle";
-  TVM_FFI_ICHECK(!g_cft_manager)
-      << "CFT logical endpoints are already bound to a workspace. Only one workspace per "
-         "process may use CFT counted writes.";
-
-  auto manager = std::make_unique<tl::CftLeManager>();
-  if (!manager->loadApis()) {
-    return false;
+  std::unique_ptr<tl::CftLeManager> manager;
+  if (g_cft_manager) {
+    TVM_FFI_ICHECK(g_cft_manager->getLocalBackingPtr() == 0)
+        << "CFT logical endpoints are already bound to a workspace. Only one workspace per "
+           "process may use CFT counted writes.";
+    manager = std::move(g_cft_manager);
+  } else {
+    manager = std::make_unique<tl::CftLeManager>();
+    if (!manager->loadApis()) {
+      return false;
+    }
   }
   int localDevIdx = -1;
   TVM_FFI_ICHECK(cudaGetDevice(&localDevIdx) == cudaSuccess)
       << "cudaGetDevice failed during CFT initialization";
   auto const workspaceRankPtr = reinterpret_cast<CUdeviceptr>(rankWorkspacePtr(workspace, epRank));
-  if (!manager->createEndpointExternal(
-          localDevIdx, static_cast<CUmemGenericAllocationHandle>(workspaceMemHandle),
-          workspaceRankPtr, static_cast<size_t>(workspaceSizePerRank), static_cast<int>(epRank),
-          static_cast<int>(epSize))) {
-    return false;
-  }
-  if (!manager->exportEndpoint(handleOut.data_ptr())) {
-    return false;
-  }
+  // Keep the manager, and any reserved ID block, for moe_a2a_cft_destroy even when
+  // creation fails.
   g_cft_manager = std::move(manager);
-  return true;
+  return g_cft_manager->createEndpointExternal(
+             localDevIdx, static_cast<CUmemGenericAllocationHandle>(workspaceMemHandle),
+             workspaceRankPtr, static_cast<size_t>(workspaceSizePerRank), static_cast<int>(epRank),
+             static_cast<int>(epSize)) &&
+         g_cft_manager->exportEndpoint(handleOut.data_ptr());
 }
 
 // Import every rank's exported endpoint (allHandles: CPU uint8 [epSize, handle bytes],
@@ -337,17 +339,57 @@ bool moeA2ACftImportEndpointsOp(TensorView workspace, int64_t epRank, TensorView
   return true;
 }
 
-// All ranks must finish using the workspace before releasing their local binding.
+// Fail if the endpoints are bound to another workspace; released endpoints match any.
+void checkCftWorkspace(TensorView workspace, int64_t epRank) {
+  auto const backingPtr = g_cft_manager->getLocalBackingPtr();
+  TVM_FFI_ICHECK(backingPtr == 0 ||
+                 backingPtr == reinterpret_cast<CUdeviceptr>(rankWorkspacePtr(workspace, epRank)))
+      << "CFT endpoints are bound to a different workspace";
+}
+
+// Destroy the endpoints and release their ID block. All ranks must finish using the
+// workspace before releasing their local binding.
 void moeA2ACftDestroyOp(TensorView workspace, int64_t epRank) {
   if (!g_cft_manager) {
     return;
   }
-  TVM_FFI_ICHECK(g_cft_manager->getLocalBackingPtr() ==
-                 reinterpret_cast<CUdeviceptr>(rankWorkspacePtr(workspace, epRank)))
-      << "Cannot destroy CFT endpoints bound to a different workspace";
+  checkCftWorkspace(workspace, epRank);
   TVM_FFI_ICHECK(cudaDeviceSynchronize() == cudaSuccess)
       << "CUDA synchronization failed before CFT endpoint release";
   g_cft_manager.reset();
+}
+
+// Destroy the endpoints and unbind the workspace memory, keeping the ID block reserved
+// so that moe_a2a_cft_create_endpoint recreates the endpoints under the same IDs, e.g.
+// after the workspace memory has been released and remapped. All ranks must finish
+// using the workspace first.
+void moeA2ACftReleaseEndpointsOp(TensorView workspace, int64_t epRank) {
+  TVM_FFI_ICHECK(g_cft_manager) << "CFT endpoints are not initialized";
+  checkCftWorkspace(workspace, epRank);
+  TVM_FFI_ICHECK(cudaDeviceSynchronize() == cudaSuccess)
+      << "CUDA synchronization failed before CFT endpoint release";
+  g_cft_manager->releaseEndpoints();
+}
+
+// Write the logical-endpoint ID that dispatch and combine use for each peer rank into
+// idsOut (CPU int64 [epSize]). Launches bake these IDs into their kernel parameters, so a
+// captured CUDA graph stays valid only while the IDs are unchanged.
+void moeA2ACftEndpointIdsOp(TensorView workspace, int64_t epRank, TensorView idsOut) {
+  CHECK_CPU(idsOut);
+  CHECK_CONTIGUOUS(idsOut);
+  CHECK_INPUT_TYPE(idsOut, dl_int64);
+  TVM_FFI_ICHECK(g_cft_manager && g_cft_manager->isInitialized())
+      << "CFT endpoints are not initialized";
+  TVM_FFI_ICHECK(g_cft_manager->getLocalBackingPtr() ==
+                 reinterpret_cast<CUdeviceptr>(rankWorkspacePtr(workspace, epRank)))
+      << "CFT endpoints are bound to a different workspace";
+  TVM_FFI_ICHECK_EQ(idsOut.numel(), workspace.size(0))
+      << "ids_out must hold one endpoint ID per rank";
+  auto const* leIds = g_cft_manager->getAllLeIds();
+  auto* out = static_cast<int64_t*>(idsOut.data_ptr());
+  for (int64_t r = 0; r < idsOut.numel(); ++r) {
+    out[r] = static_cast<int64_t>(leIds[r]);
+  }
 }
 
 // MoE All-to-All Dispatch Operation
@@ -873,6 +915,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_cft_handle_bytes, moeA2ACftHandleBytesOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_cft_create_endpoint, moeA2ACftCreateEndpointOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_cft_import_endpoints, moeA2ACftImportEndpointsOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_cft_destroy, moeA2ACftDestroyOp);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_cft_release_endpoints, moeA2ACftReleaseEndpointsOp);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_cft_endpoint_ids, moeA2ACftEndpointIdsOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_dispatch, moeA2ADispatchOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine, moeA2ACombineOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_sanitize_expert_ids, moeA2ASanitizeExpertIdsOp);

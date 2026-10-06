@@ -290,9 +290,19 @@ public:
         localLe_.memHandle = 0; // not owned
         localLe_.ownsMemory = false;
 
-        CU_MUST(pfnIdReserve_(&leIdBlock_.base, static_cast<unsigned int>(epSize)));
-        leIdBlock_.count = static_cast<unsigned int>(epSize);
-        leIdBlock_.reserved = true;
+        // A block kept by releaseEndpoints() is reused, so the endpoints are recreated under
+        // the IDs that earlier launches baked into their kernel parameters.
+        if (!leIdBlock_.reserved)
+        {
+            CU_MUST(pfnIdReserve_(&leIdBlock_.base, static_cast<unsigned int>(epSize)));
+            leIdBlock_.count = static_cast<unsigned int>(epSize);
+            leIdBlock_.reserved = true;
+        }
+        else if (leIdBlock_.count != static_cast<unsigned int>(epSize))
+        {
+            fprintf(stderr, "CftLeManager: reserved LE ID block holds %u IDs, need %d\n", leIdBlock_.count, epSize);
+            return false;
+        }
 
         localLe_.leId = leIdBlock_.base + static_cast<unsigned int>(epRank);
 
@@ -351,6 +361,7 @@ public:
     bool importEndpoints(void const* allHandles)
     {
         peerLeIds_.resize(epSize_);
+        peerImported_.assign(epSize_, false);
         auto const* handles = static_cast<CUlogicalEndpointFabricHandle const*>(allHandles);
 
         // Import each peer handle into its contiguous slot and wait for the full block.
@@ -365,6 +376,7 @@ public:
                 CUlogicalEndpointId peerLeId = leIdBlock_.base + static_cast<unsigned int>(r);
                 CU_MUST(pfnImport_(peerLeId, &handles[r], CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC));
                 peerLeIds_[r] = peerLeId;
+                peerImported_[r] = true;
             }
         }
 
@@ -442,17 +454,21 @@ public:
         return initialized_;
     }
 
-    void destroy()
+    // Destroy the local and imported LEs and unbind their memory, but keep the ID block
+    // reserved: createEndpointExternal() then recreates them under the same IDs.
+    void releaseEndpoints()
     {
-        // Imported peer LEs reuse the reserved contiguous ID block.
-        for (size_t r = 0; r < peerLeIds_.size(); r++)
+        // Imported peer LEs reuse the reserved contiguous ID block. ID 0 is valid, so
+        // track the imported slots explicitly.
+        for (size_t r = 0; r < peerImported_.size(); r++)
         {
-            if (static_cast<int>(r) != epRank_ && peerLeIds_[r] != 0)
+            if (peerImported_[r])
             {
                 pfnDestroy_(peerLeIds_[r]);
             }
         }
         peerLeIds_.clear();
+        peerImported_.clear();
 
         // Destroy local LE
         if (localLe_.memBound)
@@ -462,11 +478,6 @@ public:
         if (localLe_.leCreated)
         {
             pfnDestroy_(localLe_.leId);
-        }
-        if (leIdBlock_.reserved)
-        {
-            pfnIdRelease_(leIdBlock_.base, leIdBlock_.count);
-            leIdBlock_.reserved = false;
         }
 
         // Free fabric memory only if we own it (not for external workspace binding)
@@ -485,6 +496,16 @@ public:
         initialized_ = false;
     }
 
+    void destroy()
+    {
+        releaseEndpoints();
+        if (leIdBlock_.reserved)
+        {
+            pfnIdRelease_(leIdBlock_.base, leIdBlock_.count);
+            leIdBlock_.reserved = false;
+        }
+    }
+
 private:
     bool apisLoaded_ = false;
     bool initialized_ = false;
@@ -496,6 +517,7 @@ private:
     RankLE localLe_;
     LeIdBlock leIdBlock_;
     std::vector<CUlogicalEndpointId> peerLeIds_;
+    std::vector<bool> peerImported_;
 
     // Function pointers loaded via cuGetProcAddress
     PFN_cuLeIdReserve pfnIdReserve_ = nullptr;
@@ -575,6 +597,8 @@ public:
     {
         return false;
     }
+
+    void releaseEndpoints() {}
 
     void destroy() {}
 
