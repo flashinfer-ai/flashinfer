@@ -923,7 +923,15 @@ def test_cake_ssd_combined_accepts_short_total_tokens(varlen, lengths, state_dty
     host pins a 128-row TMA box on the token axis, so the runner binds the
     x/B/C/out maps to zero-padded one-chunk buffers and copies the valid
     output rows back; the result must match the fp64 recurrence at least as
-    well as CuTe on the zero-padded packed stream."""
+    well as CuTe on the zero-padded packed stream.
+
+    Single-token f16-state rows: the state is the initial state, so the
+    rounding of the f16 initial state to the bf16 ``C . state`` MMA operand
+    (done by both kernels; see the softplus-off row of
+    ``test_cake_ssd_combined_exact_scan_softplus_parity``) dominates and
+    both kernels put 6 of the 512 outputs outside 1e-2 of the recurrence on
+    GB300 (1.17 %, identical counts), hence the same 2 % cap for those two
+    rows; every other row stays under the 1 % default."""
 
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
@@ -938,7 +946,15 @@ def test_cake_ssd_combined_accepts_short_total_tokens(varlen, lengths, state_dty
     assert tuple(actual[0].shape) == tuple(tensors[0].shape)
     assert tuple(actual[1].shape) == (len(lengths), constructor["nheads"], 64, 128)
     assert actual[1].dtype == state_dtype
-    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
+    single_token_f16 = state_dtype == torch.float16 and max(lengths) == 1
+    _assert_cake_accuracy(
+        actual,
+        expected,
+        constructor,
+        tensors,
+        arguments,
+        max_outside_fraction=0.02 if single_token_f16 else _MAX_OUTSIDE_FRACTION,
+    )
 
 
 def test_cake_ssd_combined_short_call_after_nan_injection_is_clean():
