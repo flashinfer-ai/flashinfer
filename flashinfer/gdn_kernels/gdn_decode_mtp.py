@@ -2908,6 +2908,7 @@ def run_mtp_decode(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    verify_parents: Optional[torch.Tensor] = None,
 ):
     """Execute the appropriate MTP kernel based on batch size.
 
@@ -2941,6 +2942,8 @@ def run_mtp_decode(
             that batch slot (matching the read-side padding skip semantics).
         cache_replayssm: Whether to persist only the fold-every-commit
             ReplaySSM inputs instead of full intermediate states.
+        verify_parents: Optional int32 [B, T] parent indices for tree-structured
+            drafts. Requires ``parent[i] < i``. ReplaySSM verify only.
     """
     if B == 0:
         return
@@ -3012,6 +3015,7 @@ def run_mtp_decode(
             H,
             HV,
             scale,
+            verify_parents,
         )
         return
 
