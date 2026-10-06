@@ -577,19 +577,19 @@ _ARCH_REGISTRATIONS = {
             "fp8_h64_prefill_source_persistent_m64": {
                 "arg_plan": _PLAN_FP8_H64_M64_SWA_K_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "a02d4f1a8e9fd92577ef6d101df0f4942f83c7ae13afb950fb6f78032286b108",
+                "identity": "3d8b2f227d6d64372fccde9122a871ba30417cfe6326ed90846394ff04ac8f74",
                 "sources": [
-                    "common/cake_dsv4_fp8_h64_prefill_source_persistent_m64_kernel.cu",
-                    "common/cake_dsv4_fp8_h64_prefill_source_persistent_m64_binding.cu",
+                    "sm_100a/cake_dsv4_536b3a44f96e5c09fa99_kernel.cu",
+                    "sm_100a/cake_dsv4_536b3a44f96e5c09fa99_binding.cu",
                 ],
             },
             "fp8_h64_prefill_source_persistent_m64_multi_tile": {
                 "arg_plan": _PLAN_FP8_H64_M64_SWA_K_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "61e599ce3d53209553029873004c309a0fecc8827c2aa0c9ec8bfe1e4c1f2419",
+                "identity": "266c11008eed6161c57d9d1e639e02c5596ef65164f28bc5ac3775096674a5cf",
                 "sources": [
-                    "common/cake_dsv4_fp8_h64_prefill_source_persistent_m64_multi_tile_kernel.cu",
-                    "common/cake_dsv4_fp8_h64_prefill_source_persistent_m64_multi_tile_binding.cu",
+                    "sm_100a/cake_dsv4_ae42584c56277f4ab8e9_kernel.cu",
+                    "sm_100a/cake_dsv4_ae42584c56277f4ab8e9_binding.cu",
                 ],
             },
             "fp8_h64_source_exact": {
@@ -613,10 +613,10 @@ _ARCH_REGISTRATIONS = {
             "fp8_lowhead_h64": {
                 "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "b092d98fb4bd86027bf690e60c3aebcc5d788ec288eba2b2989e5818cf5ba13a",
+                "identity": "ad32a0f1926ce4e4f4184f362bff388d2f02b75a56ce939db746c1c833a25758",
                 "sources": [
-                    "common/cake_dsv4_fp8_lowhead_h64_kernel.cu",
-                    "common/cake_dsv4_fp8_lowhead_h64_binding.cu",
+                    "sm_100a/cake_dsv4_8187b1ca82318d5f5f7b_kernel.cu",
+                    "sm_100a/cake_dsv4_8187b1ca82318d5f5f7b_binding.cu",
                 ],
             },
             "fp8_lowhead_one_partition": {
