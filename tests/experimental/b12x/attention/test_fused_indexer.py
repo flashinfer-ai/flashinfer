@@ -8,6 +8,8 @@ is the same contract the production scorer + tiled_topk path satisfies.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 from b12x.preparation import FrozenMapping
@@ -736,7 +738,13 @@ def test_dsa_indexer_config_and_merge_thresholds() -> None:
     )
 
     config = DsaIndexerConfig.from_config(
-        FrozenMapping({"backend": "native", "fused_merge": FUSED_MERGE_AUTO})
+        FrozenMapping(
+            {
+                "backend": "native",
+                "fused_merge": FUSED_MERGE_AUTO,
+                "mxfp4_score_kind": None,
+            }
+        )
     )
     assert TUNING.encode_config(config) == config.to_dict()
     common = dict(ctas_per_group=47, num_heads=32, topk=2048)
@@ -745,6 +753,37 @@ def test_dsa_indexer_config_and_merge_thresholds() -> None:
     assert resolve_fused_merge_threshold(
         FUSED_MERGE_AUTO, **common
     ) == _resolve_default_merge_threshold(**common)
+
+
+def test_tuning_keeps_the_live_length_merge_policy() -> None:
+    """Decode lengths vary per launch; a fixed merge tuned on a short trial
+    (serial) is slow at long context, so tuning keeps "auto" and fixed
+    choices remain overrides."""
+    from b12x.attention.dsa_indexer._tuning import (
+        FUSED_MERGE_AUTO,
+        FUSED_MERGE_SERIAL,
+        TUNING,
+        DsaIndexerConfig,
+        DsaIndexerQuery,
+    )
+    from b12x.preparation import DeviceIdentity
+
+    device = DeviceIdentity("nvidia", (12, 0), 188, "RTX PRO 6000")
+    query = DsaIndexerQuery(
+        source_layout="paged", mode="decode", dtype="bfloat16", kv_dtype="uint8",
+        num_q_heads=32, num_idx_heads=1, max_q_rows=4, max_k_rows=8192 * 64,
+        top_k=2048, page_size=64, score_mode="dsa", shared_page_table=False,
+        max_page_table_width=8192, route="auto", output_physical_slots=True,
+        supertile_k=0, prefill_block_k=256, reserve_paged_logits=False,
+        paged_logits_k_rows=0, operands=FrozenMapping({}), exhaustive=False,
+    )
+    for exhaustive in (False, True):
+        plan = TUNING.eligible_plan(replace(query, exhaustive=exhaustive), device)
+        assert {config.fused_merge for _, config in plan.candidates} == {
+            FUSED_MERGE_AUTO
+        }
+    serial = DsaIndexerConfig(backend="native", fused_merge=FUSED_MERGE_SERIAL)
+    assert TUNING.configure(query, device=device, override=serial).pinned == serial
 
 
 @pytest.mark.skipif(

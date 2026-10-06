@@ -146,6 +146,16 @@ def _query(
         elif experts.plan.activation.mode is not ActivationMode.AUTO:
             quant_mode = _packed_recipe(experts.plan.source, experts.plan.activation.mode)
             quant_modes = (quant_mode,)
+    deterministic_output = routing.deterministic_output
+    if deterministic_output is None:
+        from ._impl import _dynamic_deterministic_output_enabled
+
+        # Candidate eligibility and the compiled kernel must see the same
+        # reduction contract, including environment-selected determinism.
+        deterministic_output = any(
+            _dynamic_deterministic_output_enabled(quant_mode=mode, device=experts.device)
+            for mode in quant_modes
+        )
     return MoeDecodeQuery(
         quant_mode=quant_mode,
         quant_modes=quant_modes,
@@ -162,7 +172,7 @@ def _query(
         route_logits_dtype=None if routing.logits_dtype is None else str(routing.logits_dtype).removeprefix("torch."),
         apply_router_weight_on_input=bool(routing.apply_router_weight_on_input),
         collect_activation_amax=bool(routing.collect_activation_amax),
-        deterministic_output=routing.deterministic_output,
+        deterministic_output=deterministic_output,
         swiglu_limit=_codec_scalar(experts.plan.activation.swiglu_limit),
         swiglu_alpha=_codec_scalar(experts.plan.activation.swiglu_alpha),
         swiglu_beta=_codec_scalar(experts.plan.activation.swiglu_beta),

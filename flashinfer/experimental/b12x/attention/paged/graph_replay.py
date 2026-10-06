@@ -1942,9 +1942,9 @@ def update_prefill_graph_chunk_metadata(
 
 
 def compile_graph_replay(binding: object) -> Mapping[str, object]:
-    """Warm exactly the graph-replay scheduling kernels for a prepared binding.
+    """Warm exactly the graph-replay scheduling kernels for a binding.
 
-    The caller invokes this inside ``compile_only_launches`` with fake metadata
+    The caller invokes this inside ``compile_only_launches`` with fake or real
     views.  Consequently every ``launch_triton`` below performs JIT ``warmup``
     with pointer descriptors and returns the resident program carrier, without
     allocating or reading device data.

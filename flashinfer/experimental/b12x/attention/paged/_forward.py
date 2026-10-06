@@ -1847,7 +1847,8 @@ def compile_paged_launchers(
     from b12x._lib.compile_plan import compile_only_launches
     from .graph_replay import compile_graph_replay
     launchers = _PagedLaunchers(controls=MappingProxyType(dict(controls)))
-    with paged_controls(launchers.controls), getattr(binding.q, "fake_mode", nullcontext()), compile_only_launches():
+    tensor_mode = binding.q.fake_mode if hasattr(binding.q, "fake_mode") else nullcontext()
+    with paged_controls(launchers.controls), tensor_mode, compile_only_launches():
         paged_attention_forward(
             binding=binding,
             _compile_only=True,
@@ -1869,7 +1870,7 @@ def run_paged_prepared(
 
 
 def _compile_paged_attention(*, binding) -> None:
-    """Private priming primitive used only by preparation providers."""
+    """Prime the programs selected by a heuristic binding."""
     compile_paged_launchers(binding, controls=snapshot_paged_controls())
 
 
