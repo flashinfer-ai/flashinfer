@@ -1,3 +1,5 @@
+import pytest
+
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _TC_DECODE_MAX_M,
     _TC_DECODE_PACK_COLLIDING_PAIRS,
@@ -7,7 +9,9 @@ from b12x.moe._shared.kernels.w4a16.kernel import (
     _LARGE_BATCH_TILE_CONFIGS,
     _SMALL_BATCH_TILE_CONFIGS,
     _candidate_tile_fits,
+    _determine_blocks_per_sm,
     _w4a16_num_regs,
+    _w4a16_pipeline_stages,
     _w4a16_tc_decode_preferred,
 )
 
@@ -139,3 +143,35 @@ def test_tc_decode_planner_keeps_lower_coverage_direct_route() -> None:
 
 def test_tc_decode_planner_keeps_low_collision_direct_route() -> None:
     assert _w4a16_tc_decode_preferred(m=8, topk=6, num_experts=512, sms=48)
+
+
+def _small_m_residency(scale_format: str, weight_layout: str = "packed"):
+    """GLM-5.3 (744B) TP8 decode geometry: 256 channels per rank."""
+    common = dict(tile_n=128, tile_k=128, uses_m_block_8=True, weight_layout=weight_layout)
+    stages = _w4a16_pipeline_stages(scale_format=scale_format, **common)
+    blocks = _determine_blocks_per_sm(
+        problem_m=4, problem_n=512, top_k=8, cta_threads=256, cta_m_blocks=1,
+        sms=188, max_shared_mem=101_376, scale_format=scale_format, **common,
+    )
+    return stages, blocks
+
+
+@pytest.mark.parametrize("scale_format", ["e4m3_k16"])
+def test_small_m_occupancy_two_runs_three_stages_on_two_ctas(monkeypatch, scale_format) -> None:
+    monkeypatch.delenv("B12X_W4A16_SMALL_M_OCCUPANCY", raising=False)
+    assert _small_m_residency(scale_format) == (4, 1)
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", "2")
+    assert _small_m_residency(scale_format) == (3, 2)
+
+
+def test_small_m_occupancy_two_keeps_other_scale_formats_on_one_cta(monkeypatch) -> None:
+    """E8M0 kernels need more resources than the estimate: two CTAs per SM
+    fail the cooperative launch, so they keep the default schedule."""
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", "2")
+    assert _small_m_residency("e8m0_k32", weight_layout="modelopt") == (4, 1)
+
+
+def test_small_m_occupancy_rejects_other_values(monkeypatch) -> None:
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", "3")
+    with pytest.raises(ValueError, match="must be 1 or 2"):
+        _small_m_residency("e4m3_k16")

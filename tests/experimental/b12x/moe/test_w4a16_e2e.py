@@ -3831,3 +3831,118 @@ def test_w4a16_fc2_only_is_cuda_graph_safe_with_preallocated_output() -> None:
     torch.testing.assert_close(captured, invalid_expected, rtol=0, atol=0)
     torch.testing.assert_close(route_ids, invalid_ids, rtol=0, atol=0)
     torch.testing.assert_close(route_weights, original_weights, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", [4, 16])
+def test_w4a16_small_m_occupancy_is_captured_for_graph_replay(tokens, monkeypatch):
+    from b12x.moe import fused_moe
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.preparation.types import require_prepared
+
+    monkeypatch.setenv("B12X_W4A16_PREFILL_FUSED_SUM", "0")
+    torch.manual_seed(5150 + tokens)
+    experts, hidden, intermediate, topk = 128, 512, 256, 8
+    x = (torch.randn(tokens, hidden, device="cuda") * 0.125).to(torch.bfloat16)
+    shares = torch.arange(1, experts + 1, dtype=torch.float32, device="cuda")
+    ids = torch.multinomial(shares.expand(tokens, -1), topk).to(torch.int32)
+    weights = torch.softmax(torch.randn(tokens, topk, device="cuda"), dim=-1)
+    raw = _make_weights(
+        experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        activation="silu",
+    )
+    outputs = {}
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16GemmKernel
+    original_init = W4A16GemmKernel.__init__
+    compiled_controls = []
+
+    def record_control(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        compiled_controls.append(kwargs["small_m_occupancy"])
+
+    monkeypatch.setattr(W4A16GemmKernel, "__init__", record_control)
+    for skip in ("1", "2"):
+        monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", skip)
+        weight_plan = fused_moe.plan_weights(
+            source=fused_moe.PackedSource(format=fused_moe.PackedSourceFormat("modelopt_nvfp4")),
+            activation=fused_moe.ActivationSpec(
+                mode=fused_moe.ActivationMode.A16,
+                nonlinearity="silu",
+                io_dtype=x.dtype,
+            ),
+            geometry=fused_moe.MoEGeometry(
+                num_experts=experts,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+            ),
+        )
+        prepared = fused_moe.prepare_weights(
+            plan=weight_plan,
+            weights=fused_moe.PackedWeights(
+                w13=raw[0].clone(),
+                w13_block_scales=raw[1].clone(),
+                w13_global_scales=raw[2].clone(),
+                w2=raw[3].clone(),
+                w2_block_scales=raw[4].clone(),
+                w2_global_scales=raw[5].clone(),
+            ),
+        )
+        plan = fused_moe.plan_execution(
+            experts=prepared,
+            capacity=fused_moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
+            routing=fused_moe.RoutingSpec(),
+        )
+        monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", str(3 - int(skip)))
+        compiled_controls.clear()
+        output = torch.empty_like(x)
+
+        def allocate(state):
+            return tuple(
+                torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+                for spec in state.scratch.scratch_specs()
+            )
+
+        def primer(state, output=output, prepared=prepared):
+            scratch = allocate(state)
+            binding = state.bind(
+                scratch=scratch,
+                a=x,
+                experts=prepared,
+                topk_weights=weights,
+                topk_ids=ids,
+                output=output,
+            )
+            return PreparedCall(run=lambda: state.run(binding), owners=scratch)
+
+        with PreparationSession(device=x.device, autotune=False, compile_workers=0) as session:
+            request = plan.request(name=f"skip-empty-rows-{skip}", prepare_call=primer)
+            session.prepare((request,))
+            state = require_prepared(request.plan, "moe.decode")
+            binding = fused_moe.bind(
+                request.plan,
+                scratch=allocate(state),
+                a=x,
+                experts=prepared,
+                topk_weights=weights,
+                topk_ids=ids,
+                output=output,
+            )
+            assert binding.fused_launch.moe_block_size == 8
+            outputs[skip] = binding.run().clone()
+            assert compiled_controls and set(compiled_controls) == {int(skip)}
+            session.freeze()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                binding.run()
+            output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(output, outputs[skip], rtol=0, atol=0)
+            graph.reset()
+    expected = _reference_w4a16(x, *raw, ids, weights, activation="silu")
+    for output in outputs.values():
+        assert torch.isfinite(output).all() and torch.count_nonzero(output)
+        _assert_matches_oracle(output, expected, activation="silu")
