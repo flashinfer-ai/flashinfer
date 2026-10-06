@@ -1682,7 +1682,9 @@ def top_k_varlen(
         ``gvr_2`` (dedicated windowed engines, TRT-LLM #18702 port); the other
         backends are not eligible. CUDA graphs: warm up with one eager windowed
         call of the same (row count, top_k, ``max_seq_len``, logits width) or
-        ``warmup_prefill``. Default ``None`` (every window starts at column 0).
+        ``flashinfer.topk_varlen.warmup_prefill`` (``prefill_ready`` tells
+        whether a geometry would launch without compiling). Default ``None``
+        (every window starts at column 0).
     max_seq_len : int, optional
         Windowed (prefill) mode only: an optional tighter bound on the window lengths,
         used to pick the engine before the launch (and before CUDA-graph
@@ -1714,7 +1716,8 @@ def top_k_varlen(
         indices; a paged consumer keeps the default and maps the local
         position through its page table. Fused into the kernels' index emit
         (no extra memory traffic); a distinct compiled variant, so warm up with
-        the same value (``warmup_prefill(..., absolute_indices=True)``).
+        the same value (``flashinfer.topk_varlen.warmup_prefill(...,
+        absolute_indices=True)``).
         Default ``False``.
     compress_ratio : int, optional
         KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4): every

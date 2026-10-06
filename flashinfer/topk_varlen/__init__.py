@@ -18,7 +18,12 @@ The CuTe-DSL kernel source (GVR and radix Top-K for Blackwell sm_100+) lives in
 ``flashinfer.topk_varlen.kernels``.  The public ``top_k_varlen`` API is defined in
 ``flashinfer.topk_varlen.topk_varlen`` and re-exported from the top-level
 ``flashinfer`` namespace. ``release_gvr2_resources`` frees the ``gvr_2``
-backend's per-device caches (default workspace slabs).
+backend's per-device caches (default workspace slabs). ``warmup_prefill``
+compiles and first-launches the windowed (prefill) engine set before serving
+and ``prefill_ready`` reports whether a windowed geometry would launch without
+compiling, so a serving framework can prepare CUDA-graph capture.
 """
 
+from .kernels.gvr2_topk_host import prefill_ready as prefill_ready
+from .kernels.gvr2_topk_host import warmup_prefill as warmup_prefill
 from .topk_varlen import release_gvr2_resources as release_gvr2_resources
