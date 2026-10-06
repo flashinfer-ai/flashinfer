@@ -842,8 +842,8 @@ class _WeightViews:
     def padded_scales(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """The tile-padded block-scale storages (dynamic / micro / direct-micro
         operands).  Without the source-scale mode these are the storages the
-        static kernel uses too; with it they are materialized on first use and
-        refused during CUDA graph capture (run one eager call on that backend)."""
+        static kernel uses too. Source-mode builders reuse the shared padding
+        cache and reject capture only when preparation is still needed."""
         if not self.source_scales:
             return self._w13_sf_storage, self._down_sf_storage
         if self._padded_w13_sf_storage is None:
@@ -851,9 +851,8 @@ class _WeightViews:
                 raise ValueError(
                     "source-scale weight views carry no padded-scale builder"
                 )
-            _refuse_during_capture(
-                "the tile-padded block scales (dynamic / micro kernels)"
-            )
+            # Functional calls recreate these views; the builder checks the
+            # shared cache before refusing first-use preparation in capture.
             self._padded_w13_sf_storage, self._padded_down_sf_storage = (
                 self._padded_scale_builder()
             )
@@ -865,21 +864,14 @@ class _WeightViews:
 
     def ensure_legacy(self) -> None:
         """Materialize tile-padded FP4 views for direct-micro fallbacks.
-        Refused during CUDA graph capture: run one eager call on the same
-        backend before capturing.
+        The builder reuses shared cached copies after eager warm-up, even
+        when a functional call creates a new _WeightViews during capture.
         """
         if self.legacy_materialized:
             return
         if self._legacy_builder is None:
             raise ValueError(
                 "weight views carry neither tile-padded legacy views nor a builder"
-            )
-        if torch.cuda.is_current_stream_capturing():
-            raise ValueError(
-                "the tile-padded legacy weight views (direct-micro fallback) are "
-                "materialized on first use and cannot be created during CUDA graph "
-                "capture; run one eager warm-up call on the same backend "
-                "before capturing the graph"
             )
         w1_padded, w2_padded = self._legacy_builder()
         self.w13_fp4 = w1_padded.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
@@ -1243,12 +1235,7 @@ def _get_weight_views(
                     f"intermediate_size {n_true} is not a multiple of "
                     f"{_TRUE_EXTENT_ALIGN}; the tile-padded weights are required"
                 )
-            if torch.cuda.is_current_stream_capturing():
-                raise ValueError(
-                    "the tile-padded weight copies are materialized on first "
-                    "use and cannot be created during CUDA graph capture; run "
-                    "one eager warm-up call before capturing the graph"
-                )
+            # The builder permits a cache hit during functional graph capture.
             w1_p, w2_p = legacy_builder()
             w13 = w1_p.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
             down = w2_p.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)

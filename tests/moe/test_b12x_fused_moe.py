@@ -3923,6 +3923,51 @@ class TestB12xMoEStatefulAccuracy:
         padded = self._wrapper(kwargs).run(**kwargs)
         torch.testing.assert_close(padded, eager, rtol=0, atol=0)
 
+    @pytest.mark.parametrize("api", ["functional", "wrapper"])
+    @pytest.mark.parametrize(
+        "num_tokens,hidden,intermediate",
+        [
+            (1024, 256, 320),  # Lazy source-scale padding for dynamic.
+            (1024, 256, 512),  # Aligned control; no lazy padding.
+            (1, 2560, 160),  # Direct-micro fallback needs padded FP4 weights.
+            (200, 256, 144),  # True extent cannot meet the TMA stride alignment.
+        ],
+    )
+    def test_warmed_api_cuda_graph_accuracy(
+        self, api, num_tokens, hidden, intermediate, monkeypatch
+    ):
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        monkeypatch.setattr(md, "_FORCED_BACKEND", None)
+        monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
+        _clear_static_cutover_env(monkeypatch)
+        tensors, kwargs = self._inputs(
+            num_tokens, intermediate, experts=8, hidden=hidden
+        )
+        expected = self._reference(tensors, kwargs)
+        if api == "functional":
+            output = torch.empty_like(kwargs["x"])
+            launch = lambda: b12x_fused_moe(
+                **kwargs, num_experts=8, top_k=2, output=output
+            )
+        else:
+            wrapper = self._wrapper(kwargs, max_num_tokens=num_tokens)
+            launch = lambda: wrapper.run(**kwargs)
+        # Each functional call recreates its weight views; warm-up must still
+        # make cached preparation available to the capture call.
+        for _ in range(3):
+            eager = launch().clone()
+        self._assert_accuracy(eager, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = launch()
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            self._assert_accuracy(captured, expected)
+            torch.testing.assert_close(captured, eager, rtol=2e-2, atol=2e-2)
+
     @pytest.mark.parametrize("num_tokens", [32, 33, 65])
     @pytest.mark.parametrize("merged", [False, True])
     def test_hot_expert_tile_boundary_accuracy(self, num_tokens, merged, monkeypatch):
