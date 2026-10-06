@@ -1664,9 +1664,10 @@ def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
     damage keep their correct results.  The main kernel ends a segment at
     the next segment of the same physical chunk, else at the chunk end
     (segments partition the stream): a sequence whose range another
-    sequence starts inside is cut there, and the last sequence absorbs
-    trailing unclaimed tokens -- both documented in D12, both flagged.  A
-    clean call afterwards leaves the reset word at 0."""
+    sequence starts inside is cut there, and the last segment runs over
+    trailing unclaimed tokens without a preprocess delta (rows and last
+    state undefined) -- both documented in D12, both flagged.  A clean call
+    afterwards leaves the reset word at 0."""
 
     _skip_unless_cake_arch()
     f32 = torch.float32
@@ -1779,13 +1780,16 @@ def test_cake_ssd_combined_flags_invalid_cu_seqlens(case):
         assert torch.isfinite(out.to(f32)).all() and torch.isfinite(final.to(f32)).all()
         valid_lengths = (60, 40, 50, 100)
     elif case == "total":
-        # Sequence 0 is bitwise the clean problem; sequence 1 absorbs the
-        # unclaimed tail, i.e. equals the clean problem [0, 100) + [100, 250).
+        # Sequences 0 and 1 are bitwise the clean problem over the claimed
+        # tokens on their rows; the main kernel also runs the last segment
+        # over the unclaimed tail [200, 250) (segments partition the stream)
+        # for which the preprocess computed no delta, so the tail rows and
+        # the last state are undefined (flagged, memory-safe) and not compared.
         (clean_out, clean_final), _ = clean_run(
-            slice(0, 250), (100, 150), arguments["initial_states"]
+            slice(0, 200), (100, 100), arguments["initial_states"]
         )
-        assert torch.equal(out, clean_out)
-        assert torch.equal(final, clean_final)
+        assert torch.equal(out[:, :200], clean_out)
+        assert torch.equal(final[0], clean_final[0])
         valid_lengths = (100, 150)
     else:
         (clean_out, clean_final), _ = clean_run(slice(0, 1024), (1024,), None)
