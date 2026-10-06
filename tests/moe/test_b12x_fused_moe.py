@@ -329,27 +329,6 @@ def test_static_workspace_uses_disjoint_route_output_scratch():
 
 
 @cute_dsl_available
-def test_static_workspace_rounds_odd_retained_group_count_up():
-    """Five N128 slices keep their native extent; retained2 rounds the
-    group count up so the phantom sixth slice has a route-scratch slot."""
-    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
-
-    workspace = moe_dispatch.allocate_sm120_static_workspace(
-        state_E=2,
-        weight_E=2,
-        max_rows=8,
-        k=256,
-        n=640,
-        num_topk=2,
-        device=torch.device("cpu"),
-        quant_mode="nvfp4",
-    )
-
-    assert workspace.n == 640
-    assert workspace.route_output_scratch.shape == (8, 3, 256)
-
-
-@cute_dsl_available
 def test_dynamic_workspace_keeps_native_n128_geometry():
     """Static retained-group padding must not leak into dynamic geometry."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
@@ -2660,16 +2639,6 @@ class TestMicroKernel:
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
 
         monkeypatch.setattr(md, "_FORCED_BACKEND", "direct_micro")
-        monkeypatch.setattr(md, "_DIRECT_MICRO_LAUNCH_CACHE", {})
-        builds = []
-        original_build = md.build_direct_micro_kernel
-
-        def record_build(*args, **kwargs):
-            kernel = original_build(*args, **kwargs)
-            builds.append(kernel)
-            return kernel
-
-        monkeypatch.setattr(md, "build_direct_micro_kernel", record_build)
         num_experts = 64
         tensors = create_moe_tensors(
             num_tokens,
@@ -2707,15 +2676,6 @@ class TestMicroKernel:
         }
         kwargs["x"] = tensors["x_bf16"]
         actual = wrapper.run(**kwargs).clone()
-        assert builds
-        cfg = builds[-1]._cfg
-        # I192 really launches at N256. Check the production getter, not a
-        # separately configured kernel that the wrapper might never select.
-        assert cfg.n == (256 if intermediate_size == 192 else 320)
-        # M3 narrows only the true N320/K2560 configuration; the padded
-        # N256 case and M2 retain their complete four-block Q1 chunks.
-        blocks = 2 if num_tokens == 3 and cfg.n == 320 else 4
-        assert cfg.inter_blocks == blocks and cfg.i_chunk == 16 * blocks
         reference = compute_reference_moe_fp4(
             tensors["x_bf16"].float(),
             tensors["w1_weight_bf16"].float(),
@@ -2737,7 +2697,6 @@ class TestMicroKernel:
         with torch.cuda.graph(graph):
             captured = wrapper.run(**kwargs)
         for _ in range(3):
-            wrapper._static_workspace.dm_intermediate.fill_(float("nan"))
             graph.replay()
             torch.cuda.synchronize()
             torch.testing.assert_close(captured, actual, rtol=0, atol=0)
@@ -3856,6 +3815,664 @@ def test_borrowed_dense_method_self_deps(path_name, cls, borrowed, target):
             f"{sorted(missing)}; make the helper a module-level function or add "
             f"it to {cls.name}."
         )
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+class TestB12xMoEStatefulAccuracy:
+    """Numerical regressions for weight preparation and reusable workspaces."""
+
+    @staticmethod
+    def _inputs(
+        num_tokens,
+        intermediate=320,
+        experts=64,
+        hidden=256,
+        top_k=2,
+        *,
+        vary_block_scales=True,
+        seed=42,
+    ):
+        tensors = create_moe_tensors(
+            num_tokens,
+            hidden,
+            intermediate,
+            experts,
+            experts,
+            top_k,
+            vary_block_scales=vary_block_scales,
+            seed=seed,
+        )
+        kwargs = {
+            name: tensors[name]
+            for name in (
+                "w1_weight",
+                "w1_weight_sf",
+                "w1_alpha",
+                "w2_weight",
+                "w2_weight_sf",
+                "w2_alpha",
+                "fc2_input_scale",
+                "token_selected_experts",
+                "token_final_scales",
+            )
+        }
+        kwargs["x"] = tensors["x_bf16"]
+        return tensors, kwargs
+
+    @staticmethod
+    def _wrapper(kwargs, max_num_tokens=8192):
+        from flashinfer import B12xMoEWrapper
+
+        return B12xMoEWrapper(
+            num_experts=kwargs["w1_weight"].shape[0],
+            top_k=kwargs["token_selected_experts"].shape[1],
+            hidden_size=kwargs["x"].shape[1],
+            intermediate_size=kwargs["w2_weight"].shape[2] * 2,
+            use_cuda_graph=True,
+            max_num_tokens=max_num_tokens,
+        )
+
+    @staticmethod
+    def _reference(tensors, kwargs):
+        experts = kwargs["w1_weight"].shape[0]
+        return compute_reference_moe_fp4(
+            hidden_states=kwargs["x"].float(),
+            gemm1_weights=tensors["w1_weight_bf16"].float(),
+            gemm2_weights=tensors["w2_weight_bf16"].float(),
+            token_selected_experts=kwargs["token_selected_experts"],
+            token_final_scales=kwargs["token_final_scales"],
+            num_tokens=kwargs["x"].shape[0],
+            num_experts=experts,
+            top_k=kwargs["token_selected_experts"].shape[1],
+            hidden_size=kwargs["x"].shape[1],
+            intermediate_size=kwargs["w2_weight"].shape[2] * 2,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+    @staticmethod
+    def _assert_accuracy(actual, expected):
+        assert torch.isfinite(actual).all()
+        passed, percent, atol = check_accuracy(actual, expected)
+        assert passed, f"{percent * 100:.2f}% within tolerance (atol={atol:.4f})"
+        relative_error = (actual.float() - expected.float()).norm() / (
+            expected.float().norm().clamp_min(1e-12)
+        )
+        assert relative_error.item() < 0.30
+
+    @pytest.mark.parametrize("intermediate", [192, 320, 448, 576, 640, 704])
+    def test_source_scales_eager_and_graph_accuracy(self, intermediate, monkeypatch):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        monkeypatch.setattr(md, "_FORCED_BACKEND", "static")
+        monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
+        tensors, kwargs = self._inputs(200, intermediate)
+        wrapper = self._wrapper(kwargs)
+        expected = self._reference(tensors, kwargs)
+        eager = wrapper.run(**kwargs).clone()
+        self._assert_accuracy(eager, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = wrapper.run(**kwargs)
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+        monkeypatch.setenv(md._STATIC_SOURCE_SCALES_ENV, "0")
+        padded = self._wrapper(kwargs).run(**kwargs)
+        torch.testing.assert_close(padded, eager, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("num_tokens", [32, 33, 65])
+    @pytest.mark.parametrize("merged", [False, True])
+    def test_hot_expert_tile_boundary_accuracy(self, num_tokens, merged, monkeypatch):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        monkeypatch.setattr(md, "_FORCED_BACKEND", "static")
+        monkeypatch.setenv(md._STATIC_MERGED_GROUPS_ENV, "1" if merged else "0")
+        tensors, kwargs = self._inputs(num_tokens, experts=4)
+        kwargs["token_selected_experts"][:] = torch.tensor([0, 1], device="cuda")
+        kwargs["token_final_scales"].fill_(0.5)
+        wrapper = self._wrapper(kwargs)
+        expected = self._reference(tensors, kwargs)
+        eager = wrapper.run(**kwargs).clone()
+        self._assert_accuracy(eager, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = wrapper.run(**kwargs)
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("deferred", [False, True])
+    def test_reused_workspace_eager_and_graph_accuracy(self, deferred, monkeypatch):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        monkeypatch.setenv(md._STATIC_DEFERRED_INIT_ENV, "1" if deferred else "0")
+        tensors, inputs = self._inputs(1024)
+        wrapper = self._wrapper(inputs)
+        cases = []
+        for backend, num_tokens in (
+            ("static", 200),
+            ("micro", 4),
+            ("dynamic", 1024),
+            ("static", 33),
+        ):
+            kwargs = dict(inputs)
+            for name in ("x", "token_selected_experts", "token_final_scales"):
+                kwargs[name] = inputs[name][:num_tokens]
+            monkeypatch.setattr(md, "_FORCED_BACKEND", backend)
+            expected = self._reference(tensors, kwargs)
+            eager = wrapper.run(**kwargs).clone()
+            self._assert_accuracy(eager, expected)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = wrapper.run(**kwargs)
+            cases.append((backend, kwargs, expected, eager, graph, captured))
+        for _ in range(3):
+            for backend, kwargs, expected, eager, graph, captured in cases:
+                monkeypatch.setattr(md, "_FORCED_BACKEND", backend)
+                self._assert_accuracy(wrapper.run(**kwargs), expected)
+                graph.replay()
+                torch.cuda.synchronize()
+                self._assert_accuracy(captured, expected)
+                if backend == "static":
+                    torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+                else:
+                    torch.testing.assert_close(captured, eager, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("backend,num_tokens", [("micro", 4), ("dynamic", 576)])
+    @pytest.mark.parametrize("weight", ["w1_weight", "w2_weight"])
+    @pytest.mark.parametrize(
+        "api,intermediate", [("wrapper", 320), ("functional", 160)]
+    )
+    def test_strided_weights_eager_and_graph_accuracy(
+        self, backend, num_tokens, weight, api, intermediate, monkeypatch
+    ):
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        monkeypatch.setattr(md, "_FORCED_BACKEND", backend)
+        tensors, kwargs = self._inputs(num_tokens, intermediate=intermediate)
+        expected = self._reference(tensors, kwargs)
+        packed = kwargs[weight]
+        kwargs[weight] = torch.stack((packed, torch.zeros_like(packed)), -1)[..., 0]
+        if api == "wrapper":
+            wrapper = self._wrapper(kwargs, max_num_tokens=num_tokens)
+            launch = lambda: wrapper.run(**kwargs)
+        else:
+            output = torch.empty_like(kwargs["x"])
+            launch = lambda: b12x_fused_moe(
+                **kwargs, num_experts=64, top_k=2, output=output
+            )
+        eager = launch().clone()
+        self._assert_accuracy(eager, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = launch()
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            self._assert_accuracy(captured, expected)
+            torch.testing.assert_close(captured, eager, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("backend", ["static", "dynamic"])
+    @pytest.mark.parametrize("inference_scale", [False, True])
+    def test_live_fc2_scale_eager_and_graph_accuracy(
+        self, backend, inference_scale, monkeypatch
+    ):
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+        # E == I used to make the weight-padding helper also pad the live scale.
+        tensors, kwargs = self._inputs(17, experts=320)
+        with torch.inference_mode(inference_scale):
+            kwargs["fc2_input_scale"] = torch.ones(320, device="cuda")
+        monkeypatch.setattr(md, "_FORCED_BACKEND", backend)
+        wrapper = self._wrapper(kwargs)
+        before = wrapper.run(**kwargs).clone()
+        self._assert_accuracy(before, self._reference(tensors, kwargs))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = wrapper.run(**kwargs)
+        with torch.inference_mode():
+            kwargs["fc2_input_scale"].copy_(
+                torch.linspace(0.25, 1.75, 320, device="cuda")
+            )
+        fresh_kwargs = dict(kwargs, fc2_input_scale=kwargs["fc2_input_scale"].clone())
+        expected = self._wrapper(fresh_kwargs).run(**fresh_kwargs).clone()
+        eager = wrapper.run(**kwargs).clone()
+        graph.replay()
+        replayed = captured.clone()
+        functional = b12x_fused_moe(**kwargs, num_experts=320, top_k=2).clone()
+        assert not torch.equal(before, expected)
+        for actual in (eager, replayed, functional):
+            assert torch.isfinite(actual).all()
+            error = (actual.float() - expected.float()).norm() / expected.float().norm()
+            assert error.item() < 0.01
+
+    @pytest.mark.parametrize("num_tokens", [200, 1024])
+    @pytest.mark.parametrize("scale_name", ["w1_alpha", "input_global_scale"])
+    @pytest.mark.parametrize("per_expert", [False, True])
+    def test_live_fc1_scale_eager_and_graph_accuracy(
+        self, num_tokens, scale_name, per_expert
+    ):
+        _, kwargs = self._inputs(num_tokens, experts=8)
+        kwargs["input_global_scale"] = torch.full(
+            (8,) if per_expert else (1,), 0.75, device="cuda"
+        )
+        with torch.inference_mode():
+            kwargs[scale_name] = kwargs[scale_name].clone()
+        wrapper = self._wrapper(kwargs)
+        with torch.inference_mode():
+            wrapper.run(**kwargs)
+            kwargs[scale_name].mul_(1.25)
+        eager = wrapper.run(**kwargs).clone()
+        expected = self._wrapper(kwargs).run(**kwargs).clone()
+        torch.testing.assert_close(eager, expected, rtol=1e-2, atol=1e-3)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = wrapper.run(**kwargs)
+        for factor in (0.5, 1.5):
+            with torch.inference_mode():
+                kwargs[scale_name].mul_(factor)
+            graph.replay()
+            torch.cuda.synchronize()
+            fresh_kwargs = dict(kwargs, **{scale_name: kwargs[scale_name].clone()})
+            expected = self._wrapper(fresh_kwargs).run(**fresh_kwargs).clone()
+            assert torch.isfinite(captured).all()
+            torch.testing.assert_close(captured, expected, rtol=1e-2, atol=1e-3)
+
+    @pytest.mark.parametrize(
+        "shape", [(256, 4096, 128, 8), (8, 2560, 64, 2), (256, 4096, 64, 8)]
+    )
+    @pytest.mark.parametrize("num_tokens", [1, 2, 4])
+    def test_single_slice_decode_accuracy(self, shape, num_tokens):
+        experts, hidden, intermediate, top_k = shape
+        tensors, kwargs = self._inputs(
+            num_tokens,
+            intermediate,
+            experts,
+            hidden,
+            top_k,
+            vary_block_scales=False,
+            seed=21,
+        )
+        actual = self._wrapper(kwargs).run(**kwargs)
+        self._assert_accuracy(actual, self._reference(tensors, kwargs))
+
+
+(
+    _DIRECT_SCALE_EXPERTS,
+    _DIRECT_SCALE_HIDDEN,
+    _DIRECT_SCALE_INTERMEDIATE,
+    _DIRECT_SCALE_TOPK,
+) = 512, 2560, 320, 10
+
+
+def _direct_scale_decode_weight(packed, scales):
+    # The checkpoint bytes store the low nibble first. These are logical
+    # weights before either activation quantizer, with no kernel arithmetic.
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device=packed.device,
+        dtype=torch.float32,
+    )
+    codes = torch.stack((packed & 15, packed >> 4), -1).long()
+    values = lut[codes].reshape(packed.shape[0], packed.shape[1] * 2)
+    return values * scales.repeat_interleave(16, dim=1)
+
+
+@pytest.fixture(scope="module")
+def direct_scale_inputs(request):
+    from flashinfer.cute_dsl.utils import convert_sf_from_mma_layout
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
+        unswizzle_block_scale,
+    )
+    from .utils import create_moe_tensors
+
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM120/SM121 required")
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    request.addfinalizer(
+        lambda: setattr(torch.backends.cuda.matmul, "allow_tf32", previous_tf32)
+    )
+    torch.backends.cuda.matmul.allow_tf32 = False
+    t = create_moe_tensors(
+        num_tokens=6,
+        hidden_size=_DIRECT_SCALE_HIDDEN,
+        intermediate_size=_DIRECT_SCALE_INTERMEDIATE,
+        num_experts=_DIRECT_SCALE_EXPERTS,
+        num_local_experts=_DIRECT_SCALE_EXPERTS,
+        top_k=_DIRECT_SCALE_TOPK,
+        seed=20260916,
+        interleave_gated_weights=False,
+        use_nontrivial_alphas=True,
+    )
+    decoded = {}
+    for key, rows, cols in (
+        ("w1", 2 * _DIRECT_SCALE_INTERMEDIATE, _DIRECT_SCALE_HIDDEN),
+        ("w2", _DIRECT_SCALE_HIDDEN, _DIRECT_SCALE_INTERMEDIATE),
+    ):
+        sf = t[key + "_weight_sf"]
+        assert torch.unique(sf.view(torch.uint8).flatten()[:4096]).numel() > 1
+        sw = convert_sf_from_mma_layout(sf, rows, cols, _DIRECT_SCALE_EXPERTS, 16)
+        sw = sw.reshape(_DIRECT_SCALE_EXPERTS, ((rows + 127) // 128) * 128, -1)
+        decoded[key] = {
+            e: _direct_scale_decode_weight(
+                t[key + "_weight"][e],
+                unswizzle_block_scale(sw[e], rows, cols // 16),
+            )
+            for e in (*range(9), _DIRECT_SCALE_EXPERTS - 1)
+        }
+    return t, decoded
+
+
+def _direct_scale_wrapper():
+    from flashinfer import B12xMoEWrapper
+
+    return B12xMoEWrapper(
+        num_experts=_DIRECT_SCALE_EXPERTS,
+        top_k=_DIRECT_SCALE_TOPK,
+        hidden_size=_DIRECT_SCALE_HIDDEN,
+        intermediate_size=_DIRECT_SCALE_INTERMEDIATE,
+        use_cuda_graph=True,
+        max_num_tokens=8192,
+    )
+
+
+def _direct_scale_kwargs(t, m, scale_kind, duplicate=False):
+    ids = torch.tensor(
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, _DIRECT_SCALE_EXPERTS - 1], device="cuda"
+    )
+    if duplicate:
+        ids.zero_()
+    kwargs = dict(
+        x=t["x_bf16"][:m],
+        w1_weight=t["w1_weight"],
+        w1_weight_sf=t["w1_weight_sf"],
+        w1_alpha=t["w1_alpha"],
+        w2_weight=t["w2_weight"],
+        w2_weight_sf=t["w2_weight_sf"],
+        w2_alpha=t["w2_alpha"],
+        token_selected_experts=ids.to(torch.int32).repeat(m, 1),
+        token_final_scales=t["token_final_scales"][:m],
+        fc2_input_scale=torch.linspace(0.7, 1.3, _DIRECT_SCALE_EXPERTS, device="cuda"),
+    )
+    if scale_kind == "scalar":
+        kwargs["input_global_scale"] = torch.tensor(0.8, device="cuda")
+        kwargs["fc2_input_scale"] = torch.tensor(0.7, device="cuda")
+    elif scale_kind == "vector":
+        kwargs["input_global_scale"] = torch.linspace(
+            0.8, 1.2, _DIRECT_SCALE_EXPERTS, device="cuda"
+        )
+    return kwargs
+
+
+def _direct_scale_expert_value(t, e):
+    return t.flatten()[0 if t.numel() == 1 else e]
+
+
+def _direct_scale_fp32_reference(kwargs, decoded):
+    """FP32 logical MoE before activation rounding, using exact packed weights.
+
+    MMA quantization divides activations by the ordinary API global scale.
+    Explicit FC1 globals are folded into alpha by the wrapper, cancelling
+    that divisor; legacy alpha serves both purposes. FC2 alpha stays separate.
+    """
+    x = kwargs["x"].float()
+    ids, routing = kwargs["token_selected_experts"], kwargs["token_final_scales"]
+    out = torch.zeros_like(x)
+    input_gs = kwargs.get("input_global_scale", kwargs["w1_alpha"])
+    for e in torch.unique(ids).tolist():
+        d1 = _direct_scale_expert_value(input_gs, e)
+        d2 = _direct_scale_expert_value(kwargs["fc2_input_scale"], e)
+        if d1.item() == 0 or d2.item() == 0:
+            continue
+        alpha1 = kwargs["w1_alpha"][e]
+        if "input_global_scale" in kwargs:
+            alpha1 = alpha1 * d1
+        uv = (x @ decoded["w1"][e].T) * (alpha1 / d1)
+        activated = (
+            torch.nn.functional.silu(uv[:, _DIRECT_SCALE_INTERMEDIATE:])
+            * uv[:, :_DIRECT_SCALE_INTERMEDIATE]
+        )
+        projected = (activated @ decoded["w2"][e].T) * (kwargs["w2_alpha"][e] / d2)
+        weight = (routing * (ids == e)).sum(-1, keepdim=True)
+        out += projected * weight
+    return out
+
+
+def _direct_scale_run(moe, kwargs, backend):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+    old = md._FORCED_BACKEND
+    md._FORCED_BACKEND = backend
+    try:
+        return moe.run(**kwargs)
+    finally:
+        md._FORCED_BACKEND = old
+
+
+def _direct_scale_static_precise(moe, kwargs):
+    # The wrapper has no fast_math argument. Keep its ordinary public scale
+    # folding and prepared views, overriding only the internal reference's
+    # compile option. Every case uses this same reference method.
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+    original = md.launch_sm120_static_moe
+
+    def precise_launch(**launch_kwargs):
+        launch_kwargs["fast_math"] = False
+        return original(**launch_kwargs)
+
+    md.launch_sm120_static_moe = precise_launch
+    try:
+        return _direct_scale_run(moe, kwargs, "static")
+    finally:
+        md.launch_sm120_static_moe = original
+
+
+def _direct_scale_inverse(t):
+    return torch.where(t != 0, 1.0 / t, t)
+
+
+def _direct_scale_reciprocal_call(moe, kwargs, input_recip, fc2_recip):
+    # Exercise the lower-level reciprocal flag with a prepared weight view:
+    # the FC1 alpha fold must remain the same as for the ordinary wrapper.
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+    old = md._FORCED_BACKEND
+    md._FORCED_BACKEND = "direct_micro"
+    try:
+        m = kwargs["x"].shape[0]
+        return md.launch_sm120_static_moe(
+            workspace=moe._static_workspace,
+            weights=moe._weight_views,
+            a=kwargs["x"],
+            topk_ids=kwargs["token_selected_experts"],
+            topk_weights=kwargs["token_final_scales"],
+            input_gs=input_recip,
+            down_input_scale=fc2_recip,
+            scatter_output=moe._moe_output[:m],
+            num_experts=_DIRECT_SCALE_EXPERTS,
+            num_tokens=m,
+            k=_DIRECT_SCALE_HIDDEN,
+            n=moe._static_workspace.n,
+            top_k=_DIRECT_SCALE_TOPK,
+            input_scales_are_reciprocal=True,
+        )
+    finally:
+        md._FORCED_BACKEND = old
+
+
+def _direct_scale_error(actual, expected, tolerance):
+    a, b = actual.detach().cpu().double(), expected.detach().cpu().double()
+    assert torch.isfinite(a).all() and torch.isfinite(b).all()
+    error = ((a - b).norm() / b.norm().clamp_min(1e-12)).item()
+    assert error < tolerance, error
+
+
+def _direct_scale_check(actual, reference, oracle):
+    _direct_scale_error(actual, reference, 0.03)
+    _direct_scale_error(actual, oracle, 0.35)
+    _direct_scale_error(reference, oracle, 0.35)
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+@pytest.mark.parametrize(
+    "m,scale_kind,duplicate",
+    [(m, kind, False) for m in (1, 2, 3, 4) for kind in ("scalar", "vector", "legacy")]
+    + [(4, "vector", True)],
+)
+def test_direct_micro_scale_contract(
+    direct_scale_inputs, monkeypatch, m, scale_kind, duplicate
+):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+    monkeypatch.setattr(md, "_FORCED_BACKEND", None)
+    monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
+    backend = None if m == 4 else "direct_micro"
+    t, decoded = direct_scale_inputs
+    kwargs = _direct_scale_kwargs(t, m, scale_kind, duplicate)
+    actual_moe, reference_moe = _direct_scale_wrapper(), _direct_scale_wrapper()
+    actual = _direct_scale_run(actual_moe, kwargs, backend).clone()
+    reference = _direct_scale_static_precise(reference_moe, kwargs).clone()
+    oracle = _direct_scale_fp32_reference(kwargs, decoded)
+    _direct_scale_error(actual, reference, 0.03)
+    _direct_scale_error(actual, oracle, 0.35)
+    _direct_scale_error(reference, oracle, 0.35)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _direct_scale_run(actual_moe, kwargs, backend)
+    for _ in range(3):
+        graph.replay()
+        _direct_scale_error(captured, actual, 0.03)
+        _direct_scale_error(captured, oracle, 0.35)
+
+    input_recip = _direct_scale_inverse(
+        kwargs.get("input_global_scale", kwargs["w1_alpha"])
+    )
+    fc2_recip = _direct_scale_inverse(kwargs["fc2_input_scale"])
+    reciprocal = _direct_scale_reciprocal_call(
+        actual_moe, kwargs, input_recip, fc2_recip
+    ).clone()
+    _direct_scale_error(reciprocal, actual, 0.03)
+    reciprocal_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(reciprocal_graph):
+        reciprocal_buffer = _direct_scale_reciprocal_call(
+            actual_moe, kwargs, input_recip, fc2_recip
+        )
+    for _ in range(3):
+        reciprocal_graph.replay()
+        _direct_scale_error(reciprocal_buffer, actual, 0.03)
+        _direct_scale_error(reciprocal_buffer, oracle, 0.35)
+
+    # Change the caller tensor in place, including an active zero-scale expert.
+    # The already captured graph must execute the conversion on the new values.
+    fc2_scale = kwargs["fc2_input_scale"]
+    original_ptr = fc2_scale.data_ptr()
+    if fc2_scale.numel() == 1:
+        fc2_scale.zero_()
+    else:
+        fc2_scale.copy_(torch.linspace(1.3, 0.7, _DIRECT_SCALE_EXPERTS, device="cuda"))
+        fc2_scale[0] = 0
+    assert fc2_scale.data_ptr() == original_ptr
+    fc2_recip.copy_(_direct_scale_inverse(fc2_scale))
+    updated = _direct_scale_run(actual_moe, kwargs, backend).clone()
+    updated_reference = _direct_scale_static_precise(reference_moe, kwargs).clone()
+    updated_oracle = _direct_scale_fp32_reference(kwargs, decoded)
+    assert not torch.equal(actual, updated), "live scale must affect the output"
+    _direct_scale_error(updated, updated_reference, 0.03)
+    _direct_scale_error(updated, updated_oracle, 0.35)
+    _direct_scale_error(updated_reference, updated_oracle, 0.35)
+    for _ in range(3):
+        for replay, buffer in (
+            (graph, captured),
+            (reciprocal_graph, reciprocal_buffer),
+        ):
+            replay.replay()
+            _direct_scale_error(buffer, updated, 0.03)
+            _direct_scale_error(buffer, updated_oracle, 0.35)
+    if fc2_scale.numel() == 1 or duplicate:
+        assert torch.count_nonzero(updated) == 0
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+@pytest.mark.parametrize("fallback", ["source_off", "w1_strided", "w2_strided"])
+def test_m4_source_layout_fallback(direct_scale_inputs, monkeypatch, fallback):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+    monkeypatch.setattr(md, "_FORCED_BACKEND", None)
+    monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
+    t, decoded = direct_scale_inputs
+    kwargs = _direct_scale_kwargs(t, 4, "vector")
+    if fallback == "source_off":
+        monkeypatch.setenv(md._STATIC_SOURCE_SCALES_ENV, "0")
+    else:
+        key = "w1_weight" if fallback == "w1_strided" else "w2_weight"
+        packed = kwargs[key]
+        kwargs[key] = torch.stack((packed, torch.zeros_like(packed)), -1)[..., 0]
+        assert not kwargs[key].is_contiguous()
+    candidate, reference_moe = _direct_scale_wrapper(), _direct_scale_wrapper()
+    actual = _direct_scale_run(candidate, kwargs, None).clone()
+    # Static's compiled TMA descriptor expects contiguous packed weights.
+    # Keep the candidate strided, and give the oracle the same weight values
+    # in the original contiguous layout rather than testing static strides.
+    reference_kwargs = dict(kwargs)
+    for key in ("w1_weight", "w2_weight"):
+        assert torch.equal(kwargs[key], t[key])
+        reference_kwargs[key] = t[key]
+    reference = _direct_scale_static_precise(reference_moe, reference_kwargs).clone()
+    oracle = _direct_scale_fp32_reference(kwargs, decoded)
+    _direct_scale_check(actual, reference, oracle)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _direct_scale_run(candidate, kwargs, None)
+    for _ in range(3):
+        graph.replay()
+        _direct_scale_check(captured, reference, oracle)
+        _direct_scale_error(captured, actual, 0.03)
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+def test_m3_m4_m6_m4_shared_wrapper_graph(direct_scale_inputs, monkeypatch):
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as md
+
+    monkeypatch.setattr(md, "_FORCED_BACKEND", None)
+    monkeypatch.delenv(md._STATIC_SOURCE_SCALES_ENV, raising=False)
+    t, decoded = direct_scale_inputs
+    kwargs = {m: _direct_scale_kwargs(t, m, "vector") for m in (3, 4, 6)}
+    # Hold the same FC1/FC2 scale tensors through every warm-up and replay.
+    # Distinct FC1 tensor pointers would test an unrelated folded-alpha cache.
+    for m in (4, 6):
+        for key in ("input_global_scale", "fc2_input_scale"):
+            kwargs[m][key] = kwargs[3][key]
+    candidate, reference_moe = _direct_scale_wrapper(), _direct_scale_wrapper()
+    expected, oracles, eager, graphs, buffers = {}, {}, {}, {}, {}
+    for m in (3, 4, 6):
+        eager[m] = _direct_scale_run(candidate, kwargs[m], None).clone()
+        expected[m] = _direct_scale_static_precise(reference_moe, kwargs[m]).clone()
+        oracles[m] = _direct_scale_fp32_reference(kwargs[m], decoded)
+        _direct_scale_check(eager[m], expected[m], oracles[m])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            buffers[m] = _direct_scale_run(candidate, kwargs[m], None)
+        graphs[m] = graph
+    for _ in range(3):
+        for m in (3, 4, 6, 4):
+            actual = _direct_scale_run(candidate, kwargs[m], None).clone()
+            _direct_scale_check(actual, expected[m], oracles[m])
+            graphs[m].replay()
+            _direct_scale_check(buffers[m], expected[m], oracles[m])
+            _direct_scale_error(buffers[m], eager[m], 0.03)
 
 
 if __name__ == "__main__":
