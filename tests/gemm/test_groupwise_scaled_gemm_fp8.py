@@ -32,9 +32,26 @@ from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.parametrize import parametrize_product
 
 pytestmark = pytest.mark.solo
+
+# cuTile shape grids. The cuTile kernels bake M/N/K (and TOTAL_M/Q for the group
+# kernel) in as ct.Constant, so every distinct shape is a fresh tileiras JIT, and
+# the dense path also runs a 24-config exhaustive_search per shape. On the full
+# cutlass/trtllm grids that is ~9 s/case (dense) and ~4 s/case (group), i.e.
+# ~60 min per file on SM100/SM103 once CUDA 13 CI images ship tileiras (#4939).
+# Keep a representative subset that still covers: a single K tile, multi K tile,
+# small/large M (swap_ab / BLOCK_M pruning), and both group-config branches
+# (avg_m < 256 -> swap_ab BLOCK_M=64; avg_m >= 256 -> BLOCK_M=128).
+_CUTILE_GEMM_SHAPES = {
+    (m, n, k) for m in (128, 512, 8192) for n in (256, 4096) for k in (128, 8192)
+}
+_CUTILE_GROUP_GEMM_SHAPES = {
+    (m, n, k, g)
+    for m in (4, 128, 512, 4096)
+    for (n, k) in ((128, 128), (4096, 8192))
+    for g in (1, 8)
+}
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
@@ -82,16 +99,40 @@ def test_fp8_blockscale_gemm(
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
 
-def _skip_unless_gemm_fp8_nt_groupwise_backend(backend):
+@pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+@pytest.mark.parametrize("backend", ["cutlass", "trtllm", "cutile"])
+def test_fp8_groupwise_gemm(
+    m,
+    n,
+    k,
+    scale_major_mode,
+    backend,
+):
     if not torch.cuda.is_available():
         pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
     major, minor = get_compute_capability(torch.device("cuda"))
     cc = major * 10 + minor
     if not gemm_fp8_nt_groupwise.is_backend_supported(backend, cc):
         pytest.skip(f"gemm_fp8_nt_groupwise backend {backend} does not support SM{cc}")
-
-
-def _run_fp8_groupwise_gemm(m, n, k, scale_major_mode, backend):
+    if backend == "trtllm":
+        if scale_major_mode != "MN":
+            pytest.skip("trtllm only supports MN scale_major_mode")
+        if k < 256:
+            pytest.skip("k < 256")
+    if backend == "cutile":
+        if scale_major_mode != "K":
+            pytest.skip(
+                "gemm_fp8_nt_groupwise with cuTile backend currently supports scale_major_mode='K' only."
+            )
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
+        if (m, n, k) not in _CUTILE_GEMM_SHAPES:
+            pytest.skip("cuTile: reduced shape grid (one tileiras JIT per shape)")
     torch.random.manual_seed(0)
     tile_size = 128
     out_dtype = torch.bfloat16
@@ -128,59 +169,6 @@ def _run_fp8_groupwise_gemm(m, n, k, scale_major_mode, backend):
         backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("m", [128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
-@pytest.mark.parametrize("backend", ["cutlass", "trtllm"])
-def test_fp8_groupwise_gemm(
-    m,
-    n,
-    k,
-    scale_major_mode,
-    backend,
-):
-    _skip_unless_gemm_fp8_nt_groupwise_backend(backend)
-    if backend == "trtllm":
-        if scale_major_mode != "MN":
-            pytest.skip("trtllm only supports MN scale_major_mode")
-        if k < 256:
-            pytest.skip("k < 256")
-    _run_fp8_groupwise_gemm(m, n, k, scale_major_mode, backend)
-
-
-# The cuTile kernels bake M/N/K in as ct.Constant, so every shape is a fresh
-# tileiras JIT plus a 24-config exhaustive_search (~9 s/case on SM100). Regular
-# runs take one case per kernel behavior; --full (nightly) runs every shape.
-# BLOCK_N = BLOCK_K = 128 and BLOCK_M in {16, 32, 64, 128} is pruned to <= M.
-@parametrize_product(
-    {
-        "m": [1, 16, 100, 128, 256, 512, 4096, 8192],
-        "n": [128, 256, 512, 4096, 8192],
-        "k": [128, 256, 512, 4096, 8192],
-    },
-    regular=[
-        (1, 4096, 8192),  # M below every BLOCK_M: prune falls back to all configs
-        (16, 256, 512),  # M == smallest BLOCK_M: prune keeps BLOCK_M=16 only
-        (100, 4096, 128),  # unaligned M: partial last M tile, single K tile
-        (128, 128, 128),  # one tile in every dimension
-        (128, 4096, 8192),
-        (512, 256, 8192),
-        (512, 4096, 256),  # two K tiles
-        (4096, 8192, 512),  # widest N
-        (8192, 256, 128),  # num_pid_m > GROUP_SIZE_M: multi-group swizzle
-        (8192, 4096, 8192),
-    ],
-    ids=lambda case: "m{}-n{}-k{}".format(*case),
-)
-def test_fp8_groupwise_gemm_cutile(m, n, k):
-    """cuTile backend of gemm_fp8_nt_groupwise (K-major scales only)."""
-    _skip_unless_gemm_fp8_nt_groupwise_backend("cutile")
-    if not is_cuda_tile_available():
-        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
-    _run_fp8_groupwise_gemm(m, n, k, "K", "cutile")
 
 
 @pytest.mark.parametrize("m", [1, 4, 16, 32])
@@ -228,7 +216,23 @@ def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode):
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
 
-def _skip_unless_group_gemm_fp8_nt_groupwise(group_size):
+@pytest.mark.parametrize("backend", ["trtllm", "cutile"])
+@pytest.mark.parametrize("m", [4, 128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
+@pytest.mark.parametrize("group_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
+def test_fp8_groupwise_group_gemm(
+    m,
+    n,
+    k,
+    group_size,
+    scale_major_mode,
+    out_dtype,
+    backend,
+):
+    """Grouped FP8 groupwise GEMM must match the reference across group sizes and scale modes."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if group_size > 1 and compute_capability[0] in [
         12,
@@ -240,11 +244,23 @@ def _skip_unless_group_gemm_fp8_nt_groupwise(group_size):
         pytest.skip(
             "group_gemm_fp8_nt_groupwise is only supported on SM100/103/107, and SM120/121 GPUs."
         )
-
-
-def _run_fp8_groupwise_group_gemm(
-    m, n, k, group_size, scale_major_mode, out_dtype, backend
-):
+    if backend == "cutile":
+        # cuTile group GEMM backend (added in #3426); mirror the capability
+        # guards used by test_fp8_groupwise_gemm's cuTile branch.
+        if compute_capability[0] not in [10, 11, 12]:
+            pytest.skip(
+                "group_gemm_fp8_nt_groupwise cuTile backend requires SM100+ GPUs."
+            )
+        if scale_major_mode != "K":
+            pytest.skip(
+                "group_gemm_fp8_nt_groupwise cuTile backend supports scale_major_mode='K' only."
+            )
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
+        if (m, n, k, group_size) not in _CUTILE_GROUP_GEMM_SHAPES:
+            pytest.skip("cuTile: reduced shape grid (one tileiras JIT per shape)")
     torch.random.manual_seed(0)
     tile_size = 128
 
@@ -290,64 +306,6 @@ def _run_fp8_groupwise_group_gemm(
         .to(out_dtype)
     )
     torch.testing.assert_close(out, ref_c, atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.parametrize("backend", ["trtllm"])
-@pytest.mark.parametrize("m", [4, 128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("n", [128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("k", [128, 256, 512, 4096, 8192])
-@pytest.mark.parametrize("group_size", [1, 2, 4, 8])
-@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
-def test_fp8_groupwise_group_gemm(
-    m,
-    n,
-    k,
-    group_size,
-    scale_major_mode,
-    out_dtype,
-    backend,
-):
-    """Grouped FP8 groupwise GEMM must match the reference across group sizes and scale modes."""
-    _skip_unless_group_gemm_fp8_nt_groupwise(group_size)
-    _run_fp8_groupwise_group_gemm(
-        m, n, k, group_size, scale_major_mode, out_dtype, backend
-    )
-
-
-# Like the dense kernel, every (Q, TOTAL_M, N, K) is a fresh tileiras JIT
-# (~4 s/case on SM100). The config is static: avg_m < 256 takes swap_ab with
-# BLOCK_M=64, otherwise BLOCK_M=128. Rows of a group's last M tile that spill
-# into the next group are dropped on store, so unaligned m with group_size > 1
-# is the masking case. group_size == 1 cases are the only ones SM120/121 run.
-@parametrize_product(
-    {
-        "m": [4, 100, 128, 256, 300, 512, 4096, 8192],
-        "n": [128, 256, 512, 4096, 8192],
-        "k": [128, 256, 512, 4096, 8192],
-        "group_size": [1, 2, 4, 8],
-    },
-    regular=[
-        (4, 128, 128, 8),  # BLOCK_M=64: 60 of 64 tile rows spill into the next group
-        (4, 4096, 8192, 1),
-        (100, 256, 4096, 4),  # BLOCK_M=64: second M tile is partial and spills
-        (128, 128, 128, 1),  # one tile in every dimension
-        (128, 4096, 8192, 8),  # BLOCK_M=64, aligned
-        (256, 512, 256, 2),  # avg_m == 256: first BLOCK_M=128 case
-        (300, 4096, 512, 8),  # BLOCK_M=128: third M tile is partial and spills
-        (300, 128, 8192, 1),
-        (512, 8192, 128, 4),  # widest N
-        (4096, 4096, 8192, 8),  # several persistent-loop iterations per CTA
-        (8192, 256, 128, 1),
-    ],
-    ids=lambda case: "m{}-n{}-k{}-g{}".format(*case),
-)
-def test_fp8_groupwise_group_gemm_cutile(m, n, k, group_size):
-    """cuTile backend of group_gemm_fp8_nt_groupwise (K-major scales only)."""
-    _skip_unless_group_gemm_fp8_nt_groupwise(group_size)
-    if not is_cuda_tile_available():
-        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
-    _run_fp8_groupwise_group_gemm(m, n, k, group_size, "K", torch.bfloat16, "cutile")
 
 
 @pytest.mark.parametrize("segment_alignment", [128, 256])
