@@ -28,7 +28,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_kimi_k3_latent_moe_1fd6385985f9c2ca5c86(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ y_out, int M, int num_partials, float eps)
+kernel_cake_kimi_k3_latent_moe_bf078c28bb875c3ae557(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ y_out, int M, int num_partials, float eps)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
