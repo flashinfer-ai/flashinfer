@@ -622,7 +622,7 @@ class BatchMLAPagedAttentionWrapper:
             and scale_mode == "default"
             and not (
                 q_data_type == torch.float8_e4m3fn
-                and _get_compute_capability(self.device) == (10, 0)
+                and _get_compute_capability(self.device) in ((10, 0), (10, 3), (10, 7))
             )
         ):
             # Existing FP8 callers always supply CKV/KPE scales at run time.
