@@ -151,6 +151,7 @@ _W4A16_SCALE_FORMATS = {
     "iq2_xxs": "iq2_xxs",
     "q8_0": "q8_0",
     "e4m3_k16": "e4m3_k16",
+    "e4m3_k16_csf": "e4m3_k16_csf",
     "e4m3_k32": "e4m3_k32",
     "e8m0_k32": "e8m0_k32",
 }
@@ -449,6 +450,9 @@ class B12XFP4ExpertWeights:
     representation: _PreparedWeightRepresentation | None = None
     immutable_input_scales: bool = False
     nvfp4_csf: object | None = None
+    # Packed W4A16 representation over the expanded scale scratch, for calls
+    # planned above the stage-scale token limit (nvfp4_csf expands into it).
+    w4a16_expanded: object | None = None
     mxfp4_csf: object | None = None
     _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
@@ -1001,7 +1005,14 @@ class TPMoEScratchPlan:
     ) -> "TPMoEFP4Binding":
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
-        if experts.plan != self.caps.weight_plan:
+        weight_plan = experts.plan
+        if (
+            weight_plan.w4a16_compressed_scales
+            and not self.caps.weight_plan.w4a16_compressed_scales
+        ):
+            # Calls above the stage-scale token limit run on expanded scales.
+            weight_plan = replace(weight_plan, w4a16_compressed_scales=False)
+        if weight_plan != self.caps.weight_plan:
             raise ValueError(
                 "experts do not match the plan used to size TP MoE scratch"
             )
@@ -6408,6 +6419,7 @@ def plan_b12x_fp4_moe_weights(
     hidden_size: int,
     intermediate_size: int,
     nvfp4_inline_scales: bool = False,
+    w4a16_compressed_scales: bool = False,
     w13_layout: str = "w13",
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
@@ -6451,7 +6463,11 @@ def plan_b12x_fp4_moe_weights(
         intermediate_hadamard_blocks=intermediate_hadamard_blocks,
     )
 
-    return replace(result, nvfp4_inline_scales=bool(nvfp4_inline_scales))
+    return replace(
+        result,
+        nvfp4_inline_scales=bool(nvfp4_inline_scales),
+        w4a16_compressed_scales=bool(w4a16_compressed_scales),
+    )
 
 
 def prepare_b12x_fp4_moe_weights(
@@ -12803,6 +12819,18 @@ def _finalize_trellis_output(
     return target
 
 
+# Planned token capacity limit for W4A16 per-stage compressed-scale reads.
+W4A16_CSF_STAGE_MAX_TOKENS = int(os.environ.get("B12X_W4A16_CSF_STAGE_MAX_TOKENS", "1536"))
+
+
+def _w4a16_reads_stage_scales(binding) -> bool:
+    """Whether this W4A16 call reads compressed scales per stage (its planned launch's format)."""
+    launch = getattr(binding, "fused_launch", None)
+    if launch is not None:
+        return getattr(launch, "scale_format", None) == "e4m3_k16_csf"
+    raise RuntimeError("Compressed W4A16 scales require a prepared fused launch")
+
+
 def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     """Execute one fully planned, prepared, and scratch-bound FP4 MoE launch."""
     if not isinstance(binding, TPMoEFP4Binding):
@@ -12855,8 +12883,15 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     topk_ids = binding.topk_ids
     if experts.mxfp4_csf is not None:
         experts.mxfp4_csf.decode(topk_ids, w1_blockscale, w2_blockscale)
+    # The A4 prefill path (when present) reads expanded (W4A16-layout) scales.
+    stage_scales = (
+        experts.w4a16_expanded is not None
+        and getattr(binding, "a4_prefill_launches", None) is None
+        and _w4a16_reads_stage_scales(binding)
+    )
     csf_reset_barriers = (
         experts.nvfp4_csf is not None
+        and not stage_scales
         and binding.implementation == "micro"
         and topk_ids.numel() > 0
     )
@@ -12868,7 +12903,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         and plan.decode_config.nvfp4_inline_scales
     ):
         inline_scales = experts.nvfp4_csf.inline_scales
-    if experts.nvfp4_csf is not None and inline_scales is None:
+    if experts.nvfp4_csf is not None and inline_scales is None and not stage_scales:
         barriers = (
             (
                 _require_binding_field(binding, "barrier_count"),
@@ -12877,8 +12912,13 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             if csf_reset_barriers
             else None
         )
+        # W4A16 compressed storage expands into its shared scratch, not in place.
+        expanded = experts.w4a16_expanded
         experts.nvfp4_csf.decode(
-            topk_ids, w1_blockscale, w2_blockscale, barriers=barriers
+            topk_ids,
+            w1_blockscale if expanded is None else expanded.w13_scale,
+            w2_blockscale if expanded is None else expanded.w2_scale,
+            barriers=barriers,
         )
     workspace = None
     apply_router_weight_on_input = binding.apply_router_weight_on_input
@@ -13066,6 +13106,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         )
 
         prepared = prepared_payload
+        if experts.w4a16_expanded is not None and not stage_scales:
+            prepared = experts.w4a16_expanded
         if prepared is None:
             raise RuntimeError(
                 "the W4A16 weight plan did not materialize its required representation"

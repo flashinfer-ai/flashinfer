@@ -1354,6 +1354,24 @@ def ld_shared_u8(smem_addr: Int32, *, loc=None, ip=None) -> Uint8:
 
 
 @dsl_user_op
+def ld_shared_u16_zx(smem_addr: Int32, *, loc=None, ip=None) -> Uint32:
+    """Load a shared halfword zero-extended into a 32-bit register."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.u16 $0, [$1];",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def st_shared_u16(smem_addr: Int32, value: Uint32, *, loc=None, ip=None):
     """Store the low 16 bits of a register to shared memory."""
     llvm.inline_asm(

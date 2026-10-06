@@ -66,6 +66,7 @@ from b12x._lib.intrinsics import (
     cp_async_u32_shared_global,
     get_ptr_as_int64,
     ld_global_b16,
+    ld_shared_u16_zx,
     ld_shared_u8_offset,
     ldmatrix_m8n8x4_b16,
     shared_ptr_to_u32,
@@ -103,24 +104,6 @@ class _BMajor(IntEnum):
 # ---------------------------------------------------------------------------
 # Exact-value device conversions (this module's own primitives).
 # ---------------------------------------------------------------------------
-
-
-@dsl_user_op
-def ld_shared_u16_zx(smem_addr: Int32, *, loc=None, ip=None) -> Uint32:
-    """Load a shared halfword zero-extended into a 32-bit register."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
-            "ld.shared.u16 $0, [$1];",
-            "=r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
 
 
 @dsl_user_op

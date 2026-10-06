@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS
 
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 
@@ -497,6 +498,43 @@ def prepare_weights(
                     planes, (plan.geometry.intermediate_size, 0), tables, strict=True
                 )
             )
+            if _w4a16_stage_scales(plan.geometry):
+                # Keep the compressed planes as stage-readable storage. Calls
+                # planned up to the stage-scale token limit rebuild each
+                # pipeline stage's scales in shared memory, with no expansion
+                # pass before the layer. Larger calls expand their routed
+                # experts into the shared scratch first, from the same storage.
+                from b12x._lib.quant.nvfp4_csf_packed import (
+                    PackedCsfPlane,
+                    build_packed_csf_scales,
+                )
+
+                stored = tuple(build_packed_csf_scales(plane) for plane in planes)
+                expander = Nvfp4CsfDecoder.prepare(
+                    *(PackedCsfPlane.of(scales) for scales in stored), *outputs
+                )
+                expanded = replace(packed, w13_scale=outputs[0], w2_scale=outputs[1])
+                packed = replace(
+                    packed,
+                    w13_scale=stored[0].storage,
+                    w2_scale=stored[1].storage,
+                    scale_format="e4m3_k16_csf",
+                )
+                plan = replace(
+                    plan, _impl=replace(plan._impl, w4a16_compressed_scales=True)
+                )
+                return PreparedExperts(
+                    plan=plan,
+                    _impl=replace(
+                        prepared._impl,
+                        plan=plan._impl,
+                        representation=replace(representation, value=packed),
+                        w1_blockscale=stored[0].storage,
+                        w2_blockscale=stored[1].storage,
+                        nvfp4_csf=expander,
+                        w4a16_expanded=expanded,
+                    ),
+                )
             packed = replace(packed, w13_scale=outputs[0], w2_scale=outputs[1])
             prepared = replace(
                 prepared,
@@ -749,6 +787,19 @@ def prepare_weights(
             a2_gscale=intermediate_scale,
         )
     return PreparedExperts(plan=plan, _impl=prepared)
+
+
+def _w4a16_stage_scales(geometry) -> bool:
+    """Whether W4A16 keeps NVFP4-CSF scales as stage-readable storage.
+
+    Stages cover whole 128-row slabs of four-k-group atoms in both projections.
+    B12X_W4A16_CSF_INLINE=0 keeps the per-layer expansion pass.
+    """
+    return (
+        os.environ.get("B12X_W4A16_CSF_INLINE", "1") != "0"
+        and geometry.hidden_size % 128 == 0
+        and geometry.intermediate_size % 64 == 0
+    )
 
 
 __all__ = [
