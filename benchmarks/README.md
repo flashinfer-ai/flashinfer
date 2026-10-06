@@ -55,6 +55,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
+    - `trtllm_fp4_block_scale_routed_moe`, `trtllm_fp8_block_scale_routed_moe`, `trtllm_fp8_per_tensor_scale_routed_moe` - Pre-routed variants of the three routines above. Routing for `--routing_method` is computed once outside the timed region and passed as packed `(expert_id << 16) | bf16_weight` top-k entries (the layout SGLang's `flashinfer_trtllm_routed` backend passes), so only the routed kernel path is timed. `--refcheck` compares the output against the routing-logits path on the same weights.
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
     - `cute_dsl_bf16_moe` - CuTe-DSL BF16/FP16 fused MoE for Hopper.
     - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends (plus TRT-LLM and CuTe DSL for MXFP4 W4A8, `--quant-variant mxfp4_w4a8` or its alias `mxfp4_mxfp8`). It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
@@ -588,6 +589,9 @@ Legend:
 | **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
+| **trtllm_fp4_block_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm |  |
+| **trtllm_fp8_block_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm |  |
+| **trtllm_fp8_per_tensor_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
 | **cute_dsl_bf16_moe** |  |  |  |  | cute-dsl |  |  |  |
 | **unified_moe** |  |  |  | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass | cutlass | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16) |

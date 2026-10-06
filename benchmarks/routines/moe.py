@@ -17,8 +17,11 @@ from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     alphamoe_nvfp4_aligned_moe,
     trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
+    trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    trtllm_fp8_per_tensor_scale_routed_moe,
     cutlass_fused_moe,
     fused_topk_deepseek,
 )
@@ -33,6 +36,7 @@ from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     enum_type,
     get_device,
+    is_close_stats,
     print_perf_metrics,
     print_autotune_choices,
     probe_autotune_choices,
@@ -120,11 +124,20 @@ def run_moe_test(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
-    if args.routine == "trtllm_fp4_block_scale_moe":
+    if args.routine in (
+        "trtllm_fp4_block_scale_moe",
+        "trtllm_fp4_block_scale_routed_moe",
+    ):
         return testTrtllmFp4BlockScaleMoe(args)
-    elif args.routine == "trtllm_fp8_block_scale_moe":
+    elif args.routine in (
+        "trtllm_fp8_block_scale_moe",
+        "trtllm_fp8_block_scale_routed_moe",
+    ):
         return testTrtllmFp8BlockScaleMoe(args)
-    elif args.routine == "trtllm_fp8_per_tensor_scale_moe":
+    elif args.routine in (
+        "trtllm_fp8_per_tensor_scale_moe",
+        "trtllm_fp8_per_tensor_scale_routed_moe",
+    ):
         return testTrtllmFp8PerTensorScaleMoe(args)
     elif args.routine == "cutlass_fused_moe":
         return testCutlassFusedMoe(args)
@@ -270,8 +283,9 @@ def parse_moe_args(line, parser):
         default=False,
         help=(
             "Enable autotuner warmup for supported routines (trtllm_fp4_block_scale_moe, "
-            "trtllm_fp8_block_scale_moe, trtllm_fp8_per_tensor_scale_moe, cutlass_fused_moe, "
-            "cute_dsl_fp4_block_scale_moe, cute_dsl_bf16_moe, b12x_fused_moe)."
+            "trtllm_fp8_block_scale_moe, trtllm_fp8_per_tensor_scale_moe and their *_routed_moe "
+            "variants, cutlass_fused_moe, cute_dsl_fp4_block_scale_moe, cute_dsl_bf16_moe, "
+            "b12x_fused_moe)."
         ),
     )
     parser.add_argument(
@@ -531,6 +545,109 @@ def _compute_routing_for_method(
         return selected_experts
 
 
+def _is_routed_routine(routine: str) -> bool:
+    """True for the ``*_routed_moe`` routines, which take precomputed top-k."""
+    return routine.endswith("_routed_moe")
+
+
+def _compute_packed_topk(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    top_k: int,
+    routing_method_type: int,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    routed_scaling_factor: Optional[float] = None,
+) -> torch.Tensor:
+    """Route outside the kernel and pack the result for a ``*_routed_moe`` call.
+
+    Returns an int32 ``[num_tokens, top_k]`` tensor of
+    ``(expert_id << 16) | bf16_weight`` entries, the layout SGLang's
+    ``flashinfer_trtllm_routed`` backend passes. The weights follow the same
+    routing method the logits-path kernel applies, so the routed output can be
+    checked against it.
+    """
+    logits = routing_logits.float()
+    if routing_method_type == RoutingMethodType.DeepSeekV3:
+        num_tokens, num_experts = logits.shape
+        bias = (
+            routing_bias.float()
+            if routing_bias is not None
+            else torch.zeros(num_experts, device=logits.device)
+        )
+        topk_weights = torch.empty(
+            num_tokens, top_k, device=logits.device, dtype=torch.float32
+        )
+        topk_ids = torch.empty(
+            num_tokens, top_k, device=logits.device, dtype=torch.int32
+        )
+        fused_topk_deepseek(
+            scores=logits,
+            bias=bias,
+            n_group=n_group,
+            topk_group=topk_group,
+            topk=top_k,
+            routed_scaling_factor=routed_scaling_factor,
+            topk_values=topk_weights,
+            topk_indices=topk_ids,
+        )
+    elif routing_method_type == RoutingMethodType.Default:
+        topk_weights, topk_ids = torch.topk(
+            torch.softmax(logits, dim=-1), top_k, dim=-1
+        )
+    elif routing_method_type in (
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+    ):
+        topk_logits, topk_ids = torch.topk(logits, top_k, dim=-1)
+        topk_weights = torch.softmax(topk_logits, dim=-1)
+    elif routing_method_type == RoutingMethodType.Llama4:
+        topk_logits, topk_ids = torch.topk(logits, top_k, dim=-1)
+        topk_weights = torch.sigmoid(topk_logits)
+    elif routing_method_type == RoutingMethodType.TopK:
+        topk_weights, topk_ids = torch.topk(logits, top_k, dim=-1)
+    else:
+        raise ValueError(
+            f"Routing method {routing_method_type} has no precomputed-routing reference"
+        )
+    weights_bits = topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
+    return (topk_ids.to(torch.int32) << 16) | (weights_bits & 0xFFFF)
+
+
+def _first_output(result) -> torch.Tensor:
+    return result[0] if isinstance(result, (list, tuple)) else result
+
+
+def _check_routed_against_logits(args, routed_out, logits_out) -> bool:
+    """Compare a ``*_routed_moe`` output with the logits-path output.
+
+    Both paths run the same GEMMs on the same experts and bf16 routing
+    weights, so they should agree to accumulation-order noise.
+    """
+    rtol, atol = 1e-2, 1e-2
+    mismatch_threshold_pct = 1.0
+    num_different, num_elements, pct = is_close_stats(
+        logits_out.float(), routed_out.float(), rtol=rtol, atol=atol
+    )
+    if pct > mismatch_threshold_pct:
+        print(
+            f"[ERROR] {args.routine} output mismatch against the routing-logits "
+            f"path: {num_different}/{num_elements} ({pct:.4f}%) elements differ "
+            f"(threshold: {mismatch_threshold_pct}%)"
+        )
+        if not args.allow_output_mismatch:
+            raise AssertionError(
+                f"[ERROR] {args.routine} output mismatch with {num_different} elements"
+            )
+        return False
+    if args.verbose >= 1:
+        print(
+            f"[REFCHECK] {args.routine} vs routing-logits path: PASSED "
+            f"({num_different}/{num_elements} elements differ ({pct:.4f}%))"
+        )
+    return True
+
+
 def testTrtllmFp4BlockScaleMoe(args):
     """
     Test trtllm_fp4_block_scale_moe API (TensorRT-LLM fused MoE).
@@ -539,6 +656,11 @@ def testTrtllmFp4BlockScaleMoe(args):
     1. Creates quantized FP4 weights and scales
     2. Runs FP4 block scale MOE
     3. Measures performance metrics (TFLOPS, TB/sec)
+
+    For trtllm_fp4_block_scale_routed_moe the routing is computed once outside
+    the timed region and passed as packed ``(expert_id << 16) | bf16_weight``
+    top-k entries, so only the routed kernel path is timed. ``--refcheck``
+    compares it against the routing-logits path on the same weights.
 
     Args:
         args: Parsed command line arguments containing test configuration
@@ -590,6 +712,7 @@ def testTrtllmFp4BlockScaleMoe(args):
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
     activation_type = args.activation_type
+    routed = _is_routed_routine(args.routine)
     res = []
 
     backends = ["trtllm"]
@@ -735,8 +858,26 @@ def testTrtllmFp4BlockScaleMoe(args):
         print(f"[VVERBOSE] gemm1_weights_fp4.shape = {gemm1_weights_fp4.shape}")
         print(f"[VVERBOSE] gemm2_weights_fp4.shape = {gemm2_weights_fp4.shape}")
 
-    def run_fp4_moe(
-        routing_logits,
+    if routed:
+        routing_input = _compute_packed_topk(
+            routing_logits,
+            routing_bias,
+            top_k,
+            routing_method_type,
+            n_group,
+            topk_group,
+            routed_scaling_factor,
+        )
+        kernel_routing_bias = None
+        moe_fn = trtllm_fp4_block_scale_routed_moe
+    else:
+        routing_input = routing_logits
+        kernel_routing_bias = routing_bias
+        moe_fn = trtllm_fp4_block_scale_moe
+
+    def call_fp4_moe(
+        fn,
+        routing_input,
         routing_bias,
         hidden_states_fp4,
         hidden_states_scale_linear_fp4,
@@ -748,8 +889,8 @@ def testTrtllmFp4BlockScaleMoe(args):
         output1_scale_gate_scalar,
         output2_scale_scalar,
     ):
-        return trtllm_fp4_block_scale_moe(
-            routing_logits=routing_logits,
+        return fn(
+            routing_input,
             routing_bias=routing_bias,
             hidden_states=hidden_states_fp4,
             hidden_states_scale=hidden_states_scale_linear_fp4,
@@ -776,9 +917,12 @@ def testTrtllmFp4BlockScaleMoe(args):
             routing_method_type=routing_method_type,
             do_finalize=True,
             enable_pdl=args.enable_pdl,
-            **_activation_kwarg(trtllm_fp4_block_scale_moe, activation_type),
+            **_activation_kwarg(fn, activation_type),
             hidden_states_scale_layout=SfLayout.layout_linear,
         )
+
+    def run_fp4_moe(*tensors):
+        return call_fp4_moe(moe_fn, *tensors)
 
     backend = "trtllm"
 
@@ -796,8 +940,8 @@ def testTrtllmFp4BlockScaleMoe(args):
         with autotune(True, cache=cache_path):
             for _ in range(warmup_iters):
                 run_fp4_moe(
-                    routing_logits,
-                    routing_bias,
+                    routing_input,
+                    kernel_routing_bias,
                     hidden_states_fp4,
                     hidden_states_scale_linear_fp4,
                     gemm1_weights_fp4,
@@ -813,8 +957,8 @@ def testTrtllmFp4BlockScaleMoe(args):
             pass
 
     fp4_moe_args = (
-        routing_logits,
-        routing_bias,
+        routing_input,
+        kernel_routing_bias,
         hidden_states_fp4,
         hidden_states_scale_linear_fp4,
         gemm1_weights_fp4,
@@ -829,6 +973,26 @@ def testTrtllmFp4BlockScaleMoe(args):
     autotune_choices = (
         probe_autotune_choices(run_fp4_moe, *fp4_moe_args) if autotuned else {}
     )
+    refcheck_passed = ""
+    if routed and args.refcheck:
+        fp4_args = (
+            hidden_states_fp4,
+            hidden_states_scale_linear_fp4,
+            gemm1_weights_fp4,
+            gemm1_weights_scale,
+            gemm2_weights_fp4,
+            gemm2_weights_scale,
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+        )
+        routed_out = _first_output(run_fp4_moe(routing_input, None, *fp4_args))
+        logits_out = _first_output(
+            call_fp4_moe(
+                trtllm_fp4_block_scale_moe, routing_logits, routing_bias, *fp4_args
+            )
+        )
+        refcheck_passed = _check_routed_against_logits(args, routed_out, logits_out)
 
     # Benchmark timing
     times = bench_gpu_time(
@@ -869,7 +1033,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         weight_dtype,
         input_format=input_format_str,
         weight_format=weight_format_str,
-        routing_logits_dtype=routing_logits.dtype,
+        routing_logits_dtype=None if routed else routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
         is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
@@ -907,6 +1071,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["weight_dtype"] = weight_dtype
         cur_res["activation_type"] = args.activation_type.name
         cur_res["fp4_mode"] = fp4_mode
+        cur_res["refcheck_passed"] = refcheck_passed
         res.append(cur_res)
 
     return res
@@ -2746,6 +2911,11 @@ def testTrtllmFp8BlockScaleMoe(args):
     2. Runs FP8 block scale MOE
     3. Measures performance metrics (TFLOPS, TB/sec)
 
+    For trtllm_fp8_block_scale_routed_moe the routing is computed once outside
+    the timed region and passed as packed ``(expert_id << 16) | bf16_weight``
+    top-k entries, so only the routed kernel path is timed. ``--refcheck``
+    compares it against the routing-logits path on the same weights.
+
     Args:
         args: Parsed command line arguments containing test configuration
 
@@ -2795,6 +2965,7 @@ def testTrtllmFp8BlockScaleMoe(args):
     use_shuffled_weight = args.use_shuffled_weight
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
+    routed = _is_routed_routine(args.routine)
     res = []
     backends = ["trtllm"]
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -2887,8 +3058,26 @@ def testTrtllmFp8BlockScaleMoe(args):
         print(f"[VVERBOSE] gemm1_weights_fp8.shape = {gemm1_weights_fp8.shape}")
         print(f"[VVERBOSE] gemm2_weights_fp8.shape = {gemm2_weights_fp8.shape}")
 
-    def run_fp8_block_moe(
-        routing_logits,
+    if routed:
+        routing_input = _compute_packed_topk(
+            routing_logits,
+            routing_bias,
+            top_k,
+            routing_method_type,
+            n_group,
+            topk_group,
+            routed_scaling_factor,
+        )
+        kernel_routing_bias = None
+        moe_fn = trtllm_fp8_block_scale_routed_moe
+    else:
+        routing_input = routing_logits
+        kernel_routing_bias = routing_bias
+        moe_fn = trtllm_fp8_block_scale_moe
+
+    def call_fp8_block_moe(
+        fn,
+        routing_input,
         routing_bias,
         hidden_states,
         hidden_states_scale,
@@ -2901,8 +3090,8 @@ def testTrtllmFp8BlockScaleMoe(args):
         hidden_states_fp8 = hidden_states.to(torch.float8_e4m3fn)
         # Note: FP8 block scale MOE expects int64_t for n_group/topk_group, not Optional[int64_t]
         # So we convert None to 0 to indicate "no groups" mode
-        return trtllm_fp8_block_scale_moe(
-            routing_logits=routing_logits,
+        return fn(
+            routing_input,
             routing_bias=routing_bias,
             hidden_states=hidden_states_fp8,
             hidden_states_scale=hidden_states_scale,
@@ -2924,9 +3113,12 @@ def testTrtllmFp8BlockScaleMoe(args):
             enable_pdl=args.enable_pdl,
         )
 
+    def run_fp8_block_moe(*tensors):
+        return call_fp8_block_moe(moe_fn, *tensors)
+
     run_fp8_block_moe_args = (
-        routing_logits,
-        routing_bias,
+        routing_input,
+        kernel_routing_bias,
         hidden_states,
         hidden_states_scale,
         kernel_gemm1_weights,
@@ -2943,6 +3135,24 @@ def testTrtllmFp8BlockScaleMoe(args):
         if autotuned
         else {}
     )
+
+    refcheck_passed = ""
+    if routed and args.refcheck:
+        fp8_args = (
+            hidden_states,
+            hidden_states_scale,
+            kernel_gemm1_weights,
+            gemm1_weights_scale,
+            kernel_gemm2_weights,
+            gemm2_weights_scale,
+        )
+        routed_out = _first_output(run_fp8_block_moe(routing_input, None, *fp8_args))
+        logits_out = _first_output(
+            call_fp8_block_moe(
+                trtllm_fp8_block_scale_moe, routing_logits, routing_bias, *fp8_args
+            )
+        )
+        refcheck_passed = _check_routed_against_logits(args, routed_out, logits_out)
 
     # Benchmark timing
     times = bench_gpu_time(
@@ -2979,7 +3189,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         weight_dtype,
         input_format="fp8",
         weight_format="fp8",
-        routing_logits_dtype=routing_logits.dtype,
+        routing_logits_dtype=None if routed else routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
     )
@@ -3014,6 +3224,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
+        cur_res["refcheck_passed"] = refcheck_passed
         res.append(cur_res)
 
     return res
@@ -3027,6 +3238,12 @@ def testTrtllmFp8PerTensorScaleMoe(args):
     1. Creates quantized FP8 weights and per-tensor scales
     2. Runs FP8 per-tensor scale MOE
     3. Measures performance metrics (TFLOPS, TB/sec)
+
+    For trtllm_fp8_per_tensor_scale_routed_moe the routing is computed once
+    outside the timed region and passed as packed
+    ``(expert_id << 16) | bf16_weight`` top-k entries, so only the routed
+    kernel path is timed. ``--refcheck`` compares it against the
+    routing-logits path on the same weights.
 
     Args:
         args: Parsed command line arguments containing test configuration
@@ -3076,6 +3293,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
     routing_method_type = args.routing_method_type
     use_routing_scales_on_input = args.use_routing_scales_on_input
     is_cuda_graph_compatible = not args.no_cuda_graph
+    routed = _is_routed_routine(args.routine)
     res = []
     backends = ["trtllm"]
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -3136,8 +3354,26 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         print(f"[VVERBOSE] gemm1_weights_fp8.shape = {gemm1_weights_fp8.shape}")
         print(f"[VVERBOSE] gemm2_weights_fp8.shape = {gemm2_weights_fp8.shape}")
 
-    def run_fp8_per_tensor_moe(
-        routing_logits,
+    if routed:
+        routing_input = _compute_packed_topk(
+            routing_logits,
+            routing_bias,
+            top_k,
+            routing_method_type,
+            n_group,
+            topk_group,
+            routed_scaling_factor,
+        )
+        kernel_routing_bias = None
+        moe_fn = trtllm_fp8_per_tensor_scale_routed_moe
+    else:
+        routing_input = routing_logits
+        kernel_routing_bias = routing_bias
+        moe_fn = trtllm_fp8_per_tensor_scale_moe
+
+    def call_fp8_per_tensor_moe(
+        fn,
+        routing_input,
         routing_bias,
         hidden_states_fp8,
         gemm1_weights_fp8,
@@ -3149,8 +3385,8 @@ def testTrtllmFp8PerTensorScaleMoe(args):
     ):
         # Note: FP8 per-tensor MOE expects int64_t for n_group/topk_group, not Optional[int64_t]
         # So we convert None to 0 to indicate "no groups" mode
-        return trtllm_fp8_per_tensor_scale_moe(
-            routing_logits=routing_logits,
+        return fn(
+            routing_input,
             routing_bias=routing_bias,
             hidden_states=hidden_states_fp8,
             gemm1_weights=gemm1_weights_fp8,
@@ -3169,12 +3405,15 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
             enable_pdl=args.enable_pdl,
-            **_activation_kwarg(trtllm_fp8_per_tensor_scale_moe, activation_type),
+            **_activation_kwarg(fn, activation_type),
         )
 
+    def run_fp8_per_tensor_moe(*tensors):
+        return call_fp8_per_tensor_moe(moe_fn, *tensors)
+
     run_fp8_per_tensor_moe_args = (
-        routing_logits,
-        routing_bias,
+        routing_input,
+        kernel_routing_bias,
         hidden_states_fp8,
         gemm1_weights_fp8,
         output1_scales_scalar,
@@ -3195,6 +3434,27 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         if autotuned
         else {}
     )
+
+    refcheck_passed = ""
+    if routed and args.refcheck:
+        fp8_args = (
+            hidden_states_fp8,
+            gemm1_weights_fp8,
+            output1_scales_scalar,
+            output1_scales_gate_scalar,
+            gemm2_weights_fp8,
+            output2_scales_scalar,
+            args.activation_type,
+        )
+        routed_out = _first_output(
+            run_fp8_per_tensor_moe(routing_input, None, *fp8_args)
+        )
+        logits_out = _first_output(
+            call_fp8_per_tensor_moe(
+                trtllm_fp8_per_tensor_scale_moe, routing_logits, routing_bias, *fp8_args
+            )
+        )
+        refcheck_passed = _check_routed_against_logits(args, routed_out, logits_out)
 
     # Benchmark timing
     times = bench_gpu_time(
@@ -3231,7 +3491,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         weight_dtype,
         input_format="fp8",
         weight_format="fp8",
-        routing_logits_dtype=routing_logits.dtype,
+        routing_logits_dtype=None if routed else routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
     )
@@ -3265,6 +3525,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
         cur_res["activation_type"] = args.activation_type.name
+        cur_res["refcheck_passed"] = refcheck_passed
         res.append(cur_res)
 
     return res
