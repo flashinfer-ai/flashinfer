@@ -18,7 +18,8 @@ limitations under the License.
 
 Public API
 ----------
-:func:`top_k_varlen` — selects top-K per row of decode-step logits.
+:func:`top_k_varlen` — selects top-K per row of decode-step logits, or per
+window of a packed prefill-indexer layout (``row_starts``).
 
 Backend choices
 ---------------
@@ -1579,7 +1580,8 @@ def top_k_varlen(
     load_balance: bool = True,
     workspace: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    r"""Top-K selection over batched decode-step logits.
+    r"""Top-K selection over batched decode-step logits, or over per-row
+    windows of a packed prefill-indexer layout (``row_starts``).
 
     Selects the top-``top_k`` elements from each row of ``logits``,
     respecting per-request KV-cache lengths given by ``seq_lens``.
@@ -1596,6 +1598,37 @@ def top_k_varlen(
     corner and on every other GPU.  Force a specific backend with
     ``backend="radix"``, ``"gvr"``, ``"gvr_2"``, ``"radix_filter"`` or
     ``"radix_cutlass"``.
+
+    Windowed (prefill) mode
+    -----------------------
+    ``row_starts``, ``max_seq_len`` and ``absolute_indices`` exist for ONE
+    layout and have no effect on decode calls. In decode every row is one
+    request whose keys start at column 0. The DSA prefill indexer instead
+    scores a whole chunk in one grouped GEMM: one row per new query token, and
+    the keys of every request in the batch packed along the column axis, so a
+    row's valid keys are a window ``[row_starts[r], row_starts[r] +
+    seq_lens[r])`` of its own request, and cells outside the window are never
+    written. Toy chunk, request A (2 new tokens) and request B (1 cached token
+    ``b0``, 3 new tokens), ``top_k=2``::
+
+                       col: 0   1  | 2   3   4   5       row_starts  seq_lens
+                            a0  a1 | b0  b1  b2  b3
+            row 0  a0     [ *   .  | .   .   .   .  ]       0           1
+            row 1  a1     [ *   *  | .   .   .   .  ]       0           2
+            row 2  b1     [ .   .  | *   *   .   .  ]       2           2
+            row 3  b2     [ .   .  | *   *   *   .  ]       2           3
+            row 4  b3     [ .   .  | *   *   *   *  ]       2           4
+
+    ``*`` marks a key inside the row's window, ``.`` a cell outside it
+    (garbage from the GEMM, never read as a candidate). ``row_starts`` says
+    where the row's request begins; ``seq_lens`` becomes the window length
+    (cached prefix + position + 1; the cached ``b0`` is a column, not a row).
+    Row 4 selecting ``b0`` and ``b2`` is returned as ``[0, 2]`` (positions
+    inside B, the default: a paged consumer maps them through B's page table)
+    or as ``[2, 4]`` (columns of ``logits``, ``absolute_indices=True``: the
+    ragged consumer reads the packed KV buffer by column). ``max_seq_len``
+    (here 4, the longest window) only selects the engine before the launch
+    and defaults to the logits width; it never changes which keys win.
 
     Parameters
     ----------
@@ -1628,8 +1661,8 @@ def top_k_varlen(
         Number of top elements per row.  GVR backend supports
         ``{512, 1024, 2048}``; radix backend has no restriction.
     row_starts : torch.Tensor, optional
-        Windowed (prefill) mode: where each row's request begins on the column
-        axis. 1-D ``int32`` CUDA tensor of shape ``(num_rows,)``; row ``r``
+        Windowed (prefill) mode only; passing it switches the mode on. Where
+        each row's request begins on the column axis. 1-D ``int32`` CUDA tensor of shape ``(num_rows,)``; row ``r``
         then ranks ``logits[r, row_starts[r] : row_starts[r] + seq_lens[r]]``
         (``seq_lens[r]`` is the WINDOW LENGTH: cached prefix + position + 1)
         and returns window-local indices (``column - row_starts[r]``; absolute
@@ -1651,7 +1684,7 @@ def top_k_varlen(
         call of the same (row count, top_k, ``max_seq_len``, logits width) or
         ``warmup_prefill``. Default ``None`` (every window starts at column 0).
     max_seq_len : int, optional
-        Windowed mode only: an optional tighter bound on the window lengths,
+        Windowed (prefill) mode only: an optional tighter bound on the window lengths,
         used to pick the engine before the launch (and before CUDA-graph
         capture, where the choice is frozen). Defaults to the logits width,
         which is always a valid bound (no window is wider than its row) but a
@@ -1671,7 +1704,7 @@ def top_k_varlen(
         logits width is clamped. Must be a Python ``int``. Ignored when
         ``row_starts`` is ``None``.
     absolute_indices : bool, optional
-        Windowed mode only: write each hit as its column of ``logits``
+        Windowed (prefill) mode only: write each hit as its column of ``logits``
         (``window-local index + row_starts[r]``) instead of the window-local
         position; ``-1`` padding is unchanged. In the DSA prefill layout the
         column axis is the batch's packed key sequence, so this is the
