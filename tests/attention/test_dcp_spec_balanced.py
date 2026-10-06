@@ -732,8 +732,9 @@ def test_balanced_scratch_sizes_are_shape_independent() -> None:
 
 
 def test_balanced_uri_names_the_family_instance_and_pins() -> None:
-    assert get_dcp_spec_balanced_uri("dcp_spec_bf16_balanced", "sm100a", 32) == (
-        f"cake_fmha_dcp_spec_bf16_balanced_n32_sm100a_{CAKE_FMHA_JIT_TAG}"
+    # the BF16 head_dim-128 family ships two programs (1 planner, 2 whole-tile static): its URI names the program
+    assert get_dcp_spec_balanced_uri("dcp_spec_bf16_balanced", "sm100a", 32, 2) == (
+        f"cake_fmha_dcp_spec_bf16_balanced_n32_program2_sm100a_{CAKE_FMHA_JIT_TAG}"
     )
     assert get_dcp_spec_balanced_uri(
         "dcp_spec_bf16_fp8_d256_balanced", "sm103a", 64
@@ -791,16 +792,11 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
             int(variants["at_or_above_grid"]),
             int(variants["static_one_wave"]),
         )
-        assert sorted((below, above, static)) == sorted(
+        # the rule's programs cover the family's values (the BF16 family runs one program below and at or above the grid)
+        assert sorted({below, above, static}) == sorted(
             int(v) for v in variants["values"]
         )
         regime = variants["static_one_wave_regime"]
-        assert regime == {
-            "page_size": 64,
-            "chunk_tokens": 256,
-            "min_chunks": 3,
-            "reduce_tickets_per_tile": 8,
-        }
 
         def program(batch, hkv, pages, sm):
             return dcp_balanced_program(
@@ -810,6 +806,31 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
                 max_pages_per_seq=pages,
                 sm_count=sm,
             )
+
+        if regime.get("form") == "whole_tiles":
+            # the BF16 head_dim-128 family: planner / whole-tile static, from the export-time regime table
+            assert kind == "bf16_p16" and (below, above, static) == (1, 1, 2)
+            assert regime["page_size"] == 16 and regime["one_request"] == 1
+            table = regime["whole_pages_max"]
+            assert table["148"]["8"] == 112 and table["152"]["8"] == 112
+            for sm in (148, 152):
+                # the b1 s4096 cp4 row (65 pages, 8 KV-head tiles) and the table's bound; 113 pages is the planner
+                assert program(1, 8, 65, sm) == static
+                assert program(1, 8, 112, sm) == static and program(1, 8, 113, sm) == below
+                # the 16k row (257 pages), two and eight requests: the planner program
+                assert program(1, 8, 257, sm) == below
+                assert program(2, 8, 65, sm) == below and program(8, 8, 65, sm) == below
+                # at or above the grid the family keeps its planner body
+                assert program(-(-sm // 8), 8, 65, sm) == above == below
+            # an SM count outside the table keeps the planner program
+            assert program(1, 8, 65, 160) == below
+            continue
+        assert regime == {
+            "page_size": 64,
+            "chunk_tokens": 256,
+            "min_chunks": 3,
+            "reduce_tickets_per_tile": 8,
+        }
 
         for sm in (148, 152):
             # the b1 s8192 cp4 row (36 pages -> 9 chunks per pair; 8 x (9 + 8) = 136 tickets) is the static regime
@@ -881,6 +902,45 @@ def test_fp8_program_row_selection(monkeypatch) -> None:
     calls["static"].clear()
     inputs = _rank_inputs(
         "fp8_p64", batch=1, q_len=4, prefixes=[8192], cp_world=4, cp_rank=0
+    )
+    run_dcp_spec_decode(**inputs)
+    assert not calls["balanced"] and len(calls["static"]) == 1
+
+
+def test_bf16_program_row_selection(monkeypatch) -> None:
+    """The bf16 b1 s4096 cp4 row (one request, 65 pages, eight KV-head tiles) runs the whole-tile static program when
+    the caller forces the balanced route (the ``auto`` band keeps that one-wave row on the static specialization);
+    b8 and the 16k b1 row run the planner program."""
+
+    variants = dcp_balanced_program_variants("dcp_spec_bf16_balanced")
+    if variants is None:
+        pytest.skip("the shipped BF16 head_dim-128 family has one program")
+    calls, _launches = _patch_loaders(monkeypatch)
+    for batch, prefix, route, n_rows, expected in (
+        (1, 4096, "balanced", 32, variants["static_one_wave"]),
+        (8, 4096, "auto", 32, variants["below_grid"]),
+        (1, 16384, "balanced", 32, variants["below_grid"]),
+    ):
+        calls["balanced"].clear()
+        calls["static"].clear()
+        inputs = _rank_inputs(
+            "bf16_p16",
+            batch=batch,
+            q_len=4,
+            prefixes=[prefix] * batch,
+            cp_world=4,
+            cp_rank=0,
+        )
+        run_dcp_spec_decode(**inputs, route=route)
+        assert calls["balanced"] == [
+            ("dcp_spec_bf16_balanced", "sm100a", n_rows, int(expected))
+        ], (batch, prefix, route)
+        assert not calls["static"]
+    # ``auto`` routes the one-wave b1 row to the static specialization (band reason ``one_wave``).
+    calls["balanced"].clear()
+    calls["static"].clear()
+    inputs = _rank_inputs(
+        "bf16_p16", batch=1, q_len=4, prefixes=[4096], cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
     assert not calls["balanced"] and len(calls["static"]) == 1
@@ -1188,7 +1248,8 @@ def test_bf16_band_row_launches_the_balanced_program(monkeypatch) -> None:
         "bf16_p16", batch=8, q_len=4, prefixes=[4096] * 8, cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
-    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, None)]
+    # eight requests: the planner program (1); the whole-tile static program (2) is the one-request regime
+    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 1)]
     assert (
         dcp_balanced_program(
             "bf16_p16",
@@ -1197,7 +1258,7 @@ def test_bf16_band_row_launches_the_balanced_program(monkeypatch) -> None:
             max_pages_per_seq=int(inputs["block_tables"].shape[1]),
             sm_count=148,
         )
-        is None
+        == 1
     )
     assert not calls["static"]
     (args,) = launches["balanced"]
@@ -1224,7 +1285,8 @@ def test_bf16_q8_row_uses_the_64_row_instance(monkeypatch) -> None:
         "bf16_p16", batch=1, q_len=8, prefixes=[16384], cp_world=4, cp_rank=0
     )
     run_dcp_spec_decode(**inputs)
-    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 64, None)]
+    # 4097 rank-local keys = 257 pages: outside the whole-tile regime, the planner program
+    assert calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 64, 1)]
 
 
 def test_band_row_without_balanced_scratch_keeps_the_static_route(monkeypatch) -> None:
@@ -1287,8 +1349,9 @@ def test_forced_balanced_route_serves_a_row_outside_the_band(monkeypatch) -> Non
         == "static"
     )
     run_dcp_spec_decode(**inputs, route="balanced")
+    # one request of 65 pages on 148 SMs is inside the whole-tile regime (whole_pages_max 112): program 2
     assert (
-        calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, None)]
+        calls["balanced"] == [("dcp_spec_bf16_balanced", "sm100a", 32, 2)]
         and len(launches["balanced"]) == 1
     )
 

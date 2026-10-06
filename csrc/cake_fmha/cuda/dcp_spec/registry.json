@@ -94,6 +94,64 @@
           8
         ]
       },
+      "program_variants": {
+        "at_or_above_grid": 1,
+        "below_grid": 1,
+        "bodies": {
+          "1": "cake_fmha_dcp_spec_bf16_balanced_program1.cu",
+          "2": "cake_fmha_dcp_spec_bf16_balanced_program2.cu"
+        },
+        "default": 1,
+        "items_lower_bound": "batch_size * num_kv_heads",
+        "key": "program",
+        "rule": "program = static_one_wave when batch_size == 1, num_kv_heads < grid (sm_count) and max_pages_per_seq <= whole_pages_max[sm_count][num_kv_heads] (the planner plans whole tiles for every rank-local length within that page-table bound, so the static program issues each (request, KV head) tile whole from its CTA index: no planner, no partials, no reduce tickets, bitwise the planner program's result); else below_grid (= at_or_above_grid: the family keeps one planner body)",
+        "static_one_wave": 2,
+        "static_one_wave_regime": {
+          "form": "whole_tiles",
+          "one_request": 1,
+          "page_size": 16,
+          "whole_pages_max": {
+            "148": {
+              "1": 112,
+              "10": 112,
+              "12": 112,
+              "16": 112,
+              "2": 112,
+              "24": 112,
+              "3": 112,
+              "32": 112,
+              "4": 112,
+              "48": 224,
+              "5": 112,
+              "6": 112,
+              "64": 240,
+              "7": 112,
+              "8": 112
+            },
+            "152": {
+              "1": 112,
+              "10": 112,
+              "12": 112,
+              "16": 112,
+              "2": 112,
+              "24": 112,
+              "3": 112,
+              "32": 112,
+              "4": 112,
+              "48": 224,
+              "5": 112,
+              "6": 112,
+              "64": 240,
+              "7": 112,
+              "8": 112
+            }
+          }
+        },
+        "values": [
+          1,
+          2
+        ]
+      },
       "public_name": "cake_fmha_dcp_spec_bf16_balanced",
       "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_balanced",
       "selector": {
@@ -616,11 +674,12 @@
             "N_ROWS": 32
           },
           "selector": {
-            "n_rows": 32
+            "n_rows": 32,
+            "program": 1
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program1.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program1.cu"
           }
         },
         {
@@ -628,11 +687,38 @@
             "N_ROWS": 64
           },
           "selector": {
-            "n_rows": 64
+            "n_rows": 64,
+            "program": 1
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program1.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program1.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 32
+          },
+          "selector": {
+            "n_rows": 32,
+            "program": 2
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program2.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program2.cu"
+          }
+        },
+        {
+          "defines": {
+            "N_ROWS": 64
+          },
+          "selector": {
+            "n_rows": 64,
+            "program": 2
+          },
+          "sources": {
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program2.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel_program2.cu"
           }
         }
       ],

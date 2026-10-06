@@ -433,8 +433,15 @@ def dcp_balanced_program(
     ``batch_size * num_kv_heads * (n_max + reduce_tickets_per_tile)`` tickets
     fit the grid runs the plan-free static one-wave program
     (``static_one_wave``: ticket = CTA index, no device planner); every other
-    launch runs the default planner program (``below_grid``).  Mirrors the
-    manifest's ``program_variants`` rule from host metadata only.
+    launch runs the default planner program (``below_grid``).  The BF16
+    head_dim-128 family ships two programs under the regime's whole-tile form
+    (``form = whole_tiles``): a single request whose ``block_tables`` width is
+    within ``whole_pages_max[sm_count][num_kv_heads]`` runs the whole-tile
+    static program (one ticket per (request, KV head) tile, no device planner,
+    no partials; the planner itself plans whole tiles for every length within
+    that bound, so the output is bitwise the planner program's), every other
+    launch the planner program.  Mirrors the manifest's ``program_variants``
+    rule from host metadata only.
     """
 
     _check_dcp_balanced_kind(kind)
@@ -458,6 +465,25 @@ def dcp_balanced_program(
     if tiles >= int(sm_count):
         return int(variants["at_or_above_grid"])
     regime = variants["static_one_wave_regime"]
+    if regime.get("form", "split_chunks") == "whole_tiles":
+        # The whole-tile form (the BF16 head_dim-128 family): one request whose
+        # block-table width stays within ``whole_pages_max[sm_count][num_kv_heads]``
+        # (the widest bound for which the planner itself plans every tile whole)
+        # runs the static program; everything else, including SM counts or KV-head
+        # counts outside the table, runs the planner program.
+        limit = (
+            regime["whole_pages_max"]
+            .get(str(int(sm_count)), {})
+            .get(str(int(num_kv_heads)))
+        )
+        if (
+            int(batch_size) == 1
+            and int(regime.get("one_request", 1)) == 1
+            and limit is not None
+            and int(max_pages_per_seq) <= int(limit)
+        ):
+            return int(variants["static_one_wave"])
+        return int(variants["below_grid"])
     n_max = -(
         -int(max_pages_per_seq)
         * int(regime["page_size"])
