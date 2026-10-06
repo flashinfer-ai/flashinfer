@@ -579,8 +579,8 @@ _ARCH_REGISTRATIONS = {
                 "compile_flags": ["--use_fast_math"],
                 "identity": "a02d4f1a8e9fd92577ef6d101df0f4942f83c7ae13afb950fb6f78032286b108",
                 "sources": [
-                    "sm_100a/cake_dsv4_732d5cf6773cc8b4149e_kernel.cu",
-                    "sm_100a/cake_dsv4_732d5cf6773cc8b4149e_binding.cu",
+                    "common/cake_dsv4_fp8_h64_prefill_source_persistent_m64_kernel.cu",
+                    "common/cake_dsv4_fp8_h64_prefill_source_persistent_m64_binding.cu",
                 ],
             },
             "fp8_h64_prefill_source_persistent_m64_multi_tile": {
@@ -588,17 +588,17 @@ _ARCH_REGISTRATIONS = {
                 "compile_flags": ["--use_fast_math"],
                 "identity": "61e599ce3d53209553029873004c309a0fecc8827c2aa0c9ec8bfe1e4c1f2419",
                 "sources": [
-                    "sm_100a/cake_dsv4_cc3dc07386ea36e9e33e_kernel.cu",
-                    "sm_100a/cake_dsv4_cc3dc07386ea36e9e33e_binding.cu",
+                    "common/cake_dsv4_fp8_h64_prefill_source_persistent_m64_multi_tile_kernel.cu",
+                    "common/cake_dsv4_fp8_h64_prefill_source_persistent_m64_multi_tile_binding.cu",
                 ],
             },
             "fp8_h64_source_exact": {
                 "arg_plan": _PLAN_FP8_H64_SOURCE_EXACT_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "1c2a45ec13b59cfa15b542cdb949de73afd722850b3cc7fc627633fc0b377fb7",
+                "identity": "352746d692034c50a35b06d02d65716efe8dd8cc9e71eb6e2f77d51437188fce",
                 "sources": [
-                    "sm_100a/cake_dsv4_bb94c261f0b94b4516fa_kernel.cu",
-                    "sm_100a/cake_dsv4_bb94c261f0b94b4516fa_binding.cu",
+                    "sm_100a/cake_dsv4_36501bc12985abdd4500_kernel.cu",
+                    "sm_100a/cake_dsv4_36501bc12985abdd4500_binding.cu",
                 ],
             },
             "fp8_h8_h16_source_exact": {
@@ -634,10 +634,10 @@ _ARCH_REGISTRATIONS = {
             "fp8_lowhead_prefill": {
                 "arg_plan": _PLAN_FP8_LOWHEAD_QLAYOUT + _GRID,
                 "compile_flags": ["--use_fast_math"],
-                "identity": "65d592b28ce2923c0f1873272756107a672997e5a054a933a6ab2499fcb1adab",
+                "identity": "a3333942fb9f9681b6b06b4a4f1a5735947928a8ca41e4e4b680f5c4ab76a5d9",
                 "sources": [
-                    "sm_100a/cake_dsv4_63917d15d01eebe7aa89_kernel.cu",
-                    "sm_100a/cake_dsv4_63917d15d01eebe7aa89_binding.cu",
+                    "sm_100a/cake_dsv4_0aa7fec6b7ea28f44170_kernel.cu",
+                    "sm_100a/cake_dsv4_0aa7fec6b7ea28f44170_binding.cu",
                 ],
             },
             "split_reduce": {

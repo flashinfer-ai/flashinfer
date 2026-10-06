@@ -386,7 +386,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_74e3158027d9108791d3(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_swa_k, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_732d5cf6773cc8b4149e(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, const __grid_constant__ CUtensorMap tmap_swa_k, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1046,11 +1046,15 @@ kernel_cake_dsv4_74e3158027d9108791d3(const __grid_constant__ CUtensorMap tmap_q
                     int query_length = max_q_len;
                     if (ragged_query != 0) {
                         query_batch = 0;
-                        #pragma unroll 1
-                        for (int batch = 0; batch < batch_size; batch++) {
-                            if (mapped_query_idx_2 >= cum_seq_lens_q[batch + 1]) {
-                                query_batch = batch + 1;
-                            }
+                        #pragma unroll 2
+                        for (int chunk = 0; chunk < (batch_size + 31) / 32; chunk++) {
+                            int lane_entry = chunk * 32 + lane + 1;
+                            int _min_4 = ((lane_entry) < (batch_size) ? (lane_entry) : (batch_size));
+                            int lane_load = _min_4;
+                            unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, lane_entry <= batch_size && mapped_query_idx_2 >= cum_seq_lens_q[lane_load]);
+                            unsigned int started = _vote_1;
+                            int _popc_0 = __popc(started);
+                            query_batch = query_batch + _popc_0;
                         }
                         int query_begin = cum_seq_lens_q[query_batch];
                         query_length = cum_seq_lens_q[query_batch + 1] - query_begin;
@@ -1104,8 +1108,8 @@ kernel_cake_dsv4_74e3158027d9108791d3(const __grid_constant__ CUtensorMap tmap_q
                             #pragma unroll
                             for (int w = 0; w < 4; w++) {
                                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&staged_index_all[w])) : "r"(index_tile_addr + (w * 32 + lane) * 4));
-                                unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, staged_index_all[w] < 0);
-                                invalid_all[w] = _vote_1;
+                                unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, staged_index_all[w] < 0);
+                                invalid_all[w] = _vote_2;
                             }
                             invalid_cols[0] = ((n_half == 0) ? invalid_all[0] : invalid_all[2]);
                             invalid_cols[1] = ((n_half == 0) ? invalid_all[1] : invalid_all[3]);
@@ -1483,7 +1487,7 @@ kernel_cake_dsv4_74e3158027d9108791d3(const __grid_constant__ CUtensorMap tmap_q
                             {
                                 if (valid_sparse_cols != 0) {
                                     const float2 _fma_b2_3 = {softmax_scale_log2, softmax_scale_log2};
-                                    const float2 _fma_c2_4 = {-max_scaled, -max_scaled};
+                                    const float2 _fma_c2_4 = {8.0f - max_scaled, 8.0f - max_scaled};
                                     #pragma unroll
                                     for (int _lf = 0; _lf < 32; _lf++)
                                         fma_f32x2_inplace(&reinterpret_cast<float2*>(sv_split)[_lf], _fma_b2_3, _fma_c2_4);
@@ -1765,13 +1769,13 @@ kernel_cake_dsv4_74e3158027d9108791d3(const __grid_constant__ CUtensorMap tmap_q
                     if (has_sinks != 0 && sink_head < num_heads && split_idx_2 == 0 && n_half == 0) {
                         float sink_max = sinks[sink_head] * 1.4426950408889634f / softmax_scale_log2;
                         if (row_max_val > -CAKE_INF) {
-                            float _fma_3 = __fmaf_rn(sink_max, softmax_scale_log2, (-row_max_val) * softmax_scale_log2);
+                            float _fma_3 = __fmaf_rn(sink_max, softmax_scale_log2, 8.0f - row_max_val * softmax_scale_log2);
                             float sink_delta = _fma_3;
                             float _exp2_1 = approx_exp2(sink_delta);
                             row_sum_val = row_sum_val + _exp2_1;
                         } else {
                             row_max_val = sink_max;
-                            row_sum_val = 1.0f;
+                            row_sum_val = 256.0f;
                         }
                     }
                     smem_stats_sum[stats_row] = row_sum_val;
@@ -1888,8 +1892,8 @@ kernel_cake_dsv4_74e3158027d9108791d3(const __grid_constant__ CUtensorMap tmap_q
                 if (source_work_valid_3 != 0) {
                     {
                         int _max_15 = ((sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) : (0));
-                        int _min_4 = ((_max_15) < (sparse_topk) ? (_max_15) : (sparse_topk));
-                        int active_topk_3 = _min_4;
+                        int _min_5 = ((_max_15) < (sparse_topk) ? (_max_15) : (sparse_topk));
+                        int active_topk_3 = _min_5;
                         int _max_16 = ((active_topk_3) > (1) ? (active_topk_3) : (1));
                         all_num_kv_tiles_3 = (_max_16 + 128 - 1) / 128;
                     }
@@ -1919,8 +1923,8 @@ kernel_cake_dsv4_74e3158027d9108791d3(const __grid_constant__ CUtensorMap tmap_q
                         float acc_scale_1 = smem_stats_max[phase_1 * 128 + stats_row_1];
                         int split_prev_output_tile = pipeline_tile_1 - 1;
                         int split_o_full_phase = split_prev_output_tile & 1;
-                        int _vote_3 = __any_sync(0xFFFFFFFF, acc_scale_1 < 1.0f);
-                        int split_any_rescale = _vote_3;
+                        int _vote_4 = __any_sync(0xFFFFFFFF, acc_scale_1 < 1.0f);
+                        int split_any_rescale = _vote_4;
                         #pragma unroll
                         for (int o_stage = 0; o_stage < 2; o_stage++) {
                             uint32_t _mbar_token_6 = mbarrier_try_wait(o_full_addr + (o_stage) * 8, split_o_full_phase);
@@ -2717,8 +2721,8 @@ kernel_cake_dsv4_74e3158027d9108791d3(const __grid_constant__ CUtensorMap tmap_q
                 if (pv_valid != 0) {
                     int pv_query = source_work_z_5 * (unsigned int)max_q_len + source_work_x_5;
                     int _max_17 = ((sparse_topk_lens[pv_query] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[pv_query] + sparse_topk_lens_offset) : (0));
-                    int _min_5 = ((_max_17) < (sparse_topk) ? (_max_17) : (sparse_topk));
-                    int pv_active = _min_5;
+                    int _min_6 = ((_max_17) < (sparse_topk) ? (_max_17) : (sparse_topk));
+                    int pv_active = _min_6;
                     int _max_18 = ((pv_active) > (1) ? (pv_active) : (1));
                     int pv_tiles = (_max_18 + 128 - 1) / 128;
                     int pv_first = 1;
