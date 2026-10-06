@@ -109,14 +109,16 @@ def materialize_fused_moe_weights(
             )
             continue
 
-        if quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4) and isinstance(
-            backend_cfg, TrtllmFp4Config
-        ):
+        if quant.pair in (
+            (QuantFormat.NVFP4, QuantFormat.NVFP4),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        ) and isinstance(backend_cfg, TrtllmFp4Config):
             if "trtllm_fp4_routed" in pack.native_views:
                 continue
             view = TrtllmFp4Config.prepare_weights(
                 weights.w13,
                 weights.w2,
+                quant=quant,
                 num_local_experts=num_local,
                 hidden_size=hidden,
                 intermediate_size=intermediate,

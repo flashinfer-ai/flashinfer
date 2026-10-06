@@ -175,10 +175,40 @@ def test_packed_mxfp8_dispatch_width_uses_supported_transport_rows():
         packed_mxfp8_dispatch_width(255)
 
 
+@pytest.mark.parametrize("layout", ["expert_major", "rank_major"])
+def test_w4a8_pack_preserves_scale_bytes(monkeypatch, layout):
+    from flashinfer.quantization import fp8_quantization
+
+    x = torch.zeros(2, 2, 64, dtype=torch.bfloat16)
+    q = torch.zeros(4, 64, dtype=torch.float8_e4m3fn)
+    scales = torch.tensor(
+        [[0, 126], [127, 128], [129, 254], [255, 1]], dtype=torch.uint8
+    )
+    monkeypatch.setattr(
+        fp8_quantization, "mxfp8_quantize", lambda *args, **kwargs: (q, scales)
+    )
+    quant = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    if layout == "expert_major":
+        pack = build_activation_pack(x, quant=quant)
+    else:
+        pack = build_activation_pack_rank_major(
+            x,
+            torch.zeros(4, 1, dtype=torch.int32),
+            torch.ones(4, 1),
+            num_local_experts=2,
+            quant=quant,
+        )
+    assert pack.hidden_states_q is q
+    assert pack.hidden_states_scale.dtype == torch.float8_e4m3fn
+    assert pack.hidden_states_scale.shape == scales.shape
+    assert pack.hidden_states_scale.data_ptr() == scales.data_ptr()
+    assert torch.equal(pack.hidden_states_scale.view(torch.uint8), scales)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="MXFP8 quantization needs SM100/SM103",
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="MXFP8 quantization needs SM100/SM103/SM107",
 )
 def test_mxfp8_pre_dispatch_payload_matches_post_dispatch_quantization():
     num_local_experts, cap, hidden = 2, 3, 256
@@ -198,9 +228,12 @@ def test_mxfp8_pre_dispatch_payload_matches_post_dispatch_quantization():
     )
 
     assert packed.hidden_states_q.dtype is torch.float8_e4m3fn
-    assert packed.hidden_states_scale.dtype is torch.uint8
+    assert packed.hidden_states_scale.dtype is torch.float8_e4m3fn
     assert torch.equal(packed.hidden_states_q, direct.hidden_states_q)
-    assert torch.equal(packed.hidden_states_scale, direct.hidden_states_scale)
+    assert torch.equal(
+        packed.hidden_states_scale.view(torch.uint8),
+        direct.hidden_states_scale.view(torch.uint8),
+    )
     assert torch.equal(packed.topk_ids, direct.topk_ids)
 
 

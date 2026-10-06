@@ -14,10 +14,11 @@ class FusedMoeKernelConfig:
     """Inner compute via :class:`flashinfer.fused_moe.layer.MoELayer`.
 
     ``moe_config.backend`` controls the compute candidates independently of
-    the EP transport. For NVFP4, list both ``CuteDslConfig()`` and
-    ``TrtllmFp4Config()`` in ``BackendOptions`` to enable MoELayer's existing
-    backend selection, or list one to keep an explicit backend. Each candidate
-    retains its native eligibility checks and requires a prepared weight view.
+    the EP transport. For NVFP4×NVFP4 or MXFP4×MXFP8, list both
+    ``CuteDslConfig()`` and ``TrtllmFp4Config()`` in ``BackendOptions`` to enable
+    MoELayer's existing backend selection, or list one to keep an explicit
+    backend. Each candidate retains its native eligibility checks and requires
+    a prepared weight view.
     Warm up each input shape eagerly before CUDA graph capture.
     """
 
