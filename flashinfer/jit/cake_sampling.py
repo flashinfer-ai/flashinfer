@@ -29,31 +29,21 @@ from .core import JitSpec, gen_jit_spec, logger
 from .utils import write_if_different
 
 _GENERATED_DIR = "generated"
+# The root translation unit; its kernel bodies live in the ``source_files`` parts the manifest
+# lists (``cake_sampling_kernels_part<N>.cuh``, each under the repository's 5 MiB file limit),
+# which the root includes in order.
 _SOURCE_FILE = f"{_GENERATED_DIR}/cake_sampling_kernels.cu"
 _MANIFEST_FILE = f"{_GENERATED_DIR}/manifest.json"
 _BINDING_HEADER = "cake_sampling_binding.cuh"
+_MODULE_NAME = "cake_sampling"
 # The kernels use thread-block clusters, distributed shared memory, programmatic dependent launch
 # and redux.sync only, i.e. the sm_90 feature set, so one frozen source serves every compute
 # capability 9.x / 10.x / 11.x / 12.x device.  It is compiled once into a single fatbin with one
 # -gencode per target architecture; the targets come from FlashInfer's ``CompilationContext``:
 # ``FLASHINFER_CUDA_ARCH_LIST`` when set (AOT builds on hosts without a GPU), otherwise the
-# capabilities of the visible devices.
+# capabilities of the visible devices.  A stage-2/3 static form is compiled only for the targets
+# whose host dispatches it (the frozen source guards the other forms out per ``__CUDA_ARCH__``).
 SUPPORTED_MAJOR_VERSIONS: tuple[int, ...] = (9, 10, 11, 12)
-_MANIFEST_KEYS = {
-    "buckets",
-    "codegen_arch",
-    "compile_flags",
-    "kernel_count",
-    "kernel_symbols",
-    "min_compute_capability",
-    "schema_version",
-    "semantics",
-    "slab_entries",
-    "source_sha256",
-    "stage1",
-    "stage23",
-    "tma_abi",
-}
 _LOADED: dict[str, Any] = {}
 
 
@@ -131,79 +121,47 @@ def nvcc_flags() -> list[str]:
     )
 
 
-def _reject_duplicate_keys(pairs):
-    document = {}
-    for key, value in pairs:
-        if key in document:
-            raise RuntimeError(f"radix sampling manifest has duplicate key {key!r}")
-        document[key] = value
-    return document
+@functools.cache
+def load_manifest() -> dict[str, Any]:
+    """The frozen manifest (``csrc/cake_sampling/generated/manifest.json``).
+
+    It carries the launch resources of every frozen kernel (``stage1`` / ``stage23`` rows: symbol,
+    threads, dynamic shared memory, cluster size, build flags, the capabilities a stage-2/3 form is
+    dispatched on), the slab geometry and the names of the frozen source files.  The generator
+    writes it together with the source.
+    """
+    return json.loads((_get_csrc_dir() / _MANIFEST_FILE).read_text(encoding="utf-8"))
 
 
 @functools.cache
-def load_manifest() -> dict[str, Any]:
-    """Load and verify the frozen manifest (``csrc/cake_sampling/generated/manifest.json``)."""
-    csrc = _get_csrc_dir()
-    source = csrc / _SOURCE_FILE
-    manifest_path = csrc / _MANIFEST_FILE
-    binding = csrc / _BINDING_HEADER
-    missing = [p.name for p in (source, manifest_path, binding) if not p.is_file()]
-    if missing:
-        raise RuntimeError(
-            f"radix sampling source package is incomplete: missing {', '.join(missing)}"
-        )
-    try:
-        manifest = json.loads(
-            manifest_path.read_text(encoding="utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-        )
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise RuntimeError("radix sampling manifest is invalid JSON") from error
-    if not isinstance(manifest, dict) or set(manifest) != _MANIFEST_KEYS:
-        raise RuntimeError("radix sampling manifest schema is invalid")
-    if manifest["schema_version"] != 1 or manifest["tma_abi"] != "pointer":
-        raise RuntimeError("radix sampling manifest identity is invalid")
-    min_cc = manifest["min_compute_capability"]
-    if (
-        not isinstance(min_cc, list)
-        or len(min_cc) != 2
-        or not all(isinstance(v, int) for v in min_cc)
-        or tuple(min_cc) != (min(SUPPORTED_MAJOR_VERSIONS), 0)
-    ):
-        raise RuntimeError(
-            "radix sampling manifest min_compute_capability does not cover the compiled targets"
-        )
-    if not re.fullmatch(r"sm_[0-9]+a", str(manifest["codegen_arch"])):
-        raise RuntimeError("radix sampling manifest codegen_arch is invalid")
-    source_bytes = source.read_bytes()
-    if hashlib.sha256(source_bytes).hexdigest() != manifest["source_sha256"]:
-        raise RuntimeError("radix sampling source identity is invalid")
-    symbols = list(manifest["kernel_symbols"])
-    stage_symbols = [v["symbol"] for v in manifest["stage1"]] + [
-        v["symbol"] for v in manifest["stage23"]
-    ]
-    if symbols != stage_symbols or len(symbols) != manifest["kernel_count"]:
-        raise RuntimeError("radix sampling manifest kernel inventory is inconsistent")
-    for symbol in symbols:
-        definitions = re.findall(
-            rb"(?<![A-Za-z0-9_])" + re.escape(symbol.encode()) + rb"\(", source_bytes
-        )
-        if len(definitions) != 1:
-            raise RuntimeError(
-                f"radix sampling source does not define {symbol} exactly once"
-            )
-    return manifest
+def stage23_flags_by_capability() -> dict[Optional[tuple[int, int]], int]:
+    """``variant_flags`` of the stage-2/3 form each compute capability dispatches (manifest
+    ``capabilities``); the ``None`` key is the form every capability not listed runs."""
+    table: dict[Optional[tuple[int, int]], int] = {}
+    for v in load_manifest()["stage23"]:
+        flags = int(v["variant_flags"])
+        if v["capabilities"] is None:
+            table[None] = flags
+        else:
+            for major, minor in v["capabilities"]:
+                table[(int(major), int(minor))] = flags
+    return table
 
 
 def _binding_source(manifest: dict[str, Any]) -> str:
     min_major, min_minor = manifest["min_compute_capability"]
     stage1 = " ".join(
         f"X({v['symbol']}, {v['cluster']}, {v['ept']}, {1 if v['stream'] else 0}, "
-        f"{v['block_threads']}, {v['dynamic_smem_bytes']})"
+        f"{v['block_threads']}, {v['dynamic_smem_bytes']}, {1 if v['fused_tail'] else 0}, "
+        f"{1 if v['fused_block_tail'] else 0}, {1 if v['coarse_sample'] else 0}, "
+        f"{1 if v['spec_sample'] else 0}, {1 if v['slab_tail'] else 0}, "
+        f"{1 if v['coarse_push'] else 0}, {1 if v.get('leader_push', False) else 0}, "
+        f"{1 if v.get('local_select', False) else 0}, {1 if v.get('int_tail', False) else 0})"
         for v in manifest["stage1"]
     )
     stage23 = " ".join(
-        f"X({v['symbol']}, {v['threads']}, {v['items']}, {v['dynamic_smem_bytes']})"
+        f"X({v['symbol']}, {v['threads']}, {v['items']}, {int(v['variant_flags'])}, "
+        f"{v['dynamic_smem_bytes']})"
         for v in manifest["stage23"]
     )
     return f"""\
@@ -215,6 +173,8 @@ def _binding_source(manifest: dict[str, Any]) -> str:
 #define CAKE_SAMPLING_MIN_MAJOR {min_major}
 #define CAKE_SAMPLING_MIN_MINOR {min_minor}
 #define CAKE_SAMPLING_SLAB {manifest["slab_entries"]}
+#define CAKE_SAMPLING_FUSED_TAIL_KCAP {manifest["fused_tail_kcap"]}
+#define CAKE_SAMPLING_FUSED_BLOCK_TAIL_KCAP {manifest["fused_block_tail_kcap"]}
 #define CAKE_SAMPLING_STAGE1_TABLE(X) {stage1}
 #define CAKE_SAMPLING_STAGE23_TABLE(X) {stage23}
 #include "{_BINDING_HEADER}"
@@ -222,22 +182,28 @@ def _binding_source(manifest: dict[str, Any]) -> str:
 
 
 def _module_identity(manifest: dict[str, Any]) -> str:
-    """JIT module name: sealed over the frozen source, manifest and binding.
+    """JIT module name, sealed over the frozen source parts (manifest order), the manifest, the
+    binding header and the rendered binding: ``cake_sampling_`` + 20 hex digits.
 
-    The target architectures are not part of the name: FlashInfer's JIT workspace directory is
-    already keyed by the ``CompilationContext`` target set, so one name maps to one fatbin per
-    target set.
+    FlashInfer resolves installed AOT artifacts by module name before ninja sees the build inputs,
+    so a fixed name could load the artifact of another bundle revision; the content-derived name
+    cannot.  The target architectures are not part of the name:
+    FlashInfer's JIT workspace directory is already keyed by the ``CompilationContext`` target
+    set, so one name maps to one fatbin per target set.
     """
     csrc = _get_csrc_dir()
     digest = hashlib.sha256()
-    digest.update((csrc / _SOURCE_FILE).read_bytes())
+    for name in manifest["source_files"]:
+        digest.update((csrc / _GENERATED_DIR / name).read_bytes())
     digest.update(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode())
     digest.update((csrc / _BINDING_HEADER).read_bytes())
     digest.update(_binding_source(manifest).encode())
-    return f"cake_sampling_{digest.hexdigest()[:20]}"
+    return f"{_MODULE_NAME}_{digest.hexdigest()[:20]}"
 
 
+@functools.cache
 def get_cake_sampling_uri() -> str:
+    """Content-derived JIT module name (see :func:`_module_identity`), computed once per process."""
     return _module_identity(load_manifest())
 
 
@@ -246,7 +212,7 @@ def gen_cake_sampling_module() -> JitSpec:
     """One JIT spec compiling the frozen source for every ``CompilationContext`` target."""
     manifest = load_manifest()
     csrc = _get_csrc_dir()
-    uri = _module_identity(manifest)
+    uri = get_cake_sampling_uri()
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_sampling_binding.cu"
     write_if_different(binding, _binding_source(manifest))
     spec = gen_jit_spec(
@@ -285,6 +251,7 @@ __all__ = [
     "load_cake_sampling_module",
     "load_manifest",
     "nvcc_flags",
+    "stage23_flags_by_capability",
     "supported_capabilities",
     "supported_capability",
     "target_capabilities",

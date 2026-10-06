@@ -64,8 +64,9 @@ def _skip_sm107_unimplemented_moe_features(request):
     """Skip parameterizations the SM107 (Rubin) CuTe DSL MoE kernels do not implement.
 
     ``fused_moe/cute_dsl/rubin/`` holds a narrower specialisation of the
-    Blackwell kernels rather than a port of them: the gather kernel hardcodes
-    SwiGLU and exposes no ``activation_type``, its wrapper has no
+    Blackwell kernels rather than a port of them: the gather kernel implements
+    SwiGLU (including its SiTU variant) and Relu2 but not GeGLU-tanh or custom
+    SwiGLU alpha/beta/limit constants, its wrapper has no
     ``a_per_token_scale_ptr``, and the finalize kernel implements no unfused
     path. The wrappers raise ``NotImplementedError`` for these cases, which is
     correct behaviour -- but on Rubin it reports as a test failure on every CI
@@ -97,7 +98,7 @@ def _skip_sm107_unimplemented_moe_features(request):
         pytest.skip("SM107 finalize kernel implements only the fused path")
 
     if params.get("activation_type") == ActivationType.GegluTanh:
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
     # test_geglu_tanh_accuracy sets the activation in its body rather than via a
     # parameter, so it has to be matched by identity. Match the function exactly
@@ -105,7 +106,7 @@ def _skip_sm107_unimplemented_moe_features(request):
     # prefix but only exercises normalize_cute_dsl_moe_activation_type, touches no
     # kernel, and passes on SM107 -- a substring match silently dropped it.
     if request.node.function.__name__ == "test_geglu_tanh_accuracy":
-        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+        pytest.skip("SM107 gather grouped GEMM does not implement GeGLU-tanh")
 
     if (
         request.node.function.__name__
@@ -249,7 +250,12 @@ def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
     [
         (ActivationType.Swiglu, None, 1.0, "requires situ_beta"),
         (ActivationType.Swiglu, 0.0, None, "positive and finite"),
-        (ActivationType.GegluTanh, 1.0, None, "require ActivationType.Swiglu"),
+        (
+            ActivationType.GegluTanh,
+            1.0,
+            None,
+            "require ActivationType.Swiglu",
+        ),
     ],
 )
 def test_invalid_situ_config(activation_type, situ_beta, situ_linear_beta, error: str):
@@ -745,6 +751,47 @@ class TestInputsHelperContract:
             "token_selected_experts tensors. The seeded "
             "torch.random.fork_rng + manual_seed pattern in "
             "generate_token_selected_experts is broken."
+        )
+
+
+# =============================================================================
+# Test: routing PDL forwarding (no GPU required)
+# =============================================================================
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("enable_pdl", [False, True], ids=["pdl-off", "pdl-on"])
+def test_moe_core_forwards_enable_pdl(monkeypatch, enable_pdl):
+    from flashinfer.fused_moe.cute_dsl import fused_moe
+
+    class RoutingReached(Exception):
+        pass
+
+    def check_routing_pdl(**kwargs):
+        assert kwargs["enable_pdl"] is enable_pdl
+        # Stop before routing or GEMM kernels execute; only test flag forwarding.
+        raise RoutingReached
+
+    monkeypatch.setattr(fused_moe, "moe_sort", check_routing_pdl)
+
+    with pytest.raises(RoutingReached):
+        fused_moe._moe_core_impl(
+            x=torch.empty((2, 8), dtype=torch.uint8),
+            x_sf=torch.empty((2, 1), dtype=torch.uint8),
+            token_selected_experts=torch.zeros((2, 1), dtype=torch.int32),
+            token_final_scales=torch.ones((2, 1), dtype=torch.float32),
+            w1_weight=torch.empty((1, 32, 8), dtype=torch.uint8),
+            w1_weight_sf=torch.empty((1, 32, 1), dtype=torch.uint8),
+            w1_alpha=torch.ones(1, dtype=torch.float32),
+            fc2_input_scale=torch.ones(1, dtype=torch.float32),
+            w2_weight=torch.empty((1, 16, 8), dtype=torch.uint8),
+            w2_weight_sf=torch.empty((1, 16, 1), dtype=torch.uint8),
+            w2_alpha=torch.ones(1, dtype=torch.float32),
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            use_async_memset=False,
+            enable_pdl=enable_pdl,
         )
 
 
@@ -1744,12 +1791,6 @@ class TestCuteDslFusedMoeFunctional:
     ):
         from flashinfer import cute_dsl_fused_moe
 
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
-
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_local_experts = num_experts
 
@@ -1899,12 +1940,6 @@ class TestCuteDslFusedMoeFunctional:
         situ_linear_beta: float | None,
     ):
         """Accuracy test for SiTU with optional smooth up-branch clamping."""
-        if is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels do not implement SiTU; the "
-                "gather kernel is SwiGLU-only and silently ignores situ_beta/"
-                "situ_linear_beta"
-            )
         from flashinfer import cute_dsl_fused_moe
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
@@ -2403,12 +2438,6 @@ class TestCuteDslMoEWrapper:
         """Test wrapper API with autotune context."""
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
-
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_tokens, hidden_size, intermediate_size = 256, 256, 512

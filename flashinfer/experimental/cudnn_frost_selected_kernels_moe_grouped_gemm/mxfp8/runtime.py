@@ -22,6 +22,14 @@ from ..activations import ACTIVATIONS, is_gated
 _FC2 = "block_scale_grouped_gemm2"
 _OPS = {f"block_scale_grouped_gemm1_{name}" for name in ACTIVATIONS} | {_FC2}
 
+_TAIL_SLOTS = {
+    "output": -1,
+    "scale": 0,
+    "gate_scale": 1,
+    "linear_scale": 2,
+    "output_scale": 3,
+}
+
 
 @dataclass(frozen=True)
 class Mxfp8Kernel:
@@ -52,6 +60,10 @@ class Mxfp8Kernel:
         return self.tactic_metadata.get("swap_ab", False)
 
     @property
+    def quantizes_output(self):
+        return self.contract["output_dtype"] == "float8_e4m3fn"
+
+    @property
     def tactic(self):
         return (
             "cudnn_frost-mxfp8-v1",
@@ -61,8 +73,10 @@ class Mxfp8Kernel:
 
 
 @functools.lru_cache(maxsize=8)
-def discover(root: Path | None = None) -> tuple[Mxfp8Kernel, ...]:
-    """Load explicitly selected MXFP8 artifacts, separate from the BF16 pool."""
+def discover(
+    root: Path | None = None, *, quantized_output: bool = False
+) -> tuple[Mxfp8Kernel, ...]:
+    """Load BF16 grouped kernels or FC1 kernels with fused output quantization."""
     root = runtime.artifact_root("mxfp8") if root is None else Path(root)
     path = root / runtime._MANIFEST
     payload = json.loads(path.read_text())
@@ -78,12 +92,13 @@ def discover(root: Path | None = None) -> tuple[Mxfp8Kernel, ...]:
         if not isinstance(identity, str) or not identity or identity in seen:
             raise RuntimeError("MXFP8 artifact ids must be non-empty and unique")
         seen.add(identity)
-        runtime._validate_abi(raw, op)
         contract = raw.get("contract", {})
+        fused = contract.get("output_dtype") == "float8_e4m3fn"
+        runtime._validate_abi(raw, f"{op}_quantized" if fused else op)
         expected = dict(
             token_dtype="float8_e4m3fn",
             weight_dtype="float8_e4m3fn",
-            output_dtype="bfloat16",
+            output_dtype="float8_e4m3fn" if fused else "bfloat16",
             scale_dtype="float8_e8m0fnu",
             block_size=32,
             scale_layout="F8_128x4",
@@ -92,6 +107,12 @@ def discover(root: Path | None = None) -> tuple[Mxfp8Kernel, ...]:
             if op == _FC2
             else op.removeprefix("block_scale_grouped_gemm1_"),
         )
+        if fused:
+            expected.update(
+                intermediate_dtype="bfloat16", output_scale_layout="segmented_F8_128x4"
+            )
+            if op == _FC2 or raw.get("tactic", {}).get("swap_ab"):
+                raise RuntimeError("fused MXFP8 output requires normal FC1")
         if any(contract.get(k) != v for k, v in expected.items()):
             raise RuntimeError(f"invalid MXFP8 numerical contract: {identity}")
         tail = tuple(raw.get("launch", {}).get("tail", ()))
@@ -99,6 +120,11 @@ def discover(root: Path | None = None) -> tuple[Mxfp8Kernel, ...]:
         expected_tail = {"output"} if op == _FC2 else {"output", "scale"}
         if expected["activation"] == "situ":
             expected_tail |= {"gate_scale", "linear_scale"}
+        if fused:
+            expected_tail.add("output_scale")
+            prefix = ("output_scale",) if store == "tma" else ("output", "output_scale")
+            if tail[: len(prefix)] != prefix:
+                raise RuntimeError(f"invalid fused MXFP8 launch tail: {identity}")
         if (
             store not in ("stg", "tma")
             or set(tail) != expected_tail
@@ -109,6 +135,8 @@ def discover(root: Path | None = None) -> tuple[Mxfp8Kernel, ...]:
         size = raw.get("workspace_bytes")
         if type(size) is not int or size <= 0 or size % 128:
             raise RuntimeError("MXFP8 workspace must be a positive multiple of 128")
+        if fused != quantized_output:
+            continue
         source, digest = runtime._read_source(root, raw)
         result.append(
             Mxfp8Kernel(
@@ -158,8 +186,8 @@ def _blocked(scales):
 
 
 def _offsets(offsets, rows):
-    if offsets.ndim != 1 or offsets.dtype != torch.int32 or not offsets.numel():
-        raise ValueError("offsets must be a nonempty int32 vector")
+    if offsets.ndim != 1 or offsets.dtype != torch.int32 or offsets.numel() < 2:
+        raise ValueError("offsets must be an int32 vector with G+1 explicit boundaries")
     starts = offsets.tolist()
     if (
         starts[0] != 0
@@ -186,12 +214,12 @@ def pack_token_scales(scales: torch.Tensor, offsets: torch.Tensor) -> torch.Tens
     rows, cols = scales.shape
     starts = _offsets(offsets, rows)
     result = torch.zeros(
-        segmented_scale_rows(rows, len(starts)) * ((cols + 3) // 4 * 4),
+        segmented_scale_rows(rows, len(starts) - 1) * ((cols + 3) // 4 * 4),
         dtype=torch.uint8,
         device=scales.device,
     )
     pos = 0
-    for begin, end in zip(starts, starts[1:] + [rows], strict=False):
+    for begin, end in zip(starts, starts[1:], strict=False):
         block = _blocked(scales[begin:end])
         result[pos : pos + block.numel()] = block
         pos += block.numel()
@@ -236,7 +264,7 @@ def _launch_arguments(
         s if kernel.swap_ab else n,
         k,
         e,
-        offsets.numel(),
+        offsets.numel() - 1,
         *(v for t in operands for v in t.stride()),
         *out.stride(),
     )
@@ -299,7 +327,10 @@ class PreparedMxfp8GroupedGemm:
         if offsets.device != tokens.device or not offsets.is_contiguous():
             raise ValueError("offsets must be contiguous on the token device")
         starts = _offsets(offsets, s)
-        geometry = dict(s=s, n=n, k=k, experts=e, groups=len(starts))
+        groups = len(starts) - 1
+        if groups % e:
+            raise ValueError("offsets must describe a positive multiple of E groups")
+        geometry = dict(s=s, n=n, k=k, experts=e, groups=groups)
         if kernel.arch != runtime._arch_for(tokens.device) or not all(
             runtime._dimension_matches(v, kernel.contract.get(key))
             for key, v in geometry.items()
@@ -309,7 +340,7 @@ class PreparedMxfp8GroupedGemm:
             raise ValueError("MXFP8 data must be float8_e4m3fn")
         if out.shape != (s, n) or out.dtype != torch.bfloat16:
             raise ValueError("output must be BF16 [S,N]")
-        required_sfa = segmented_scale_rows(s, len(starts)) * (k // 32)
+        required_sfa = segmented_scale_rows(s, groups) * (k // 32)
         required_sfb = e * n * (k // 32)
         for sf, size in (
             (token_scales, required_sfa),
@@ -318,6 +349,8 @@ class PreparedMxfp8GroupedGemm:
             _scale_bytes(sf)
             if sf.numel() != size:
                 raise ValueError(f"MXFP8 scale blob requires {size} bytes")
+        if kernel.quantizes_output:
+            raise ValueError("quantized FC1 kernels are launched by the MoE runner")
         if scale is not None and not kernel.fc1:
             raise ValueError("FC2 does not accept an output scale")
         if scale is None:

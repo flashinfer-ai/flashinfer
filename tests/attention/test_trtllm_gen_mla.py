@@ -1857,39 +1857,61 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
     "overrides,expected_domain",
     [
         (
-            {"batch_size": 1, "q_len": 4, "total_q": 4},
+            {"batch_size": 1, "q_len": 4, "total_q": 4, "kv_lens": (1024,)},
             "mla_bf16_native_split8_pdl",
+        ),
+        (
+            {"batch_size": 1, "q_len": 4, "total_q": 4, "kv_lens": (512,)},
+            "mla_bf16_vquarter",
+        ),
+        ({"batch_size": 1, "q_len": 8, "total_q": 8}, "mla_bf16_vquarter"),
+        ({"batch_size": 4, "q_len": 8, "total_q": 32}, "mla_bf16_vhalf"),
+        ({"batch_size": 4, "q_len": 16, "total_q": 64}, "mla_bf16_clc"),
+        ({"batch_size": 64, "q_len": 16, "total_q": 1024}, "mla_bf16_clc"),
+        (
+            {
+                "batch_size": 64,
+                "q_len": 2,
+                "total_q": 128,
+                "max_seq_len": 8192,
+                "table_width": 256,
+                "kv_lens": (4096,) * 63 + (8192,),
+            },
+            "mla_bf16_clc_exact007790",
         ),
         (
             {
-                "batch_size": 1,
-                "q_len": 1,
-                "total_q": 1,
-                "page_size": 64,
-                "enable_sink": True,
+                "batch_size": 64,
+                "q_len": 2,
+                "total_q": 128,
+                "max_seq_len": 8192,
+                "table_width": 256,
+                "kv_lens": (8192,) + (4096,) * 63,
             },
-            "mla_bf16_native_split8_pdl",
-        ),
-        (
-            {"batch_size": 1, "q_len": 8, "total_q": 8},
-            "mla_bf16_vquarter",
-        ),
-        (
-            {"batch_size": 4, "q_len": 8, "total_q": 32},
-            "mla_bf16_vhalf",
-        ),
-        (
-            {"batch_size": 4, "q_len": 16, "total_q": 64},
             "mla_bf16_clc",
         ),
         (
-            {"batch_size": 64, "q_len": 16, "total_q": 1024},
-            "mla_bf16_unsplit",
+            {
+                "batch_size": 512,
+                "q_len": 16,
+                "total_q": 8192,
+                "kv_lens": (1024,) * 512,
+            },
+            "mla_bf16_clc_exact007826",
         ),
+        ({"batch_size": 512, "q_len": 16, "total_q": 8192}, "mla_bf16_clc"),
         (
-            {"num_heads": 32, "qk_dim": 320, "value_dim": 256},
-            "mla_bf16_tail",
+            {
+                "page_size": 64,
+                "enable_sink": True,
+                "q_len": 1,
+                "total_q": 1,
+                "kv_lens": (1024,),
+            },
+            "mla_bf16_native_split8_pdl",
         ),
+        ({"page_size": 64, "enable_sink": True}, "mla_bf16_vquarter"),
+        ({"num_heads": 32, "qk_dim": 320, "value_dim": 256}, "mla_bf16_tail"),
         (
             {
                 "dtype": torch.float8_e4m3fn,
@@ -1900,9 +1922,15 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
             "mla_fp8_tail",
         ),
         (
-            {"dtype": torch.float8_e4m3fn, "q_len": 2, "total_q": 2},
+            {
+                "dtype": torch.float8_e4m3fn,
+                "q_len": 2,
+                "total_q": 2,
+                "kv_lens": (1024,),
+            },
             "mla_fp8_p32_qk_l2",
         ),
+        ({"dtype": torch.float8_e4m3fn, "q_len": 2, "total_q": 2}, "mla_fp8_tail"),
         (
             {
                 "dtype": torch.float8_e4m3fn,
@@ -1913,36 +1941,78 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
             },
             "mla_fp8_page64_pdl",
         ),
+        (
+            {"dtype": torch.float8_e4m3fn, "page_size": 64, "ragged_query": True},
+            "mla_fp8_tail",
+        ),
     ],
 )
-def test_trtllm_mla_blackwell_semantic_domain_selection(
+def test_trtllm_mla_blackwell_domain_selection(
     overrides: dict, expected_domain: str
 ) -> None:
     from flashinfer.mla.cake_trtllm_mla_blackwell import (
-        ROUTE_TO_DOMAIN,
-        _BlackwellDispatchMetadata,
-        _select_route,
+        ROUTES,
+        exact_route_candidate,
+        select_domain,
     )
 
     values = {
         "dtype": torch.bfloat16,
-        "batch_size": 1,
-        "q_len": 8,
-        "total_q": 8,
         "num_heads": 128,
         "qk_dim": 576,
         "value_dim": 512,
+        "qk_nope_head_dim": 128,
         "page_size": 32,
-        "max_seq_len": 1024,
         "topk": 0,
-        "table_ndim": 2,
+        "uses_shared_paged_kv_idx": True,
+        "ragged_query": False,
+        "enable_sink": False,
+        "skip_softmax": False,
+        "wants_lse": False,
+        "bmm2_scale": 1.0,
+        "batch_size": 1,
+        "q_len": 8,
+        "total_q": 8,
+        "max_seq_len": 1024,
+        "table_width": 32,
+        "kv_lens": None,
         "num_sms": 148,
     }
     values.update(overrides)
-    values["q_lens"] = (values["q_len"],) * values["batch_size"]
-    values["kv_lens"] = (values["max_seq_len"],) * values["batch_size"]
-    route = _select_route(_BlackwellDispatchMetadata(**values))
-    assert ROUTE_TO_DOMAIN[route] == expected_domain
+    # The host reads the KV lengths only for the pre-filtered geometries; a row
+    # that supplies them must be one, and a row that cannot select an exact,
+    # native-split or P32 route must not read them.
+    candidate = exact_route_candidate(
+        **{
+            key: values[key]
+            for key in (
+                "dtype",
+                "num_heads",
+                "page_size",
+                "topk",
+                "ragged_query",
+                "enable_sink",
+                "skip_softmax",
+                "batch_size",
+                "q_len",
+                "table_width",
+            )
+        }
+    )
+    if values["kv_lens"] is not None:
+        assert candidate
+    domain = select_domain(**values)
+    assert domain == expected_domain
+    if not candidate:
+        assert domain in {
+            "mla_bf16_vquarter",
+            "mla_bf16_vhalf",
+            "mla_bf16_clc",
+            "mla_bf16_tail",
+            "mla_fp8_tail",
+            "mla_fp8_page64_pdl",
+        }
+    assert f"{domain}__sm_100a" in ROUTES and f"{domain}__sm_103a" in ROUTES
 
 
 def test_trtllm_mla_blackwell_rejects_non_scalar_or_nonfinite_scales() -> None:
@@ -1954,20 +2024,37 @@ def test_trtllm_mla_blackwell_rejects_non_scalar_or_nonfinite_scales() -> None:
         _normalize_scale(float("inf"), "bmm2_scale")
 
 
-def test_trtllm_mla_blackwell_caches_host_lengths_until_tensor_version_changes() -> (
-    None
-):
+def test_trtllm_mla_blackwell_row_metadata_is_computed_without_host_reads() -> None:
     from flashinfer.mla.cake_trtllm_mla_blackwell import (
-        _HOST_METADATA_CACHE,
-        _host_int_tuple,
+        longest_first_order,
+        row_metadata,
     )
 
-    _HOST_METADATA_CACHE.clear()
-    lengths = torch.tensor([1024, 768], dtype=torch.int32)
-    first = _host_int_tuple(lengths)
-    assert _host_int_tuple(lengths) is first
-    lengths.add_(1)
-    assert _host_int_tuple(lengths) == (1025, 769)
+    seq_lens = torch.tensor([1024, 300], dtype=torch.int32)
+    row_batches, row_seq_lens = row_metadata(
+        seq_lens, None, batch_size=2, q_len=2, total_q=4
+    )
+    assert row_batches.tolist() == [0, 0, 1, 1]
+    assert row_seq_lens.tolist() == [1023, 1024, 299, 300]
+    cum = torch.tensor([0, 1, 3], dtype=torch.int32)
+    row_batches, row_seq_lens = row_metadata(
+        seq_lens, cum, batch_size=2, q_len=2, total_q=3
+    )
+    assert row_batches.tolist() == [0, 1, 1]
+    assert row_seq_lens.tolist() == [1024, 299, 300]
+    # Longest rows first; equal tile counts keep row order.
+    assert longest_first_order(
+        torch.tensor([129, 1024, 128, 1024], dtype=torch.int32)
+    ).tolist() == [1, 3, 0, 2]
+
+
+def test_trtllm_mla_blackwell_page64_split_plan_is_size_based() -> None:
+    from flashinfer.mla.cake_trtllm_mla_blackwell import plan_num_split
+
+    assert plan_num_split(16, 4096, 148) == 4
+    assert plan_num_split(1, 1024, 148) == 4
+    assert plan_num_split(64, 8192, 152) == 2
+    assert plan_num_split(1, 128, 148) == 2
 
 
 @pytest.mark.parametrize(
@@ -1981,20 +2068,8 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
         pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
     if get_compute_capability(torch.device("cuda")) not in {(10, 0), (10, 3)}:
         pytest.skip("TRT-LLM MLA Blackwell requires SM100a or SM103a")
-    from flashinfer.mla.cake_trtllm_mla_blackwell import _source_catalog, _target_key
 
     device = torch.device("cuda")
-    try:
-        target = _target_key(device)
-    except ValueError as exc:
-        pytest.skip(f"TRT-LLM MLA Blackwell has no target for this GPU: {exc}")
-    shipped_targets = _source_catalog()["target_order"]
-    if target not in shipped_targets:
-        pytest.skip(
-            f"TRT-LLM MLA Blackwell generated-source catalog ships "
-            f"{shipped_targets!r}, not {target!r}"
-        )
-
     torch.manual_seed(42)
     page_size = 32
     max_seq_len = 1024
@@ -2028,11 +2103,7 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
         backend="cake",
     )
     reference = trtllm_mla_blackwell_reference(
-        query,
-        kv_cache,
-        block_tables,
-        seq_lens,
-        bmm1_scale,
+        query, kv_cache, block_tables, seq_lens, bmm1_scale
     )
     assert output.shape == (batch_size, q_len_per_request, 128, 512)
     torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)

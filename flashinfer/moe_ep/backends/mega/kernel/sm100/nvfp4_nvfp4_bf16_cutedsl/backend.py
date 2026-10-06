@@ -154,12 +154,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         The reducer is published for the datacenter-Blackwell targets that
         also run this CuTeDSL megakernel (sm_100a on B200, sm_103a on B300).
         """
-        from flashinfer.jit.cake_megamoe_topk_reduce import supported_capabilities
+        from flashinfer.jit.cake_megamoe_topk_reduce import supports_device
 
         k = self._kernel_config
         return (
-            torch.cuda.get_device_capability(torch.cuda.current_device())
-            in supported_capabilities()
+            supports_device()
             and fleet_params.max_tokens_per_rank in (256, 4096)
             and fleet_params.token_hidden_size == 4096
             and k.top_k == 6

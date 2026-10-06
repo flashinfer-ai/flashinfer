@@ -29,6 +29,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
+from ..quantization.nvfp4_quantization_utils import _UNSET
 from ..utils import get_compute_capability
 from .api import (
     BackendOptions,
@@ -58,8 +59,10 @@ from .api import (
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
+    PrimsTsConfig,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
+    SM12xNvfp4Bf16Config,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -90,8 +93,10 @@ from .runners import (
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    PrimsTsRunner,
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
+    SM12xNvfp4Bf16Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -124,8 +129,10 @@ _RunnerT = Union[
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    PrimsTsRunner,
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
+    SM12xNvfp4Bf16Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -158,8 +165,10 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CuTileNvfp4Bf16Config: CuTileNvfp4Bf16Runner,
     CuTileNvfp4Config: CuTileNvfp4Runner,
     CuteDslConfig: CuteDslRunner,
+    PrimsTsConfig: PrimsTsRunner,
     SM12xFp8Config: SM12xFp8Runner,
     SM12xMxfp8Mxfp4Config: SM12xMxfp8Mxfp4Runner,
+    SM12xNvfp4Bf16Config: SM12xNvfp4Bf16Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
@@ -219,6 +228,9 @@ class MoELayer:
 
         # Build one runner per compatible backend
         self.runners: List[_RunnerT] = []
+        # check_support() raises a precise reason; keep it instead of letting
+        # the filter swallow it, or every rejection reads "no usable backend".
+        rejected: List[str] = []
         for backend_cfg in config.backend:
             if not backend_cfg.supported(arch):
                 continue
@@ -238,7 +250,8 @@ class MoELayer:
                 )
                 runner = runner_cls(runner_config, device=self.device)
                 runner.check_support()
-            except (NotImplementedError, ValueError, RuntimeError):
+            except (NotImplementedError, ValueError, RuntimeError) as exc:
+                rejected.append(f"{runner_cls.__name__}: {exc}")
                 continue
             runner.build()
             self.runners.append(runner)
@@ -284,11 +297,32 @@ class MoELayer:
                 f"activation={config.quant.activation.name}, "
                 f"output={config.quant.output.name}."
             )
+            # Name the runners that implement an explicit recipe; the filter
+            # loop swallowed their _check_support() reasons.
+            if config.quant.nvfp4_4over6 is not _UNSET:
+                supporting = ", ".join(
+                    r.__name__
+                    for r in _BACKEND_RUNNERS.values()
+                    if r.supports_nvfp4_4over6
+                )
+                hint += (
+                    f" Note nvfp4_4over6={config.quant.nvfp4_4over6!r}: an "
+                    f"explicit NVFP4 4over6 setting is implemented only by "
+                    f"[{supporting}]; other backends read the "
+                    f"FLASHINFER_NVFP4_4OVER6* environment variables, which "
+                    f"leaving the field unset restores."
+                )
+            # Per-runner reasons last: they are the ground truth.
+            reasons = ""
+            if rejected:
+                reasons = " Backends rejected this configuration: " + "; ".join(
+                    rejected
+                )
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
                 f"arch sm{arch} for this configuration. Registered unified "
-                f"runners: [{mvp}].{hint}"
+                f"runners: [{mvp}].{hint}{reasons}"
             )
 
         # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
@@ -418,8 +452,7 @@ class MoELayer:
         weight_pack: MoEWeightPack,
         runners: List[_RunnerT],
     ) -> Tuple[_RunnerT, Any]:
-        """Run per-runner autotune, then measure each winner-tactic and
-        pick cross-backend winner."""
+        """Tune each runner, then select by packing + forward GPU latency."""
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
@@ -446,16 +479,15 @@ class MoELayer:
                 break
             from ..testing.utils import bench_gpu_time
 
-            # Measure runner at its winning tactic.  Use CUDA-graph timing so
-            # the cross-backend comparison reflects production (graph-captured)
-            # latency rather than per-call launch/Python overhead — at low token
-            # counts (~tens of us kernels) a no-graph 10-iter median is dominated
-            # by that overhead and picks the wrong backend.  Requires a warmed-up
-            # layer (the autotune pass above), not a cold capture.
+            def run_candidate(r=runner, t=tactic):
+                packed_inputs = r.pack_inputs(act_pack, weight_pack)
+                return r.forward(
+                    packed_inputs, tactic=t, **r.launch_kwargs_for(packed_inputs)
+                )
+
+            # Measure packing + forward GPU time after warmup.
             times = bench_gpu_time(
-                lambda r=runner, i=inputs, t=tactic, kw=launch_kwargs: r.forward(
-                    i, tactic=t, **kw
-                ),
+                run_candidate,
                 dry_run_iters=5,
                 repeat_iters=30,
                 use_cuda_graph=True,

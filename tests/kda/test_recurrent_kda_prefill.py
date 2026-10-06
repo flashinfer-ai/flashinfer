@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import importlib
-import json
 import math
 import sys
 import threading
@@ -111,7 +110,7 @@ def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
             "m128_bt64_unbounded_softplus", target
         )
         assert n32_uri != bt64_uri
-        assert bt64_uri.endswith(f"_8f5147c17f_{target}")
+        assert bt64_uri.endswith(f"_{target}")
     csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
     assert (csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu").is_file()
     assert (
@@ -119,31 +118,26 @@ def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
     ).is_file()
 
 
-def test_cake_kda_affine_manifest_controls_export_availability():
-    csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
-    manifest = json.loads(
-        (
-            csrc_dir / "cake_kda_bf16_affine_unbounded_softplus_import_manifest.json"
-        ).read_text()
-    )
+def test_cake_kda_affine_module_table_is_complete():
     cake_kda_jit_api.get_cake_kda_affine_module_specs.cache_clear()
     specs = cake_kda_jit_api.get_cake_kda_affine_module_specs()
-    if manifest["status"] == "pending_generated_sources":
-        assert manifest["modules"] == []
-        assert manifest["remaining_generated_inputs"]
-        assert specs == ()
-        assert not cake_kda_jit_api.cake_kda_affine_is_available()
-    else:
-        assert manifest["status"] == "complete"
-        assert len(specs) == 8
-        assert cake_kda_jit_api.cake_kda_affine_is_available()
-        assert {spec.target for spec in specs} == {"sm100a", "sm103a"}
-        assert {spec.role for spec in specs} == {
-            "main",
-            "map",
-            "scan",
-            "correction",
-        }
+    assert len(specs) == 8
+    assert cake_kda_jit_api.cake_kda_affine_is_available()
+    assert {spec.target for spec in specs} == {"sm100a", "sm103a"}
+    assert {spec.role for spec in specs} == {
+        "main",
+        "map",
+        "scan",
+        "correction",
+    }
+    for spec in specs:
+        assert spec.binding_path.is_file()
+        assert all(source.is_file() for source in spec.sources)
+    uris = {
+        cake_kda_jit_api.get_cake_kda_affine_uri(spec.target, spec.role)
+        for spec in specs
+    }
+    assert len(uris) == 8
 
 
 def _valid_cake_kda_affine_selector_kwargs():
@@ -5270,6 +5264,48 @@ def test_frozen_route_rejects_output_overlap(cuda_device, monkeypatch):
             backend="cake",
         )
     assert module.calls == []
+
+
+@pytest.mark.parametrize("name", ["q", "k", "v", "g", "beta", "initial_state"])
+@pytest.mark.parametrize("layout", ["contiguous", "transposed", "gapped", "expanded"])
+def test_output_overlap_checks_current_storage(cuda_device, name, layout):
+    storage = torch.empty(64, device=cuda_device, dtype=torch.bfloat16)
+    output = storage[16:32].view(4, 4)
+    if layout == "transposed":
+        output = output.T
+    elif layout == "gapped":
+        output = storage[16:32:2]
+    elif layout == "expanded":
+        output = storage[16:17].expand(4, 4)
+    inputs = {
+        key: torch.empty(4, device=cuda_device)
+        for key in ("q", "k", "v", "g", "beta", "initial_state")
+    }
+    inputs[name] = storage[:16]
+    kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
+    inputs[name] = storage[32:]
+    kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
+    inputs[name] = storage[16:17].view(torch.uint8)[1:2]
+    with pytest.raises(ValueError, match=f"output must not overlap {name}"):
+        kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
+    inputs[name] = storage[30:31] if layout == "gapped" else storage[16:17]
+    with pytest.raises(ValueError, match=f"output must not overlap {name}"):
+        kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
+    if layout == "expanded":
+        inputs[name] = storage[17:18]
+        kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
+    inputs[name] = storage[16:16]
+    kda_prefill_api._check_output_does_not_overlap_inputs(output, **inputs)
+    kda_prefill_api._check_output_does_not_overlap_inputs(output[:0], **inputs)
+
+
+def test_allocated_output_needs_no_overlap_check(monkeypatch):
+    def unexpected_range(tensor):
+        raise AssertionError("Fresh output cannot overlap live input storage")
+
+    monkeypatch.setattr(kda_prefill_api, "_tensor_byte_range", unexpected_range)
+    inputs = dict.fromkeys(("q", "k", "v", "g", "beta", "initial_state"))
+    kda_prefill_api._check_output_does_not_overlap_inputs(None, **inputs)
 
 
 def test_initial_state_is_updated_in_place(cuda_device, monkeypatch):

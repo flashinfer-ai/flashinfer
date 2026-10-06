@@ -29,6 +29,8 @@ _TAIL_SLOTS = {
     "gate_alpha": 4,
     "up_alpha": 5,
     "alpha": 4,
+    "output_scale": 6,
+    "quant_scale": 7,
 }
 
 
@@ -61,6 +63,10 @@ class Nvfp4Kernel:
         return self.tactic_metadata.get("swap_ab", False)
 
     @property
+    def quantizes_output(self):
+        return self.contract["output_dtype"] == "float4_e2m1fn_x2"
+
+    @property
     def tactic(self):
         return (
             "cudnn_frost-nvfp4-v1",
@@ -70,8 +76,10 @@ class Nvfp4Kernel:
 
 
 @functools.lru_cache(maxsize=8)
-def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
-    """Load explicitly selected NVFP4 artifacts, separate from the BF16 pool."""
+def discover(
+    root: Path | None = None, *, quantized_output: bool = False
+) -> tuple[Nvfp4Kernel, ...]:
+    """Load BF16 grouped kernels or FC1 kernels with fused output quantization."""
     root = runtime.artifact_root("nvfp4") if root is None else Path(root)
     path = root / runtime._MANIFEST
     payload = json.loads(path.read_text())
@@ -87,12 +95,13 @@ def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
         if not isinstance(identity, str) or not identity or identity in seen:
             raise RuntimeError("NVFP4 artifact ids must be non-empty and unique")
         seen.add(identity)
-        runtime._validate_abi(raw, op)
         contract = raw.get("contract", {})
+        fused = contract.get("output_dtype") == "float4_e2m1fn_x2"
+        runtime._validate_abi(raw, f"{op}_quantized" if fused else op)
         expected = dict(
             token_dtype="float4_e2m1fn_x2",
             weight_dtype="float4_e2m1fn_x2",
-            output_dtype="bfloat16",
+            output_dtype="float4_e2m1fn_x2" if fused else "bfloat16",
             scale_dtype="float8_e4m3fn",
             block_size=16,
             elements_per_byte=2,
@@ -105,6 +114,14 @@ def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
             if op == _FC2
             else op.removeprefix("block_scale_grouped_gemm1_"),
         )
+        if fused:
+            expected.update(
+                intermediate_dtype="bfloat16",
+                output_scale_layout="segmented_F8_128x4",
+                quant_scale_dtype="float32",
+            )
+            if op == _FC2 or raw.get("tactic", {}).get("swap_ab"):
+                raise RuntimeError("fused NVFP4 output requires normal FC1")
         if any(contract.get(k) != v for k, v in expected.items()):
             raise RuntimeError(f"invalid NVFP4 numerical contract: {identity}")
         tail = tuple(raw.get("launch", {}).get("tail", ()))
@@ -116,6 +133,11 @@ def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
             expected_tail.add("up_alpha")
         if expected["activation"] == "situ":
             expected_tail |= {"gate_scale", "linear_scale"}
+        if fused:
+            expected_tail |= {"output_scale", "quant_scale"}
+            prefix = ("output_scale",) if store == "tma" else ("output", "output_scale")
+            if tail[: len(prefix)] != prefix:
+                raise RuntimeError(f"invalid fused NVFP4 launch tail: {identity}")
         if (
             store not in ("stg", "tma")
             or set(tail) != expected_tail
@@ -126,6 +148,8 @@ def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
         size = raw.get("workspace_bytes")
         if type(size) is not int or size <= 0 or size % 128:
             raise RuntimeError("NVFP4 workspace must be a positive multiple of 128")
+        if fused != quantized_output:
+            continue
         source, digest = runtime._read_source(root, raw)
         result.append(
             Nvfp4Kernel(
@@ -175,8 +199,8 @@ def _blocked(scales):
 
 
 def _offsets(offsets, rows):
-    if offsets.ndim != 1 or offsets.dtype != torch.int32 or not offsets.numel():
-        raise ValueError("offsets must be a nonempty int32 vector")
+    if offsets.ndim != 1 or offsets.dtype != torch.int32 or offsets.numel() < 2:
+        raise ValueError("offsets must be an int32 vector with G+1 explicit boundaries")
     starts = offsets.tolist()
     if (
         starts[0] != 0
@@ -203,12 +227,12 @@ def pack_token_scales(scales: torch.Tensor, offsets: torch.Tensor) -> torch.Tens
     rows, cols = scales.shape
     starts = _offsets(offsets, rows)
     result = torch.zeros(
-        segmented_scale_rows(rows, len(starts)) * ((cols + 3) // 4 * 4),
+        segmented_scale_rows(rows, len(starts) - 1) * ((cols + 3) // 4 * 4),
         dtype=torch.uint8,
         device=scales.device,
     )
     pos = 0
-    for begin, end in zip(starts, starts[1:] + [rows], strict=False):
+    for begin, end in zip(starts, starts[1:], strict=False):
         block = _blocked(scales[begin:end])
         result[pos : pos + block.numel()] = block
         pos += block.numel()
@@ -255,7 +279,7 @@ def _launch_arguments(
         s if kernel.swap_ab else n,
         k,
         e,
-        offsets.numel(),
+        offsets.numel() - 1,
         *(v for t in operands for v in t.stride()),
         *out.stride(),
     )
@@ -267,7 +291,7 @@ def _launch_arguments(
         else (("gate_alpha",) if kernel.fc1 else ("alpha",))
     )
     tail.update(
-        (name, value.reshape(offsets.numel(), 1, 1))
+        (name, value.reshape(offsets.numel() - 1, 1, 1))
         for name, value in zip(alpha_names, gemm_scales, strict=True)
     )
     return (
@@ -308,6 +332,8 @@ class PreparedNvfp4GroupedGemm:
         gemm_scales: tuple[torch.Tensor, ...] | None = None,
         workspace: torch.Tensor | None = None,
     ):
+        if kernel.quantizes_output:
+            raise ValueError("quantized FC1 kernels are launched by the MoE runner")
         if tokens.device.type != "cuda":
             raise ValueError("NVFP4 grouped GEMM requires CUDA tensors")
         with torch.cuda.device(tokens.device):
@@ -332,7 +358,10 @@ class PreparedNvfp4GroupedGemm:
         if offsets.device != tokens.device or not offsets.is_contiguous():
             raise ValueError("offsets must be contiguous on the token device")
         starts = _offsets(offsets, s)
-        geometry = dict(s=s, n=n, k=k, experts=e, groups=len(starts))
+        groups = len(starts) - 1
+        if groups % e:
+            raise ValueError("offsets must describe a positive multiple of E groups")
+        geometry = dict(s=s, n=n, k=k, experts=e, groups=groups)
         if kernel.arch != runtime._arch_for(tokens.device) or not all(
             runtime._dimension_matches(v, kernel.contract.get(key))
             for key, v in geometry.items()
@@ -342,7 +371,7 @@ class PreparedNvfp4GroupedGemm:
             raise ValueError("NVFP4 data must be packed uint8 E2M1 pairs")
         if out.shape != (s, n) or out.dtype != torch.bfloat16:
             raise ValueError("output must be BF16 [S,N]")
-        required_sfa = segmented_scale_rows(s, len(starts)) * (k // 16)
+        required_sfa = segmented_scale_rows(s, groups) * (k // 16)
         required_sfb = e * n * (k // 16)
         for sf, size in (
             (token_scales, required_sfa),
@@ -359,11 +388,11 @@ class PreparedNvfp4GroupedGemm:
             raise ValueError("FC1 output scale must be float32 [1,1,1]")
         if gemm_scales is None:
             gemm_scales = tuple(
-                torch.ones(len(starts), dtype=torch.float32, device=tokens.device)
+                torch.ones(groups, dtype=torch.float32, device=tokens.device)
                 for _ in weights
             )
         if len(gemm_scales) != count or any(
-            value.dtype != torch.float32 or tuple(value.shape) != (len(starts),)
+            value.dtype != torch.float32 or tuple(value.shape) != (groups,)
             for value in gemm_scales
         ):
             raise ValueError(

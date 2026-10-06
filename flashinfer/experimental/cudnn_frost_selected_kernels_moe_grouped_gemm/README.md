@@ -67,9 +67,12 @@ out  = silu(gate) * up * scale
 ```
 
 `grouped_tokens` must already be materialized in contiguous group order.
-`first_token_offset[g]` is the first row of group `g`; the last group ends at
-`S`, and group `g` uses expert `g % E`. Routing, permutation, GEMM2, and final
-scatter are outside this API.
+`first_token_offset` contains `G+1` nondecreasing int32 boundaries starting at
+zero. Group `g` spans `[first_token_offset[g], first_token_offset[g+1])` and uses
+expert `g % E`; `G` is a positive multiple of `E`. The final boundary may be
+smaller than buffer capacity `S`; rows beyond it are not processed. Artifact ABI
+`v2` requires this explicit final boundary and rejects the old `v1` manifests.
+Routing, permutation, GEMM2, and final scatter are outside this API.
 
 An independent FC2 grouped-GEMM PoC and a full `CudnnFrostBf16MoeRunner` are also
 implemented. The old cuDNN Frost-FC1/CUTLASS-FC2 hybrid integration has been removed
@@ -89,6 +92,29 @@ lightweight `support.py` for numerical-contract admission and deferred runner
 construction. The root `support.py` contains the shared model/top-k and token-range
 policy. BF16 also provides its standalone `fc2.py`; MXFP8's grouped FC1 and FC2 share the same
 block-scale runtime.
+
+BF16 additionally offers an independent FMA tactic for all ten default activations
+on SM107a: E64/H2048/I1408/K6 at T=1..4, and E12/H7168/I3072/K2 at T=1. Full-pipeline
+autotuning compares it with the existing Tensor Core candidates. FC1 reads
+original tokens and routing IDs, computes BF16 products with FP32 FMA
+accumulation, and writes a route-ordered BF16 activation intermediate. FC2 preserves
+each expert's BF16 output boundary, then performs FP32 routing weighting and
+slot-ordered reduction inside the same kernel. The complete path launches two
+kernels without separate routing, gather, or finalize launches. FC1 computes
+two outputs per warp at T=1 and four at T=2..4. Other shapes retain their
+existing Tensor Core candidates. The `bf16/fma*.py` sources use
+the shared persistent JIT cache, external PTXAS and graph resource retention.
+
+All four FMA dtype paths share `fma_activations.py`. FC1 specializes the activation
+at compile time; non-gated variants omit gate weight/scale loads and the second
+dot product. FC1 compilation and tactic identities include the activation, while
+FC2's compiled source is shared across activations. The supported contracts are
+`SwiGLU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `SiTU`, `Identity`, `ReLU`, `ReLU2`,
+`SiLU` and `GELU`, with their default parameters. GeGLU/GELU use erf, and
+GeGLUTanh uses the tanh approximation. SwiGLUStep clamps after SiLU; SiTU
+transforms both up and gate. Activation runs in FP32, followed by BF16 rounding
+and, for quantized paths, intermediate quantization. Existing restrictions on
+custom activation parameters and per-expert overrides still apply.
 
 ## Artifact layout
 
@@ -152,6 +178,20 @@ eligible backends. Intermediate token counts use the next measured profile;
 native plans use the exact input shape. Calls beyond the largest token profile
 or without a matching table entry retain their original candidates.
 
+All ten default activations additionally offer an independent small-token FMA
+tactic on SM107a: E64/H2048/I1408/K6 at T=1..4, and E12/H7168/I3072/K2 at T=1.
+FC1 directly reads the original tokens and routing IDs, computes block32
+products with FP32 FMA accumulation, and fuses activation, BF16 rounding and MXFP8
+requantization. Each CTA produces one complete 32-element quantization block.
+FC2 consumes this route-ordered intermediate, preserves each expert's BF16
+output boundary, and fuses FP32 routing weighting and slot-ordered reduction.
+The complete path launches two kernels. It accepts linear and F8_128x4 input
+scales, including the minimum E8M0 scale, and retains the Tensor Core tactics
+for full-pipeline autotuning. Other shapes retain their existing candidates.
+`prepared_stage_inputs` rejects the FMA tactic because it has no grouped views.
+The `mxfp8/fma*.py` sources share the persistent JIT cache, external PTXAS and
+graph resource retention used by the other FMA paths.
+
 Prepare and autotune outside CUDA Graph capture. Activation data, activation
 scales, expert ids and routing weights may change between graph replays.
 Prepared weights and weight scales must remain static. For ordinary tensors,
@@ -177,8 +217,9 @@ each call. `bf16.runtime.clear_artifact_cache()` invalidates this metadata when
 refreshing artifacts. Measure ordinary warm calls separately from CUDA Graph
 replay, which bypasses Python admission and packing.
 
-The `artifacts/mxfp8/` pool retains 169 selected configurations in 39 source
-templates, with 400 measured two-by-two profiles. The offline pool covers all
+The `artifacts/mxfp8/` pool retains 169 selected BF16-output configurations in
+39 source templates, with 400 measured two-by-two profiles. It also includes
+111 fused FC1 configurations in twenty templates (60 STG and 51 TMA). The offline pool covers all
 44 families: ten FC1 activations and one shared FC2, each with normal/swap-AB
 and STG/TMA output variants. Only families used by the selected profiles ship.
 Geometry records share these templates. CTA/MMA/cluster geometry,
@@ -192,6 +233,11 @@ Export success alone does not establish correctness or performance. Validate
 and select candidates on the deployment GPU: shared-memory, L2 and persistent
 grid budgets are part of the compiled specialization. Each dtype has its own
 manifest and shortlist under the same artifact layout.
+
+Source filenames include an architecture prefix, for example
+`sources/sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_normal_stg.py`.
+Exports for another architecture use its own prefix, such as `sm120_`, so
+templates for different architectures can coexist in each dtype directory.
 
 All ten default activation contracts are included: gated `SwiGLU`, `GeGLU`,
 `GeGLUTanh`, `SwiGLUStep`, `SiTU`; non-gated `Identity`, `ReLU`, `ReLU2`,
@@ -211,6 +257,17 @@ python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.
   --output-dir "$ARTIFACT_DIR" --cudnn-frost-revision "$FROST_REVISION"
 ```
 
+Add `--quantize-output` for normal FC1 with fused MXFP8 quantization, using
+`--store-mode stg` or `--store-mode tma`. These variants retain a 32-element
+epilogue and explicit BF16 rounding before block32 quantization. Data stores
+use STG or TMA; E8M0 scales use STG in segmented F8_128x4 layout. Scale
+conversion rounds upward, and normalization honors byte zero as `2^-127`.
+The fused path removes the BF16 intermediate buffer and standalone quantizer.
+The runner keeps the original two FC1 choices and adds available fused variants
+of their normal geometries, paired with the same two FC2 choices. Autotuning
+measures up to twelve complete pipelines because fusion need not win for every
+shape. Standalone grouped preparation still accepts BF16-output kernels only.
+
 Use `--op grouped_gemm2` for FC2. Changing geometry while retaining the same
 operation, dtype, orientation and output store reuses the source file; an
 unexpected source difference is an error rather than a new geometry-named file.
@@ -223,13 +280,13 @@ from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runti
     _arch_for, _dimension_matches,
 )
 
-# x: grouped E4M3 [S,K]; gate/up: E4M3 [E,N,K]; offsets: int32 [G].
+# x: grouped E4M3 [S,K]; gate/up: E4M3 [E,N,K]; offsets: int32 [G+1].
 # x_sf: logical E8M0 bytes [S,K/32]; gate_sf/up_sf: [E,N,K/32].
 # Choose an artifact matching the operation, architecture and shape contract.
 arch = _arch_for(x.device)
 geometry = dict(
     s=x.shape[0], n=gate.shape[1], k=x.shape[1],
-    experts=gate.shape[0], groups=offsets.numel(),
+    experts=gate.shape[0], groups=offsets.numel() - 1,
 )
 kernel = next(
     (k for k in mxfp8.discover()
@@ -278,7 +335,7 @@ python benchmarks/bench_cudnn_frost_moe_mxfp8.py benchmark \
   --routing uniform --verify-locked-clocks --output "$RESULT_DIR/mxfp8_e2e.jsonl"
 ```
 
-The benchmark preserves the original backend tactics, checks all four Frost
+The benchmark preserves the original backend tactics, checks all Frost
 plans eagerly and through CUDA Graph replay, and records actual autotune winners.
 It alternates timing order over batched graph replays and reports numerical
 error, raw timings and GPU telemetry. Use `--artifacts DIR` to benchmark another
@@ -325,9 +382,51 @@ corresponding NVFP4 × NVFP4 pipeline and `cudnn_frost_nvfp4` automatic
 candidate. Both operands contain two E2M1 values per byte, with E4M3 block
 scales per 16 logical K elements. Logical N and K must be divisible by 128;
 packing halves the tensor's last storage dimension, not its logical K.
-Both grouped stages produce BF16. The native pipeline gathers packed inputs,
-runs fused FC1/activation, requantizes the intermediate to NVFP4, runs FC2,
-and reduces routed outputs in FP32 before the final BF16 conversion.
+The native pipeline gathers packed inputs, runs FC1/activation and intermediate
+NVFP4 quantization, runs FC2 with BF16 output, and reduces routed outputs in
+FP32 before the final BF16 conversion.
+
+Normal-orientation FC1 also has a fused quantization variant. Its graph marks
+the post-activation intermediate as BF16 before applying the FP32 global
+quantization scale. Frost preserves that BF16 conversion in registers, then
+writes packed E2M1 data and expert-segmented E4M3 scales directly for FC2.
+The data output has STG and TMA variants; the scale output uses STG in both.
+This removes the BF16 intermediate write/read and the standalone quantization
+launch. Blocks whose E4M3 scale underflows to zero may have different FP4 codes
+from the standalone quantizer, but both dequantize to zero.
+
+The measured two FC1 and two FC2 choices remain available. Their normal FC1
+geometries additionally contribute fused STG variants and, where Frost uses a
+32-element epilogue, fused TMA variants, for up to twelve full-pipeline tactics.
+Online tuning compares complete MoE calls because fusion can affect GEMM overlap.
+Swap-AB FC1 retains its
+separate quantizer; packed FP4 output in that orientation is not enabled.
+The standalone grouped API continues to return BF16.
+
+All ten default activations also offer one independent small-token NVFP4 FMA
+tactic on SM107a: E64/H2048/I1408/K6 at T=1..4, and E12/H7168/I3072/K2 at T=1. The existing
+Tensor Core candidates remain available to full-pipeline autotuning. Other
+geometries retain their existing candidate sets.
+
+This tactic launches two kernels. FC1 reads the original input and routing IDs,
+computes the required up/gate branches, applies activation and BF16 rounding,
+then writes NVFP4 data and one F8_128x4 scale segment per route. FC2 consumes
+those segments and combines
+the expert results in top-k slot order, preserving each expert's BF16 output
+boundary before FP32 weighting/reduction and final BF16 conversion. Both
+kernels decode FP4 in registers, use FP16 vector arithmetic for short dot
+products, and use FP32 for block scaling, accumulation and warp reductions.
+They do not materialize grouped inputs or a BF16 intermediate in global memory.
+`prepared_stage_inputs` rejects this tactic because its workspace is route-ordered.
+
+The FMA sources in `nvfp4/fma_fc*.py` follow the tiny-MoE algorithm from
+[PR #4](https://github.com/YangXu1990uiuc/flashinfer/pull/4). FC1's `_o2` and
+`_o4` variants compute two and four intermediate outputs per warp, respectively.
+`nvfp4/fma.py`
+specializes their shapes and uses the same source verification, external PTXAS,
+and persistent compilation path as the frozen Tensor Core kernels. Conversion
+helpers and the native adapter participate in source/tactic identities. Compiled
+functions remain owned by the native plan and retained during CUDA Graph replay.
 
 The runner consumes the canonical `cutlass_nvfp4` weight view. Activation
 scales may use linear or F8_128x4 layout. FC1 dequantization multiplies the
@@ -352,13 +451,21 @@ present, Frost reuses it without another
 copy; otherwise, retaining it alongside other backend views consumes
 additional weight memory. Frost does not convert other backends' views.
 
-`artifacts/nvfp4/` retains 154 selected configurations in 34 geometry-parameterized
-source templates and 400 measured two-by-two profiles. The offline sweep
+`artifacts/nvfp4/` retains 154 selected BF16-output configurations in 34
+geometry-parameterized source templates and 400 measured two-by-two profiles.
+It also contains 98 fused FC1 configurations (53 STG and 45 TMA) in twenty
+additional source templates, using the normal FC1 geometries from those profiles.
+Fused TMA templates retain only the 32-element epilogue drain. The offline sweep
 covers all 44 operation/orientation/store families, including every default
 gated and non-gated activation and the shared FC2. Only templates referenced
 by the selected profiles are packaged.
 
-Use `--dtype nvfp4` with the shared exporter. The corresponding stage and
+Use `--dtype nvfp4` with the shared exporter; add `--quantize-output` and
+`--store-mode stg` or `--store-mode tma` for a normal FC1 quantization variant.
+Export requires a Frost producer whose
+grouped scale-output ABI supports dynamic allocation extents. cuDNN remains an
+offline dependency; the frozen sources contain that ABI.
+The corresponding stage and
 full-layer benchmark is `benchmarks/bench_cudnn_frost_moe_nvfp4.py`, with
 the same command-line structure as the MXFP8 benchmark. Its default input
 standard deviation is 1.0: tiny inputs combined with unit global scales
@@ -376,7 +483,16 @@ tactic pool and including GPU work performed by `pack_inputs`.
 `cudnn_frost_mxfp8_mxfp4` automatic candidate. Activations use E4M3 data;
 weights pack two E2M1 values per byte. Both operands use E8M0 block scales
 per 32 logical K elements. Logical N and K must be divisible by 128.
-FC1/activation and FC2 produce BF16, with MXFP8 intermediate requantization.
+FC1 rounds its activation to BF16 before MXFP8 intermediate quantization;
+FC2 produces BF16. Normal FC1 also supports the fused STG/TMA variants
+described for MXFP8 above, with the same E8M0 block32 scale contract.
+
+The same small-token FMA tactic is available for the geometries listed in the
+MXFP8 section. `mxfp8_mxfp4/fma.py` specializes the shared `mxfp8/fma*.py`
+kernels for packed E2M1 weights. Both MX paths use FP32 dot-product accumulation:
+unscaled E4M3 products or block sums can overflow FP16 before the E8M0 scales
+are applied. Their intermediate quantization and finalized output contracts
+match the existing Tensor Core paths.
 
 The runner reuses the canonical `cutlass_mxfp8_mxfp4` weight view, including
 its packed weights, F8_128x4 scales and unit input multipliers. Input scales
@@ -391,8 +507,10 @@ backend list. Automatic Frost candidates are added when the layer is called.
 The quantization configuration uses
 `QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)`.
 
-`artifacts/mxfp8_mxfp4/` retains 169 selected configurations in 42
+`artifacts/mxfp8_mxfp4/` retains 169 selected BF16-output configurations in 42
 geometry-parameterized source templates and 400 measured two-by-two profiles.
+It also includes 101 fused FC1 configurations in twenty templates (52 STG and
+49 TMA).
 The offline pool covers all 44 operation/orientation/store families.
 
 Use `--dtype mxfp8_mxfp4` with the shared exporter and
@@ -406,8 +524,9 @@ the current CuTe DSL runner rejects W4A8 on this architecture.
 
 The SM107 selected source pool additionally supports default `GeGLU()`,
 `GeGLUTanh()`, `ReLU2()`, `SiTU()`, `SwiGLUStep()`, `GELU()`, `ReLU()`,
-`SiLU()`, and `Identity()`. This backend supports only SM107a (Rubin).
-Availability is checked
+`SiLU()`, and `Identity()`. The block-scaled pipelines support only SM107a
+(Rubin); BF16 additionally supports SM120a (see
+[SM120 warp-MMA artifacts](#sm120-warp-mma-artifacts)). Availability is checked
 against the architecture, geometry and activation in the manifest.
 
 Set `MoEConfig(activation=...)` using the existing typed activation API.
@@ -462,11 +581,12 @@ print(layer.winner_backend)               # "cudnn_frost_bf16" if cuDNN Frost wo
 
 Automatic admission is deliberately narrow:
 
-- SM107a (Rubin), BF16 input/weights/output, finalized output;
+- SM107a (Rubin) or SM120a (consumer/workstation Blackwell), BF16
+  input/weights/output, finalized output;
 - matching source artifacts for the requested activation and architecture;
-- on SM107a, all ten supported activations use registered stage shortlists for
-  `(E,H,I,top_k)` = `(12,7168,3072,1/2/4)`, `(8,4096,14336,2)`, or
-  `(64,2048,1408,6)`, with `1 <= num_tokens <= 12288`;
+- on each architecture, all ten supported activations use registered stage
+  shortlists for `(E,H,I,top_k)` = `(12,7168,3072,1/2/4)`, `(8,4096,14336,2)`,
+  or `(64,2048,1408,6)`, with `1 <= num_tokens <= 12288`;
 - `PackedPrecomputed` routing, int32 ids and FP32 routing weights;
 - an existing contiguous row-major `cutlass_bf16` weight view containing only
   `fc1_expert_weights[E,2I,H]` in **[up, gate]** order for gated activations
@@ -546,8 +666,8 @@ instantiation changes the concrete source AST. The deployed process needs no
 cuDNN installation to instantiate a template.
 
 Both stages independently support normal and swap-AB artifacts. Swapped kernels
-use explicit `cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1` and
-`cudnn_frost_grouped_gemm2_swap_ab_v1` ABIs, with matching `tactic.swap_ab` metadata.
+use explicit `cudnn_frost_grouped_gemm1_swiglu_swap_ab_v2` and
+`cudnn_frost_grouped_gemm2_swap_ab_v2` ABIs, with matching `tactic.swap_ab` metadata.
 The adapter exchanges operand order, M/N problem dimensions and output strides;
 the external [up, gate]/down weight layout and grouped workspace layout stay the
 same. Normal-ABI records without `swap_ab` remain valid. Contradictory ABI
@@ -678,6 +798,111 @@ automatic API result: use the `with_cudnn_frost` winner and its interleaved timi
 judge whether users actually benefit. Only validated, useful source kernels should be
 selected for packaging.
 
+### SM120 warp-MMA artifacts
+
+`artifacts/bf16/` also packages kernels of cuDNN Frost's SM120 MoE template,
+`sm120_moe_grouped_matmul_fwd.py`, for consumer and workstation Blackwell
+(`sm_120a`). Eight compute warps issue warp-level `mma.sync` from TMA-filled
+shared memory; a scheduler warp runs the same grouped persistent scheduler as
+SM100. The template addresses tokens by coordinate on one global TMA descriptor
+and stores through STG, so it patches no tensormap: the workspace is one
+128-byte scheduler-counter slot. There is no swap-AB orientation, CTA pair,
+cluster or TMA-store variant. Its families sit next to the SM107 ones as
+`sm120_cudnn_frost_*_bf16_normal_stg.py`, and its artifact ids start with
+`sm120_cudnn_frost_`; manifest and shortlist records carry `arch: sm_120a`.
+
+The sources are exported from cuDNN Frontend `a74b1b21`. Its SM120 host zeroes
+the scheduler counter with a one-thread kernel before the PDL main launch, as
+the SM100 MoE hosts do; earlier SM120 producers relied on the in-process cuDNN
+Frost launcher for that reset, which the FlashInfer adapter does not run. Like
+the SM107 sources, its scheduler takes `G+1` explicit group boundaries (launch
+ABI `v2`). The producer warpgroup (the TMA, scheduler and donor warps after the
+eight compute warps) releases its registers with one warpgroup-uniform
+`setmaxnreg` before the per-warp roles diverge, as the `.aligned` PTX
+instruction requires; the kernel body is otherwise that of `c132d859`.
+
+Admission, token-count shortlists, the native routing/finalize adapter and the
+MoELayer integration are shared with SM107a; the adapter is compiled with the
+`sm_120a` flags. Only CC 12.0 devices are admitted: SM121a sources have not been
+selected. The small-token FMA tactic remains SM107a-only, so SM120 keeps its
+Tensor Core candidates at those geometries. On SM120 the original BF16 pool is
+CUTLASS and cuTile.
+
+Kernels were selected on an RTX PRO 6000 Blackwell Server Edition (188 SMs,
+128 MB L2). The persistent grid size and the L2 rasterization budget are
+compile-time constants of each source, as on SM107; other CC 12.0 parts run
+the same kernels correctly, but should be revalidated before relying on their
+performance.
+
+On an SM120 GPU, `bench_cudnn_frost_moe_bf16.py export` exports its 34 SM120
+tiles (CTA M 32..256, N 32..256, K 32..128 bytes, four compute-warp grids) for
+the requested activation and model geometries. A single configuration can also
+be exported directly; SM120 configurations have no CTA pair or TMA store:
+
+```bash
+python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export \
+  --op grouped_gemm1_swiglu --config CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2 \
+  --cta-group 1 --store-mode stg --experts 12 --n 3072 --k 7168 \
+  --output-dir "$SM120_POOL" --cudnn-frost-revision "$FROST_REVISION"
+```
+
+The offline search exports every tile for every activation and model geometry,
+then runs stage-only sweeps over tokens
+`1,16,128,512,2048,4096,8192,12288` and uniform/skew routing. SwiGLU and
+ReLU2 screen every tile. The other gated or non-gated activations share the
+mainloop of their class, so `--candidates-from` screens only the eight tiles
+that SwiGLU or ReLU2 ranked fastest for the same case. FC2 is swept once. The
+`shortlist` command then keeps, per profile and stage, the two candidates with
+the best geometric mean of latency normalized by each routing's fastest, and
+validates every resulting FC1 x FC2 pair with routed inputs and CUDA Graph
+replay before copying it:
+
+```bash
+python benchmarks/bench_cudnn_frost_moe_bf16.py sweep --artifacts "$SM120_POOL" \
+  --output sweep-swiglu.jsonl --activation swiglu --stage-only 1 \
+  --geometries 12:7168:3072:1,12:7168:3072:2,12:7168:3072:4,8:4096:14336:2,64:2048:1408:6 \
+  --tokens 1,16,128,512,2048,4096,8192,12288 --rounds 7 --batch 16 --keep-going
+python benchmarks/bench_cudnn_frost_moe_bf16.py sweep --artifacts "$SM120_POOL" \
+  --output sweep-geglu.jsonl --activation geglu --stage-only 1 \
+  --candidates-from sweep-swiglu.jsonl ...   # same geometry/token/timing options
+python benchmarks/bench_cudnn_frost_moe_bf16.py shortlist --artifacts "$SM120_POOL" \
+  --results sweep-swiglu.jsonl --results sweep-geglu.jsonl ... --results sweep-fc2.jsonl \
+  --selected-dir flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/bf16 \
+  --validate --output shortlist.jsonl
+```
+
+Dual-GEMM tiles whose two accumulators exceed the compute warps' register
+grant (128x256 and 256x128 CTA tiles) are accepted by cuDNN Frost but measured
+20-240x slower than the best tile; the SwiGLU screen skips them with
+`--skip-kernel`.
+
+The packaged SM120 pool holds 373 selected model configurations (24 tiles, 11
+templates) and 400 two-by-two profiles; all 3,200 shortlisted FC1 x FC2 pairs
+passed eager and CUDA Graph validation with uniform and skew routing. Stage
+timings repeat one call, so a decode working set that fits in the 128 MB L2
+is measured warm, as in the SM107 sweeps.
+
+Complete-MoE comparisons against the original CUTLASS and cuTile pool used
+`benchmark --rounds 9 --iterations 10 --graph-batch 8`, tokens
+`1,16,128,512,2048,4096,8192,12288`. SM clocks were not locked, and the card
+power-capped at 600 W under sustained load: when both pools selected the same
+original backend, individual cases still varied by up to 11%. The benchmark
+therefore also reports `paired_speedup`, the median of per-round ratios.
+
+| Slice (152 cases) | Cases | With Frost (geomean / peak) | Frost only |
+| --- | --- | --- | --- |
+| All | 152 | 1.011x / 1.357x | 0.975x |
+| SwiGLU, E8/H4096/I14336/K2 | 16 | 1.083x / 1.357x | 1.077x |
+| SwiGLU, E64/H2048/I1408/K6 | 16 | 1.028x / 1.156x | 0.980x |
+| SwiGLU, E12/H7168/I3072/K1, K2, K4 | 48 | 1.004x / 1.145x | 0.994x |
+| Nine other activations, E12/H7168/I3072/K2, uniform | 72 | 0.996x / 1.078x | 0.940x |
+
+Speedups are original / with-Frost median latency; SwiGLU rows cover uniform
+and skew routing. Frost won the cross-backend selection in 64 cases. At one
+token, cuTile or CUTLASS remained faster and was kept (Frost only 0.854x).
+Results below 1x arise from that same-backend variation or from autotuning
+choosing between plans within a few percent of each other under it.
+
 ## Standalone cuDNN Frost FC2 PoC
 
 `bf16/fc2.py` implements an internal prepared launcher for:
@@ -686,21 +911,21 @@ selected for packaging.
 grouped_intermediate[S,I] @ down_weight[expert,H,I].T -> grouped_output[S,H]
 ```
 
-All data tensors are contiguous BF16. Offsets are int32[E], one group per
-local expert, with an implicit final end at S. Empty/uneven expert groups
-are supported. This stage does not apply routing weights or finalize/scatter.
+All data tensors are contiguous BF16. Offsets are int32[E+1], one group per
+local expert, with an explicit final boundary at or before S. Empty/uneven
+expert groups are supported. This stage does not apply routing weights or finalize/scatter.
 Preparation validates offsets and compiles or reloads the native TVM-FFI function outside
 CUDA Graph capture. `PreparedFc2.run()` resets the caller-owned descriptor /
 scheduler workspace and invokes that Function, without importing cuDNN Frost or
 compiling kernels during execution. Tensor metadata is prepared once; tensor contents may
 change between calls. Use distinct workspaces/plans for concurrent streams.
 
-The FC2 configurations target SM107a with dynamic S and are shared across
-activations. FC2's N is the **hidden size**, whereas FC1's N is the intermediate
-size. FC2 does not apply an activation; its configurations are selected
-independently from FC1.
+The FC2 configurations target SM107a or SM120a with dynamic S and are shared
+across activations. FC2's N is the **hidden size**, whereas FC1's N is the
+intermediate size. FC2 does not apply an activation; its configurations are
+selected independently from FC1.
 
-The FC2 records use `op=grouped_gemm2` and ABI `cudnn_frost_grouped_gemm2_v1`;
+The FC2 records use `op=grouped_gemm2` and ABI `cudnn_frost_grouped_gemm2_v2`;
 the manifest lists their Python source paths and digests. FC1 discovery ignores
 these records, retaining its separate candidate pool.
 
@@ -718,11 +943,14 @@ python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.
 The exporter renders and compiles the candidate with the chosen cuDNN Frost revision,
 then freezes `generated_path` and its device helpers into standalone Python.
 Device function bodies are retained; cuDNN Frost imports and its secondary compiled
-cache are removed. Sources use a `cudnn_frost_` prefix and configuration-based
-artifact names, preserving the operation, architecture, geometry, tile and
-store mode in the filename,
-including `swapAB` for swapped configurations. `select` verifies source hashes
-and refuses to replace different bytes.
+cache are removed, as are inlined helper definitions the kernel never reaches
+(shared Frost helper modules also carry other pipelines' wrappers, such as
+SM100 `tcgen05` for an SM120 kernel). Kernel names lead with the target
+architecture: a family is `<arch>_cudnn_frost_<op>_<dtype>_<orientation>_<store>.py`
+and a default artifact id starts `<arch>_cudnn_frost_<op>_` (e.g.
+`sm120_cudnn_frost_grouped_gemm2_...`), followed by the geometry, tile and
+store mode, including `swapAB` for swapped configurations. `select` verifies
+source hashes and refuses to replace different bytes.
 
 `tests/experimental/test_cudnn_frost_selected_kernels.py` focuses on the complete
 **cuDNN Frost FC1 + SwiGLU -> cuDNN Frost FC2 -> finalize** path: every compound tactic on

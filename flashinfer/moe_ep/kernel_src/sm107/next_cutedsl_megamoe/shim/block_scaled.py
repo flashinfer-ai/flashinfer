@@ -2,27 +2,25 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """SM107 (Rubin) block-scaled swap-AB inference mega-MoE frontend.
 
-Wraps the vendored ``sources.kernel_src.rubin.inference.mega`` kernel
-(``BlockScaledSwapAbMegaMoeKernel``) behind the standard two-entry-point mega
-contract:
+Wraps the vendored generic inference and GenPhase kernels behind the standard
+two-entry-point mega contract:
 
 - :func:`get_symm_buffer_for_sm107_block_scaled_mega_moe` — workspace allocator
-- :func:`sm107_block_scaled_mega_moe` — fused dispatch + FC1 + SwiGLU + FC2 +
-  combine compute entry
+- :func:`sm107_block_scaled_mega_moe` — fused dispatch + FC1 + activation +
+  FC2 + combine compute entry, with SwiGLU or SiTU
 
 The kernel is generic over the drop's ``QuantKind``; this shim wires up the
-``nvfp4`` and ``mxfp8_e4m3`` / ``mxfp8_e5m2`` kinds (``mxfp4`` /
-``mxfp4_mxfp8`` need a w4 weight-transform path and are not exposed yet).
+``nvfp4``, ``mxfp8_e4m3``, ``mxfp8_e5m2``, and ``mxfp4_mxfp8`` kinds.
+The mixed kind uses packed FP4 weights and E4M3 activations, both with
+E8M0 scales per 32 values.
 
 All ``sources`` / ``cutlass`` imports are function-local so importing this
 module stays CPU-safe (the package ``__init__`` re-exports from here).
 
-The staging/launch protocol mirrors the drop's own runner
-(``next/repo_internal_only/test_megamoe_rubin.py``): activation, activation
-SF, topk scores, the shared workspace, and (for the in-kernel-reduce path) the
-output live on the symmetric heap; routing indices are local int32 (16-byte
-aligned); workspaces are 128-byte aligned with their leading bytes zeroed
-before the first launch.
+Input activations, block scales, routing scores, and the shared workspace
+live on the symmetric heap, as does the output for in-kernel reduction.
+Routing indices are local int32 tensors aligned to 16 bytes. Workspaces are
+128-byte aligned with their leading bytes zeroed before the first launch.
 """
 
 from __future__ import annotations
@@ -37,7 +35,7 @@ from . import comm
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 
-Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"]
+Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
 Sm107WorkIdMode = Literal["grid_stride", "atomic_counter"]
 Sm107ScheduleMode = Literal["grouped", "phase_interleave"]
@@ -49,6 +47,7 @@ _KIND_TABLE: dict = {
     "nvfp4": (None, torch.float8_e4m3fn, Nvfp4BlockSize, 128),
     "mxfp8_e4m3": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
     "mxfp8_e5m2": (torch.float8_e5m2, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
+    "mxfp4_mxfp8": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
 }
 
 TransformedBlockScaledWeights = Tuple[torch.Tensor, torch.Tensor]
@@ -118,17 +117,17 @@ def _max_active_clusters(cluster_size: int) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class Sm107BlockScaledMoeConfig:
-    """Validated construction parameters for ``BlockScaledSwapAbMegaMoeKernel``."""
+    """Validated construction parameters for Rubin inference and GenPhase."""
 
     num_total_experts: int
     max_tokens_per_rank: int
     num_topk: int
     hidden: int
-    intermediate: int  # post-SwiGLU width; the FC1 GEMM N is 2*intermediate
+    intermediate: int  # width after activation; the FC1 GEMM N is 2*intermediate
     rank: int
     world_size: int
     quant_kind: Sm107QuantKind = "mxfp8_e4m3"
-    mma_tiler_mnk: Optional[Tuple[int, int, int]] = None  # None -> (256, 128, 4*ik)
+    mma_tiler_mnk: Optional[Tuple[int, int, int]] = None  # None -> (256, 128, 2*ik)
     cluster_shape_mn: Tuple[int, int] = (2, 1)
     # Mixed-CGA launch: alongside the preferred clusters, fill leftover SMs with
     # smaller fallback clusters (upstream commit a5b4d33). None = uniform launch.
@@ -148,10 +147,43 @@ class Sm107BlockScaledMoeConfig:
     token_back_mode: Sm107TokenBackMode = "epi_warps"
     apply_topk_at_fc1: bool = True
     max_sm_count: Optional[int] = None
+    activation: Literal["swiglu", "situ"] = "swiglu"
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[float] = None
+
+    kernel_variant: Literal["inference", "genphase"] = "inference"
+    combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
 
     def __post_init__(self) -> None:
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
+        if self.kernel_variant not in ("inference", "genphase"):
+            raise ValueError(f"unsupported kernel_variant {self.kernel_variant!r}.")
+        if self.combine_dtype not in ("bf16", "nvfp4", "mxfp8"):
+            raise ValueError(f"unsupported combine_dtype {self.combine_dtype!r}.")
+        if self.kernel_variant == "genphase" and self.combine_dtype != "bf16":
+            raise ValueError("GenPhase requires BF16 combine.")
+        if self.combine_dtype != "bf16" and self.reduce_topk_in_kernel:
+            raise ValueError("Quantized combine requires separate top-k reduction.")
+        if (
+            self.combine_dtype == "nvfp4"
+            and self.fc2_use_bulk
+            and self.token_back_mode == "epi_warps"
+        ):
+            raise ValueError(
+                "NVFP4 combine bulk stores require a token-back data path."
+            )
+        if self.activation not in ("swiglu", "situ"):
+            raise ValueError("activation must be 'swiglu' or 'situ'.")
+        if self.activation == "situ":
+            for name in ("situ_beta", "situ_linear_beta"):
+                value = getattr(self, name)
+                if value is None or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"SiTU requires positive, finite {name}.")
+            if self.gate_up_clamp is not None:
+                raise ValueError("SiTU does not support gate_up_clamp.")
+        elif self.situ_beta is not None or self.situ_linear_beta is not None:
+            raise ValueError("SiTU beta parameters require activation='situ'.")
         for name in (
             "num_total_experts",
             "max_tokens_per_rank",
@@ -193,6 +225,8 @@ class Sm107BlockScaledMoeConfig:
                 f"{max(2 * vec, 32)} (gate/up interleave + SF blocks) for "
                 f"{self.quant_kind}."
             )
+        if self.quant_kind == "mxfp4_mxfp8" and self.intermediate % 128:
+            raise ValueError("mxfp4_mxfp8 intermediate must be a multiple of 128.")
         tiler = self.resolved_mma_tiler_mnk
         instruction_k = self.instruction_k
         if len(tiler) != 3:
@@ -327,6 +361,32 @@ class Sm107BlockScaledMoeConfig:
                 "in-kernel reduce red-adds already-weighted terms)."
             )
 
+        if self.kernel_variant == "genphase":
+            if self.padded_tokens_per_rank > 1024:
+                raise ValueError("GenPhase supports at most 1024 tokens per rank.")
+            if (
+                self.cluster_shape_mn != (4, 1)
+                or self.fallback_cluster_shape_mn is not None
+            ):
+                raise ValueError("GenPhase requires uniform cluster_shape_mn=(4, 1).")
+            if not self.fc2_use_bulk:
+                raise ValueError("GenPhase requires fc2_use_bulk=True.")
+            if tiler[1] not in (128, 256):
+                raise ValueError("GenPhase requires tile N 128 or 256.")
+            if tiler[2] != 2 * instruction_k:
+                raise ValueError(
+                    f"GenPhase {self.quant_kind} requires tile K {2 * instruction_k} "
+                    "so each gathered row occupies one 128-byte swizzle atom."
+                )
+            if self.sf_padding_block != 128 or 128 % self.token_padding_block:
+                raise ValueError(
+                    "GenPhase requires SF padding 128 and token padding 64 or 128."
+                )
+            if self.token_back_mode != "epi_warps" or self.token_in_flag_batch != 1:
+                raise ValueError(
+                    "GenPhase does not use token-back or token-in flag knobs."
+                )
+
     @property
     def experts_per_rank(self) -> int:
         return self.num_total_experts // self.world_size
@@ -355,6 +415,12 @@ class Sm107BlockScaledMoeConfig:
     def torch_act_data_dtype(self) -> torch.dtype:
         dtype = _KIND_TABLE[self.quant_kind][0]
         return _fp4_storage_dtype() if dtype is None else dtype
+
+    @property
+    def torch_weight_data_dtype(self) -> torch.dtype:
+        if self.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
+            return _fp4_storage_dtype()
+        return self.torch_act_data_dtype
 
     @property
     def torch_act_sf_dtype(self) -> torch.dtype:
@@ -389,12 +455,28 @@ class Sm107BlockScaledSymmBuffer:
             self.x = comm.sym_zeros((tokens, cfg.hidden // 2), cfg.torch_act_data_dtype)
         else:
             self.x = comm.sym_zeros((tokens, cfg.hidden), cfg.torch_act_data_dtype)
-        self.sf_cols = int(kernel.token_comm.activation_sf_hidden_padded)
+        self.sf_cols = int(
+            kernel.token_comm.plain_activation_sf_row_elements
+            if cfg.kernel_variant == "genphase"
+            else kernel.token_comm.activation_sf_hidden_padded
+        )
         self.x_sf = comm.sym_zeros((tokens, self.sf_cols), cfg.torch_act_sf_dtype)
         self.topk_weights = comm.sym_zeros((tokens, cfg.num_topk), torch.float32)
         self.topk_idx = torch.full(
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
         )
+        # Stable local-expert pointers allow per-call scaling updates in graphs.
+        # Defaults and overrides are copied on every backend staging call.
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            setattr(
+                self,
+                name,
+                torch.ones(
+                    cfg.experts_per_rank, dtype=torch.float32, device=self.device
+                )
+                if cfg.quant_kind == "nvfp4"
+                else None,
+            )
         if self.topk_idx.data_ptr() % 16 != 0:
             raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
@@ -419,15 +501,27 @@ class Sm107BlockScaledSymmBuffer:
         )
         self.shared_workspace = comm.sym_zeros((max(shared_bytes, 1),), torch.uint8)
         self._pre_reduced_activation = None
+        self._pre_reduced_activation_sf = None
         if not cfg.reduce_topk_in_kernel:
-            region = kernel.token_comm.pre_reduced_activation_region
+            region = (
+                kernel.pre_reduced_activation_region
+                if cfg.kernel_variant == "genphase"
+                else kernel.token_comm.pre_reduced_activation_region
+            )
             start = workspace.offset(region)
             end = start + workspace.nbytes(region)
-            self._pre_reduced_activation = (
-                self.shared_workspace[start:end]
-                .view(torch.bfloat16)
-                .view(tokens, cfg.num_topk, cfg.hidden)
+            # Byte views also cover packed FP4/FP8 payloads, which do not
+            # support Torch masked_fill directly.
+            self._pre_reduced_activation = self.shared_workspace[start:end].view(
+                tokens, cfg.num_topk, -1
             )
+            if cfg.combine_dtype != "bf16":
+                region = kernel.token_comm.pre_reduced_activation_sf_region
+                start = workspace.offset(region)
+                end = start + workspace.nbytes(region)
+                self._pre_reduced_activation_sf = self.shared_workspace[start:end].view(
+                    tokens, cfg.num_topk, -1
+                )
         if (
             self.local_workspace.data_ptr() % 128 != 0
             or self.shared_workspace.data_ptr() % 128 != 0
@@ -454,7 +548,7 @@ class Sm107BlockScaledSymmBuffer:
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
 
-        from sources import RubinInferenceMegaMoE
+        from sources import RubinInferenceGenphaseMegaMoE, RubinInferenceMegaMoE
         from sources.api import ImplDesc, ProblemDesc
         from sources.quant_def import CombineFormat
 
@@ -506,8 +600,16 @@ class Sm107BlockScaledSymmBuffer:
                 "quant_kind": cfg.quant_kind,
                 "a_major_mode": OperandMajorMode.K,
                 "b_major_mode": OperandMajorMode.K,
-                "combine_format": CombineFormat.parse("bf16"),
+                "combine_format": CombineFormat.parse(
+                    {
+                        "bf16": "bf16",
+                        "nvfp4": "16e2m1xbf16",
+                        "mxfp8": "32e4m3xe8m0",
+                    }[cfg.combine_dtype]
+                ),
                 "gate_up_clamp": cfg.gate_up_clamp,
+                "situ_beta": cfg.situ_beta,
+                "situ_linear_beta": cfg.situ_linear_beta,
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -540,7 +642,12 @@ class Sm107BlockScaledSymmBuffer:
             )
             impl_fields["preferred_cluster_count"] = preferred_count
             impl_fields["fallback_cluster_count"] = fallback_count
-        return RubinInferenceMegaMoE(problem_desc, ImplDesc(impl_fields))
+        kernel_cls = (
+            RubinInferenceGenphaseMegaMoE
+            if cfg.kernel_variant == "genphase"
+            else RubinInferenceMegaMoE
+        )
+        return kernel_cls(problem_desc, ImplDesc(impl_fields))
 
     def note_staged_tokens(self, num_tokens: int) -> None:
         self._staged_tokens = int(num_tokens)
@@ -580,10 +687,11 @@ class Sm107BlockScaledSymmBuffer:
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
             "stream": _cu_stream(stream),
-            # nvfp4 per-expert dequant scalars (fc1_alpha / fc2_alpha /
-            # fc1_norm_const) are omitted: the weight/staging transforms
-            # quantize with norm_const=1.0, so the scalars are identically 1
-            # and the epilogue's const_expr None-path is exact.
+            **{
+                name: _to_cute(getattr(self, name), assumed_align=4)
+                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+                if self.config.quant_kind == "nvfp4"
+            },
         }
 
     def launch(
@@ -632,6 +740,12 @@ class Sm107BlockScaledSymmBuffer:
                 self.topk_idx >= self.config.num_total_experts
             )
             self._pre_reduced_activation.masked_fill_(invalid.unsqueeze(-1), 0)
+            if self.config.combine_dtype != "bf16":
+                # Clear BF16 amax for NVFP4; E8M0 byte 127 is unit scale for MXFP8.
+                sf_byte = 0 if self.config.combine_dtype == "nvfp4" else 127
+                self._pre_reduced_activation_sf.masked_fill_(
+                    invalid.unsqueeze(-1), sf_byte
+                )
         self._compiled(**self._launch_kwargs)
 
     def destroy(self) -> None:
@@ -646,6 +760,7 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_kwargs = None
         self._launch_weights = None
         self._pre_reduced_activation = None
+        self._pre_reduced_activation_sf = None
         for name in ("x", "x_sf", "topk_weights", "shared_workspace"):
             comm.free_sym_tensor(getattr(self, name, None))
             setattr(self, name, None)
@@ -654,6 +769,7 @@ class Sm107BlockScaledSymmBuffer:
         self.output_activation = None
         self.local_workspace = None
         self.topk_idx = None
+        self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
         self._destroyed = True
 
 
@@ -667,6 +783,8 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     world_size: int,
     *,
     quant_kind: Sm107QuantKind = "mxfp8_e4m3",
+    kernel_variant: Literal["inference", "genphase"] = "inference",
+    combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16",
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -683,11 +801,14 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     token_back_mode: Sm107TokenBackMode = "epi_warps",
     apply_topk_at_fc1: bool = True,
     max_sm_count: Optional[int] = None,
+    activation: Literal["swiglu", "situ"] = "swiglu",
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
 ) -> Sm107BlockScaledSymmBuffer:
     """Allocate the SM107 block-scaled mega session workspace.
 
     Problem sizes positional, tuning knobs keyword-only (the standard mega
-    allocator contract). ``intermediate`` is the post-SwiGLU width. Expert
+    allocator contract). ``intermediate`` is the width after activation. Expert
     weights are NOT owned by the workspace; they are passed per launch.
     """
     config = Sm107BlockScaledMoeConfig(
@@ -699,6 +820,8 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         rank=rank,
         world_size=world_size,
         quant_kind=quant_kind,
+        kernel_variant=kernel_variant,
+        combine_dtype=combine_dtype,
         mma_tiler_mnk=mma_tiler_mnk,
         cluster_shape_mn=cluster_shape_mn,
         fallback_cluster_shape_mn=fallback_cluster_shape_mn,
@@ -715,6 +838,9 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         token_back_mode=token_back_mode,
         apply_topk_at_fc1=apply_topk_at_fc1,
         max_sm_count=max_sm_count,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     return Sm107BlockScaledSymmBuffer(config)
 
@@ -726,7 +852,7 @@ def _expected_weight_shapes(
     experts = cfg.experts_per_rank
     fc1_out = 2 * cfg.intermediate
     vec = cfg.sf_vec_size
-    if cfg.quant_kind == "nvfp4":
+    if cfg.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
         fc1_shape = (experts, cfg.hidden // 2, fc1_out)
         fc2_shape = (experts, cfg.intermediate // 2, cfg.hidden)
     else:
@@ -763,11 +889,11 @@ def _validate_weight_leg(
             f"{expected_sf_numel * expected_weight_shape[0]}."
         )
     if (
-        weight.dtype != cfg.torch_act_data_dtype
+        weight.dtype != cfg.torch_weight_data_dtype
         or scale.dtype != cfg.torch_act_sf_dtype
     ):
         raise ValueError(
-            f"{name} requires {cfg.torch_act_data_dtype} weights and {cfg.torch_act_sf_dtype} scales."
+            f"{name} requires {cfg.torch_weight_data_dtype} weights and {cfg.torch_act_sf_dtype} scales."
         )
     if not weight.permute(0, 2, 1).is_contiguous() or not scale.is_contiguous():
         raise ValueError(
@@ -787,7 +913,7 @@ def sm107_block_scaled_mega_moe(
     fast_math: bool = True,  # accepted for mega API parity; the kernel has no toggle
     sync: bool = False,
 ) -> Optional[torch.Tensor]:
-    """Fused dispatch + FC1 + SwiGLU + FC2 + combine; writes ``y[:num_tokens]``.
+    """Fused dispatch, FC1, SwiGLU/SiTU, FC2, and combine; writes ``y[:num_tokens]``.
 
     The caller must have staged ``symm_buffer.x`` / ``.x_sf`` and the routing
     slices first. With ``y=None`` returns a workspace view (valid under stream

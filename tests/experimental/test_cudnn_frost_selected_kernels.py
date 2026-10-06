@@ -65,6 +65,24 @@ supported_gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
     reason="packaged cuDNN Frost sources target SM107a",
 )
+# BF16 additionally packages SM120a sources of the warp-MMA template.
+bf16_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 7), (12, 0)),
+    reason="packaged BF16 cuDNN Frost sources target SM107a and SM120a",
+)
+BF16_SHORTLIST_GEOMETRIES = {
+    (12, 7168, 3072, 1),
+    (12, 7168, 3072, 2),
+    (12, 7168, 3072, 4),
+    (8, 4096, 14336, 2),
+    (64, 2048, 1408, 6),
+}
+
+
+def _sm120():
+    """SM120 has STG normal-orientation kernels only: no swap-AB or TMA store."""
+    return torch.cuda.get_device_capability() == (12, 0)
 
 
 def bf16_config(topk=2, experts=8, intermediate=256, ceiling=16384):
@@ -118,12 +136,10 @@ def _bf16_moe_reference(act, weights, activation=None):
     return expanded.sum(dim=1).bfloat16()
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize("name", [name for name in ACTIVATIONS if name != "swiglu"])
 @pytest.mark.parametrize("tokens,topk", [(17, 1), (129, 4)])
 def test_bf16_extended_activations_graph_and_routing(name, tokens, topk, monkeypatch):
-    if torch.cuda.get_device_capability() != (10, 7):
-        pytest.skip("Extended activation sources have been selected on SM107")
     monkeypatch.setitem(sys.modules, "cudnn", None)
     torch.manual_seed(81)
     activation = ACTIVATIONS[name]()
@@ -144,7 +160,7 @@ def test_bf16_extended_activations_graph_and_routing(name, tokens, topk, monkeyp
         tokens * topk, 128, 256, 8, act.hidden_states_q.device, activation
     )
     assert {k.activation for k in first} == {name}
-    assert {k.swap_ab for k in first} == {False, True}
+    assert {k.swap_ab for k in first} == ({False} if _sm120() else {False, True})
     reference = _bf16_moe_reference(act, weights, activation)
     for tactic in runner.get_valid_tactics(inputs, None):
         out = runner.forward(inputs, tactic)
@@ -183,8 +199,9 @@ def test_bf16_extended_activation_scalars_are_not_silently_dropped(activation):
         activation_name(activation)
 
 
-def test_bf16_activation_artifact_pools_are_disjoint(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
+@pytest.mark.parametrize("capability", [(10, 7), (12, 0)])
+def test_bf16_activation_artifact_pools_are_disjoint(capability, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
     seen = set()
     shared_fc2 = None
     for name, cls in ACTIVATIONS.items():
@@ -200,7 +217,7 @@ def test_bf16_activation_artifact_pools_are_disjoint(monkeypatch):
         shared_fc2 = fc2_ids
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize("topk", [1, 2, 4])
 def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     topk, monkeypatch
@@ -222,7 +239,8 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     inputs = runner.pack_inputs(act, weights)
     expected = _bf16_moe_reference(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
-    assert len(tactics) == 16
+    # SM107: normal/swap-AB x STG/TMA per stage. SM120: three STG geometries.
+    assert len(tactics) == (9 if _sm120() else 16)
     if torch.cuda.get_device_capability() == (10, 7):
         first, second = bf16_moe._kernels(129 * topk, 128, 256, 8, torch.device("cuda"))
         assert {k.swap_ab for k in first} == {False, True}
@@ -255,7 +273,7 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     torch.cuda.current_stream().wait_stream(stream)
 
 
-@supported_gpu
+@bf16_gpu
 def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics():
     runner = bf16_moe.CudnnFrostBf16MoeRunner(bf16_config(), "cuda")
     runner.check_support()
@@ -282,7 +300,7 @@ def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics
         runner.pack_inputs(a, wa)
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
     [(12, 7168, 3072), (8, 4096, 14336), (64, 2048, 1408)],
@@ -291,8 +309,6 @@ def test_bf16_model_geometry_artifacts_ragged_graph(
     experts, hidden, intermediate, monkeypatch
 ):
     """Exercise every packaged pair on partial tiles and initially empty experts."""
-    if experts == 64 and torch.cuda.get_device_capability() != (10, 7):
-        pytest.skip("E64 artifacts are packaged for Rubin only")
     monkeypatch.setitem(sys.modules, "cudnn.gemm.frost.compiler", None)
     torch.manual_seed(97)
     act, weights = bf16_packs(
@@ -329,7 +345,7 @@ def test_bf16_model_geometry_artifacts_ragged_graph(
     assert error.item() < 0.01
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -539,7 +555,7 @@ def test_bf16_layer_adds_independent_candidate_and_separates_winner_cache(monkey
     assert not layer._winners
 
 
-@supported_gpu
+@bf16_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
     [(12, 7168, 3072), (8, 4096, 14336)],
@@ -602,6 +618,11 @@ def test_bf16_auto_admission_uses_validated_architecture_profiles(activation):
         (1, 7168, 107, True),
         (12289, 7168, 107, False),
         (4096, 4096, 100, False),
+        (4096, 7168, 120, True),
+        (1, 7168, 120, True),
+        (12289, 7168, 120, False),
+        (4096, 4096, 120, False),
+        (4096, 7168, 121, False),  # SM121a sources have not been selected
     ):
         act, _ = bf16_packs(
             tokens=tokens, experts=12, hidden=hidden, intermediate=3072, device="meta"
@@ -624,6 +645,7 @@ def test_bf16_auto_admission_uses_validated_architecture_profiles(activation):
     )
     assert not large_bf16_moe(cfg, act, 100)  # unsupported architecture
     assert large_bf16_moe(cfg, act, 107)  # four shortlisted plans compete normally
+    assert large_bf16_moe(cfg, act, 120)
 
 
 def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
@@ -631,21 +653,29 @@ def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
         runtime,
     )
 
-    for capability in ((10, 0), (10, 7), (10, 3)):
+    for capability in ((10, 0), (10, 7), (10, 3), (12, 0), (12, 1)):
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
         first, second = bf16_moe._kernels(258, 128, 256, 8, torch.device("cuda"))
-        if capability != (10, 7):
+        if capability not in ((10, 7), (12, 0)):
             assert not first and not second
         else:
             assert first and second
             assert {k.arch for k in (*first, *second)} == {
                 f"sm_{capability[0]}{capability[1]}a"
             }
+            if capability == (12, 0):
+                # The SM120 template has neither swap-AB nor TMA-store variants.
+                assert {
+                    (k.swap_ab, k.tactic_metadata["store_mode"])
+                    for k in (*first, *second)
+                } == {(False, "stg")}
     # Swapping changes the native signature: a flag alone cannot reinterpret
     # an old normal object, nor can a swapped object omit its orientation.
     for abi, swap in (
-        ("cudnn_frost_grouped_gemm2_v1", True),
-        ("cudnn_frost_grouped_gemm2_swap_ab_v1", False),
+        ("cudnn_frost_grouped_gemm2_v1", False),
+        ("cudnn_frost_grouped_gemm2_swap_ab_v1", True),
+        ("cudnn_frost_grouped_gemm2_v2", True),
+        ("cudnn_frost_grouped_gemm2_swap_ab_v2", False),
     ):
         with pytest.raises(RuntimeError, match="ABI"):
             runtime._validate_abi(
@@ -685,6 +715,75 @@ def test_bf16_source_distribution_has_no_binary_or_cudnn_frost_dependency():
         assert options == [f"--enable-tvm-ffi --gpu-arch {record['arch']}"]
 
 
+@bf16_gpu
+@pytest.mark.parametrize("stage", ["fc1", "fc2"])
+@pytest.mark.parametrize("swap", [False, True])
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_bf16_explicit_final_boundary_and_graph(stage, swap, store):
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16.fc2 import (
+        PreparedFc2,
+    )
+
+    torch.manual_seed(23)
+    s, h, i, e = 259, 128, 256, 8
+    first, second = bf16_moe._kernels(s, h, i, e, torch.device("cuda"))
+    kernels = [
+        kernel
+        for kernel in (first if stage == "fc1" else second)
+        if kernel.swap_ab == swap and kernel.tactic_metadata["store_mode"] == store
+    ]
+    if not kernels:
+        pytest.skip("this orientation/store is not in the packaged shortlist")
+    n, k = (i, h) if stage == "fc1" else (h, i)
+    x = torch.randn(s, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    gate = torch.randn(e, n, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    up = torch.randn_like(gate) * 0.1
+    offsets = torch.tensor(
+        [0, 0, 1, 128, 128, 130, 130, 130, 193], device="cuda", dtype=torch.int32
+    )
+    scale = torch.ones(1, device="cuda")
+    out = torch.full((s, n), -7.0, device="cuda", dtype=torch.bfloat16)
+    for kernel in kernels:
+        workspace = torch.empty(
+            kernel.workspace_bytes, device="cuda", dtype=torch.uint8
+        )
+        if stage == "fc1":
+            assert kernel in runtime.matching_kernels(x, gate, up, offsets, scale, out)
+
+            def run():
+                runtime._launch(kernel, x, gate, up, offsets, scale, out, workspace)
+
+        else:
+            run = PreparedFc2(kernel, x, gate, offsets, out, workspace).run
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for boundaries in (
+            [0, 0, 1, 128, 128, 130, 130, 130, 193],
+            [0, 2, 2, 2, 31, 193, 193, 193, 193],
+            [0] * 9,
+        ):
+            offsets.copy_(torch.tensor(boundaries, device="cuda", dtype=torch.int32))
+            expected = torch.full_like(out, -7)
+            for expert, (begin, end) in enumerate(
+                zip(boundaries[:-1], boundaries[1:], strict=True)
+            ):
+                value = x[begin:end].float() @ gate[expert].float().T
+                if stage == "fc1":
+                    value = torch.nn.functional.silu(value) * (
+                        x[begin:end].float() @ up[expert].float().T
+                    )
+                expected[begin:end] = value.bfloat16()
+            out.fill_(-7)
+            graph.replay()
+            torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-4)
+            assert torch.all(out[boundaries[-1] :] == -7)
+
+
 def test_bf16_source_manifest_rejects_tampering_and_legacy_objects(tmp_path):
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
         runtime,
@@ -711,6 +810,160 @@ def test_bf16_source_manifest_rejects_tampering_and_legacy_objects(tmp_path):
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(RuntimeError, match="unsupported cuDNN Frost manifest schema"):
         runtime._read_root(tmp_path)
+
+
+def test_bf16_sm120_sources_roundtrip_without_cudnn(monkeypatch):
+    """SM120 warp-MMA templates: one STG family per op and exact re-extraction."""
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
+
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    root = runtime.artifact_root("bf16")
+    records = [
+        record
+        for record in json.loads((root / runtime._MANIFEST).read_text())["kernels"]
+        if record["arch"] == "sm_120a"
+    ]
+    families = {}
+    for record in records:
+        entry = record["source"]
+        template = (root / entry["path"]).read_text()
+        families.setdefault(record["op"], set()).add(entry["path"])
+        # Kernel names are sm120_cudnn_frost_<op>...
+        assert record["id"].startswith(f"sm120_cudnn_frost_{record['op']}_")
+        assert entry["path"] == (
+            f"sources/sm120_cudnn_frost_{record['op']}_bf16_normal_stg.py"
+        )
+        # Explicit G+1 group boundaries: no final endpoint inferred from S.
+        assert record["abi"] == f"cudnn_frost_{record['op']}_v2"
+        assert "first_token_arr[my_group + 1]" in template
+        assert "gemm_s" not in template
+        # Unreached helpers (e.g. SM100 tcgen05 wrappers) are not frozen in.
+        assert not any(
+            isinstance(node, ast.FunctionDef)
+            and node.name.startswith("tcgen05")
+            or isinstance(node, ast.Attribute)
+            and node.attr.startswith("tcgen05")
+            for node in ast.walk(ast.parse(template))
+        )
+        assert "# @@FROST_TMA_STORE@@" not in template
+        # PTX setmaxnreg is .sync.aligned over the warpgroup: the producer
+        # warpgroup (TMA, scheduler and donor warps) releases registers once,
+        # before its per-warp roles diverge, and the compute warpgroups grow once.
+        assert template.count("nvvm.setmaxregister(") == 2
+        assert (
+            "    if warp_idx >= NUM_COMPUTE_WARPS:\n"
+            "        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)\n"
+        ) in template
+        assert "SCHED_REG_COUNT" not in template
+        tactic = record["tactic"]
+        assert tactic["template"] == "sm120_moe_grouped_matmul_fwd.py"
+        assert (tactic["swap_ab"], tactic["store_mode"], tactic["cta_group"]) == (
+            False,
+            "stg",
+            1,
+        )
+        # Only the scheduler counter: the template patches no tensormap.
+        assert record["workspace_bytes"] == 128
+        constants = dict(entry["parameters"]["constants"])
+        assert "n_tma_outputs" not in constants and "epi_n" not in constants
+        assert constants["frost_compile_options"] == repr(
+            "--enable-tvm-ffi --gpu-arch sm_120a"
+        )
+        assert int(constants["grid_num_clusters"]) > 0
+        concrete = render_source(template, entry["parameters"])
+        # The host zeroes the tile-scheduler counter before every launch, so
+        # the exported TVM-FFI function needs no caller-side reset.
+        assert "_dynamic_scheduler_counter_initialization(a_tma_workspace" in concrete
+        first = entry["parameters"]["constants"][0][0]
+        produced = concrete.replace(
+            f"\n{first} = ", f"\n# Tile config: {tactic['tile']}\n{first} = ", 1
+        )
+        assert extract_template(produced, swap_ab=False) == (
+            template,
+            entry["parameters"],
+        )
+    assert set(families) == {
+        *(f"grouped_gemm1_{name}" for name in ACTIVATIONS),
+        "grouped_gemm2",
+    }
+    assert all(len(paths) == 1 for paths in families.values())
+
+
+def test_frost_export_names_architecture_first_and_prunes_unreached_helpers():
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+        _reachable_definitions,
+        arch_tag,
+    )
+
+    assert (arch_tag("sm_107a"), arch_tag("sm_120a")) == ("sm107", "sm120")
+    with pytest.raises(ValueError, match="architecture"):
+        arch_tag("sm120")
+    source = "\n".join(
+        (
+            "def used(x):\n    return nested(x)",
+            "def nested(x):\n    return x",
+            "def unused(x):\n    return orphan(x)",
+            "def orphan(x):\n    return x",
+            "alias = used",
+            "def kernel():\n    return alias(1)",
+        )
+    )
+    optional = {"used", "nested", "unused", "orphan"}
+    assert _reachable_definitions(source, optional) == {"used", "nested"}
+    gate = torch.empty(1, 3, 4, dtype=torch.bfloat16)
+    args = (torch.empty(2, 4, dtype=torch.bfloat16), gate, gate)
+    scale = torch.ones(1)
+    # G+1 boundaries: one boundary alone describes no group.
+    with pytest.raises(ValueError, match="G\\+1"):
+        runtime._validate_common(*args, torch.zeros(1, dtype=torch.int32), scale, None)
+    assert runtime._validate_common(
+        *args, torch.tensor([0, 2], dtype=torch.int32), scale, None
+    ) == (2, 3, 4, 1, 1)
+
+
+@bf16_gpu
+def test_bf16_sm120_launches_need_no_workspace_reset(monkeypatch):
+    """The SM120 host zeroes its scheduler counter, even in a garbage workspace."""
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        fc2,
+    )
+
+    if not _sm120():
+        pytest.skip("SM107 sources rely on PreparedFc2.run() resetting the workspace")
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    torch.manual_seed(7)
+    device = torch.device("cuda", torch.cuda.current_device())
+    sizes = [64, 0, 200, 128, 100, 12, 196, 68]
+    bounds = [sum(sizes[:g]) for g in range(len(sizes) + 1)]
+    rows = bounds[-1] + 37  # routed capacity beyond every group
+    x = torch.randn(rows, 256, dtype=torch.bfloat16, device=device)
+    w = torch.randn(8, 128, 256, dtype=torch.bfloat16, device=device) * 0.1
+    offsets = torch.tensor(bounds, dtype=torch.int32, device=device)
+    expected = torch.cat(
+        [
+            x[a:b].float() @ w[g].float().T
+            for g, (a, b) in enumerate(zip(bounds[:-1], bounds[1:], strict=True))
+        ]
+    )
+    kernels = fc2.matching_kernels(rows, 128, 256, 8, device)
+    assert kernels
+    for kernel in kernels:
+        out = torch.full((rows, 128), float("nan"), dtype=torch.bfloat16, device=device)
+        workspace = torch.full(
+            (kernel.workspace_bytes,), 0x7F, dtype=torch.uint8, device=device
+        )
+        plan = fc2.PreparedFc2(kernel, x, w, offsets, out, workspace)
+        for _ in range(2):
+            # Bypass PreparedFc2.run()'s reset: the frozen host zeroes its counter.
+            plan._launch(*plan._args, fc2._current_custream(device))
+            error = (out[: bounds[-1]].float() - expected).norm() / expected.norm()
+            assert error.item() < 0.01, (kernel.artifact_id, error.item())
+        assert torch.isnan(out[bounds[-1] :]).all(), kernel.artifact_id
 
 
 @pytest.fixture
@@ -999,6 +1252,59 @@ def test_bf16_moe_shortlist_rejects_more_than_two_stage_candidates(tmp_path):
         shortlist._read((tmp_path,))
 
 
+@pytest.mark.parametrize("arch", ["sm_107a", "sm_120a"])
+def test_bf16_packaged_shortlists_resolve_all_profiles(arch, monkeypatch):
+    """Every measured profile maps to two FC1 and two FC2 packaged artifacts."""
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        shortlist,
+    )
+
+    runtime = bf16_moe.runtime
+    table = {
+        key: profiles
+        for key, profiles in shortlist._read(runtime._artifact_roots()).items()
+        if key[0] == arch
+    }
+    assert {key[1] for key in table} == set(ACTIVATIONS)
+    assert {key[2:] for key in table} == BF16_SHORTLIST_GEOMETRIES
+    monkeypatch.setattr(runtime, "_arch_for", lambda device: arch)
+    runtime.clear_artifact_cache()
+    try:
+        for (_, name, experts, hidden, intermediate, topk), profiles in table.items():
+            assert sorted(profiles) == [1, 16, 128, 512, 2048, 4096, 8192, 12288]
+            previous = 0
+            for tokens, (fc1, fc2) in sorted(profiles.items()):
+                # Measured counts and the next-bucket rule, without compiling.
+                for query in {tokens, previous + 1}:
+                    first, second = bf16_moe._selected_kernels(
+                        query,
+                        hidden,
+                        intermediate,
+                        experts,
+                        topk,
+                        "cpu",
+                        ACTIVATIONS[name](),
+                    )
+                    assert tuple(k.artifact_id for k in first) == fc1
+                    assert tuple(k.artifact_id for k in second) == fc2
+                    assert all(k.arch == arch and k.activation == name for k in first)
+                    assert all(k.arch == arch for k in second)
+                previous = tokens
+    finally:
+        runtime.clear_artifact_cache()
+
+
+def test_bf16_fma_tactic_is_limited_to_sm107(monkeypatch):
+    """SM120 keeps its Tensor Core candidates at the SM107 FMA geometries."""
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(bf16_moe.fma, "check_support", lambda *_: None)
+    for arch, expected in (("sm_120a", False), ("sm_107a", True)):
+        monkeypatch.setattr(bf16_moe.runtime, "_arch_for", lambda _: arch)
+        for geometry in ((1, 7168, 3072, 12, 2), (4, 2048, 1408, 64, 6)):
+            tactic = bf16_moe._fma_tactic(*geometry, SwiGLU(), device)
+            assert (tactic is not None) == expected
+
+
 def test_bf16_shortlist_survives_autotuner_plain_tensor_profiles(monkeypatch):
     runner = object.__new__(bf16_moe.CudnnFrostBf16MoeRunner)
     runner._built = True
@@ -1173,9 +1479,15 @@ def _assert_block_scale_geometry_roundtrip(
             geometry = ast.literal_eval(constants[name])
             assert len(geometry) == 3 and all(value > 0 for value in geometry)
         assert "sm_107a" in constants["frost_compile_options"]
+        if (
+            record["contract"]["output_dtype"] in ("float4_e2m1fn_x2", "float8_e4m3fn")
+            and record["tactic"]["store_mode"] == "tma"
+        ):
+            assert constants["epi_chunk_elems"] == "32"
         family = (
             record["arch"],
             record["op"],
+            record["contract"]["output_dtype"],
             record["tactic"]["swap_ab"],
             record["tactic"]["store_mode"],
         )
@@ -1206,7 +1518,7 @@ def _assert_block_scale_geometry_roundtrip(
     # source paths must not accidentally mix activations or launch ABIs.
     assert all(len(paths) == 1 for paths in families.values())
     assert all(len(variants) == 1 for variants in source_families.values())
-    assert len(by_source) <= len(ACTIVATIONS) * 4 + 4
+    assert len(by_source) <= len(ACTIVATIONS) * 6 + 4
     assert sum(len(digests) for digests in by_source.values()) == len(records)
 
 
@@ -1319,11 +1631,13 @@ def test_mxfp8_scale_layout_uneven_empty_groups_and_experts():
 def _assert_block_scale_layout(runtime):
     rows, cols = 259, 8
     scales = (torch.arange(rows * cols) % 253).to(torch.uint8).reshape(rows, cols)
-    offsets = torch.tensor([0, 0, 1, 128, 128, 130, 259, 259], dtype=torch.int32)
+    offsets = torch.tensor([0, 0, 1, 128, 128, 130, 259, 259, 259], dtype=torch.int32)
     packed = runtime.pack_token_scales(scales, offsets).view(torch.uint8)
-    assert packed.numel() == runtime.segmented_scale_rows(rows, offsets.numel()) * cols
+    assert (
+        packed.numel() == runtime.segmented_scale_rows(rows, offsets.numel() - 1) * cols
+    )
     base = 0
-    starts = offsets.tolist() + [rows]
+    starts = offsets.tolist()
     for begin, end in zip(starts, starts[1:], strict=False):
         for row in range(end - begin):
             for col in range(cols):
@@ -1342,6 +1656,119 @@ def _assert_block_scale_layout(runtime):
                     packed_weight[expert, _block_scale_sf_address(row, col, cols)]
                     == weight[expert, row, col]
                 )
+
+
+@pytest.mark.parametrize("runtime", [mxfp8, nvfp4, mxfp8_mxfp4])
+@pytest.mark.parametrize("boundaries", [[0, 1, 129], [0, 129, 129], [0, 0, 0]])
+def test_block_scale_explicit_final_boundary(runtime, boundaries):
+    # The backing token buffer has spare capacity which belongs to no group.
+    scales = torch.arange(259 * 4).remainder(253).to(torch.uint8).reshape(259, 4)
+    offsets = torch.tensor(boundaries, dtype=torch.int32)
+    packed = runtime.pack_token_scales(scales, offsets).view(torch.uint8)
+    expected = torch.zeros_like(packed)
+    base = 0
+    for begin, end in zip(boundaries[:-1], boundaries[1:], strict=True):
+        for row in range(end - begin):
+            for col in range(4):
+                expected[base + _block_scale_sf_address(row, col, 4)] = scales[
+                    begin + row, col
+                ]
+        base += ((end - begin + 127) // 128) * 128 * 4
+    torch.testing.assert_close(packed, expected)
+    # Updating unused capacity cannot change the packed groups.
+    scales[boundaries[-1] :] = 255
+    torch.testing.assert_close(
+        runtime.pack_token_scales(scales, offsets).view(torch.uint8), expected
+    )
+
+
+@pytest.mark.parametrize("runtime", [mxfp8, nvfp4, mxfp8_mxfp4])
+@pytest.mark.parametrize("boundaries", [[], [0]])
+def test_block_scale_requires_start_and_end_boundaries(runtime, boundaries):
+    with pytest.raises(ValueError, match="G\\+1"):
+        runtime.pack_token_scales(
+            torch.ones(10, 4, dtype=torch.uint8),
+            torch.tensor(boundaries, dtype=torch.int32),
+        )
+
+
+@supported_gpu
+@pytest.mark.parametrize("runtime", [mxfp8, nvfp4, mxfp8_mxfp4])
+@pytest.mark.parametrize("groups", [32, 40, 64])
+@pytest.mark.parametrize("swap", [False, True])
+def test_block_scale_final_boundary_across_scheduler_warps(runtime, groups, swap):
+    # Exercise the scheduler's initial warp, subsequent warp, and exact-warp
+    # boundary with G > E. Only the final group has tokens.
+    s, k, n, e = 259, 128, 128, 8
+    kernel = next(
+        kernel
+        for kernel in runtime.discover()
+        if not kernel.fc1 and kernel.swap_ab == swap
+    )
+    nv = runtime is nvfp4
+    mixed = runtime is mxfp8_mxfp4
+    x = torch.full(
+        (s, k // (2 if nv else 1)),
+        0x22 if nv else 1,
+        dtype=torch.uint8 if nv else torch.float8_e4m3fn,
+        device="cuda",
+    )
+    weight = torch.full(
+        (e, n, k // (2 if nv or mixed else 1)),
+        0x22 if nv or mixed else 1,
+        dtype=torch.uint8 if nv or mixed else torch.float8_e4m3fn,
+        device="cuda",
+    )
+    block = 16 if nv else 32
+    sf_dtype = torch.float8_e4m3fn if nv else torch.uint8
+    x_sf = torch.full((s, k // block), 1 if nv else 127, dtype=sf_dtype, device="cuda")
+    w_sf = torch.full(
+        (e, n, k // block), 1 if nv else 127, dtype=sf_dtype, device="cuda"
+    )
+    offsets = torch.zeros(groups + 1, device="cuda", dtype=torch.int32)
+    offsets[-1] = 193
+    packed_sf = runtime.pack_token_scales(x_sf, offsets)
+    out = torch.full((s, n), -7, dtype=torch.bfloat16, device="cuda")
+    plan_type = (
+        runtime.PreparedNvfp4GroupedGemm
+        if nv
+        else (
+            runtime.PreparedMxfp8Mxfp4GroupedGemm
+            if mixed
+            else runtime.PreparedMxfp8GroupedGemm
+        )
+    )
+    kwargs = (
+        {
+            "gemm_scales": (
+                torch.arange(1, groups + 1, device="cuda", dtype=torch.float32),
+            )
+        }
+        if nv
+        else {}
+    )
+    plan = plan_type(
+        kernel,
+        x,
+        (weight,),
+        offsets,
+        packed_sf,
+        (runtime.pack_weight_scales(w_sf),),
+        out,
+        **kwargs,
+    )
+    plan()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan()
+    for end in (193, 129, 0):
+        offsets[-1] = end
+        packed_sf.copy_(runtime.pack_token_scales(x_sf, offsets))
+        out.fill_(-7)
+        graph.replay()
+        expected = torch.full_like(out, -7)
+        expected[:end] = k * (groups if nv else 1)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 def test_mxfp8_segmented_scale_capacity_covers_routing_partitions():
@@ -1423,7 +1850,7 @@ def _assert_block_scale_launch_abi(runtime, *, packed, block, packed_weights=Non
             runtime.segmented_scale_rows(s, e) * (k // block), dtype=torch.uint8
         )
         b_sf = tuple(torch.empty(e, n * k // block, dtype=torch.uint8) for _ in w)
-        offsets = torch.zeros(e, dtype=torch.int32)
+        offsets = torch.zeros(e + 1, dtype=torch.int32)
         out = torch.empty(s, n, dtype=torch.bfloat16)
         workspace = torch.empty(kernel.workspace_bytes, dtype=torch.uint8)
         scale = torch.ones(1, 1, 1)
@@ -1463,6 +1890,8 @@ def _assert_block_scale_launch_abi(runtime, *, packed, block, packed_weights=Non
             name: arg.data_ptr() for name, arg in zip(names[1:], args[1:], strict=False)
         }
         tensors = dict(zip(names[1:-1], args[1:], strict=True))
+        assert args[0][3:5] == (e, e)
+        assert tensors["first_token_offset"].shape == (e + 1,)
         token_arg = tensors["b_0" if kernel.swap_ab else "a_0"]
         weight_arg = tensors["a_0" if kernel.swap_ab else "b_0"]
         assert token_arg.shape == (s, k // (2 if packed else 1), 1)
@@ -1506,7 +1935,7 @@ def test_mxfp8_reject_incompatible_scale_contract(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("index", range(len(MXFP8_RECORDS)))
+@pytest.mark.parametrize("index", range(len(mxfp8.discover())))
 def test_mxfp8_grouped_kernel_and_graph_replay(index, monkeypatch):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("packaged block-scale templates target SM107a")
@@ -1545,7 +1974,7 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
         for _ in w
     )
     offsets = torch.tensor(
-        [0, 0, 1, 128, 128, 130, 259, 259], dtype=torch.int32, device="cuda"
+        [0, 0, 1, 128, 128, 130, 259, 259, 259], dtype=torch.int32, device="cuda"
     )
     out = torch.empty(s, n, dtype=torch.bfloat16, device="cuda")
     packed_a = runtime.pack_token_scales(a_sf, offsets)
@@ -1575,8 +2004,8 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
             * sf.view(torch.float8_e8m0fnu).double().repeat_interleave(32, -1)
             for v, sf in zip(w, b_sf, strict=False)
         ]
-        expected = torch.empty(s, n, device="cuda")
-        starts = offsets.tolist() + [s]
+        expected = torch.full((s, n), -7.0, device="cuda")
+        starts = offsets.tolist()
         for expert, (begin, end) in enumerate(zip(starts, starts[1:], strict=False)):
             values = xd[begin:end].double() @ wd[0][expert].double().T
             if kernel.gated:
@@ -1605,7 +2034,9 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
         plan()
     x.copy_((torch.randn(s, k, device="cuda") * 0.1).to(x.dtype))
     offsets.copy_(
-        torch.tensor([0, 2, 2, 2, 31, 259, 259, 259], device="cuda", dtype=torch.int32)
+        torch.tensor(
+            [0, 2, 2, 2, 31, 259, 259, 259, 259], device="cuda", dtype=torch.int32
+        )
     )
     packed_a.copy_(runtime.pack_token_scales(a_sf, offsets))
     if mixed:
@@ -1616,6 +2047,20 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
     out.fill_(float("nan"))
     graph.replay()
     torch.testing.assert_close(out, reference(), rtol=2e-2, atol=2e-4)
+
+    # The final offset is device data, not the static token-buffer capacity.
+    # Cover a nonempty last expert, an empty last expert, and no active rows.
+    for boundaries in (
+        [0, 0, 1, 128, 128, 130, 130, 130, 193],
+        [0, 2, 2, 2, 31, 193, 193, 193, 193],
+        [0] * 9,
+    ):
+        offsets.copy_(torch.tensor(boundaries, device="cuda", dtype=torch.int32))
+        packed_a.copy_(runtime.pack_token_scales(a_sf, offsets))
+        out.fill_(-7)
+        graph.replay()
+        torch.testing.assert_close(out, reference(), rtol=2e-2, atol=2e-4)
+        assert torch.all(out[boundaries[-1] :] == -7)
 
 
 def _block_scale_linear_scales(packed, rows, cols):
@@ -1689,11 +2134,16 @@ def _pick_stage_pair(pool):
 @supported_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
-def test_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch):
-    _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch)
+@pytest.mark.parametrize("fc1_output", ["bf16", "fp8_stg", "fp8_tma"])
+def test_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, fc1_output):
+    _assert_mxfp8_moe_full_pipeline_and_graph(
+        name, swizzled, monkeypatch, fc1_output=fc1_output
+    )
 
 
-def _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, mixed=False):
+def _assert_mxfp8_moe_full_pipeline_and_graph(
+    name, swizzled, monkeypatch, mixed=False, fc1_output="bf16"
+):
     from flashinfer.fused_moe import (
         CutlassMxfp8Config,
         CutlassMxfp8Mxfp4Config,
@@ -1752,6 +2202,15 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, mixed
     weights = MoEWeightPack({f"cutlass_{dtype}": view})
     first, second = moe._kernels(t * k, h, i, e, xq.device, activation)
 
+    if fc1_output != "bf16":
+        first, _ = moe._kernels(
+            t * k, h, i, e, xq.device, activation, quantized_output=True
+        )
+        first = tuple(
+            kernel
+            for kernel in first
+            if kernel.tactic_metadata["store_mode"] == fc1_output.removeprefix("fp8_")
+        )
     selected = _pick_stage_pair(first), _pick_stage_pair(second)
     # Test full launch mechanics on small allocations independently of the
     # measured model-size shortlist. Admission is covered separately below.
@@ -1823,7 +2282,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, mixed
 @supported_gpu
 def test_mxfp8_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
-        test_mxfp8_moe_full_pipeline_and_graph("swiglu", False, monkeypatch)
+        test_mxfp8_moe_full_pipeline_and_graph("swiglu", False, monkeypatch, "fp8_stg")
 
 
 def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
@@ -1836,10 +2295,19 @@ def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
 
 def _assert_moe_shortlist_buckets(moe, monkeypatch):
     key = ("sm_107a", "swiglu", 8, 4096, 14336, 2)
-    first = tuple(SimpleNamespace(artifact_id=f"first{j}") for j in range(3))
+    first = tuple(
+        SimpleNamespace(artifact_id=f"first{j}", tactic_metadata={"tile": f"tile{j}"})
+        for j in range(3)
+    )
     second = tuple(SimpleNamespace(artifact_id=f"second{j}") for j in range(3))
     monkeypatch.setattr(moe.common, "_arch_for", lambda device: "sm_107a")
-    monkeypatch.setattr(moe, "_kernels", lambda *args: (first, second))
+    monkeypatch.setattr(
+        moe,
+        "_kernels",
+        lambda *args, **kwargs: ((), ())
+        if kwargs.get("quantized_output")
+        else (first, second),
+    )
     table = {key: {128: (("first2", "first0"), ("second1", "second2"))}}
     monkeypatch.setattr(moe, "_read", lambda roots: table)
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
@@ -1970,6 +2438,33 @@ def test_nvfp4_reject_incompatible_numerical_contract(change, tmp_path):
         nvfp4.discover(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"intermediate_dtype": "float32"},
+        {"output_scale_layout": "F8_128x4"},
+        {"quant_scale_dtype": "bfloat16"},
+    ],
+)
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_nvfp4_fused_manifest_rejects_changed_quantization(change, store, tmp_path):
+    root = nvfp4.runtime.artifact_root("nvfp4")
+    records = json.loads((root / nvfp4.runtime._MANIFEST).read_text())["kernels"]
+    record = next(
+        r
+        for r in records
+        if r["contract"]["output_dtype"] == "float4_e2m1fn_x2"
+        and r["tactic"]["store_mode"] == store
+    )
+    payload = {
+        "schema_version": 2,
+        "kernels": [record | {"contract": record["contract"] | change}],
+    }
+    (tmp_path / nvfp4.runtime._MANIFEST).write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="numerical contract"):
+        nvfp4.discover(tmp_path, quantized_output=True)
+
+
 @pytest.mark.parametrize("name", ACTIVATIONS)
 def test_nvfp4_auto_admission_uses_logical_hidden_size(name):
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
@@ -2082,7 +2577,7 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
         for _ in w
     )
     offsets = torch.tensor(
-        [0, 0, 1, 128, 128, 130, 259, 259], dtype=torch.int32, device="cuda"
+        [0, 0, 1, 128, 128, 130, 259, 259, 259], dtype=torch.int32, device="cuda"
     )
     alphas = tuple(
         torch.linspace(0.25 + j, 2.0 + j, e, device="cuda") for j in range(len(w))
@@ -2105,8 +2600,8 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
     def reference():
         xd = _nvfp4_dequant(x, a_sf)
         wd = [_nvfp4_dequant(v, sf) for v, sf in zip(w, b_sf, strict=True)]
-        expected = torch.empty(s, n, device="cuda", dtype=torch.float32)
-        starts = offsets.tolist() + [s]
+        expected = torch.full((s, n), -7.0, device="cuda", dtype=torch.float32)
+        starts = offsets.tolist()
         for expert, (begin, end) in enumerate(zip(starts, starts[1:], strict=False)):
             values = (xd[begin:end] @ wd[0][expert].T).float() * alphas[0][expert]
             if kernel.gated:
@@ -2129,7 +2624,9 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
         plan()
     x.bitwise_xor_(0x88)
     offsets.copy_(
-        torch.tensor([0, 2, 2, 2, 31, 259, 259, 259], device="cuda", dtype=torch.int32)
+        torch.tensor(
+            [0, 2, 2, 2, 31, 259, 259, 259, 259], device="cuda", dtype=torch.int32
+        )
     )
     packed_a.copy_(nvfp4.pack_token_scales(a_sf, offsets))
     for j, alpha in enumerate(alphas):
@@ -2139,6 +2636,20 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
     out.fill_(float("nan"))
     graph.replay()
     torch.testing.assert_close(out, reference(), rtol=2e-2, atol=2e-4)
+
+    # The final offset is device data, not the static token-buffer capacity.
+    # Cover a nonempty last expert, an empty last expert, and no active rows.
+    for boundaries in (
+        [0, 0, 1, 128, 128, 130, 130, 130, 193],
+        [0, 2, 2, 2, 31, 193, 193, 193, 193],
+        [0] * 9,
+    ):
+        offsets.copy_(torch.tensor(boundaries, device="cuda", dtype=torch.int32))
+        packed_a.copy_(nvfp4.pack_token_scales(a_sf, offsets))
+        out.fill_(-7)
+        graph.replay()
+        torch.testing.assert_close(out, reference(), rtol=2e-2, atol=2e-4)
+        assert torch.all(out[boundaries[-1] :] == -7)
 
 
 def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
@@ -2191,7 +2702,10 @@ def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
 @supported_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
-def test_nvfp4_moe_full_pipeline_and_dynamic_graph(name, swizzled, monkeypatch):
+@pytest.mark.parametrize("fc1_output", ["bf16", "fp4_stg", "fp4_tma"])
+def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
+    name, swizzled, fc1_output, monkeypatch
+):
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
         moe,
     )
@@ -2252,6 +2766,15 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(name, swizzled, monkeypatch):
     act = MoEActivationPack(xq, xsf, ids, scores)
     weights = MoEWeightPack({"cutlass_nvfp4": view})
     first, second = moe._kernels(t * k, h, i, e, xq.device, activation)
+    if fc1_output != "bf16":
+        first, _ = moe._kernels(
+            t * k, h, i, e, xq.device, activation, quantized_output=True
+        )
+        first = tuple(
+            kernel
+            for kernel in first
+            if kernel.tactic_metadata["store_mode"] == fc1_output.removeprefix("fp4_")
+        )
     selected = _pick_stage_pair(first), _pick_stage_pair(second)
     monkeypatch.setattr(moe, "_selected_kernels", lambda *args: selected)
     runner = moe.CudnnFrostNvfp4MoeRunner(config, "cuda")
@@ -2301,9 +2824,248 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(name, swizzled, monkeypatch):
 
 
 @supported_gpu
-def test_nvfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_nvfp4_moe_inference_mode_preparation_and_graph(store, monkeypatch):
     with torch.inference_mode():
-        test_nvfp4_moe_full_pipeline_and_dynamic_graph("swiglu", False, monkeypatch)
+        test_nvfp4_moe_full_pipeline_and_dynamic_graph(
+            "swiglu", False, f"fp4_{store}", monkeypatch
+        )
+
+
+@supported_gpu
+@pytest.mark.parametrize("tokens", [1, 17, 129])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
+    tokens, store, mixed, monkeypatch
+):
+    from flashinfer.fused_moe import (
+        CutlassMxfp8Config,
+        CutlassMxfp8Mxfp4Config,
+        QuantFormat,
+    )
+
+    dtype = "mxfp8_mxfp4" if mixed else "mxfp8"
+    moe = importlib.import_module(
+        f"flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.{dtype}.moe"
+    )
+    backend = CutlassMxfp8Mxfp4Config if mixed else CutlassMxfp8Config
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    torch.manual_seed(131)
+    h, i, e, k = 256, 256, 8, 2
+    activation = SwiGLU()
+    quant = QuantConfig(
+        QuantFormat.MXFP4 if mixed else QuantFormat.MXFP8, QuantFormat.MXFP8
+    )
+    config = replace(
+        bf16_config(topk=k, experts=e, intermediate=i),
+        quant=quant,
+        backend=BackendOptions((backend(),)),
+    )
+    x = torch.randn(tokens, h, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.randn(e, 2 * i, h, device="cuda", dtype=torch.bfloat16) * 0.1
+    w2 = torch.randn(e, h, i, device="cuda", dtype=torch.bfloat16) * 0.1
+    xq, xsf = backend.prepare_activations(x, quant=quant)
+    view = backend.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=e,
+        hidden_size=h,
+        intermediate_size=i,
+        activation=activation,
+    )
+    ids = torch.randint(0, e // 2, (tokens, k), device="cuda", dtype=torch.int32)
+    ids[::7, 0] = -1
+    scores = torch.rand(tokens, k, device="cuda")
+    act = MoEActivationPack(xq, xsf, ids, scores)
+    weights = MoEWeightPack({f"cutlass_{dtype}": view})
+    first, second = moe._kernels(tokens * k, h, i, e, xq.device, activation)
+    fused, _ = moe._kernels(
+        tokens * k, h, i, e, xq.device, activation, quantized_output=True
+    )
+    fused = next(
+        kernel for kernel in fused if kernel.tactic_metadata["store_mode"] == store
+    )
+    original = next(
+        kernel
+        for kernel in first
+        if kernel.tactic_metadata["tile"] == fused.tactic_metadata["tile"]
+    )
+    monkeypatch.setattr(
+        moe, "_selected_kernels", lambda *args: ((original, fused), second[:2])
+    )
+    runner_type = (
+        moe.CudnnFrostMxfp8Mxfp4MoeRunner if mixed else moe.CudnnFrostMxfp8MoeRunner
+    )
+    runner = runner_type(config, "cuda")
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(act, weights)
+    tactics = runner.get_valid_tactics(inputs, None)
+    baseline_tactic, fused_tactic = tactics[0], tactics[2]
+    plans = inputs.launch_state.plans
+    assert plans[baseline_tactic]["workspace_size"]() - plans[fused_tactic][
+        "workspace_size"
+    ]() == tokens * k * i * 2 + max(
+        original.workspace_bytes, second[0].workspace_bytes
+    ) - max(fused.workspace_bytes, second[0].workspace_bytes)
+
+    for input_scale_byte in (127, 60, 0):
+        # Include zero blocks and tiny values with E8M0 scale byte zero.
+        xsf.view(torch.uint8).fill_(input_scale_byte)
+        baseline = {
+            name: tensor.clone()
+            for name, tensor in moe.prepared_stage_inputs(
+                inputs, tactic=baseline_tactic
+            ).items()
+        }
+        actual = moe.prepared_stage_inputs(inputs, tactic=fused_tactic)
+        assert "fc1_output" not in actual
+        assert torch.equal(actual["offsets"], baseline["offsets"])
+        rows, columns = tokens * k, i // 32
+        logical_sf = []
+        for stage in (baseline, actual):
+            unpacked = torch.empty(rows, columns, device="cuda", dtype=torch.uint8)
+            starts = stage["offsets"].tolist()
+            sf_start = 0
+            for begin, end in zip(starts, starts[1:], strict=False):
+                row = torch.arange(end - begin, device="cuda")[:, None]
+                col = torch.arange(columns, device="cuda")[None, :]
+                index = (
+                    sf_start * columns
+                    + (row // 128) * 128 * columns
+                    + (col // 4) * 512
+                    + (row % 32) * 16
+                    + ((row % 128) // 32) * 4
+                    + col % 4
+                )
+                unpacked[begin:end] = stage["fc2_token_scales"][index]
+                sf_start += (end - begin + 127) // 128 * 128
+            logical_sf.append(unpacked)
+        blocks = baseline["fc1_output"].cpu().double().reshape(rows, columns, 32)
+        exponents = torch.ceil(torch.log2(blocks.abs().amax(-1) / 448)).clamp(-127, 127)
+        expected_sf = (exponents + 127).to(torch.uint8)
+        assert torch.equal(logical_sf[0].cpu(), expected_sf)
+        reference = (
+            (blocks / torch.exp2(exponents).unsqueeze(-1))
+            .float()
+            .to(torch.float8_e4m3fn)
+            .reshape(rows, i)
+        )
+        torch.testing.assert_close(
+            baseline["fc2_tokens"].cpu().float(), reference.float(), rtol=0, atol=0
+        )
+        assert torch.equal(*logical_sf)
+        torch.testing.assert_close(
+            actual["fc2_tokens"].float(), baseline["fc2_tokens"].float(), rtol=0, atol=0
+        )
+
+
+@supported_gpu
+@pytest.mark.parametrize("tokens", [1, 17, 129])
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
+    tokens, store, monkeypatch
+):
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
+        moe,
+    )
+    from flashinfer.fused_moe import CutlassNvfp4Config, QuantFormat
+
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
+    torch.manual_seed(131)
+    h, i, e, k = 256, 256, 8, 2
+    activation = SwiGLU()
+    quant = QuantConfig(QuantFormat.NVFP4, QuantFormat.NVFP4)
+    config = replace(
+        bf16_config(topk=k, experts=e, intermediate=i),
+        quant=quant,
+        backend=BackendOptions((CutlassNvfp4Config(),)),
+    )
+    x = torch.randn(tokens, h, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.randn(e, 2 * i, h, device="cuda", dtype=torch.bfloat16) * 0.1
+    w2 = torch.randn(e, h, i, device="cuda", dtype=torch.bfloat16) * 0.1
+    xq, xsf = CutlassNvfp4Config.prepare_activations(x, quant=quant)
+    view = CutlassNvfp4Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=e,
+        hidden_size=h,
+        intermediate_size=i,
+        activation=activation,
+    )
+    ids = torch.randint(0, e // 2, (tokens, k), device="cuda", dtype=torch.int32)
+    ids[::7, 0] = -1
+    scores = torch.rand(tokens, k, device="cuda")
+    act = MoEActivationPack(xq, xsf, ids, scores)
+    weights = MoEWeightPack({"cutlass_nvfp4": view})
+    first, second = moe._kernels(tokens * k, h, i, e, xq.device, activation)
+    fused, _ = moe._kernels(
+        tokens * k, h, i, e, xq.device, activation, quantized_output=True
+    )
+    fused = next(
+        kernel for kernel in fused if kernel.tactic_metadata["store_mode"] == store
+    )
+    original = next(
+        kernel
+        for kernel in first
+        if kernel.tactic_metadata["tile"] == fused.tactic_metadata["tile"]
+        and kernel.tactic_metadata["store_mode"] == "stg"
+    )
+    monkeypatch.setattr(
+        moe, "_selected_kernels", lambda *args: ((original, fused), second[:2])
+    )
+    runner = moe.CudnnFrostNvfp4MoeRunner(config, "cuda")
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(act, weights)
+    tactics = runner.get_valid_tactics(inputs, None)
+    baseline_tactic, fused_tactic = tactics[0], tactics[2]
+    plans = inputs.launch_state.plans
+    assert plans[baseline_tactic]["workspace_size"]() - plans[fused_tactic][
+        "workspace_size"
+    ]() == tokens * k * i * 2 + max(
+        original.workspace_bytes, second[0].workspace_bytes
+    ) - max(fused.workspace_bytes, second[0].workspace_bytes)
+
+    for global_scale in (1.0, 1.3, 3.7, 0.03125):
+        view["fc2_act_global_scale"].fill_(global_scale)
+        baseline = {
+            name: tensor.clone()
+            for name, tensor in moe.prepared_stage_inputs(
+                inputs, tactic=baseline_tactic
+            ).items()
+        }
+        actual = moe.prepared_stage_inputs(inputs, tactic=fused_tactic)
+        assert "fc1_output" not in actual
+        assert torch.equal(actual["offsets"], baseline["offsets"])
+        rows, columns = tokens * k, i // 16
+        logical_sf = []
+        for stage in (baseline, actual):
+            unpacked = torch.empty(rows, columns, device="cuda", dtype=torch.uint8)
+            starts = stage["offsets"].tolist()
+            sf_start = 0
+            for begin, end in zip(starts, starts[1:], strict=False):
+                row = torch.arange(end - begin, device="cuda")[:, None]
+                col = torch.arange(columns, device="cuda")[None, :]
+                index = (
+                    sf_start * columns
+                    + (row // 128) * 128 * columns
+                    + (col // 4) * 512
+                    + (row % 32) * 16
+                    + ((row % 128) // 32) * 4
+                    + col % 4
+                )
+                unpacked[begin:end] = stage["fc2_token_scales"][index]
+                sf_start += (end - begin + 127) // 128 * 128
+            logical_sf.append(unpacked)
+        assert torch.equal(*logical_sf)
+        # Underflowed scales can produce different FP4 codes for zero values;
+        # those blocks dequantize to zero in both paths.
+        expected = _nvfp4_dequant(baseline["fc2_tokens"], logical_sf[0])
+        result = _nvfp4_dequant(actual["fc2_tokens"], logical_sf[1])
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
 def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
@@ -2348,12 +3110,39 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
                     "cpu",
                     ACTIVATIONS[name](),
                 )
-                assert len(first) == len(second) == 2
-                assert tuple(k.artifact_id for k in first) == identities[0]
+                assert 2 <= len(first) <= 6 and len(second) == 2
+                assert tuple(k.artifact_id for k in first[:2]) == identities[0]
                 assert tuple(k.artifact_id for k in second) == identities[1]
+                for kernel in first[2:]:
+                    assert kernel.quantizes_output and not kernel.swap_ab
+                    assert kernel.tactic_metadata["tile"] in {
+                        original.tactic_metadata["tile"] for original in first[:2]
+                    }
+                if first[2:]:
+                    variants = {
+                        (
+                            kernel.tactic_metadata["tile"],
+                            kernel.tactic_metadata["store_mode"],
+                        )
+                        for kernel in first[2:]
+                    }
+                    normal_tiles = {
+                        original.tactic_metadata["tile"]
+                        for original in first[:2]
+                        if not original.swap_ab
+                    }
+                    assert {(tile, "stg") for tile in normal_tiles} <= variants
+                    assert variants <= {
+                        (tile, store)
+                        for tile in normal_tiles
+                        for store in ("stg", "tma")
+                    }
                 assert all(k.fc1 and k.activation == name for k in first)
                 assert all(not k.fc1 for k in second)
-                assert len({(a.tactic, b.tactic) for a in first for b in second}) == 4
+                assert (
+                    len({(a.tactic, b.tactic) for a in first for b in second})
+                    == len(first) * 2
+                )
             previous = tokens
 
 
@@ -2448,15 +3237,20 @@ def test_mxfp8_mxfp4_grouped_kernel_extremes_and_graph(
 @supported_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
-def test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(name, swizzled, monkeypatch):
-    _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, mixed=True)
+@pytest.mark.parametrize("fc1_output", ["bf16", "fp8_stg", "fp8_tma"])
+def test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
+    name, swizzled, monkeypatch, fc1_output
+):
+    _assert_mxfp8_moe_full_pipeline_and_graph(
+        name, swizzled, monkeypatch, mixed=True, fc1_output=fc1_output
+    )
 
 
 @supported_gpu
 def test_mxfp8_mxfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
         test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
-            "swiglu", False, monkeypatch
+            "swiglu", False, monkeypatch, "fp8_tma"
         )
 
 
@@ -2843,8 +3637,16 @@ def test_frost_layer_bounds_exact_shape_winners_and_refreshes_lru(monkeypatch):
     assert len(selected) == 131
 
 
-@supported_gpu
-@pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4"])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param("bf16", marks=bf16_gpu),
+        *(
+            pytest.param(dtype, marks=supported_gpu)
+            for dtype in ("mxfp8", "nvfp4", "mxfp8_mxfp4")
+        ),
+    ],
+)
 def test_moe_graph_retains_evicted_plans_and_weight_scales(dtype, monkeypatch):
     """A graph owns temporary packed-call resources after bounded-cache eviction."""
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.cache import (

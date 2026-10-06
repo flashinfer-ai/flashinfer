@@ -18,7 +18,7 @@ from ....autotuner import TuningConfig
 from ....fused_moe.api import QuantFormat, RoutingInputMode, SwiGLU
 from ....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from ....utils import get_compute_capability
-from . import fc2, runtime
+from . import fc2, fma, runtime
 from ..cache import (
     LRUCache,
     require_graph_resource_retention,
@@ -30,19 +30,22 @@ from .support import large_bf16_moe
 
 _WEIGHT_KEYS = frozenset(("fc1_expert_weights", "fc2_expert_weights"))
 _TAG = "cudnn_frost-bf16-moe-v2"
+# Architectures with packaged BF16 sources, and their routing/finalize adapter flags.
+_NVCC_FLAGS = {"sm_107a": "sm107a_nvcc_flags", "sm_120a": "sm120a_nvcc_flags"}
+_UNSUPPORTED = "cuDNN Frost BF16 MoE kernels require SM107a or SM120a"
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=None)
 def _module(arch):
-    from ....jit.core import gen_jit_spec, sm107a_nvcc_flags
+    from ....jit import core
 
-    if arch != "sm_107a":
-        raise ValueError("cuDNN Frost BF16 MoE kernels require SM107a")
+    if arch not in _NVCC_FLAGS:
+        raise ValueError(_UNSUPPORTED)
 
-    return gen_jit_spec(
+    return core.gen_jit_spec(
         f"cudnn_frost_bf16_moe_v2_{arch}",
         [Path(__file__).parent.parent / "csrc" / "moe_bf16.cu"],
-        extra_cuda_cflags=sm107a_nvcc_flags,
+        extra_cuda_cflags=getattr(core, _NVCC_FLAGS[arch]),
     ).build_and_load()
 
 
@@ -121,6 +124,23 @@ def _selected_kernels_cached(
     )
 
 
+def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation, device):
+    # The FMA kernels are specialized and validated for SM107a only.
+    if (
+        not fma.supported(
+            tokens, hidden, intermediate, experts, topk, activation_name(activation)
+        )
+        or runtime._arch_for(device) != "sm_107a"
+    ):
+        return None
+    try:
+        fma.check_support(activation_name(activation))
+    except NotImplementedError:
+        # An older DSL can still run the existing Tensor Core candidates.
+        return None
+    return fma.tactic(activation_name(activation))
+
+
 class _Inputs(list):
     def __init__(self, tensors, state, tuning_config):
         super().__init__(tensors)
@@ -140,6 +160,7 @@ class _Plans:
         first,
         second,
         workspace_pool,
+        fma_tactic=None,
     ):
         self.plans = {}
         self.launches = {}
@@ -165,10 +186,34 @@ class _Plans:
                 ],
                 a.swap_ab,
                 b.swap_ab,
+                False,
             )
             # Retain Module ownership: its run Function borrows the native plan.
             self.plans[key] = plan
             self.launches[key] = plan["run"]
+            required = max(required, plan["workspace_size"]())
+        if fma_tactic is not None:
+            first_fma, second_fma = fma.build(
+                tokens, hidden, intermediate, experts, topk, device, fma_tactic[1]
+            )
+            plan = module.make_plan(
+                first_fma,
+                second_fma,
+                tokens,
+                hidden,
+                intermediate,
+                experts,
+                topk,
+                device.index,
+                0,
+                0,
+                first[0].gated,
+                [],
+                False,
+                False,
+                True,
+            )
+            self.plans[fma_tactic], self.launches[fma_tactic] = plan, plan["run"]
             required = max(required, plan["workspace_size"]())
         # Exact-shape host plans must not imply one large GPU allocation per
         # token count. Share geometrically grown storage on this runner's stream.
@@ -203,10 +248,10 @@ class CudnnFrostBf16MoeRunner(MoERunner):
     def _check_support(self):
         super()._check_support()
         if self.device.type != "cuda":
-            raise NotImplementedError("cuDNN Frost BF16 MoE kernels require SM107a")
+            raise NotImplementedError(_UNSUPPORTED)
         major, minor = get_compute_capability(self.device)
-        if (major, minor) != (10, 7):
-            raise NotImplementedError("cuDNN Frost BF16 MoE kernels require SM107a")
+        if f"sm_{major}{minor}a" not in _NVCC_FLAGS:
+            raise NotImplementedError(_UNSUPPORTED)
         name = activation_name(self.config.activation)
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("cuDNN Frost BF16 MoE requires finalized output")
@@ -311,6 +356,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         )
         if not first or not second:
             raise ValueError("No matching cuDNN Frost FC1/FC2 source kernels")
+        fma_tactic = _fma_tactic(t, h, i, e, k, self.config.activation, self.device)
         key = (
             t,
             h,
@@ -319,6 +365,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
             k,
             tuple(a.tactic for a in first),
             tuple(b.tactic for b in second),
+            fma_tactic,
         )
         if key not in self._plans:
             with torch.cuda.device(self.device):
@@ -327,7 +374,16 @@ class CudnnFrostBf16MoeRunner(MoERunner):
                         "Prepare cuDNN Frost MoE outside CUDA Graph capture"
                     )
                 self._plans[key] = _Plans(
-                    t, h, i, e, k, self.device, first, second, self._workspace_pool
+                    t,
+                    h,
+                    i,
+                    e,
+                    k,
+                    self.device,
+                    first,
+                    second,
+                    self._workspace_pool,
+                    fma_tactic,
                 )
         output = torch.empty_like(act.hidden_states_q)
         # Exact shapes: a fixed native plan cannot execute a rounded profile.
@@ -369,7 +425,19 @@ class CudnnFrostBf16MoeRunner(MoERunner):
             self.device,
             self.config.activation,
         )
-        return [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
+        tactics = [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
+        fma_tactic = _fma_tactic(
+            tokens,
+            hidden,
+            self.config.experts.intermediate_size,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            self.config.activation,
+            self.device,
+        )
+        if fma_tactic is not None:
+            tactics.append(fma_tactic)
+        return tactics
 
     def get_cache_key_extras(self, inputs):
         return super().get_cache_key_extras(inputs) + (
