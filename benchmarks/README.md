@@ -141,8 +141,10 @@ main BF16-input latency. The additional CSV columns `prequantized_median_time`
 and `prequantized_std_time` (milliseconds) report the runner-only timing without
 that input conversion. Per-tensor CUTLASS uses its fixed GEMM2 activation scale,
 whereas cuTile dynamically scales GEMM2 input; equal precision pairs do not imply
-identical quantization policies. CUTLASS `mxfp4_w4a8` requires hidden and
-intermediate sizes divisible by 128; unsupported shapes are skipped.
+identical quantization policies. The CUTLASS, TRT-LLM and CuTe DSL
+`mxfp4_w4a8` backends require hidden and intermediate sizes divisible by 128
+and are skipped for other shapes; cuTile `mxfp4_w4a8` requires divisibility
+by 32.
 On SM120/SM121, `--backends b12x cutile` also compares NVFP4 W4A4 (`nvfp4`)
 and W4A16 (`nvfp4_w4a16`). The b12x runner exposes a single heuristic tactic;
 `--autotune` does not expand its search space. MXFP4 is not supported by b12x.

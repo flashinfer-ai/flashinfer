@@ -115,6 +115,11 @@ _QUANT_FORMATS = {
     "mxfp4_w4a8": (QuantFormat.MXFP4, QuantFormat.MXFP8),
 }
 
+# Backends whose weight preparation needs hidden_size and intermediate_size
+# divisible by 128 for a quant variant. cuTile's MXFP4 x MXFP8 path only needs
+# 32-element alignment and is not listed.
+_ALIGN_128_BACKENDS = {"mxfp4_w4a8": ("cutlass", "trtllm", "cute_dsl")}
+
 # Alternate spellings accepted by --quant-variant. ``mxfp4_mxfp8`` matches the
 # flat trtllm routines' ``--fp4_mode mxfp4_mxfp8``.
 _QUANT_VARIANT_ALIASES = {"mxfp4_mxfp8": "mxfp4_w4a8"}
@@ -188,15 +193,6 @@ def _canonical_inputs(args, activation, device: torch.device):
         raise ValueError("hidden_size and intermediate_size must be positive")
     if args.num_experts <= 0 or not 0 < args.top_k <= args.num_experts:
         raise ValueError("require 0 < top_k <= num_experts")
-    if args.quant_variant == "mxfp4_w4a8" and (
-        args.hidden_size % 128 or args.intermediate_size % 128
-    ):
-        raise ValueError(
-            "mxfp4_w4a8 (MXFP4 weights x MXFP8 activations) requires hidden_size "
-            "and intermediate_size divisible by 128, got "
-            f"hidden_size={args.hidden_size}, "
-            f"intermediate_size={args.intermediate_size}"
-        )
 
     torch.manual_seed(args.random_seed)
     w1_rows = args.intermediate_size * (2 if activation.is_gated else 1)
@@ -636,6 +632,16 @@ def run_unified_moe_test(args):
             print(
                 f"[INFO] {backend} does not support {args.quant_variant} "
                 f"unified MoE on SM{arch}; skipping."
+            )
+            continue
+        if backend in _ALIGN_128_BACKENDS.get(args.quant_variant, ()) and (
+            args.hidden_size % 128 or args.intermediate_size % 128
+        ):
+            print(
+                f"[INFO] {backend} {args.quant_variant} unified MoE requires "
+                "hidden_size and intermediate_size divisible by 128, got "
+                f"hidden_size={args.hidden_size}, "
+                f"intermediate_size={args.intermediate_size}; skipping."
             )
             continue
 
