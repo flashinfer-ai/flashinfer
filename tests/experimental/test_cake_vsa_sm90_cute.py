@@ -74,16 +74,15 @@ def _stage_of(plan):
 # One problem per planner-selectable stage: (route, h, mb, nb, capacity,
 # ragged, seed).  The selection sizes steer ``small_kmax_for`` / ``split_kmax``
 # / ``cluster_variant_for`` to the named variant; the test asserts the stage.
-# ``small_k3s`` is compiled and exported for parity with the CUDA route but
-# ``split_kmax`` never selects it (its modelled chain cost ties KMAX 4, which
-# wins on ties with fewer slices); it is checked by a direct launch below.
+# ``small_k1s`` and ``small_k3s`` are still part of this build but no plan
+# reaches them: ``split_kmax`` ranks only the KMAX 4 and 6 split variants and
+# ``plan_small`` refuses a split plan for any other KMAX.
 STAGE_CASES = {
     "attention": ("persistent", 2, 8, 32, 6, True, 11),
     "small_k1": ("small", 4, 4, 4, 1, False, 11),
     "small_k3": ("small", 8, 4, 4, 3, True, 11),
     "small_k4": ("small", 8, 16, 16, 4, True, 11),
     "small_k6": ("small", 2, 8, 32, 6, True, 11),
-    "small_k1s": ("smallsplit", 2, 4, 8, 3, True, 13),
     "small_k4s": ("smallsplit", 1, 1, 8, 6, False, 13),
     "small_k6s": ("smallsplit", 1, 1, 64, 64, False, 13),
     "small_k2c4": ("smallcluster", 1, 1, 8, 8, False, 19),
@@ -249,52 +248,3 @@ def test_unknown_engine_is_rejected():
     rows, cols = _descriptors(mask)
     with pytest.raises(ValueError, match="engine"):
         CakeVsaSm90Plan("cuda", mask, rows, cols, 1, 1, 128, engine="ptx")
-
-
-@requires_hopper
-@requires_cute
-def test_planner_unreachable_k3s_stage_matches_reference():
-    """``small_k3s`` is not selectable through ``split_kmax``; launch it directly."""
-    from flashinfer.cake_vsa_sm90 import (
-        BLOCK,
-        HEAD_DIM,
-        LOG2E,
-        SMALL_ITEM_ELEMS,
-        SMALL_STATS_FLOATS,
-        plan_small,
-    )
-
-    h, mb, nb, capacity = 2, 4, 8, 6
-    mask = _random_mask(h, mb, nb, capacity, seed=29, ragged=True, device="cuda")
-    plan = plan_small(mask, kmax=3, split=True, cluster=0)
-    assert plan["split"] and plan["num_items"] > plan["num_tiles"]
-    q, k, v = _inputs(h, mb, nb)
-    out = torch.empty_like(q)
-    stage = load_stage("small_k3s")
-    bindings = {
-        "Q": q,
-        "K": k,
-        "Vt": v,
-        "O": out,
-        "plan": plan["plan"].contiguous(),
-        "seqlen_q": mb * BLOCK,
-        "seqlen_k": nb * BLOCK,
-        "scale_log2": HEAD_DIM**-0.5 * LOG2E,
-        "Wo": torch.empty(
-            (plan["num_items"] * SMALL_ITEM_ELEMS,), dtype=torch.float32, device="cuda"
-        ),
-        "Ws": torch.empty(
-            (plan["num_items"] * SMALL_STATS_FLOATS,),
-            dtype=torch.float32,
-            device="cuda",
-        ),
-        "Wc": torch.zeros((plan["num_tiles"],), dtype=torch.int32, device="cuda").view(
-            torch.uint32
-        ),
-    }
-    stage.run(bindings, (int(plan["num_items"]), 1, 1))
-    torch.cuda.synchronize()
-    reference = _reference(q, k, v, mask, HEAD_DIM**-0.5)
-    torch.testing.assert_close(out.float(), reference, **TOL)
-    assert float((out.float() - reference).abs().max()) <= MAX_ABS
-    assert int(bindings["Wc"].view(torch.int32).abs().sum()) == 0

@@ -46,6 +46,7 @@ import tvm_ffi  # noqa: F401 -- TVM FFI supplies the active PyTorch stream
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ..norm import utils as norm_utils
+from .fused_kda_decode import _device_index, _device_sm_count
 
 _D = 128
 _W = 4
@@ -846,7 +847,7 @@ def _run_fused_kda_decode_multitoken(
     )
     T, H, lower_bound, norm_eps = key
     N = state_indices.shape[0]
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+    sm_count = _device_sm_count(_device_index(x.device))
     SPLIT = _pick_split(N * H, sm_count)
     if T == 1:
         SPLIT = 1

@@ -13,18 +13,14 @@ preflight owns eligibility; candidate preparation may compile a native plan.
 
 from typing import TYPE_CHECKING, cast
 
-import torch
-
-from ...api_logging import (
-    _warn_from_external_caller,
-    experimental_auto_backends_allowed,
-)
+from ...api_logging import experimental_auto_backends_allowed
 from ...utils import (
-    determine_mla_backend,
     get_compute_capability as _get_compute_capability,
+    is_sm90a_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
 )
 from ._backends._capabilities import _BackendPlanUnsupportedError
-from ._backends.cutile_backend import _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES
 from ._planning import _MLAPlanArguments
 
 if TYPE_CHECKING:
@@ -34,36 +30,6 @@ if TYPE_CHECKING:
 class _BatchMLAPagedAttentionAutoBackend:
     """Resolve the automatic policy to a prepared concrete backend."""
 
-    _blackwell_auto_fallback_warned: bool = False
-
-    @classmethod
-    def _maybe_warn_blackwell_auto_fallback(
-        cls, device: torch.device, selected_backend: str
-    ) -> None:
-        if cls._blackwell_auto_fallback_warned:
-            return
-        major, minor = _get_compute_capability(device)
-        if major < 10:
-            return
-        cls._blackwell_auto_fallback_warned = True
-        if (major, minor) in _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES:
-            in_wrapper_alternative = (
-                "backend='cutile' is the native in-wrapper cuda.tile alternative."
-            )
-        else:
-            in_wrapper_alternative = (
-                "backend='cutlass' is the closest in-wrapper alternative but may be "
-                "slower than this fallback for decode shapes."
-            )
-        _warn_from_external_caller(
-            f"BatchMLAPagedAttentionWrapper: backend='auto' selected "
-            f"'{selected_backend}' on SM{major}{minor}, which is not Blackwell-native "
-            f"and gives poor MLA decode performance. For decode, use "
-            f"flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla "
-            f"(Blackwell-native trtllm-gen); {in_wrapper_alternative}",
-            UserWarning,
-        )
-
     @classmethod
     def plan_from_wrapper(cls, plan_args: _MLAPlanArguments) -> "_PlannedBackend":
         # The wrapper registers this class during import; resolve its shared
@@ -71,16 +37,24 @@ class _BatchMLAPagedAttentionAutoBackend:
         from ._wrapper import _BACKEND_TYPES
 
         plan_args.csr()  # Malformed metadata is never a candidate support refusal.
-        device = plan_args._float_workspace_buffer.device
+
+        # Retain the executable family used by the existing graph plan.
         if plan_args._use_cuda_graph and plan_args._previous_backend_name is not None:
-            # Retain the executable family used by the existing graph plan.
             candidates: tuple[str, ...] = (plan_args._previous_backend_name,)
-        elif _get_compute_capability(device) == (10, 0):
-            candidates = ordered_sm100_backends(plan_args)
         else:
-            backend = determine_mla_backend(device)
-            cls._maybe_warn_blackwell_auto_fallback(device, backend)
-            candidates = (backend,)
+            device = plan_args._float_workspace_buffer.device
+            if _get_compute_capability(device) == (8, 0):
+                candidates = ordered_sm80_backends(plan_args)
+            elif is_sm90a_supported(device):
+                candidates = ordered_sm90_backends(plan_args)
+            elif _get_compute_capability(device) in ((10, 0), (10, 3)):
+                candidates = ordered_sm100_backends(plan_args)
+            elif _get_compute_capability(device) == (10, 7):
+                candidates = _ordered_sm107_backends(plan_args)
+            elif is_sm120a_supported(device) or is_sm121a_supported(device):
+                candidates = ordered_sm12x_backends(plan_args)
+            else:
+                candidates = _AUTO_BACKEND_CANDIDATES
         rejections: list[str] = []
         for candidate in candidates:
             try:
@@ -105,18 +79,32 @@ class _BatchMLAPagedAttentionAutoBackend:
         )
 
 
+# Default fallback groups: FA, TRT/CuTe, narrow adapters, then experimental.
+# Architecture policies move their measured preferences first.
 _AUTO_BACKEND_CANDIDATES = (
-    "cute-dsl-monolithic",
-    "trtllm-gen",
     "fa2",
+    "fa3",
+    "trtllm-gen",
+    "cute-dsl-monolithic",
     "cute-dsl-modular",
-    "cutile",
     "cutlass",
+    "xqa",
+    "cutile",
 )
 
 
 def _prefer(*backends):
     return backends + tuple(b for b in _AUTO_BACKEND_CANDIDATES if b not in backends)
+
+
+def ordered_sm80_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
+    """Prefer FA2 on SM80."""
+    return _prefer("fa2")
+
+
+def ordered_sm90_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
+    """Prefer FA3 on supported SM90 toolchains, with FA2 as fallback."""
+    return _prefer("fa3", "fa2")
 
 
 # SM100 warmed planned-wrapper measurements favor monolithic CuTe at larger
@@ -135,10 +123,10 @@ def ordered_sm100_backends(args):
     # Legacy flat metadata can have extra query offsets. Leave its interpretation
     # to the backend instead of imposing a new validity restriction here.
     if not q_lens or len(q_lens) != len(kv_lens):
-        return _AUTO_BACKEND_CANDIDATES
+        return _prefer("cute-dsl-monolithic", "trtllm-gen")
     total_q, total_kv = sum(q_lens), sum(kv_lens)
     if not total_q or not total_kv:
-        return _AUTO_BACKEND_CANDIDATES
+        return _prefer("cute-dsl-monolithic", "trtllm-gen")
     heads = args.num_heads
     work = heads * sum(q * kv for q, kv in zip(q_lens, kv_lens, strict=True))
     output_work = heads * total_q
@@ -190,22 +178,24 @@ def ordered_sm100_backends(args):
         # Large short-context prefill amortizes TRT's launch cost. Preserve
         # CuTe for longer prefixes and lower head counts with different crossovers.
         if heads >= 64 and max_q >= 128 and output_work >= 65536 and max_kv <= 512:
-            return _prefer("trtllm-gen")
+            return _prefer("trtllm-gen", "cute-dsl-monolithic")
         # Batched short prefill amortizes TRT's launch cost at larger head
         # counts. Lower-head requests retain CuTe even at the same output work.
         if heads >= 64 and output_work >= 24576 and 16 <= max_q <= 32 and max_kv <= 32:
-            return _prefer("trtllm-gen")
+            return _prefer("trtllm-gen", "cute-dsl-monolithic")
         # TRT wins small short-context query tiles; CuTe wins as those tiles
         # grow. Preserve the older narrow tile rule for larger query counts.
         query_tile = max_q * heads
         if work <= 2**20 and max_kv <= 512 and (query_tile <= 128 or max_q <= 16):
             return (
-                _prefer("trtllm-gen") if query_tile <= 576 else _AUTO_BACKEND_CANDIDATES
+                _prefer("trtllm-gen", "cute-dsl-monolithic")
+                if query_tile <= 576
+                else _prefer("cute-dsl-monolithic", "trtllm-gen")
             )
         # Larger short-context decode batches favor TRT. Count actual queries
         # so empty metadata requests cannot trigger the throughput preference.
         if max_q == 1 and heads >= 64 and total_q >= 96 and max_kv <= 512:
-            return _prefer("trtllm-gen")
+            return _prefer("trtllm-gen", "cute-dsl-monolithic")
         if heads >= 128:
             # Distinguish long KV from short-KV multi-query work with the same
             # aggregate size. Their measured TRT/CuTe crossovers differ.
@@ -214,28 +204,46 @@ def ordered_sm100_backends(args):
                 if 1 < max_q <= 8 and min_kv > 4096:
                     graph_limit = 2**23
                 if work <= graph_limit:
-                    return _AUTO_BACKEND_CANDIDATES
-            return _prefer("trtllm-gen")
+                    return _prefer("cute-dsl-monolithic", "trtllm-gen")
+            return _prefer("trtllm-gen", "cute-dsl-monolithic")
         if max_q == 1 and (
             min_kv >= 8192
             or (output_work > 384 and max_kv > 512)
             or (16 < heads < 32 and min_kv > 512 and max_kv <= 2048)
         ):
-            return _AUTO_BACKEND_CANDIDATES
+            return _prefer("cute-dsl-monolithic", "trtllm-gen")
         if work <= 2**20 and max_q == 1:
-            return _prefer("trtllm-gen")
-        return _AUTO_BACKEND_CANDIDATES
+            return _prefer("trtllm-gen", "cute-dsl-monolithic")
+        return _prefer("cute-dsl-monolithic", "trtllm-gen")
     if heads >= 128:
-        order = _prefer("trtllm-gen")
+        order = _prefer("trtllm-gen", "cute-dsl-monolithic")
     elif small_work:
         # Long-context decode keeps CuTe before FA2 after typed TRT rejection.
-        order = _prefer("trtllm-gen") if max_q == 1 else _prefer("trtllm-gen", "fa2")
+        order = (
+            _prefer("trtllm-gen", "cute-dsl-monolithic")
+            if max_q == 1
+            else _prefer("trtllm-gen", "fa2")
+        )
     else:
-        order = _AUTO_BACKEND_CANDIDATES
+        order = _prefer("cute-dsl-monolithic", "trtllm-gen")
     # Larger multi-query work or aggregate KV volume can favor modular CuTe
     # after earlier implementations reject. Keep the eager guards authoritative.
-    if max_q > 1 and (work >= 5 * 2**20 or total_kv >= 5 * 2**14):
+    # Small-head Q4 requests favor FA2 after earlier native candidates reject.
+    # Keep modular's measured Q2/Q3 and larger-head advantages.
+    prefer_fa2_q4 = heads <= 16 and max_q == 4 and min(q_lens) == 4 and not args.causal
+    if max_q > 1 and not prefer_fa2_q4 and (work >= 5 * 2**20 or total_kv >= 5 * 2**14):
         remaining = tuple(backend for backend in order if backend != "cute-dsl-modular")
         position = remaining.index("fa2")
         return remaining[:position] + ("cute-dsl-modular",) + remaining[position:]
     return order
+
+
+def _ordered_sm107_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
+    # The SM100 policy performed well in SM107 development measurements.
+    # Further investigation may identify useful SM107-specific ordering rules.
+    return ordered_sm100_backends(args)
+
+
+def ordered_sm12x_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
+    """Prefer FA2 on SM120/SM121, then native XQA and opt-in cuTile."""
+    return _prefer("fa2", "xqa", "cutile")

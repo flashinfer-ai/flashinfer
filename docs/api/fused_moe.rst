@@ -104,12 +104,27 @@ Multi-LoRA MoE (BGMV)
 Batched Gather-Matrix-Vector kernels for serving multiple LoRA adapters on
 top of a Mixture-of-Experts layer (shrink + expand).
 
+:func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100 and
+SM103 devices the generated Cake programs serve one LoRA slice with rank 8, 16,
+32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688 and
+3072 at rank 32 use the specialized measured bodies at up to 2048 tokens, ``plan.variant ==
+"specialized"``; everything else the runtime-hidden generic bundles,
+``plan.variant == "generic"``); the output has one owner per token, so replays
+are bitwise reproducible. Arbitrary pair order (for example expert-sorted
+dispatch) is served through a token->pair route index that the shrink kernels
+publish and the expand kernels read in O(1) per CTA; the generic shrink splits the hidden
+dimension over extra CTAs at small pair counts and reduces the partials in a fixed order.
+Other inputs fall back to the portable
+``bgmv_moe_shrink`` / ``bgmv_moe_expand`` kernels (``plan.backend_used ==
+"portable"``) unless ``fallback=False`` is passed.
+
 .. autosummary::
     :toctree: ../generated
 
     bgmv_moe
     prepare_bgmv_moe
-    BGMVMoEBlackwellPlan
+    BGMVMoECakePlan
+    BGMVMoEPortablePlan
     bgmv_moe_shrink
     bgmv_moe_expand
     bgmv_moe_gemm1_lora_delta
@@ -368,8 +383,11 @@ portfolio fails closed outside these contracts:
   ``(SwiGLU(), 2048, 512, 256, 8)``,
   ``(SwiGLU(), 4096, 1024, 512, 10)``,
   ``(SwiGLU(), 3072, 1536, 256, 8)``,
-  ``(SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4)``, or
-  ``(SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16)``;
+  ``(SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4)``,
+  ``(SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16)``, or one
+  of the sharded per-partition slices ``(SwiGLU(), 4096, 512, 512, 10)``,
+  ``(SwiGLU(), 4096, 256, 512, 10)``, ``(SwiGLU(), 3072, 768, 256, 8)``,
+  and ``(SwiGLU(), 3072, 384, 256, 8)``;
 * the token count is 1--32, routing is ``UnpackedPrecomputed`` with contiguous
   int32 expert IDs and BF16 routing weights;
 * quantization is NVFP4, finalization and PDL are enabled, and expert

@@ -22,7 +22,7 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt"]
+license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda"]
 
 [project.optional-dependencies]
 b12x = [
@@ -35,6 +35,8 @@ b12x = [
   "rich>=13",
   "safetensors>=0.6",
 ]
+# Static SM103a KDA PTX uses ISA 9.2 and embedded-cubin TVM FFI shims.
+ptx = ["nvidia-cuda-nvcc>=13.2", "apache-tvm-ffi>=0.1.12,<0.2"]
 # Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
 cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
@@ -88,7 +90,11 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 [tool.setuptools.package-data]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
+"flashinfer.experimental.cake_lm_head_loss" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
+"flashinfer.experimental.cake_mla_varq_dcp_decode" = ["csrc/**"]
+"flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
+"flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**"]
 "flashinfer" = ["_build_meta.py"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
@@ -104,6 +110,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+# Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
+"flashinfer.experimental.cake_moe_grouped_gemm" = ["csrc/**"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
 "flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm" = ["artifacts/*/*.json", "artifacts/*/sources/*.py", "csrc/**"]
 # Generated sources for the experimental exact-SM110 GQA decode backend.

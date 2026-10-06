@@ -1472,6 +1472,11 @@ def cutlass_fused_moe(
         their own buffer. A buffer sized for the maximum token count is valid for all
         smaller counts on the same call.
 
+    backend : str
+        ``"cutlass"`` preserves the existing backend. ``"cake"`` selects the
+        prepared TP8-local SiTU complete call; output and workspace are required.
+        See the Cake SiTU guide for its TRTLLM shuffled NVFP4 weight layout.
+
     Returns
     -------
     out: torch.Tensor
@@ -1491,10 +1496,6 @@ def cutlass_fused_moe(
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
 
-    backend : str
-        ``"cutlass"`` preserves the existing backend. ``"cake"`` selects the
-        prepared TP8-local SiTU complete call; output and workspace are required.
-        See the Cake SiTU guide for its TRTLLM shuffled NVFP4 weight layout.
     """
     if backend == "cake":
         from .cake_kimi_k3_situ import _cake_situ_fused_moe
@@ -7093,4 +7094,4 @@ def trtllm_mxint4_block_scale_routed_moe(
     )
 
 
-from .cake_kimi_k3_situ import cutlass_fused_moe_prepare_workspace  # noqa: E402,F401
+from .cake_kimi_k3_situ import cake_fused_moe_prepare_workspace  # noqa: E402,F401

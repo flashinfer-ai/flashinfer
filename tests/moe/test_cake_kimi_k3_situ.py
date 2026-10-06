@@ -23,7 +23,7 @@ from flashinfer.fused_moe import (
     SiTU,
     TrtllmFp4Config,
     cutlass_fused_moe,
-    cutlass_fused_moe_prepare_workspace,
+    cake_fused_moe_prepare_workspace,
     cutlass_fused_moe_workspace_size,
     trtllm_fp4_block_scale_routed_moe,
 )
@@ -159,7 +159,7 @@ def test_cake_situ_prepare_smaller_shape_in_maximum_size_buffer(
     )
     for tokens in (num_tokens, max_num_tokens):
         assert (
-            cutlass_fused_moe_prepare_workspace(
+            cake_fused_moe_prepare_workspace(
                 workspace,
                 tokens,
                 backend="cake",
@@ -292,7 +292,7 @@ def test_cake_situ_output_workspace_and_external_graph(
         submit()
     assert torch.isnan(output).all()
     assert (
-        cutlass_fused_moe_prepare_workspace(
+        cake_fused_moe_prepare_workspace(
             workspace,
             num_tokens,
             backend="cake",

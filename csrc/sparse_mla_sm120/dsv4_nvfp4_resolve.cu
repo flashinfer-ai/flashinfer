@@ -18,7 +18,7 @@ ExecutionPlan resolve_dsv4_nvfp4(int tokens, int heads, int topk, int extra_topk
                                  size_t max_shared_bytes, bool prefill, bool stage1_only) {
   using namespace nvfp4;
   TVM_FFI_ICHECK(tokens > 0 && has_instance(heads, topk)) << "unsupported NVFP4 tokens/heads/topk";
-  TVM_FFI_ICHECK(page_size == FixedPageSize &&
+  TVM_FFI_ICHECK(page_size > 0 &&
                  page_stride_bytes >= size_t(page_size) * Dsv4Nvfp4Layout::BYTES_PER_TOKEN &&
                  page_stride_bytes % 16 == 0)
       << "unsupported NVFP4 page layout";
@@ -35,8 +35,11 @@ ExecutionPlan resolve_dsv4_nvfp4(int tokens, int heads, int topk, int extra_topk
   const int chunks = (topk + DECODE_CAND_WINDOW - 1) / DECODE_CAND_WINDOW +
                      (extra_topk + DECODE_CAND_WINDOW - 1) / DECODE_CAND_WINDOW;
   const int grouped_blocks = (heads + STREAMING_HEADS_PER_CTA - 1) / STREAMING_HEADS_PER_CTA;
-  const bool grouped = prefill || (heads >= STREAMING_HEADS_PER_CTA && chunks >= 8 &&
-                                   int64_t{tokens} * grouped_blocks >= 8);
+  // The streaming kernel requires a full HPB head group; thinner prefill falls
+  // back to the decode kernel, which supports NUM_HEADS < HPB via VALID_HPB.
+  const bool streaming_prefill = prefill && heads % HPB == 0;
+  const bool grouped = streaming_prefill || (heads >= STREAMING_HEADS_PER_CTA && chunks >= 8 &&
+                                             int64_t{tokens} * grouped_blocks >= 8);
   const int h_blocks = grouped ? grouped_blocks : (heads + HPB - 1) / HPB;
   if (prefill) cpb = chunks;
   if (cpb < 1 || cpb > chunks) {
@@ -66,9 +69,9 @@ ExecutionPlan resolve_dsv4_nvfp4(int tokens, int heads, int topk, int extra_topk
   const size_t slots = merge == Merge::Direct ? 0 : size_t(tokens) * heads * active;
   return {
       NumericRoute::NVFP4,
-      prefill   ? Implementation::Dsv4Nvfp4Prefill
-      : grouped ? Implementation::Dsv4Nvfp4GroupedDecode
-                : Implementation::Dsv4Nvfp4Decode,
+      streaming_prefill ? Implementation::Dsv4Nvfp4Prefill
+      : grouped         ? Implementation::Dsv4Nvfp4GroupedDecode
+                        : Implementation::Dsv4Nvfp4Decode,
       cpb,
       chunks,
       active,
@@ -152,6 +155,7 @@ ffi::Map<ffi::String, ffi::Any> dsv4_nvfp4_format_info() {
           {"bytes_per_token", Dsv4Nvfp4Layout::BYTES_PER_TOKEN},
           {"chunk_width", nvfp4::DECODE_CAND_WINDOW},
           {"page_size", FixedPageSize},
+          {"runtime_page", true},
           {"extra_page_sizes", pages},
           {"heads", heads},
           {"topks", topks}};

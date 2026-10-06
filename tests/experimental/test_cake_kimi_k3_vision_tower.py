@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.experimental.kimi_k3_vision_tower import cake_backend as cb
+from flashinfer.experimental.kimi_k3_vision_tower import cake_jit
 from flashinfer.experimental.kimi_k3_vision_tower.cake_backend import (
     FFN,
     GEMM_BLOCK_M,
@@ -39,7 +40,6 @@ from flashinfer.experimental.kimi_k3_vision_tower.cake_backend import (
     PROJECTOR_EPS,
     QKV_HIDDEN,
     QKV_N,
-    REQUIRED_KERNEL_KEYS,
     SOFTMAX_SCALE,
     SUPPORTED_COMPUTE_CAPABILITIES,
     TEXT_HIDDEN,
@@ -173,11 +173,14 @@ def test_select_tile_config_buckets():
         "gelu_erf": ("xs", "s", "l", "l_sk"),
         "rmsnorm": ("s", "s", "l", "l"),
     }
+    # Round 6: ``select_tile_config`` = this rule + the outermost half-N tail step (``_half_twin``; tested below);
+    # the interval tables here are those of the round-3 .. round-5 rule ``_select_tile_config_base``.
+    base = cb._select_tile_config_base
     for variant, names in expect.items():
-        got = tuple(select_tile_config(variant, m).name for m in (4, 1024, 4144, 10764))
+        got = tuple(base(variant, m).name for m in (4, 1024, 4144, 10764))
         assert got == names, (variant, got)
     # The census is per device: on 160 SMs (80 clusters) the same M leaves a 48-tile tail (60 %), no twin.
-    assert select_tile_config("gelu_erf", 10764, sm_count=160).name == "l"
+    assert base("gelu_erf", 10764, sm_count=160).name == "l"
     # Round-3 per-form boundaries (Cake ``kimi_k3_vision_gemm`` r3 tile-boundary policy):
     # (first M of each interval, tile) over M = 1 .. 20000.
     boundaries = {
@@ -227,7 +230,7 @@ def test_select_tile_config_buckets():
         # Round 4 / 5: ``l`` <-> ``l_sk`` alternate per 128-row tile pair inside the pair-tile range wherever
         # the census leaves a tail of <= 30 % of the 74 clusters worth >= 6.5 % of the rounds OR (round 5) a
         # tail of <= 60 % worth >= 9 % (Cake ``_sk_twin``; identical to the Cake rule over M = 1 .. 65536 at the
-        # round-5 head, copied from ``exports/kimi_k3_vision_tower`` ``_gemm_tile``).
+        # round-5 head, copied from the Cake export's ``_gemm_tile``).
         "gelu_erf": [
             (1, "xs"),
             (257, "s"),
@@ -284,7 +287,7 @@ def test_select_tile_config_buckets():
     for variant, segments in boundaries.items():
         got, prev = [], None
         for m in range(1, 20001):
-            name = select_tile_config(variant, m).name
+            name = base(variant, m).name
             if name != prev:
                 got.append((m, name))
                 prev = name
@@ -312,7 +315,8 @@ def test_select_tile_config_buckets():
     l_sk = [m for m, name in fc1 if name == "l_sk"]
     assert (l_sk[0], l_sk[-1], len(l_sk)) == (15873, 105857, 704)
     assert select_tile_config("residual_fc1_sqxw", cb.FC1_SK_L_MAX_M).name == "l_sk"
-    assert select_tile_config("residual_fc1_sqxw", cb.FC1_SK_L_MAX_M + 1).name == "m_p"
+    assert base("residual_fc1_sqxw", cb.FC1_SK_L_MAX_M + 1).name == "m_p"
+    assert base("residual_fc1_sqxw", 153088).name == "m_p"
     assert select_tile_config("residual_fc1_sqxw", 153088).name == "m_p"
     # The census counts cover every routing window of the module (fc1 l_sk up to 105984, PDL windows) plus
     # the rule boundaries and the PDL window edges on M.
@@ -334,15 +338,105 @@ def test_select_tile_config_buckets():
     for variant in expect:
         for m in (4, 256, 257, 1024, 1025, 8192, 8193, 153088):
             assert not select_tile_config(variant, m).tail
-    # Without a packed table the ``_cs`` tiles fall back to their FP32-table base.
+    # Round 6 (Cake lever G1 / G2, ``_half_twin``): the outermost step maps a plain persistent tile to its half-N
+    # twin ``*_h`` when the census tail (tiles past the last full round on ``min(tiles, SM // cluster_x)`` clusters)
+    # fits one half-round with margin: ``0 < 2 tail <= clusters - 4``.  pos and the stream-K / split-K / tail tiles
+    # have no twin; the twin is the same tile with a half-width (acc_n / 2) tail item.
+    assert (
+        cb.half_tail_split(688, 74) == 22
+    )  # gelu_erf-like census: tail 22 -> 44 <= 70
+    assert (
+        cb.half_tail_split(74 * 3 + 35, 74) == 35
+    )  # 70 <= 70: the largest half round taken
+    assert (
+        cb.half_tail_split(74 * 3 + 36, 74) == 0
+    )  # 72 > 70: a >= 97 %-full half round is a tie
+    assert cb.half_tail_split(74 * 4, 74) == 0 and cb.half_tail_split(50, 74) == 0
+    for variant, m, name in (
+        ("norm_gelu", 2552, "m_e8_h"),
+        ("residual_wo_sqxw", 2552, "s_e8_pf_h"),
+        ("residual_wo_sqxw", 19136, "m_tma1_h"),
+        ("residual_wo_sqxw", 8192, "m_tma1"),  # HALF_MIN_ROUNDS: 4 rounds
+        ("residual_wo_sqxw", 12288, "m_tma1_h"),  # 6 rounds
+        ("residual_wo_sqxw", 10764, "m_tma1"),
+        ("residual_wo_sqxw", 4144, "s_e8_pf"),
+        ("norm_qkv_rope", 4144, "l_e8_cs_h"),
+        ("norm_qkv_rope", 1152, "s_cs_h"),
+        (
+            "norm_qkv_rope",
+            576,
+            "xs_cs_pf",
+        ),  # the xs tile never takes its twin
+        ("norm_gelu", 576, "xs"),
+        ("norm_qkv_rope", 256, "xs_cs_pf"),
+        ("rmsnorm", 4144, "l_h"),
+        ("gelu_erf", 1196, "s_h"),
+        (
+            "gelu_erf",
+            638,
+            "xs",
+        ),  # (gelu_erf, xs) never takes its twin
+        ("residual_wo_sqxw", 66564, "m_tma1"),  # 33 rounds > HALF_MAX_ROUNDS
+        ("residual_wo_sqxw", 43056, "m_tma1_h"),  # 20 rounds: twin kept
+        ("norm_gelu", 66564, "l_e8"),
+        ("norm_gelu", 153088, "l_e8"),
+        ("norm_gelu", 19140, "l_e8_h"),
+        ("norm_qkv_rope", 43056, "l_e8_cs"),
+        ("norm_qkv_rope", 153088, "l_e8_cs"),
+        ("residual_fc1_sqxw", 4144, "l_e8_pf"),
+        ("pos_sqxw", 2552, "s_e8_pf"),
+        ("pos_sqxw", 19136, "s_e8_pf"),
+    ):
+        cfg = select_tile_config(variant, m)
+        assert cfg.name == name, (variant, m, cfg.name)
+        assert cfg.half == name.endswith("_h")
+        if cfg.half:
+            assert base(variant, m).name == name[:-2]
+    for name, twin in cb.HALF_TWIN.items():
+        a, b = TILE_CONFIGS[name], TILE_CONFIGS[twin]
+        assert not a.half and b.half
+        fields = (
+            "cta_group",
+            "acc_n",
+            "num_stages",
+            "group_m",
+            "ksplit",
+            "epi_warps",
+            "packed",
+            "prefetch",
+            "rope",
+            "tma_epi",
+            "tma_onebuf",
+            "mcast",
+        )
+        assert tuple(getattr(a, f) for f in fields) == tuple(
+            getattr(b, f) for f in fields
+        ), name
+    assert not any(select_tile_config("pos_sqxw", m).half for m in range(1, 65537, 128))
+    # Final-head limits (Cake HALF_MAX_ROUNDS; the xs twins Cake excludes on every form are not in the catalogue).
+    assert cb.HALF_MAX_ROUNDS == 24
+    assert not any(name.startswith("xs") for name in cb.HALF_TWIN.values())
+    # m_tma1_h needs >= 6 persistent rounds (8192 = 4 rounds regressed the batch8_448 tower row on B200); 12288 keeps it.
+    assert cb.HALF_MIN_ROUNDS == {"m_tma1": 6}
+    assert select_tile_config("residual_wo_sqxw", 8192).name == "m_tma1"
+    assert select_tile_config("residual_wo_sqxw", 12288).name == "m_tma1_h"
+    assert not any(
+        select_tile_config(variant, m).name in ("xs_h", "xs_cs_pf_h")
+        for variant in ("gelu_erf", "norm_gelu", "norm_qkv_rope")
+        for m in range(1, 20001)
+    )
+    assert all(
+        not select_tile_config(variant, m).half
+        for variant in ("residual_wo_sqxw", "norm_gelu", "norm_qkv_rope")
+        for m in (66564, 105984, 153088)
+    )
+    assert not any(
+        cfg.half and (cfg.sk or cfg.tail or cfg.ksplit > 1)
+        for cfg in TILE_CONFIGS.values()
+    )
+    # The host always passes the packed RoPE table: a ``_cs`` tile is launched as is.
     assert (
         launch_tile_config("norm_qkv_rope", TILE_CONFIGS["xs_cs_pf"]).name == "xs_cs_pf"
-    )
-    assert (
-        launch_tile_config(
-            "norm_qkv_rope", TILE_CONFIGS["xs_cs_pf"], rope_table=False
-        ).name
-        == "xs"
     )
 
 
@@ -361,8 +455,6 @@ def test_gemm_launch_geometry():
     assert geo.cluster_tiles == (geo.m_tiles // 2) * (QKV_N // 256)
     assert geo.grid == (2 * min(geo.cluster_tiles, SM_COUNT // 2), 1, 1)
     assert (geo.full_tiles, geo.tail_split) == (geo.cluster_tiles, 1)
-    with pytest.raises(NotImplementedError):
-        gemm_launch_geometry("norm_qkv_rope", TILE_CONFIGS["l_e8_t"], 4144, SM_COUNT)
     # Stream-K twin (round 4): the full rounds stay data-parallel; the 22-tile tail of gelu_erf
     # at M = 10764 (688 pair tiles on 74 clusters) is cut into q = 22 k-steps per cluster
     # (ceil(22 x 64 / 74) = 20, raised to ceil(64 / (SK_MAX_CONTRIB - 1)) = 22).
@@ -387,71 +479,23 @@ def test_gemm_launch_geometry():
     geo = gemm_launch_geometry("residual_fc1_sqxw", cfg, 16576, SM_COUNT)
     assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 130, 260)
     assert (geo.full_tiles, geo.tail_split) == (222, 33)
-
-
-def test_required_kernel_keys():
-    # The plain SPLIT_KV form is reachable only on sm_103a (segments < 576 tokens or > 10764
-    # tokens); on sm_100a every SPLIT_KV row runs the ring3 form.
-    assert set(REQUIRED_KERNEL_KEYS) == {"sm_100a", "sm_103a"}
-    assert "attention:tiles1" not in REQUIRED_KERNEL_KEYS["sm_100a"]
-    assert "attention:tiles1" in REQUIRED_KERNEL_KEYS["sm_103a"]
-    for keys in REQUIRED_KERNEL_KEYS.values():
-        assert "attention:ring3" in keys
-        assert "attention:tiles2" in keys
-        assert "merge" in keys
-        assert "rmsnorm_apply" in keys
-        gemm_keys = [k for k in keys if k.startswith("gemm:")]
-        # Small-M tiles of the per-layer forms are always inside their PDL_EARLY window: only the pdle
-        # binary is reachable; the large-M tiles exist in both forms (window bound inside their range).
-        assert (
-            "gemm:pos_sqxw:xs_pf" in gemm_keys
-            and "gemm:pos_sqxw:xs_pf:pdle" not in gemm_keys
-        )
-        assert "gemm:residual_fc1_sqxw:xs_k4_pf:pdle" in gemm_keys
-        assert "gemm:residual_fc1:xs_k4_pf:pdle" in gemm_keys
-        assert "gemm:residual_wo_sqxw:m_tma1" in gemm_keys
-        assert "gemm:residual_wo_sqxw:m_tma1:pdle" in gemm_keys
-        assert "gemm:residual_wo_sqxw:s_e8_pf:pdle" in gemm_keys
-        assert "gemm:residual_fc1:s_e8_pf:pdle" in gemm_keys
-        assert (
-            "gemm:norm_qkv_rope:l_e8_cs" in gemm_keys
-            and "gemm:norm_qkv_rope:l_e8_cs:pdle" in gemm_keys
-            and "gemm:gelu_erf:l" in gemm_keys
-        )
-        # Round 4 / 5: the stream-K twins of the projector GEMMs and (round 5) of residual_fc1.
-        assert "gemm:gelu_erf:l_sk" in gemm_keys and "gemm:rmsnorm:l_sk" in gemm_keys
-        assert (
-            "gemm:residual_fc1_sqxw:m_sk" in gemm_keys
-            and "gemm:residual_fc1:l_sk" in gemm_keys
-        )
-        assert not any(
-            k.split(":")[2].endswith("_sk")
-            for k in gemm_keys
-            if k.split(":")[1]
-            not in ("gelu_erf", "rmsnorm", "residual_fc1", "residual_fc1_sqxw")
-        )
-        # Round 5: the PDL_EARLY binaries inside the census windows; never on stream-K / pos tiles, and the
-        # plain PDL binary of a tile is registered only where it is reachable (e.g. norm_qkv_rope s_cs at
-        # 769..1536 is always inside the window -> only its pdle form exists).
-        pdle = [k for k in gemm_keys if k.endswith(":pdle")]
-        assert len(pdle) == 25 and len(gemm_keys) == len(set(gemm_keys)) == 43
-        assert (
-            "gemm:norm_gelu:m_e8:pdle" in pdle
-            and "gemm:norm_qkv_rope:m_e8_cs:pdle" in pdle
-        )
-        assert (
-            "gemm:norm_qkv_rope:s_cs:pdle" in pdle
-            and "gemm:norm_qkv_rope:s_cs" not in gemm_keys
-        )
-        assert "gemm:gelu_erf:l:pdle" not in pdle and "gemm:gelu_erf:l" in gemm_keys
-        assert not any(
-            TILE_CONFIGS[k.split(":")[2]].sk or k.split(":")[1] == "pos_sqxw"
-            for k in pdle
-        )
-        # Every registered GEMM tile is a production (non-tail) config.
-        assert not any(TILE_CONFIGS[k.split(":")[2]].tail for k in gemm_keys)
-        # Only the launched variants (the ``_sq``-only forms are not part of the tower).
-        assert not any(k.split(":")[1].endswith("_sq") for k in gemm_keys)
+    # Round 6 half-N twins: the full rounds stay whole tiles; the ``half_tail_split`` tail runs as half items
+    # (norm_gelu at 2552: 20 pair rows / 2 x 32 column tiles = 320 tiles on 74 clusters, tail 24 -> 48 <= 70).
+    cfg = select_tile_config("norm_gelu", 2552)
+    assert cfg.name == "m_e8_h" and cfg.half
+    geo = gemm_launch_geometry("norm_gelu", cfg, 2552, SM_COUNT)
+    assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 20, 320)
+    assert (geo.full_tiles, geo.tail_split) == (296, 1)
+    # The out-proj TMA-epilogue twin at 19136 (150 pair rows / 2 x 8 column tiles = 600 tiles, tail 8).
+    cfg = select_tile_config("residual_wo_sqxw", 19136)
+    assert cfg.name == "m_tma1_h"
+    geo = gemm_launch_geometry("residual_wo_sqxw", cfg, 19136, SM_COUNT)
+    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (600, 592, 1)
+    # The base tile of a half twin keeps the whole-tile geometry.
+    geo = gemm_launch_geometry(
+        "residual_wo_sqxw", TILE_CONFIGS["m_tma1"], 19136, SM_COUNT
+    )
+    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (600, 600, 1)
 
 
 def test_pdl_early_window_and_exclusions():
@@ -471,7 +515,6 @@ def test_pdl_early_window_and_exclusions():
     assert not cb.pdl_early_selected("pos_sqxw", TILE_CONFIGS["xs_pf"], 4)
     assert not cb.pdl_early_selected("residual_fc1_sqxw", TILE_CONFIGS["m_sk"], 4784)
     assert not cb.pdl_early_selected("residual_fc1_sqxw", TILE_CONFIGS["l_sk"], 16576)
-    assert not cb.pdl_early_selected("norm_gelu", TILE_CONFIGS["l_e8_t"], 4144)
     assert cb.pdl_early_selected("residual_fc1_sqxw", TILE_CONFIGS["l_e8_pf"], 4144)
     assert cb.gemm_stage_key("residual_fc1_sqxw", 4784) == "gemm:residual_fc1_sqxw:m_sk"
     assert (
@@ -483,7 +526,8 @@ def test_pdl_early_window_and_exclusions():
     assert cb.gemm_stage_key("rmsnorm", 1196) == "gemm:rmsnorm:l:pdle"
     assert cb.gemm_stage_key("rmsnorm", 1197) == "gemm:rmsnorm:l"
     assert cb.gemm_stage_key("norm_qkv_rope", 8192) == "gemm:norm_qkv_rope:l_e8_cs:pdle"
-    assert cb.gemm_stage_key("norm_qkv_rope", 8193) == "gemm:norm_qkv_rope:l_e8_cs"
+    # (round 6: at 8193 the pair tile leaves the window AND takes its half-N twin, 65 pair rows / 2 -> tail)
+    assert cb.gemm_stage_key("norm_qkv_rope", 8193) == "gemm:norm_qkv_rope:l_e8_cs_h"
     # The census is per device (the fc1 twin's tail is counted on sm_count // 2 clusters).
     assert (
         cb.gemm_stage_key("residual_fc1_sqxw", 4784, sm_count=160)
@@ -491,305 +535,53 @@ def test_pdl_early_window_and_exclusions():
     )
 
 
-# Logical GEMM kernel key per launched variant of every contract row (T = total tokens, N = merged tokens),
-# copied ONCE from the Cake export protocol at the round-5 head (``exports/kimi_k3_vision_tower/export.py``
-# ``stage_kernels`` on ``kimi_k3_vision_gemm`` 2a311f42769; arch-independent).  The mirror must reproduce it
-# exactly: a disagreement here means the host launches another binary than the source route.
-CONTRACT_ROW_GEMM_KEYS = {
-    # label: (T, N, {variant: key})
-    "smoke_2x2": (
-        4,
-        1,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "xs_k4_pf:pdle",
-            "xs_k4_pf:pdle",
-            "xs",
-            "s",
-        ),
-    ),
-    "smoke_ragged": (
-        264,
-        62,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "s:pdle",
-            "xs_pf:pdle",
-            "xs_pf:pdle",
-            "xs",
-            "s",
-        ),
-    ),
-    "smoke_t3": (
-        360,
-        58,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "s:pdle",
-            "xs_pf:pdle",
-            "xs_pf:pdle",
-            "xs",
-            "s",
-        ),
-    ),
-    "img_224": (
-        256,
-        64,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "xs_k4_pf:pdle",
-            "xs_k4_pf:pdle",
-            "xs",
-            "s",
-        ),
-    ),
-    "img_336": (
-        576,
-        144,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "xs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "s:pdle",
-        ),
-    ),
-    "img_448": (
-        1024,
-        256,
-        (
-            "xs_pf",
-            "s_cs:pdle",
-            "xs_pf:pdle",
-            "s:pdle",
-            "xs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "s:pdle",
-        ),
-    ),
-    "img_640x480": (
-        1656,
-        414,
-        (
-            "s_e8_pf",
-            "l_e8_cs:pdle",
-            "s_e8_pf:pdle",
-            "s:pdle",
-            "s_e8_pf:pdle",
-            "s_e8_pf:pdle",
-            "s:pdle",
-            "s:pdle",
-        ),
-    ),
-    "img_800x600": (
-        2552,
-        638,
-        (
-            "s_e8_pf",
-            "m_e8_cs:pdle",
-            "s_e8_pf:pdle",
-            "m_e8:pdle",
-            "l_e8_pf:pdle",
-            "l_e8_pf:pdle",
-            "xs:pdle",
-            "s:pdle",
-        ),
-    ),
-    "img_1024x768": (
-        4144,
-        1036,
-        (
-            "s_e8_pf",
-            "l_e8_cs:pdle",
-            "s_e8_pf:pdle",
-            "l_e8:pdle",
-            "l_e8_pf:pdle",
-            "l_e8_pf:pdle",
-            "s",
-            "l",
-        ),
-    ),
-    "img_1280x720": (
-        4784,
-        1196,
-        (
-            "s_e8_pf",
-            "l_e8_cs:pdle",
-            "s_e8_pf:pdle",
-            "l_e8:pdle",
-            "m_sk",
-            "m_sk",
-            "s:pdle",
-            "l:pdle",
-        ),
-    ),
-    "batch8_448": (
-        8192,
-        2048,
-        (
-            "s_e8_pf",
-            "l_e8_cs:pdle",
-            "m_tma1:pdle",
-            "l_e8:pdle",
-            "l_e8_pf:pdle",
-            "l_e8_pf:pdle",
-            "l",
-            "l_sk",
-        ),
-    ),
-    "img_1920x1080": (
-        10764,
-        2691,
-        (
-            "s_e8_pf",
-            "l_e8_cs",
-            "m_tma1:pdle",
-            "l_e8:pdle",
-            "m_p:pdle",
-            "m_p:pdle",
-            "l_sk",
-            "l_sk",
-        ),
-    ),
-    "doc_1240x1754": (
-        11340,
-        2835,
-        (
-            "s_e8_pf",
-            "l_e8_cs",
-            "m_tma1:pdle",
-            "l_e8:pdle",
-            "m_p:pdle",
-            "m_p:pdle",
-            "l_sk",
-            "l_sk",
-        ),
-    ),
-    "mixed_1080p_xga_448_336": (
-        16508,
-        4127,
-        ("s_e8_pf", "l_e8_cs", "m_tma1:pdle", "l_e8:pdle", "l_sk", "l_sk", "l", "l"),
-    ),
-    "batch4_1024x768": (
-        16576,
-        4144,
-        ("s_e8_pf", "l_e8_cs", "m_tma1:pdle", "l_e8:pdle", "l_sk", "l_sk", "l", "l"),
-    ),
-    "img_2560x1440": (
-        19136,
-        4784,
-        (
-            "s_e8_pf",
-            "l_e8_cs",
-            "m_tma1:pdle",
-            "l_e8:pdle",
-            "l_sk",
-            "l_sk",
-            "l_sk",
-            "l_sk",
-        ),
-    ),
-    "video_720p_4f": (
-        19136,
-        1196,
-        (
-            "s_e8_pf",
-            "l_e8_cs",
-            "m_tma1:pdle",
-            "l_e8:pdle",
-            "l_sk",
-            "l_sk",
-            "s:pdle",
-            "l:pdle",
-        ),
-    ),
-    "img_3840x2160": (
-        43056,
-        10764,
-        ("s_e8_pf", "l_e8_cs", "m_tma1:pdle", "l_e8", "l_sk", "l_sk", "l_sk", "l"),
-    ),
-    "video_1080p_4f": (
-        43056,
-        2691,
-        ("s_e8_pf", "l_e8_cs", "m_tma1:pdle", "l_e8", "l_sk", "l_sk", "l_sk", "l_sk"),
-    ),
-    "img_max_4096sq": (
-        66564,
-        16641,
-        ("s_e8_pf", "l_e8_cs", "m_tma1", "l_e8", "l_sk", "l_sk", "l", "l"),
-    ),
-    "video_480p_64f": (
-        105984,
-        6624,
-        ("s_e8_pf", "l_e8_cs", "m_tma1", "l_e8", "l_sk", "l_sk", "l", "l"),
-    ),
-    "video_720p_32f": (
-        153088,
-        9568,
-        ("s_e8_pf", "l_e8_cs", "m_tma1", "l_e8", "m_p", "m_p", "l_sk", "l"),
-    ),
-}
-CONTRACT_ROW_VARIANTS = (
-    "pos_sqxw",
-    "norm_qkv_rope",
-    "residual_wo_sqxw",
-    "norm_gelu",
-    "residual_fc1_sqxw",
-    "residual_fc1",
-    "gelu_erf",
-    "rmsnorm",
-)
-
-
-def test_contract_row_kernel_keys_match_cake_protocol():
-    assert set(CONTRACT_ROW_VARIANTS) == set(cb.PRODUCTION_GEMM_VARIANTS)
-    for label, (total, merged, tiles) in CONTRACT_ROW_GEMM_KEYS.items():
-        expected = {
-            variant: f"gemm:{variant}:{tile}"
-            for variant, tile in zip(CONTRACT_ROW_VARIANTS, tiles, strict=True)
-        }
-        assert cb.gemm_kernel_keys_for(total, merged, SM_COUNT) == expected, label
-        # Every key of every row is registered as reachable on both architectures.
-        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
-            assert set(expected.values()) <= set(REQUIRED_KERNEL_KEYS[arch]), (
-                label,
-                arch,
-            )
-    # ... and the census names nothing the rows cannot reach (the exporter refuses both directions).
-    reachable = {
-        key
-        for _t, _n, tiles in CONTRACT_ROW_GEMM_KEYS.values()
-        for key in (
-            f"gemm:{variant}:{tile}"
-            for variant, tile in zip(CONTRACT_ROW_VARIANTS, tiles, strict=True)
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_export_rows_plan_onto_registered_programs(arch):
+    """Every grid batch of the export's rows (the contract rows and the coverage rows) plans on the
+    CPU, with the census device's SM count, onto kernels this checkout registers for ``arch``, and the
+    attention plan's tables and partial workspace agree with its own geometry."""
+    if not cake_jit.route_available(arch):
+        pytest.skip(f"no generated Kimi-K3 vision tower program registered for {arch}")
+    for label, grids in {**cb.CONTRACT_ROW_GRIDS, **cb.COVERAGE_ROW_GRIDS}.items():
+        plan = build_kimi_k3_vision_plan(
+            grids, "cpu", num_layers=1, sm_count=SM_COUNT, arch=arch
         )
-    }
-    for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
-        assert {
-            k for k in REQUIRED_KERNEL_KEYS[arch] if k.startswith("gemm:")
-        } == reachable, arch
+        keys = cb.plan_kernel_keys(plan)
+        missing = [k for k in keys if not cake_jit.route_available(arch, (k,))]
+        assert not missing, (label, arch, missing)
+        attn = plan.attention
+        assert (attn.num_merge_units > 0) == (":split" in attn.kernel_key)
+        assert (attn.num_merge_units > 0) == (attn.kv_split is not None)
+        assert attn.unit_words == 2 + 2 * (attn.wide or attn.kv_split is not None)
+        assert attn.unit_table.numel() == max(attn.unit_words * attn.total_tiles, 2)
+        assert attn.merge_table.numel() == 4 * max(attn.num_merge_units, 1)
+        assert attn.num_partial_slots == attn.split_units * attn.kv_split_used
+        assert attn.total_tiles == attn.total_units + attn.split_units * (
+            attn.kv_split_used - 1
+        )
+        assert attn.part_rows == 2 * attn.tiles_per_cta * 128
+        assert (
+            attn.num_clusters
+            <= attn.full_clusters
+            == min(GRID_CLUSTERS, attn.total_tiles)
+        )
+        if attn.num_merge_units:
+            assert cb.ATTENTION_MERGE_KERNEL_KEY in keys
+        for stage_key in keys:
+            name = cake_jit.kernel_module_name(arch, stage_key)
+            assert arch in cake_jit.MODULES[name]["arches"], (label, stage_key)
+            assert cake_jit.MODULES[name]["arg_plan"] in cake_jit.ARG_PLANS
 
 
 @pytest.mark.parametrize("label,grids", list(CONTRACT_GRIDS.items()))
 def test_attention_plan(label, grids):
     cu = cu_seqlens_of(grids)
+    # Whole units (split policy off): the unit-table semantics of the two- / four-word table.
     plan = build_attention_plan(
-        cu, torch.device("cpu"), HEADS, grid_clusters=GRID_CLUSTERS
+        cu, torch.device("cpu"), HEADS, grid_clusters=GRID_CLUSTERS, split_policy="off"
     )
+    assert plan.kv_split is None and plan.num_merge_units == 0 and not plan.wide
+    assert plan.unit_words == 2 and plan.total_tiles == plan.total_units
     lens = [b - a for a, b in zip(cu, cu[1:], strict=False) if b > a]
     rows = 2 * plan.tiles_per_cta * 128
     clusters = [_ceil_div(n, rows) for n in lens]
@@ -878,6 +670,120 @@ def test_attention_plan_layout_rule():
         assert sel["makespan"][MODE_SPLIT_KV] == pytest.approx(split), (arch, sel)
     assert cb.split_cost_model(None) is cb.SPLIT_COST_MODELS["r3"]
     assert cb.split_cost_model("sm_103a") is cb.SPLIT_COST_MODELS["r3"]
+    # Round 6 forms.  Wide (UNIT_PREFETCH) table on rows up to the arch's token limit (1656 / 2552), never
+    # without an arch; the kernel key names the build.
+    for arch, limit in cb.UNIT_PREFETCH_MAX_TOKENS.items():
+        assert cb.unit_prefetch_selected(arch, limit) and not cb.unit_prefetch_selected(
+            arch, limit + 1
+        )
+        at = build_attention_plan(
+            [0, limit],
+            torch.device("cpu"),
+            HEADS,
+            grid_clusters=GRID_CLUSTERS,
+            arch=arch,
+        )
+        above = build_attention_plan(
+            [0, limit + 1],
+            torch.device("cpu"),
+            HEADS,
+            grid_clusters=GRID_CLUSTERS,
+            arch=arch,
+        )
+        assert at.wide and at.kernel_key.endswith(":wide") and at.unit_words == 4
+        assert not above.wide and ":wide" not in above.kernel_key
+    assert not cb.unit_prefetch_selected(None, 4)
+    plain = build_attention_plan(
+        [0, 256], torch.device("cpu"), HEADS, grid_clusters=GRID_CLUSTERS
+    )
+    assert not plain.wide and plain.kernel_key == "attention:tiles1"
+    # The automatic tail split (SPLIT_TAIL_RULE): img_1280x720 on sm_100a runs the ring on 228 units (19 x 256-row
+    # clusters x 12 heads = 3 x 74 + 6): the 6 tail units are cut into k = 8 K/V parts -> 6 merge units, 48 partial
+    # slots, 270 LPT items on the full 74 clusters; the merge launch follows the attention launch.
+    split = build_attention_plan(
+        cu_seqlens_of([(1, 52, 92)]),
+        torch.device("cpu"),
+        HEADS,
+        grid_clusters=GRID_CLUSTERS,
+        arch="sm_100a",
+    )
+    assert split.kernel_key == "attention:ring3:split" and split.kv_split == 0
+    assert (
+        split.kv_split_used,
+        split.split_units,
+        split.num_merge_units,
+        split.num_partial_slots,
+    ) == (8, 6, 6, 48)
+    assert (split.total_units, split.total_tiles, split.num_clusters) == (228, 270, 74)
+    assert split.unit_words == 4 and split.merge_table.shape == (6 * 4,)
+    merge = split.merge_table.view(6, 4).tolist()
+    assert all(parts == 8 for _s, _hc, _slot, parts in merge)
+    assert sorted(slot for _s, _hc, slot, _p in merge) == [8 * i for i in range(6)]
+    # ... and the same row with the split policy off keeps whole units on the plain ring.
+    whole = build_attention_plan(
+        cu_seqlens_of([(1, 52, 92)]),
+        torch.device("cpu"),
+        HEADS,
+        grid_clusters=GRID_CLUSTERS,
+        arch="sm_100a",
+        split_policy="off",
+    )
+    assert (
+        whole.kernel_key == "attention:ring3"
+        and whole.total_tiles == 228
+        and whole.num_merge_units == 0
+    )
+    # A pinned split that splits nothing falls back to whole units (never the partial build idle).
+    none = build_attention_plan(
+        [0, 256],
+        torch.device("cpu"),
+        HEADS,
+        grid_clusters=GRID_CLUSTERS,
+        arch="sm_100a",
+    )
+    assert (
+        none.kv_split is None
+        and none.num_merge_units == 0
+        and none.kernel_key == "attention:ring3:wide"
+    )
+    # Lever G (sm_103a only): batch8_448 two-tile runs 192 units on 64 of the 74 clusters (same LPT makespan).
+    g = build_attention_plan(
+        cu_seqlens_of([(1, 32, 32)] * 8),
+        torch.device("cpu"),
+        HEADS,
+        grid_clusters=GRID_CLUSTERS,
+        arch="sm_103a",
+    )
+    assert (g.kernel_key, g.num_clusters, g.full_clusters, g.grid_policy) == (
+        "attention:tiles2",
+        64,
+        74,
+        "auto",
+    )
+    g100 = build_attention_plan(
+        cu_seqlens_of([(1, 32, 32)] * 8),
+        torch.device("cpu"),
+        HEADS,
+        grid_clusters=GRID_CLUSTERS,
+        arch="sm_100a",
+    )
+    assert (g100.kernel_key, g100.num_clusters) == ("attention:ring3", 74)
+    # Key round trip.
+    for key in cb.ATTENTION_FORM_KEYS["sm_103a"]:
+        if key == cb.ATTENTION_MERGE_KERNEL_KEY:
+            continue
+        parsed = cake_jit.parse_attention_kernel_key(key)
+        assert (
+            cb.attention_kernel_key(
+                parsed["tiles_per_cta"],
+                parsed["ring3"],
+                wide=parsed["wide"],
+                split=parsed["split"],
+            )
+            == key
+        )
+    with pytest.raises(ValueError):
+        cake_jit.parse_attention_kernel_key("attention:ring3:split:wide")
 
 
 def test_attention_plan_drops_empty_segments():
@@ -943,7 +849,7 @@ def test_prepare_weights_no_folding():
     assert not prepared.patch_proj[HIDDEN:, :POS_SHIFT].any()
     lw = weights["layers"][0]
     # The RMSNorm weights stay separate (applied on the activation side by the
-    # residual epilogues); every layer tensor is a contiguous copy of the input.
+    # residual epilogues); every layer tensor is the (contiguous) input tensor itself.
     assert set(prepared.layers[0]) == {"norm0", "wqkv", "wo", "norm1", "fc0", "fc1"}
     for name, tensor in prepared.layers[0].items():
         assert torch.equal(tensor, lw[name]) and tensor.is_contiguous()
@@ -1016,11 +922,12 @@ def test_plan_on_cpu_device_needs_sm_count():
     assert sk_plan.gemm_configs["gelu_erf"] == "l_sk"
     assert sk_plan.gemm_kernel_keys["gelu_erf"] == "gemm:gelu_erf:l_sk"
     # The per-layer forms at T = 10764: qkv outside its PDL_EARLY window (8192), the others inside.
-    assert sk_plan.gemm_kernel_keys["norm_qkv_rope"] == "gemm:norm_qkv_rope:l_e8_cs"
+    assert sk_plan.gemm_kernel_keys["norm_qkv_rope"] == "gemm:norm_qkv_rope:l_e8_cs_h"
     assert (
         sk_plan.gemm_kernel_keys["residual_wo_sqxw"]
         == "gemm:residual_wo_sqxw:m_tma1:pdle"
     )
+    assert sk_plan.gemm_kernel_keys["norm_gelu"] == "gemm:norm_gelu:l_e8_h:pdle"
     assert (
         sk_plan.gemm_kernel_keys["residual_fc1_sqxw"]
         == "gemm:residual_fc1_sqxw:m_p:pdle"
@@ -1046,10 +953,49 @@ def test_plan_on_cpu_device_needs_sm_count():
         fc1_plan.gemm_kernel_keys["residual_fc1_sqxw"] == "gemm:residual_fc1_sqxw:m_sk"
     )
     assert fc1_plan.gemm_kernel_keys["rmsnorm"] == "gemm:rmsnorm:l:pdle"
+    # Round 6 half-N twins on this row: out-proj s_e8_pf_h, norm_gelu l_e8_h, gelu_erf s_h.
     assert (
-        fc1_plan.gemm_configs["gelu_erf"] == "s"
+        fc1_plan.gemm_configs["gelu_erf"] == "s_h"
         and fc1_plan.gemm_configs["rmsnorm"] == "l"
+        and fc1_plan.gemm_configs["residual_wo_sqxw"] == "s_e8_pf_h"
+        and fc1_plan.gemm_configs["norm_gelu"] == "l_e8_h"
     )
+    assert fc1_plan.gemm_kernel_keys["gelu_erf"] == "gemm:gelu_erf:s_h:pdle"
+    assert (
+        fc1_plan.gemm_kernel_keys["residual_wo_sqxw"]
+        == "gemm:residual_wo_sqxw:s_e8_pf_h:pdle"
+    )
+    # The partial workspace follows the attention plan: 8-element dummies on whole units (the smoke row: 24 units,
+    # no tail), the partial O rows / (m, l) pairs of every slot on a split plan (this row splits under the round-3
+    # model too: no arch = the plain SPLIT_KV form with the tail split).
+    assert plan.attention.kv_split is None and plan.attention.num_merge_units == 0
+    assert plan.workspace["partial_O"].shape == (8,) and plan.workspace[
+        "partial_ML"
+    ].shape == (8,)
+    assert plan.workspace["partial_O"].dtype == torch.float32
+    attn = fc1_plan.attention
+    assert (
+        attn.kernel_key == "attention:tiles1:split"
+        and attn.kv_split == 0
+        and attn.num_merge_units == 6
+    )
+    assert fc1_plan.workspace["partial_O"].shape == (
+        attn.num_partial_slots * attn.part_rows * 128,
+    )
+    assert fc1_plan.workspace["partial_ML"].shape == (
+        attn.num_partial_slots * attn.part_rows * 2,
+    )
+    # The same row planned for sm_100a splits (ring3:split, 6 x 8 partial slots of 256 rows): the plan owns the
+    # partial O rows and (m, l) pairs the merge reads.
+    split_plan = build_kimi_k3_vision_plan(
+        [(1, 52, 92)], "cpu", num_layers=1, sm_count=SM_COUNT, arch="sm_100a"
+    )
+    attn = split_plan.attention
+    assert attn.kernel_key == "attention:ring3:split" and attn.num_merge_units == 6
+    assert (attn.num_partial_slots, attn.part_rows) == (48, 256)
+    assert split_plan.workspace["partial_O"].shape == (48 * 256 * 128,)
+    assert split_plan.workspace["partial_ML"].shape == (48 * 256 * 2,)
+    assert split_plan.workspace["partial_O"].dtype == torch.float32
     assert fc1_plan.workspace["sk_ws"].shape == (150 * 3 * 128 * 256,)
     assert fc1_plan.workspace["sk_flags"].shape == (150,)
     assert sk_plan.workspace["sk_ws"].shape == (150 * 3 * 128 * 256,)
@@ -1399,8 +1345,12 @@ def test_prepared_runner_graph_replay_and_no_allocation():
     runner = prepare_kimi_k3_vision_tower(
         pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
     )
-    assert runner.plan is plan and runner.launch_count == 1 + 2 * 5 + 4
-    assert set(runner.stage_modules) == set(cb.STAGE_NAMES)
+    merge = int(plan.attention.num_merge_units > 0)
+    assert runner.plan is plan and runner.launch_count == 1 + 2 * (5 + merge) + 4
+    expected_stages = set(cb.STAGE_NAMES) - (
+        set() if merge else {"layer_attention_merge"}
+    )
+    assert set(runner.stage_modules) == expected_stages
     runner.launch()
     torch.cuda.synchronize()
     eager = out.clone()
@@ -1431,6 +1381,9 @@ def test_prepared_runner_graph_replay_and_no_allocation():
     metadata = runner.route_metadata
     assert metadata["layers"] == 2 and metadata["segment_count"] == 4
     assert metadata["tiles_per_cta"] in (1, 2)
+    assert metadata["attention_kernel_key"] == plan.attention.kernel_key
+    assert metadata["attention_merge"] is bool(merge)
+    assert metadata["attention_kernel_key"] in cb.REGISTERED_KERNEL_KEYS[plan.arch]
 
 
 def test_one_shot_api():
