@@ -136,9 +136,14 @@ def _program_name(state_dtype: torch.dtype, mode_varlen: bool) -> str:
 # grid, main arguments, its grid, then the explicit CUDA stream.  The
 # preprocess also derives ``seq_chunk_cumsum`` from the packed-varlen metadata
 # (``write_seq_chunk_cumsum``), so one launcher call covers the whole forward;
-# ``preprocess_status`` is the runner-owned int32 word it sets to 1 when a
-# packed-sequence id is out of range or non-monotonic (CAKE-990).  The order
-# is the kernel's parameter order (``preprocess_arg_plan`` of the export).
+# with ``metadata_from_cu_seqlens`` it derives the whole segment metadata
+# (``chunk_indices`` / ``chunk_offsets`` / ``seq_chunk_cumsum`` + sentinel)
+# from ``cu_seqlens`` into runner-owned tables (CAKE-934 item 2), inserting
+# the chunk-unaligned ``checkpoint_token_indices`` boundaries when
+# ``checkpoint_state_count > 0``; ``preprocess_status`` is the runner-owned
+# int32 word it sets to 1 when a packed-sequence id is out of range or
+# non-monotonic (CAKE-990) or ``cu_seqlens`` is invalid.  The order is the
+# kernel's parameter order (``preprocess_arg_plan`` of the export).
 _PREPROCESS_ARGS = (
     "dt",
     "A",
@@ -162,6 +167,10 @@ _PREPROCESS_ARGS = (
     "seq_chunk_cumsum",
     "num_sequences",
     "write_seq_chunk_cumsum",
+    "cu_seqlens",
+    "checkpoint_token_indices",
+    "metadata_from_cu_seqlens",
+    "checkpoint_state_count",
     "preprocess_status",
 )
 _MAIN_ARGS = (
@@ -233,9 +242,18 @@ def _direct_preprocess_inputs(
     seq_chunk_cumsum: object,
     num_sequences: int,
     write_seq_chunk_cumsum: bool,
+    cu_seqlens: object,
+    checkpoint_token_indices: object,
+    metadata_from_cu_seqlens: bool,
+    checkpoint_state_count: int,
     preprocess_status: object,
 ) -> tuple[dict[str, object], tuple[int, int, int]]:
-    """Build the metadata-fused preprocess values and launch grid."""
+    """Build the metadata-fused preprocess values and launch grid.
+
+    ``num_segments`` is the real segment count of the triple / batched forms
+    and the host bound ``_segment_bound`` of the ``cu_seqlens`` form (the
+    kernel derives the real count and never reads past its sentinel).
+    """
 
     if threads <= 0:
         raise ValueError(f"preprocess thread count must be positive, got {threads}")
@@ -263,10 +281,23 @@ def _direct_preprocess_inputs(
         "seq_chunk_cumsum": seq_chunk_cumsum,
         "num_sequences": num_sequences,
         "write_seq_chunk_cumsum": int(write_seq_chunk_cumsum),
+        "cu_seqlens": cu_seqlens,
+        "checkpoint_token_indices": checkpoint_token_indices,
+        "metadata_from_cu_seqlens": int(metadata_from_cu_seqlens),
+        "checkpoint_state_count": int(checkpoint_state_count),
         "preprocess_status": preprocess_status,
     }
     total_tiles = num_segments * nheads
     return values, ((total_tiles + threads - 1) // threads, 1, 1)
+
+
+def _segment_bound(seqlen: int, num_sequences: int) -> int:
+    """Segment-count bound of the ``cu_seqlens`` form: every 128-token chunk
+    of the packed stream plus one unaligned start and one unaligned checkpoint
+    per sequence.  Sizes the preprocess grid, the delta/cumsum workspace and
+    the ``[bound + 1]`` metadata tables; the real count stays on the device."""
+
+    return -(-int(seqlen) // _CHUNK_SIZE) + 2 * int(num_sequences)
 
 
 def _persistent_grid_size(*, total_work: int, sm_count: int) -> int:
@@ -463,9 +494,14 @@ def _load_generated_program(name: str, arch: str):
 class CakeSSDCombined:
     """Source-built Cake implementation of the admitted SSDCombined domain.
 
-    The kernels require chunk size 128, head dimension 64, state dimension
-    128, BF16 inputs/outputs, BF16, FP16, or FP32 states, and SM100/SM103.
-    Head and group counts are runtime values and may be any positive pair for
+    The kernels require head dimension 64, state dimension 128, BF16
+    inputs/outputs, BF16, FP16, or FP32 states, and SM100/SM103.  Any positive
+    ``chunk_size`` is accepted as the caller's convention: the programs tile
+    the token axis in 128-token chunks internally and the SSD output and
+    final states do not depend on the chunk size (chunking factorises the
+    same recurrence; only rounding differs), so ``chunk_size=256`` (the
+    Nemotron-H engine default) runs the same kernels as 128.  Head and group
+    counts are runtime values and may be any positive pair for
     which ``nheads`` is divisible by ``ngroups``.  Any positive sequence
     length is accepted: the kernels handle a partial trailing chunk, and a
     call shorter than one 128-token chunk (batched ``seqlen < 128`` or packed
@@ -477,6 +513,21 @@ class CakeSSDCombined:
     Every call issues one launcher call: the preprocess (which also derives
     ``seq_chunk_cumsum`` from the packed-varlen metadata unless the caller
     supplies a precomputed vector) followed by the scan.
+
+    Packed varlen has two forms.  ``cu_seqlens`` (int32 ``[num_seqs + 1]``,
+    ``cu[0] == 0``, non-decreasing, ``cu[-1] == seqlen``, ``batch == 1``):
+    the preprocess derives the 128-granularity segment tables, the sequence
+    prefix sum and a sentinel on the device, so the caller's chunk-size
+    convention never matters, ``seq_idx`` is optional (never read) and the
+    chunk-unaligned ``checkpoint_token_indices`` boundaries are inserted
+    automatically; the sequence count is ``cu_seqlens.numel() - 1`` (host
+    shape, no synchronisation).  An invalid ``cu_seqlens`` (``cu[0] != 0``,
+    decreasing, ``cu[-1] != seqlen``, more segments than the bound) is
+    memory-safe: it is flagged in ``preprocess_status`` (:meth:`seq_idx_status`),
+    the untouched sequences stay exact and the offending tokens' outputs are
+    undefined.  The ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets`` triple
+    (chunk-128 logical segments built by the caller; checkpoint tokens must
+    then be logical chunk ends) is accepted with ``chunk_size == 128`` only.
 
     Packed-varlen ``seq_idx`` contract (CAKE-990): ids must be non-decreasing
     along the packed token axis.  An id in ``[0, num_sequences)`` without
@@ -509,9 +560,12 @@ class CakeSSDCombined:
         has_z: bool,
         seq_idx_dtype: torch.dtype,
     ) -> None:
-        if chunk_size != _CHUNK_SIZE or headdim != _HEADDIM or dstate != _DSTATE:
+        if headdim != _HEADDIM or dstate != _DSTATE:
+            raise ValueError("Cake SSDCombined requires headdim=64 and dstate=128")
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
             raise ValueError(
-                "Cake SSDCombined requires chunk_size=128, headdim=64, and dstate=128"
+                "Cake SSDCombined chunk_size must be a positive int (a caller "
+                "convention; the kernels tile 128 tokens internally)"
             )
         if nheads <= 0 or ngroups <= 0 or nheads % ngroups:
             raise ValueError(
@@ -526,6 +580,7 @@ class CakeSSDCombined:
         if seq_idx_dtype not in (torch.int32, torch.int64):
             raise ValueError("Cake SSDCombined seq_idx dtype must be int32 or int64")
         _target_arch(torch.cuda.current_device())
+        self.chunk_size = int(chunk_size)
         self.nheads = nheads
         self.ngroups = ngroups
         self.state_dtype = state_dtype
@@ -626,6 +681,7 @@ class CakeSSDCombined:
         nchunks: int,
         num_segments: int,
         num_sequences: int,
+        from_cu_seqlens: bool = False,
     ):
         key = (
             device.index,
@@ -635,6 +691,7 @@ class CakeSSDCombined:
             num_segments,
             num_sequences,
             self.state_dtype,
+            from_cu_seqlens,
         )
         if self._workspace_key != key:
             ids = torch.arange(num_segments, dtype=torch.int32, device=device)
@@ -686,6 +743,19 @@ class CakeSSDCombined:
                     device=device,
                 ),
             }
+            if from_cu_seqlens:
+                # cu_seqlens form: the preprocess publishes the derived
+                # chunk_indices / chunk_offsets (+ the sentinel at the real
+                # segment count) into these [bound + 1] tables; the scan
+                # reads them with num_logical_chunks = bound.
+                self._workspace.update(
+                    chunk_indices=torch.empty(
+                        num_segments + 1, dtype=torch.int32, device=device
+                    ),
+                    chunk_offsets=torch.empty(
+                        num_segments + 1, dtype=torch.int32, device=device
+                    ),
+                )
             if seqlen < _CHUNK_SIZE:
                 # CAKE-1063: a call shorter than one chunk binds the x/B/C/out
                 # tensor maps to these one-chunk buffers (see ``run``).  The
@@ -760,6 +830,7 @@ class CakeSSDCombined:
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
         num_seqs: Optional[int] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ):
         batch, seqlen, nheads, headdim = x.shape
         if (nheads, headdim) != (self.nheads, _HEADDIM):
@@ -786,44 +857,90 @@ class CakeSSDCombined:
             )
         mode_varlen = self.has_varlen
         metadata = (seq_idx, chunk_indices, chunk_offsets)
-        if mode_varlen and any(value is None for value in metadata):
-            raise ValueError(
-                "varlen mode requires seq_idx, chunk_indices, and chunk_offsets"
-            )
+        from_cu_seqlens = cu_seqlens is not None
         if not mode_varlen and (
             any(value is not None for value in metadata)
             or seq_chunk_cumsum is not None
             or num_seqs is not None
+            or from_cu_seqlens
         ):
             raise ValueError(
                 "batched mode does not accept varlen metadata, seq_chunk_cumsum, "
-                "or num_seqs"
+                "num_seqs, or cu_seqlens"
             )
+        if mode_varlen and from_cu_seqlens:
+            # cu_seqlens form: the device derives the segment tables; the
+            # caller's chunk-128 triple is not consulted (seq_idx may ride
+            # along for callers that still build it; it is never read).
+            if chunk_indices is not None or chunk_offsets is not None:
+                raise ValueError(
+                    "cu_seqlens excludes chunk_indices / chunk_offsets: the "
+                    "preprocess derives the segment tables from cu_seqlens"
+                )
+            if (
+                cu_seqlens.dtype != torch.int32
+                or cu_seqlens.ndim != 1
+                or cu_seqlens.numel() < 2
+            ):
+                raise ValueError(
+                    "cu_seqlens must be an int32 vector of num_seqs + 1 entries"
+                )
+            if batch != 1:
+                raise ValueError("cu_seqlens describes a packed [1, total] stream")
+            if seq_chunk_cumsum is not None and not update_seq_chunk_cumsum:
+                raise ValueError(
+                    "with cu_seqlens the preprocess derives seq_chunk_cumsum; pass "
+                    "update_seq_chunk_cumsum=True to receive it in your buffer or "
+                    "omit it"
+                )
+        elif mode_varlen:
+            if self.chunk_size != _CHUNK_SIZE:
+                raise ValueError(
+                    f"chunk_size={self.chunk_size}: the seq_idx / chunk_indices / "
+                    "chunk_offsets triple is the chunk-128 logical segmentation; "
+                    "pass cu_seqlens instead (the kernels derive the segments)"
+                )
+            if any(value is None for value in metadata):
+                raise ValueError(
+                    "varlen mode requires seq_idx, chunk_indices, and chunk_offsets "
+                    "(or cu_seqlens)"
+                )
         if initial_states is not None and initial_states.dtype != self.state_dtype:
             raise ValueError("initial_states dtype must match state_dtype")
 
         nchunks = -(-seqlen // _CHUNK_SIZE)
         if not mode_varlen:
             num_sequences = batch
-        elif initial_states is not None:
-            num_sequences = int(initial_states.shape[0])
-        elif seq_chunk_cumsum is not None:
-            num_sequences = int(seq_chunk_cumsum.numel()) - 1
-        elif num_seqs is not None:
-            num_sequences = int(num_seqs)
         else:
-            raise ValueError(
-                "varlen mode without initial_states requires seq_chunk_cumsum or "
-                "num_seqs to determine the sequence count"
-            )
-        if num_seqs is not None and int(num_seqs) != num_sequences:
-            raise ValueError(
-                f"num_seqs ({num_seqs}) does not match the sequence count "
-                f"({num_sequences}) implied by initial_states/seq_chunk_cumsum"
-            )
+            # Every given source of the packed sequence count must agree;
+            # cu_seqlens is a host shape (no synchronisation).
+            counts: list[tuple[str, int]] = []
+            if from_cu_seqlens:
+                counts.append(("cu_seqlens", int(cu_seqlens.numel()) - 1))
+            if initial_states is not None:
+                counts.append(("initial_states", int(initial_states.shape[0])))
+            if seq_chunk_cumsum is not None:
+                counts.append(("seq_chunk_cumsum", int(seq_chunk_cumsum.numel()) - 1))
+            if num_seqs is not None:
+                counts.append(("num_seqs", int(num_seqs)))
+            if not counts:
+                raise ValueError(
+                    "varlen mode without initial_states requires seq_chunk_cumsum or "
+                    "num_seqs to determine the sequence count"
+                )
+            source, num_sequences = counts[0]
+            for name, value in counts[1:]:
+                if value != num_sequences:
+                    raise ValueError(
+                        f"{name} ({value}) does not match the sequence count "
+                        f"({num_sequences}) implied by {source}"
+                    )
         if num_sequences <= 0:
             raise ValueError("the sequence count must be positive")
-        num_segments = len(chunk_indices) if mode_varlen else batch * nchunks
+        if from_cu_seqlens:
+            num_segments = _segment_bound(seqlen, num_sequences)
+        else:
+            num_segments = len(chunk_indices) if mode_varlen else batch * nchunks
         dt_min, dt_max = (float(value) for value in dt_limit)
         checkpoint_args = (
             checkpoint_token_indices,
@@ -898,6 +1015,7 @@ class CakeSSDCombined:
                 raise ValueError(
                     "seq_idx shape or dtype does not match the constructor"
                 )
+        if chunk_indices is not None:
             if (
                 chunk_indices.dtype != torch.int32
                 or chunk_offsets.dtype != torch.int32
@@ -945,6 +1063,7 @@ class CakeSSDCombined:
             nchunks=nchunks,
             num_segments=num_segments,
             num_sequences=num_sequences,
+            from_cu_seqlens=from_cu_seqlens,
         )
         # The kernel needs valid storage even when final states are disabled.
         # When they are returned, allocate caller-owned storage up front so
@@ -977,6 +1096,7 @@ class CakeSSDCombined:
         seq_idx = packed("seq_idx", seq_idx)
         chunk_indices = packed("chunk_indices", chunk_indices)
         chunk_offsets = packed("chunk_offsets", chunk_offsets)
+        cu_seqlens = packed("cu_seqlens", cu_seqlens)
         checkpoint_token_indices = packed(
             "checkpoint_token_indices", checkpoint_token_indices
         )
@@ -1026,28 +1146,49 @@ class CakeSSDCombined:
             if seq_idx is not None and seq_idx_int64
             else self._dummy(x.device, torch.int64)
         )
-        chunk_indices_arg = (
-            chunk_indices
-            if chunk_indices is not None
-            else self._dummy(x.device, torch.int32)
-        )
-        chunk_offsets_arg = (
-            chunk_offsets
-            if chunk_offsets is not None
-            else self._dummy(x.device, torch.int32)
+        if from_cu_seqlens:
+            chunk_indices_arg = workspace["chunk_indices"]
+            chunk_offsets_arg = workspace["chunk_offsets"]
+        else:
+            chunk_indices_arg = (
+                chunk_indices
+                if chunk_indices is not None
+                else self._dummy(x.device, torch.int32)
+            )
+            chunk_offsets_arg = (
+                chunk_offsets
+                if chunk_offsets is not None
+                else self._dummy(x.device, torch.int32)
+            )
+        cu_seqlens_arg = (
+            cu_seqlens if from_cu_seqlens else self._dummy(x.device, torch.int32)
         )
         # Packed varlen: the preprocess writes seq_chunk_cumsum (into the
         # caller's buffer when update_seq_chunk_cumsum is set, else into the
         # runner-owned one) unless the caller passed a precomputed vector.
+        # The cu_seqlens derivation always publishes it (the seq_idx
+        # publisher, write_seq_chunk_cumsum, is the triple form's).
         if not mode_varlen:
             write_seq_chunk_cumsum = False
             cumsum_arg = self._dummy(x.device, torch.int32)
+        elif from_cu_seqlens:
+            write_seq_chunk_cumsum = False
+            cumsum_arg = (
+                seq_chunk_cumsum
+                if seq_chunk_cumsum is not None
+                else self._seq_chunk_cumsum_buffer(x.device, num_sequences)
+            )
         elif seq_chunk_cumsum is None:
             write_seq_chunk_cumsum = True
             cumsum_arg = self._seq_chunk_cumsum_buffer(x.device, num_sequences)
         else:
             write_seq_chunk_cumsum = bool(update_seq_chunk_cumsum)
             cumsum_arg = seq_chunk_cumsum
+        checkpoint_token_indices_arg = (
+            checkpoint_token_indices
+            if checkpoint_token_indices is not None
+            else self._dummy(x.device, torch.int32)
+        )
 
         dt_float = dt
         if dt.dtype != torch.float32:
@@ -1085,6 +1226,10 @@ class CakeSSDCombined:
             seq_chunk_cumsum=cumsum_arg,
             num_sequences=num_sequences,
             write_seq_chunk_cumsum=write_seq_chunk_cumsum,
+            cu_seqlens=cu_seqlens_arg,
+            checkpoint_token_indices=checkpoint_token_indices_arg,
+            metadata_from_cu_seqlens=from_cu_seqlens,
+            checkpoint_state_count=checkpoint_state_count,
             preprocess_status=self._preprocess_status_buffer(x.device),
         )
         grid = _persistent_grid_size(
@@ -1108,11 +1253,6 @@ class CakeSSDCombined:
             checkpoint_states
             if checkpoint_states is not None
             else self._dummy(x.device, self.state_dtype)
-        )
-        checkpoint_token_indices_arg = (
-            checkpoint_token_indices
-            if checkpoint_token_indices is not None
-            else self._dummy(x.device, torch.int32)
         )
         checkpoint_state_slots_arg = (
             checkpoint_state_slots
@@ -1158,6 +1298,8 @@ class CakeSSDCombined:
             "seqlen": seqlen,
             "nchunks": nchunks,
             "sequence_count": num_sequences,
+            # cu_seqlens: the bound; the scan reads at most one entry past the
+            # last derived segment, the sentinel.
             "num_logical_chunks": num_segments if mode_varlen else nchunks,
             "mode_varlen": int(mode_varlen),
             "D_mode": d_mode,
