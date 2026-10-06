@@ -81,6 +81,7 @@ def recurrent_kda(
         "small-bh",
         "cudnn",
     ] = "auto",
+    qk_l2norm_additive_epsilon: Optional[float] = None,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -111,7 +112,11 @@ def recurrent_kda(
             Query of shape ``[B, T, H, K]``, or
             ``[1, total_tokens, H, K]`` when using ``cu_seqlens``. Must be
             bfloat16. ``T=1`` selects decode; eligible ``T>1`` calls may select
-            the frozen prefill backend.
+            the frozen prefill backend. Ordinary prefill with ``auto``,
+            ``cute-dsl``, ``cake``, ``small-bh`` or ``cudnn`` accepts strided
+            Q/K: providers that require compact inputs pack them internally,
+            while cuDNN consumes supported strides directly. Other inputs
+            retain their backend-specific layout requirements.
         k (torch.Tensor):
             Key with the same shape as ``q``. Must be bfloat16.
         v (torch.Tensor):
@@ -304,6 +309,14 @@ def recurrent_kda(
             serve the call. It is never selected implicitly, and it covers
             ordinary multi-token prefill only: no speculative decode, no state
             pool, no ``initial_state_source``, no state checkpoints.
+        qk_l2norm_additive_epsilon (Optional[float]):
+            Explicit Q/K normalization denominator ``sqrt(sum(x*x) + epsilon)``.
+            Currently supported only by ``backend="cudnn"`` ordinary prefill
+            with ``use_qk_l2norm_in_kernel=True`` and a cuDNN frontend that
+            supports additive KDA normalization. Must be a positive finite
+            normal FP32 value. Unsupported providers or frontends raise;
+            ``None`` preserves each provider's existing normalization.
+            Fusion can change intermediate rounding.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -329,6 +342,11 @@ def recurrent_kda(
         raise ValueError(
             "backend must be 'auto', 'cute-dsl', 'cute-dsl-persistent', 'tirx', 'ptx', 'cake', 'small-bh', or 'cudnn', "
             f"got {backend!r}"
+        )
+    if qk_l2norm_additive_epsilon is not None and backend != "cudnn":
+        raise NotImplementedError(
+            "qk_l2norm_additive_epsilon is currently supported only by "
+            "backend='cudnn' ordinary prefill"
         )
     if backend == "cute-dsl-persistent":
         from .kda_prefill_persistent import _run_persistent_kda
@@ -511,6 +529,7 @@ def recurrent_kda(
             cu_seqlens=cu_seqlens,
             beta_is_logit=beta_is_logit,
             output=output,
+            qk_l2norm_additive_epsilon=qk_l2norm_additive_epsilon,
         )
     if checkpoint_state_indices is not None and backend == "cake":
         raise ValueError("checkpoint_state_indices is supported only by CuTe DSL")
@@ -574,6 +593,25 @@ def recurrent_kda(
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
     )
+    original_q, original_k = q, k
+    if (
+        is_plain_prefill
+        and isinstance(k, torch.Tensor)
+        and (not q.is_contiguous() or not k.is_contiguous())
+    ):
+        # Check the caller's storage before packing can hide an output alias.
+        # cuDNN returned above and reads supported strides without these copies.
+        if output is not None:
+            _kda_prefill._check_output_does_not_overlap_inputs(
+                output,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+            )
+        q, k = q.contiguous(), k.contiguous()
     if backend in ("auto", "small-bh"):
         small_bh_available = (
             is_cute_dsl_available()
@@ -883,8 +921,8 @@ def recurrent_kda(
     # An explicit small-BH request either returned or raised in prefill dispatch.
     assert backend != "small-bh"
     return _kda_decode._dispatch_recurrent_kda_decode(
-        q=q,
-        k=k,
+        q=original_q,
+        k=original_k,
         v=v,
         g=g,
         beta=beta,

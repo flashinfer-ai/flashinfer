@@ -205,6 +205,127 @@ def _serial(
     return out.unsqueeze(0), state
 
 
+def _run_additive(inputs, **kwargs):
+    try:
+        return _run(inputs, **kwargs)
+    except TypeError as exc:
+        message = str(exc)
+        if (
+            "got unexpected arguments ['qk_l2norm_additive_epsilon']" in message
+            or "got an unexpected keyword argument 'qk_l2norm_additive_epsilon'"
+            in message
+        ):
+            pytest.skip("requires cuDNN frontend with additive KDA normalization")
+        raise
+
+
+def _additive_inputs(*, strided=False):
+    inputs = _make_inputs([17, 31], 4, initial_state=True, seed=127)
+    for name in ("q", "k"):
+        inputs[name][:, 0::4] = 0
+        inputs[name][:, 1::4] *= 1e-5
+        inputs[name][:, 2::4] *= 1e-4
+    if strided:
+        projection = 4 * HEAD_DIM
+        carrier = torch.empty(
+            48, 3 * projection, dtype=inputs["q"].dtype, device="cuda"
+        )
+        for name, part in zip(
+            ("q", "k", "v"), carrier.split(projection, dim=-1), strict=True
+        ):
+            view = part.view(inputs[name].shape)
+            view.copy_(inputs[name])
+            inputs[name] = view
+    return inputs
+
+
+def _serial_additive(inputs, epsilon, *, initial_state=...):
+    normalized = dict(inputs)
+    for name in ("q", "k"):
+        value = inputs[name].float()
+        # Independent FP32 math: no intermediate BF16 cast to mimic another
+        # implementation's rounding, and no cuDNN execution in this oracle.
+        normalized[name] = (
+            value * (value.square().sum(-1, keepdim=True) + epsilon).rsqrt()
+        )
+    return _serial(normalized, l2norm=False, initial_state=initial_state)
+
+
+def _assert_additive_close(actual, expected):
+    for label, got, want in zip(("output", "state"), actual, expected, strict=True):
+        assert_rel_close(label, got, want, SERIAL_TOLERANCE)
+    # Ordinary rows must not hide an ignored epsilon on tiny input vectors.
+    for rows in (slice(1, None, 4), slice(2, None, 4)):
+        assert_rel_close(
+            "tiny output", actual[0][:, rows], expected[0][:, rows], SERIAL_TOLERANCE
+        )
+    assert torch.count_nonzero(actual[0][:, 0::4]) == 0
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_cudnn_additive_normalization_matches_fp32_serial(strided):
+    inputs = _additive_inputs(strided=strided)
+    expected = _serial_additive(inputs, 1e-6)
+    actual = _run_additive(
+        inputs,
+        initial_state=inputs["initial_state"],
+        **_gate_kwargs(
+            inputs, output_final_state=True, qk_l2norm_additive_epsilon=1e-6
+        ),
+    )
+    _assert_additive_close(actual, expected)
+
+
+def test_cudnn_additive_epsilon_separates_same_shape_graphs():
+    inputs = _additive_inputs()
+    outputs = []
+    for epsilon in (1e-6, 1e-2, 1e-6):
+        expected = _serial_additive(inputs, epsilon)
+        actual = _run_additive(
+            inputs,
+            initial_state=inputs["initial_state"].clone(),
+            **_gate_kwargs(
+                inputs, output_final_state=True, qk_l2norm_additive_epsilon=epsilon
+            ),
+        )
+        _assert_additive_close(actual, expected)
+        outputs.append(actual[0].clone())
+    assert rel_err(outputs[0][:, 1::4], outputs[1][:, 1::4]) > 0.1
+    torch.testing.assert_close(outputs[0], outputs[2], rtol=0, atol=0)
+
+
+def test_cudnn_additive_strided_replay_reads_changed_inputs():
+    inputs = _additive_inputs(strided=True)
+    seed = inputs["initial_state"].clone()
+    out = torch.empty(inputs["v"].shape, dtype=inputs["v"].dtype, device="cuda")
+    kwargs = _gate_kwargs(
+        inputs,
+        initial_state=inputs["initial_state"],
+        output=out,
+        output_final_state=True,
+        qk_l2norm_additive_epsilon=1e-6,
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run_additive(inputs, **kwargs)
+        stream.synchronize()
+        inputs["initial_state"].copy_(seed)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = _run(inputs, **kwargs)
+        for delta in (0.0, 0.0625):
+            inputs["q"][:, 1::4].add_(delta * 1e-4)
+            inputs["v"].add_(delta)
+            seed.add_(delta)
+            expected = _serial_additive(inputs, 1e-6, initial_state=seed)
+            inputs["initial_state"].copy_(seed)
+            out.fill_(float("nan"))
+            graph.replay()
+            stream.synchronize()
+            _assert_additive_close(actual, expected)
+
+
 # ---------------------------------------------------------------------------
 # Numerics
 # ---------------------------------------------------------------------------

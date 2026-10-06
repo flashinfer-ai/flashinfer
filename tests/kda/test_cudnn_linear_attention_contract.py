@@ -16,12 +16,14 @@
 
 import importlib.util
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from flashinfer.cudnn import linear_attention
+from flashinfer.kda import recurrent_kda
 
 
 @pytest.fixture
@@ -188,3 +190,144 @@ def test_kda_preserves_inference_tensor_mutation_rules(
         else:
             with pytest.raises(RuntimeError, match="[Ii]nference[Mm]ode"):
                 adapter.cudnn_recurrent_kda(q, q, q, q, torch.ones(7, 2), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "epsilon",
+    [
+        0.0,
+        -1.0,
+        float("nan"),
+        float("inf"),
+        1e-50,
+        1e40,
+        True,
+        "1e-6",
+        torch.tensor(1e-6),
+    ],
+)
+def test_kda_rejects_invalid_additive_epsilon_without_tensor_conversion(
+    monkeypatch, adapter, epsilon
+):
+    def no_conversion(*args, **kwargs):
+        raise AssertionError("epsilon validation must not read a tensor scalar")
+
+    monkeypatch.setattr(torch.Tensor, "__float__", no_conversion)
+    monkeypatch.setattr(torch.Tensor, "item", no_conversion)
+    monkeypatch.setattr(adapter, "_run_la_graph", no_conversion)
+    q = torch.ones(7, 2, 8)
+    with pytest.raises(ValueError, match="qk_l2norm_additive_epsilon"):
+        adapter.cudnn_recurrent_kda(
+            q, q, q, q, torch.ones(7, 2), qk_l2norm_additive_epsilon=epsilon
+        )
+
+
+@pytest.mark.parametrize(
+    "epsilon", [None, 1e-6, 1, 1.1754943508222875e-38, 3.4028234663852886e38]
+)
+def test_kda_forwards_valid_additive_epsilon(monkeypatch, adapter, epsilon):
+    seen = {}
+
+    def execute(*args, **kwargs):
+        seen.update(kwargs)
+        return None
+
+    monkeypatch.setattr(adapter, "_run_la_graph", execute)
+    q = torch.ones(7, 2, 8)
+    adapter.cudnn_recurrent_kda(
+        q,
+        q,
+        q,
+        q,
+        torch.ones(7, 2),
+        cu_seqlens=torch.tensor([0, 7], dtype=torch.int32),
+        qk_l2norm_additive_epsilon=epsilon,
+    )
+    assert seen["qk_l2norm_additive_epsilon"] == epsilon
+
+
+def test_kda_additive_epsilon_requires_normalization(adapter):
+    q = torch.ones(7, 2, 8)
+    with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel=True"):
+        adapter.cudnn_recurrent_kda(
+            q,
+            q,
+            q,
+            q,
+            torch.ones(7, 2),
+            use_qk_l2norm_in_kernel=False,
+            qk_l2norm_additive_epsilon=1e-6,
+        )
+
+
+@pytest.mark.parametrize(
+    "backend",
+    ["auto", "cute-dsl", "cake", "small-bh", "cute-dsl-persistent", "tirx", "ptx"],
+)
+def test_public_additive_epsilon_declines_other_backends(backend):
+    q = torch.ones(1, 7, 2, 8)
+    with pytest.raises(NotImplementedError, match="qk_l2norm_additive_epsilon"):
+        recurrent_kda(
+            q,
+            q,
+            q,
+            q,
+            torch.ones(1, 7, 2),
+            backend=backend,
+            qk_l2norm_additive_epsilon=1e-6,
+        )
+
+
+def test_kda_legacy_graph_omits_default_and_rejects_explicit_epsilon(
+    monkeypatch, adapter
+):
+    """Exercise the real builder; no version guess or silent normalization change."""
+    calls = []
+
+    class Port:
+        def set_uid(self, *args):
+            return self
+
+        set_output = set_dim = set_stride = set_data_type = set_uid
+
+    class LegacyGraph:
+        def tensor(self, **kwargs):
+            return Port()
+
+        def kda(self, **attrs):
+            calls.append(attrs)
+            if "qk_l2norm_additive_epsilon" in attrs:
+                raise TypeError(
+                    "kda() got an unexpected keyword argument 'qk_l2norm_additive_epsilon'"
+                )
+            return Port(), None, None
+
+    graph = LegacyGraph()
+    monkeypatch.setattr(
+        adapter.cudnn, "graph", lambda handle: nullcontext((graph, None))
+    )
+    q = torch.ones(7, 2, 8)
+    args = (
+        "kda",
+        q,
+        q,
+        q,
+        q,
+        torch.ones(7, 2),
+        torch.tensor([0, 7]),
+        torch.empty_like(q),
+    )
+    kwargs = dict(
+        scale=1.0,
+        use_qk_l2norm=True,
+        use_beta_sigmoid=False,
+        safe_gate=False,
+        gate_lower_bound=None,
+        batch_invariant=False,
+    )
+    builder = adapter._create_la_graph.__wrapped__
+    builder(*args, **kwargs)
+    assert "qk_l2norm_additive_epsilon" not in calls[-1]
+    with pytest.raises(TypeError, match="qk_l2norm_additive_epsilon"):
+        builder(*args, **kwargs, qk_l2norm_additive_epsilon=1e-6)
+    assert calls[-1]["qk_l2norm_additive_epsilon"] == 1e-6

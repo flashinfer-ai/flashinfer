@@ -36,6 +36,7 @@ gdn_prefill_qk4_v8_d128.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
+recurrent_kda_additive_q16_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
 packed_fused_kda_decode_t3_h12_d128.json
@@ -1160,6 +1161,24 @@ flashinfer.recurrent_kda(
     initial_state_source=rk_source,
     initial_state_indices=rk_source_indices,
     beta_is_logit=True,
+)
+
+# ── additive Q/K normalization for an 8K-token KDA prefill ──────────────────
+# Trace-only so generation also works without the optional cuDNN FE feature.
+ak_q = torch.randn(1, 8192, 16, 128, dtype=torch.bfloat16, device=device)
+flashinfer.recurrent_kda.fi_trace(
+    q=ak_q,
+    k=torch.randn_like(ak_q),
+    v=torch.randn_like(ak_q),
+    g=torch.full_like(ak_q, -0.01),
+    beta=torch.full((1, 8192, 16), 0.5, dtype=torch.bfloat16, device=device),
+    initial_state=torch.zeros(1, 16, 128, 128, dtype=torch.bfloat16, device=device),
+    cu_seqlens=torch.tensor([0, 8192], dtype=torch.int64, device=device),
+    output_final_state=True,
+    use_qk_l2norm_in_kernel=True,
+    qk_l2norm_additive_epsilon=1e-6,
+    backend="cudnn",
+    save_dir=SAVE_DIR,
 )
 
 # ── AlphaMoE NVFP4 (SM100/SM103, pre-aligned route plan) ────────────────────

@@ -33,6 +33,7 @@ except Exception:
     CUDNN_AVAILABLE = False
 
 _MIN_FRONTEND_VERSION = (1, 29)
+_FLOAT32_LIMITS = torch.finfo(torch.float32)
 
 
 def _linear_gate(g: Optional[torch.Tensor], ones_shape, dtype, device):
@@ -125,6 +126,7 @@ def _la_graph_key_fn(
     batch_invariant: bool,
     gate_domain: str = "log",
     overwrite_initial_state: bool = False,
+    qk_l2norm_additive_epsilon: Optional[float] = None,
 ):
     def layout(t):
         return None if t is None else (t.shape, t.stride(), t.dtype)
@@ -153,6 +155,7 @@ def _la_graph_key_fn(
         batch_invariant,
         gate_domain,
         overwrite_initial_state,
+        qk_l2norm_additive_epsilon,
     )
 
 
@@ -183,6 +186,7 @@ if CUDNN_AVAILABLE:
         batch_invariant: bool,
         gate_domain: str = "log",
         overwrite_initial_state: bool = False,
+        qk_l2norm_additive_epsilon: Optional[float] = None,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
@@ -243,6 +247,8 @@ if CUDNN_AVAILABLE:
                 attrs["gate_lower_bound"] = gate_lower_bound
             if family == "gdp":
                 attrs["num_householder"] = num_householder
+            if qk_l2norm_additive_epsilon is not None:
+                attrs["qk_l2norm_additive_epsilon"] = qk_l2norm_additive_epsilon
             attrs["gate_domain"] = gate_domain
             if overwrite_initial_state:
                 attrs["overwrite_initial_state"] = True
@@ -339,6 +345,7 @@ def _run_la_graph(
     batch_invariant: bool,
     gate_domain: str = "log",
     overwrite_initial_state: bool = False,
+    qk_l2norm_additive_epsilon: Optional[float] = None,
 ) -> Optional[torch.Tensor]:
     graph, _ = _build_la_graph(
         family,
@@ -363,6 +370,7 @@ def _run_la_graph(
         batch_invariant=batch_invariant,
         gate_domain=gate_domain,
         overwrite_initial_state=overwrite_initial_state,
+        qk_l2norm_additive_epsilon=qk_l2norm_additive_epsilon,
     )
 
     if overwrite_initial_state and not graph._fi_la_overwrite:
@@ -842,6 +850,7 @@ def cudnn_recurrent_kda(
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
     batch_invariant: bool = False,
+    qk_l2norm_additive_epsilon: Optional[float] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Kimi Delta Attention prefill on cuDNN's fused SM100 engine.
 
@@ -901,6 +910,12 @@ def cudnn_recurrent_kda(
     batch_invariant : bool
         Disable the split-K partition; see
         :func:`cudnn_chunk_gated_delta_rule`.
+    qk_l2norm_additive_epsilon : float, optional
+        When provided, normalize Q/K using ``x / sqrt(sum(x*x) + epsilon)``.
+        Requires ``use_qk_l2norm_in_kernel=True`` and a cuDNN frontend that
+        supports this graph attribute. An older frontend raises rather than
+        substituting a different formula. ``None`` preserves the existing
+        normalization. Fused rounding may differ from a separate operation.
 
     Returns
     -------
@@ -909,6 +924,22 @@ def cudnn_recurrent_kda(
         ``output_final_state=False``.
     """
     _check_cudnn_frontend("recurrent_kda")
+    if qk_l2norm_additive_epsilon is not None:
+        if (
+            isinstance(qk_l2norm_additive_epsilon, bool)
+            or not isinstance(qk_l2norm_additive_epsilon, (int, float))
+            or not _FLOAT32_LIMITS.tiny
+            <= qk_l2norm_additive_epsilon
+            <= _FLOAT32_LIMITS.max
+        ):
+            raise ValueError(
+                "qk_l2norm_additive_epsilon must be a positive finite normal FP32 value"
+            )
+        if not use_qk_l2norm_in_kernel:
+            raise ValueError(
+                "qk_l2norm_additive_epsilon requires use_qk_l2norm_in_kernel=True"
+            )
+        qk_l2norm_additive_epsilon = float(qk_l2norm_additive_epsilon)
     if cu_seqlens is None:
         raise ValueError("cudnn_recurrent_kda: cu_seqlens is required")
     if use_gate_in_kernel and (A_log is None or dt_bias is None):
@@ -990,6 +1021,7 @@ def cudnn_recurrent_kda(
         gate_lower_bound=float(lower_bound) if lower_bound is not None else None,
         batch_invariant=bool(batch_invariant),
         overwrite_initial_state=overwrite_initial_state,
+        qk_l2norm_additive_epsilon=qk_l2norm_additive_epsilon,
     )
 
     if output_state is None and initial_state is not None:

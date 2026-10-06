@@ -352,6 +352,49 @@ def test_recurrent_kda_facades_trace_under_distinct_names():
     assert "stage:decode" in deprecated["tags"]
 
 
+def test_recurrent_kda_additive_trace_preserves_legacy_bindings():
+    from flashinfer.trace.templates.kda import (
+        recurrent_kda_decode_trace,
+        recurrent_kda_trace,
+    )
+    from flashinfer.trace_apply.adapt import (
+        build_candidate_kwargs,
+        ordered_input_values,
+    )
+
+    default = recurrent_kda_trace()
+    epsilon_name = "qk_l2norm_additive_epsilon"
+    assert epsilon_name not in default.inputs
+    assert epsilon_name not in recurrent_kda_decode_trace.inputs
+    assert tuple(default.inputs) == tuple(recurrent_kda_decode_trace.inputs)
+    namespace = {name: object() for name in default.inputs}
+    # Default calls keep every positional binding used by existing native
+    # Trace Apply solutions, including positions for absent optional inputs.
+    assert ordered_input_values(default, namespace) == ordered_input_values(
+        recurrent_kda_decode_trace, namespace
+    )
+
+    q = torch.empty(1, 17, 4, 128, dtype=torch.bfloat16)
+    call = dict(q=q, k=q, v=q, g=q, beta=torch.empty(1, 17, 4))
+    canonical = flashinfer.recurrent_kda.fi_trace(**call)
+    unchanged = flashinfer.recurrent_kda.fi_trace(**call, **{epsilon_name: None})
+    additive = flashinfer.recurrent_kda.fi_trace(**call, **{epsilon_name: 1e-6})
+    assert canonical == unchanged
+    assert epsilon_name not in canonical["inputs"]
+    assert additive["name"] != canonical["name"]
+    assert additive["inputs"][epsilon_name] == {"shape": None, "dtype": "float32"}
+
+    selected = recurrent_kda_trace(**{epsilon_name: 1e-6})
+    assert selected in recurrent_kda_trace.templates
+    for epsilon in (1e-6, 1e-2):
+        explicit = dict(call, **{epsilon_name: epsilon})
+        assert build_candidate_kwargs(selected, explicit)[epsilon_name] == epsilon
+        positional = ordered_input_values(selected, explicit)
+        assert (
+            dict(zip(selected.inputs, positional, strict=True))[epsilon_name] == epsilon
+        )
+
+
 def test_ssd_combined_trace_dispatch_exposes_exact_finite_matrix():
     from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
 
