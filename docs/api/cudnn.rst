@@ -52,6 +52,52 @@ specialization: warm it before CUDA graph capture.
     cudnn_batch_decode_with_kv_cache
     cudnn_batch_prefill_with_kv_cache
 
+Ragged prefill: cached geometry and warmup
+-----------------------------------------
+
+``BatchPrefillWithRaggedKVCacheWrapper`` separates sequence metadata planning
+from repeated attention execution. With shape overrides, cuDNN graphs are
+cached by capacity class, while device indptrs carry the live lengths. Hq/Hkv,
+head dimensions, dtypes, tensor strides, attention scale, mask and requested
+Stats layout remain part of the graph signature; they are not padded into a
+larger head-count class.
+
+On SM100, BF16 expanded MLA (D192/V128, equal Q/KV heads) with cuDNN Frontend
+1.31 or newer and its matching native extension uses bounded batch/Q/KV
+classes for short-Q, long-KV prefixes.
+Batch and lengths round up to powers of two within the qualified range;
+Q129 and Q241 can share the same Q256 graph. The graph also receives a packed
+Q capacity, allowing either cuDNN provider to reserve workspace and choose
+parallelism from useful bounds. A bounded declaration does not force an engine
+or split count. Other inputs retain their existing cache policy.
+
+A new graph signature can require graph construction and kernel compilation.
+Warm the signatures needed by the serving schedule **before** CUDA Graph
+capture or latency-sensitive requests, using the existing ``plan`` and ``run``
+methods. No separate preparation API is required. In particular:
+
+* Warm each batch/Q/KV capacity class that the schedule will use, with the same
+  strides, scale, causal flag and ``return_lse`` / ``lse_layout`` as execution.
+* The existing ``max_token_per_sequence`` and ``max_sequence_kv`` plan arguments
+  can declare known upper bounds. For example, use Q256/KV4096 for both a
+  Q129/KV2049 warmup and a Q241/KV3001 request. Device indptrs still supply the
+  true lengths; the buffers do not need dummy tokens up to those bounds.
+* Allocate caller workspace and output/Stats buffers before capture. Use a
+  side stream for warmup, establish stream dependencies, and then capture
+  ``run`` with those buffers. Replays use the captured plan and addresses.
+* Re-plan metadata when the serving batch changes. CPU indptrs, or CPU mirrors
+  where supported, keep shape discovery off the GPU critical path. Repeated
+  ``run`` calls with the same plan only bind current tensors and launch.
+* An unprepared class, a changed layout/dtype/mask, or an evicted graph-cache
+  entry can need fresh preparation. Do not treat the initial warmup as a
+  promise that arbitrary future signatures will be compile-free.
+
+A smaller declaration adds cache classes compared with the broad fallback.
+Measure startup cost and steady-state GPU replay separately; per-step host
+planning and eager submission are different measurements again. In particular,
+a long declared sequence bound or a mostly empty batch can make the selected
+parallelism conservative. Capacity is not a measurement of active work.
+
 Linear attention
 ----------------
 
