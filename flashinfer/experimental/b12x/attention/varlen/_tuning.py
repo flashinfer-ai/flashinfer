@@ -30,6 +30,10 @@ class VarlenAttentionQuery:
     kv_rows: int
     max_seqlen_q: int
     max_seqlen_k: int
+    block_sparse: bool = False
+    per_segment_tiles: bool = False
+    block_tile_m: int = 0
+    block_tile_n: int = 0
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
 
@@ -58,6 +62,8 @@ def _default_config(
     query: VarlenAttentionQuery,
     _device: DeviceIdentity | None,
 ) -> VarlenAttentionConfig:
+    if query.block_sparse and query.block_tile_m:
+        return VarlenAttentionConfig(tile_m=query.block_tile_m, tile_n=query.block_tile_n)
     if query.q_head_dim <= 64:
         return VarlenAttentionConfig(tile_m=128, tile_n=128)
     if query.q_head_dim <= 128 or (
@@ -93,6 +99,10 @@ def _validate_config(
     config: VarlenAttentionConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    if _query.block_sparse and (config.tile_m, config.tile_n) != (
+        _query.block_tile_m, _query.block_tile_n
+    ):
+        raise ValueError("Sparse attention tiles must match the declared CSR block geometry")
     if config.tile_m <= 0 or config.tile_n <= 0:
         raise ValueError("attention tile dimensions must be positive")
     if config.tile_m % 16 or config.tile_n % 16:
@@ -110,6 +120,12 @@ def _tuning_parameters(
     # materialization applies the exact joint can_implement predicate.
     if query.q_head_dim <= 0 or query.v_head_dim <= 0:
         raise ValueError("attention head dimensions must be positive")
+    if query.block_sparse:
+        return ParameterSpace.create(
+            TUNING.knobs,
+            values={"tile_m": (query.block_tile_m,), "tile_n": (query.block_tile_n,)},
+            exhaustive=query.exhaustive,
+        )
     capacity = utils.get_smem_capacity_in_bytes("sm_120")
     q_width = (query.q_head_dim + 15) // 16 * 16
     v_width = (query.v_head_dim + 15) // 16 * 16
@@ -156,7 +172,7 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="attention.varlen",
-    query_schema_version=2,
+    query_schema_version=3,
     config_schema_version=1,
     query_fields=frozenset(VarlenAttentionQuery.__dataclass_fields__),
     config_fields=frozenset(VarlenAttentionConfig.__dataclass_fields__),
@@ -170,7 +186,7 @@ TUNING = TuningContract(
         Knob(name="tile_m", values=None, binding=ParameterBinding.COMPILE),
         Knob(name="tile_n", values=None, binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=3,
+    candidate_contract_version=4,
     parameters=_tuning_parameters,
     materialize=_materialize_tuning,
 )

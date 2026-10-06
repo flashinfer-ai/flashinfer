@@ -179,6 +179,8 @@ class ContiguousAttentionForwardKernel:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         mma_pv_is_rs: bool = True,
+        is_block_sparse: bool = False,
+        per_segment_tiles: bool = False,
     ):
         self.dtype = dtype
         hdim_multiple_of = 16
@@ -198,6 +200,8 @@ class ContiguousAttentionForwardKernel:
         self.tile_n = tile_n
         self.num_threads = num_threads
         self.num_stages = num_stages
+        self.is_block_sparse = is_block_sparse
+        self.per_segment_tiles = per_segment_tiles
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.qk_acc_dtype = Float32
@@ -575,7 +579,10 @@ class ContiguousAttentionForwardKernel:
         logical_seqlen_k_static: cutlass.Constexpr = 0,
         stream: cuda.CUstream = None,
     ):
-        assert blocksparse_tensors is None
+        if const_expr(blocksparse_tensors is None):
+            mBlockIndices, mBlockOffsets = None, None
+        else:
+            mBlockIndices, mBlockOffsets = blocksparse_tensors
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -759,6 +766,8 @@ class ContiguousAttentionForwardKernel:
             mLSE,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mBlockIndices,
+            mBlockOffsets,
             learnable_sink,
             has_attention_sink_bias,
             tma_atom_Q,
@@ -800,6 +809,8 @@ class ContiguousAttentionForwardKernel:
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
+        mBlockIndices: Optional[cute.Tensor],
+        mBlockOffsets: Optional[cute.Tensor],
         mAttentionSinkBias: cute.Tensor,
         has_attention_sink_bias: cutlass.Constexpr,
         tma_atom_Q: cute.CopyAtom,
@@ -881,6 +892,10 @@ class ContiguousAttentionForwardKernel:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead
             if const_expr(self.pack_gqa)
             else 1,
+            is_block_sparse=self.is_block_sparse,
+            mBlockIndices=mBlockIndices,
+            mBlockOffsets=mBlockOffsets,
+            per_segment_tiles=self.per_segment_tiles,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1027,13 +1042,23 @@ class ContiguousAttentionForwardKernel:
                     mbar_ptr_Q, self.tma_copy_bytes["Q"]
                 )
             load_Q(tma_bar_ptr=mbar_ptr_Q)
-            for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
-                n_block = n_block_max - 1 - n_tile
-                pipeline_k.producer_acquire(kv_producer_state)
-                load_K(src_idx=n_block, producer_state=kv_producer_state)
-                pipeline_v.producer_acquire(kv_producer_state)
-                load_V(src_idx=n_block, producer_state=kv_producer_state)
-                kv_producer_state.advance()
+            if const_expr(block_info.is_block_sparse):
+                list_offset, list_count = block_info.n_block_list(seqlen, m_block)
+                for list_i in cutlass.range(list_count, unroll=1):
+                    list_n_block = block_info.n_block_from_list(list_offset, list_count, list_i)
+                    pipeline_k.producer_acquire(kv_producer_state)
+                    load_K(src_idx=list_n_block, producer_state=kv_producer_state)
+                    pipeline_v.producer_acquire(kv_producer_state)
+                    load_V(src_idx=list_n_block, producer_state=kv_producer_state)
+                    kv_producer_state.advance()
+            else:
+                for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
+                    n_block = n_block_max - 1 - n_tile
+                    pipeline_k.producer_acquire(kv_producer_state)
+                    load_K(src_idx=n_block, producer_state=kv_producer_state)
+                    pipeline_v.producer_acquire(kv_producer_state)
+                    load_V(src_idx=n_block, producer_state=kv_producer_state)
+                    kv_producer_state.advance()
 
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.PFull),
@@ -1124,7 +1149,7 @@ class ContiguousAttentionForwardKernel:
             smem_thr_copy_V,
             tCcB=thr_mma_pv.partition_B(
                 cute.make_identity_tensor((self.tile_hdimv, self.tile_n))
-            ) if const_expr(is_first_n_block) else None,
+            ) if const_expr(is_first_n_block or self.is_block_sparse) else None,
             valid_k=seqlen.seqlen_k - n_block * self.tile_n,
         )
         pipeline_v.consumer_release(kv_consumer_state)
@@ -1235,44 +1260,98 @@ class ContiguousAttentionForwardKernel:
                 mask_mod=self.mask_mod,
             )
 
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-            if n_block_max > n_block_min:
-                kv_consumer_state = self.mma_one_n_block(
-                    n_block_max - 1,
-                    kv_consumer_state,
-                    thr_mma_qk,
-                    thr_mma_pv,
-                    tSrQ,
-                    tSrK,
-                    tOrVt,
-                    acc_O,
-                    smem_thr_copy_Q,
-                    smem_thr_copy_K,
-                    smem_thr_copy_V,
-                    tSsQ,
-                    tSsK,
-                    tOsVt,
-                    pipeline_k,
-                    pipeline_v,
-                    softmax,
-                    seqlen,
-                    batch_idx,
-                    head_idx,
-                    m_block,
-                    partial(mask_fn, mask_seqlen=True),
-                    aux_tensors=aux_tensors,
-                    is_first_n_block=True,
-                )
-                n_block_max -= 1
+            if const_expr(block_info.is_block_sparse):
+                list_offset, list_count = block_info.n_block_list(seqlen, m_block)
+                for list_i in cutlass.range(list_count, unroll=1):
+                    n_block = block_info.n_block_from_list(list_offset, list_count, list_i)
+                    kv_consumer_state = self.mma_one_n_block(
+                        n_block, kv_consumer_state, thr_mma_qk, thr_mma_pv,
+                        tSrQ, tSrK, tOrVt, acc_O,
+                        smem_thr_copy_Q, smem_thr_copy_K, smem_thr_copy_V,
+                        tSsQ, tSsK, tOsVt, pipeline_k, pipeline_v, softmax, seqlen,
+                        batch_idx, head_idx, m_block,
+                        partial(mask_fn, mask_seqlen=True),
+                        aux_tensors=aux_tensors,
+                    )
+            else:
+                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+                if n_block_max > n_block_min:
+                    kv_consumer_state = self.mma_one_n_block(
+                        n_block_max - 1,
+                        kv_consumer_state,
+                        thr_mma_qk,
+                        thr_mma_pv,
+                        tSrQ,
+                        tSrK,
+                        tOrVt,
+                        acc_O,
+                        smem_thr_copy_Q,
+                        smem_thr_copy_K,
+                        smem_thr_copy_V,
+                        tSsQ,
+                        tSsK,
+                        tOsVt,
+                        pipeline_k,
+                        pipeline_v,
+                        softmax,
+                        seqlen,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        partial(mask_fn, mask_seqlen=True),
+                        aux_tensors=aux_tensors,
+                        is_first_n_block=True,
+                    )
+                    n_block_max -= 1
 
-                if const_expr(self.is_causal or self.is_local):
-                    n_block_min_causal_local_mask = (
-                        block_info.get_n_block_min_causal_local_mask(
+                    if const_expr(self.is_causal or self.is_local):
+                        n_block_min_causal_local_mask = (
+                            block_info.get_n_block_min_causal_local_mask(
+                                seqlen, m_block, n_block_min
+                            )
+                        )
+                        for n_tile in cutlass.range(
+                            n_block_max - n_block_min_causal_local_mask, unroll=1
+                        ):
+                            kv_consumer_state = self.mma_one_n_block(
+                                n_block_max - 1 - n_tile,
+                                kv_consumer_state,
+                                thr_mma_qk,
+                                thr_mma_pv,
+                                tSrQ,
+                                tSrK,
+                                tOrVt,
+                                acc_O,
+                                smem_thr_copy_Q,
+                                smem_thr_copy_K,
+                                smem_thr_copy_V,
+                                tSsQ,
+                                tSsK,
+                                tOsVt,
+                                pipeline_k,
+                                pipeline_v,
+                                softmax,
+                                seqlen,
+                                batch_idx,
+                                head_idx,
+                                m_block,
+                                partial(mask_fn, mask_seqlen=False),
+                                aux_tensors=aux_tensors,
+                            )
+                        n_block_max = cutlass.min(
+                            n_block_max, n_block_min_causal_local_mask
+                        )
+
+                    n_block_min_before_local_mask = (
+                        block_info.get_n_block_min_before_local_mask(
                             seqlen, m_block, n_block_min
                         )
                     )
+                    n_block_min_before_local_mask = cutlass.min(
+                        n_block_min_before_local_mask, n_block_max
+                    )
                     for n_tile in cutlass.range(
-                        n_block_max - n_block_min_causal_local_mask, unroll=1
+                        n_block_max - n_block_min_before_local_mask, unroll=1
                     ):
                         kv_consumer_state = self.mma_one_n_block(
                             n_block_max - 1 - n_tile,
@@ -1299,77 +1378,38 @@ class ContiguousAttentionForwardKernel:
                             partial(mask_fn, mask_seqlen=False),
                             aux_tensors=aux_tensors,
                         )
-                    n_block_max = cutlass.min(
-                        n_block_max, n_block_min_causal_local_mask
-                    )
+                    n_block_max = n_block_min_before_local_mask
 
-                n_block_min_before_local_mask = (
-                    block_info.get_n_block_min_before_local_mask(
-                        seqlen, m_block, n_block_min
-                    )
-                )
-                n_block_min_before_local_mask = cutlass.min(
-                    n_block_min_before_local_mask, n_block_max
-                )
-                for n_tile in cutlass.range(
-                    n_block_max - n_block_min_before_local_mask, unroll=1
-                ):
-                    kv_consumer_state = self.mma_one_n_block(
-                        n_block_max - 1 - n_tile,
-                        kv_consumer_state,
-                        thr_mma_qk,
-                        thr_mma_pv,
-                        tSrQ,
-                        tSrK,
-                        tOrVt,
-                        acc_O,
-                        smem_thr_copy_Q,
-                        smem_thr_copy_K,
-                        smem_thr_copy_V,
-                        tSsQ,
-                        tSsK,
-                        tOsVt,
-                        pipeline_k,
-                        pipeline_v,
-                        softmax,
-                        seqlen,
-                        batch_idx,
-                        head_idx,
-                        m_block,
-                        partial(mask_fn, mask_seqlen=False),
-                        aux_tensors=aux_tensors,
-                    )
-                n_block_max = n_block_min_before_local_mask
+                    if const_expr(
+                        self.is_local and block_info.window_size_left is not None
+                    ):
+                        for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
+                            kv_consumer_state = self.mma_one_n_block(
+                                n_block_max - 1 - n_tile,
+                                kv_consumer_state,
+                                thr_mma_qk,
+                                thr_mma_pv,
+                                tSrQ,
+                                tSrK,
+                                tOrVt,
+                                acc_O,
+                                smem_thr_copy_Q,
+                                smem_thr_copy_K,
+                                smem_thr_copy_V,
+                                tSsQ,
+                                tSsK,
+                                tOsVt,
+                                pipeline_k,
+                                pipeline_v,
+                                softmax,
+                                seqlen,
+                                batch_idx,
+                                head_idx,
+                                m_block,
+                                partial(mask_fn, mask_seqlen=False),
+                                aux_tensors=aux_tensors,
+                            )
 
-                if const_expr(
-                    self.is_local and block_info.window_size_left is not None
-                ):
-                    for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
-                        kv_consumer_state = self.mma_one_n_block(
-                            n_block_max - 1 - n_tile,
-                            kv_consumer_state,
-                            thr_mma_qk,
-                            thr_mma_pv,
-                            tSrQ,
-                            tSrK,
-                            tOrVt,
-                            acc_O,
-                            smem_thr_copy_Q,
-                            smem_thr_copy_K,
-                            smem_thr_copy_V,
-                            tSsQ,
-                            tSsK,
-                            tOsVt,
-                            pipeline_k,
-                            pipeline_v,
-                            softmax,
-                            seqlen,
-                            batch_idx,
-                            head_idx,
-                            m_block,
-                            partial(mask_fn, mask_seqlen=False),
-                            aux_tensors=aux_tensors,
-                        )
             sink_val = None
             if const_expr(has_attention_sink_bias):
                 sink_val = cute.make_rmem_tensor(softmax.num_rows, Float32)
