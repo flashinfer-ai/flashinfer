@@ -544,6 +544,7 @@ _LOCAL_SELECT_MAX_K_BY_CAPABILITY: dict[tuple[int, int], int] = {
     (9, 0): 10,
     (10, 0): 20,
     (10, 3): 32,
+    (10, 7): 20,
 }
 # Round 11 (lever M4): a one-chunk row (an ept-32 stream whose rows fit one register chunk per CTA, V128256 on cluster 8)
 # keeps its per-CTA lists small enough that the local select still wins at k 50 / 64 (GB300 `_sp_lp` -> `_sp_lp_l1` k50

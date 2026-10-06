@@ -706,7 +706,7 @@ def test_per_request_tensors_and_routes():
         (8, 262144, 50): (8, 16, True),  # +1.5 % vs best
         (16, 262144, 50): (4, 16, True),  # +2.8 % vs best
         (32, 262144, 50): (2, 32, True),
-        (64, 262144, 50): (2, 32, True),
+        (64, 262144, 50): (1, 32, True),  # round-11 M4 one-wave cluster-1 re-pick (was (2, 32, True))
         (128, 262144, 50): (1, 32, True),
     }.items():
         assert pick(pb, pv, sm_count=132, top_k_max=pk) == want, (pb, pv, pk, 132)
@@ -3417,6 +3417,7 @@ def test_local_select_build_matches_leader_push_build():
         (9, 0): 10,
         (10, 0): 20,
         (10, 3): 32,
+        (10, 7): 20,
     }
     for cap, kmax in cs._LOCAL_SELECT_MAX_K_BY_CAPABILITY.items():
         for flags in (fused_sp, fused_cs):
