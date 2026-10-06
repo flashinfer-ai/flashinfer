@@ -816,7 +816,9 @@ def test_balanced_program_rule_mirrors_the_manifest() -> None:
             for sm in (148, 152):
                 # the b1 s4096 cp4 row (65 pages, 8 KV-head tiles) and the table's bound; 113 pages is the planner
                 assert program(1, 8, 65, sm) == static
-                assert program(1, 8, 112, sm) == static and program(1, 8, 113, sm) == below
+                assert (
+                    program(1, 8, 112, sm) == static and program(1, 8, 113, sm) == below
+                )
                 # the 16k row (257 pages), two and eight requests: the planner program
                 assert program(1, 8, 257, sm) == below
                 assert program(2, 8, 65, sm) == below and program(8, 8, 65, sm) == below
