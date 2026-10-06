@@ -25,16 +25,7 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda"]
 
 [project.optional-dependencies]
-b12x = [
-  "torch>=2.12.0",
-  "nvidia-cutlass-dsl==4.7.1",
-  "nvidia-cutlass-dsl-libs-base==4.7.1",
-  "nvidia-cutlass-dsl-libs-core==4.7.1",
-  "nvidia-cutlass-dsl-libs-cu12==4.7.1",
-  "nvidia-cutlass-dsl-libs-cu13==4.7.1",
-  "rich>=13",
-  "safetensors>=0.6",
-]
+b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl==4.7.1", "nvidia-cutlass-dsl-libs-base==4.7.1", "nvidia-cutlass-dsl-libs-core==4.7.1", "nvidia-cutlass-dsl-libs-cu12==4.7.1", "nvidia-cutlass-dsl-libs-cu13==4.7.1", "rich>=13", "safetensors>=0.6"]
 # Static SM103a KDA PTX uses ISA 9.2 and embedded-cubin TVM FFI shims.
 ptx = ["nvidia-cuda-nvcc>=13.2", "apache-tvm-ffi>=0.1.12,<0.2"]
 # Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
