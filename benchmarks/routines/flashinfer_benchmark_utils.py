@@ -851,6 +851,7 @@ routine_cc_to_supported_backends = {
     "unified_nvfp4_moe": {
         "10.0": ["unified"],
         "10.3": ["unified"],
+        "10.7": ["unified"],
     },
     # NORM
     "rmsnorm": {
