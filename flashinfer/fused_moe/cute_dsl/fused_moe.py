@@ -549,6 +549,12 @@ def _moe_core_impl(
             memset_event = memset_event or resources["memset_event"]
 
     is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
+    # Reject before routing so an unsupported call does no GPU work.
+    if use_localized_path and not is_rubin:
+        raise NotImplementedError(
+            "locality-domain localization is Rubin (SM107) only; pass gemm1_mma_tiler / "
+            "gemm1_mma_inst_shape."
+        )
 
     # Multi-CTA Rubin tactics are filtered out in tuner.get_valid_tactics; this
     # is the backstop for callers that pass tactic parameters directly.
@@ -584,14 +590,7 @@ def _moe_core_impl(
         **moe_sort_kwargs,
     )
 
-    kernel_num_non_exiting_tiles = num_non_exiting_tiles
-
     if use_localized_path:
-        if not is_rubin:
-            raise NotImplementedError(
-                "locality-domain localization is Rubin (SM107) only; pass gemm1_mma_tiler / "
-                "gemm1_mma_inst_shape."
-            )
         # Allocate once: both domains fill disjoint columns of this buffer.
         permuted_m = permuted_idx_to_expanded_idx.shape[0]
         sf_vec_size = 16  # NVFP4
@@ -672,7 +671,7 @@ def _moe_core_impl(
                 tile_idx_to_expert_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
                 token_id_mapping=permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+                num_non_exiting_tiles=num_non_exiting_tiles,
                 out=gemm1_out,
                 out_scale=gemm1_out_scale,
                 global_scale=fc2_input_scale,
@@ -730,7 +729,7 @@ def _moe_core_impl(
                 tile_idx_to_expert_idx=tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
                 token_id_mapping=permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+                num_non_exiting_tiles=num_non_exiting_tiles,
                 out=gemm1_out,
                 out_scale=None if use_per_token_activation else gemm1_out_scale,
                 global_scale=(
@@ -816,7 +815,7 @@ def _moe_core_impl(
                 b_scale=shard["w2_weight_sf"],
                 alpha=w2_alpha,
                 tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-                num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+                num_non_exiting_tiles=num_non_exiting_tiles,
                 tile_idx_to_mn_limit=tile_idx_to_mn_limit,
                 permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
                 token_final_scales=token_final_scales,
@@ -851,7 +850,7 @@ def _moe_core_impl(
             b_scale=w2_weight_sf,
             alpha=w2_alpha,
             tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-            num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+            num_non_exiting_tiles=num_non_exiting_tiles,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
             token_final_scales=token_final_scales,
