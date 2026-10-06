@@ -161,7 +161,7 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap OUT32, const __grid_constant__ CUtensorMap OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int group_m, int promo_code, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
+kernel_cake_dense_projection_gemm_7be35c7ed354eaca505c(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap OUT32, const __grid_constant__ CUtensorMap OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int group_m, int promo_code, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -306,33 +306,25 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                             :: "r"(work_response_addr + work_stage * 16 + 0 * 16), "r"(work_full_addr + work_stage * 8)
                             : "memory");
                     }
-                    int u = (int)this_bid / 2 - num_full;
-                    int lin0 = u * iters_per_unit;
-                    int lin1_raw = lin0 + iters_per_unit;
-                    int lin1 = ((lin1_raw > sk_iters) ? sk_iters : lin1_raw);
-                    int n_tail = (lin1 - 1) / k_iters - lin0 / k_iters + 1;
-                    int n = ((u < 0) ? 1 : n_tail);
-                    int nseg = n;
+                    int n1 = 1;
+                    int nseg = n1;
                     #pragma unroll 1
                     for (int seg = 0; seg < nseg; seg++) {
-                        int u_0 = (int)this_bid / 2 - num_full;
-                        int lin0_1 = u_0 * iters_per_unit;
-                        int lin1_raw_2 = lin0_1 + iters_per_unit;
-                        int lin1_3 = ((lin1_raw_2 > sk_iters) ? sk_iters : lin1_raw_2);
-                        int t = lin0_1 / k_iters + seg;
-                        int tb = t * k_iters;
-                        int kb0 = lin0_1 - tb;
-                        int kbeg_t = ((kb0 > 0) ? kb0 : 0);
-                        int ke0 = lin1_3 - tb;
-                        int kend_t = ((ke0 > k_iters) ? k_iters : ke0);
-                        int tile_bid = ((u_0 < 0) ? (int)this_bid : 2 * (num_full + t) + cta_rank);
-                        int kbeg = ((u_0 < 0) ? 0 : kbeg_t);
-                        int kend = ((u_0 < 0) ? k_iters : kend_t);
-                        int tail_t = ((u_0 < 0) ? -1 : t);
+                        int ux = (int)this_bid / 2 - num_full;
+                        int px = sk_iters;
+                        int tx = ux / px;
+                        int qx = ux - tx * px;
+                        int kbx = qx * iters_per_unit;
+                        int kex_raw = kbx + iters_per_unit;
+                        int kex = ((kex_raw > k_iters) ? k_iters : kex_raw);
+                        int tile_bid_x = ((ux < 0) ? (int)this_bid : 2 * (num_full + tx) + cta_rank);
+                        int kbeg_x = ((ux < 0) ? 0 : kbx);
+                        int kend_x = ((ux < 0) ? k_iters : kex);
+                        int tail_x = ((ux < 0) ? -1 : tx);
                         int tiles_per_l = m_tiles * n_tiles;
                         int tiles_per_group = group_m * n_tiles;
-                        int head = tile_bid / tiles_per_l;
-                        int rem = tile_bid - head * tiles_per_l;
+                        int head = tile_bid_x / tiles_per_l;
+                        int rem = tile_bid_x - head * tiles_per_l;
                         int group = rem / tiles_per_group;
                         int first_m = group * group_m;
                         int remaining = m_tiles - first_m;
@@ -343,11 +335,11 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                         int off_m = bid_m * 128;
                         int off_n = bid_n * 256;
                         int b_col = off_n + cta_rank * 128;
-                        int klen = kend - kbeg;
+                        int klen = kend_x - kbeg_x;
                         #pragma unroll 1
                         for (int iter_k = 0; iter_k < klen; iter_k++) {
                             mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
-                            int k0 = (kbeg + iter_k) * 64;
+                            int k0 = (kbeg_x + iter_k) * 64;
                             #pragma unroll
                             for (int p = 0; p < 2; p++) {
                                 #pragma unroll
@@ -425,30 +417,22 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                 unsigned int this_bid_1 = bid;
                 #pragma unroll 1
                 for (unsigned int _tile_iter_1 = 0; _tile_iter_1 < num_cluster_tiles; _tile_iter_1++) {
-                    int u_1 = (int)this_bid_1 / 2 - num_full;
-                    int lin0_2 = u_1 * iters_per_unit;
-                    int lin1_raw_1 = lin0_2 + iters_per_unit;
-                    int lin1_1 = ((lin1_raw_1 > sk_iters) ? sk_iters : lin1_raw_1);
-                    int n_tail_1 = (lin1_1 - 1) / k_iters - lin0_2 / k_iters + 1;
-                    int n_1 = ((u_1 < 0) ? 1 : n_tail_1);
-                    int nseg_1 = n_1;
+                    int n1_1 = 1;
+                    int nseg_1 = n1_1;
                     #pragma unroll 1
                     for (int seg_1 = 0; seg_1 < nseg_1; seg_1++) {
-                        int u_0_1 = (int)this_bid_1 / 2 - num_full;
-                        int lin0_1_1 = u_0_1 * iters_per_unit;
-                        int lin1_raw_2_1 = lin0_1_1 + iters_per_unit;
-                        int lin1_3_1 = ((lin1_raw_2_1 > sk_iters) ? sk_iters : lin1_raw_2_1);
-                        int t_1 = lin0_1_1 / k_iters + seg_1;
-                        int tb_1 = t_1 * k_iters;
-                        int kb0_1 = lin0_1_1 - tb_1;
-                        int kbeg_t_1 = ((kb0_1 > 0) ? kb0_1 : 0);
-                        int ke0_1 = lin1_3_1 - tb_1;
-                        int kend_t_1 = ((ke0_1 > k_iters) ? k_iters : ke0_1);
-                        int tile_bid_1 = ((u_0_1 < 0) ? (int)this_bid_1 : 2 * (num_full + t_1) + cta_rank);
-                        int kbeg_1 = ((u_0_1 < 0) ? 0 : kbeg_t_1);
-                        int kend_1 = ((u_0_1 < 0) ? k_iters : kend_t_1);
-                        int tail_t_1 = ((u_0_1 < 0) ? -1 : t_1);
-                        int klen_1 = kend_1 - kbeg_1;
+                        int ux_1 = (int)this_bid_1 / 2 - num_full;
+                        int px_1 = sk_iters;
+                        int tx_1 = ux_1 / px_1;
+                        int qx_1 = ux_1 - tx_1 * px_1;
+                        int kbx_1 = qx_1 * iters_per_unit;
+                        int kex_raw_1 = kbx_1 + iters_per_unit;
+                        int kex_1 = ((kex_raw_1 > k_iters) ? k_iters : kex_raw_1);
+                        int tile_bid_x_1 = ((ux_1 < 0) ? (int)this_bid_1 : 2 * (num_full + tx_1) + cta_rank);
+                        int kbeg_x_1 = ((ux_1 < 0) ? 0 : kbx_1);
+                        int kend_x_1 = ((ux_1 < 0) ? k_iters : kex_1);
+                        int tail_x_1 = ((ux_1 < 0) ? -1 : tx_1);
+                        int klen_1 = kend_x_1 - kbeg_x_1;
                         mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
                         #pragma unroll 1
                         for (int iter_k_1 = 0; iter_k_1 < klen_1; iter_k_1++) {
@@ -561,33 +545,25 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_2 = 0; _tile_iter_2 < num_cluster_tiles; _tile_iter_2++) {
-                int u_2 = (int)this_bid_2 / 2 - num_full;
-                int lin0_3 = u_2 * iters_per_unit;
-                int lin1_raw_3 = lin0_3 + iters_per_unit;
-                int lin1_2 = ((lin1_raw_3 > sk_iters) ? sk_iters : lin1_raw_3);
-                int n_tail_2 = (lin1_2 - 1) / k_iters - lin0_3 / k_iters + 1;
-                int n_2 = ((u_2 < 0) ? 1 : n_tail_2);
-                int nseg_2 = n_2;
+                int n1_2 = 1;
+                int nseg_2 = n1_2;
                 #pragma unroll 1
                 for (int seg_2 = 0; seg_2 < nseg_2; seg_2++) {
-                    int u_0_2 = (int)this_bid_2 / 2 - num_full;
-                    int lin0_1_2 = u_0_2 * iters_per_unit;
-                    int lin1_raw_2_2 = lin0_1_2 + iters_per_unit;
-                    int lin1_3_2 = ((lin1_raw_2_2 > sk_iters) ? sk_iters : lin1_raw_2_2);
-                    int t_2 = lin0_1_2 / k_iters + seg_2;
-                    int tb_2 = t_2 * k_iters;
-                    int kb0_2 = lin0_1_2 - tb_2;
-                    int kbeg_t_2 = ((kb0_2 > 0) ? kb0_2 : 0);
-                    int ke0_2 = lin1_3_2 - tb_2;
-                    int kend_t_2 = ((ke0_2 > k_iters) ? k_iters : ke0_2);
-                    int tile_bid_2 = ((u_0_2 < 0) ? (int)this_bid_2 : 2 * (num_full + t_2) + cta_rank);
-                    int kbeg_2 = ((u_0_2 < 0) ? 0 : kbeg_t_2);
-                    int kend_2 = ((u_0_2 < 0) ? k_iters : kend_t_2);
-                    int tail_t_2 = ((u_0_2 < 0) ? -1 : t_2);
+                    int ux_2 = (int)this_bid_2 / 2 - num_full;
+                    int px_2 = sk_iters;
+                    int tx_2 = ux_2 / px_2;
+                    int qx_2 = ux_2 - tx_2 * px_2;
+                    int kbx_2 = qx_2 * iters_per_unit;
+                    int kex_raw_2 = kbx_2 + iters_per_unit;
+                    int kex_2 = ((kex_raw_2 > k_iters) ? k_iters : kex_raw_2);
+                    int tile_bid_x_2 = ((ux_2 < 0) ? (int)this_bid_2 : 2 * (num_full + tx_2) + cta_rank);
+                    int kbeg_x_2 = ((ux_2 < 0) ? 0 : kbx_2);
+                    int kend_x_2 = ((ux_2 < 0) ? k_iters : kex_2);
+                    int tail_x_2 = ((ux_2 < 0) ? -1 : tx_2);
                     int tiles_per_l_1 = m_tiles * n_tiles;
                     int tiles_per_group_1 = group_m * n_tiles;
-                    int head_1 = tile_bid_2 / tiles_per_l_1;
-                    int rem_1 = tile_bid_2 - head_1 * tiles_per_l_1;
+                    int head_1 = tile_bid_x_2 / tiles_per_l_1;
+                    int rem_1 = tile_bid_x_2 - head_1 * tiles_per_l_1;
                     int group_1 = rem_1 / tiles_per_group_1;
                     int first_m_1 = group_1 * group_m;
                     int remaining_1 = m_tiles - first_m_1;
@@ -598,8 +574,8 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                     int off_m_1 = bid_m_1 * 128;
                     int off_n_1 = bid_n_1 * 256;
                     int bidx = head_1;
-                    int part_4 = ((kbeg_2 > 0) ? 1 : ((kend_2 < k_iters) ? 1 : 0));
-                    int slab = u_0_2 + tail_t_2;
+                    int part_0 = ((kbeg_x_2 > 0) ? 1 : ((kend_x_2 < k_iters) ? 1 : 0));
+                    int slab = ux_2 + tail_x_2;
                     int global_row = off_m_1 + local_row;
                     int row0 = off_m_1 + warp_row0;
                     int col0 = slice_col0;
@@ -624,10 +600,10 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                             :: "r"((epilogue_done_addr + (epi_stage) * 8) & 0xFEFFFFFF) : "memory");
                     }
-                    if (part_4 == 0) {
+                    if (part_0 == 0) {
                         unsigned long long row_base = (unsigned long long)bidx * (unsigned long long)out_l + (unsigned long long)global_row * (unsigned long long)ldo + (unsigned long long)(off_n_1 + col0);
                         if (global_row < M) {
-                            int mis32 = (int)((unsigned long long)(out32 + row_base) & 31);
+                            int mis32 = (int)((unsigned long long)(out + row_base) & 31);
                             #pragma unroll
                             for (int n_chunk = 0; n_chunk < 8; n_chunk++) {
                                 int col = n_chunk * 16;
@@ -638,54 +614,55 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                                 }
                                 if (off_n_1 + col0 + col + 16 <= N) {
                                     if (mis32 == 0) {
-                                        #pragma unroll
-                                        for (int q = 0; q < 2; q++) {
+                                        {
                                             {
-                                                unsigned _stv8_0_0 = __float_as_uint(out_vals[8 * q + 0]);
-                                                unsigned _stv8_0_1 = __float_as_uint(out_vals[8 * q + 1]);
-                                                unsigned _stv8_0_2 = __float_as_uint(out_vals[8 * q + 2]);
-                                                unsigned _stv8_0_3 = __float_as_uint(out_vals[8 * q + 3]);
-                                                unsigned _stv8_0_4 = __float_as_uint(out_vals[8 * q + 4]);
-                                                unsigned _stv8_0_5 = __float_as_uint(out_vals[8 * q + 5]);
-                                                unsigned _stv8_0_6 = __float_as_uint(out_vals[8 * q + 6]);
-                                                unsigned _stv8_0_7 = __float_as_uint(out_vals[8 * q + 7]);
+                                                __nv_bfloat162 _pk0 = __floats2bfloat162_rn(out_vals[0 + 0], out_vals[0 + 1]);
+                                                unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
+                                                __nv_bfloat162 _pk1 = __floats2bfloat162_rn(out_vals[0 + 2], out_vals[0 + 3]);
+                                                unsigned _pk_u1 = *reinterpret_cast<unsigned*>(&_pk1);
+                                                __nv_bfloat162 _pk2 = __floats2bfloat162_rn(out_vals[0 + 4], out_vals[0 + 5]);
+                                                unsigned _pk_u2 = *reinterpret_cast<unsigned*>(&_pk2);
+                                                __nv_bfloat162 _pk3 = __floats2bfloat162_rn(out_vals[0 + 6], out_vals[0 + 7]);
+                                                unsigned _pk_u3 = *reinterpret_cast<unsigned*>(&_pk3);
+                                                __nv_bfloat162 _pk4 = __floats2bfloat162_rn(out_vals[0 + 8], out_vals[0 + 9]);
+                                                unsigned _pk_u4 = *reinterpret_cast<unsigned*>(&_pk4);
+                                                __nv_bfloat162 _pk5 = __floats2bfloat162_rn(out_vals[0 + 10], out_vals[0 + 11]);
+                                                unsigned _pk_u5 = *reinterpret_cast<unsigned*>(&_pk5);
+                                                __nv_bfloat162 _pk6 = __floats2bfloat162_rn(out_vals[0 + 12], out_vals[0 + 13]);
+                                                unsigned _pk_u6 = *reinterpret_cast<unsigned*>(&_pk6);
+                                                __nv_bfloat162 _pk7 = __floats2bfloat162_rn(out_vals[0 + 14], out_vals[0 + 15]);
+                                                unsigned _pk_u7 = *reinterpret_cast<unsigned*>(&_pk7);
                                                 asm volatile(
-                                                    "st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                    :: "l"((void*)(out32 + (row_base + (unsigned long long)(col + 8 * q)) + (0))), "r"(_stv8_0_0), "r"(_stv8_0_1), "r"(_stv8_0_2), "r"(_stv8_0_3), "r"(_stv8_0_4), "r"(_stv8_0_5), "r"(_stv8_0_6), "r"(_stv8_0_7) : "memory");
+                                                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                                    :: "l"((void*)(&((__nv_bfloat16*)(out + (row_base + (unsigned long long)col)))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
                                             }
                                         }
                                     } else {
-                                        #pragma unroll
-                                        for (int q_1 = 0; q_1 < 4; q_1++) {
-                                            {
-                                                float4 _v4 = make_float4(out_vals[4 * q_1 + 0], out_vals[4 * q_1 + 1], out_vals[4 * q_1 + 2], out_vals[4 * q_1 + 3]);
-                                                *reinterpret_cast<float4*>((out32 + (row_base + (unsigned long long)(col + 4 * q_1))) + 0) = _v4;
-                                            }
+                                        {
+                                            __nv_bfloat162 _pk[4];
+                                            _pk[0] = __floats2bfloat162_rn(out_vals[0 + 0], out_vals[0 + 1]);
+                                            _pk[1] = __floats2bfloat162_rn(out_vals[0 + 2], out_vals[0 + 3]);
+                                            _pk[2] = __floats2bfloat162_rn(out_vals[0 + 4], out_vals[0 + 5]);
+                                            _pk[3] = __floats2bfloat162_rn(out_vals[0 + 6], out_vals[0 + 7]);
+                                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (row_base + (unsigned long long)col)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                        }
+                                        {
+                                            __nv_bfloat162 _pk[4];
+                                            _pk[0] = __floats2bfloat162_rn(out_vals[8 + 0], out_vals[8 + 1]);
+                                            _pk[1] = __floats2bfloat162_rn(out_vals[8 + 2], out_vals[8 + 3]);
+                                            _pk[2] = __floats2bfloat162_rn(out_vals[8 + 4], out_vals[8 + 5]);
+                                            _pk[3] = __floats2bfloat162_rn(out_vals[8 + 6], out_vals[8 + 7]);
+                                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (row_base + (unsigned long long)(col + 8))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                                         }
                                     }
                                 } else if (off_n_1 + col0 + col + 8 <= N) {
-                                    if (mis32 == 0) {
-                                        {
-                                            unsigned _stv8_1_0 = __float_as_uint(out_vals[0 + 0]);
-                                            unsigned _stv8_1_1 = __float_as_uint(out_vals[0 + 1]);
-                                            unsigned _stv8_1_2 = __float_as_uint(out_vals[0 + 2]);
-                                            unsigned _stv8_1_3 = __float_as_uint(out_vals[0 + 3]);
-                                            unsigned _stv8_1_4 = __float_as_uint(out_vals[0 + 4]);
-                                            unsigned _stv8_1_5 = __float_as_uint(out_vals[0 + 5]);
-                                            unsigned _stv8_1_6 = __float_as_uint(out_vals[0 + 6]);
-                                            unsigned _stv8_1_7 = __float_as_uint(out_vals[0 + 7]);
-                                            asm volatile(
-                                                "st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                :: "l"((void*)(out32 + (row_base + (unsigned long long)col) + (0))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                                        }
-                                    } else {
-                                        #pragma unroll
-                                        for (int q_2 = 0; q_2 < 2; q_2++) {
-                                            {
-                                                float4 _v4 = make_float4(out_vals[4 * q_2 + 0], out_vals[4 * q_2 + 1], out_vals[4 * q_2 + 2], out_vals[4 * q_2 + 3]);
-                                                *reinterpret_cast<float4*>((out32 + (row_base + (unsigned long long)(col + 4 * q_2))) + 0) = _v4;
-                                            }
-                                        }
+                                    {
+                                        __nv_bfloat162 _pk[4];
+                                        _pk[0] = __floats2bfloat162_rn(out_vals[0 + 0], out_vals[0 + 1]);
+                                        _pk[1] = __floats2bfloat162_rn(out_vals[0 + 2], out_vals[0 + 3]);
+                                        _pk[2] = __floats2bfloat162_rn(out_vals[0 + 4], out_vals[0 + 5]);
+                                        _pk[3] = __floats2bfloat162_rn(out_vals[0 + 6], out_vals[0 + 7]);
+                                        *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (row_base + (unsigned long long)col)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                                     }
                                 }
                             }
@@ -708,22 +685,21 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                             for (int g = 0; g < 8; g++) {
                                 if (nvalid > g * 16) {
                                     #pragma unroll
-                                    for (int q_3 = 0; q_3 < 4; q_3++) {
+                                    for (int q = 0; q < 4; q++) {
                                         {
-                                            float4 _v4 = make_float4(_tmem_load_0[(g * 4 + q_3) * 4 + 0], _tmem_load_0[(g * 4 + q_3) * 4 + 1], _tmem_load_0[(g * 4 + q_3) * 4 + 2], _tmem_load_0[(g * 4 + q_3) * 4 + 3]);
-                                            *reinterpret_cast<float4*>((ws + (off_0 + (unsigned long long)((g * 4 + q_3) * 128))) + 0) = _v4;
+                                            float4 _v4 = make_float4(_tmem_load_0[(g * 4 + q) * 4 + 0], _tmem_load_0[(g * 4 + q) * 4 + 1], _tmem_load_0[(g * 4 + q) * 4 + 2], _tmem_load_0[(g * 4 + q) * 4 + 3]);
+                                            *reinterpret_cast<float4*>((ws + (off_0 + (unsigned long long)((g * 4 + q) * 128))) + 0) = _v4;
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    if (part_4 != 0) {
+                    if (part_0 != 0) {
                         __syncwarp();
-                        int cidx = tail_t_2 * 16 + cta_rank * 8 + (warp - 2);
-                        int u_first = tail_t_2 * k_iters / iters_per_unit;
-                        int u_last = ((tail_t_2 + 1) * k_iters - 1) / iters_per_unit;
-                        int nparts = u_last - u_first + 1;
+                        int cidx = tail_x_2 * 16 + cta_rank * 8 + (warp - 2);
+                        int u_first = tail_x_2 * sk_iters;
+                        int nparts = sk_iters;
                         unsigned int inc = ((lane == 0) ? 1 : 0);
                         int aidx = cidx;
                         aidx = ((lane == 0) ? cidx : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
@@ -740,7 +716,7 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                             #pragma unroll 1
                             for (int sidx = 0; sidx < nparts; sidx++) {
                                 int slice_id_1 = cta_rank * 8 + (warp - 2);
-                                unsigned long long off_1 = (unsigned long long)((u_first + sidx + tail_t_2) * 16 + slice_id_1) * 4096 + (unsigned long long)((col0 - slice_col0) * 32 + lane * 4);
+                                unsigned long long off_1 = (unsigned long long)((u_first + sidx + tail_x_2) * 16 + slice_id_1) * 4096 + (unsigned long long)((col0 - slice_col0) * 32 + lane * 4);
                                 unsigned long long off_0_1 = off_1;
                                 if (nvalid_1 >= 128) {
                                     #pragma unroll
@@ -763,10 +739,10 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                                     for (int g_1 = 0; g_1 < 8; g_1++) {
                                         if (nvalid_1 > g_1 * 16) {
                                             #pragma unroll
-                                            for (int q_4 = 0; q_4 < 4; q_4++) {
+                                            for (int q_1 = 0; q_1 < 4; q_1++) {
                                                 float _vec_load_1[4];
                                                 {
-                                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (off_0_1 + (unsigned long long)((g_1 * 4 + q_4) * 128)) + 0);
+                                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (off_0_1 + (unsigned long long)((g_1 * 4 + q_1) * 128)) + 0);
                                                     _vec_load_1[0 + 0] = _v4.x;
                                                     _vec_load_1[0 + 1] = _v4.y;
                                                     _vec_load_1[0 + 2] = _v4.z;
@@ -774,7 +750,7 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                                                 }
                                                 #pragma unroll
                                                 for (int i_1 = 0; i_1 < 4; i_1++) {
-                                                    _tmem_load_0[(g_1 * 4 + q_4) * 4 + i_1] = _tmem_load_0[(g_1 * 4 + q_4) * 4 + i_1] + _vec_load_1[i_1];
+                                                    _tmem_load_0[(g_1 * 4 + q_1) * 4 + i_1] = _tmem_load_0[(g_1 * 4 + q_1) * 4 + i_1] + _vec_load_1[i_1];
                                                 }
                                             }
                                         }
@@ -783,7 +759,7 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                             }
                             unsigned long long row_base_1 = (unsigned long long)bidx * (unsigned long long)out_l + (unsigned long long)global_row * (unsigned long long)ldo + (unsigned long long)(off_n_1 + col0);
                             if (global_row < M) {
-                                int mis32_1 = (int)((unsigned long long)(out32 + row_base_1) & 31);
+                                int mis32_1 = (int)((unsigned long long)(out + row_base_1) & 31);
                                 #pragma unroll
                                 for (int n_chunk_1 = 0; n_chunk_1 < 8; n_chunk_1++) {
                                     int col_1 = n_chunk_1 * 16;
@@ -794,54 +770,55 @@ kernel_cake_dense_projection_gemm_b5a2f6245e2d3a777333(const __grid_constant__ C
                                     }
                                     if (off_n_1 + col0 + col_1 + 16 <= N) {
                                         if (mis32_1 == 0) {
-                                            #pragma unroll
-                                            for (int q_5 = 0; q_5 < 2; q_5++) {
+                                            {
                                                 {
-                                                    unsigned _stv8_4_0 = __float_as_uint(out_vals_1[8 * q_5 + 0]);
-                                                    unsigned _stv8_4_1 = __float_as_uint(out_vals_1[8 * q_5 + 1]);
-                                                    unsigned _stv8_4_2 = __float_as_uint(out_vals_1[8 * q_5 + 2]);
-                                                    unsigned _stv8_4_3 = __float_as_uint(out_vals_1[8 * q_5 + 3]);
-                                                    unsigned _stv8_4_4 = __float_as_uint(out_vals_1[8 * q_5 + 4]);
-                                                    unsigned _stv8_4_5 = __float_as_uint(out_vals_1[8 * q_5 + 5]);
-                                                    unsigned _stv8_4_6 = __float_as_uint(out_vals_1[8 * q_5 + 6]);
-                                                    unsigned _stv8_4_7 = __float_as_uint(out_vals_1[8 * q_5 + 7]);
+                                                    __nv_bfloat162 _pk0 = __floats2bfloat162_rn(out_vals_1[0 + 0], out_vals_1[0 + 1]);
+                                                    unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
+                                                    __nv_bfloat162 _pk1 = __floats2bfloat162_rn(out_vals_1[0 + 2], out_vals_1[0 + 3]);
+                                                    unsigned _pk_u1 = *reinterpret_cast<unsigned*>(&_pk1);
+                                                    __nv_bfloat162 _pk2 = __floats2bfloat162_rn(out_vals_1[0 + 4], out_vals_1[0 + 5]);
+                                                    unsigned _pk_u2 = *reinterpret_cast<unsigned*>(&_pk2);
+                                                    __nv_bfloat162 _pk3 = __floats2bfloat162_rn(out_vals_1[0 + 6], out_vals_1[0 + 7]);
+                                                    unsigned _pk_u3 = *reinterpret_cast<unsigned*>(&_pk3);
+                                                    __nv_bfloat162 _pk4 = __floats2bfloat162_rn(out_vals_1[0 + 8], out_vals_1[0 + 9]);
+                                                    unsigned _pk_u4 = *reinterpret_cast<unsigned*>(&_pk4);
+                                                    __nv_bfloat162 _pk5 = __floats2bfloat162_rn(out_vals_1[0 + 10], out_vals_1[0 + 11]);
+                                                    unsigned _pk_u5 = *reinterpret_cast<unsigned*>(&_pk5);
+                                                    __nv_bfloat162 _pk6 = __floats2bfloat162_rn(out_vals_1[0 + 12], out_vals_1[0 + 13]);
+                                                    unsigned _pk_u6 = *reinterpret_cast<unsigned*>(&_pk6);
+                                                    __nv_bfloat162 _pk7 = __floats2bfloat162_rn(out_vals_1[0 + 14], out_vals_1[0 + 15]);
+                                                    unsigned _pk_u7 = *reinterpret_cast<unsigned*>(&_pk7);
                                                     asm volatile(
-                                                        "st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                        :: "l"((void*)(out32 + (row_base_1 + (unsigned long long)(col_1 + 8 * q_5)) + (0))), "r"(_stv8_4_0), "r"(_stv8_4_1), "r"(_stv8_4_2), "r"(_stv8_4_3), "r"(_stv8_4_4), "r"(_stv8_4_5), "r"(_stv8_4_6), "r"(_stv8_4_7) : "memory");
+                                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                                        :: "l"((void*)(&((__nv_bfloat16*)(out + (row_base_1 + (unsigned long long)col_1)))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
                                                 }
                                             }
                                         } else {
-                                            #pragma unroll
-                                            for (int q_6 = 0; q_6 < 4; q_6++) {
-                                                {
-                                                    float4 _v4 = make_float4(out_vals_1[4 * q_6 + 0], out_vals_1[4 * q_6 + 1], out_vals_1[4 * q_6 + 2], out_vals_1[4 * q_6 + 3]);
-                                                    *reinterpret_cast<float4*>((out32 + (row_base_1 + (unsigned long long)(col_1 + 4 * q_6))) + 0) = _v4;
-                                                }
+                                            {
+                                                __nv_bfloat162 _pk[4];
+                                                _pk[0] = __floats2bfloat162_rn(out_vals_1[0 + 0], out_vals_1[0 + 1]);
+                                                _pk[1] = __floats2bfloat162_rn(out_vals_1[0 + 2], out_vals_1[0 + 3]);
+                                                _pk[2] = __floats2bfloat162_rn(out_vals_1[0 + 4], out_vals_1[0 + 5]);
+                                                _pk[3] = __floats2bfloat162_rn(out_vals_1[0 + 6], out_vals_1[0 + 7]);
+                                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (row_base_1 + (unsigned long long)col_1)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                            }
+                                            {
+                                                __nv_bfloat162 _pk[4];
+                                                _pk[0] = __floats2bfloat162_rn(out_vals_1[8 + 0], out_vals_1[8 + 1]);
+                                                _pk[1] = __floats2bfloat162_rn(out_vals_1[8 + 2], out_vals_1[8 + 3]);
+                                                _pk[2] = __floats2bfloat162_rn(out_vals_1[8 + 4], out_vals_1[8 + 5]);
+                                                _pk[3] = __floats2bfloat162_rn(out_vals_1[8 + 6], out_vals_1[8 + 7]);
+                                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (row_base_1 + (unsigned long long)(col_1 + 8))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                                             }
                                         }
                                     } else if (off_n_1 + col0 + col_1 + 8 <= N) {
-                                        if (mis32_1 == 0) {
-                                            {
-                                                unsigned _stv8_5_0 = __float_as_uint(out_vals_1[0 + 0]);
-                                                unsigned _stv8_5_1 = __float_as_uint(out_vals_1[0 + 1]);
-                                                unsigned _stv8_5_2 = __float_as_uint(out_vals_1[0 + 2]);
-                                                unsigned _stv8_5_3 = __float_as_uint(out_vals_1[0 + 3]);
-                                                unsigned _stv8_5_4 = __float_as_uint(out_vals_1[0 + 4]);
-                                                unsigned _stv8_5_5 = __float_as_uint(out_vals_1[0 + 5]);
-                                                unsigned _stv8_5_6 = __float_as_uint(out_vals_1[0 + 6]);
-                                                unsigned _stv8_5_7 = __float_as_uint(out_vals_1[0 + 7]);
-                                                asm volatile(
-                                                    "st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                    :: "l"((void*)(out32 + (row_base_1 + (unsigned long long)col_1) + (0))), "r"(_stv8_5_0), "r"(_stv8_5_1), "r"(_stv8_5_2), "r"(_stv8_5_3), "r"(_stv8_5_4), "r"(_stv8_5_5), "r"(_stv8_5_6), "r"(_stv8_5_7) : "memory");
-                                            }
-                                        } else {
-                                            #pragma unroll
-                                            for (int q_7 = 0; q_7 < 2; q_7++) {
-                                                {
-                                                    float4 _v4 = make_float4(out_vals_1[4 * q_7 + 0], out_vals_1[4 * q_7 + 1], out_vals_1[4 * q_7 + 2], out_vals_1[4 * q_7 + 3]);
-                                                    *reinterpret_cast<float4*>((out32 + (row_base_1 + (unsigned long long)(col_1 + 4 * q_7))) + 0) = _v4;
-                                                }
-                                            }
+                                        {
+                                            __nv_bfloat162 _pk[4];
+                                            _pk[0] = __floats2bfloat162_rn(out_vals_1[0 + 0], out_vals_1[0 + 1]);
+                                            _pk[1] = __floats2bfloat162_rn(out_vals_1[0 + 2], out_vals_1[0 + 3]);
+                                            _pk[2] = __floats2bfloat162_rn(out_vals_1[0 + 4], out_vals_1[0 + 5]);
+                                            _pk[3] = __floats2bfloat162_rn(out_vals_1[0 + 6], out_vals_1[0 + 7]);
+                                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out + (row_base_1 + (unsigned long long)col_1)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                                         }
                                     }
                                 }
