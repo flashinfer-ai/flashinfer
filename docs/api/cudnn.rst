@@ -22,7 +22,9 @@ it to the frontend's ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` before its first
 ``import cudnn``; cudnn-frontend 1.30.0+). With the engines on, the decode
 wrapper's ``backend="auto"`` resolves to ``cudnn`` on SM100 for the d128 decode
 shapes where the decode tile measures at or ahead of fa2; ``FLASHINFER_DECODE_AUTO_CUDNN``
-overrides that choice.
+overrides that choice. Under CUDA graphs ``auto`` takes cuDNN only with a caller-owned
+``block_tables`` (the auto-built table cannot grow once captured), and the resolution
+is frozen after the first plan.
 
 Compatible decode runs and replans retain the prepared cuDNN graph. Planning
 still stages changing KV lengths and, unless the caller supplies a dense GPU
