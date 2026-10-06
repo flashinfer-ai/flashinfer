@@ -91,8 +91,8 @@ constexpr int64_t kFlagCoarsePush = 256;  // host-side build selection (pushed-c
                                           // the default build); never forwarded to the kernel
 constexpr int64_t kFlagLocalSelect = 1024;  // host-side build selection (CTA-local select form of
                                             // a leader-push sample build); never forwarded
-constexpr int64_t kFlagIntTail = 2048;  // host-side build selection (integer-tested whole-CTA
-                                        // tail); never forwarded to the kernel
+constexpr int64_t kFlagIntTail = 2048;      // host-side build selection (integer-tested whole-CTA
+                                            // tail); never forwarded to the kernel
 constexpr int32_t kTopKScalar = 1;
 constexpr int32_t kTopKPerRow = 2;
 constexpr int32_t kTopPScalar = 1;
@@ -151,8 +151,8 @@ struct Stage1Variant {
   int32_t local_select;  // 1: each CTA picks its filter bucket from its own sample and the leader
                          // push is the only cluster round (the leader-push sample builds' twin
                          // taken by launch_flags bit 10)
-  int32_t int_tail;  // 1: the whole-CTA tail's f64 target / sample tests run as the integer
-                     // emulation (the whole-CTA-tail build's twin taken by launch_flags bit 11)
+  int32_t int_tail;      // 1: the whole-CTA tail's f64 target / sample tests run as the integer
+                         // emulation (the whole-CTA-tail build's twin taken by launch_flags bit 11)
 };
 
 struct Stage23Variant {
@@ -163,23 +163,22 @@ struct Stage23Variant {
   int32_t smem_bytes;
 };
 
-#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused,  \
-                                   fused_block, wide, spec, slab, push, leader, local, \
-                                   itail)                                              \
-  {reinterpret_cast<const void*>(&symbol),                                             \
-   cluster,                                                                            \
-   ept,                                                                                \
-   stream,                                                                             \
-   threads,                                                                            \
-   smem,                                                                               \
-   fused,                                                                              \
-   fused_block,                                                                        \
-   wide,                                                                               \
-   spec,                                                                               \
-   slab,                                                                               \
-   push,                                                                               \
-   leader,                                                                             \
-   local,                                                                              \
+#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused,        \
+                                   fused_block, wide, spec, slab, push, leader, local, itail) \
+  {reinterpret_cast<const void*>(&symbol),                                                    \
+   cluster,                                                                                   \
+   ept,                                                                                       \
+   stream,                                                                                    \
+   threads,                                                                                   \
+   smem,                                                                                      \
+   fused,                                                                                     \
+   fused_block,                                                                               \
+   wide,                                                                                      \
+   spec,                                                                                      \
+   slab,                                                                                      \
+   push,                                                                                      \
+   leader,                                                                                    \
+   local,                                                                                     \
    itail},
 #define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, variant_flags, smem) \
   {reinterpret_cast<const void*>(&symbol), threads, items, variant_flags, smem},
@@ -441,8 +440,8 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   TVM_FFI_ICHECK(!(want_leader && (want_block_tail || want_slab || want_push)))
       << "launch_flags bit 9 (leader-push exchange) is exclusive with bits 3, 7 and 8";
   const int32_t want_local = (launch_flags & kFlagLocalSelect) != 0 ? 1 : 0;
-  TVM_FFI_ICHECK(!(want_local && !want_leader))
-      << "launch_flags bit 10 (CTA-local select) selects a leader-push build's twin: it needs bit 9";
+  TVM_FFI_ICHECK(!(want_local && !want_leader)) << "launch_flags bit 10 (CTA-local select) selects "
+                                                   "a leader-push build's twin: it needs bit 9";
   TVM_FFI_ICHECK(!(want_local && !(want_spec || want_coarse)))
       << "launch_flags bit 10 (CTA-local select) selects a sample build's twin: it needs bit 4 or "
          "bit 6";
@@ -454,10 +453,10 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
          "needs bit 3";
   TVM_FFI_ICHECK(!(want_itail && stream_variant == 0))
       << "the integer-tested tail build (launch_flags bit 11) exists for streaming variants only";
-  const Stage1Variant* v = FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
-                                      static_cast<int32_t>(stream_variant), want_block_tail,
-                                      want_coarse, want_spec, want_slab, want_push, want_leader,
-                                      want_local, want_itail);
+  const Stage1Variant* v =
+      FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
+                 static_cast<int32_t>(stream_variant), want_block_tail, want_coarse, want_spec,
+                 want_slab, want_push, want_leader, want_local, want_itail);
   TVM_FFI_ICHECK(v != nullptr)
       << "no frozen stage-1 variant for cluster=" << cluster << " ept=" << ept
       << " stream=" << stream_variant
