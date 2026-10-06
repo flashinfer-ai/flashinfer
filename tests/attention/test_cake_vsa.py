@@ -440,3 +440,159 @@ def test_cake_vsa_blk64_full_group_rows_use_weight_stationary_profile():
 
     for tensor, original in zip((q, k, v, q2k_indices, q2k_num), inputs, strict=True):
         assert torch.equal(tensor, original)
+
+
+def _balanced_blk64_case(device):
+    """A shared full-block selection over two persistent waves: the balanced profile's band.
+
+    28 of 32 blocks per row (full four-block groups, more than 24 on average), the
+    same selection in every head, and ``MB * heads >= 2 * SM count`` tiles.
+    """
+
+    block_size, heads, nb, selected = 64, 8, 32, 28
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    mb = -(-2 * sm_count // heads)
+    M, N = mb * block_size, nb * block_size
+    mask = torch.zeros((heads, mb, nb), dtype=torch.bool, device=device)
+    for row in range(mb):
+        mask[:, row, (torch.arange(selected, device=device) * 5 + row) % nb] = True
+    return block_size, heads, mb, nb, M, N, mask
+
+
+def _assert_blk64_queue_counters_reset(plan):
+    torch.cuda.synchronize()
+    assert plan["workspace"]["blk64_queue_counters"].tolist() == [0, 0, 0, 0]
+
+
+def test_cake_vsa_blk64_balanced_matches_weight_stationary_profile():
+    """The balanced profile reproduces the shipped WS profile and resets its queue."""
+
+    torch.manual_seed(20261006)
+    device = torch.device("cuda")
+    block_size, heads, mb, nb, M, N, mask = _balanced_blk64_case(device)
+    head_dim = 128
+    q = torch.randn((M, heads, head_dim), dtype=torch.bfloat16, device=device)
+    k = torch.randn((N, heads, head_dim), dtype=torch.bfloat16, device=device)
+    v = torch.randn((N, heads, head_dim), dtype=torch.bfloat16, device=device)
+
+    workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
+    wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
+    _plan(
+        wrapper,
+        M,
+        N,
+        block_size,
+        heads,
+        heads,
+        head_dim,
+        torch.bfloat16,
+        block_mask=mask,
+    )
+    plan = wrapper._cake_vsa_plan
+    assert plan is not None
+    assert plan["blk64_profile"] == "blk64_balanced"
+    assert plan["indptr"].numel() == mb + 1 and plan["indices"].numel() == mb * 28
+
+    output, lse = wrapper.run(q, k, v, return_lse=True)
+    _assert_blk64_queue_counters_reset(plan)
+
+    # The shipped weight-stationary profile on the same plan-time metadata.
+    ws_plan = dict(plan)
+    ws_plan["blk64_profile"] = "blk64_persistent_ws_m64n256"
+    ws_output = torch.empty_like(q)
+    ws_lse = torch.empty((M, heads), dtype=torch.float32, device=device)
+    cake_vsa._run_blk64(ws_plan, q, k, v, ws_output, ws_lse, True)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, ws_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, ws_lse, atol=1e-2, rtol=1e-2)
+
+    reference, reference_lse = _dense_reference(q, k, v, mask, block_size)
+    torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, reference_lse, atol=1e-2, rtol=1e-2)
+
+    # run() launches from plan-time metadata only, and the result is deterministic.
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        repeated_output, repeated_lse = wrapper.run(q, k, v, return_lse=True)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    _assert_blk64_queue_counters_reset(plan)
+    assert torch.equal(repeated_output, output)
+    assert torch.equal(repeated_lse, lse)
+
+
+def test_cake_vsa_blk64_balanced_graph_replay_matches_eager():
+    """Three CUDA-graph replays of the balanced launch equal the eager result."""
+
+    torch.manual_seed(20261007)
+    device = torch.device("cuda")
+    block_size, heads, mb, nb, M, N, mask = _balanced_blk64_case(device)
+    head_dim = 128
+    q = torch.randn((M, heads, head_dim), dtype=torch.bfloat16, device=device)
+    k = torch.randn((N, heads, head_dim), dtype=torch.bfloat16, device=device)
+    v = torch.randn((N, heads, head_dim), dtype=torch.bfloat16, device=device)
+    plan = cake_vsa.plan_cake_vsa(
+        None,
+        None,
+        mask,
+        None,
+        None,
+        None,
+        M=M,
+        N=N,
+        R=block_size,
+        C=block_size,
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        q_data_type=torch.bfloat16,
+        sm_scale=None,
+        device=device,
+    )
+    assert plan["blk64_profile"] == "blk64_balanced"
+
+    eager_output = torch.empty_like(q)
+    eager_lse = torch.empty((M, heads), dtype=torch.float32, device=device)
+    cake_vsa.run_cake_vsa(
+        plan, q, k, v, out=eager_output, lse=eager_lse, return_lse=True, backend="cake"
+    )
+    _assert_blk64_queue_counters_reset(plan)
+
+    graph_output = torch.empty_like(q)
+    graph_lse = torch.empty((M, heads), dtype=torch.float32, device=device)
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        cake_vsa.run_cake_vsa(
+            plan,
+            q,
+            k,
+            v,
+            out=graph_output,
+            lse=graph_lse,
+            return_lse=True,
+            backend="cake",
+        )
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cake_vsa.run_cake_vsa(
+            plan,
+            q,
+            k,
+            v,
+            out=graph_output,
+            lse=graph_lse,
+            return_lse=True,
+            backend="cake",
+        )
+    _assert_blk64_queue_counters_reset(plan)
+
+    for _replay in range(3):
+        graph_output.zero_()
+        graph_lse.zero_()
+        graph.replay()
+        _assert_blk64_queue_counters_reset(plan)
+        assert torch.equal(graph_output, eager_output)
+        assert torch.equal(graph_lse, eager_lse)
