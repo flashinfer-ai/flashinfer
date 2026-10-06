@@ -539,7 +539,7 @@ device, and backend-specific option checks.
 | cuTile | Dense | Split | None | None | First plan/capture only |
 | TRTLLM-GEN | Dense | Packed | None, base 2 or natural log | None | First plan/capture only |
 | XQA | Dense | Packed | None | None | First plan/capture only |
-| CuTe DSL monolithic | Dense | Packed | None or base e | None | First plan/capture only |
+| CuTe DSL monolithic | Dense | Packed | None, base 2, or base e | None | First plan/capture only |
 | CuTe DSL modular | Dense | Packed | None | None | Rejected before planning |
 
 ### FA2 and FA3
