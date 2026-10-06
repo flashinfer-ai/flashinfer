@@ -706,7 +706,11 @@ def test_per_request_tensors_and_routes():
         (8, 262144, 50): (8, 16, True),  # +1.5 % vs best
         (16, 262144, 50): (4, 16, True),  # +2.8 % vs best
         (32, 262144, 50): (2, 32, True),
-        (64, 262144, 50): (1, 32, True),  # round-11 M4 one-wave cluster-1 re-pick (was (2, 32, True))
+        (64, 262144, 50): (
+            1,
+            32,
+            True,
+        ),  # round-11 M4 one-wave cluster-1 re-pick (was (2, 32, True))
         (128, 262144, 50): (1, 32, True),
     }.items():
         assert pick(pb, pv, sm_count=132, top_k_max=pk) == want, (pb, pv, pk, 132)
@@ -3032,7 +3036,6 @@ def test_one_wave_e16_repick_policy():
     ) == (8, 32, True)
 
 
-
 def test_one_wave_c1_repick_policy():
     """Round-11 M4 (H100, sm 132): a small-k one-wave cluster-2 ept-32 stream pick on a 16-chunk row yields to the
     cluster-1 ept-32 stream from the measured batch on; smaller batches, shorter rows, large k and the other wave
@@ -3040,7 +3043,9 @@ def test_one_wave_c1_repick_policy():
     assert cs._ONE_WAVE_C1_REPICK_MIN_BATCH_BY_SM_COUNT == {132: 64}
     assert cs._ONE_WAVE_C1_REPICK_MIN_CHUNKS == 16
     smem = 232448
-    pick = lambda b, v, k, two=False, sm=132: cs.choose_stage1(b, v, sm_count=sm, smem_limit=smem, top_k_max=k, two_launch=two)
+    pick = lambda b, v, k, two=False, sm=132: cs.choose_stage1(
+        b, v, sm_count=sm, smem_limit=smem, top_k_max=k, two_launch=two
+    )
     for k in (10, 50, 64, None):
         assert pick(64, 262144, k) == (1, 32, True), k
         assert pick(66, 262144, k) == (1, 32, True), k
@@ -3051,6 +3056,7 @@ def test_one_wave_c1_repick_policy():
     assert pick(64, 128256, 50) == (2, 16, True)
     assert pick(64, 262144, 1000, True) == (2, 16, True)
     assert pick(64, 262144, 10, sm=212) == (2, 32, True)
+
 
 def test_leader_push_build_matches_pull_build():
     """Round 9, lever L-P: every multi-CTA streaming variant ships the leader-push exchange form of its default, coarse-sample
@@ -3464,7 +3470,10 @@ def test_local_select_build_matches_leader_push_build():
     assert cs._local_select_flag(8, 32, True, fused_sp, 64, None, 262144) == 0
     assert cs._local_select_flag(8, 32, True, fused_sp, 10, (12, 0)) == 0
     # round 11 (lever M4): R200 takes it up to k 20 on every leader-push sample cell (cliff into the fallback from k 24)
-    assert cs._local_select_flag(8, 16, True, fused_cs, 20, (10, 7)) == cs._FLAG_LOCAL_SELECT
+    assert (
+        cs._local_select_flag(8, 16, True, fused_cs, 20, (10, 7))
+        == cs._FLAG_LOCAL_SELECT
+    )
     assert cs._local_select_flag(8, 16, True, fused_cs, 21, (10, 7)) == 0
     assert cs._local_select_flag(8, 16, True, fused_cs, 11, (9, 0)) == 0
     # never without bit 9, without a sample bit, without bit 0, with the whole-CTA tail, or on a single CTA / resident
@@ -3543,6 +3552,26 @@ def test_local_select_build_matches_leader_push_build():
     )
     assert cs._leader_push_flag(8, 32, True, fused_sp, 2 * span, (10, 3), False) == 0
     assert cs._leader_push_flag(8, 32, True, fused_sp, 3 * span, (10, 3), True) == 0
+    # round 11 (lever M4-lb): the two-chunk speculative-sample row (V151936 on cluster-8 ept-32) at B <= 2, k <= 50
+    # reaches the leader push on 10.0 without the local select; larger batches / top-k, one-chunk rows, the coarse
+    # build and the other capabilities keep the chunk rule
+    sb_reach = cs._leader_push_small_batch_reach
+    for cap in ((10, 0), None):
+        assert sb_reach(8, 32, True, fused_sp, 50, 151936, 1, cap)
+        assert sb_reach(8, 32, True, fused_sp, 50, 151936, 2, cap)
+        assert not sb_reach(8, 32, True, fused_sp, 50, 151936, 4, cap)
+        assert not sb_reach(8, 32, True, fused_sp, 51, 151936, 1, cap)
+        assert not sb_reach(8, 32, True, fused_sp, 50, 128256, 1, cap)
+        assert not sb_reach(8, 32, True, fused_cs, 50, 151936, 1, cap)
+        assert (
+            cs._leader_push_flag(8, 32, True, fused_sp, 151936, cap, False, True)
+            == cs._FLAG_LEADER_PUSH
+        )
+    for cap in ((9, 0), (10, 3), (10, 7), (12, 0)):
+        assert not sb_reach(8, 32, True, fused_sp, 50, 151936, 1, cap)
+    assert (
+        cs._leader_push_flag(8, 32, True, fused_sp, 151936, (10, 0), False, False) == 0
+    )
     assert (
         cs._leader_push_flag(
             8, 32, True, cs._FLAG_FUSE_BLOCK_TAIL, 2 * span, (10, 3), True

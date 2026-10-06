@@ -530,6 +530,15 @@ _LEADER_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
 )
 _LEADER_PUSH_WIDE_EPT = 32
 _LEADER_PUSH_WIDE_MAX_CHUNKS = 1
+# Round 11 (lever M4-lb): on B200 the two-chunk speculative-sample row (`_sp` on cluster 8 ept 32: V151936) at a small
+# batch is faster with the leader push (plain `_sp_lp`, no local select) than with the served slab-tail pull `_sp_lb`
+# once both carry E1: k50 V151936 B1 0.976, B2 0.995 (6 perturbed processes each, bit-identical), B4 1.000, B8 1.011
+# -> (max batch, max top-k) per capability; rows above either bound and the coarse-sample build keep the slab form.
+_LEADER_PUSH_TWO_CHUNK_SMALL_BATCH_BY_CAPABILITY: dict[
+    tuple[int, int], tuple[int, int]
+] = {
+    (10, 0): (2, 50),
+}
 # Stage-1 launch_flags bit 10 (round 10, lever L1): the CTA-local select form of a leader-push sample build (`_cs_lp_l1` /
 # `_sp_lp_l1` twins).  Each CTA picks its filter bucket from its own sample (sampled mass >= k) instead of the cluster-wide
 # coarse histogram, so that DSM round disappears and the leader push is the only cluster round; the row's exact top-k lies
@@ -850,13 +859,15 @@ def _leader_push_flag(
     vocab: int,
     capability: Optional[tuple[int, int]] = None,
     local_select_reach: bool = False,
+    small_batch_reach: bool = False,
 ) -> int:
     """Stage-1 ``launch_flags`` bit 9 for a launch whose other bits are ``launch_flags``: the leader-push exchange form
     of the build the sample bits select, on a multi-CTA streaming variant that ships it, on the capabilities in
     ``_LEADER_PUSH_CAPABILITIES`` (``capability`` None: every capability), for any row on an ept-16 stream and for a
     row of at most ``_LEADER_PUSH_WIDE_MAX_CHUNKS`` register chunks per CTA on an ept-``_LEADER_PUSH_WIDE_EPT`` stream.
     Never with the whole-CTA tail (bit 3); the caller drops the slab tail (bit 7) and the pushed coarse sums (bit 8)
-    when this bit is taken."""
+    when this bit is taken.  ``local_select_reach`` (round 10) and ``small_batch_reach`` (round 11,
+    ``_leader_push_small_batch_reach``) extend it to a two-chunk ept-32 row."""
     if not stream or int(cluster) < 2 or (launch_flags & _FLAG_FUSE_BLOCK_TAIL) != 0:
         return 0
     if (
@@ -867,7 +878,8 @@ def _leader_push_flag(
     if int(ept) >= _LEADER_PUSH_WIDE_EPT:
         chunks = -(-int(vocab) // (_THREADS * int(ept) * int(cluster)))
         if chunks > _LEADER_PUSH_WIDE_MAX_CHUNKS and not (
-            local_select_reach and chunks <= _LOCAL_SELECT_WIDE_MAX_CHUNKS
+            (local_select_reach or small_batch_reach)
+            and chunks <= _LOCAL_SELECT_WIDE_MAX_CHUNKS
         ):
             return 0
     coarse = (launch_flags & _FLAG_COARSE_SAMPLE) != 0
@@ -898,6 +910,43 @@ def _stage1_has_local_select(
     if not found:
         raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
     return False
+
+
+def _leader_push_small_batch_reach(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    launch_flags: int,
+    top_k_max: Optional[int],
+    vocab: int,
+    batch: int,
+    capability: Optional[tuple[int, int]] = None,
+) -> bool:
+    """Whether a fused speculative-sample launch (``launch_flags`` carry bits 0 and 6) on a row of two register chunks
+    per CTA at a small batch reaches the leader push (round 11, lever M4-lb): an ept-``_LEADER_PUSH_WIDE_EPT`` stream
+    whose row takes more than ``_LEADER_PUSH_WIDE_MAX_CHUNKS`` and at most ``_LOCAL_SELECT_WIDE_MAX_CHUNKS`` chunks,
+    ``batch`` and ``top_k_max`` within the capability's bounds in ``_LEADER_PUSH_TWO_CHUNK_SMALL_BATCH_BY_CAPABILITY``
+    (``capability`` None: the loosest bounds of the table)."""
+    if not stream or top_k_max is None or int(ept) < _LEADER_PUSH_WIDE_EPT:
+        return False
+    if (launch_flags & _FLAG_FUSE_TAIL) == 0 or (launch_flags & _FLAG_SPEC_SAMPLE) == 0:
+        return False
+    if capability is None:
+        max_batch = max(
+            b for b, _ in _LEADER_PUSH_TWO_CHUNK_SMALL_BATCH_BY_CAPABILITY.values()
+        )
+        max_k = max(
+            k for _, k in _LEADER_PUSH_TWO_CHUNK_SMALL_BATCH_BY_CAPABILITY.values()
+        )
+    else:
+        cc = (int(capability[0]), int(capability[1]))
+        if cc not in _LEADER_PUSH_TWO_CHUNK_SMALL_BATCH_BY_CAPABILITY:
+            return False
+        max_batch, max_k = _LEADER_PUSH_TWO_CHUNK_SMALL_BATCH_BY_CAPABILITY[cc]
+    if int(batch) > max_batch or int(top_k_max) > max_k:
+        return False
+    chunks = -(-int(vocab) // (_THREADS * int(ept) * int(cluster)))
+    return _LEADER_PUSH_WIDE_MAX_CHUNKS < chunks <= _LOCAL_SELECT_WIDE_MAX_CHUNKS
 
 
 def _local_select_reach(
@@ -967,9 +1016,10 @@ def _local_select_flag(
     spec = (launch_flags & _FLAG_SPEC_SAMPLE) != 0
     if not (coarse or spec):
         return 0
-    one_chunk = vocab is not None and -(
-        -int(vocab) // (_THREADS * int(ept) * int(cluster))
-    ) == 1
+    one_chunk = (
+        vocab is not None
+        and -(-int(vocab) // (_THREADS * int(ept) * int(cluster))) == 1
+    )
     if capability is None:
         cap = max(_LOCAL_SELECT_MAX_K_BY_CAPABILITY.values())
         if one_chunk:
@@ -1218,10 +1268,15 @@ def _one_wave_c1_repick(
     """``best`` is the ranked streaming ``(cluster, ept)``; the cluster-1 ept-32 stream replaces a small-k cluster-2 ept-32
     pick on long rows from the measured batch on when both grids run in one wave (see
     ``_ONE_WAVE_C1_REPICK_MIN_BATCH_BY_SM_COUNT``)."""
-    min_batch = _ONE_WAVE_C1_REPICK_MIN_BATCH_BY_SM_COUNT.get(_nearest_table(int(sm_count)))
+    min_batch = _ONE_WAVE_C1_REPICK_MIN_BATCH_BY_SM_COUNT.get(
+        _nearest_table(int(sm_count))
+    )
     if min_batch is None or large_k or best != (2, 32) or int(batch) < min_batch:
         return best
-    if -(-int(vocab) // (_THREADS * 32)) < _ONE_WAVE_C1_REPICK_MIN_CHUNKS or (1, 32) not in streaming:
+    if (
+        -(-int(vocab) // (_THREADS * 32)) < _ONE_WAVE_C1_REPICK_MIN_CHUNKS
+        or (1, 32) not in streaming
+    ):
         return best
     wave_ctas = _wave_ctas(int(sm_count))
     if -(-(batch * 2) // wave_ctas[2]) != 1 or -(-batch // wave_ctas[1]) != 1:
@@ -1396,7 +1451,9 @@ def _choose_stage1_resolved(
         if resident_cost <= stream_cost(best):
             return resident[0], resident[1], False
     best = _one_wave_e16_repick(batch, best, streaming, int(sm_count), large_k > 0.0)
-    best = _one_wave_c1_repick(batch, vocab, best, streaming, int(sm_count), large_k > 0.0)
+    best = _one_wave_c1_repick(
+        batch, vocab, best, streaming, int(sm_count), large_k > 0.0
+    )
     return best[0], best[1], True
 
 
@@ -1468,6 +1525,9 @@ def _launch_plan(
             vocab,
             capability,
             _local_select_reach(
+                cluster, ept, stream, launch_flags, top_k_max, vocab, batch, capability
+            ),
+            _leader_push_small_batch_reach(
                 cluster, ept, stream, launch_flags, top_k_max, vocab, batch, capability
             ),
         )
