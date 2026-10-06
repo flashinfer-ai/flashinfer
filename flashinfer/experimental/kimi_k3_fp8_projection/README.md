@@ -84,8 +84,8 @@ activation bit-exact vs the DeepGEMM recipe; see
 `tests/experimental/test_cake_kimi_k3_fp8_projection.py`.
 
 Benchmark: `python benchmarks/bench_cake_kimi_k3_fp8_projection.py [--cupti]`
-times the 132 representative rows (22 families x `M in {1, 8, 64, 256, 4096,
-16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
+times the 198 representative rows (22 families x `M in {1, 8, 64, 256, 512,
+1024, 2048, 4096, 16384}`) as CUDA-graph replays with a cold L2 against FlashInfer's existing
 `per_token_group_quant_8bit` + `gemm_fp8_nt_groupwise` chains (`cutlass` sm1 /
 sm2, `trtllm`, `cutile`) on the same weight.
 

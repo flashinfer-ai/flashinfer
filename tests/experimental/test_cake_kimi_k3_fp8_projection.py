@@ -62,6 +62,11 @@ from flashinfer.gemm import (
 ATOL = 1e-2
 RTOL = 1e-2
 SM_COUNT = 148
+# Measured SM counts of the dispatch tables (round 7, CAKE-985): B200 148, GB300 152 (JHB nodes).
+SM_COUNTS = {"sm_100a": 148, "sm_103a": 152}
+# Round-6 sm_103a cell whose ordered stream-K window (planned at 148 SMs) never opens at the measured 152: plain GEMM
+# in production (the sealed export measured it so); pruning it is a table-hygiene follow-up.
+STREAM_K_CLOSED_CELLS = {"sm_103a": {"56,48,4096"}}
 
 # Representative rows (tp, module, M): every route of the dispatch (fused decode incl.
 # resident token tiles, quantization launch + decode, quantization launch + GEMM) and
@@ -292,18 +297,12 @@ def test_decode_table_covers_every_family(arch):
             for bucket in DECODE_TABLE_BUCKETS:
                 entry = cb.decode_table_entry(bucket, n_tiles128, num_k_iters, arch)
                 if bucket > DECODE_MAX_M:
-                    # Large buckets list only the families measured faster on the decode kernel, plus (round 6,
-                    # lever L5) the GEMM-routed rows that pin the 192-wide N tile and (round 6 continuation 12,
-                    # lever SKO) the GEMM-routed rows that take the ordered stream-K tail.
-                    assert (
-                        entry is None
-                        or entry["route"] == "decode"
-                        or (
-                            entry["route"] == "gemm"
-                            and (
-                                entry.get("gemm_bn") == 192 or entry.get("gemm_sk") == 1
-                            )
-                        )
+                    # Large buckets hold the families measured faster on the decode kernel, the GEMM-routed rows whose
+                    # cell pins an instance lever (round 6: the 192-wide N tile, the ordered / fix-up stream-K forms;
+                    # round 7: the weight prefetch distance and the sliced stream-K form) and, since round 7, explicit
+                    # plain-GEMM cells (every measured M <= 2048 cell is tabulated; an absent cell is plain GEMM too).
+                    assert entry is None or entry["route"] in ("decode", "gemm"), (
+                        f"{arch} {tp}:{name} bucket {bucket}: {entry}"
                     )
                     continue
                 assert entry is not None, f"{arch} {tp}:{name} bucket {bucket}"
@@ -312,8 +311,13 @@ def test_decode_table_covers_every_family(arch):
 
 @pytest.mark.parametrize("arch", ARCHES)
 def test_decode_config_rules(arch):
-    # Above DECODE_MAX_M only tabulated (narrow-N) families take the decode route; the table decides below.
-    assert decode_config(257, 12, 28, arch, SM_COUNT) is None
+    # Above DECODE_MAX_M the table decides: a tabulated bucket cell routes its whole bucket (round 7: M = 257 follows
+    # the 512 cell of the 12-tile K = 7168 family), an absent cell is plain GEMM; the narrow-N families stay decode.
+    cell_512 = cb.decode_table_entry(512, 12, 28, arch)
+    assert cell_512 is not None
+    assert (decode_config(257, 12, 28, arch, SM_COUNT) is not None) == (
+        cell_512["route"] == "decode"
+    )
     assert decode_config(4096, 12, 28, arch, SM_COUNT) is None
     assert decode_config(4096, 1, 28, arch, SM_COUNT) is not None
     for key, entry in decode_table(arch).items():
@@ -358,7 +362,7 @@ def test_decode_config_rules(arch):
                 1,
                 min(
                     expected_grid // cfg.csplit,
-                    cb.decode_cluster_capacity(cfg.csplit),
+                    cb.decode_cluster_capacity(arch, cfg.csplit),
                 ),
             )
         if cfg.mc > 1:
@@ -367,7 +371,7 @@ def test_decode_config_rules(arch):
                 min(
                     expected_grid,
                     SM_COUNT // cfg.mc,
-                    cb.decode_cluster_capacity(cfg.mc),
+                    cb.decode_cluster_capacity(arch, cfg.mc),
                 ),
             )
         assert cfg.grid == expected_grid
@@ -468,7 +472,7 @@ def test_decode_config_round6_rules(arch):
     cfg = decode_config(256, 50, 28, arch, SM_COUNT)
     assert (cfg.tok, cfg.split, cfg.csplit, cfg.mc, cfg.pf) == (128, 1, 1, 2, 3)
     assert cfg.m_tiles == 2 and cfg.tiles == 100 and cfg.total_work == 50
-    assert cfg.grid == 2 * min(50, SM_COUNT // 2, cb.decode_cluster_capacity(2))
+    assert cfg.grid == 2 * min(50, SM_COUNT // 2, cb.decode_cluster_capacity(arch, 2))
     assert cfg.kernel_key == "decode:t128_p3_mc2_pf3"
     # Bucket edge: an M whose m-tile count does not fill whole clusters (65..128 rows -> one 128-token tile) falls back
     # to the plain instance -- multicast off and no prefetch (the fallback is not a tabulated route).
@@ -567,7 +571,7 @@ def test_decode_config_round6_continuation_rules(arch):
             n_tiles,
             cfg,
         )
-        assert clusters <= cb.decode_cluster_capacity(c)
+        assert clusters <= cb.decode_cluster_capacity(arch, c)
         assert cfg.grid == c * clusters and cfg.total_work == cfg.grid
         assert f"_cs{c}" in cfg.kernel_key and not cfg.tstore
         # the small-inbox exchange of a 7..16-wide cluster gives up one t16 stage (2C - 1 inbox lines next to the ring)
@@ -576,7 +580,10 @@ def test_decode_config_round6_continuation_rules(arch):
         assert cfg.kernel_key == f"decode:t16_p{cfg.module_stages}_fused_cs{c}" + (
             f"_px{cfg.pfx}" if cfg.pfx else ""
         )
-    assert cb.decode_cluster_capacity(14) == 7 and cb.decode_cluster_capacity(9) == 15
+    assert (
+        cb.decode_cluster_capacity(arch, 14) == 7
+        and cb.decode_cluster_capacity(arch, 9) == 15
+    )
     # The plan carries both programs of every tstore row (the register program is the fallback of unaligned views).
     required = set(cb.required_kernel_keys(arch, SM_COUNT))
     assert {
@@ -595,10 +602,15 @@ def test_decode_config_round6_continuation_rules(arch):
     # tiles stream and multiply no padded columns (1.04-1.09x on both GPUs, bit-exact with the 256-wide output); the
     # fused_qkv_a family (N = 2112) measured slower with it and stays 256-wide, as does every untabulated shape.
     narrow = {k: e for k, e in decode_table(arch).items() if "gemm_bn" in e}
-    assert sorted(narrow) == ["5,28,16384", "5,28,4096"]
+    # round 7 (CAKE-985) adds measured 192-wide cells on the 512 / 1024 / 2048 buckets; the round-6 kv_a cells stay
+    assert {"5,28,16384", "5,28,4096"} <= set(narrow)
     assert all(e["route"] == "gemm" and e["gemm_bn"] == 192 for e in narrow.values())
-    for M in (257, 4096, 4097, 16384):
+    for M in (4096, 4097, 16384):
         assert cb.gemm_block_n(M, 5, 28, arch, 576, 768) == 192
+    # round 7: M = 257 follows the kv_a 512 cell (the decode route, so the GEMM tile width is the default)
+    cell_512 = cb.decode_table_entry(512, 5, 28, arch)
+    assert cell_512 is not None and cell_512["route"] == "decode"
+    assert cb.gemm_block_n(257, 5, 28, arch, 576, 768) == 256
     assert cb.gemm_block_n(256, 5, 28, arch, 576, 768) == 256  # tabulated decode row
     assert (
         cb.gemm_block_n(4096, 17, 28, arch, 2112, 2304) == 256
@@ -611,8 +623,10 @@ def test_decode_config_round6_continuation_rules(arch):
     # launch has one full wave of CTA pairs plus at most half a wave of tail tiles: the head pair of each tail tile runs
     # the first K half and hands its FP32 partial to the tail pair, which continues the same accumulation (bit-exact).
     sk_rows = {k: e for k, e in decode_table(arch).items() if "gemm_sk" in e}
-    assert sorted(sk_rows) == ["12,28,4096", "56,48,4096"]
+    # round 7 (CAKE-985) adds measured stream-K cells on the 512 / 1024 / 2048 buckets; every cell's window opens at its bucket
+    assert {"12,28,4096", "56,48,4096"} <= set(sk_rows)
     assert all(e["route"] == "gemm" and e["gemm_sk"] == 1 for e in sk_rows.values())
+    sm_count = SM_COUNTS[arch]
     for key in sk_rows:
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
         plan = cb.gemm_stream_k_plan(
@@ -620,13 +634,16 @@ def test_decode_config_round6_continuation_rules(arch):
             n_tiles128,
             num_k_iters,
             arch,
-            SM_COUNT,
+            sm_count,
             cb._m_tiles(bucket),
             n_tiles128 // 2,
         )
+        if key in STREAM_K_CLOSED_CELLS.get(arch, ()):
+            assert plan is None
+            continue
         assert (
             plan is not None
-            and plan.pairs == SM_COUNT // 2
+            and plan.pairs == sm_count // 2
             and plan.grid == 2 * plan.dp
         )
         expected_ks = (
@@ -651,7 +668,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # into 74 equal K ranges; the pair finishing a tile adds the other contributors' FP32 partials in ordinal order
     # (reduction order of those tiles differs from the plain schedule; accepted by the user, max_abs_err 0.03125).
     skf_rows = {k: e for k, e in decode_table(arch).items() if "gemm_skf" in e}
-    assert sorted(skf_rows) == ["384,28,256", "386,28,256", "5,28,16384"]
+    # round 7 (CAKE-985) adds measured fix-up stream-K cells on the 512 / 1024 / 2048 buckets; the round-6 cells stay
+    assert {"384,28,256", "386,28,256", "5,28,16384"} <= set(skf_rows)
     assert all(
         e["route"] == "gemm" and e["gemm_skf"] == 1 and "gemm_sk" not in e
         for e in skf_rows.values()
@@ -742,7 +760,12 @@ def test_required_kernel_keys_are_registered_when_programs_exist(arch):
                 assert defines == ()
         # The three quantization widths are one program, specialized on the compile line.
         assert len(quant_programs) == 1
-        assert set(KERNELS) == set(required)
+        # The registry is the union of the per-architecture key maps (round 7): every architecture's required keys
+        # are registered and no registered key is unused by every architecture.
+        assert set(required) <= set(KERNELS)
+        assert set(KERNELS) == set().union(
+            *(required_kernel_keys(a, SM_COUNT) for a in ARCHES)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -966,6 +989,95 @@ def test_graph_replay_follows_device_inputs(tp, module, M, stride_pad):
         graph.replay()
         torch.cuda.synchronize()
         assert_matches(out, reference(x, weight, scale, n_valid))
+
+
+def test_launcher_matches_prepare_path():
+    """Round 7 (CAKE-949 host path): the cached launcher reproduces the prepare() + launch() output bit for bit
+    for fresh and strided output views, follows new activations, and binds only the call's tensors after the
+    first call of an (M, output class)."""
+    device = _require_program()
+    n_valid, K = PROJECTION_FAMILIES["tp8"]["fused_qkv_a"]
+    weight, scale = make_weight(n_valid, K, device, 31)
+    prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+    launcher = cb.kimi_k3_fp8_projection_launcher(prepared, max_workspaces=2)
+    for M in (8, 1024, 1025):
+        x = make_activation(M, K, device, 100 + M)
+        expected = kimi_k3_fp8_projection(x, prepared)
+        got = launcher(x)
+        torch.cuda.synchronize()
+        assert torch.equal(got, expected), M
+        buf = torch.full(
+            (M, n_valid + 48), float("nan"), dtype=torch.bfloat16, device=device
+        )
+        view = buf[:, :n_valid]
+        assert launcher(x, view) is view
+        torch.cuda.synchronize()
+        assert torch.equal(buf[:, :n_valid], expected), M
+        assert torch.isnan(buf[:, n_valid:].float()).all()
+        x2 = make_activation(M, K, device, 200 + M)
+        assert torch.equal(launcher(x2), kimi_k3_fp8_projection(x2, prepared))
+    # workspace cache: least recently used M evicted beyond max_workspaces
+    assert launcher.cached_rows == (1024, 1025)
+    out = torch.empty((1024, n_valid), dtype=torch.bfloat16, device=device)
+    x = make_activation(1024, K, device, 3)
+    launcher(x, out)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    launcher(x, out)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] - before == 0
+    assert (
+        launcher.plan(x, out).kernels
+        == prepare_kimi_k3_fp8_projection(
+            x, prepared, out, launcher.workspace(1024)
+        ).plan.kernels
+    )
+
+
+def test_launcher_graph_replay_follows_device_inputs():
+    device = _require_program()
+    n_valid, K = PROJECTION_FAMILIES["tp8"]["q_b"]
+    weight, scale = make_weight(n_valid, K, device, 41)
+    prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+    launcher = cb.kimi_k3_fp8_projection_launcher(prepared, max_workspaces=1)
+    M = 64
+    x = make_activation(M, K, device, 41)
+    out = torch.empty((M, n_valid), dtype=torch.bfloat16, device=device)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        launcher(x, out)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            launcher(x, out)
+    torch.cuda.synchronize()
+    # another M evicts nothing the graph uses: the captured M stays cached (max_workspaces=1 grows instead)
+    launcher(make_activation(8, K, device, 1))
+    torch.cuda.synchronize()
+    assert 64 in launcher.cached_rows
+    for round_index in range(3):
+        x.copy_(make_activation(M, K, device, 1000 + round_index))
+        out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_matches(out, reference(x, weight, scale, n_valid))
+
+
+def test_launcher_rejects_bad_bindings():
+    device = _require_program()
+    weight, scale, x, _buf, out, n_valid = _make_case(
+        "tp8", "q_proj", 16, 0, device, seed=3
+    )
+    prepared = prepare_kimi_k3_fp8_projection_weights(weight, scale, n_valid)
+    launcher = cb.kimi_k3_fp8_projection_launcher(prepared)
+    with pytest.raises(ValueError, match="contiguous bf16"):
+        launcher(x.float())
+    with pytest.raises(ValueError, match="unit column stride"):
+        launcher(x, out.t())
+    with pytest.raises(ValueError, match="max_workspaces"):
+        cb.kimi_k3_fp8_projection_launcher(prepared, max_workspaces=0)
 
 
 def test_launch_makes_no_allocation():
