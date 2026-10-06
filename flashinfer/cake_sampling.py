@@ -548,9 +548,11 @@ _LOCAL_SELECT_MAX_K_BY_CAPABILITY: dict[tuple[int, int], int] = {
 }
 # Round 11 (lever M4): a one-chunk row (an ept-32 stream whose rows fit one register chunk per CTA, V128256 on cluster 8)
 # keeps its per-CTA lists small enough that the local select still wins at k 50 / 64 (GB300 `_sp_lp` -> `_sp_lp_l1` k50
-# V128256 B1/B2/B4/B8 0.976/0.970/0.981/0.984, k64 0.985/0.982, 8 perturbed processes each) while the two-chunk rows read
-# 0.998-1.018 at k50 and keep the capability cap.  A capability absent from the table keeps the capability cap.
+# V128256 B1/B2/B4/B8 0.976/0.970/0.981/0.984, k64 0.985/0.982, 8 perturbed processes each; B200 k50 B1/B2/B4/B8
+# 0.978-0.981/0.935-0.997/0.966-0.970/0.973-0.976, k64 B1/B8 0.951-0.991/0.982-0.985 over 6 histories) while the two-chunk
+# rows read 0.998-1.018 at k50 and keep the capability cap.  A capability absent from the table keeps the capability cap.
 _LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY: dict[tuple[int, int], int] = {
+    (10, 0): 64,
     (10, 3): 64,
 }
 # Reach of the CTA-local select onto the rows the leader-push chunk rule excludes (an ept-32 stream whose rows take two

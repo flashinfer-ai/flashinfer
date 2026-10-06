@@ -3439,8 +3439,8 @@ def test_local_select_build_matches_leader_push_build():
     )
     assert cs._local_select_flag(8, 32, True, fused_sp, 33, None) == 0
     # round 11 (lever M4): a one-chunk row (V128256 on the cluster-8 ept-32 stream) takes the local select up to the
-    # one-chunk cap on 10.3; two-chunk rows, an unknown vocabulary and the other capabilities keep the capability cap
-    assert cs._LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY == {(10, 3): 64}
+    # one-chunk cap on 10.0 / 10.3; two-chunk rows, an unknown vocabulary and the other capabilities keep the capability cap
+    assert cs._LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY == {(10, 0): 64, (10, 3): 64}
     for k in (33, 50, 64):
         assert (
             cs._local_select_flag(8, 32, True, fused_sp, k, (10, 3), 128256)
@@ -3448,9 +3448,15 @@ def test_local_select_build_matches_leader_push_build():
         )
         assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 3), 151936) == 0
         assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 3)) == 0
-        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 0), 128256) == 0
+        assert (
+            cs._local_select_flag(8, 32, True, fused_sp, k, (10, 0), 128256)
+            == cs._FLAG_LOCAL_SELECT
+        )
+        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 0), 151936) == 0
+        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 0)) == 0
         assert cs._local_select_flag(8, 32, True, fused_cs, k, (9, 0), 128256) == 0
     assert cs._local_select_flag(8, 32, True, fused_sp, 65, (10, 3), 128256) == 0
+    assert cs._local_select_flag(8, 32, True, fused_sp, 65, (10, 0), 128256) == 0
     assert (
         cs._local_select_flag(8, 32, True, fused_sp, 64, None, 128256)
         == cs._FLAG_LOCAL_SELECT
