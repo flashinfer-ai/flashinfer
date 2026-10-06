@@ -3032,6 +3032,26 @@ def test_one_wave_e16_repick_policy():
     ) == (8, 32, True)
 
 
+
+def test_one_wave_c1_repick_policy():
+    """Round-11 M4 (H100, sm 132): a small-k one-wave cluster-2 ept-32 stream pick on a 16-chunk row yields to the
+    cluster-1 ept-32 stream from the measured batch on; smaller batches, shorter rows, large k and the other wave
+    tables keep the ranked pick."""
+    assert cs._ONE_WAVE_C1_REPICK_MIN_BATCH_BY_SM_COUNT == {132: 64}
+    assert cs._ONE_WAVE_C1_REPICK_MIN_CHUNKS == 16
+    smem = 232448
+    pick = lambda b, v, k, two=False, sm=132: cs.choose_stage1(b, v, sm_count=sm, smem_limit=smem, top_k_max=k, two_launch=two)
+    for k in (10, 50, 64, None):
+        assert pick(64, 262144, k) == (1, 32, True), k
+        assert pick(66, 262144, k) == (1, 32, True), k
+    assert pick(32, 262144, 10) == (2, 32, True)
+    assert pick(63, 262144, 10) == (2, 32, True)
+    assert pick(128, 262144, 10) == (1, 32, True)
+    assert pick(64, 151936, 10) == (2, 16, True)
+    assert pick(64, 128256, 50) == (2, 16, True)
+    assert pick(64, 262144, 1000, True) == (2, 16, True)
+    assert pick(64, 262144, 10, sm=212) == (2, 32, True)
+
 def test_leader_push_build_matches_pull_build():
     """Round 9, lever L-P: every multi-CTA streaming variant ships the leader-push exchange form of its default, coarse-sample
     and speculative-sample builds (`_lp` / `_cs_lp` / `_sp_lp`, launch_flags bit 9).  Every CTA stores its compacted candidate
@@ -3417,6 +3437,24 @@ def test_local_select_build_matches_leader_push_build():
         cs._local_select_flag(8, 32, True, fused_sp, 32, None) == cs._FLAG_LOCAL_SELECT
     )
     assert cs._local_select_flag(8, 32, True, fused_sp, 33, None) == 0
+    # round 11 (lever M4): a one-chunk row (V128256 on the cluster-8 ept-32 stream) takes the local select up to the
+    # one-chunk cap on 10.3; two-chunk rows, an unknown vocabulary and the other capabilities keep the capability cap
+    assert cs._LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY == {(10, 3): 64}
+    for k in (33, 50, 64):
+        assert (
+            cs._local_select_flag(8, 32, True, fused_sp, k, (10, 3), 128256)
+            == cs._FLAG_LOCAL_SELECT
+        )
+        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 3), 151936) == 0
+        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 3)) == 0
+        assert cs._local_select_flag(8, 32, True, fused_sp, k, (10, 0), 128256) == 0
+        assert cs._local_select_flag(8, 32, True, fused_cs, k, (9, 0), 128256) == 0
+    assert cs._local_select_flag(8, 32, True, fused_sp, 65, (10, 3), 128256) == 0
+    assert (
+        cs._local_select_flag(8, 32, True, fused_sp, 64, None, 128256)
+        == cs._FLAG_LOCAL_SELECT
+    )
+    assert cs._local_select_flag(8, 32, True, fused_sp, 64, None, 262144) == 0
     for cap in ((10, 7), (12, 0)):
         assert cs._local_select_flag(8, 32, True, fused_sp, 10, cap) == 0
     assert cs._local_select_flag(8, 16, True, fused_cs, 11, (9, 0)) == 0

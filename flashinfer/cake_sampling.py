@@ -545,6 +545,13 @@ _LOCAL_SELECT_MAX_K_BY_CAPABILITY: dict[tuple[int, int], int] = {
     (10, 0): 20,
     (10, 3): 32,
 }
+# Round 11 (lever M4): a one-chunk row (an ept-32 stream whose rows fit one register chunk per CTA, V128256 on cluster 8)
+# keeps its per-CTA lists small enough that the local select still wins at k 50 / 64 (GB300 `_sp_lp` -> `_sp_lp_l1` k50
+# V128256 B1/B2/B4/B8 0.976/0.970/0.981/0.984, k64 0.985/0.982, 8 perturbed processes each) while the two-chunk rows read
+# 0.998-1.018 at k50 and keep the capability cap.  A capability absent from the table keeps the capability cap.
+_LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY: dict[tuple[int, int], int] = {
+    (10, 3): 64,
+}
 # Reach of the CTA-local select onto the rows the leader-push chunk rule excludes (an ept-32 stream whose rows take two
 # register chunks per CTA): with the local select the pushed lists stay small, so the one-round form beats the served
 # slab-tail pull form there too -- when the second chunk is full or the batch is at least the capability's minimum in
@@ -941,11 +948,14 @@ def _local_select_flag(
     launch_flags: int,
     top_k_max: Optional[int],
     capability: Optional[tuple[int, int]] = None,
+    vocab: Optional[int] = None,
 ) -> int:
     """Stage-1 ``launch_flags`` bit 10 for a fused launch whose other bits are ``launch_flags``: the CTA-local select
     form of the leader-push sample build those bits select (bit 0 with bit 9 and bit 4 or 6), on a variant that ships it,
     when the largest top-k is at most ``_LOCAL_SELECT_MAX_K_BY_CAPABILITY`` for ``capability`` (None: the largest cap of
-    the table).  Never on a chain, the whole-CTA tail or the pull form."""
+    the table) -- or, for a row of one register chunk per CTA (``vocab`` given), at most the capability's
+    ``_LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY`` cap when that is larger.  Never on a chain, the whole-CTA tail or the
+    pull form."""
     if not stream or top_k_max is None:
         return 0
     if (launch_flags & _FLAG_FUSE_TAIL) == 0 or (launch_flags & _FLAG_LEADER_PUSH) == 0:
@@ -954,12 +964,18 @@ def _local_select_flag(
     spec = (launch_flags & _FLAG_SPEC_SAMPLE) != 0
     if not (coarse or spec):
         return 0
+    one_chunk = vocab is not None and -(
+        -int(vocab) // (_THREADS * int(ept) * int(cluster))
+    ) == 1
     if capability is None:
         cap = max(_LOCAL_SELECT_MAX_K_BY_CAPABILITY.values())
+        if one_chunk:
+            cap = max(cap, max(_LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY.values()))
     else:
-        cap = _LOCAL_SELECT_MAX_K_BY_CAPABILITY.get(
-            (int(capability[0]), int(capability[1])), 0
-        )
+        cc = (int(capability[0]), int(capability[1]))
+        cap = _LOCAL_SELECT_MAX_K_BY_CAPABILITY.get(cc, 0)
+        if one_chunk:
+            cap = max(cap, _LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY.get(cc, 0))
     if int(top_k_max) > cap:
         return 0
     return (
@@ -1177,6 +1193,39 @@ def _one_wave_e16_repick(
     return (8, 16)
 
 
+# Round-11 lever M4 on H100 (sm 132, compute capability 9.0): at V262144 the 132 table ranks the cluster-2 ept-32 stream
+# (128 one-wave CTAs, 8 chunks each) ahead of the cluster-1 ept-32 stream (64 CTAs, 16 chunks) by the per-chunk constant,
+# but from B64 on the single-CTA rows already saturate the read and skip the cluster exchange (measured 0.981 / 0.986 at
+# k10 / k50, perturbed processes, eager and graph, bitwise; the round-10 regret row).  A constant refit cannot keep the
+# B <= 32 ranking while flipping B64, so the measured crossover is applied after the ranking (mirrored by cake
+# `one_wave_c1_repick`): a small-k one-wave cluster-2 ept-32 pick on rows of at least _ONE_WAVE_C1_REPICK_MIN_CHUNKS
+# single-CTA chunks yields to the cluster-1 ept-32 stream from the table's measured batch on, while that grid runs in one wave.
+_ONE_WAVE_C1_REPICK_MIN_BATCH_BY_SM_COUNT: dict[int, int] = {132: 64}
+_ONE_WAVE_C1_REPICK_MIN_CHUNKS = 16
+
+
+def _one_wave_c1_repick(
+    batch: int,
+    vocab: int,
+    best: tuple[int, int],
+    streaming: list[tuple[int, int]],
+    sm_count: int,
+    large_k: bool,
+) -> tuple[int, int]:
+    """``best`` is the ranked streaming ``(cluster, ept)``; the cluster-1 ept-32 stream replaces a small-k cluster-2 ept-32
+    pick on long rows from the measured batch on when both grids run in one wave (see
+    ``_ONE_WAVE_C1_REPICK_MIN_BATCH_BY_SM_COUNT``)."""
+    min_batch = _ONE_WAVE_C1_REPICK_MIN_BATCH_BY_SM_COUNT.get(_nearest_table(int(sm_count)))
+    if min_batch is None or large_k or best != (2, 32) or int(batch) < min_batch:
+        return best
+    if -(-int(vocab) // (_THREADS * 32)) < _ONE_WAVE_C1_REPICK_MIN_CHUNKS or (1, 32) not in streaming:
+        return best
+    wave_ctas = _wave_ctas(int(sm_count))
+    if -(-(batch * 2) // wave_ctas[2]) != 1 or -(-batch // wave_ctas[1]) != 1:
+        return best
+    return (1, 32)
+
+
 @functools.lru_cache(maxsize=8192)
 def _choose_stage1_resolved(
     batch: int,
@@ -1344,6 +1393,7 @@ def _choose_stage1_resolved(
         if resident_cost <= stream_cost(best):
             return resident[0], resident[1], False
     best = _one_wave_e16_repick(batch, best, streaming, int(sm_count), large_k > 0.0)
+    best = _one_wave_c1_repick(batch, vocab, best, streaming, int(sm_count), large_k > 0.0)
     return best[0], best[1], True
 
 
@@ -1422,7 +1472,7 @@ def _launch_plan(
             cluster, ept, stream, sample_flag, vocab, capability
         )
         launch_flags |= _local_select_flag(
-            cluster, ept, stream, launch_flags, top_k_max, capability
+            cluster, ept, stream, launch_flags, top_k_max, capability, vocab
         )
     elif fused_block:
         launch_flags = _FLAG_FUSE_BLOCK_TAIL
