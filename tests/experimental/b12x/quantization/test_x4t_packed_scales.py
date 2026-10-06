@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 
+from b12x.moe.fused_moe import CsfScalePlanes
 from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
 from b12x._lib.quant.x4t_packed_scales import (
     decode_x4t_packed_scales,
@@ -16,7 +17,7 @@ from b12x.moe._shared.kernels.w4a16.prepare import _pack_e8m0_k32_scales
 from ..conftest import require_b12x
 
 
-def _batch(rows, columns, rotation, task_rows=64, *, finite=False):
+def _batch(rows, columns, rotation, task_rows=64, raw=False, *, finite=False):
     device = require_b12x()
     fixed, exceptions, logical = [], [], []
     for expert in range(4):
@@ -46,6 +47,10 @@ def _batch(rows, columns, rotation, task_rows=64, *, finite=False):
         fixed.append(torch.from_numpy(stream))
         exceptions.append(torch.from_numpy(words))
         logical.append(torch.from_numpy(values))
+    if raw:
+        return CsfScalePlanes(tuple(fixed), tuple(exceptions)), torch.stack(logical).to(
+            device
+        )
     batch = make_x4t_scale_batch(
         fixed,
         exceptions,
@@ -163,18 +168,26 @@ def test_packed_counts_retained_program_and_poisoned_graph():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_native_x4t_keeps_nibbles_and_shares_micro_and_prefill_scales():
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize(
+    "layout,packing", [("w13", "mma_packed"), ("w31", "source_native")]
+)
+def test_csf_preparation_preserves_scale_batches_and_shared_scratch(
+    raw, layout, packing
+):
     from b12x.moe import fused_moe
 
-    fc1, _ = _batch(1152, 160, 0)
-    fc2, _ = _batch(5120, 18, 0)
-    device = fc1.fixed.device
+    rotation = 576 if layout == "w13" else 0
+    fc1, _ = _batch(1152, 160, rotation, raw=raw)
+    fc2, _ = _batch(5120, 18, 0, raw=raw)
+    device = require_b12x()
     w13 = torch.zeros((4, 1152, 2560), dtype=torch.uint8, device=device)
     w2 = torch.zeros((4, 5120, 288), dtype=torch.uint8, device=device)
     scales13 = torch.empty((4, 160, 1152), dtype=torch.uint8, device=device)
     scales2 = torch.empty((4, 18, 5120), dtype=torch.uint8, device=device)
     plan = fused_moe.plan_weights(
-        source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
+        source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout=layout),
+        constraints=fused_moe.WeightPlanConstraints(required_packing=packing),
         activation=fused_moe.ActivationSpec(
             mode="a16",
             nonlinearity="silu",
@@ -189,7 +202,7 @@ def test_native_x4t_keeps_nibbles_and_shares_micro_and_prefill_scales():
     )
     experts = fused_moe.prepare_weights(
         plan=plan,
-        weights=fused_moe.X4TWeights(
+        weights=fused_moe.Mxfp4CsfWeights(
             w13=w13,
             w2=w2,
             w13_scales=fc1,
@@ -198,20 +211,22 @@ def test_native_x4t_keeps_nibbles_and_shares_micro_and_prefill_scales():
             w2_scale_scratch=scales2,
         ),
     )
-    assert experts.plan.prepared_format.packing.value == "source_native"
+    assert experts.plan.prepared_format.packing.value == packing
     payload = experts._impl.representation.value
-    assert payload.w13 is w13 and payload.w2 is w2
-    assert (
-        payload.w13_scale.data_ptr()
-        == payload.micro_w13_scale.data_ptr()
-        == scales13.data_ptr()
-    )
-    assert (
-        payload.w2_scale.data_ptr()
-        == payload.micro_w2_scale.data_ptr()
-        == scales2.data_ptr()
-    )
+    assert payload.w13_scale.data_ptr() == scales13.data_ptr()
+    assert payload.w2_scale.data_ptr() == scales2.data_ptr()
+    if packing == "source_native":
+        assert payload.w13 is w13 and payload.w2 is w2
+        assert payload.micro_w13_scale.data_ptr() == scales13.data_ptr()
+        assert payload.micro_w2_scale.data_ptr() == scales2.data_ptr()
     assert len(payload.x4t_packed_pair_programs) == 4
+    for actual, reference in (
+        (payload.x4t_w13_scale, _batch(1152, 160, rotation)[0]),
+        (payload.x4t_w2_scale, _batch(5120, 18, 0)[0]),
+    ):
+        for name in actual.__dataclass_fields__:
+            a, r = getattr(actual, name), getattr(reference, name)
+            assert torch.equal(a, r) if isinstance(a, torch.Tensor) else a == r
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

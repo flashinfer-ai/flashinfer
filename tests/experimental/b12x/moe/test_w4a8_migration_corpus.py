@@ -179,20 +179,22 @@ def test_w4a8_packed_prefill_matches_oracle_under_graph(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("tile_m,m", [(32, 128), (64, 4096)])
 def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
+    tile_m: int,
+    m: int,
 ) -> None:
     """Prove the serving materialized route/phase1/phase2 prefill graph."""
 
     require_b12x()
     from b12x.moe.fused_moe._impl import b12x_moe_fp4, clear_tp_moe_caches
 
-    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", "64x128")
+    monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", f"{tile_m}x128")
     monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     clear_tp_moe_caches()
     device = torch.device("cuda")
-    m = 4096
     weights = _weights(seed=3_000)
     x, topk_ids, topk_weights = _routed_inputs(m, 3_001)
     reference = moe_reference_w4a8_mx(
@@ -289,7 +291,7 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
 
     launch()
     torch.cuda.synchronize()
-    context = "materialized-m64-prefill"
+    context = ("materialized-prefill", tile_m, m)
     _assert_dynamic_oracle(output, reference, context=context)
 
     graph = _capture_and_replay(launch)
@@ -297,6 +299,15 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     deterministic_replays = []
     for sentinel in (float("nan"), 997.0, -733.0):
         output.fill_(sentinel)
+        # Shared activation rows are indexed by token, while deterministic
+        # scatter metadata contains routed-pair indices. Poison padding so
+        # a missing pair-to-token conversion cannot consume allocator data.
+        for tensor in (
+            binding.packed_input,
+            binding.packed_input_scale,
+            binding.materialized_intermediate,
+        ):
+            tensor.view(torch.uint8).fill_(0x7F)
         graph.replay()
         torch.cuda.synchronize()
         deterministic_replays.append(output.clone())
@@ -388,6 +399,12 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
     atomic_ptrs = {name: tensor.data_ptr() for name, tensor in atomic_tensors.items()}
     for sentinel in (float("nan"), 997.0, -733.0):
         atomic_output.fill_(sentinel)
+        for tensor in (
+            atomic_binding.packed_input,
+            atomic_binding.packed_input_scale,
+            atomic_binding.materialized_intermediate,
+        ):
+            tensor.view(torch.uint8).fill_(0x7F)
         allocated_before_replay = torch.cuda.memory_allocated()
         reserved_before_replay = torch.cuda.memory_reserved()
         atomic_graph.replay()

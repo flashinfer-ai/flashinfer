@@ -11,6 +11,9 @@ import torch
 from b12x._lib.quant.block_codec import block_codec
 
 if TYPE_CHECKING:
+    from b12x._lib.quant.nvfp4_csf import Nvfp4CsfBatch
+    from b12x._lib.quant.x4t_scales import X4TScaleBatch
+
     from ._impl import B12XFP4ExpertWeights
     from .planning import WeightPlan
 
@@ -189,17 +192,62 @@ class PackedWeights:
 
 
 @dataclass(frozen=True)
-class X4TWeights:
-    """Exact MXFP4 nibbles, compressed scales and caller-owned expansion buffers.
+class CsfScalePlanes:
+    """Rank-local compressed scale planes in canonical 16-row slab order.
 
+    Each tuple contains one CPU tensor per expert: uint8 fixed bytes and uint32
+    exceptions. The weight plan supplies matrix geometry and the scale codec.
+    ``prepare_weights`` uploads and rearranges these planes for its kernels.
+    """
+
+    fixed: tuple[torch.Tensor, ...]
+    exceptions: tuple[torch.Tensor, ...]
+
+    def __post_init__(self) -> None:
+        if not self.fixed or len(self.fixed) != len(self.exceptions):
+            raise ValueError(
+                "CSF requires matching nonempty fixed and exception planes"
+            )
+        for planes, dtype in (
+            (self.fixed, torch.uint8),
+            (self.exceptions, torch.uint32),
+        ):
+            for plane in planes:
+                if not isinstance(plane, torch.Tensor) or plane.dtype != dtype:
+                    raise TypeError(f"CSF planes must be {dtype} tensors")
+                if plane.device.type != "cpu":
+                    raise ValueError("Unprepared CSF planes must reside on CPU")
+
+
+@dataclass(frozen=True)
+class Nvfp4CsfWeights:
+    """Native NVFP4 weights with compressed E4M3 scales and shared scratch.
+
+    FC1 weights and compressed rows use up/gate order. Scale planes may be
+    canonical CPU tensors or a prepared device batch.
+    The packed bundle's block-scale tensors are caller-owned expansion
+    buffers. Their contents are overwritten before each expert invocation.
+    Separate concurrent execution streams require separate buffers.
+    """
+
+    packed: PackedWeights
+    w13_scales: CsfScalePlanes | Nvfp4CsfBatch
+    w2_scales: CsfScalePlanes | Nvfp4CsfBatch
+
+
+@dataclass(frozen=True)
+class Mxfp4CsfWeights:
+    """MXFP4-CSF nibbles, one-bit byte offsets and caller-owned scale buffers.
+
+    Scale planes may be canonical CPU tensors or a prepared device batch.
     Buffers may be shared only by serialized layer executions on one CUDA
     stream. Concurrent model execution lanes require separate buffers.
     """
 
     w13: torch.Tensor
     w2: torch.Tensor
-    w13_scales: object
-    w2_scales: object
+    w13_scales: CsfScalePlanes | X4TScaleBatch
+    w2_scales: CsfScalePlanes | X4TScaleBatch
     w13_scale_scratch: torch.Tensor
     w2_scale_scratch: torch.Tensor
 
@@ -240,7 +288,9 @@ class PreparedExperts:
 
 
 __all__ = [
-    "X4TWeights",
+    "CsfScalePlanes",
+    "Nvfp4CsfWeights",
+    "Mxfp4CsfWeights",
     "PackedWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",

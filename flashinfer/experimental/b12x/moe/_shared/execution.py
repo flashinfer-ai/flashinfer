@@ -307,6 +307,7 @@ class MoEWeightPreparationPlan:
     trellis_rate_granularity: str | None = None
     trellis_pair_kinds: frozenset[str] | None = None
     intermediate_hadamard_blocks: tuple[int, int] | None = None
+    nvfp4_inline_scales: bool = False
 
     def __post_init__(self) -> None:
         specs = tuple(self.specs)

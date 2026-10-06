@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -22,8 +22,10 @@ from .config import TrellisConfig
 from .source import PackedSource, TrellisSource, WeightSource
 from .trellis_layout import TrellisStaging
 from .weights import (
+    CsfScalePlanes,
+    Nvfp4CsfWeights,
     PackedWeights,
-    X4TWeights,
+    Mxfp4CsfWeights,
     IQ2XSWeights,
     PreparedExperts,
     PreparedWeightFormat,
@@ -139,7 +141,9 @@ def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
         ) from exc
 
 
-def _validate_trellis_runtime(source: TrellisConfig, *, explicit_uniform: bool = False) -> None:
+def _validate_trellis_runtime(
+    source: TrellisConfig, *, explicit_uniform: bool = False
+) -> None:
     if source.codebook.value == "lut_fp16" and not explicit_uniform:
         raise NotImplementedError(
             "lut_fp16 preparation requires an explicit uniform_bits declaration"
@@ -198,8 +202,9 @@ def _prepared_format(
         scales = ScaleEncoding.TRELLIS_SCALES
     else:
         weights = (
-            WeightEncoding(source.format.value) if source.format.value in BLOCK_CODECS else
-            WeightEncoding.FP6_E2M3
+            WeightEncoding(source.format.value)
+            if source.format.value in BLOCK_CODECS
+            else WeightEncoding.FP6_E2M3
             if source.format.value == "mxfp6_e2m3"
             else WeightEncoding.FP4_E2M1
         )
@@ -236,20 +241,32 @@ def plan_weights(
     if isinstance(source, PackedSource):
         automatic = activation.mode is ActivationMode.AUTO
         if activation.a16_max_tokens and (
-            source.format.value != "modelopt_nvfp4" or activation.io_dtype is not torch.bfloat16
+            source.format.value != "modelopt_nvfp4"
+            or activation.io_dtype is not torch.bfloat16
         ):
-            raise ValueError("A16 token cutoff requires BF16 inputs and ModelOpt NVFP4 weights")
+            raise ValueError(
+                "A16 token cutoff requires BF16 inputs and ModelOpt NVFP4 weights"
+            )
         if automatic and (
             source.format.value != "modelopt_nvfp4"
             or activation.io_dtype is not torch.bfloat16
             or activation.nonlinearity != "silu"
         ):
-            raise ValueError("automatic MoE precision requires BF16 inputs, SiLU, and ModelOpt NVFP4 weights")
-        if automatic and constraints.required_packing not in {None, WeightPacking.SOURCE_NATIVE}:
-            raise ValueError("automatic MoE precision requires source-native weight storage")
+            raise ValueError(
+                "automatic MoE precision requires BF16 inputs, SiLU, and ModelOpt NVFP4 weights"
+            )
+        if automatic and constraints.required_packing not in {
+            None,
+            WeightPacking.SOURCE_NATIVE,
+        }:
+            raise ValueError(
+                "automatic MoE precision requires source-native weight storage"
+            )
         if automatic and source.w13_layout.value != "w13":
             raise ValueError("automatic MoE precision requires up/gate W13 row order")
-        recipe = _packed_recipe(source, ActivationMode.A4 if automatic else activation.mode)
+        recipe = _packed_recipe(
+            source, ActivationMode.A4 if automatic else activation.mode
+        )
         shared_a16 = activation.a16_max_tokens > 0 and recipe != "w4a16"
         requested_layout = None
         if automatic:
@@ -268,8 +285,11 @@ def plan_weights(
             requested_layout = constraints.required_packing.value
         raw_plan = plan_b12x_fp4_moe_weights(
             quant_modes=(
-                ("nvfp4", "w4a16") if automatic else
-                (recipe, "w4a16") if shared_a16 else recipe
+                ("nvfp4", "w4a16")
+                if automatic
+                else (recipe, "w4a16")
+                if shared_a16
+                else recipe
             ),
             source_format=source.format.value,
             activation=activation.nonlinearity,
@@ -288,16 +308,22 @@ def plan_weights(
             raise ValueError("Trellis fused MoE requires A16 activations")
         if constraints.required_packing not in {None, WeightPacking.TRELLIS_NATIVE}:
             raise ValueError("Trellis weights require trellis_native packing")
-        _validate_trellis_runtime(config, explicit_uniform=source.uniform_bits is not None)
+        _validate_trellis_runtime(
+            config, explicit_uniform=source.uniform_bits is not None
+        )
         expert = config.transform.expert
         if source.extent is not None:
             if source.extent.intermediate_size != geometry.intermediate_size:
-                raise ValueError("trellis extent width differs from the weight geometry")
+                raise ValueError(
+                    "trellis extent width differs from the weight geometry"
+                )
             if expert.kind == "intermediate_hadamard" and (
                 32 * source.extent.first_slot % expert.post_block_size
                 or geometry.intermediate_size % expert.post_block_size
             ):
-                raise ValueError("trellis extent must contain complete post-Hadamard blocks")
+                raise ValueError(
+                    "trellis extent must contain complete post-Hadamard blocks"
+                )
         if activation.rotation_dtype is not None and (
             config.codebook.value == "mcg" and source.uniform_bits is None
         ):
@@ -329,7 +355,8 @@ def plan_weights(
             trellis_codebook=config.codebook.value,
             trellis_rate_granularity=config.rate.granularity.value,
             intermediate_hadamard_blocks=(
-                None if expert.kind == "none"
+                None
+                if expert.kind == "none"
                 else (expert.pre_block_size, expert.post_block_size)
             ),
         )
@@ -353,7 +380,11 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights | IQ2XSWeights | X4TWeights,
+    weights: PackedWeights
+    | TrellisWeights
+    | IQ2XSWeights
+    | Mxfp4CsfWeights
+    | Nvfp4CsfWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
@@ -361,22 +392,293 @@ def prepare_weights(
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
-    if (device is not None or staging is not None) and not isinstance(plan.source, TrellisSource):
-        raise ValueError("device and staging are only supported for trellis preparation")
-    if isinstance(weights, X4TWeights):
+    if (device is not None or staging is not None) and not isinstance(
+        plan.source, TrellisSource
+    ):
+        raise ValueError(
+            "device and staging are only supported for trellis preparation"
+        )
+    if isinstance(weights, Nvfp4CsfWeights):
+        from b12x._lib.quant.nvfp4_csf import (
+            Nvfp4CsfDecoder,
+            make_nvfp4_csf_batch,
+            repack_nvfp4_csf_batch,
+        )
+
+        if (
+            not isinstance(plan.source, PackedSource)
+            or plan.source.format.value != "modelopt_nvfp4"
+            or plan.source.w13_layout.value != "w13"
+            or plan.activation.mode not in (ActivationMode.A4, ActivationMode.A16)
+            or (
+                plan.activation.mode is ActivationMode.A16
+                and plan.prepared_format.packing is not WeightPacking.MMA_PACKED
+            )
+            or plan.activation.a16_max_tokens
+        ):
+            raise ValueError(
+                "NVFP4-CSF requires native ModelOpt NVFP4 A4/A16 in up/gate order"
+            )
+        geometry = plan.geometry
+        planes = tuple(
+            make_nvfp4_csf_batch(
+                plane.fixed,
+                plane.exceptions,
+                rows=rows,
+                columns=columns,
+                device=weights.packed.w13.device,
+            )
+            if isinstance(plane, CsfScalePlanes)
+            else plane
+            for plane, rows, columns in (
+                (
+                    weights.w13_scales,
+                    2 * geometry.intermediate_size,
+                    geometry.hidden_size // 16,
+                ),
+                (
+                    weights.w2_scales,
+                    geometry.hidden_size,
+                    geometry.intermediate_size // 16,
+                ),
+            )
+        )
+        if plan.activation.mode is ActivationMode.A16:
+            from b12x.moe._shared.kernels.w4a16.prepare import (
+                _nvfp4_compute_scale_factor,
+                _process_nvfp4_packed_scales,
+            )
+
+            # Standard W4A16 preparation chooses one scale normalization per
+            # projection and packs weights/scales into its MMA layout. Expand
+            # one layer in shared scratch to retain that exact preparation law.
+            source_scales = (
+                weights.packed.w13_block_scales,
+                weights.packed.w2_block_scales,
+            )
+            staging_decoder = Nvfp4CsfDecoder.prepare(*planes, *source_scales)
+            ids = torch.arange(
+                plan.geometry.num_experts,
+                dtype=torch.int32,
+                device=weights.packed.w13.device,
+            )
+            staging_decoder.decode(ids, *source_scales)
+            factors = tuple(
+                _nvfp4_compute_scale_factor(t, plan.activation.io_dtype)
+                for t in source_scales
+            )
+        prepared = prepare_weights(plan=plan, weights=weights.packed)
+        if plan.activation.mode is ActivationMode.A16:
+            representation = prepared._impl.representation
+            packed = representation.value
+            outputs = (
+                source_scales[0].view_as(packed.w13_scale),
+                source_scales[1].view_as(packed.w2_scale),
+            )
+            tables = []
+            for factor in factors:
+                alphabet = torch.arange(
+                    256, dtype=torch.uint8, device=weights.packed.w13.device
+                ).view(torch.float8_e4m3fn)
+                alphabet = (
+                    alphabet[:, None]
+                    .expand(256, 4)
+                    .contiguous()
+                    .to(plan.activation.io_dtype)
+                )
+                tables.append(
+                    _process_nvfp4_packed_scales(alphabet, scale_factor=factor)
+                    .view(torch.uint8)[:, 0]
+                    .contiguous()
+                )
+            planes = tuple(
+                repack_nvfp4_csf_batch(plane, row_rotation=rotation, value_lut=table)
+                for plane, rotation, table in zip(
+                    planes, (plan.geometry.intermediate_size, 0), tables, strict=True
+                )
+            )
+            packed = replace(packed, w13_scale=outputs[0], w2_scale=outputs[1])
+            prepared = replace(
+                prepared,
+                _impl=replace(
+                    prepared._impl,
+                    representation=replace(representation, value=packed),
+                    w1_blockscale=outputs[0],
+                    w2_blockscale=outputs[1],
+                ),
+            )
+        inline = None
+        if (
+            plan.activation.mode is ActivationMode.A4
+            and plan.activation.nonlinearity == "silu"
+            and plan.geometry.intermediate_size % 64 == 0
+            and plan.geometry.hidden_size % 128 == 0
+        ):
+            from b12x._lib.quant.nvfp4_csf_inline import prepare_inline_scales
+
+            inline = tuple(prepare_inline_scales(plane) for plane in planes)
+            # Both execution paths own views of one fixed stream. Only the
+            # exception index differs between whole-plane and tile reads.
+            planes = tuple(
+                replace(plane, fixed=value.storage[1024: 1024 + plane.fixed.numel()].view_as(plane.fixed))
+                for plane, value in zip(planes, inline, strict=True)
+            )
+            plan = replace(plan, _impl=replace(plan._impl, nvfp4_inline_scales=True))
+        decoder = Nvfp4CsfDecoder.prepare(
+            *planes,
+            prepared._impl.w1_blockscale,
+            prepared._impl.w2_blockscale,
+            inline_scales=inline,
+        )
+        return PreparedExperts(
+            plan=plan,
+            _impl=replace(
+                prepared._impl, plan=plan._impl,
+                nvfp4_csf=replace(decoder, inline_scales=inline),
+            ),
+        )
+    if isinstance(weights, Mxfp4CsfWeights):
         if (
             not isinstance(plan.source, PackedSource)
             or plan.source.format.value != "fp4_e8m0_k32"
-            or plan.activation.mode is not ActivationMode.A16
-            or plan.prepared_format.packing not in {
-                WeightPacking.MMA_PACKED, WeightPacking.SOURCE_NATIVE
-            }
+            or plan.activation.mode not in (ActivationMode.A16, ActivationMode.A8)
+            or (
+                plan.activation.mode is ActivationMode.A16
+                and plan.prepared_format.packing
+                not in {WeightPacking.MMA_PACKED, WeightPacking.SOURCE_NATIVE}
+            )
         ):
-            raise ValueError("X4T requires native or MMA-packed MXFP4 A16 weights")
+            raise ValueError(
+                "MXFP4-CSF requires native MXFP4 with uniform A16 or A8 activations"
+            )
+        from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
+
+        geometry = plan.geometry
+        rotation = (
+            geometry.intermediate_size if plan.source.w13_layout.value == "w13" else 0
+        )
+        planes = tuple(
+            make_x4t_scale_batch(
+                plane.fixed,
+                plane.exceptions,
+                rows=rows,
+                columns=columns,
+                device=weights.w13.device,
+                exception_task_rows=64,
+                exception_row_rotation=row_rotation,
+            )
+            if isinstance(plane, CsfScalePlanes)
+            else plane
+            for plane, rows, columns, row_rotation in (
+                (
+                    weights.w13_scales,
+                    2 * geometry.intermediate_size,
+                    geometry.hidden_size // 32,
+                    rotation,
+                ),
+                (
+                    weights.w2_scales,
+                    geometry.hidden_size,
+                    geometry.intermediate_size // 32,
+                    0,
+                ),
+            )
+        )
+        weights = replace(weights, w13_scales=planes[0], w2_scales=planes[1])
+        if plan.activation.mode is ActivationMode.A8:
+            from b12x._lib.quant.mxfp4_csf import (
+                Mxfp4CsfDecoder,
+                repack_mxfp4_csf_batch,
+            )
+            from b12x._lib.quant.x4t_scales import decode_x4t_scales
+
+            if (
+                not isinstance(plan.source, PackedSource)
+                or plan.source.format.value != "fp4_e8m0_k32"
+                or plan.activation.a16_max_tokens
+            ):
+                raise ValueError("MXFP4-CSF A8 requires a uniform MXFP4/MXFP8 plan")
+            e, h, n = (
+                plan.geometry.num_experts,
+                plan.geometry.hidden_size,
+                plan.geometry.intermediate_size,
+            )
+            planes = (weights.w13_scales, weights.w2_scales)
+            source_scales = (
+                weights.w13_scale_scratch.view(e, 2 * n, h // 32),
+                weights.w2_scale_scratch.view(e, h, n // 32),
+            )
+            ids = torch.arange(e, dtype=torch.int32, device=weights.w13.device)
+            for plane, output in zip(planes, source_scales, strict=True):
+                decode_x4t_scales(plane, ids, output)
+            unit = torch.ones(e, dtype=torch.float32, device=weights.w13.device)
+            packed = PackedWeights(
+                w13=weights.w13,
+                w2=weights.w2,
+                w13_block_scales=source_scales[0],
+                w2_block_scales=source_scales[1],
+                w13_global_scales=unit,
+                w2_global_scales=unit,
+            )
+            prepared = prepare_weights(plan=plan, weights=packed)
+            representation = prepared._impl.representation
+            native = representation.value
+            outputs = []
+            for buffer, scales in zip(
+                (weights.w13_scale_scratch, weights.w2_scale_scratch),
+                (native.w13_sfb, native.w2_sfb),
+                strict=True,
+            ):
+                if (
+                    buffer.numel() * buffer.element_size()
+                    != scales.numel() * scales.element_size()
+                ):
+                    raise ValueError(
+                        "MXFP4-CSF A8 scratch must match the prepared scale storage"
+                    )
+                output = buffer.view(-1).view(scales.dtype).view_as(scales)
+                output.copy_(scales)
+                outputs.append(output)
+            native = replace(native, w13_sfb=outputs[0], w2_sfb=outputs[1])
+            prepared = replace(
+                prepared,
+                _impl=replace(
+                    prepared._impl,
+                    representation=replace(representation, value=native),
+                    w1_blockscale=outputs[0],
+                    w2_blockscale=outputs[1],
+                ),
+            )
+            rotation = n if plan.source.w13_layout.value == "w31" else 0
+            native_planes = tuple(
+                repack_mxfp4_csf_batch(
+                    plane,
+                    compact=n % 128 == 64,
+                    group_rows=group,
+                    row_rotation=rot,
+                )
+                for plane, group, rot in zip(planes, (n, h), (rotation, 0), strict=True)
+            )
+            decoder = Mxfp4CsfDecoder.prepare(
+                *native_planes,
+                prepared._impl.w1_blockscale,
+                prepared._impl.w2_blockscale,
+            )
+            return PreparedExperts(
+                plan=plan, _impl=replace(prepared._impl, mxfp4_csf=decoder)
+            )
         prepared = prepare_b12x_x4t_weights(plan=plan._impl, weights=weights)
-    elif isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
-        if not isinstance(weights, IQ2XSWeights) or weights.codec != plan.source.format.value:
-            raise TypeError(f"{plan.source.format.value} preparation requires matching BlockQuantWeights")
+    elif (
+        isinstance(plan.source, PackedSource)
+        and plan.source.format.value in BLOCK_CODECS
+    ):
+        if (
+            not isinstance(weights, IQ2XSWeights)
+            or weights.codec != plan.source.format.value
+        ):
+            raise TypeError(
+                f"{plan.source.format.value} preparation requires matching BlockQuantWeights"
+            )
         prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
     elif isinstance(plan.source, TrellisSource):
         if not isinstance(weights, TrellisWeights):
@@ -392,15 +694,21 @@ def prepare_weights(
     else:
         if not isinstance(weights, PackedWeights):
             raise TypeError("packed preparation requires PackedWeights")
-        if (plan.activation.a16_max_tokens and is_gated_moe_activation(plan._impl.activation)
-                and plan.source.w13_layout.value == "w31" and plan._impl.w13_layout == "w13"):
+        if (
+            plan.activation.a16_max_tokens
+            and is_gated_moe_activation(plan._impl.activation)
+            and plan.source.w13_layout.value == "w31"
+            and plan._impl.w13_layout == "w13"
+        ):
             from ._impl import _ensure_w13_kernel_order_inplace
 
             # Both activation precisions must see the same physical FC1 halves.
             mode = _packed_recipe(plan.source, plan.activation.mode)
             _ensure_w13_kernel_order_inplace(
-                weights.w13, weights.w13_block_scales,
-                n=plan.geometry.intermediate_size, k=plan.geometry.hidden_size,
+                weights.w13,
+                weights.w13_block_scales,
+                n=plan.geometry.intermediate_size,
+                k=plan.geometry.hidden_size,
                 quant_mode=mode,
             )
         input_scale = weights.input_scale

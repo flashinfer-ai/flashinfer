@@ -185,6 +185,7 @@ def _query(
         numerical_recipe=invocation.get("numerical_recipe"),
         controls=controls,
         shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
+        nvfp4_inline_scales=plan.nvfp4_inline_scales,
     )
 
 
@@ -198,6 +199,7 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
     )
     return {
         "quant_modes": tuple(plan.quant_modes), "source_format": plan.source_format,
+        "nvfp4_inline_scales": plan.nvfp4_inline_scales,
         "activation": plan.activation, "params_dtype": plan.io_dtype,
         "num_experts": plan.num_experts, "hidden_size": plan.hidden_size,
         "intermediate_size": plan.intermediate_size, "w13_layout": plan.w13_layout,
@@ -558,6 +560,11 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
         "external_route_plan": external_route_plan,
         "share_input_across_experts": share_input,
         "planned_tile_m": tile_m,
+        "nvfp4_inline_scales": bool(
+            caps.weight_plan.nvfp4_inline_scales
+            and quant_mode == "nvfp4"
+            and plan.decode_config.nvfp4_inline_scales
+        ),
     }
 
 
@@ -683,6 +690,7 @@ def _program_carriers(
                 w4a8_repacked=dynamic["w4a8_repacked"],
                 w4a8_n64_repacked=dynamic["w4a8_n64_repacked"],
                 nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+                nvfp4_inline_scales=dynamic["nvfp4_inline_scales"],
                 direct_routing=dynamic["direct_routing"],
                 external_route_plan=dynamic["external_route_plan"],
                 share_input_across_experts=dynamic["share_input_across_experts"],
@@ -693,6 +701,15 @@ def _program_carriers(
                 planned_tile_m=dynamic["planned_tile_m"],
             )
             launches.append(launch)
+        if plan.deterministic_output:
+            from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_topk_sum
+
+            # The dynamic kernel writes one result per routed pair. Its
+            # deterministic reduction is a separate retained launch.
+            launches.append(compile_w4a16_topk_sum(
+                m=exact_m, topk=plan.num_topk, hidden_size=plan.k,
+                element_dtype=_impl._w4a16_element_dtype(plan.dtype),
+            ))
     return tuple(launches)
 
 @dataclass(frozen=True)
@@ -747,6 +764,34 @@ def compile_x4t_scale_programs(payload, ordinal):
                 for mapped in (False, True) for unique in (False, True)
             )
         raise ValueError(f"unsupported X4T scale program layout: {payload[0]!r}")
+
+
+@program_cache(scope="preparation")
+def compile_nvfp4_csf_programs(payload, ordinal):
+    """Declare both integer routing ABIs for native NVFP4 scale expansion."""
+    from b12x._lib.quant.nvfp4_csf import compile_nvfp4_csf_pair
+    from b12x._lib.quant.csf_routing import compile_csf_active_experts
+
+    first, second, indexed = payload
+    with torch.cuda.device(ordinal):
+        return tuple(
+            compile_nvfp4_csf_pair(first, second, ids64, use_index)
+            for ids64 in (False, True)
+            for use_index in ((False, True) if indexed else (False,))
+        ) + tuple(compile_csf_active_experts(ids64) for ids64 in (False, True))
+
+
+@program_cache(scope="preparation")
+def compile_mxfp4_csf_programs(payload, ordinal):
+    """Retain scale expansion and expert presence under frozen resolution."""
+    from b12x._lib.quant.mxfp4_csf import compile_mxfp4_csf_pair
+    from b12x._lib.quant.csf_routing import compile_csf_active_experts
+
+    with torch.cuda.device(ordinal):
+        return tuple(compile_mxfp4_csf_pair(*payload, ids64)
+                     for ids64 in (False, True)) + tuple(
+            compile_csf_active_experts(ids64) for ids64 in (False, True)
+        )
 
 
 @program_cache(scope="preparation")
@@ -896,6 +941,12 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
         int(experts._impl.a2_gscale.numel()),
     )
     x4t_payload = _x4t_scale_program_payload(experts)
+    lsc = experts._impl.nvfp4_csf
+    lsc_payload = () if lsc is None else (
+        lsc.first.geometry, lsc.second.geometry, lsc.indexed_programs is not None,
+    )
+    mx_csf = experts._impl.mxfp4_csf
+    mx_payload = () if mx_csf is None else (mx_csf.first.geometry, mx_csf.second.geometry)
 
     def child(tokens):
         query = _query(experts, capacity, tokens, routing, controls, invocation)
@@ -908,6 +959,9 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                 "deterministic_output": query.deterministic_output,
             }), "controls": controls,
             **({"x4t_scale_programs": x4t_payload} if x4t_payload else {}),
+            **({"nvfp4_csf_programs": lsc_payload} if lsc_payload else {}),
+            **({"mxfp4_csf_programs": mx_payload} if mx_payload else {}),
+            **({"nvfp4_inline_scales": True} if experts.plan._impl.nvfp4_inline_scales else {}),
         })
 
         def caps_for(config, device):
@@ -931,6 +985,14 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                     "b12x.moe.fused_moe._preparation:compile_x4t_scale_programs",
                     x4t_payload, device.ordinal,
                 ),) if x4t_payload else ()),
+                *((CompileJob.create(
+                    "b12x.moe.fused_moe._preparation:compile_nvfp4_csf_programs",
+                    lsc_payload, device.ordinal,
+                ),) if lsc_payload else ()),
+                *((CompileJob.create(
+                    "b12x.moe.fused_moe._preparation:compile_mxfp4_csf_programs",
+                    mx_payload, device.ordinal,
+                ),) if mx_payload else ()),
                 *(
                     CompileJob.create(
                         "b12x.moe.fused_moe._preparation:compile_dynamic_route_plan",
@@ -960,6 +1022,10 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
             launchers = list(programs.launchers)
             if x4t_payload:
                 launchers.extend(compile_x4t_scale_programs(x4t_payload, device.ordinal))
+            if lsc_payload:
+                launchers.extend(compile_nvfp4_csf_programs(lsc_payload, device.ordinal))
+            if mx_payload:
+                launchers.extend(compile_mxfp4_csf_programs(mx_payload, device.ordinal))
             route_query = _route_query_from_moe(query, routing)
             route_launcher = compile_route_topk(
                 ROUTE_TUNING.encode_query(route_query), device.ordinal

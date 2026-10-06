@@ -362,6 +362,7 @@ def test_moe_cluster_ladder_stops_at_the_planned_task_queue():
         backend="dynamic", route_planner="triton", dynamic_tile_m=16,
         dynamic_route_mode="grouped", w4a16_route_mode=None, max_active_clusters=30,
         nvfp4_share_input=False, nvfp4_materialize_intermediate=False,
+        nvfp4_inline_scales=False,
         w4a16_tile_config=None, w4a16_block_size_m=None, w4a16_pipeline_stages=None,
     )
     space.validate(triton)
