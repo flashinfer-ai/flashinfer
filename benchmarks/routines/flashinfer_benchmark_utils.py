@@ -356,6 +356,7 @@ benchmark_apis = {
     ],
     "kda": [
         "recurrent_kda_prefill",
+        "fused_kda_decode",
     ],
     "sparse_attention": [
         "MSAProxyScore",
@@ -1448,6 +1449,21 @@ routine_cc_to_supported_backends = {
             "cutekda",
             "flash-kda",
         ],
+        "12.1": [],
+    },
+    # Fused Kimi KDA decode. Cake routes are exported for SM100a/SM103a only;
+    # "auto" keeps CuTe DSL wherever no Cake route matches.
+    "fused_kda_decode": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl", "cake", "auto"],
+        "10.3": ["cute-dsl", "cake", "auto"],
+        "10.7": ["cute-dsl", "auto"],
+        "11.0": [],
+        "12.0": [],
         "12.1": [],
     },
 }

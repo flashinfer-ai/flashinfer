@@ -109,8 +109,9 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (CuTe-DSL) and `triton` (reference).
     - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. `--state_dtype float32` uses `gated_delta_rule_mtp`; `--state_dtype bfloat16` uses the BF16 MTP kernel via `gated_delta_rule_decode_pretranspose`. Backends: `flashinfer`, `triton`.
     - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
-- KDA (SM120a):
-    - `recurrent_kda_prefill` - Ordinary multi-token recurrent KDA prefill with fixed or packed inputs. Backends: `flashinfer` (automatic variant policy), `flashinfer-decomp`, `flashinfer-fused`, and optional external `cutekda` / `flash-kda` baselines.
+- KDA (Kimi Delta Attention):
+    - `recurrent_kda_prefill` - Ordinary multi-token recurrent KDA prefill with fixed or packed inputs (SM120a). Backends: `flashinfer` (automatic variant policy), `flashinfer-decomp`, `flashinfer-fused`, and optional external `cutekda` / `flash-kda` baselines.
+    - `fused_kda_decode` - Fused Kimi KDA decode (`flashinfer.kda_decode.fused_kda_decode`): causal convolution + SiLU, one recurrent KDA update and gated RMSNorm per row, with paged convolution and recurrent-state caches updated in place (SM100/SM103/SM107). `--batch_size` is the number of decode rows, `--num_q_heads` one of 8, 12, 24, 32, 48, 96, `--state_dtype` `bfloat16` (default) or `float32`. Backends: `cute-dsl` (default), `cake` (exported Cake kernels, SM100a/SM103a only) and `auto`. `--refcheck` compares against a torch reference.
 
 ## Quick Start
 ### Single Test Run
@@ -639,6 +640,7 @@ Legend:
 | **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
 | **chunk_gated_delta_rule** |  |  |  |  | flashinfer, fla | flashinfer, fla | flashinfer, fla |  |
 | **recurrent_kda_prefill** |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
+| **fused_kda_decode** |  |  |  |  |  | cute-dsl, cake, auto | cute-dsl, cake, auto |  |
 
 Backend Legend:
 - fa2: FlashAttention2
@@ -686,3 +688,4 @@ python benchmarks/flashinfer_benchmark.py \
 - fla: flash-linear-attention Triton kernels (GDN prefill baseline)
 - flashinfer-decomp / flashinfer-fused: pinned SM120 KDA prefill variants
 - cutekda / flash-kda: optional external SM120 KDA prefill baselines
+- cake: exported Cake kernels (`fused_kda_decode`, SM100a/SM103a)
