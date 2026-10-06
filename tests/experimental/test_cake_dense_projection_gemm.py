@@ -511,7 +511,8 @@ EXPORTED_TEMPLATES = frozenset(
         'dense_proj_gemm_nn_n160_m256_bz64',
         'dense_proj_gemm_nn_n160_m256_bz64_f32_v8_ef',
         'dense_proj_gemm_nn_n192_bz64_hee_f32_t',
-        'dense_proj_gemm_nn_n192_bz64_hee_t',
+        'dense_proj_gemm_nn_n192_bz64_hee_f32_t_sks',
+        'dense_proj_gemm_nn_n192_bz64_hee_t_sks',
         'dense_proj_gemm_nn_n192_hee_f32_t_tma1',
         'dense_proj_gemm_nn_n192_hee_t_tma1',
         'dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6',
@@ -529,6 +530,7 @@ EXPORTED_TEMPLATES = frozenset(
         'dense_proj_gemm_nn_n256_m256_ov_ht',
         'dense_proj_gemm_nn_n256_m256_t_tma1',
         'dense_proj_gemm_nn_n256_m256_tma1',
+        'dense_proj_gemm_nn_n256_sks',
         'dense_proj_gemm_nn_n256_skx',
     }
 )
@@ -1207,7 +1209,11 @@ def test_round15_pd_sh_knobs():
     key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
     assert len(key) == 26 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
-    assert instance_key(a_mn=False, b_mn=True)[23:] == (0, 0, False)  # ... followed by the round-18 sk_sync flag
+    assert instance_key(a_mn=False, b_mn=True)[23:] == (
+        0,
+        0,
+        False,
+    )  # ... followed by the round-18 sk_sync flag
     assert (
         instance_symbol(
             instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
@@ -1281,17 +1287,29 @@ def test_sk_sync_plan_mirrors_cake():
     assert sk_sync_plan(192, 254, 106) == (106, 86, 106, 212, 20)
     assert sk_sync_plan(192, 254, 106, None, 26) == (106, 86, 106, 216, 20)
     assert sk_sync_plan(64, 254, 74) == (0, 64, 74, 223, 10)
-    assert sk_sync_plan(72, 254, 106, 173) == (0, 72, 106, 173, 34)  # an explicit s (sweeps only)
+    assert sk_sync_plan(72, 254, 106, 173) == (
+        0,
+        72,
+        106,
+        173,
+        34,
+    )  # an explicit s (sweeps only)
     assert sk_sync_plan(212, 254, 106) is None  # no tail
     assert sk_sync_plan(106, 254, 106) is None  # a full wave: no collector
-    assert sk_sync_plan(72, 254, 74) is None  # 2 collectors x 36 leftovers: K - s = 6 < SK_MIN_ITERS
+    assert (
+        sk_sync_plan(72, 254, 74) is None
+    )  # 2 collectors x 36 leftovers: K - s = 6 < SK_MIN_ITERS
     # the short-K rows admit the plan arithmetically (W3's q_a fwd observation: 1536 tiles on 106 pairs, 52 tails,
     # q = 1, s = 16) - the rules never ask for it there (the fixup costs more than the 16-step unit)
     assert sk_sync_plan(1536, 32, 106) == (1484, 52, 104, 16, 52)
     assert sk_sync_plan(52, 32, 74) == (0, 52, 74, 24, 22)
-    assert sk_sync_plan(52, 30, 74) is None  # q = 3: s = 23 leaves 7 steps < SK_MIN_ITERS
+    assert (
+        sk_sync_plan(52, 30, 74) is None
+    )  # q = 3: s = 23 leaves 7 steps < SK_MIN_ITERS
     with_margin = sk_sync_plan(72, 254, 106, None, 400)
-    assert with_margin is None  # a margin that leaves the collectors under SK_MIN_ITERS steps is refused
+    assert (
+        with_margin is None
+    )  # a margin that leaves the collectors under SK_MIN_ITERS steps is refused
 
 
 def test_round13_knob_normalisation():
@@ -1970,7 +1988,10 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         plan.iters_per_unit,
                         plan.sk_collectors,
                     ) == sync_plan
-                    assert (plan.num_full, plan.tail_tiles) == (plan.pair_tiles - tail, tail)
+                    assert (plan.num_full, plan.tail_tiles) == (
+                        plan.pair_tiles - tail,
+                        tail,
+                    )
                     assert plan.sk_collectors == min(plan.sm_pairs - tail, tail) >= 1
                     assert plan.sk_units == tail + plan.sk_collectors <= plan.sm_pairs
                     q = -(-tail // plan.sk_collectors)
@@ -1983,10 +2004,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         <= plan.k_blocks - SK_MIN_ITERS
                     )
                     assert plan.sk_iters == tail
-                    assert (
-                        plan.ws_f32_elems
-                        == tail * 2 * plan.cta_rows * plan.block_n
-                    )
+                    assert plan.ws_f32_elems == tail * 2 * plan.cta_rows * plan.block_n
                 elif htail:
                     # 2 x tail half-height items of whole K: no partial slabs, no fixup, no counters in use beyond
                     # the tail tiles; the tall tile may exceed one wave of pairs
