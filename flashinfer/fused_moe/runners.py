@@ -8440,6 +8440,8 @@ _BLOCK_SCALE_TILE = 128
 _PLAIN_SEGMENT_ROWS = 16
 # Architectures whose moe_utils kernels sort, permute and finalize.
 _MOE_UTILS_ARCHS: tuple[int, ...] = (90, 100, 103, 107)
+# First cuDNN release with an SM120 / SM121 engine for the block-scaled grouped GEMM.
+_CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION = 92200
 
 # (gemm1, gemm2) plan indices of the fallback tactic
 _FALLBACK_STAGE_TACTIC: tuple[int, int] = (-1, -1)
@@ -9420,6 +9422,12 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
     def _token_sized_extra_inputs(self) -> tuple[int, ...]:
         return (self._hidden_states_scale_input,)
 
+    def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        inputs = super()._prepare_tuning_inputs(inputs)
+        scale = inputs[self._hidden_states_scale_input]
+        scale.fill_(127 if scale.dtype == torch.uint8 else 1.0)
+        return inputs
+
     def _allocate_workspace(self, rows: int, hidden_size: int) -> _GroupedGemmWorkspace:
         """Add the permuted scale rows with one spare row for the -1 slots."""
         workspace = super()._allocate_workspace(rows, hidden_size)
@@ -9458,6 +9466,13 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
 
     def _check_support(self) -> None:
         super()._check_support()
+        if self._device_arch in (120, 121):
+            from ..grouped_mm.cudnn import _check_cudnn_version
+
+            _check_cudnn_version(
+                _CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION,
+                f"{self.backend_key} MoE on SM{self._device_arch}",
+            )
         intermediate_size = self.config.experts.intermediate_size
         if intermediate_size % _BLOCK_SCALE_TILE:
             raise NotImplementedError(

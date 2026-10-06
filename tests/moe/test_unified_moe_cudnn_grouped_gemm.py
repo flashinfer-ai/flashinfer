@@ -50,7 +50,11 @@ from flashinfer.fused_moe.api import (
     ALL_BACKEND_CONFIGS,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
-from flashinfer.fused_moe.runners import _MOE_UTILS_ARCHS, MoERunner
+from flashinfer.fused_moe.runners import (
+    _CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION,
+    _MOE_UTILS_ARCHS,
+    MoERunner,
+)
 from flashinfer.grouped_mm.core import (
     _check_grouped_mm_bf16,
     _check_grouped_mm_fp4,
@@ -188,7 +192,6 @@ def _device_arch() -> int:
 # GEMM although the flat ``grouped_mm_mxfp8`` / ``grouped_mm_fp4`` list those
 # architectures; the block-scaled backends are skipped there until the flat API
 # states the per-architecture minimum.
-_SM12X_BLOCK_SCALE_MIN_CUDNN = 92200
 _SM12X_BLOCK_SCALE_SKIP = (
     "cuDNN < 9.22 has no SM120 / SM121 engine for the block-scaled MoE grouped GEMM"
 )
@@ -199,7 +202,7 @@ def _sm12x_block_scale_unsupported() -> bool:
         return False
     import cudnn
 
-    return cudnn.backend_version() < _SM12X_BLOCK_SCALE_MIN_CUDNN
+    return cudnn.backend_version() < _CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION
 
 
 def _cudnn_backend_is_supported(key: str) -> bool:
@@ -447,6 +450,36 @@ def test_cudnn_check_support_rejects_unsupported_options():
         runner._device_arch = arch
         with pytest.raises(RuntimeError, match=f"does not support SM{arch}"):
             runner._check_support()
+
+
+@pytest.mark.skipif(not _cudnn_moe_available(), reason="requires cuDNN >= 9.21")
+def test_cudnn_block_scale_check_support_requires_cudnn_9_22_on_sm12x(monkeypatch):
+    """SM120 / SM121 get the block-scaled engine in cuDNN 9.22: older versions are
+    rejected at backend selection rather than at plan build."""
+    import cudnn
+
+    for version, rejected in (
+        (_CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION - 100, True),
+        (_CUDNN_SM12X_BLOCK_SCALE_MIN_VERSION, False),
+    ):
+        monkeypatch.setattr(cudnn, "backend_version", lambda v=version: v)
+        for key in _BLOCK_SCALE_KEYS:
+            for arch in (120, 121):
+                runner = _detached_runner(key, _config(key))
+                runner._device_arch = arch
+                if rejected:
+                    with pytest.raises(
+                        RuntimeError, match=f"SM{arch} requires backend version"
+                    ):
+                        runner._check_support()
+                else:
+                    runner._check_support()
+    # The plain grouped GEMMs keep the cuDNN 9.21 minimum on SM12x.
+    monkeypatch.setattr(cudnn, "backend_version", lambda: 92100)
+    for key in (_BF16_KEY, _FP8_KEY):
+        runner = _detached_runner(key, _config(key))
+        runner._device_arch = 120
+        runner._check_support()
 
 
 @pytest.mark.parametrize("key", _FAMILY_KEYS)

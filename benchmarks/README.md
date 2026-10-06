@@ -131,9 +131,9 @@ graph replay with cold-L2 benchmarking enabled; pass `--no_cuda_graph` for eager
 timing. Without `--autotune`, results are named after the backend (`cutlass`,
 `cutile`, `b12x`, `cudnn`); autotuned results append `_autotune`.
 CUTLASS comparisons also support `fp8` (per-tensor W8A8) and `mxfp4_w4a8`
-on supported architectures. These CUTLASS runners take prequantized activations,
-so the benchmark includes their public `prepare_activations` conversion in the
-main BF16-input latency. The additional CSV columns `prequantized_median_time`
+on supported architectures. These CUTLASS runners and the cuDNN `fp8` runner take
+prequantized activations, so the benchmark includes their public `prepare_activations`
+conversion in the main BF16-input latency. The additional CSV columns `prequantized_median_time`
 and `prequantized_std_time` (milliseconds) report the runner-only timing without
 that input conversion. Per-tensor CUTLASS uses its fixed GEMM2 activation scale,
 whereas cuTile dynamically scales GEMM2 input; equal precision pairs do not imply

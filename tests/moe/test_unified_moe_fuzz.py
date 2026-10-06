@@ -2371,23 +2371,23 @@ _CURATED = [
         )
         for variant, route, activation, seed, do_finalize in (
             ("cudnn_grouped_gemm_bf16", "uniform", "swiglu", 900_102, False),
-            ("cudnn_grouped_gemm_bf16", "imbalanced", "swiglu", 900_105, False),
-            ("cudnn_grouped_gemm_fp8_per_tensor", "uniform", "swiglu", 900_106, False),
+            ("cudnn_grouped_gemm_bf16", "imbalanced", "swiglu", 900_103, False),
+            ("cudnn_grouped_gemm_fp8_per_tensor", "uniform", "swiglu", 900_104, False),
             (
                 "cudnn_grouped_gemm_fp8_per_tensor",
                 "imbalanced",
                 "swiglu",
-                900_108,
+                900_105,
                 False,
             ),
-            ("cudnn_grouped_gemm_mxfp8", "uniform", "swiglu", 900_109, False),
-            ("cudnn_grouped_gemm_mxfp8", "imbalanced", "swiglu", 900_110, False),
-            ("cudnn_grouped_gemm_nvfp4", "uniform", "swiglu", 900_111, False),
-            ("cudnn_grouped_gemm_nvfp4", "imbalanced", "swiglu", 900_112, False),
-            ("cudnn_grouped_gemm_bf16", "imbalanced", "swiglu", 900_113, True),
-            ("cudnn_grouped_gemm_fp8_per_tensor", "uniform", "swiglu", 900_114, True),
-            ("cudnn_grouped_gemm_mxfp8", "uniform", "swiglu", 900_115, True),
-            ("cudnn_grouped_gemm_nvfp4", "imbalanced", "swiglu", 900_116, True),
+            ("cudnn_grouped_gemm_mxfp8", "uniform", "swiglu", 900_106, False),
+            ("cudnn_grouped_gemm_mxfp8", "imbalanced", "swiglu", 900_107, False),
+            ("cudnn_grouped_gemm_nvfp4", "uniform", "swiglu", 900_108, False),
+            ("cudnn_grouped_gemm_nvfp4", "imbalanced", "swiglu", 900_109, False),
+            ("cudnn_grouped_gemm_bf16", "imbalanced", "swiglu", 900_110, True),
+            ("cudnn_grouped_gemm_fp8_per_tensor", "uniform", "swiglu", 900_111, True),
+            ("cudnn_grouped_gemm_mxfp8", "uniform", "swiglu", 900_112, True),
+            ("cudnn_grouped_gemm_nvfp4", "imbalanced", "swiglu", 900_113, True),
         )
     ],
 ]
@@ -2438,7 +2438,7 @@ def test_b12x_w4a16_uses_nvfp4_weight_snap():
 
 def test_contract_curated_seeds_match_declared_capabilities():
     contract_cases = [cfg for cfg in _CURATED if cfg.variant in _CONTRACT_HANDLERS]
-    assert {cfg.seed for cfg in contract_cases} == set(range(900_080, 900_117))
+    assert {cfg.seed for cfg in contract_cases} == set(range(900_080, 900_114))
     for cfg in contract_cases:
         handler = _handler_for(cfg)
         config_type = handler.candidate_configs[0]

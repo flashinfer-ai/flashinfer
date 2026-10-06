@@ -109,14 +109,20 @@ _BACKEND_CONFIGS = {
 
 # Backends consuming a pre-quantized activation pack built once, outside the
 # timed region, by their config's ``prepare_activations``. The other quantized
-# backends read BF16 and quantize in-kernel, or (CUTLASS FP8 / MXFP4 W4A8)
+# backends read BF16 and quantize in-kernel, or (_TIMED_INPUT_QUANTIZATION)
 # quantize inside the timed region through ``input_quantizer``.
 _PREQUANTIZED_ACTIVATIONS = (
     CutlassNvfp4Config,
     CutlassMxfp8Config,
-    CudnnGroupedGemmFp8PerTensorConfig,
     CudnnGroupedGemmMxfp8Config,
     CudnnGroupedGemmNvfp4Config,
+)
+# Backends taking pre-quantized activations whose BF16 conversion is timed, to
+# match the API boundary of the backends that quantize in-kernel.
+_TIMED_INPUT_QUANTIZATION = (
+    CutlassFp8PerTensorConfig,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CutlassMxfp8Mxfp4Config,
 )
 # Per-tensor FP8 backends taking the static multipliers as ``prepare_weights`` inputs.
 _STATIC_FP8_PER_TENSOR = (CutlassFp8PerTensorConfig, CudnnGroupedGemmFp8PerTensorConfig)
@@ -533,6 +539,7 @@ def _measure_runner(
     *,
     input_quantizer=None,
     bf16_input=None,
+    hidden_index: int = 1,
 ):
     runner.forward(inputs, tactic=tactic, do_preparation=True)
     torch.cuda.synchronize()
@@ -541,11 +548,11 @@ def _measure_runner(
         if input_quantizer is None:
             packed = list(profile_inputs)
         else:
-            # CUTLASS FP8 takes prequantized input. Include its public BF16
-            # conversion in the timed graph to match cuTile's API boundary.
+            # Prequantized input: include its public BF16 conversion in the
+            # timed graph to match cuTile's API boundary.
             packed = list(profile_inputs[1:])
             quantized, scale = input_quantizer(profile_inputs[0])
-            packed[1] = quantized
+            packed[hidden_index] = quantized
             if scale is not None:  # per-tensor FP8 keeps its scale in the view
                 packed[-1] = scale
         return runner.forward(packed, tactic=tactic)
@@ -654,7 +661,7 @@ def run_unified_moe_test(args):
             weights = MoEWeightPack()
             weights.prepare_for(runner.backend_key, view)
             input_quantizer = None
-            if backend == "cutlass" and args.quant_variant in ("fp8", "mxfp4_w4a8"):
+            if config_type in _TIMED_INPUT_QUANTIZATION:
                 input_quantizer = prepare_activations
                 quantized, scale = input_quantizer(activations.hidden_states_q)
                 backend_activations = MoEActivationPack(
@@ -689,6 +696,11 @@ def run_unified_moe_test(args):
             tactic,
             input_quantizer=input_quantizer,
             bf16_input=activations.hidden_states_q,
+            hidden_index=next(
+                i
+                for i, tensor in enumerate(inputs)
+                if tensor is backend_activations.hidden_states_q
+            ),
         )
         backend_label = f"{backend}_autotune" if args.autotune else backend
 
