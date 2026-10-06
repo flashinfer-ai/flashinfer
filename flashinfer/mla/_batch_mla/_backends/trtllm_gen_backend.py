@@ -99,6 +99,16 @@ class _BatchMLAPagedAttentionTrtllmGenBackend(TunableRunner):
 
     # Capabilities and common state
 
+    _is_planned: bool
+    kv_cache: torch.Tensor
+    _qk_nope_head_dim: int
+    sinks: Optional[List[torch.Tensor]]
+    skip_softmax_threshold_scale_factor: Optional[float]
+    _is_var_seq: bool
+    return_lse: bool
+    lse: Optional[torch.Tensor]
+    return_lse_base: Optional[Literal["basee", "base2"]]
+
     _plan_capability_error_type = _BackendPlanUnsupportedError
     _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="trtllm-gen",

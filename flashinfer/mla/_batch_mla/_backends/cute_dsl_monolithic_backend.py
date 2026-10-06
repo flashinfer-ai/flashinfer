@@ -21,6 +21,11 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
     """Concrete monolithic CuTe DSL MLA backend."""
 
     _profile_lse: Optional[torch.Tensor]
+    _lse_scale: float
+    return_lse_base: Optional[Literal["basee", "base2"]]
+    enable_dcp: bool
+    cp_world: int
+    cp_rank: int
     _backend_name = "cute-dsl-monolithic"
     _supports_lse = True
     _supports_variable_q = True

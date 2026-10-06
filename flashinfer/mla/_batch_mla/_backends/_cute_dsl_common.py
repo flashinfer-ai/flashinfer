@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from numbers import Real
-from typing import Any, Callable, ClassVar, Optional, Union
+from typing import Any, Callable, ClassVar, Optional, TypeVar, Union
 
 import torch
 
@@ -18,6 +18,11 @@ from ._capabilities import (
     _BackendPlanUnsupportedError,
     MLAPlanCapabilities,
     plan_capability_rejection_reason,
+)
+
+
+_CuteDslBackendT = TypeVar(
+    "_CuteDslBackendT", bound="_BatchMLAPagedAttentionCuteDslBackendBase"
 )
 
 
@@ -401,6 +406,26 @@ class _BatchMLAPagedAttentionCuteDslBackendBase(TunableRunner):
     _plan_capability_error_type = _BackendPlanUnsupportedError
     _plan_capabilities: ClassVar[MLAPlanCapabilities]
 
+    # Call-local state populated by the concrete functional factories.
+    _functional_run: Callable[..., Any]
+    _workspace_sizer: Callable[..., tuple[int, int]]
+    kv_cache: torch.Tensor
+    kv_lora_rank: int
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+    page_size: int
+    max_seq_len: int
+    softmax_scale: float
+    output_scale: float
+    out_dtype: torch.dtype
+    enable_pdl: bool
+    is_var_seq: bool
+    uses_shared_paged_kv_idx: bool
+    lse: Optional[torch.Tensor]
+    return_lse: bool
+    sinks: Optional[torch.Tensor]
+    cute_dsl_impl: str
+
     def __init__(self, workspace_buffer: torch.Tensor) -> None:
         self._backend = self._backend_name
         self._float_workspace_buffer = workspace_buffer
@@ -410,8 +435,8 @@ class _BatchMLAPagedAttentionCuteDslBackendBase(TunableRunner):
     @classmethod
     @_audit_plan_from_wrapper_arguments
     def plan_from_wrapper(
-        cls, args: _MLAPlanArguments
-    ) -> "_BatchMLAPagedAttentionCuteDslBackendBase":
+        cls: type[_CuteDslBackendT], args: _MLAPlanArguments
+    ) -> _CuteDslBackendT:
         cls.preflight_plan_from_wrapper(args)
         args.require_cuda_graph_dense_metadata(cls._backend_name)
         dense = args.device_dense(table_width_alignment=128 // args.page_size)

@@ -129,7 +129,7 @@ def test_batch_mla_module_proxy_rejects_invalid_workspace_prefix(
 
 def _minimal_uninitialized_wrapper(wrapper_cls, *, use_cuda_graph=False):
     wrapper = wrapper_cls.__new__(wrapper_cls)
-    wrapper._float_workspace_buffer = torch.empty(16, dtype=torch.uint8)
+    wrapper._float_workspace_buffer = torch.empty(256 * 1024, dtype=torch.uint8)
     wrapper._int_workspace_buffer = torch.empty(16, dtype=torch.uint8)
     wrapper._pin_memory_int_workspace_buffer = torch.empty(16, dtype=torch.uint8)
     wrapper._use_cuda_graph = use_cuda_graph
@@ -165,6 +165,8 @@ def _patch_fake_fa_module(monkeypatch, fake_module):
             module, "_validate_generated_fa_plan", lambda **kwargs: None
         )
     monkeypatch.setattr(fa_common, "_validate_fa_plan_workload", lambda *args: None)
+    # Model one SM while keeping the real workspace-capacity check enabled.
+    monkeypatch.setattr(fa_common, "get_device_sm_count", lambda device: 1)
     monkeypatch.setattr(fa2_backend, "get_batch_mla_module", lambda *args: fake_module)
     monkeypatch.setattr(fa3_backend, "get_batch_mla_module", lambda *args: fake_module)
 
@@ -3433,7 +3435,7 @@ def _rollback_plan_args(*, graph=False, **overrides):
             "metadata": _dense_metadata(),
             "output_dtype": torch.bfloat16,
             "kv_layout": "combined",
-            "_float_workspace_buffer": torch.full((128,), 17, dtype=torch.uint8),
+            "_float_workspace_buffer": torch.full((256 * 1024,), 17, dtype=torch.uint8),
             "_use_cuda_graph": graph,
             "_qo_indptr_buf": torch.full((3,), -1, dtype=torch.int32),
             "_kv_indptr_buf": torch.full((3,), -1, dtype=torch.int32),

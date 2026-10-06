@@ -180,6 +180,7 @@ class _BatchMLAPagedAttentionXqaBackend(TunableRunner):
     _plan_capability_error_type = _BackendPlanUnsupportedError
     _bmm1_scale: Union[float, torch.Tensor]
     _bmm2_scale: Union[float, torch.Tensor]
+    _kv_cache: torch.Tensor
     _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="XQA",
         lse_modes=frozenset({"none"}),
