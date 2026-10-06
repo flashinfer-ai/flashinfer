@@ -1655,6 +1655,21 @@ def _nvfp4_kv_requires_disabled_split_kv(
     return get_compute_capability(device) in _NVFP4_SPLIT_KV_BROKEN_ARCHS
 
 
+def _host_uniform_q_len(
+    uniform_q_len: Optional[int], qo_indptr_host: torch.Tensor
+) -> int:
+    """Return ``uniform_q_len`` when it is positive and every request in
+    ``qo_indptr_host`` has exactly that many query rows, else ``0``. Pure host
+    arithmetic on the copy ``plan()`` already makes; no device sync."""
+    if uniform_q_len is None:
+        return 0
+    uniform_q_len = int(uniform_q_len)
+    if uniform_q_len <= 0 or qo_indptr_host.numel() < 2:
+        return 0
+    q_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
+    return uniform_q_len if bool((q_lens == uniform_q_len).all()) else 0
+
+
 def _resolve_uniform_q_len(
     uniform_q_len: Optional[int],
     qo_indptr_host: torch.Tensor,
@@ -1686,7 +1701,7 @@ def _resolve_uniform_q_len(
         # already sizes the tile from the batch's actual query lengths.
         return 0
     q_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
-    if q_lens.numel() == 0 or not bool((q_lens == uniform_q_len).all()):
+    if _host_uniform_q_len(uniform_q_len, qo_indptr_host) == 0:
         lo = int(q_lens.min()) if q_lens.numel() else 0
         hi = int(q_lens.max()) if q_lens.numel() else 0
         logger.warning_once(
@@ -1708,8 +1723,9 @@ def _resolve_uniform_q_len(
 # (csrc/eagle_verify_fp8kv_sm90.cu, flashinfer/jit/eagle_verify_fp8kv_sm90.py).
 #
 # Dispatched from BatchPrefillWithPagedKVCacheWrapper.run() instead of the FA2
-# paged kernel when plan() forwarded ``uniform_q_len == 4`` (the EAGLE verify
-# shape: 4 draft tokens per request), a custom mask is in use and the geometry
+# paged kernel when the caller passed ``uniform_q_len == 4`` (the EAGLE verify
+# shape: 4 draft tokens per request) and the host batch has exactly 4 query rows
+# per request (eager and CUDA-graph plans alike), a custom mask is in use and the geometry
 # below holds (4 query heads per KV head on the rank, head_dim 256, page size
 # 1, NHD, bf16 q/o, e4m3 KV, compute capability 9.0); every other call takes
 # the stock path untouched. The kernel is a numerical drop-in for the FA2
@@ -1764,6 +1780,9 @@ _eagle_verify_fp8kv_sm90_counters: Dict[str, int] = {
 }
 _eagle_verify_fp8kv_sm90_module: Any = None
 _eagle_verify_fp8kv_sm90_module_error: Optional[str] = None
+# (id(module), device_index) pairs whose cudaFuncSetAttribute init has run.
+# Keyed by the module object as well as the device so that a replaced module
+# (tests, a rebuilt JIT) is initialised again before its first launch.
 _eagle_verify_fp8kv_sm90_init_devices: set = set()
 _eagle_verify_fp8kv_sm90_announced = False
 
@@ -1786,7 +1805,9 @@ def _eagle_verify_fp8kv_sm90_stats() -> Dict[str, Any]:
     stats["compiled_variants"] = 1 if _eagle_verify_fp8kv_sm90_module is not None else 0
     stats["distinct_kernels"] = 2  # split-KV attention + merge
     stats["graph_nodes_per_launch"] = 2
-    stats["init_devices"] = sorted(_eagle_verify_fp8kv_sm90_init_devices)
+    stats["init_devices"] = sorted(
+        {device for _, device in _eagle_verify_fp8kv_sm90_init_devices}
+    )
     stats["specialized_dispatches"] = stats["runs_dispatched"]
     return stats
 
@@ -1795,6 +1816,7 @@ def _reset_eagle_verify_fp8kv_sm90_stats() -> None:
     global _eagle_verify_fp8kv_sm90_announced
     for key in _eagle_verify_fp8kv_sm90_counters:
         _eagle_verify_fp8kv_sm90_counters[key] = 0
+    _eagle_verify_fp8kv_sm90_init_devices.clear()
     _eagle_verify_fp8kv_sm90_announced = False
 
 
@@ -1914,6 +1936,8 @@ def _eagle_verify_fp8kv_sm90_run_eligibility(
     set at plan time). Semantics first, then shapes/dtypes/strides, device last;
     no device synchronisation anywhere."""
     state = wrapper._eagle_verify_fp8kv_sm90_state
+    if getattr(wrapper, "_jit_module", None) is not None:
+        return "jit_module"
     if return_lse:
         return "return_lse"
     if sinks is not None:
@@ -2000,6 +2024,10 @@ def _eagle_verify_fp8kv_sm90_run_eligibility(
         or not mask.is_contiguous()
     ):
         return "custom_mask buffer"
+    if mask.data_ptr() % 4 != 0:
+        # the kernel reads its mask window as 32-bit words aligned relative
+        # to the buffer base, so the base itself must be 4-byte aligned
+        return "custom_mask buffer not 4-byte aligned"
     if mask.numel() < state.mask_bytes_required:
         # the kernel reads up to 7 bytes past the packed bits (see prepare)
         return f"custom_mask buffer {mask.numel()} < {state.mask_bytes_required} bytes"
@@ -2061,6 +2089,12 @@ def _eagle_verify_fp8kv_sm90_prepare(
     counters = _eagle_verify_fp8kv_sm90_counters
     wrapper._eagle_verify_fp8kv_sm90_state = None
     counters["plans_seen"] += 1
+    if getattr(wrapper, "_jit_module", None) is not None:
+        # a wrapper built with jit_args runs a custom attention variant; the
+        # specialized kernel implements the stock math only, so it must never
+        # replace that variant (silent stock path, like a non-verify plan)
+        counters["plans_not_verify_route"] += 1
+        return
     try:
         reason = _eagle_verify_fp8kv_sm90_plan_eligibility(
             wrapper._backend,
@@ -2142,21 +2176,30 @@ def _eagle_verify_fp8kv_sm90_prepare(
     mask_bytes_required = (
         int(packed_mask_bytes) + _EAGLE_VERIFY_FP8KV_SM90_MASK_TAIL_SLACK_BYTES
     )
-    if mask_buf.numel() < mask_bytes_required:
+    mask_misaligned = mask_buf.data_ptr() % 4 != 0
+    if mask_buf.numel() < mask_bytes_required or mask_misaligned:
         if wrapper.is_cuda_graph_enabled:
             # the buffer belongs to the caller (shared with the captured
             # graph); never swap it behind their back -> fail closed, once
             counters["plans_ineligible"] += 1
-            logger.info_once(
-                "eagle_verify_fp8kv_sm90: not dispatched for this plan "
-                "(custom_mask_buf has %d B of tail slack after the packed mask, "
-                "the kernel needs %d); the FA2 kernel serves it",
-                mask_buf.numel() - int(packed_mask_bytes),
-                _EAGLE_VERIFY_FP8KV_SM90_MASK_TAIL_SLACK_BYTES,
-            )
+            if mask_misaligned:
+                logger.info_once(
+                    "eagle_verify_fp8kv_sm90: not dispatched for this plan "
+                    "(custom_mask_buf is not 4-byte aligned; the kernel reads "
+                    "the mask as 32-bit words); the FA2 kernel serves it"
+                )
+            else:
+                logger.info_once(
+                    "eagle_verify_fp8kv_sm90: not dispatched for this plan "
+                    "(custom_mask_buf has %d B of tail slack after the packed mask, "
+                    "the kernel needs %d); the FA2 kernel serves it",
+                    mask_buf.numel() - int(packed_mask_bytes),
+                    _EAGLE_VERIFY_FP8KV_SM90_MASK_TAIL_SLACK_BYTES,
+                )
             return
         # eager mode: plan() allocated this buffer itself (exact size), so a
-        # padded copy is ours to make; the FA2 kernel reads only the packed bits
+        # padded, aligned copy is ours to make; the FA2 kernel reads only the
+        # packed bits
         padded = torch.zeros(
             mask_bytes_required, dtype=torch.uint8, device=mask_buf.device
         )
@@ -2169,9 +2212,10 @@ def _eagle_verify_fp8kv_sm90_prepare(
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
     )
-    if device_index not in _eagle_verify_fp8kv_sm90_init_devices:
+    init_key = (id(module), device_index)
+    if init_key not in _eagle_verify_fp8kv_sm90_init_devices:
         module.init(device_index)
-        _eagle_verify_fp8kv_sm90_init_devices.add(device_index)
+        _eagle_verify_fp8kv_sm90_init_devices.add(init_key)
     num_splits = max(
         1,
         ceil_div(
@@ -3737,9 +3781,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._backend == "fa2":
                 # specialized SM90 fp8-KV verify kernel: eligibility, JIT
                 # build and workspace are settled here, outside the hot path
+                # The kernel route needs the caller's promise to hold on the
+                # host batch, not the FA2 planner to have consumed it: the
+                # eager planner never reads the hint, so forwarded_uniform_q_len
+                # is 0 there while the shape contract is the same.
                 _eagle_verify_fp8kv_sm90_prepare(
                     self,
-                    forwarded_uniform_q_len,
+                    _host_uniform_q_len(uniform_q_len, qo_indptr_host),
                     self._custom_mask_buf is not None,
                     num_qo_heads,
                     num_kv_heads,

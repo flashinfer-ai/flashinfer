@@ -184,8 +184,9 @@ def test_uniform_q_len_plan_matches_stock_plan_on_device(
             paged_kv_last_page_len_buf=torch.empty(
                 batch_size, dtype=torch.int32, device=device
             ),
+            # one byte-aligned segment per request (segment_packbits layout)
             custom_mask_buf=torch.empty(
-                (batch_size * qo_len * kv_len + 7) // 8,
+                batch_size * ((qo_len * kv_len + 7) // 8),
                 dtype=torch.uint8,
                 device=device,
             )

@@ -237,6 +237,21 @@ def test_run_guard_reads_the_wrapper_state_set_by_plan():
     assert _run_reason(wrapper, tensors) == "device cpu"
 
 
+def test_run_guard_never_replaces_a_custom_jit_variant():
+    # a wrapper built with jit_args runs its own attention variant
+    wrapper, tensors = _fake_wrapper(_jit_module=object())
+    assert _run_reason(wrapper, tensors) == "jit_module"
+
+
+def test_run_guard_requires_a_4_byte_aligned_mask_buffer():
+    wrapper, tensors = _fake_wrapper()
+    backing = torch.full(
+        (wrapper._custom_mask_buf.numel() + 1,), 255, dtype=torch.uint8
+    )
+    wrapper._custom_mask_buf = backing[1:]  # contiguous, but base offset by 1 B
+    assert _run_reason(wrapper, tensors) == "custom_mask buffer not 4-byte aligned"
+
+
 def test_run_guard_asserts_the_strides_the_kernel_derives():
     wrapper, tensors = _fake_wrapper()
     # a KV pool with a padded head dim: 256 B rows are no longer 256 B apart
@@ -361,6 +376,35 @@ def test_prepare_requires_mask_tail_slack_in_cuda_graph_mode(eligible_without_mo
     wrapper = _contract_wrapper(2, 64 + MASK_TAIL_SLACK, cuda_graph=True)
     _eagle_verify_fp8kv_sm90_prepare(**_prepare_kwargs(wrapper, 2, good, 64))
     assert _eagle_verify_fp8kv_sm90_stats()["plans_ineligible"] == 1
+
+
+def test_prepare_never_replaces_a_custom_jit_variant(eligible_without_module):
+    good = torch.tensor([0, 4, 8], dtype=torch.int32)
+    wrapper = _contract_wrapper(2, 64 + MASK_TAIL_SLACK, cuda_graph=True)
+    wrapper._jit_module = object()
+    _eagle_verify_fp8kv_sm90_prepare(**_prepare_kwargs(wrapper, 2, good, 64))
+    stats = _eagle_verify_fp8kv_sm90_stats()
+    assert stats["plans_not_verify_route"] == 1 and stats["plans_ineligible"] == 0
+    assert wrapper._eagle_verify_fp8kv_sm90_state is None
+
+
+def test_prepare_requires_an_aligned_mask_buffer(eligible_without_module):
+    good = torch.tensor([0, 4, 8], dtype=torch.int32)
+    # caller-owned graph buffer whose base is offset by one byte: fail closed
+    wrapper = _contract_wrapper(2, 64 + MASK_TAIL_SLACK + 1, cuda_graph=True)
+    wrapper._custom_mask_buf = wrapper._custom_mask_buf[1:]
+    before = wrapper._custom_mask_buf
+    _eagle_verify_fp8kv_sm90_prepare(**_prepare_kwargs(wrapper, 2, good, 64))
+    stats = _eagle_verify_fp8kv_sm90_stats()
+    assert stats["plans_ineligible"] == 1 and stats["mask_buf_padded"] == 0
+    assert wrapper._custom_mask_buf is before
+    # an eager-mode buffer is ours: re-allocated aligned and padded
+    wrapper = _contract_wrapper(2, 64 + MASK_TAIL_SLACK + 1, cuda_graph=False)
+    wrapper._custom_mask_buf = wrapper._custom_mask_buf[1:]
+    _eagle_verify_fp8kv_sm90_prepare(**_prepare_kwargs(wrapper, 2, good, 64))
+    assert _eagle_verify_fp8kv_sm90_stats()["mask_buf_padded"] == 1
+    assert wrapper._custom_mask_buf.data_ptr() % 4 == 0
+    assert wrapper._custom_mask_buf.numel() == 64 + MASK_TAIL_SLACK
 
 
 def test_prepare_pads_the_eager_mode_mask_buffer(eligible_without_module):
@@ -514,8 +558,10 @@ def _wrapper(problem, device, use_cuda_graph=True):
         # + the tail slack the kernel's two-word mask window may read into
         # (serving frameworks size this buffer at max_tokens x context_len
         # bytes, far above the packed bits)
+        # segment_packbits pads every request to a byte boundary, so size per
+        # request rather than from the total bit count
         custom_mask_buf=torch.empty(
-            (bs * QO_LEN * kv_len + 7) // 8 + MASK_TAIL_SLACK,
+            bs * ((QO_LEN * kv_len + 7) // 8) + MASK_TAIL_SLACK,
             dtype=torch.uint8,
             device=device,
         ),
