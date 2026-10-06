@@ -399,9 +399,14 @@ def _install_jit_cache_wheel(
     index_url: str | None,
     nightly: bool,
     dry_run: bool,
-    mode: str = "all",
+    mode: str | None = None,
     sm_architectures: tuple[str, ...] = (),
 ) -> None:
+    if mode is None:
+        mode = "minimal" if sm_architectures else "all"
+    elif sm_architectures and mode != "minimal":
+        raise click.ClickException("--sm cannot be combined with --mode all.")
+
     detected_cuda_version = _parse_cuda_version(cuda_version)
     wheel_cuda_version = _resolve_jit_cache_cuda_version(detected_cuda_version)
     cuda_index_label = _cuda_version_to_index_label(wheel_cuda_version)
@@ -412,8 +417,6 @@ def _install_jit_cache_wheel(
     resolved_index_url = index_url or _build_jit_cache_index_url(
         cuda_index_label, nightly
     )
-    if sm_architectures and mode != "minimal":
-        raise click.ClickException("--sm can only be used with --mode minimal.")
 
     provider_tags: tuple[str, ...] = ()
     requirements = [shim_requirement]
@@ -733,12 +736,12 @@ def clear_cubin_cmd():
 @click.option(
     "--mode",
     type=click.Choice(("all", "minimal")),
-    default="all",
-    show_default=True,
+    default=None,
     help=(
         "Install all provider dependencies declared by the shim, or only the "
-        "providers selected by --sm or the visible GPUs. Minimal mode does not "
-        "add a baseline provider."
+        "providers selected by --sm or the visible GPUs. Defaults to minimal "
+        "when --sm is given, otherwise all. Minimal mode does not add a "
+        "baseline provider."
     ),
 )
 @click.option(
@@ -746,8 +749,8 @@ def clear_cubin_cmd():
     "sm_architectures",
     multiple=True,
     help=(
-        "CUDA architecture to install in minimal mode, such as sm80, sm90a, "
-        "or sm120f. May be repeated."
+        "CUDA architecture to install a provider for, such as sm80, sm90a, "
+        "or sm120f. Implies --mode minimal. May be repeated."
     ),
 )
 @click.option(

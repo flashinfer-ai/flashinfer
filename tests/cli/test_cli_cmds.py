@@ -270,6 +270,52 @@ def test_install_jit_cache_wheel_cmd_minimal_does_not_add_sm80(monkeypatch):
     ]
 
 
+def test_install_jit_cache_wheel_cmd_sm_implies_minimal(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "12.9")
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm80", "sm90a")
+
+    out = _test_cmd_helper(["install-jit-cache-wheel", "--sm", "sm90a", "--dry-run"])
+
+    _assert_output_contains_all(
+        out,
+        "Install mode: minimal",
+        "Providers: sm90a",
+        "--no-deps",
+        "flashinfer-jit-cache==0.4.1+cu129 flashinfer-jit-cache-sm90a==0.4.1+cu129",
+    )
+    assert "flashinfer-jit-cache-sm80" not in out
+
+
+def test_install_jit_cache_wheel_cmd_rejects_sm_with_mode_all(monkeypatch):
+    from click.testing import CliRunner
+
+    from flashinfer.__main__ import cli
+
+    def fail_run(*_args, **_kwargs):
+        pytest.fail("Conflicting options must not execute subprocesses")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "install-jit-cache-wheel",
+            "--cuda-version",
+            "12.9",
+            "--mode",
+            "all",
+            "--sm",
+            "sm90a",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--sm cannot be combined with --mode all." in result.output
+
+
 def test_install_jit_cache_wheel_cmd_minimal_detects_visible_sm(monkeypatch):
     import flashinfer.__main__ as flashinfer_main
 
