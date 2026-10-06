@@ -1004,10 +1004,6 @@ class CakeSSDCombined:
                 )
         if z is not None and (z.shape != x.shape or z.dtype != torch.bfloat16):
             raise ValueError("z must have the same shape and dtype as x")
-        # The scan epilogue reads z and D in 16-byte groups (CAKE-991).
-        for name, tensor in (("D", D), ("z", z)):
-            if tensor is not None and tensor.data_ptr() % 16 != 0:
-                raise ValueError(f"{name} must be 16-byte aligned")
         if initial_states is not None:
             expected_states = (
                 num_sequences,
@@ -1254,6 +1250,12 @@ class CakeSSDCombined:
             d_arg = workspace["d_head"]
             pending_copies.append((d_arg, D[:, 0]))
         z_arg = z if z is not None else self._dummy(x.device, torch.bfloat16)
+        # The scan epilogue reads z and D in 16-byte groups (CAKE-991). Check
+        # the tensors that are bound: packed copies and workspace buffers are
+        # aligned by construction, a contiguous view at an odd offset is not.
+        for name, bound, given in (("D", d_arg, D), ("z", z_arg, z)):
+            if given is not None and bound.data_ptr() % 16 != 0:
+                raise ValueError(f"{name} must be 16-byte aligned")
         initial_arg = (
             initial_states
             if initial_states is not None

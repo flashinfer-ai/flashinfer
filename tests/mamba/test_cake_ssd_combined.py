@@ -2138,6 +2138,29 @@ def test_cake_ssd_combined_rejects_invalid_public_inputs_like_cute(invalid):
         assert errors["cake"][1].endswith("(2, 128, 8, 64)")
 
 
+def test_cake_ssd_combined_checks_alignment_on_the_bound_tensors():
+    """The 16-byte ``z`` / ``D`` alignment the scan epilogue needs (CAKE-991)
+    is checked on the tensors the kernel reads: a contiguous view at an 8-byte
+    offset is rejected, while a strided view with the same odd base is repacked
+    into an aligned workspace copy and runs (bitwise the contiguous result)."""
+    _skip_unless_cake_arch()
+    constructor, tensors, arguments = _case()
+    runner = SSDCombined(**constructor, backend="cake")
+    reference = runner.run(*tensors, **arguments)
+    z = arguments["z"]
+    buffer = torch.empty(z.numel() + 4, dtype=z.dtype, device=z.device)
+    misaligned = buffer[4:].view(z.shape).copy_(z)
+    assert misaligned.is_contiguous() and misaligned.data_ptr() % 16 == 8
+    with pytest.raises(ValueError, match="z must be 16-byte aligned"):
+        runner.run(*tensors, **{**arguments, "z": misaligned})
+    wide = torch.empty((*z.shape[:-1], z.shape[-1] + 8), dtype=z.dtype, device=z.device)
+    strided = wide[..., 4 : 4 + z.shape[-1]].copy_(z)
+    assert not strided.is_contiguous() and strided.data_ptr() % 16 == 8
+    repacked = runner.run(*tensors, **{**arguments, "z": strided})
+    for actual, expected in zip(repacked, reference, strict=False):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, request):
     module = importlib.import_module("flashinfer.mamba.ssd_combined")
     runners = []
@@ -2856,8 +2879,6 @@ def _source_cake_varlen_arguments(runner, tensors):
         ("d_dtype", "D must have shape"),
         ("z_shape", "z must have the same shape and dtype as x"),
         ("z_dtype", "z must have the same shape and dtype as x"),
-        ("d_alignment", "D must be 16-byte aligned"),
-        ("z_alignment", "z must be 16-byte aligned"),
         ("initial_shape", "initial_states must have shape"),
         ("seq_idx_shape", "seq_idx shape or dtype"),
         ("seq_idx_dtype", "seq_idx shape or dtype"),
@@ -2964,17 +2985,6 @@ def test_source_public_cake_domain_validation_without_gpu(invalid, match):
         )
         if invalid == "d_dtype":
             kwargs["D"] = torch.empty(2, dtype=torch.float16)
-    elif invalid in {"d_alignment", "z_alignment"}:
-        # Contiguous, but 8 bytes past a 16-byte boundary (CAKE-991 reads
-        # z and D in 16-byte groups).
-        if invalid == "d_alignment":
-            cake_runner.has_d = True
-            kwargs["D"] = torch.empty(cake_runner.nheads + 4, dtype=torch.bfloat16)[4:]
-        else:
-            cake_runner.has_z = True
-            kwargs["z"] = torch.empty(tensors[0].numel() + 4, dtype=torch.bfloat16)[
-                4:
-            ].view(tensors[0].shape)
     elif invalid in {"z_shape", "z_dtype"}:
         cake_runner.has_z = True
         kwargs["z"] = torch.empty(
