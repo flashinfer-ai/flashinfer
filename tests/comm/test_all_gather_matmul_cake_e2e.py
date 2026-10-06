@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Multi-GPU numerical test of the Cake all-gather matmul backend on an NCCL
-subgroup of two, four or eight SM100 / SM103 devices.
+subgroup of two, four or eight SM100 / SM103 devices: both weight layouts,
+tail row counts, scratch growth and the capacity-bound prepared launcher.
 """
 
 import gc
@@ -30,7 +31,9 @@ import torch.multiprocessing as mp
 from flashinfer.comm import all_gather_matmul, prepare_all_gather_matmul
 from flashinfer.utils import get_compute_capability
 
-PACKED_QKV_N_BY_WORLD_SIZE = {4: 2560, 8: 1280}
+K = 8192
+# Llama-3.1-70B column-parallel widths per tensor-parallel degree (qkv, gate_up).
+ENGINE_WIDTHS = {2: (2048,), 4: (2560, 14336), 8: (1280, 7168)}
 
 
 def _expected(inp, weight, group, world_size):
@@ -39,6 +42,10 @@ def _expected(inp, weight, group, world_size):
     )
     dist.all_gather_into_tensor(gathered, inp, group=group)
     return (gathered.float() @ weight.float()).to(inp.dtype)
+
+
+def _check(actual, expected):
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
 def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype):
@@ -56,18 +63,18 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     symm_mem.enable_symm_mem_for_group(group.group_name)
     torch.manual_seed(41 + rank)
     rows = 384
-    inp = torch.randn(rows, 8192, dtype=dtype, device=device)
-    weight = torch.randn(8192, 2048, dtype=dtype, device=device)
+    inp = torch.randn(rows, K, dtype=dtype, device=device)
+    weight = torch.randn(K, 2048, dtype=dtype, device=device)
     expected = _expected(inp, weight, group, world_size)
 
     # Two consecutive calls return fresh outputs and the first is not overwritten.
     first = all_gather_matmul(inp, weight, group, backend="cake")
-    torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
+    _check(first, expected)
     first_snapshot = first.clone()
     second = all_gather_matmul(inp, weight, group, backend="cake")
     assert first.data_ptr() != second.data_ptr()
     torch.testing.assert_close(first, first_snapshot, atol=0, rtol=0)
-    torch.testing.assert_close(second, expected, atol=1e-2, rtol=1e-2)
+    _check(second, expected)
 
     # The backend callable writes a caller-provided output in place; a strided
     # input is rejected, not copied.
@@ -79,15 +86,37 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
         (world_size * rows, 2048), float("nan"), dtype=dtype, device=device
     )
     assert all_gather_matmul_cake(inp, weight, group, backend="cake", out=out) is out
-    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+    _check(out, expected)
     with pytest.raises(ValueError, match="contiguous"):
         all_gather_matmul(inp.t().contiguous().t(), weight, group, backend="cake")
+
+    # The engine's [N, K] parameter is consumed through its transposed view
+    # (no copy); a weight with other strides is rejected.
+    param = torch.randn(2048, K, dtype=dtype, device=device)
+    expected_k_major = _expected(inp, param.t(), group, world_size)
+    _check(all_gather_matmul(inp, param.t(), group, backend="cake"), expected_k_major)
+    with pytest.raises(ValueError, match="strides"):
+        all_gather_matmul(
+            inp,
+            torch.randn(K, 4096, dtype=dtype, device=device)[:, :2048],
+            group,
+            backend="cake",
+        )
+
+    # Tail row counts: the output has exactly world_size * M rows and the
+    # scratch grows once when a larger M arrives.
+    for tail_rows in (125, 1025):
+        tail_inp = torch.randn(tail_rows, K, dtype=dtype, device=device)
+        tail_out = all_gather_matmul(tail_inp, param.t(), group, backend="cake")
+        assert tail_out.shape == (world_size * tail_rows, 2048)
+        _check(tail_out, _expected(tail_inp, param.t(), group, world_size))
+        del tail_inp, tail_out
 
     # The backend keeps no reference to the caller's tensors.
     inp_ref = weakref.ref(inp)
     weight_ref = weakref.ref(weight)
     torch.cuda.synchronize(device)
-    del first, first_snapshot, second, expected, out, inp, weight
+    del first, first_snapshot, second, expected, expected_k_major, out, inp, weight
     gc.collect()
     assert inp_ref() is None
     assert weight_ref() is None
@@ -96,41 +125,54 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     producer_stream = torch.cuda.Stream(device=device)
     torch.manual_seed(141 + rank)
     with torch.cuda.stream(producer_stream):
-        inp = torch.randn(rows, 8192, dtype=dtype, device=device)
-        weight = torch.randn(8192, 2048, dtype=dtype, device=device)
+        inp = torch.randn(rows, K, dtype=dtype, device=device)
+        weight = torch.randn(K, 2048, dtype=dtype, device=device)
         expected = _expected(inp, weight, group, world_size)
         result = all_gather_matmul(inp, weight, group, backend="cake")
     torch.cuda.current_stream(device).wait_stream(producer_stream)
-    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
-    del inp, weight, expected, result
+    _check(result, expected)
+    del inp, weight, expected, result, param
 
-    packed_n = PACKED_QKV_N_BY_WORLD_SIZE.get(world_size)
-    capability = get_compute_capability(device)
-    packed_routed = packed_n is not None and (world_size == 8 or capability == (10, 3))
-    if packed_routed and dtype == torch.bfloat16:
-        packed_rows = 512
-        packed_weight = torch.randn(8192, packed_n, dtype=dtype, device=device)
-        active_inp = torch.randn(packed_rows, 8192, dtype=dtype, device=device)
-        packed_expected = _expected(active_inp, packed_weight, group, world_size)
-        launcher = prepare_all_gather_matmul(
-            active_inp, packed_weight, group, backend="cake"
-        )
-        packed_stream = torch.cuda.Stream(device=device)
-        packed_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(packed_stream):
-            packed_first = launcher(active_inp)
-            packed_first_snapshot = packed_first.clone()
-            active_inp.neg_()
-            packed_second = launcher(active_inp)
-        torch.cuda.current_stream(device).wait_stream(packed_stream)
-        assert packed_first.data_ptr() != packed_second.data_ptr()
-        torch.testing.assert_close(packed_first, packed_first_snapshot, atol=0, rtol=0)
-        torch.testing.assert_close(packed_first, packed_expected, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(
-            packed_second, -packed_expected, atol=1e-2, rtol=1e-2
-        )
-        with pytest.raises(ValueError, match="shape"):
-            launcher(torch.randn(packed_rows * 2, 8192, dtype=dtype, device=device))
+    # Capacity-bound prepared launcher on the engine widths of this
+    # tensor-parallel degree with the engine's [N, K] parameters: one
+    # collective at preparation, then any row count up to max_rows.
+    if dtype == torch.bfloat16:
+        for n in ENGINE_WIDTHS[world_size]:
+            engine_param = torch.randn(n, K, dtype=dtype, device=device)
+            sample = torch.randn(512, K, dtype=dtype, device=device)
+            launcher = prepare_all_gather_matmul(
+                sample, engine_param.t(), group, backend="cake", max_rows=2048
+            )
+            prepared_stream = torch.cuda.Stream(device=device)
+            prepared_stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(prepared_stream):
+                prepared_first = launcher(sample)
+                prepared_first_snapshot = prepared_first.clone()
+                sample.neg_()
+                prepared_second = launcher(sample)
+            torch.cuda.current_stream(device).wait_stream(prepared_stream)
+            sample.neg_()
+            prepared_expected = _expected(sample, engine_param.t(), group, world_size)
+            assert prepared_first.data_ptr() != prepared_second.data_ptr()
+            torch.testing.assert_close(
+                prepared_first, prepared_first_snapshot, atol=0, rtol=0
+            )
+            _check(prepared_first, prepared_expected)
+            _check(prepared_second, -prepared_expected)
+            for served_rows in (125, 1025, 2048):
+                served = torch.randn(served_rows, K, dtype=dtype, device=device)
+                served_out = launcher(served)
+                assert served_out.shape == (world_size * served_rows, n)
+                _check(
+                    served_out, _expected(served, engine_param.t(), group, world_size)
+                )
+                del served, served_out
+            with pytest.raises(ValueError, match=r"\[1, 2048\]"):
+                launcher(torch.randn(2049, K, dtype=dtype, device=device))
+            with pytest.raises(ValueError, match="contiguous"):
+                launcher(torch.randn(512, 2 * K, dtype=dtype, device=device)[:, :K])
+            del launcher, engine_param, sample, prepared_first, prepared_second
+            del prepared_first_snapshot, prepared_expected
 
     torch.cuda.synchronize(device)
     dist.destroy_process_group(group)

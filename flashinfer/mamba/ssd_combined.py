@@ -25,10 +25,10 @@ import functools
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import cuda.bindings.driver as cuda_drv
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
-import cuda.bindings.driver as cuda_drv
 import torch
 from cutlass import Int32
 from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
@@ -259,9 +259,18 @@ class SSDCombined:
 
     Dtype expectations (no runtime conversions — assert on mismatch):
         io_dtype (bf16):  x, B, C, z, D, out, dt_processed
-        state_dtype (bf16): initial_states, final_states
+        state_dtype:      initial_states, final_states (bf16/fp16 for the CuTe
+                          backend; bf16/fp16/fp32 for backend="cake")
         fp32 always:      A, dA_cumsum
-        any (bf16/fp32):  dt, dt_bias (consumed by Triton cumsum preprocessor)
+        any (bf16/fp32):  dt, dt_bias (consumed by the cumsum preprocessor)
+
+    Output layout differs per backend: the CuTe kernel writes the chunked
+    ``[batch, nheads, headdim, nchunks, chunk_size]`` buffer and ``run``
+    returns a token-major view of it; the Cake kernels write the token-major
+    ``[batch, seqlen, nheads, headdim]`` buffer directly and return it.  The
+    Cake backend also accepts any positive ``seqlen`` and, in varlen mode,
+    ``initial_states=None`` with the sequence count from ``seq_chunk_cumsum``
+    or ``num_seqs``.
 
     Usage::
 
@@ -510,11 +519,14 @@ class SSDCombined:
         checkpoint_states: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
+        num_seqs: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass.
 
         Args:
             x: Input tensor of shape ``[batch, seqlen, nheads, headdim]``.
+                The CuTe backend requires ``seqlen`` to be a multiple of
+                ``chunk_size``; the Cake backend accepts any positive length.
             dt: Per-token step sizes of shape ``[batch, seqlen, nheads]``.
             A: Float32 state-transition coefficients of shape ``[nheads]``.
             B: Input projection of shape
@@ -528,9 +540,20 @@ class SSDCombined:
             dt_limit: Inclusive lower and upper limits for processed step sizes.
             initial_states: Optional initial state tensor of shape
                 ``[num_seqs, nheads, headdim, dstate]`` in varlen mode, or
-                ``[batch, nheads, headdim, dstate]`` in batched mode.
+                ``[batch, nheads, headdim, dstate]`` in batched mode.  The
+                CuTe backend requires it in varlen mode (it supplies the
+                sequence count); the Cake backend starts from zero state when
+                it is omitted and takes the count from ``seq_chunk_cumsum``
+                or ``num_seqs``.
             seq_idx: Optional int32/int64 packed-sequence IDs of shape
-                ``[batch, seqlen]``.
+                ``[batch, seqlen]``.  Precondition for both backends (not
+                checked on the device-side hot path): every ID lies in
+                ``[0, num_seqs)``, IDs are non-decreasing along the packed
+                token axis, and every ID in that range owns at least one
+                token.  An out-of-range ID indexes ``initial_states`` /
+                the ``[num_seqs + 1]`` chunk-boundary table out of bounds,
+                and an ID without tokens leaves its boundary entry
+                undefined for the Cake backend.
             chunk_indices: Optional int32 physical-chunk index for every logical
                 varlen segment.
             chunk_offsets: Optional int32 in-chunk start offset for every logical
@@ -540,7 +563,10 @@ class SSDCombined:
                 as pre-computed and the internal computation is skipped.
                 If provided with update_seq_chunk_cumsum=True, used as the output
                 buffer and filled by the internal computation.
-                If None, an internal buffer is allocated and computed.
+                If None, an internal buffer is allocated and computed.  The
+                CuTe backend computes it with a separate kernel; the Cake
+                backend's preprocess kernel writes it, so filling a
+                caller-owned buffer costs no extra launch there.
             update_seq_chunk_cumsum: If True, (re)compute seq_chunk_cumsum into
                 the provided tensor.  Defaults to False.
             checkpoint_token_indices: Optional contiguous int32 vector with one
@@ -554,38 +580,54 @@ class SSDCombined:
             checkpoint_states: Optional caller-owned contiguous output with shape
                 ``[num_checkpoints, nheads, headdim, dstate]`` and state dtype.
                 Supported by the Cake backend.
-            out: Optional caller-owned contiguous output storage with shape
-                ``[batch, nheads, headdim, nchunks, chunk_size]``. A fresh tensor
-                is allocated when omitted.
+            out: Optional caller-owned contiguous output storage.  Its layout
+                is the backend's kernel layout: chunked
+                ``[batch, nheads, headdim, nchunks, chunk_size]`` for the CuTe
+                backend and token-major ``[batch, seqlen, nheads, headdim]``
+                for the Cake backend.  A fresh tensor is allocated when
+                omitted.
             return_final_states: Whether to return the final state for every
                 batch element or packed sequence.
+            num_seqs: Optional packed-sequence count for the Cake backend when
+                varlen mode runs without ``initial_states`` and without
+                ``seq_chunk_cumsum``.  Rejected by the CuTe backend.  Must
+                equal the number of distinct IDs in ``seq_idx`` (see the
+                ``seq_idx`` precondition).
 
         Returns:
             A pair containing token-major output with shape
             ``[batch, seqlen, nheads, headdim]`` and either the final states or
-            ``None`` when ``return_final_states`` is false.
+            ``None`` when ``return_final_states`` is false.  The Cake backend
+            returns ``out`` itself; the CuTe backend returns a view of the
+            chunked ``out`` buffer.
         """
         # Keep backend-independent public validation ahead of dispatch so Cake
         # and CuTe expose the same exception type and message for shared API
         # errors.  Backend-specific domain checks remain in their runners.
         chunk_size = self.chunk_size
         batch, seqlen, nheads, headdim = x.shape
+        cake = self._backend == "cake"
         nchunks = seqlen // chunk_size
-        assert seqlen % chunk_size == 0, (
-            f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
-        )
+        if not cake:
+            assert seqlen % chunk_size == 0, (
+                f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
+            )
         assert A.dtype == torch.float32, f"A must be float32, got {A.dtype}"
         if out is not None:
-            assert out.shape == (batch, nheads, headdim, nchunks, chunk_size), (
-                f"out shape {out.shape} doesn't match "
-                f"expected ({batch}, {nheads}, {headdim}, {nchunks}, {chunk_size})"
+            expected_out: Tuple[int, ...]
+            if cake:
+                expected_out = (batch, seqlen, nheads, headdim)
+                layout = "(B, S, EH, D)"
+            else:
+                expected_out = (batch, nheads, headdim, nchunks, chunk_size)
+                layout = "(B, EH, D, C, L)"
+            assert out.shape == expected_out, (
+                f"out shape {out.shape} doesn't match expected {expected_out}"
             )
             assert out.dtype == x.dtype, (
                 f"out dtype {out.dtype} doesn't match x dtype {x.dtype}"
             )
-            assert out.is_contiguous(), (
-                "out must be contiguous in (B, EH, D, C, L) layout"
-            )
+            assert out.is_contiguous(), f"out must be contiguous in {layout} layout"
 
         io_torch_dtype = self._io_torch_dtype
         assert x.dtype == io_torch_dtype, (
@@ -638,7 +680,8 @@ class SSDCombined:
                 f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
             )
         if (
-            seq_idx is not None
+            not cake
+            and seq_idx is not None
             and chunk_indices is not None
             and chunk_offsets is not None
             and initial_states is None
@@ -648,7 +691,7 @@ class SSDCombined:
                 "chunk_indices, and chunk_offsets are given) to determine num_seqs"
             )
 
-        if self._backend == "cake":
+        if cake:
             return self._cake_runner.run(
                 x,
                 dt,
@@ -671,6 +714,7 @@ class SSDCombined:
                 checkpoint_states=checkpoint_states,
                 out=out,
                 return_final_states=return_final_states,
+                num_seqs=num_seqs,
             )
 
         if any(
@@ -683,6 +727,11 @@ class SSDCombined:
         ):
             raise ValueError(
                 "selective checkpoint state outputs require SSDCombined backend='cake'"
+            )
+        if num_seqs is not None:
+            raise ValueError(
+                "num_seqs requires SSDCombined backend='cake'; the CuTe backend "
+                "takes the sequence count from initial_states"
             )
 
         _, _, ngroups, dstate = B.shape
@@ -906,12 +955,14 @@ def ssd_combined_fwd(
     checkpoint_states: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     return_final_states: bool = True,
+    num_seqs: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the source-built Cake SSDCombined backend.
 
     Args:
         x: BF16 input tensor of shape
-            ``[batch, seqlen, nheads, headdim]``.
+            ``[batch, seqlen, nheads, headdim]``; any positive ``seqlen`` is
+            accepted (a partial trailing 128-token chunk is handled in-kernel).
         dt: Per-token step sizes of shape ``[batch, seqlen, nheads]``.
         A: Float32 state-transition coefficients of shape ``[nheads]``.
         B: BF16 input projection of shape
@@ -923,10 +974,12 @@ def ssd_combined_fwd(
         dt_bias: Optional step-size bias of shape ``[nheads]``.
         dt_softplus: Whether to apply softplus to ``dt + dt_bias``.
         dt_limit: Inclusive lower and upper limits for processed step sizes.
-        initial_states: Optional BF16 or FP16 initial states of shape
+        initial_states: Optional BF16, FP16, or FP32 initial states of shape
             ``[num_seqs, nheads, headdim, dstate]`` in packed-varlen mode, or
             ``[batch, nheads, headdim, dstate]`` in batched mode. Its dtype
-            selects the state dtype.
+            selects the state dtype. When omitted in packed-varlen mode the
+            scan starts from zero state and the sequence count comes from
+            ``seq_chunk_cumsum`` or ``num_seqs``.
         seq_idx: Optional int32 or int64 packed-sequence IDs of shape
             ``[batch, seqlen]``.
         chunk_indices: Optional int32 physical-chunk index for every logical
@@ -950,16 +1003,19 @@ def ssd_combined_fwd(
             with shape ``[num_checkpoints, nheads, headdim, dstate]`` and the
             selected state dtype. All three checkpoint arguments must be
             supplied together.
-        out: Optional caller-owned contiguous output storage with shape
-            ``[batch, nheads, headdim, nchunks, 128]``. A fresh tensor is
-            allocated when omitted.
+        out: Optional caller-owned contiguous token-major output storage with
+            shape ``[batch, seqlen, nheads, headdim]``, written directly by the
+            kernels. A fresh tensor is allocated when omitted.
         return_final_states: Whether to return the final state for every batch
             element or packed sequence.
+        num_seqs: Optional packed-sequence count for varlen mode without
+            ``initial_states`` and without ``seq_chunk_cumsum``.
 
     Returns:
-        A pair containing token-major output with shape
-        ``[batch, seqlen, nheads, headdim]`` and either final states or ``None``
-        when ``return_final_states`` is false.
+        A pair containing the token-major output ``out`` with shape
+        ``[batch, seqlen, nheads, headdim]`` and either final states of shape
+        ``[num_seqs, nheads, headdim, dstate]`` or ``None`` when
+        ``return_final_states`` is false.
     """
 
     _, _, nheads, headdim = x.shape
@@ -1015,4 +1071,5 @@ def ssd_combined_fwd(
         checkpoint_states=checkpoint_states,
         out=out,
         return_final_states=return_final_states,
+        num_seqs=num_seqs,
     )

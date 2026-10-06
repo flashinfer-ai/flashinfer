@@ -383,8 +383,11 @@ portfolio fails closed outside these contracts:
   ``(SwiGLU(), 2048, 512, 256, 8)``,
   ``(SwiGLU(), 4096, 1024, 512, 10)``,
   ``(SwiGLU(), 3072, 1536, 256, 8)``,
-  ``(SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4)``, or
-  ``(SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16)``;
+  ``(SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4)``,
+  ``(SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16)``, or one
+  of the sharded per-partition slices ``(SwiGLU(), 4096, 512, 512, 10)``,
+  ``(SwiGLU(), 4096, 256, 512, 10)``, ``(SwiGLU(), 3072, 768, 256, 8)``,
+  and ``(SwiGLU(), 3072, 384, 256, 8)``;
 * the token count is 1--32, routing is ``UnpackedPrecomputed`` with contiguous
   int32 expert IDs and BF16 routing weights;
 * quantization is NVFP4, finalization and PDL are enabled, and expert

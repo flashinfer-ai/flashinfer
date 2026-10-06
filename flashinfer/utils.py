@@ -712,6 +712,20 @@ def is_sm12x_supported(device: torch.device) -> bool:
     return version_at_least(torch.version.cuda, min_cuda)
 
 
+# Keep this table in sync with FLASHINFER_MAMBA_HAS_CVT_RS in
+# include/flashinfer/mamba/conversion.cuh.
+CVT_RS_SUPPORTED_ARCHES = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
+
+
+def cvt_rs_supported_arches_text() -> str:
+    """Return the supported stochastic-rounding targets in a stable order."""
+    return ", ".join(CVT_RS_SUPPORTED_ARCHES.values())
+
+
 def is_cvt_rs_supported(device: torch.device = None) -> bool:
     """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
 
@@ -722,7 +736,7 @@ def is_cvt_rs_supported(device: torch.device = None) -> bool:
     ~12-instruction software-emulation fallback and stochastic rounding runs
     ~4x slower (measured on B300 when the CUDA-side guard omitted SM103a).
     Keep this in lockstep with the FLASHINFER_MAMBA_HAS_CVT_RS guard in
-    include/flashinfer/mamba/conversion.cuh (SM100_ALL || SM103_ALL).
+    include/flashinfer/mamba/conversion.cuh.
     """
     if device is None:
         device = torch.device("cuda")

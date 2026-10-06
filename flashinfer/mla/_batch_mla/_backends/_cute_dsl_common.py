@@ -99,9 +99,9 @@ def _validate_cute_dsl_plan_args_before_metadata(args: _MLAPlanArguments) -> Non
             f"got {args.sm_scale!r}."
         )
     major, minor = get_compute_capability(args._float_workspace_buffer.device)
-    if (major, minor) not in ((10, 0), (10, 3)):
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
         raise _BackendPlanUnsupportedError(
-            "cute-dsl backend requires SM100/SM103, got compute capability "
+            "cute-dsl backend requires SM100/SM103/SM107, got compute capability "
             f"SM{major}{minor}."
         )
     from flashinfer.cute_dsl.availability import is_cute_dsl_arch_supported

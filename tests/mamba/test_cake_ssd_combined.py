@@ -17,6 +17,7 @@ limitations under the License.
 import importlib
 import importlib.util
 import inspect
+import math
 import re
 from contextlib import nullcontext
 from pathlib import Path
@@ -37,16 +38,217 @@ def _load_cake_benchmark_module():
     return module
 
 
-def _assert_cute_parity(actual, expected):
-    for index in (0, 1):
-        reference = expected[index]
-        # Cancellation ties the error to the head's magnitude rather than the
-        # entry's; the tensor max is a coarse bound on that.
-        atol = max(1e-2, 5e-4 * reference.abs().amax().item())
-        torch.testing.assert_close(actual[index], reference, atol=atol, rtol=1e-2)
+_ATOL = _RTOL = 1e-2
+# Upper bound on the fraction of Cake outputs / final-state entries outside
+# ``atol = rtol = 1e-2`` of the fp64 recurrence.  Measured on GB300 with
+# ``cake_ssd_accuracy_probe.py`` (FP16 delta): <= 0.15 % of the outputs on the
+# ``_case`` distribution, 0.53-0.57 % on the CAKE-950 realistic-decay
+# distribution (CuTe, bf16 delta: <= 0.20 % and 1.34-1.40 %); 0 final-state
+# entries in every case.
+_MAX_OUTSIDE_FRACTION = 0.01
+
+
+def _sequence_lengths(constructor, tensors, arguments):
+    """Per-sequence token counts: from ``seq_idx`` in packed-varlen mode,
+    ``seqlen`` per batch element otherwise."""
+
+    x = tensors[0]
+    if not constructor["has_varlen"]:
+        return [x.shape[1]] * x.shape[0]
+    seq_idx = arguments["seq_idx"].reshape(-1).to(torch.int64)
+    return torch.bincount(seq_idx).tolist()
+
+
+def _fp64_reference(constructor, tensors, arguments, *, delta_dtype=None):
+    """fp64 token-by-token SSM recurrence, the oracle both backends are
+    measured against.
+
+    ``dt' = clamp(softplus(dt + dt_bias), dt_limit)`` (softplus only when
+    requested); ``state = exp(dt' * A) * state + delta * (x (x) B)``;
+    ``y = C . state + D * x``; ``y *= z * sigmoid(z)`` when ``z`` is given.
+    ``delta`` is ``dt'`` rounded to ``delta_dtype`` (``None`` = exact); the
+    accuracy probe uses fp16 / bf16 here to emulate the kernels' ``delta``
+    storage, the decay always uses the exact ``dt'`` (both kernels scan the
+    fp32 ``dt * A``).  ``D`` follows the constructor like both backends: a 2D
+    ``D`` on a per-head constructor (``d_has_hdim=False``) consumes its first
+    column, a 1D ``D`` broadcasts over ``headdim``.
+    Returns the token-major fp64 output with ``x``'s shape and the
+    ``[num_seqs, nheads, 64, 128]`` final states (zero initial state when
+    ``initial_states`` is ``None``).
+    """
+
+    x, dt, A, B, C = tensors
+    lengths = _sequence_lengths(constructor, tensors, arguments)
+    batch, seqlen, nheads, headdim = x.shape
+    total = batch * seqlen
+    assert sum(lengths) == total, (lengths, total)
+    ngroups, dstate = B.shape[2], B.shape[3]
+    rep = nheads // ngroups
+    f64 = torch.float64
+    xf = x.reshape(total, nheads, headdim).to(f64)
+    dtf = dt.reshape(total, nheads).to(f64)
+    dt_bias = arguments.get("dt_bias")
+    if dt_bias is not None:
+        dtf = dtf + dt_bias.to(f64)
+    if arguments.get("dt_softplus", False):
+        dtf = torch.nn.functional.softplus(dtf)
+    dt_min, dt_max = arguments.get("dt_limit", (0.0, float("inf")))
+    dtf = dtf.clamp(min=float(dt_min), max=float(dt_max))
+    delta = dtf if delta_dtype is None else dtf.to(delta_dtype).to(f64)
+    decay = torch.exp(A.to(f64)[None, :] * dtf)
+    Bf = B.reshape(total, ngroups, dstate).to(f64).repeat_interleave(rep, dim=1)
+    Cf = C.reshape(total, ngroups, dstate).to(f64).repeat_interleave(rep, dim=1)
+    D = arguments.get("D")
+    if D is None:
+        Df = torch.zeros((nheads, 1), dtype=f64, device=x.device)
+    else:
+        Df = D.to(f64)
+        Df = Df[:, None] if Df.ndim == 1 else Df
+        if not constructor["d_has_hdim"]:
+            Df = Df[:, :1]
+    initial = arguments.get("initial_states")
+    y = torch.empty((total, nheads, headdim), dtype=f64, device=x.device)
+    states = torch.empty(
+        (len(lengths), nheads, headdim, dstate), dtype=f64, device=x.device
+    )
+    start = 0
+    for sequence, length in enumerate(lengths):
+        if initial is None:
+            state = torch.zeros((nheads, headdim, dstate), dtype=f64, device=x.device)
+        else:
+            state = initial[sequence].to(f64).clone()
+        for token in range(start, start + length):
+            state = state * decay[token][:, None, None] + (
+                (delta[token][:, None] * xf[token])[:, :, None] * Bf[token][:, None, :]
+            )
+            y[token] = torch.einsum("hdn,hn->hd", state, Cf[token]) + Df * xf[token]
+        states[sequence] = state
+        start += length
+    z = arguments.get("z")
+    if z is not None:
+        zf = z.reshape(total, nheads, headdim).to(f64)
+        y = y * (zf * torch.sigmoid(zf))
+    return y.reshape(x.shape), states
+
+
+def _outside_tolerance(actual, reference):
+    """``|actual - reference| > atol + rtol * |reference|`` elementwise."""
+
+    difference = (actual.to(torch.float64) - reference).abs()
+    return difference > _ATOL + _RTOL * reference.abs()
+
+
+def _bf16_ulp(value):
+    """Spacing of bf16 values at magnitude ``value`` (smallest normal below)."""
+
+    magnitude = max(abs(value), torch.finfo(torch.bfloat16).tiny)
+    return 2.0 ** math.floor(math.log2(magnitude)) * torch.finfo(torch.bfloat16).eps
+
+
+def _count_slack(count):
+    """Two-sided Poisson noise of an outlier count: two kernels of equal
+    internal accuracy differ by about this many outliers on the same inputs."""
+
+    return 2.0 * math.sqrt(count)
+
+
+def _assert_cake_accuracy(
+    cake,
+    cute,
+    constructor,
+    tensors,
+    arguments,
+    *,
+    max_outside_fraction=_MAX_OUTSIDE_FRACTION,
+):
+    """Cake must be at least as accurate as CuTe against the fp64 recurrence.
+
+    Both backends evaluate the same chunked algorithm with bf16 operands, so
+    each is outside ``atol = rtol = 1e-2`` of the exact recurrence on a sparse
+    set of outputs where the cancellation in ``C . state`` amplifies one
+    operand rounding.  The Cake kernels store the per-token ``delta`` in fp16
+    (CAKE-942); CuTe stores it in bf16, so the two kernels round *differently*
+    and their outlier sets no longer coincide: elementwise Cake-vs-CuTe parity
+    at 1e-2 (the previous oracle) fails on 0.0-0.2 % of the outputs although
+    Cake is the more accurate kernel.  Measured on GB300
+    (``cake_ssd_accuracy_probe.py``; outputs outside 1e-2 of the fp64
+    recurrence, Cake vs CuTe): H8/G8 batched 23 vs 79 of 131072, H128/G8
+    batched S=1024 5352 vs 16813 of 16.8 M, realistic decay varlen 8x128
+    0.573 % vs 1.403 %.  CuTe measured against a reference with a bf16-rounded
+    ``delta`` drops to Cake's count (5163 of 16.8 M): the whole difference
+    between the kernels is the ``delta`` rounding.  Final states: 0 entries
+    outside tolerance in every case for Cake.
+
+    Asserted for ``out`` and for ``final_states``:
+
+    1. every Cake value is finite;
+    2. Cake is within ``atol = rtol = 1e-2`` of the fp64 recurrence on all but
+       at most ``max_outside_fraction`` of the entries (default 1 %; the
+       elementwise tolerance is unchanged; the default is >= 6x above the
+       measured fractions on the ``_case`` distribution and ~2x on the
+       realistic one; a caller whose distribution puts *both* kernels above
+       it passes the measured class error explicitly, see
+       ``test_cake_ssd_combined_exact_scan_softplus_parity``);
+    3. Cake has no more entries outside that tolerance than CuTe on the same
+       inputs, up to the Poisson noise ``2 * sqrt(CuTe's count)`` of the
+       count (measured 0.27-0.75x of CuTe's count over 15 probe
+       configurations; the one near-tie is the softplus-off f16-state row,
+       1438 vs 1432 of 131072, where the ``delta`` rounding plays no role);
+    4. Cake's largest absolute error does not exceed CuTe's by more than one
+       bf16 ulp at the magnitude of Cake's worst entry (kernels of equal
+       internal accuracy differ by up to one output rounding there; the
+       measured excess is <= 0.8 % of CuTe's maximum, far below one ulp).
+
+    This is not a loosened CuTe parity: CuTe itself is outside 1e-2 of the
+    recurrence on 0.04-1.4 % of its outputs, so even an exact kernel would
+    fail the old oracle, while this one requires Cake to beat CuTe against
+    the truth.
+    """
+
+    reference = _fp64_reference(constructor, tensors, arguments)
+    for name, actual, baseline, expected in (
+        ("out", cake[0], cute[0], reference[0]),
+        ("final_states", cake[1], cute[1], reference[1]),
+    ):
+        assert tuple(actual.shape) == tuple(expected.shape), (
+            name,
+            tuple(actual.shape),
+            tuple(expected.shape),
+        )
+        actual64 = actual.to(torch.float64)
+        assert torch.isfinite(actual64).all(), (
+            f"{name}: Cake produced non-finite values"
+        )
+        cake_outside = int(_outside_tolerance(actual, expected).sum())
+        cute_outside = int(_outside_tolerance(baseline, expected).sum())
+        cake_error = (actual64 - expected).abs()
+        cake_max = float(cake_error.max())
+        cute_max = float((baseline.to(torch.float64) - expected).abs().max())
+        budget = max_outside_fraction * expected.numel()
+        assert cake_outside <= budget, (
+            f"{name}: {cake_outside} of {expected.numel()} Cake entries outside "
+            f"atol=rtol={_ATOL} of the fp64 recurrence (budget {budget:.0f}; "
+            f"CuTe {cute_outside})"
+        )
+        assert cake_outside <= cute_outside + _count_slack(cute_outside), (
+            f"{name}: Cake has {cake_outside} entries outside atol=rtol={_ATOL} "
+            f"of the fp64 recurrence, CuTe {cute_outside} on the same inputs "
+            f"(slack {_count_slack(cute_outside):.0f})"
+        )
+        worst = int(cake_error.argmax())
+        slack = _bf16_ulp(float(expected.reshape(-1)[worst]))
+        assert cake_max <= cute_max + slack, (
+            f"{name}: Cake max abs error {cake_max:.4g} exceeds CuTe's "
+            f"{cute_max:.4g} by more than one bf16 ulp ({slack:.4g}) at the "
+            f"worst entry (flat index {worst}, reference "
+            f"{float(expected.reshape(-1)[worst]):.4g})"
+        )
 
 
 def _varlen_metadata(lengths, dtype):
+    """Packed-varlen ``seq_idx`` / logical-chunk metadata; ``sum(lengths)`` may
+    end inside a physical chunk (the trailing chunk is then partial)."""
+
     total = sum(lengths)
     seq_idx = torch.empty((1, total), dtype=dtype, device="cuda")
     start = 0
@@ -55,7 +257,7 @@ def _varlen_metadata(lengths, dtype):
         start += length
     chunk_indices = []
     chunk_offsets = []
-    for chunk in range(total // 128):
+    for chunk in range(-(-total // 128)):
         values = seq_idx[0, chunk * 128 : (chunk + 1) * 128]
         previous = torch.cat((values[:1] - 1, values[:-1]))
         for offset in (values != previous).nonzero(as_tuple=True)[0].tolist():
@@ -68,6 +270,18 @@ def _varlen_metadata(lengths, dtype):
     )
 
 
+def _seq_chunk_cumsum(lengths):
+    """Exclusive prefix sum of per-sequence logical chunk counts."""
+
+    cumsum = [0]
+    start = 0
+    for length in lengths:
+        end = start + length
+        cumsum.append(cumsum[-1] + (-(-end // 128) - start // 128))
+        start = end
+    return torch.tensor(cumsum, dtype=torch.int32, device="cuda")
+
+
 def _case(
     *,
     nheads=8,
@@ -77,9 +291,16 @@ def _case(
     seq_idx_dtype=torch.int32,
     preprocess_dtype=torch.float32,
     d_has_hdim=True,
+    seqlen=None,
+    lengths=(96, 160),
+    initial_states=True,
+    seed=7,
 ):
-    torch.manual_seed(7)
-    batch, seqlen = (1, 256) if varlen else (2, 128)
+    torch.manual_seed(seed)
+    if varlen:
+        batch, seqlen = 1, sum(lengths)
+    else:
+        batch, seqlen = 2, 128 if seqlen is None else seqlen
     x = torch.randn(batch, seqlen, nheads, 64, device="cuda").to(torch.bfloat16)
     dt = torch.randn(batch, seqlen, nheads, device="cuda").to(preprocess_dtype)
     A = -torch.rand(nheads, device="cuda", dtype=torch.float32) - 1.0
@@ -91,15 +312,15 @@ def _case(
     dt_bias = (torch.rand(nheads, device="cuda", dtype=torch.float32) - 4.0).to(
         preprocess_dtype
     )
-    state_batch = 2 if varlen else batch
-    initial_states = torch.randn(state_batch, nheads, 64, 128, device="cuda").to(
-        state_dtype
+    state_batch = len(lengths) if varlen else batch
+    initial_states_tensor = (
+        torch.randn(state_batch, nheads, 64, 128, device="cuda").to(state_dtype)
+        if initial_states
+        else None
     )
     if varlen:
-        seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(
-            (96, 160), seq_idx_dtype
-        )
-        seq_chunk_cumsum = torch.tensor([0, 1, 3], dtype=torch.int32, device="cuda")
+        seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(lengths, seq_idx_dtype)
+        seq_chunk_cumsum = _seq_chunk_cumsum(lengths)
     else:
         seq_idx = chunk_indices = chunk_offsets = seq_chunk_cumsum = None
 
@@ -113,7 +334,7 @@ def _case(
         state_dtype=state_dtype,
         has_d=True,
         d_has_hdim=d_has_hdim,
-        has_initial_states=True,
+        has_initial_states=initial_states,
         has_varlen=varlen,
         has_z=True,
         seq_idx_dtype=seq_idx_dtype,
@@ -124,7 +345,7 @@ def _case(
         dt_bias=dt_bias,
         dt_softplus=True,
         dt_limit=(0.001, 0.1),
-        initial_states=initial_states,
+        initial_states=initial_states_tensor,
         seq_idx=seq_idx,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
@@ -134,22 +355,138 @@ def _case(
     return constructor, (x, dt, A, B, C), arguments
 
 
+def _cute_padded_reference(constructor, tensors, arguments, lengths):
+    """CuTe reference for a Cake problem the CuTe backend cannot run directly.
+
+    The Cake inputs (batched ``[B, S]`` or packed ``[1, T]``) are flattened
+    into one packed stream of ``lengths`` sequences, zero-padded with one
+    extra sequence to a multiple of 128 tokens, and run through CuTe varlen
+    with explicit (zero when absent) initial states.  Returns the token-major
+    output restricted to the real tokens and the per-sequence final states.
+    """
+
+    x, dt, A, B, C = tensors
+    nheads = constructor["nheads"]
+    total = sum(lengths)
+    assert x.shape[0] * x.shape[1] == total
+    padded = -(-total // 128) * 128
+    pad = padded - total
+
+    def stream(value):
+        flat = value.reshape(1, total, *value.shape[2:])
+        if pad == 0:
+            return flat.contiguous()
+        padding = torch.zeros(
+            (1, pad, *value.shape[2:]), dtype=value.dtype, device=value.device
+        )
+        return torch.cat((flat, padding), dim=1).contiguous()
+
+    initial_states = arguments["initial_states"]
+    if initial_states is None:
+        initial_states = torch.zeros(
+            (len(lengths), nheads, 64, 128),
+            dtype=constructor["state_dtype"],
+            device="cuda",
+        )
+    if pad:
+        initial_states = torch.cat(
+            (initial_states, torch.zeros_like(initial_states[:1])), dim=0
+        )
+    padded_lengths = [*lengths, pad] if pad else list(lengths)
+    seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(
+        padded_lengths, constructor["seq_idx_dtype"]
+    )
+    cute_constructor = {
+        **constructor,
+        "has_initial_states": True,
+        "has_varlen": True,
+    }
+    cute_arguments = {
+        **arguments,
+        "z": stream(arguments["z"]),
+        "initial_states": initial_states,
+        "seq_idx": seq_idx,
+        "chunk_indices": chunk_indices,
+        "chunk_offsets": chunk_offsets,
+        "seq_chunk_cumsum": _seq_chunk_cumsum(padded_lengths),
+    }
+    out, final = SSDCombined(**cute_constructor, backend="cute").run(
+        stream(x), stream(dt), A, stream(B), stream(C), **cute_arguments
+    )
+    return out[:, :total].reshape(x.shape), final[: len(lengths)]
+
+
 def test_cake_benchmark_validation_policy():
+    """The benchmark gates a row on accuracy against the fp64 recurrence, not CuTe parity."""
+
     module = _load_cake_benchmark_module()
 
-    def report(*, out=True, final_states=True, speedup=1.01):
+    def accuracy(
+        *,
+        cake_outside=20,
+        cute_outside=60,
+        cake_max=0.12,
+        cute_max=0.12,
+        finite=True,
+        numel=131072,
+    ):
         return {
-            "out": {"tolerance_passed": out},
-            "final_states": {"tolerance_passed": final_states},
+            "numel": numel,
+            "cake_outside": cake_outside,
+            "cute_outside": cute_outside,
+            "cake_outside_fraction": cake_outside / numel,
+            "cute_outside_fraction": cute_outside / numel,
+            "cake_max_abs": cake_max,
+            "cute_max_abs": cute_max,
+            "cake_finite": finite,
+            "cute_finite": True,
+            "bf16_ulp_at_cake_worst": 0.03125,
+        }
+
+    def report(*, out=None, final_states=None, speedup=1.01):
+        return {
+            "accuracy": {
+                "out": out if out is not None else accuracy(),
+                "final_states": final_states
+                if final_states is not None
+                else accuracy(cake_outside=0, cute_outside=0),
+            },
             "speedup": speedup,
         }
 
     module._validate_report(report(), require_qualified_row=False)
     module._validate_report(report(speedup=0.99), require_qualified_row=False)
-    with pytest.raises(AssertionError, match="output failed BF16 parity"):
-        module._validate_report(report(out=False), require_qualified_row=False)
-    with pytest.raises(AssertionError, match="final state failed BF16 parity"):
-        module._validate_report(report(final_states=False), require_qualified_row=False)
+    # Poisson slack: CuTe 60 outliers admit up to 60 + 2*sqrt(60) = 75 Cake outliers.
+    module._validate_report(
+        report(out=accuracy(cake_outside=75)), require_qualified_row=False
+    )
+    with pytest.raises(AssertionError, match="more entries outside"):
+        module._validate_report(
+            report(out=accuracy(cake_outside=76)), require_qualified_row=False
+        )
+    with pytest.raises(AssertionError, match="limit 1 %"):
+        module._validate_report(
+            report(out=accuracy(cake_outside=1400, cute_outside=5000)),
+            require_qualified_row=False,
+        )
+    with pytest.raises(AssertionError, match="is not finite"):
+        module._validate_report(
+            report(out=accuracy(finite=False)), require_qualified_row=False
+        )
+    # one bf16 ulp of headroom on the maximum error, no more
+    module._validate_report(
+        report(out=accuracy(cake_max=0.15, cute_max=0.12)), require_qualified_row=False
+    )
+    with pytest.raises(AssertionError, match="by more than one bf16 ulp"):
+        module._validate_report(
+            report(out=accuracy(cake_max=0.16, cute_max=0.12)),
+            require_qualified_row=False,
+        )
+    with pytest.raises(AssertionError, match="final_states has more entries outside"):
+        module._validate_report(
+            report(final_states=accuracy(cake_outside=1, cute_outside=0)),
+            require_qualified_row=False,
+        )
     with pytest.raises(AssertionError, match="must be faster than CuTe"):
         module._validate_report(report(speedup=0.99), require_qualified_row=True)
 
@@ -230,7 +567,7 @@ def test_cake_ssd_combined_route_matrix(
         arguments["dt_limit"] = (0.0, float("inf"))
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cute_parity(actual, expected)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 def test_cake_ssd_combined_accepts_framework_strided_input_views():
@@ -240,6 +577,8 @@ def test_cake_ssd_combined_accepts_framework_strided_input_views():
 
     constructor, tensors, arguments = _case(varlen=True)
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
+    runner = SSDCombined(**constructor, backend="cake")
+    contiguous = runner.run(*tensors, **arguments)
     x, dt, A, B, C = tensors
     tensors = (
         _sglang_projection_view(x),
@@ -254,8 +593,12 @@ def test_cake_ssd_combined_accepts_framework_strided_input_views():
         "initial_states": _strided_last_dim(arguments["initial_states"]),
     }
 
-    actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cute_parity(actual, expected)
+    actual = runner.run(*tensors, **arguments)
+    # The views carry the same values, so the kernels must reproduce the
+    # contiguous run bit for bit.
+    torch.testing.assert_close(actual[0], contiguous[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], contiguous[1], rtol=0, atol=0)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 @pytest.mark.parametrize(
@@ -274,7 +617,7 @@ def test_cake_ssd_combined_matches_cute_d_shape_coercion(
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
 
-    _assert_cute_parity(actual, expected)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
 
 def test_cake_ssd_combined_updates_caller_buffers():
@@ -283,10 +626,14 @@ def test_cake_ssd_combined_updates_caller_buffers():
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
 
     constructor, tensors, arguments = _case(varlen=True)
+    expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     expected_cumsum = arguments["seq_chunk_cumsum"]
     actual_cumsum = torch.full_like(expected_cumsum, -1)
-    out = torch.empty((1, 8, 64, 2, 128), dtype=torch.bfloat16, device="cuda")
+    # Token-major caller storage [batch, seqlen, nheads, headdim], written by
+    # the kernels and returned as-is.
+    out = torch.empty((1, 256, 8, 64), dtype=torch.bfloat16, device="cuda")
     runner = SSDCombined(**constructor, backend="cake")
+    allocated = runner.run(*tensors, **arguments)
     actual = runner.run(
         *tensors,
         **{
@@ -298,7 +645,12 @@ def test_cake_ssd_combined_updates_caller_buffers():
     )
 
     torch.testing.assert_close(actual_cumsum, expected_cumsum, rtol=0, atol=0)
-    assert actual[0].untyped_storage().data_ptr() == out.untyped_storage().data_ptr()
+    assert actual[0] is out
+    # Caller-owned output storage and a kernel-written cumsum must not change
+    # the arithmetic: bit-identical to the allocating run.
+    torch.testing.assert_close(actual[0], allocated[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], allocated[1], rtol=0, atol=0)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
 
     preserved_cumsum = actual_cumsum.clone()
     runner.run(
@@ -449,9 +801,242 @@ def test_cake_ssd_combined_allocation_output_lifetime():
     assert without_final[1] is None
 
 
+@pytest.mark.parametrize("varlen", (False, True), ids=("batched", "varlen"))
+def test_cake_ssd_combined_f32_state_matches_cute_on_bf16_representable_states(
+    varlen,
+):
+    """FP32 state programs: CuTe has no FP32 state, so feed both backends the
+    same bf16-representable initial states (exactly the same values in either
+    dtype); the fp32 final states are measured unrounded against the fp64
+    recurrence and must be at least as accurate as CuTe's bf16 states."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments = _case(varlen=varlen, state_dtype=torch.float32)
+    bf16_states = arguments["initial_states"].to(torch.bfloat16)
+    cute_constructor = {**constructor, "state_dtype": torch.bfloat16}
+    cute_arguments = {**arguments, "initial_states": bf16_states}
+    arguments["initial_states"] = bf16_states.to(torch.float32)
+
+    expected = SSDCombined(**cute_constructor, backend="cute").run(
+        *tensors, **cute_arguments
+    )
+    actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
+
+    assert actual[1].dtype == torch.float32
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
+
+
+@pytest.mark.parametrize(
+    "varlen,lengths",
+    [
+        (False, (1000, 1000)),
+        (True, (1000,)),
+        (True, (128, 900)),
+        (True, (300, 300)),
+    ],
+    ids=("batched_2x1000", "varlen_1000", "varlen_128_900", "varlen_300_300"),
+)
+def test_cake_ssd_combined_accepts_unaligned_seqlen(varlen, lengths):
+    """``seqlen % 128 != 0``: the partial trailing physical chunk is handled
+    in-kernel; the CuTe baseline runs on a zero-padded packed stream."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    if varlen:
+        constructor, tensors, arguments = _case(varlen=True, lengths=lengths)
+    else:
+        constructor, tensors, arguments = _case(seqlen=lengths[0])
+    assert tensors[0].shape[1] % 128 != 0 or sum(lengths) % 128 != 0
+    expected = _cute_padded_reference(constructor, tensors, arguments, lengths)
+
+    actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
+
+    assert tuple(actual[0].shape) == tuple(tensors[0].shape)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
+
+
+@pytest.mark.parametrize("count_source", ("num_seqs", "seq_chunk_cumsum"))
+@pytest.mark.parametrize(
+    "lengths", [(128,), (128, 128), (1000,)], ids=("1x128", "2x128", "1x1000")
+)
+def test_cake_ssd_combined_varlen_without_initial_states(lengths, count_source):
+    """``initial_states=None`` in varlen mode starts from zero state; the
+    sequence count comes from ``num_seqs`` or ``seq_chunk_cumsum``."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments = _case(
+        varlen=True, lengths=lengths, initial_states=False
+    )
+    assert constructor["has_initial_states"] is False
+    assert arguments["initial_states"] is None
+    expected = _cute_padded_reference(constructor, tensors, arguments, lengths)
+    if count_source == "num_seqs":
+        arguments["seq_chunk_cumsum"] = None
+        arguments["num_seqs"] = len(lengths)
+
+    actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
+
+    assert tuple(actual[1].shape) == (len(lengths), 8, 64, 128)
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
+
+
+def test_cake_ssd_combined_varlen_without_initial_states_needs_a_count():
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments = _case(
+        varlen=True, lengths=(128, 128), initial_states=False
+    )
+    arguments["seq_chunk_cumsum"] = None
+
+    with pytest.raises(ValueError, match="requires seq_chunk_cumsum or num_seqs"):
+        SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
+
+
+def _realistic_decay_inputs(lengths, seed, *, nheads=128, ngroups=8, varlen=True):
+    """CAKE-950's repro distribution: bf16 ``dt ~ N(-2, 0.5)`` before
+    softplus, ``dt_bias = 0.5``, ``A = -exp(N(0, 0.5))``, D = 1, no z."""
+
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed)
+    total = sum(lengths)
+    batch, seqlen = (1, total) if varlen else (len(lengths), lengths[0])
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", generator=generator)
+
+    x = randn(batch, seqlen, nheads, 64).to(torch.bfloat16)
+    dt = (randn(batch, seqlen, nheads) * 0.5 - 2.0).to(torch.bfloat16)
+    A = -torch.exp(randn(nheads) * 0.5)
+    # Pin the last heads to the Mamba2 ``A_log`` init extremes (|A| up to 16)
+    # so every seed reaches the per-chunk overflow band of CAKE-950.
+    A[-4:] = torch.tensor([-4.0, -8.0, -12.0, -16.0], device="cuda")
+    B = randn(batch, seqlen, ngroups, 128).to(torch.bfloat16)
+    C = randn(batch, seqlen, ngroups, 128).to(torch.bfloat16)
+    D = torch.ones(nheads, device="cuda", dtype=torch.bfloat16)
+    dt_bias = torch.full((nheads,), 0.5, device="cuda", dtype=torch.bfloat16)
+    initial_states = torch.zeros(
+        len(lengths), nheads, 64, 128, device="cuda", dtype=torch.bfloat16
+    )
+    constructor = dict(
+        chunk_size=128,
+        nheads=nheads,
+        headdim=64,
+        dstate=128,
+        ngroups=ngroups,
+        io_dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        has_d=True,
+        d_has_hdim=False,
+        has_initial_states=True,
+        has_varlen=varlen,
+        has_z=False,
+        seq_idx_dtype=torch.int32,
+    )
+    arguments = dict(
+        D=D,
+        z=None,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        dt_limit=(0.0, float("inf")),
+        initial_states=initial_states,
+        return_final_states=True,
+    )
+    if varlen:
+        seq_idx, chunk_indices, chunk_offsets = _varlen_metadata(lengths, torch.int32)
+        arguments.update(
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            seq_chunk_cumsum=_seq_chunk_cumsum(lengths),
+        )
+    return constructor, (x, dt, A, B, C), arguments
+
+
+@pytest.mark.parametrize("seed", (0, 1, 2))
+@pytest.mark.parametrize(
+    "varlen,lengths",
+    [(True, (128,)), (True, (128, 128)), (True, (128,) * 8), (False, (128, 128))],
+    ids=("varlen_1x128", "varlen_2x128", "varlen_8x128", "batched_2x128"),
+)
+def test_cake_ssd_combined_single_chunk_realistic_decay_has_no_nan(
+    varlen, lengths, seed
+):
+    """CAKE-950 regression: every sequence is one 128-token chunk on the
+    Nemotron-H head geometry with realistic decay (heads whose per-chunk
+    ``A * dt`` cumsum passes ``-126 / log2(e)``).  The retired prefix route
+    produced ``0 * inf`` NaNs here; the output and states must be finite and
+    at least as accurate as CuTe's."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments = _realistic_decay_inputs(
+        lengths, seed, varlen=varlen
+    )
+    dt_processed = torch.nn.functional.softplus(
+        tensors[1].float() + arguments["dt_bias"].float()
+    )
+    batch, seqlen, nheads = dt_processed.shape
+    chunk_log2_decay = (dt_processed * tensors[2]).reshape(
+        batch, seqlen // 128, 128, nheads
+    ).sum(2) * 1.4426950408889634
+    assert (chunk_log2_decay < -126.0).any(), "inputs must reach the overflow band"
+
+    expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
+    actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
+
+    assert torch.isfinite(actual[0].float()).all()
+    assert torch.isfinite(actual[1].float()).all()
+    _assert_cake_accuracy(actual, expected, constructor, tensors, arguments)
+
+
+def test_cake_ssd_combined_nemotron_accuracy_vs_recurrent_reference():
+    """CAKE-942: with FP16 ``delta`` the fraction of outputs outside
+    atol = rtol = 1e-2 of the fp64 recurrent reference on the Nemotron-H
+    geometry (T = 1024, realistic decay, zero initial state) is about 0.66 %
+    (bf16 delta: 1.56 %, stock Triton: 0.62 %)."""
+
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake SSDCombined requires SM100 or SM103")
+
+    constructor, tensors, arguments = _realistic_decay_inputs((1024,), 11)
+    reference_out, reference_states = _fp64_reference(constructor, tensors, arguments)
+
+    out, final_states = SSDCombined(**constructor, backend="cake").run(
+        *tensors, **arguments
+    )
+
+    assert torch.isfinite(out.float()).all()
+    assert torch.isfinite(final_states.float()).all()
+    assert torch.isfinite(reference_states).all()
+    outside = (out.float() - reference_out).abs() > 1e-2 + 1e-2 * reference_out.abs()
+    fraction_outside = outside.float().mean().item()
+    assert fraction_outside <= 0.010, f"{fraction_outside:.4%} of outputs outside 1e-2"
+
+
 @pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("dt_softplus", (False, True))
 def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
+    """``dt_softplus`` on and off with bf16 and f16 states.  With softplus off
+    the ``_case`` step sizes clamp to ``dt_min = 1e-3`` almost everywhere, so
+    the state barely evolves and the rounding of the f16 initial state to the
+    bf16 ``C . state`` MMA operand (done by both kernels) dominates: 1.10 % of
+    the outputs are outside 1e-2 of the fp64 recurrence for Cake and 1.09 %
+    for CuTe (GB300), hence the 2 % cap for that row; the bf16-state rows and
+    the softplus-on rows stay under the 1 % default."""
+
     capability = torch.cuda.get_device_capability()
     if capability not in ((10, 0), (10, 3)):
         pytest.skip("Cake SSDCombined requires SM100 or SM103")
@@ -461,7 +1046,15 @@ def test_cake_ssd_combined_exact_scan_softplus_parity(state_dtype, dt_softplus):
 
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
     actual = SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
-    _assert_cute_parity(actual, expected)
+    both_above_default = state_dtype == torch.float16 and not dt_softplus
+    _assert_cake_accuracy(
+        actual,
+        expected,
+        constructor,
+        tensors,
+        arguments,
+        max_outside_fraction=0.02 if both_above_default else _MAX_OUTSIDE_FRACTION,
+    )
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
@@ -487,15 +1080,17 @@ def test_cake_ssd_combined_program_cache_is_multi_device_safe(varlen):
                 SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)
             )
             runners.append(SSDCombined(**constructor, backend="cake"))
-            cases.append((tensors, arguments))
+            cases.append((constructor, tensors, arguments))
 
     torch.cuda.set_device(0)
     for device_index in (0, 1, 0, 1):
         assert torch.cuda.current_device() == 0
-        tensors, arguments = cases[device_index]
+        constructor, tensors, arguments = cases[device_index]
         actual = runners[device_index].run(*tensors, **arguments)
         assert actual[0].device.index == device_index
-        _assert_cute_parity(actual, expected[device_index])
+        _assert_cake_accuracy(
+            actual, expected[device_index], constructor, tensors, arguments
+        )
         assert torch.cuda.current_device() == 0
 
 
@@ -594,7 +1189,15 @@ def test_cake_ssd_combined_rejects_invalid_public_inputs_like_cute(invalid):
             runner.run(*tensors, **arguments)
         errors[backend] = (type(exc_info.value), str(exc_info.value))
 
-    assert errors["cake"] == errors["cute"]
+    if invalid == "a_dtype":
+        assert errors["cake"] == errors["cute"]
+    else:
+        # Same exception and message form; each backend names its own kernel
+        # output layout (CuTe chunked, Cake token-major).
+        assert "out shape torch.Size([1]) doesn't match expected" in errors["cute"][1]
+        assert "out shape torch.Size([1]) doesn't match expected" in errors["cake"][1]
+        assert errors["cute"][1].endswith("(2, 8, 64, 1, 128)")
+        assert errors["cake"][1].endswith("(2, 128, 8, 64)")
 
 
 def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, request):
@@ -649,6 +1252,7 @@ def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, reques
         "checkpoint_states": checkpoint_states,
         "out": object(),
         "return_final_states": False,
+        "num_seqs": 3,
     }
     positional = (x, object(), object(), B, object())
 
@@ -786,6 +1390,7 @@ def test_source_public_api_signatures_are_stable():
         "checkpoint_states",
         "out",
         "return_final_states",
+        "num_seqs",
     )
     run_defaults = (
         empty,
@@ -809,6 +1414,7 @@ def test_source_public_api_signatures_are_stable():
         None,
         None,
         True,
+        None,
     )
     expected_run = tuple(
         zip(
@@ -972,7 +1578,8 @@ def test_source_public_backend_constructor_validation_without_gpu(
         "nheads": 0,
         "ngroups": 0,
         "io_dtype": torch.float16,
-        "state_dtype": torch.float32,
+        # float32 states are a Cake-only feature; float64 is invalid for both.
+        "state_dtype": torch.float64,
         "seq_idx_dtype": torch.float32,
     }
     if invalid == "head_group_ratio":
@@ -1031,7 +1638,7 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
         "checkpoint_state_slots": object(),
         "checkpoint_states": object(),
     }
-    out = torch.empty((1, 2, 64, 1, 128), dtype=torch.bfloat16)
+    out = torch.empty((1, 128, 2, 64), dtype=torch.bfloat16)
     kwargs = {
         **sentinels,
         "dt_softplus": True,
@@ -1039,6 +1646,7 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
         "update_seq_chunk_cumsum": True,
         "out": out,
         "return_final_states": False,
+        "num_seqs": 1,
     }
 
     actual = runner.run(*tensors, **kwargs)
@@ -1048,14 +1656,69 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
 
 
 @pytest.mark.parametrize(
+    "relaxed", ("unaligned_seqlen", "varlen_without_initial_states")
+)
+def test_source_public_cake_dispatch_relaxed_domain_without_gpu(relaxed):
+    """The Cake-only relaxations pass the public pre-dispatch validation."""
+
+    result = (object(), None)
+    runner = _public_runner_without_constructor("cake", result)
+    x, dt, A, B, C = _cpu_public_run_inputs()
+    kwargs = {}
+    if relaxed == "unaligned_seqlen":
+        tensors = (x[:, :100], dt[:, :100], A, B[:, :100], C[:, :100])
+    else:
+        tensors = (x, dt, A, B, C)
+        kwargs = {
+            "seq_idx": torch.zeros((1, 128), dtype=torch.int32),
+            "chunk_indices": torch.zeros(1, dtype=torch.int32),
+            "chunk_offsets": torch.zeros(1, dtype=torch.int32),
+            "num_seqs": 1,
+        }
+
+    actual = runner.run(*tensors, **kwargs)
+
+    assert actual is result
+    assert len(runner._cake_runner.calls) == 1
+    assert runner._cake_runner.calls[0][0] == tensors
+    for name, value in kwargs.items():
+        assert runner._cake_runner.calls[0][1][name] is value
+
+
+@pytest.mark.parametrize("backend", ("cute", "cake"))
+@pytest.mark.parametrize("invalid", ("shape", "dtype", "contiguous"))
+def test_source_public_out_contract_per_backend_without_gpu(backend, invalid):
+    """``out`` is validated against the backend's kernel layout: CuTe chunked
+    ``[B, EH, D, C, L]``, Cake token-major ``[B, S, EH, D]``."""
+
+    runner = _public_runner_without_constructor(backend)
+    tensors = _cpu_public_run_inputs()
+    expected = (1, 128, 2, 64) if backend == "cake" else (1, 2, 64, 1, 128)
+    layout = "(B, S, EH, D)" if backend == "cake" else "(B, EH, D, C, L)"
+    if invalid == "shape":
+        out = torch.empty((1,), dtype=torch.bfloat16)
+        match = re.escape(
+            f"out shape torch.Size([1]) doesn't match expected {expected}"
+        )
+    elif invalid == "dtype":
+        out = torch.empty(expected, dtype=torch.float16)
+        match = "out dtype torch.float16 doesn't match x dtype torch.bfloat16"
+    else:
+        storage = torch.empty((*expected[:-1], expected[-1] + 1), dtype=torch.bfloat16)
+        out = storage[..., : expected[-1]]
+        assert not out.is_contiguous()
+        match = rf"out must be contiguous in {re.escape(layout)} layout"
+
+    with pytest.raises(AssertionError, match=match):
+        runner.run(*tensors, out=out)
+    assert runner._cake_runner.calls == []
+
+
+@pytest.mark.parametrize(
     "invalid,exception",
     (
         ("x_rank", ValueError),
-        ("seqlen", AssertionError),
         ("a_dtype", AssertionError),
-        ("out_shape", AssertionError),
-        ("out_dtype", AssertionError),
-        ("out_contiguous", AssertionError),
         ("x_dtype", AssertionError),
         ("b_dtype", AssertionError),
         ("c_dtype", AssertionError),
@@ -1069,7 +1732,6 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
         ("chunk_offsets_ndim", AssertionError),
         ("chunk_offsets_dtype", AssertionError),
         ("chunk_vector_shape", AssertionError),
-        ("varlen_initial", ValueError),
     ),
 )
 def test_source_public_shared_validation_error_parity_without_gpu(invalid, exception):
@@ -1077,19 +1739,8 @@ def test_source_public_shared_validation_error_parity_without_gpu(invalid, excep
     kwargs = {}
     if invalid == "x_rank":
         tensors = (torch.empty((128, 2, 64), dtype=torch.bfloat16), *tensors[1:])
-    elif invalid == "seqlen":
-        x, dt, A, B, C = tensors
-        tensors = (x[:, :-1], dt[:, :-1], A, B[:, :-1], C[:, :-1])
     elif invalid == "a_dtype":
         tensors = (*tensors[:2], tensors[2].to(torch.bfloat16), *tensors[3:])
-    elif invalid == "out_shape":
-        kwargs["out"] = torch.empty((1,), dtype=torch.bfloat16)
-    elif invalid == "out_dtype":
-        kwargs["out"] = torch.empty((1, 2, 64, 1, 128), dtype=torch.float16)
-    elif invalid == "out_contiguous":
-        storage = torch.empty((1, 2, 64, 1, 129), dtype=torch.bfloat16)
-        kwargs["out"] = storage[..., :128]
-        assert not kwargs["out"].is_contiguous()
     elif invalid in {"x_dtype", "b_dtype", "c_dtype"}:
         tensor_index = {"x_dtype": 0, "b_dtype": 3, "c_dtype": 4}[invalid]
         tensors = (
@@ -1125,11 +1776,8 @@ def test_source_public_shared_validation_error_parity_without_gpu(invalid, excep
             seq_idx=seq_idx,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
+            initial_states=torch.empty((1, 2, 64, 128), dtype=torch.bfloat16),
         )
-        if invalid != "varlen_initial":
-            kwargs["initial_states"] = torch.empty(
-                (1, 2, 64, 128), dtype=torch.bfloat16
-            )
 
     errors = {}
     for backend in ("cute", "cake"):
@@ -1250,8 +1898,16 @@ def _source_cake_varlen_arguments(runner, tensors):
         ("varlen_metadata", "varlen mode requires seq_idx"),
         ("batched_metadata", "batched mode does not accept varlen metadata"),
         ("batched_cumsum", "batched mode does not accept varlen metadata"),
-        ("varlen_initial", "varlen mode requires initial_states"),
+        ("batched_num_seqs", "batched mode does not accept varlen metadata"),
+        (
+            "varlen_sequence_count",
+            "varlen mode without initial_states requires seq_chunk_cumsum or num_seqs",
+        ),
+        ("num_seqs_conflict", r"num_seqs \(3\) does not match the sequence count"),
         ("initial_dtype", "initial_states dtype must match state_dtype"),
+        ("out_shape", "out must have shape"),
+        ("out_dtype", "out must have shape"),
+        ("out_contiguous", "out must be contiguous"),
         ("d_shape", "D must have shape"),
         ("d_dtype", "D must have shape"),
         ("z_shape", "z must have the same shape and dtype as x"),
@@ -1267,10 +1923,7 @@ def _source_cake_varlen_arguments(runner, tensors):
         ("seq_cumsum_dtype", "seq_chunk_cumsum shape or dtype"),
     ),
 )
-def test_source_public_cake_domain_validation_without_gpu(monkeypatch, invalid, match):
-    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
-    monkeypatch.setattr(module, "_PREFIX_ROUTE_SELECTED", False)
+def test_source_public_cake_domain_validation_without_gpu(invalid, match):
     cake_runner = _source_cake_runner_without_constructor()
     tensors = list(_cpu_public_run_inputs(batch=2))
     kwargs = {}
@@ -1304,13 +1957,24 @@ def test_source_public_cake_domain_validation_without_gpu(monkeypatch, invalid, 
         kwargs["seq_idx"] = torch.empty((2, 128), dtype=torch.int32)
     elif invalid == "batched_cumsum":
         kwargs["seq_chunk_cumsum"] = torch.empty(3, dtype=torch.int32)
-    elif invalid == "varlen_initial":
+    elif invalid == "batched_num_seqs":
+        kwargs["num_seqs"] = 2
+    elif invalid == "varlen_sequence_count":
         cake_runner.has_varlen = True
         kwargs.update(
             seq_idx=torch.empty((2, 128), dtype=torch.int32),
             chunk_indices=torch.arange(2, dtype=torch.int32),
             chunk_offsets=torch.zeros(2, dtype=torch.int32),
         )
+    elif invalid == "num_seqs_conflict":
+        kwargs.update(_source_cake_varlen_arguments(cake_runner, tensors))
+        kwargs["num_seqs"] = 3
+    elif invalid == "out_shape":
+        kwargs["out"] = torch.empty((2, 2, 64, 1, 128), dtype=torch.bfloat16)
+    elif invalid == "out_dtype":
+        kwargs["out"] = torch.empty((2, 128, 2, 64), dtype=torch.float16)
+    elif invalid == "out_contiguous":
+        kwargs["out"] = torch.empty((2, 128, 2, 65), dtype=torch.bfloat16)[..., :64]
     elif invalid == "initial_dtype":
         cake_runner.has_initial_states = True
         kwargs["initial_states"] = torch.empty((2, 2, 64, 128), dtype=torch.float16)
@@ -1389,6 +2053,8 @@ def _source_cute_runner_without_constructor():
         ("z_dtype", AssertionError, "z dtype"),
         ("initial_dtype", AssertionError, "init_states dtype"),
         ("varlen_initial", ValueError, "initial_states must be provided"),
+        ("seqlen", AssertionError, "must be divisible by chunk_size"),
+        ("num_seqs", ValueError, "num_seqs requires SSDCombined backend='cake'"),
     ),
 )
 def test_source_public_cute_backend_validation_without_gpu(
@@ -1452,6 +2118,11 @@ def test_source_public_cute_backend_validation_without_gpu(
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
         )
+    elif invalid == "seqlen":
+        x, dt, A, B, C = tensors
+        tensors = [x[:, :-1], dt[:, :-1], A, B[:, :-1], C[:, :-1]]
+    elif invalid == "num_seqs":
+        kwargs["num_seqs"] = 2
 
     with pytest.raises(exception, match=match):
         runner.run(*tensors, **kwargs)
@@ -1460,8 +2131,6 @@ def test_source_public_cute_backend_validation_without_gpu(
 @pytest.mark.parametrize("invalid", ("dt_bias_shape", "dt_bias_dtype"))
 def test_source_public_cake_dt_bias_validation_without_gpu(monkeypatch, invalid):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
-    monkeypatch.setattr(module, "_PREFIX_ROUTE_SELECTED", False)
     monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
     cake_runner = _source_cake_runner_without_constructor()
@@ -1485,8 +2154,6 @@ def test_source_public_cake_dt_bias_validation_without_gpu(monkeypatch, invalid)
 
 def test_source_public_cake_rejects_non_cuda_inputs_without_gpu(monkeypatch):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    monkeypatch.setattr(module, "_select_scan_route", lambda **_: "test")
-    monkeypatch.setattr(module, "_PREFIX_ROUTE_SELECTED", False)
     monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
     cake_runner = _source_cake_runner_without_constructor()
     cake_runner._get_workspace = lambda **_: {
@@ -1620,6 +2287,7 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
 
     exact = calls["exact_bf16_batched"]
     assert exact["preprocess"]["dt_softplus"] == 0
+    assert exact["preprocess"]["write_seq_chunk_cumsum"] == 0
     assert exact["preprocess_grid"] == (1, 1, 1)
     main = exact["main"]
     assert main["dt_softplus"] == 0
@@ -1630,51 +2298,189 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    (
-        "mode_varlen",
-        "num_logical_chunks",
-        "num_sequences",
-        "nheads",
-        "ngroups",
-        "dt_min",
-        "prefix_route_selected",
-        "expected",
-    ),
+    "state_dtype,mode_varlen,expected",
     [
-        (False, 2, 2, 128, 8, 0.0, True, "exact_scan"),
-        (True, 3, 2, 128, 8, 0.0, True, "exact_scan"),
-        (True, 2, 2, 128, 8, -0.001, True, "exact_scan"),
-        (True, 2, 2, 128, 8, 0.0, False, "shallow_varlen"),
-        (True, 0, 2, 128, 8, 0.0, False, "shallow_varlen"),
-        (True, 2, 2, 8, 8, 0.0, True, "shallow_varlen"),
-        (True, 2, 2, 8, 1, 0.0, True, "shallow_varlen"),
-        (True, 2, 2, 128, 1, 0.0, True, "shallow_varlen"),
-        (True, 2, 2, 128, 8, 0.0, True, "prefix_varlen"),
+        (torch.bfloat16, False, "exact_bf16_batched"),
+        (torch.bfloat16, True, "exact_bf16_varlen"),
+        (torch.float16, False, "exact_f16_batched"),
+        (torch.float16, True, "exact_f16_varlen"),
+        (torch.float32, False, "exact_f32_batched"),
+        (torch.float32, True, "exact_f32_varlen"),
     ],
 )
-def test_source_route_predicates_do_not_bind_program_symbols(
-    mode_varlen,
-    num_logical_chunks,
-    num_sequences,
-    nheads,
-    ngroups,
-    dt_min,
-    prefix_route_selected,
-    expected,
+def test_source_program_name_covers_every_state_dtype(
+    state_dtype, mode_varlen, expected
 ):
+    """One kernel family serves every admitted input: the program follows
+    from the state dtype and the batched/packed mode alone."""
+
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
 
-    actual = module._select_scan_route(
-        mode_varlen=mode_varlen,
-        num_logical_chunks=num_logical_chunks,
-        num_sequences=num_sequences,
-        nheads=nheads,
-        ngroups=ngroups,
-        dt_min=dt_min,
-        prefix_route_selected=prefix_route_selected,
-    )
+    actual = module._program_name(state_dtype, mode_varlen)
 
     assert actual == expected
+    assert actual in module._PROGRAMS
+    assert module._STATE_DTYPE_CODES == {
+        "bf16": (4, 16),
+        "f16": (2, 16),
+        "f32": (2, 32),
+    }
+    assert not hasattr(module, "_select_scan_route")
+
+
+def _cpu_forwarding_runner(module, monkeypatch, calls, **constructor):
+    """A real runner on CPU tensors whose launcher call is captured."""
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
+    monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
+    monkeypatch.setattr(module, "_sm_count", lambda _: 1)
+    monkeypatch.setattr(
+        module,
+        "_launch_program",
+        lambda name, _arch, **kwargs: calls.append((name, kwargs)),
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *_: SimpleNamespace(cuda_stream=0x1234),
+    )
+    return module.CakeSSDCombined(
+        128,
+        constructor.pop("nheads", 1),
+        64,
+        128,
+        constructor.pop("ngroups", 1),
+        io_dtype=torch.bfloat16,
+        state_dtype=constructor.pop("state_dtype", torch.bfloat16),
+        has_d=False,
+        d_has_hdim=False,
+        has_initial_states=constructor.pop("has_initial_states", False),
+        has_varlen=constructor.pop("has_varlen", False),
+        has_z=False,
+        seq_idx_dtype=constructor.pop("seq_idx_dtype", torch.int32),
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "precomputed",
+        "update_caller_buffer",
+        "runner_buffer_from_initial_states",
+        "runner_buffer_from_num_seqs",
+    ),
+)
+def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case):
+    """The preprocess owns ``seq_chunk_cumsum``: one launcher call binds the
+    same vector to both stages and ``write_seq_chunk_cumsum`` says whether
+    the preprocess fills it; ``num_seqs`` supplies the count when there are
+    no initial states."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    has_initial_states = case != "runner_buffer_from_num_seqs"
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        has_varlen=True,
+        has_initial_states=has_initial_states,
+    )
+    seqlen, num_seqs = 300, 2
+    x = torch.empty((1, seqlen, 1, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 1), dtype=torch.float32)
+    A = torch.empty((1,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 1, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "seq_idx": torch.zeros((1, seqlen), dtype=torch.int32),
+        "chunk_indices": torch.tensor([0, 1, 2], dtype=torch.int32),
+        "chunk_offsets": torch.tensor([0, 0, 0], dtype=torch.int32),
+    }
+    caller_vector = torch.tensor([0, 1, 3], dtype=torch.int32)
+    if case == "precomputed":
+        kwargs["seq_chunk_cumsum"] = caller_vector
+    elif case == "update_caller_buffer":
+        kwargs["seq_chunk_cumsum"] = caller_vector
+        kwargs["update_seq_chunk_cumsum"] = True
+    else:
+        kwargs["num_seqs"] = num_seqs
+    if has_initial_states:
+        kwargs["initial_states"] = torch.empty(
+            (num_seqs, 1, 64, 128), dtype=torch.bfloat16
+        )
+
+    out, final = runner.run(x, dt, A, B, C, **kwargs)
+
+    assert tuple(out.shape) == (1, seqlen, 1, 64)
+    assert tuple(final.shape) == (num_seqs, 1, 64, 128)
+    ((name, launch),) = calls
+    assert name == "exact_bf16_varlen"
+    preprocess, main = launch["preprocess"], launch["main"]
+    assert preprocess["seq_chunk_cumsum"] is main["seq_chunk_cumsum"]
+    assert preprocess["num_sequences"] == main["sequence_count"] == num_seqs
+    assert preprocess["seq_idx_i32"] is main["seq_idx_i32"] is kwargs["seq_idx"]
+    assert preprocess["seq_idx_int64"] == 0
+    assert main["has_initial"] == int(has_initial_states)
+    assert main["nchunks"] == 3 and main["seqlen"] == seqlen
+    if case == "precomputed":
+        assert preprocess["seq_chunk_cumsum"] is caller_vector
+        assert preprocess["write_seq_chunk_cumsum"] == 0
+    elif case == "update_caller_buffer":
+        assert preprocess["seq_chunk_cumsum"] is caller_vector
+        assert preprocess["write_seq_chunk_cumsum"] == 1
+    else:
+        assert preprocess["write_seq_chunk_cumsum"] == 1
+        bound = preprocess["seq_chunk_cumsum"]
+        assert bound.dtype == torch.int32 and bound.numel() == num_seqs + 1
+        # The runner-owned vector is reused across calls of the same count.
+        runner.run(x, dt, A, B, C, **kwargs)
+        assert calls[-1][1]["preprocess"]["seq_chunk_cumsum"] is bound
+
+
+def test_source_batched_unaligned_seqlen_binding_without_gpu(monkeypatch):
+    """Batched mode: ceil'd chunk count, partial trailing segment length, the
+    cumsum dummy with ``write_seq_chunk_cumsum=0``, FP16 delta workspace."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(module, monkeypatch, calls, nheads=2, ngroups=1)
+    batch, seqlen = 2, 1000
+    x = torch.empty((batch, seqlen, 2, 64), dtype=torch.bfloat16)
+    dt = torch.empty((batch, seqlen, 2), dtype=torch.bfloat16)
+    A = torch.empty((2,), dtype=torch.float32)
+    B = torch.empty((batch, seqlen, 1, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+
+    out, final = runner.run(x, dt, A, B, C)
+
+    assert tuple(out.shape) == (batch, seqlen, 2, 64)
+    assert tuple(final.shape) == (batch, 2, 64, 128)
+    ((name, launch),) = calls
+    assert name == "exact_bf16_batched"
+    preprocess, main = launch["preprocess"], launch["main"]
+    assert main["nchunks"] == 8 and main["num_logical_chunks"] == 8
+    assert preprocess["num_segments"] == 16
+    assert preprocess["segment_lengths"].tolist() == [128] * 7 + [104] + [128] * 7 + [
+        104
+    ]
+    assert preprocess["segment_starts"].tolist() == [
+        *(chunk * 128 for chunk in range(8)),
+        *(1000 + chunk * 128 for chunk in range(8)),
+    ]
+    assert preprocess["delta"].dtype == torch.float16
+    assert preprocess["delta"].shape == (32, 128)
+    assert preprocess["write_seq_chunk_cumsum"] == 0
+    assert preprocess["num_sequences"] == batch
+    assert main["mode_varlen"] == 0
+    # bf16 dt is widened into the FP32 workspace both stages read.
+    assert preprocess["dt"] is main["dt"] and preprocess["dt"].dtype == torch.float32
+    # No dt_bias: the zero vector allocated with the workspace is bound.
+    assert preprocess["dt_bias"] is main["dt_bias"]
+    assert preprocess["dt_bias"].dtype == torch.float32
+    assert not preprocess["dt_bias"].any()
 
 
 def test_source_direct_preprocess_and_sequence_argument_order():
@@ -1691,6 +2497,9 @@ def test_source_direct_preprocess_and_sequence_argument_order():
             "chunk_offsets",
             "delta",
             "cumsum",
+            "seq_idx_i32",
+            "seq_idx_i64",
+            "seq_chunk_cumsum",
         )
     }
     preprocess, preprocess_grid = module._direct_preprocess_inputs(
@@ -1710,6 +2519,12 @@ def test_source_direct_preprocess_and_sequence_argument_order():
         dt_softplus=False,
         dt_limit=(0.0, float("inf")),
         threads=32,
+        seq_idx_i32=sentinels["seq_idx_i32"],
+        seq_idx_i64=sentinels["seq_idx_i64"],
+        seq_idx_int64=True,
+        seq_chunk_cumsum=sentinels["seq_chunk_cumsum"],
+        num_sequences=2,
+        write_seq_chunk_cumsum=True,
     )
     main = {name: object() for name in module._MAIN_ARGS}
 
@@ -1725,8 +2540,22 @@ def test_source_direct_preprocess_and_sequence_argument_order():
     assert preprocess["chunk_offsets"] is sentinels["chunk_offsets"]
     assert preprocess["direct_varlen_metadata"] == 1
     assert preprocess["dt_softplus"] == 0
+    assert preprocess["seq_idx_i32"] is sentinels["seq_idx_i32"]
+    assert preprocess["seq_idx_i64"] is sentinels["seq_idx_i64"]
+    assert preprocess["seq_idx_int64"] == 1
+    assert preprocess["seq_chunk_cumsum"] is sentinels["seq_chunk_cumsum"]
+    assert preprocess["num_sequences"] == 2
+    assert preprocess["write_seq_chunk_cumsum"] == 1
     assert preprocess_grid == (12, 1, 1)
     assert set(preprocess) == set(module._PREPROCESS_ARGS)
+    assert module._PREPROCESS_ARGS[-6:] == (
+        "seq_idx_i32",
+        "seq_idx_i64",
+        "seq_idx_int64",
+        "seq_chunk_cumsum",
+        "num_sequences",
+        "write_seq_chunk_cumsum",
+    )
     assert bound == (
         *(preprocess[name] for name in module._PREPROCESS_ARGS),
         12,
@@ -1738,7 +2567,7 @@ def test_source_direct_preprocess_and_sequence_argument_order():
         1,
         0x1234,
     )
-    assert len(bound) == 16 + 3 + 43 + 3 + 1
+    assert len(bound) == 22 + 3 + 41 + 3 + 1
 
     assert module._persistent_grid_size(total_work=256, sm_count=148) == 128
     assert module._persistent_grid_size(total_work=384, sm_count=148) == 128
@@ -1768,7 +2597,7 @@ def test_source_program_launch_orders_stage_arguments(monkeypatch):
     main = {name: f"main:{name}" for name in module._MAIN_ARGS}
 
     module._launch_program(
-        "prefix_bf16_varlen",
+        "exact_bf16_varlen",
         "sm_103a",
         preprocess=preprocess,
         preprocess_grid=(32, 1, 1),
@@ -1796,22 +2625,29 @@ def test_source_program_table_names_shipped_sources():
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     source_dir = module._source_dir()
 
-    assert module._PREFIX_ROUTE_SELECTED is True
     assert set(module._PROGRAMS) == {
         "exact_bf16_batched",
         "exact_bf16_varlen",
         "exact_f16_batched",
         "exact_f16_varlen",
-        "shallow_bf16_varlen",
-        "shallow_f16_varlen",
-        "prefix_bf16_varlen",
-        "prefix_f16_varlen",
+        "exact_f32_batched",
+        "exact_f32_varlen",
     }
+    assert "PENDINGEXPORT" not in "".join(module._SCAN_MODULES.values())
     template = (source_dir / module._HOST_TEMPLATE).read_text(encoding="utf-8")
     device_sources = set()
     for name, program in module._PROGRAMS.items():
-        state_key = name.split("_")[1]
-        assert program.state_dtype_code == module._STATE_DTYPE_CODES[state_key]
+        family, state_key, mode = name.split("_")
+        assert family == "exact"
+        assert (program.state_dtype_code, program.state_dtype_bits) == (
+            module._STATE_DTYPE_CODES[state_key]
+        )
+        assert program.preprocess is module._SEGMENT_PREPROCESS
+        assert program.main_smem_bytes == module._EXACT_SMEM_BYTES
+        assert program.main.module.startswith(
+            program.main.kernel.removeprefix("kernel_") + "_"
+        )
+        assert program.main.kernel.endswith(f"_{state_key}_{mode}")
         assert program.preprocess.threads > 0 and program.main.threads == 512
         assert not program.preprocess.fast_math and program.main.fast_math
         for kernel in program.kernels:
@@ -1830,6 +2666,7 @@ def test_source_program_table_names_shipped_sources():
             "CAKE_SSD_MAIN_MODULE",
             "CAKE_SSD_MAIN_KERNEL",
             "CAKE_SSD_STATE_DTYPE_CODE",
+            "CAKE_SSD_STATE_DTYPE_BITS",
             "CAKE_SSD_MAIN_SMEM_BYTES",
         )
         assert all(placeholder in template for placeholder in placeholders)
@@ -1839,48 +2676,45 @@ def test_source_program_table_names_shipped_sources():
         assert f'"{program.main.kernel}"' in rendered
         assert f"namespace cake_mamba_ssd_combined_host_{name} {{" in rendered
         assert f"stream, {program.main_smem_bytes}u)" in rendered
-    # One shared source per physical kernel: ten device files, no architecture copies.
-    assert len(device_sources) == 10
+        # The regenerated host shim brace-initialises the DLDataType of the
+        # three state tensors from the two state placeholders; delta checks
+        # are FP16 for every program (D1) and not factored.
+        for state_tensor in ("initial_states", "final_states", "checkpoint_states"):
+            state_check = (
+                f"check_dtype(arg_{state_tensor}, DLDataType{{"
+                f"{program.state_dtype_code}, {program.state_dtype_bits}, 1}}, "
+                f'"{state_tensor}");'
+            )
+            assert state_check in rendered, state_check
+        assert "DLDataType{kDLFloat, 16, 1}" in rendered
+    # One shared source per physical kernel: six scan sources plus the one
+    # preprocess kernel, no architecture copies.
+    assert len(device_sources) == 7
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
 
 
-def test_active_f16_source_package_declares_cuda_half_types_explicitly():
-    source_root = (
-        Path(__file__).parents[2]
-        / "csrc"
-        / "cake_mamba_ssd_combined"
-        / "generated"
-        / "device"
-    )
-    f16_sources = (
-        source_root
-        / "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_ff78ede5d2.cu",
-        source_root / "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8c373c2436.cu",
-        source_root / "mamba_ssd_q_tmem_alias_f16_batched_8b5ef7d7eb.cu",
-        source_root / "mamba_ssd_q_tmem_alias_f16_varlen_1895881324.cu",
-    )
-    for source_path in f16_sources:
-        source = source_path.read_text(encoding="utf-8")
-        assert source.count("#include <cuda_fp16.h>") == 1
-        assert "#include <cuda_bf16.h>\n#include <cuda_fp16.h>\n" in source
+def test_active_source_package_declares_cuda_half_types_explicitly():
+    """Every program carries ``delta`` in FP16 (the state may also be FP16),
+    so each shipped device source must declare the CUDA half types itself."""
 
-    other_active_sources = (
-        source_root / "factorized_persistent_segment_preprocess_7ae61d5f32.cu",
-        source_root / "mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f.cu",
-        source_root / "mamba_ssd_q_tmem_alias_bf16_varlen_351b79a64d.cu",
-        source_root / "prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
-    )
-    assert all(
-        "#include <cuda_fp16.h>" not in source_path.read_text(encoding="utf-8")
-        for source_path in other_active_sources
-    )
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    source_root = module._source_dir() / module._DEVICE_DIR
+    sources = {
+        kernel.source
+        for program in module._PROGRAMS.values()
+        for kernel in program.kernels
+    }
+    for name in sorted(sources):
+        source = (source_root / name).read_text(encoding="utf-8")
+        assert source.count("#include <cuda_fp16.h>") == 1, name
+        assert "#include <cuda_bf16.h>\n#include <cuda_fp16.h>\n" in source, name
 
 
 def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
-    program = module._PROGRAMS["prefix_bf16_varlen"]
+    program = module._PROGRAMS["exact_bf16_varlen"]
     device_dir = tmp_path / module._DEVICE_DIR
     device_dir.mkdir(parents=True)
     for kernel in program.kernels:
@@ -1894,7 +2728,7 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
         "TVM_FFI_EMBED_CUBIN(CAKE_SSD_PREPROCESS_MODULE);\n"
         "TVM_FFI_EMBED_CUBIN(CAKE_SSD_MAIN_MODULE);\n"
         "CAKE_SSD_PREPROCESS_KERNEL CAKE_SSD_PREPROCESS_THREADS CAKE_SSD_MAIN_KERNEL "
-        "CAKE_SSD_STATE_DTYPE_CODE CAKE_SSD_MAIN_SMEM_BYTES\n",
+        "CAKE_SSD_STATE_DTYPE_CODE CAKE_SSD_STATE_DTYPE_BITS CAKE_SSD_MAIN_SMEM_BYTES\n",
         encoding="utf-8",
     )
     nvcc = tmp_path / "cuda" / "bin" / "nvcc"
@@ -1923,8 +2757,8 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
     monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
     module._load_generated_program.cache_clear()
 
-    actual = module._load_generated_program("prefix_bf16_varlen", "sm_103a")
-    again = module._load_generated_program("prefix_bf16_varlen", "sm_103a")
+    actual = module._load_generated_program("exact_bf16_varlen", "sm_103a")
+    again = module._load_generated_program("exact_bf16_varlen", "sm_103a")
     module._load_generated_program.cache_clear()
 
     assert actual is loaded and again is loaded
@@ -1935,11 +2769,13 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
     assert len(load_calls) == 1
     rendered = load_calls[0][1]["cpp_sources"]
     assert "CAKE_SSD_" not in rendered
-    assert "namespace host_prefix_bf16_varlen {}" in rendered
+    assert "namespace host_exact_bf16_varlen {}" in rendered
     assert f"TVM_FFI_EMBED_CUBIN({program.preprocess.module});" in rendered
-    assert f"{program.preprocess.kernel} 32 {program.main.kernel} 4 149248" in rendered
+    assert (
+        f"{program.preprocess.kernel} 128 {program.main.kernel} 4 16 231936" in rendered
+    )
     assert set(load_calls[0][1]["embed_cubin"]) == {
         program.preprocess.module,
         program.main.module,
     }
-    assert load_calls[0][0][0].startswith("cake_mamba_ssd_prefix_bf16_varlen_sm_103a_")
+    assert load_calls[0][0][0].startswith("cake_mamba_ssd_exact_bf16_varlen_sm_103a_")

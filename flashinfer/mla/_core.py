@@ -1251,6 +1251,45 @@ def _check_dsv4_sparse_mla_inputs(
     )
 
 
+_DSV4_KV_CACHE_FORMATS = ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca")
+
+
+def _check_dsv4_kv_cache_format_backend(
+    kv_cache_format: str,
+    backend: Literal["trtllm-gen", "cute-dsl", "sparse", "cake"],
+    *,
+    sm120_cake: bool = False,
+) -> None:
+    """Pair a resolved DSv4 backend with the sparse-cache storage format.
+
+    ``fp8_dsv41`` is SM120/SM121 ``backend="sparse"`` only; ``fp8_dsv41_fp4_ca``
+    additionally accepts the Cake mixed-cache decode on SM120/SM121
+    (``sm120_cake=True``: ``backend="cake"`` resolved on an SM120-family
+    device). The 384-byte NVFP4 ABI runs on SM120/SM121 through
+    ``backend="sparse"`` or ``backend="cake"`` and on SM100/SM103 through the
+    CAKE NVFP4 route (``backend="cake"``); the architecture itself is enforced
+    by :func:`_resolve_dsv4_sparse_mla_backend`.
+    """
+    if kv_cache_format not in _DSV4_KV_CACHE_FORMATS:
+        raise ValueError(
+            "kv_cache_format must be 'fp8', 'fp8_dsv41', 'fp8_dsv41_fp4_ca', "
+            f"or 'nvfp4', got {kv_cache_format!r}"
+        )
+    if kv_cache_format == "fp8_dsv41" and backend != "sparse":
+        raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
+    if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
+        if backend != "cake" or not sm120_cake:
+            raise ValueError(
+                "kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse' (or "
+                "backend='cake' on SM120/SM121)"
+            )
+    if kv_cache_format == "nvfp4" and backend not in ("sparse", "cake"):
+        raise ValueError(
+            "kv_cache_format='nvfp4' requires backend='sparse' (SM120/SM121) or "
+            f"backend='cake' (SM120/SM121 or SM100/SM103), got backend={backend!r}"
+        )
+
+
 def _resolve_dsv4_sparse_mla_backend(
     device: torch.device,
     requested_backend: Literal[
@@ -2211,25 +2250,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         both caches dequantized exactly on chip).
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
-    if kv_cache_format not in ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"):
-        raise ValueError(
-            "kv_cache_format must be 'fp8', 'fp8_dsv41', 'fp8_dsv41_fp4_ca', "
-            f"or 'nvfp4', got {kv_cache_format!r}"
-        )
-    if kv_cache_format == "fp8_dsv41" and backend != "sparse":
-        raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
-    if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
-        if backend != "cake" or not _is_sm120_family(query.device):
-            raise ValueError(
-                "kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse' (or "
-                "backend='cake' on SM120/SM121)"
-            )
-    if kv_cache_format == "nvfp4" and backend != "sparse":
-        if backend != "cake" or not _is_sm120_family(query.device):
-            raise ValueError(
-                "kv_cache_format='nvfp4' requires backend='sparse' (or "
-                "backend='cake' on SM120/SM121)"
-            )
+    _check_dsv4_kv_cache_format_backend(
+        kv_cache_format, backend, sm120_cake=_is_sm120_family(query.device)
+    )
 
     rope_quant = dsv4_inv_rope_cos_sin_cache is not None
     if dsv4_output_scale is not None and not rope_quant:
@@ -2455,6 +2478,65 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             kv_cache_format=kv_cache_format,
             backend="cake" if cake_sm120 else "sparse",
             enable_pdl=enable_pdl if cake_sm120 else None,
+        )
+
+    if backend == "cake" and kv_cache_format == "nvfp4":
+        # SM100/SM103 NVFP4 cache route. Two independent tables
+        # (``sparse_indices`` over ``swa_kv_cache``, ``extra_sparse_indices``
+        # over ``compressed_kv_cache``) as in the SM120 NVFP4 ABI; the main
+        # active length is ``sparse_topk_lens`` (``swa_topk_lens`` is accepted
+        # as the SM120 spelling of the same vector). No combined-table offset.
+        from .cake_dsv4 import run_cake_dsv4_nvfp4
+
+        if sparse_indices is None:
+            raise ValueError("backend='cake' requires sparse_indices")
+        if sparse_topk_lens is not None and swa_topk_lens is not None:
+            raise ValueError(
+                "kv_cache_format='nvfp4' takes either sparse_topk_lens or "
+                "swa_topk_lens for the main table, not both"
+            )
+        if sparse_topk_lens_offset != 0:
+            raise ValueError(
+                "kv_cache_format='nvfp4' uses independent tables; "
+                "sparse_topk_lens_offset must be 0"
+            )
+        if multi_ctas_kv_counter_buffer is not None:
+            raise ValueError(
+                "multi_ctas_kv_counter_buffer is only used by backend='trtllm-gen'"
+            )
+        if query.ndim == 4:
+            if max_q_len is not None and max_q_len != query.shape[1]:
+                raise ValueError(
+                    f"Expected max_q_len == {query.shape[1]} for dense query input, "
+                    f"got {max_q_len}"
+                )
+            query_flat = query.flatten(0, 1)
+        elif query.ndim == 3:
+            query_flat = query
+        else:
+            raise ValueError(f"Expected query.ndim == 3 or 4, got {query.ndim}")
+        if out is None:
+            out = torch.empty(query.shape, dtype=torch.bfloat16, device=query.device)
+        return run_cake_dsv4_nvfp4(
+            query=query_flat,
+            swa_kv_cache=swa_kv_cache,
+            compressed_kv_cache=compressed_kv_cache,
+            workspace_buffer=workspace_buffer,
+            sparse_indices=sparse_indices,
+            sparse_topk_lens=(
+                sparse_topk_lens if sparse_topk_lens is not None else swa_topk_lens
+            ),
+            extra_sparse_indices=extra_sparse_indices,
+            extra_sparse_topk_lens=extra_sparse_topk_lens,
+            out=out,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            max_q_len=max_q_len,
+            cum_seq_lens_q=cum_seq_lens_q,
+            seq_lens=seq_lens,
+            kv_layout=kv_layout,
+            backend="cake",
         )
 
     if backend != "cake":
@@ -4912,6 +4994,97 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         return_lse=return_lse,
         seq_lens_cpu=seq_lens_cpu,
         backend="cake",
+    )
+
+
+@flashinfer_experimental_api(feature="NVFP4 sparse MLA decode (SM100/SM103)")
+def nvfp4_sparse_mla_decode(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    bmm1_scale: float,
+    bmm2_scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
+    num_ctas_per_token: Optional[int] = None,
+    backend: str = "cuda",
+) -> torch.Tensor:
+    r"""Sparse MLA decode over an NVFP4 (``nvfp4_ds_mla``) KV cache on SM100 and SM103.
+
+    Each query token attends to the KV rows its sparse indexer selected (DeepSeek-V3.2 and GLM-5 DSA)::
+
+        out[t, h] = bmm2_scale * sum_k softmax_k(bmm1_scale * query[t, h] . K[i_tk]) * V[i_tk]
+
+    ``K`` is a row's 576-dim latent (512 NoPE + 64 RoPE) and ``V`` its first 512 dims. Rows are dequantized exactly
+    in the kernel; nothing is staged in global memory.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        ``[num_tokens, 16, 576]`` ``torch.float8_e4m3fn``: 16 heads per rank (for example DeepSeek-V3.2 at TP8 or
+        GLM-5 at TP4).
+    kv_cache : torch.Tensor
+        ``torch.uint8`` rows of 352 bytes in vLLM's ``nvfp4_ds_mla`` layout, any leading shape (for example
+        ``[num_blocks, block_size, 352]``). Bytes 0-255 hold the 512 NoPE values as e2m1 (element ``2i`` in the
+        low nibble), bytes 256-319 the 64 RoPE values as e4m3, bytes 320-351 one e4m3 scale per 16 NoPE values,
+        block ``b``'s at byte ``320 + 8 * (b % 4) + b // 4``.
+    indices : torch.Tensor
+        ``[num_tokens, topk]`` ``torch.int32`` row ids into ``kv_cache`` viewed as ``[-1, 352]``
+        (``block_id * block_size + offset``); ``-1`` marks an empty slot. ``topk`` is a multiple of 32 (2048 in
+        DeepSeek-V3.2 and GLM-5). Values are not range-checked.
+    bmm1_scale : float
+        Scale of ``query . K`` before the softmax: the softmax scale times the query's dequantization scale.
+    bmm2_scale : float
+        Scale of the output.
+    out : Optional[torch.Tensor]
+        ``[num_tokens, 16, 512]`` ``torch.bfloat16`` output; allocated when omitted.
+    num_ctas_per_token : Optional[int]
+        Thread-block cluster size per query token: 3 to 8 with ``backend="cuda"``, 1 to 6 or 8 with
+        ``backend="cake"`` (7 is rejected). By default, the largest size whose ``num_tokens`` clusters all fit
+        on the device in one wave.
+    backend : str
+        ``"cuda"`` (default), the hand-written kernel, or ``"cake"``, the generated program of the same
+        operator (``flashinfer/experimental/nvfp4_sparse_mla_decode/cake_backend.py``).
+
+    Returns
+    -------
+    torch.Tensor
+        ``out``. A token whose indices are all ``-1`` gets zeros.
+
+    Notes
+    -----
+    Requires compute capability 10.0 (B200, GB200) or 10.3 (B300, GB300). The first call on a device compiles
+    the kernel and queries its cluster occupancy; later calls can be captured in CUDA graphs. Layout, limits and measurements:
+    ``flashinfer/experimental/nvfp4_sparse_mla_decode/README.md``.
+    """
+    if backend == "cake":
+        from ..experimental.nvfp4_sparse_mla_decode.cake_backend import (
+            nvfp4_sparse_mla_decode as run_cake,
+        )
+
+        return run_cake(
+            query,
+            kv_cache,
+            indices,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            out=out,
+            num_ctas_per_token=num_ctas_per_token,
+            backend="cake",
+        )
+    if backend != "cuda":
+        raise ValueError(
+            "nvfp4_sparse_mla_decode supports backend='cuda' (default) or backend='cake'"
+        )
+    from ..experimental.nvfp4_sparse_mla_decode.backend import run
+
+    return run(
+        query,
+        kv_cache,
+        indices,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        out=out,
+        num_ctas_per_token=num_ctas_per_token,
     )
 
 

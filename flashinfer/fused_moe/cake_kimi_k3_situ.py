@@ -33,6 +33,29 @@ _LAYOUT = "trtllm_shuffled_nvfp4_group16"
 _STATE_ATTR = "_flashinfer_cake_situ_workspace"
 _N32_CLAIM8_ARCHES = ("sm_100a", "sm_103a")
 _M256_C12_ARCHES = ("sm_100a",)
+_LARGE_C7_ARCHES = ("sm_103a", "sm_100a")
+_LARGE_C7_TOKENS = (16384,)
+# Pre-shuffled FC1 scale factors (the ``large_c7`` route). The tile-N128 FC1
+# consumes K in steps of 512 elements. For every (N-tile, K-step) the
+# scale-factor writer emits the 4096-byte shared-memory image FC1 expects
+# (128 rows x 32 bytes; one byte per 16-element group) into ``sfb_shuffled``,
+# and FC1 loads each image with a single TMA copy. The FC1 TMA view addresses
+# an image as eight 512-byte blocks (one per 64 elements of K) of 2 x 256 bytes.
+_FC1_K_STEP = 512
+_FC1_K_TILES = _H // _FC1_K_STEP
+_SFB_IMAGE_BYTES = 128 * (_FC1_K_STEP // 16)
+_SFB_IMAGE_BLOCKS = _SFB_IMAGE_BYTES // 512
+# The 16-token SM103 and SM100 routes run an FC2 program built for two resident CTAs per
+# SM (four pipeline stages, __launch_bounds__(512, 2)), so its device-workfeed
+# pool holds 2 * SM // (_H // 128) rows: 280 CTAs on a 148-SM part instead of
+# the 140 of the single-CTA FC2 program. The pool size only sets how many CTAs
+# share the work: the router seeds the workfeed counter with the pool size and
+# every CTA claims its next tile through an atomic increment, exiting once the
+# counter passes the tile count, so a CTA that is not co-resident starts later
+# and takes whatever remains; no CTA waits for another.
+_N8_W2A_M16_ARCHES = ("sm_103a", "sm_100a")
+_N8_W2A_M16_TOKENS = (16,)
+_N8_W2A_M16_FC2_GRID_N_SM_FACTOR = 2
 
 
 def _tile_n(num_tokens):
@@ -62,6 +85,10 @@ def _geometry(num_tokens, arch=None):
     return tile_n, total_pairs, max_tiles
 
 
+def _sfb_shuffled_bytes(max_tiles):
+    return max_tiles * _FC1_K_TILES * _SFB_IMAGE_BYTES
+
+
 def _workspace_layout(num_tokens, arch=None):
     tile_n, total_pairs, max_tiles = _geometry(num_tokens, arch)
     rows = max_tiles * tile_n
@@ -89,6 +116,10 @@ def _workspace_layout(num_tokens, arch=None):
         or (num_tokens in (512, 1024) and arch in (None, *_N32_CLAIM8_ARCHES))
     ):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
+    if num_tokens in _LARGE_C7_TOKENS and arch in (None, *_LARGE_C7_ARCHES):
+        # One image per (N-tile, K-step). For 16384 tokens (2937 tiles) this
+        # adds 2937 * 7 * 4096 = 84,209,664 bytes (80.3 MiB) to the layout.
+        fields += (("sfb_shuffled", torch.uint8, (_sfb_shuffled_bytes(max_tiles),), 1),)
     layout, offset = {}, 0
     for name, dtype, shape, element_bytes in fields:
         offset = (offset + 127) // 128 * 128
@@ -259,6 +290,8 @@ def cake_fused_moe_prepare_workspace(
         mid_work5fd = arch in ("sm_100a", "sm_103a") and num_tokens in (2048, 4096)
         n32_claim8 = arch in _N32_CLAIM8_ARCHES and num_tokens in (512, 1024)
         m256_c12 = arch in _M256_C12_ARCHES and num_tokens == 256
+        large_c7 = arch in _LARGE_C7_ARCHES and num_tokens in _LARGE_C7_TOKENS
+        n8_w2a_m16 = arch in _N8_W2A_M16_ARCHES and num_tokens in _N8_W2A_M16_TOKENS
         tile_n, total_pairs, max_tiles = _geometry(num_tokens, arch)
         fc2_device_workfeed = num_tokens in (8, 16) or m64_claim8 or n32_claim8
         fc2_grid_n = max_tiles
@@ -267,24 +300,43 @@ def cake_fused_moe_prepare_workspace(
                 workspace_buffer.device
             ).multi_processor_count
             fc2_grid_n = min(max_tiles, max(1, sm_count // (_H // 128)))
-            if (num_tokens in (32, 64, 128, 256) and arch == "sm_100a") or (
-                num_tokens in (32, 64, 128, 256) and arch == "sm_103a"
-            ):
+            if m64_claim8:
+                # The 32- to 256-token routes measured best with a six-row
+                # pool: 6 * 28 = 168 FC2 CTAs on the 148-SM B200 and B300.
+                fc2_grid_n = min(max_tiles, 6)
+                if arch in ("sm_100a", "sm_103a"):
+                    fc2_grid_n = min(
+                        max_tiles, 12
+                    )  # inc23 (N16 claim8 FC2 2 CTAs/SM, s2b2 v39 program): 336 FC2 CTAs on the 148-SM B300 for the sm_103a claim8 rows M32/M64/M128/M256; inc24: the same twelve rows = 336 FC2 CTAs on the 148-SM B200 for the sm_100a claim8 rows M32/M64/M128/M256 (2 CTAs/SM x 148 + 40)
+            if n8_w2a_m16:
+                # Two resident CTAs per SM: the pool has
+                # _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * SM // (_H // 128) rows
+                # (10 rows, 280 CTAs, on 148 SMs). It sizes the FC2 grid and is
+                # passed to the fused router as fc2_pool_ctas.
                 fc2_grid_n = min(
-                    max_tiles, 6
-                )  # N16Claim8M256Pool6 (F7) + MidPool6 (inc5): 168 FC2 CTAs on the 148-SM B200 for the sm_100a claim8 rows M32/M64/M128/M256; B300Pool6 (inc7): 168 FC2 CTAs on the 148-SM B300 for the sm_103a claim8 rows M32/M64/M128/M256
+                    max_tiles,
+                    max(1, _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * sm_count // (_H // 128)),
+                )
         feature_finalize = num_tokens in (1, 8, 16) or m64_claim8
         program_key = cake_situ_sequence(
             arch,
             tile_n,
-            num_tokens == 1,
-            feature_finalize,
-            m64_claim8,
-            mid_work5fd,
-            n32_claim8,
-            m256_c12,
+            single_token=num_tokens == 1,
+            feature_finalize=feature_finalize,
+            m64_claim8=m64_claim8,
+            mid_work5fd=mid_work5fd,
+            n32_claim8=n32_claim8,
+            m256_c12=m256_c12,
+            large_c7=large_c7,
+            n8_w2a_m16=n8_w2a_m16,
         )
         module = get_cake_situ_module(program_key)
+        # The fused quantization + router programs declare the stage in their
+        # argument plan; resolve that once here rather than on every call.
+        fused_quant_route = any(
+            name == "quant_route.s2b_num_tokens"
+            for _, name in PROGRAMS[program_key]["arg_plan"]
+        )
         state["shapes"][num_tokens] = {
             "views": views,
             "tile_n": tile_n,
@@ -297,6 +349,9 @@ def cake_fused_moe_prepare_workspace(
             "mid_work5fd": mid_work5fd,
             "n32_claim8": n32_claim8,
             "m256_c12": m256_c12,
+            "large_c7": large_c7,
+            "n8_w2a_m16": n8_w2a_m16,
+            "fused_quant_route": fused_quant_route,
             "fc2_device_workfeed": fc2_device_workfeed,
             "fc2_grid_n": fc2_grid_n,
             "fc2_pool_ctas": (_H // 128) * fc2_grid_n,
@@ -551,6 +606,19 @@ def _cake_situ_stage_bindings(options, prepared):
                 tile_n_shift=tile_n.bit_length() - 1,
             ),
         }
+    if prepared["large_c7"]:
+        stages["sfb_shuffle"] = dict(
+            grid=(max_tiles, 1, 1),
+            SFB=views["x_scales"],
+            **{
+                name: views[name]
+                for name in ("route_map", "tile_mn_limit", "total_tiles")
+            },
+            SFBS=views["sfb_shuffled"],
+            K=_H,
+            K_tiles=_FC1_K_TILES,
+            grid_n=max_tiles,
+        )
     stages.update(
         {
             "fc1": dict(
@@ -579,7 +647,16 @@ def _cake_situ_stage_bindings(options, prepared):
                 K=_H,
                 grid_m=_I // 64,
                 grid_n=max_tiles,
-                K_tiles=_H // 512,
+                K_tiles=_FC1_K_TILES,
+                **(
+                    {
+                        "SFBS": views["sfb_shuffled"].view(
+                            max_tiles, _FC1_K_TILES * _SFB_IMAGE_BLOCKS, 2, 256
+                        )
+                    }
+                    if prepared["large_c7"]
+                    else {}
+                ),
             ),
             "fc2": dict(
                 grid=(_H // 128, prepared["fc2_grid_n"], 1),
@@ -630,6 +707,20 @@ def _cake_situ_stage_bindings(options, prepared):
             ),
         }
     )
+    # The fused quantization + router programs run one launch of grid
+    # (num_tokens + 1, 1, 1): block 0 routes and blocks 1..num_tokens quantize.
+    # The separate "quant" and "fused_router" entries stay in `stages` but are
+    # not referenced by their argument plan.
+    if prepared["fused_quant_route"]:
+        stages["quant_route"] = dict(
+            stages["fused_router"],
+            grid=(num_tokens + 1, 1, 1),
+            s2b_x=x,
+            s2b_qx=qx,
+            s2b_packed=views["x_packed"],
+            s2b_scales=views["x_scales"],
+            s2b_num_tokens=num_tokens,
+        )
     return stages
 
 

@@ -192,6 +192,138 @@ _DIRECT_STAGES = (
 )
 _DIRECT_POLICY = dict(min_keys_per_query=4)
 
+# The per-target rules of the registered programs (second optimisation round, lever H3): the record's
+# ``key_pass_policy`` carries them under ``rules``; a record without them (first release) is the R1 rule
+# = _RULES["sm_100a"] on every architecture.
+_RULES = {
+    "sm_100a": dict(tail_rows=0, fixed_passes=0, min_kv=0, tail_min_kv=0, tail_cap=0),
+    "sm_103a": dict(
+        tail_rows=1, fixed_passes=0, min_kv=0, tail_min_kv=131072, tail_cap=3
+    ),
+    "sm_107a": dict(
+        tail_rows=1, fixed_passes=2, min_kv=131072, tail_min_kv=131072, tail_cap=0
+    ),
+}
+
+
+def _rule_passes(
+    record: dict, num_queries: int, num_kv: int, topk: int = 2048, arch=None
+) -> int:
+    """The pass count the record's rule for ``arch`` gives a one-segment row (the test's own evaluation)."""
+    policy = KeyPassPolicy.from_record(record)
+    rule = policy.rule_for(arch)
+    formula = policy.formula_passes(num_kv)
+    if formula == 1:
+        return 1
+    one_chunk = num_queries <= policy.token_chunk(topk)
+    tail = bool(rule["tail_rows"]) and 2 * num_queries <= num_kv
+    if not (one_chunk or tail):
+        return 1
+    if num_kv < (rule["min_kv"] if one_chunk else rule["tail_min_kv"]):
+        return 1
+    passes = rule["fixed_passes"] or formula
+    if tail and not one_chunk and rule["tail_cap"]:
+        passes = min(passes, rule["tail_cap"])
+    return passes if passes <= policy.max_passes else 1
+
+
+def test_key_pass_policy_per_target_rules():
+    record = {"key_pass_policy": dict(_POLICY, rules=_RULES)}
+    policy = KeyPassPolicy.from_record(record)
+    # a first-release record (no rules) and an unknown architecture take the R1 rule
+    legacy = KeyPassPolicy.from_record({"key_pass_policy": dict(_POLICY)})
+    assert legacy.rule_for("sm_103a") == _RULES["sm_100a"]
+    assert policy.rule_for(None) == _RULES["sm_100a"]
+    assert policy.rule_for("sm_90a") == _RULES["sm_100a"]
+    assert policy.rule_for("sm_107a") == _RULES["sm_107a"]
+    # the rule fields are non-negative integers, exactly the five
+    for name in ("tail_cap", "tail_min_kv"):
+        for bad in (-1, True, 1.5):
+            rules = dict(_RULES, sm_103a=dict(_RULES["sm_103a"], **{name: bad}))
+            with pytest.raises(ValueError, match=name):
+                KeyPassPolicy.from_record(
+                    {"key_pass_policy": dict(_POLICY, rules=rules)}
+                )
+    with pytest.raises(ValueError, match="rules"):
+        KeyPassPolicy.from_record(
+            {
+                "key_pass_policy": dict(
+                    _POLICY, rules=dict(_RULES, sm_100a={"tail_rows": 0})
+                )
+            }
+        )
+    rows = {
+        # (T, S): (sm_100a, sm_103a, sm_107a)
+        (4096, 65536): (
+            2,
+            2,
+            1,
+        ),  # cptail_4k_65536: R200 runs 65-68k-key rows single-pass
+        (2123, 67923): (2, 2, 1),  # tail_2123x67923
+        (4096, 131072): (3, 3, 2),  # cptail_4k_131072: fixed two passes on R200
+        (4224, 131072): (3, 3, 2),
+        (4225, 131072): (
+            1,
+            3,
+            2,
+        ),  # more than one chunk: a 2 T <= S row on sm_103a / sm_107a
+        (32768, 65536): (
+            1,
+            1,
+            1,
+        ),  # spread_32k_65536: a 65536-key tail row stays single-pass everywhere
+        (4225, 65536): (1, 1, 1),  # more than one chunk below the tail floors
+        (32768, 131072): (1, 3, 2),  # spread_32k_131072
+        (32768, 196608): (1, 3, 2),  # formula 5, capped at 3 on sm_103a
+        (32768, 262144): (1, 3, 2),  # packed_N1
+        (65536, 131072): (1, 3, 2),  # exactly 2 T == S
+        (65537, 131072): (1, 1, 1),  # 2 T > S and more than one chunk
+        (131072, 131072): (1, 1, 1),  # a causal single document never qualifies
+        (4096, 4096): (1, 1, 1),
+        (4096, 45511): (1, 1, 1),
+        (4096, 45512): (2, 2, 1),
+        (4096, 180224): (4, 4, 2),  # the largest capped count
+        # formula 5: above max_passes on the formula targets (one pass); sm_107a's two passes are under it
+        (4096, 225280): (1, 1, 2),
+        (4096, 268757): (1, 1, 2),
+    }
+    for (T, S), want in rows.items():
+        got = tuple(policy.passes(T, S, 2048, arch=a) for a in _RULES)
+        assert got == want, (T, S, got, want)
+        assert tuple(_rule_passes(record, T, S, arch=a) for a in _RULES) == want
+        assert (
+            tuple(
+                plan_key_passes(record, _ALL_STAGES, T, S, 2048, arch=a) for a in _RULES
+            )
+            == want
+        )
+    # a multi-segment row plans one pass under every rule
+    for a in _RULES:
+        assert policy.passes(4096, 131072, 2048, num_segments=2, arch=a) == 1
+    # token chunks of a multi-pass backward (the Cake launcher's loop)
+    assert policy.token_chunks(4096, 2048) == ((0, 4096),)
+    assert policy.token_chunks(4224, 2048) == ((0, 4224),)
+    assert policy.token_chunks(8448, 2048) == ((0, 4224), (4224, 4224))
+    assert policy.token_chunks(32768, 2048) == tuple(
+        (b, min(4224, 32768 - b)) for b in range(0, 32768, 4224)
+    )
+    assert policy.token_chunks(32768, 2048)[-1] == (29568, 3200)
+
+
+def test_workspace_layout_token_chunk():
+    T, S, topk = 8448, 131072, 2048
+    whole = workspace_layout(T, S, topk, key_passes=3)
+    chunked = workspace_layout(T, S, topk, key_passes=3, token_chunk=4224)
+    assert whole["dq_partial"][1] == T * DQ_PARTIAL_BYTES_PER_TOKEN
+    assert chunked["dq_partial"][1] == 4224 * DQ_PARTIAL_BYTES_PER_TOKEN
+    assert chunked["key_scratch"][1] == 4224 * topk * 4
+    assert chunked["pass_counts"][1] == 4224 * 4
+    # a chunk larger than the row changes nothing
+    assert workspace_layout(T, S, topk, key_passes=3, token_chunk=10000) == whole
+    assert workspace_layout(
+        T, S, topk, key_passes=1, token_chunk=128
+    ) == workspace_layout(T, S, topk, key_passes=1)
+
 
 def test_key_pass_policy_rule():
     policy = KeyPassPolicy(**_POLICY)
@@ -1313,7 +1445,7 @@ def test_backward_forced_key_passes_masked_matches_reference_and_is_deterministi
     assert runner.key_passes == 3
     expected_order = ["bwd_delta"]
     for index in range(3):
-        expected_order += [(stage, index) for stage in KEY_PASS_STAGES]
+        expected_order += [(stage, 0, index) for stage in KEY_PASS_STAGES]
     if "bwd_cast" in runner.launches:
         expected_order.append("bwd_cast")
     assert list(runner.backward_order) == expected_order
@@ -1346,15 +1478,30 @@ def test_backward_forced_key_passes_masked_matches_reference_and_is_deterministi
 
 
 def test_backward_whole_row_policy_two_passes_through_public_entry():
-    """The registered policy takes two passes at T = 4096 x S = 65,536 (top-k 2048), through
-    the public entry, against the canonical gates; the 4k x 4k and 32k-token rows stay single-pass."""
+    """The registered policy takes two passes at T = 4096 x S = 65,536 (top-k 2048) under the R1
+    rule (the sm_100a / sm_103a records; the sm_107a rule keeps that row single-pass, so the test
+    forces two there), through the public entry, against the canonical gates; the 4k x 4k row stays
+    single-pass and every row follows the record's published rule for the device's architecture."""
     record, stages = _require_key_pass_program()
     device = torch.device("cuda")
+    arch = cake_backend.arch_for(device)
+    # without an architecture the record's constants give the R1 rule
     assert plan_key_passes(record, stages, 4096, 65536, 2048) == 2
     assert plan_key_passes(record, stages, 4096, 131072, 2048) == 3
     assert plan_key_passes(record, stages, 4096, 4096, 2048) == 1
     assert plan_key_passes(record, stages, 32768, 131072, 2048) == 1
-    policy_size = dsa_train_workspace_size(4096, 65536, 2048, device)
+    for T, S in (
+        (4096, 65536),
+        (4096, 131072),
+        (4096, 4096),
+        (32768, 131072),
+        (8448, 131072),
+    ):
+        assert plan_key_passes(record, stages, T, S, 2048, arch=arch) == _rule_passes(
+            record, T, S, arch=arch
+        ), (T, S)
+    forced = None if _rule_passes(record, 4096, 65536, arch=arch) == 2 else 2
+    policy_size = dsa_train_workspace_size(4096, 65536, 2048, device, key_passes=forced)
     single_size = dsa_train_workspace_size(4096, 65536, 2048, device, key_passes=1)
     assert policy_size - single_size >= 4096 * (
         DQ_PARTIAL_BYTES_PER_TOKEN + 4 * 2048 + 4
@@ -1368,10 +1515,10 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
         for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     ]
     with _quiet_experimental():
-        out = dsa_sparse_attention(*leaves, inp.idx_global)
+        out = dsa_sparse_attention(*leaves, inp.idx_global, key_passes=forced)
     grads = torch.autograd.grad(out, leaves, inp.dout)
     torch.cuda.synchronize()
-    # the policy plans two passes for this row: per pass the compaction and the pass kernel
+    # two passes for this row (one token chunk): per pass the compaction and the pass kernel
     runner = prepare_dsa_train(
         inp.q_latent,
         inp.q_rope,
@@ -1380,20 +1527,21 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
         inp.idx_global,
         dout=inp.dout,
         backward=True,
+        key_passes=forced,
     )
     assert runner.key_passes == 2
     assert [k for k in runner.backward_order if isinstance(k, tuple)] == [
-        ("bwd_compact", 0),
-        ("bwd_main_pass", 0),
-        ("bwd_compact", 1),
-        ("bwd_main_pass", 1),
+        ("bwd_compact", 0, 0),
+        ("bwd_main_pass", 0, 0),
+        ("bwd_compact", 0, 1),
+        ("bwd_main_pass", 0, 1),
     ]
     del runner
     # repeating the step with the same binding is bitwise for the forward and dq
     fwd_args = tuple(t.detach() for t in leaves) + (inp.idx_global,)
     o1, l1, olo1 = cake_backend.forward(*fwd_args)
-    g1 = cake_backend.backward(*fwd_args, o1, olo1, l1, inp.dout)
-    g2 = cake_backend.backward(*fwd_args, o1, olo1, l1, inp.dout)
+    g1 = cake_backend.backward(*fwd_args, o1, olo1, l1, inp.dout, key_passes=forced)
+    g2 = cake_backend.backward(*fwd_args, o1, olo1, l1, inp.dout, key_passes=forced)
     o2, l2, olo2 = cake_backend.forward(*fwd_args)
     torch.cuda.synchronize()
     assert torch.equal(g1[0], g2[0]) and torch.equal(g1[1], g2[1])
@@ -1415,6 +1563,48 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
     _check_backward(single, ref, canonical=True)
     assert rel_l2(grads[0], single[0]) < 1e-3 and rel_l2(grads[1], single[1]) < 1e-3
     assert max(rel_l2(grads[2], single[2]), rel_l2(grads[3], single[3])) < 1e-2
+
+
+def test_backward_forced_passes_over_two_token_chunks():
+    """Two forced passes over a row of 4352 tokens (one full chunk of 4224 and one of 128): the
+    launches run chunk by chunk through every pass, the pass scratch holds one chunk, dq is
+    bitwise across two calls and agrees with the single pass and the reference."""
+    record, _stages = _require_key_pass_program()
+    device = torch.device("cuda")
+    chunk = KeyPassPolicy.from_record(record).token_chunk(2048)
+    assert chunk == 4224
+    inp = make_inputs([chunk + 128], [65536], seed=SEED + 18, topk=2048)
+    fwd_args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
+    out, lse, o_lo = cake_backend.forward(*fwd_args)
+    runner = prepare_dsa_train(*fwd_args, dout=inp.dout, backward=True, key_passes=2)
+    assert runner.key_passes == 2
+    assert [k for k in runner.backward_order if isinstance(k, tuple)] == [
+        (stage, c, p) for c in range(2) for p in range(2) for stage in KEY_PASS_STAGES
+    ]
+    assert runner.layout["dq_partial"][1] == chunk * DQ_PARTIAL_BYTES_PER_TOKEN
+    assert runner.layout["key_scratch"][1] == chunk * 2048 * 4
+    assert (
+        dsa_train_workspace_size(chunk + 128, 65536, 2048, device, key_passes=2)
+        == runner.layout["total"]
+    )
+    del runner
+    args = fwd_args + (out, o_lo, lse, inp.dout)
+    a = cake_backend.backward(*args, key_passes=2)
+    b = cake_backend.backward(*args, key_passes=2)
+    single = cake_backend.backward(*args, key_passes=1)
+    torch.cuda.synchronize()
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+    assert rel_l2(a[0], single[0]) < 1e-3 and rel_l2(a[1], single[1]) < 1e-3
+    assert max(rel_l2(a[2], single[2]), rel_l2(a[3], single[3])) < 1e-2
+    ref = reference_fp64(
+        inp.q_latent,
+        inp.q_rope,
+        inp.kv_latent,
+        inp.k_rope,
+        inp.idx_global,
+        dout=inp.dout,
+    )
+    _check_backward(a, ref, canonical=True)
 
 
 def test_public_entry_derives_row_lengths_and_matches_full_rows():
@@ -1558,10 +1748,15 @@ def test_varlen_multi_segment_row_plans_single_pass():
         )
     grads_f = torch.autograd.grad(out_f, flat_leaves, inp.dout)
     torch.cuda.synchronize()
-    # the segment count is part of the plan key: the flat call plans anew and takes the two passes
+    # the segment count is part of the plan key: the flat call plans anew and takes the passes of the
+    # device's rule for the whole row (two under the R1 rule; a one-chunk row below the sm_107a key floor
+    # stays single-pass there)
+    flat_passes = _rule_passes(
+        record, 256, 46000, topk=128, arch=cake_backend.arch_for(device)
+    )
     assert sorted(
         b.plan.key_passes for b in cache._entries.values() if b.plan.backward
-    ) == [1, 2]
+    ) == sorted([1, flat_passes])
     assert torch.equal(out_v.detach(), out_f.detach()) and torch.equal(lse_v, lse_f)
     for a, b in zip(grads_v, grads_f, strict=True):
         assert rel_l2(a, b) < 1e-3

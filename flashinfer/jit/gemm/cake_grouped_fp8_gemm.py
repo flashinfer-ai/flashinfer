@@ -53,14 +53,36 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "plan2": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "A64"],
+        ["tma_buffer", "A32"],
+        ["tma_buffer", "B"],
+        ["buffer", "SFA"],
+        ["buffer", "SFB"],
+        ["buffer", "m_indices"],
+        ["tma_buffer", "C_tma"],
+        ["parameter", "shape_m"],
+        ["parameter", "shape_n"],
+        ["parameter", "grid_n"],
+        ["parameter", "k_tiles"],
+        ["parameter", "sfa_row_stride"],
+        ["parameter", "sfa_col_stride"],
+        ["parameter", "sfb_group_stride"],
+        ["parameter", "sfb_row_stride"],
+        ["parameter", "sfb_col_stride"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
 }
 
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_grouped_fp8_gemm_052db8d74e99d306ddd1": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_052db8d74e99d306ddd1",
+    "cake_grouped_fp8_gemm_0244c42d588c7898347e": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_0244c42d588c7898347e",
         "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_052db8d74e99d306ddd1_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_052db8d74e99d306ddd1_binding.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_0244c42d588c7898347e_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_0244c42d588c7898347e_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -68,11 +90,23 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_grouped_fp8_gemm_1b8a46c5188189851e7e": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_1b8a46c5188189851e7e",
+    "cake_grouped_fp8_gemm_1035a4c29fa0da40de08": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_1035a4c29fa0da40de08",
         "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_1b8a46c5188189851e7e_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_1b8a46c5188189851e7e_binding.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_1035a4c29fa0da40de08_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_1035a4c29fa0da40de08_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_114d583151bfd499cedb": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_114d583151bfd499cedb",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_114d583151bfd499cedb_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_114d583151bfd499cedb_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -80,11 +114,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_grouped_fp8_gemm_3b638be257142f78ec7a": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_3b638be257142f78ec7a",
+    "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_28b94ccb85e6d2d50961",
         "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_3b638be257142f78ec7a_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_3b638be257142f78ec7a_binding.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_28b94ccb85e6d2d50961_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_28b94ccb85e6d2d50961_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -92,11 +126,95 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_grouped_fp8_gemm_4cb684af9950c96d43f1": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_4cb684af9950c96d43f1",
+    "cake_grouped_fp8_gemm_38eca7c5f2fb16897c62": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_38eca7c5f2fb16897c62",
         "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_4cb684af9950c96d43f1_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_4cb684af9950c96d43f1_binding.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_38eca7c5f2fb16897c62_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_38eca7c5f2fb16897c62_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_6da15715d9ab967a1cc3",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_6da15715d9ab967a1cc3_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_6da15715d9ab967a1cc3_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_800df0f72fc29eca3650": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_800df0f72fc29eca3650",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_800df0f72fc29eca3650_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_800df0f72fc29eca3650_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_80f755e56ac14f76e72c": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_80f755e56ac14f76e72c",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_80f755e56ac14f76e72c_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_80f755e56ac14f76e72c_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_815c907592a28b332939": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_815c907592a28b332939",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_815c907592a28b332939_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_815c907592a28b332939_binding.cu",
+        ],
+        "compile_flags": ["-Xptxas=-O1"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_917859181466ebe2dd3b": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_917859181466ebe2dd3b",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_917859181466ebe2dd3b_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_917859181466ebe2dd3b_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_942f06939975f32fd8d7": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_942f06939975f32fd8d7",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_942f06939975f32fd8d7_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_942f06939975f32fd8d7_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan2",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_966750bd68250909df74": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_966750bd68250909df74",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_966750bd68250909df74_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_966750bd68250909df74_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -104,11 +222,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_grouped_fp8_gemm_69974ba44e35be8085c8": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_69974ba44e35be8085c8",
+    "cake_grouped_fp8_gemm_cd2dca5f68bd9134a455": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_cd2dca5f68bd9134a455",
         "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_69974ba44e35be8085c8_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_69974ba44e35be8085c8_binding.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_cd2dca5f68bd9134a455_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_cd2dca5f68bd9134a455_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -116,11 +234,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_grouped_fp8_gemm_6aaa2e7a81d7413f5ee7": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_6aaa2e7a81d7413f5ee7",
+    "cake_grouped_fp8_gemm_e032da34f6810f0aa5b6": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_e032da34f6810f0aa5b6",
         "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_6aaa2e7a81d7413f5ee7_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_6aaa2e7a81d7413f5ee7_binding.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_e032da34f6810f0aa5b6_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_e032da34f6810f0aa5b6_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -128,61 +246,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_grouped_fp8_gemm_8d257b8a7a26cde8a91f": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_8d257b8a7a26cde8a91f",
+    "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_f2e4effd9e0455a7e297",
         "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_8d257b8a7a26cde8a91f_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_8d257b8a7a26cde8a91f_binding.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_f2e4effd9e0455a7e297_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_f2e4effd9e0455a7e297_binding.cu",
         ],
         "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_grouped_fp8_gemm_c9d4520e67204f6fab94": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_c9d4520e67204f6fab94",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_c9d4520e67204f6fab94_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_c9d4520e67204f6fab94_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_grouped_fp8_gemm_d74a826eaa282b4ae559": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_d74a826eaa282b4ae559",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_d74a826eaa282b4ae559_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_d74a826eaa282b4ae559_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_grouped_fp8_gemm_e9a88795c566eb333bb4": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_e9a88795c566eb333bb4",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_e9a88795c566eb333bb4_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_e9a88795c566eb333bb4_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_grouped_fp8_gemm_f1969b1c8be8317cb028": {
-        "kernel": "kernel_cake_grouped_fp8_gemm_f1969b1c8be8317cb028",
-        "sources": [
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_f1969b1c8be8317cb028_kernel.cu",
-            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_f1969b1c8be8317cb028_binding.cu",
-        ],
-        "compile_flags": ["-Xptxas=-O1"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
@@ -191,114 +261,154 @@ PROGRAMS: dict[str, dict[str, Any]] = {
 }
 
 MODULES: dict[str, dict[str, str]] = {
-    "cake_grouped_fp8_gemm_052db8d74e99d306ddd1_sm_100a": {
+    "cake_grouped_fp8_gemm_0244c42d588c7898347e_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_052db8d74e99d306ddd1",
+        "program": "cake_grouped_fp8_gemm_0244c42d588c7898347e",
     },
-    "cake_grouped_fp8_gemm_052db8d74e99d306ddd1_sm_103a": {
+    "cake_grouped_fp8_gemm_0244c42d588c7898347e_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_052db8d74e99d306ddd1",
+        "program": "cake_grouped_fp8_gemm_0244c42d588c7898347e",
     },
-    "cake_grouped_fp8_gemm_1b8a46c5188189851e7e_sm_100a": {
+    "cake_grouped_fp8_gemm_1035a4c29fa0da40de08_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_1b8a46c5188189851e7e",
+        "program": "cake_grouped_fp8_gemm_1035a4c29fa0da40de08",
     },
-    "cake_grouped_fp8_gemm_1b8a46c5188189851e7e_sm_103a": {
+    "cake_grouped_fp8_gemm_1035a4c29fa0da40de08_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_1b8a46c5188189851e7e",
+        "program": "cake_grouped_fp8_gemm_1035a4c29fa0da40de08",
     },
-    "cake_grouped_fp8_gemm_3b638be257142f78ec7a_sm_100a": {
+    "cake_grouped_fp8_gemm_114d583151bfd499cedb_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_3b638be257142f78ec7a",
+        "program": "cake_grouped_fp8_gemm_114d583151bfd499cedb",
     },
-    "cake_grouped_fp8_gemm_3b638be257142f78ec7a_sm_103a": {
+    "cake_grouped_fp8_gemm_114d583151bfd499cedb_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_3b638be257142f78ec7a",
+        "program": "cake_grouped_fp8_gemm_114d583151bfd499cedb",
     },
-    "cake_grouped_fp8_gemm_4cb684af9950c96d43f1_sm_100a": {
+    "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_4cb684af9950c96d43f1",
+        "program": "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961",
     },
-    "cake_grouped_fp8_gemm_4cb684af9950c96d43f1_sm_103a": {
+    "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_4cb684af9950c96d43f1",
+        "program": "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961",
     },
-    "cake_grouped_fp8_gemm_69974ba44e35be8085c8_sm_100a": {
+    "cake_grouped_fp8_gemm_38eca7c5f2fb16897c62_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_69974ba44e35be8085c8",
+        "program": "cake_grouped_fp8_gemm_38eca7c5f2fb16897c62",
     },
-    "cake_grouped_fp8_gemm_69974ba44e35be8085c8_sm_103a": {
+    "cake_grouped_fp8_gemm_38eca7c5f2fb16897c62_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_69974ba44e35be8085c8",
+        "program": "cake_grouped_fp8_gemm_38eca7c5f2fb16897c62",
     },
-    "cake_grouped_fp8_gemm_6aaa2e7a81d7413f5ee7_sm_100a": {
+    "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_6aaa2e7a81d7413f5ee7",
+        "program": "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3",
     },
-    "cake_grouped_fp8_gemm_6aaa2e7a81d7413f5ee7_sm_103a": {
+    "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_6aaa2e7a81d7413f5ee7",
+        "program": "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3",
     },
-    "cake_grouped_fp8_gemm_8d257b8a7a26cde8a91f_sm_100a": {
+    "cake_grouped_fp8_gemm_800df0f72fc29eca3650_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_8d257b8a7a26cde8a91f",
+        "program": "cake_grouped_fp8_gemm_800df0f72fc29eca3650",
     },
-    "cake_grouped_fp8_gemm_8d257b8a7a26cde8a91f_sm_103a": {
+    "cake_grouped_fp8_gemm_800df0f72fc29eca3650_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_8d257b8a7a26cde8a91f",
+        "program": "cake_grouped_fp8_gemm_800df0f72fc29eca3650",
     },
-    "cake_grouped_fp8_gemm_c9d4520e67204f6fab94_sm_100a": {
+    "cake_grouped_fp8_gemm_80f755e56ac14f76e72c_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_c9d4520e67204f6fab94",
+        "program": "cake_grouped_fp8_gemm_80f755e56ac14f76e72c",
     },
-    "cake_grouped_fp8_gemm_c9d4520e67204f6fab94_sm_103a": {
+    "cake_grouped_fp8_gemm_80f755e56ac14f76e72c_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_c9d4520e67204f6fab94",
+        "program": "cake_grouped_fp8_gemm_80f755e56ac14f76e72c",
     },
-    "cake_grouped_fp8_gemm_d74a826eaa282b4ae559_sm_100a": {
+    "cake_grouped_fp8_gemm_815c907592a28b332939_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_d74a826eaa282b4ae559",
+        "program": "cake_grouped_fp8_gemm_815c907592a28b332939",
     },
-    "cake_grouped_fp8_gemm_d74a826eaa282b4ae559_sm_103a": {
+    "cake_grouped_fp8_gemm_815c907592a28b332939_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_d74a826eaa282b4ae559",
+        "program": "cake_grouped_fp8_gemm_815c907592a28b332939",
     },
-    "cake_grouped_fp8_gemm_e9a88795c566eb333bb4_sm_100a": {
+    "cake_grouped_fp8_gemm_917859181466ebe2dd3b_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_e9a88795c566eb333bb4",
+        "program": "cake_grouped_fp8_gemm_917859181466ebe2dd3b",
     },
-    "cake_grouped_fp8_gemm_e9a88795c566eb333bb4_sm_103a": {
+    "cake_grouped_fp8_gemm_917859181466ebe2dd3b_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_e9a88795c566eb333bb4",
+        "program": "cake_grouped_fp8_gemm_917859181466ebe2dd3b",
     },
-    "cake_grouped_fp8_gemm_f1969b1c8be8317cb028_sm_100a": {
+    "cake_grouped_fp8_gemm_942f06939975f32fd8d7_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_gemm_f1969b1c8be8317cb028",
+        "program": "cake_grouped_fp8_gemm_942f06939975f32fd8d7",
     },
-    "cake_grouped_fp8_gemm_f1969b1c8be8317cb028_sm_103a": {
+    "cake_grouped_fp8_gemm_942f06939975f32fd8d7_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_gemm_f1969b1c8be8317cb028",
+        "program": "cake_grouped_fp8_gemm_942f06939975f32fd8d7",
+    },
+    "cake_grouped_fp8_gemm_966750bd68250909df74_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_grouped_fp8_gemm_966750bd68250909df74",
+    },
+    "cake_grouped_fp8_gemm_966750bd68250909df74_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_966750bd68250909df74",
+    },
+    "cake_grouped_fp8_gemm_cd2dca5f68bd9134a455_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_grouped_fp8_gemm_cd2dca5f68bd9134a455",
+    },
+    "cake_grouped_fp8_gemm_cd2dca5f68bd9134a455_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_cd2dca5f68bd9134a455",
+    },
+    "cake_grouped_fp8_gemm_e032da34f6810f0aa5b6_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_grouped_fp8_gemm_e032da34f6810f0aa5b6",
+    },
+    "cake_grouped_fp8_gemm_e032da34f6810f0aa5b6_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_e032da34f6810f0aa5b6",
+    },
+    "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297",
+    },
+    "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297",
     },
 }
 
 ROUTES: dict[str, Any] = {
-    "deepk_c2_ab6_scale1_n256_or_m4096": "cake_grouped_fp8_gemm_4cb684af9950c96d43f1",
-    "deepk_c2_k_multiple_512": "cake_grouped_fp8_gemm_e9a88795c566eb333bb4",
-    "deepk_c2_kg1_non_kg4_k_blocks": "cake_grouped_fp8_gemm_c9d4520e67204f6fab94",
-    "deepk_c2_scalar_output": "cake_grouped_fp8_gemm_69974ba44e35be8085c8",
-    "deepk_cg2_ab5_x16_four_load_wait_grid128_kg4": "cake_grouped_fp8_gemm_1b8a46c5188189851e7e",
-    "deepk_cg2_ab5_x16_pair_wait_kg4": "cake_grouped_fp8_gemm_d74a826eaa282b4ae559",
-    "deepk_cg2_ab6_early4_output_alias_kg4": "cake_grouped_fp8_gemm_8d257b8a7a26cde8a91f",
-    "deepk_cg2_ab7_bscale_prefetch_kg4": "cake_grouped_fp8_gemm_3b638be257142f78ec7a",
-    "deepk_n256_ab4_three_panel_kg4": "cake_grouped_fp8_gemm_052db8d74e99d306ddd1",
-    "k128_exact": "cake_grouped_fp8_gemm_f1969b1c8be8317cb028",
-    "k384_exact_three_partial": "cake_grouped_fp8_gemm_6aaa2e7a81d7413f5ee7",
+    "bs_ue8m0_n128": "cake_grouped_fp8_gemm_942f06939975f32fd8d7",
+    "bs_ue8m0_n128_run32": "cake_grouped_fp8_gemm_38eca7c5f2fb16897c62",
+    "bs_ue8m0_n256": "cake_grouped_fp8_gemm_1035a4c29fa0da40de08",
+    "bs_ue8m0_n256_run32": "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3",
+    "deepk_c2_ab6_scale1_n256_or_m4096": "cake_grouped_fp8_gemm_966750bd68250909df74",
+    "deepk_c2_k_multiple_512": "cake_grouped_fp8_gemm_917859181466ebe2dd3b",
+    "deepk_c2_kg1_non_kg4_k_blocks": "cake_grouped_fp8_gemm_cd2dca5f68bd9134a455",
+    "deepk_c2_scalar_output": "cake_grouped_fp8_gemm_80f755e56ac14f76e72c",
+    "deepk_cg2_ab5_x16_four_load_wait_grid128_kg4": "cake_grouped_fp8_gemm_e032da34f6810f0aa5b6",
+    "deepk_cg2_ab5_x16_pair_wait_kg4": "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961",
+    "deepk_cg2_ab6_early4_output_alias_kg4": "cake_grouped_fp8_gemm_800df0f72fc29eca3650",
+    "deepk_cg2_ab7_bscale_prefetch_kg4": "cake_grouped_fp8_gemm_f2e4effd9e0455a7e297",
+    "deepk_n256_ab4_three_panel_kg4": "cake_grouped_fp8_gemm_0244c42d588c7898347e",
+    "k128_exact": "cake_grouped_fp8_gemm_815c907592a28b332939",
+    "k384_exact_three_partial": "cake_grouped_fp8_gemm_114d583151bfd499cedb",
 }
 
 # Tile geometry of every host route (including routes without an exported
 # program), resolved from the source dispatcher: {route: {tile_m, tile_n,
 # cluster_ctas}}.
 ROUTE_GEOMETRY: dict[str, dict[str, int]] = {
+    "bs_ue8m0_n128": {"tile_m": 128, "tile_n": 128, "cluster_ctas": 1},
+    "bs_ue8m0_n128_run32": {"tile_m": 128, "tile_n": 128, "cluster_ctas": 1},
+    "bs_ue8m0_n256": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
+    "bs_ue8m0_n256_run32": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
     "deepk_c2_ab6_scale1_n256_or_m4096": {
         "tile_m": 128,
         "tile_n": 128,
