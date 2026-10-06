@@ -5,6 +5,7 @@ import torch
 
 import b12x.moe.fused_moe._impl as tp_moe_impl
 from b12x.moe.fused_moe._impl import plan_b12x_fp4_moe_weights, plan_tp_moe_execution
+from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 from b12x.moe._shared.execution import (
     GemmEngine,
     MoERegime,
@@ -182,6 +183,7 @@ def test_materialized_fused_work_can_use_grid_or_load_balancing_queue() -> None:
 
 
 def test_workspace_plan_maps_kernel_family_to_execution_contract() -> None:
+    """Execution plans map each kernel family to its execution contract."""
     dynamic_weights = _weight_plan("nvfp4", source_format="modelopt_nvfp4")
     dynamic = plan_tp_moe_execution(
         num_tokens=64,
@@ -189,6 +191,12 @@ def test_workspace_plan_maps_kernel_family_to_execution_contract() -> None:
         device=torch.device("cpu"),
         weight_plan=dynamic_weights,
         quant_mode="nvfp4",
+        decode_config=MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="internal",
+            max_active_clusters=None,
+            dynamic_route_mode="grouped",
+        ),
     )
     w4a16_weights = _weight_plan("w4a16", source_format="fp4_e8m0_k32")
     w4a16 = plan_tp_moe_execution(
@@ -197,6 +205,9 @@ def test_workspace_plan_maps_kernel_family_to_execution_contract() -> None:
         device=torch.device("cpu"),
         weight_plan=w4a16_weights,
         quant_mode="w4a16",
+        decode_config=MoeDecodeConfig(
+            backend="w4a16", route_planner="internal", max_active_clusters=None
+        ),
     )
 
     assert dynamic.implementation == "dynamic"
@@ -214,6 +225,7 @@ def test_workspace_plan_maps_kernel_family_to_execution_contract() -> None:
 
 
 def test_workspace_plan_uses_weight_plan_source_contract() -> None:
+    """The workspace plan inherits the weight plan's source contract."""
     weights = _weight_plan(
         "w4a8_mx",
         source_format="fp4_e8m0_k32",
@@ -226,6 +238,12 @@ def test_workspace_plan_uses_weight_plan_source_contract() -> None:
         device=torch.device("cpu"),
         weight_plan=weights,
         quant_mode="w4a8_mx",
+        decode_config=MoeDecodeConfig(
+            backend="dynamic",
+            route_planner="internal",
+            max_active_clusters=None,
+            dynamic_route_mode="grouped",
+        ),
     )
 
     assert plan.spec.source_format == "fp4_e8m0_k32"
@@ -328,12 +346,9 @@ def test_non_128_aligned_e8m0_w4a16_shards_stay_source_native() -> None:
         plan = _weight_plan("w4a16", source_format="fp4_e8m0_k32", n=shard)
         assert WeightPreparationTransform.W4A16_NATIVE in plan.transforms
         assert (
-            plan.required_weight_layout("w4a16")
-            is PreparedWeightLayout.SOURCE_NATIVE
+            plan.required_weight_layout("w4a16") is PreparedWeightLayout.SOURCE_NATIVE
         )
 
     aligned = _weight_plan("w4a16", source_format="fp4_e8m0_k32", n=256)
     assert WeightPreparationTransform.W4A16_PACKED in aligned.transforms
-    assert (
-        aligned.required_weight_layout("w4a16") is PreparedWeightLayout.MMA_PACKED
-    )
+    assert aligned.required_weight_layout("w4a16") is PreparedWeightLayout.MMA_PACKED

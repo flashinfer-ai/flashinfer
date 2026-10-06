@@ -21,7 +21,11 @@ from dataclasses import dataclass
 
 import torch
 
-from b12x._lib.intrinsics import align_up, swizzle_block_scale
+from b12x._lib.intrinsics import (
+    align_up,
+    swizzle_block_scale,
+    validate_e8m0_scale_grid,
+)
 
 _SF_BLOCK = 32  # K elements per UE8M0 block scale
 _TILE_K = 128  # kernel K-tile width (packed 3:4 along K)
@@ -123,20 +127,17 @@ def _validate_e8m0_scale_grid(
     rows: int,
     k: int,
 ) -> torch.Tensor:
-    if not isinstance(scale, torch.Tensor):
-        raise TypeError(f"{name} must be a torch.Tensor")
-    if scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
-        raise TypeError(
-            f"{name} must hold UE8M0 bytes (uint8/float8_e8m0fnu), "
-            f"got {scale.dtype}"
-        )
-    expected = (num_experts, rows, k // _SF_BLOCK)
-    if scale.dim() != 3 or tuple(scale.shape) != expected:
-        raise ValueError(
-            f"{name} must be an unswizzled per-K/{_SF_BLOCK} grid with shape "
-            f"{expected}, got {tuple(scale.shape)}"
-        )
-    return scale.view(torch.uint8).contiguous()
+    """Apply the canonical UE8M0 grid rule (dtype, extent, finite bytes)."""
+    if isinstance(scale, torch.Tensor):
+        scale = scale.contiguous()
+    return validate_e8m0_scale_grid(
+        scale,
+        name=name,
+        num_experts=num_experts,
+        rows=rows,
+        k=k,
+        sf_block=_SF_BLOCK,
+    )
 
 
 def _validate_expert_scalars(

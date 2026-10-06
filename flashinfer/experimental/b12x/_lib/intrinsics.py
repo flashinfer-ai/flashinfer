@@ -81,6 +81,58 @@ def swizzle_block_scale(scale: torch.Tensor) -> torch.Tensor:
     swizzled = swizzled.reshape(batch, rows_padded, cols_padded)
     return swizzled[0] if squeeze_batch else swizzled
 
+# UE8M0 0xFF is the encoding's NaN.  No MX block scale may be NaN, and a
+# clamp would silently change every dequantized weight in the block, so the
+# preparation path rejects it instead of carrying it into the kernel.
+E8M0_NAN_BYTE = 0xFF
+
+
+def validate_e8m0_scale_grid(
+    grid: torch.Tensor,
+    *,
+    name: str,
+    num_experts: int,
+    rows: int,
+    k: int,
+    sf_block: int = 32,
+) -> torch.Tensor:
+    """Validate a checkpoint-native (unswizzled) UE8M0 block-scale grid.
+
+    The grid must hold ``[num_experts, rows, k // sf_block]`` scale bytes in
+    ``uint8`` or ``float8_e8m0fnu`` storage and be contiguous.  Every finite
+    UE8M0 byte (``0x00``..``0xFE``) is preserved verbatim; ``0xFF`` (NaN) is
+    rejected.  Returns a contiguous ``uint8`` view of the same bytes.
+    """
+    if not isinstance(grid, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if grid.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        raise TypeError(
+            f"{name} must hold UE8M0 bytes (uint8/float8_e8m0fnu), "
+            f"got {grid.dtype}"
+        )
+    if k % sf_block:
+        raise ValueError(
+            f"{name}: k={k} must be a multiple of the {sf_block}-element "
+            "UE8M0 block scale"
+        )
+    expected = (int(num_experts), int(rows), int(k) // sf_block)
+    if grid.dim() != 3 or tuple(grid.shape) != expected:
+        raise ValueError(
+            f"{name} must be an unswizzled per-K/{sf_block} grid with shape "
+            f"{expected}, got {tuple(grid.shape)}"
+        )
+    bytes_ = grid.view(torch.uint8)
+    if not bytes_.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    invalid = int((bytes_ == E8M0_NAN_BYTE).sum().item())
+    if invalid:
+        raise ValueError(
+            f"{name} holds {invalid} UE8M0 NaN scale byte(s) (0xFF); MX block "
+            "scales must be finite (0x00..0xFE) and are never clamped"
+        )
+    return bytes_
+
+
 
 def as_grouped_scale_view(
     scale_storage: torch.Tensor, rows: int, cols: int
@@ -256,6 +308,51 @@ def quant_dequant_mxfp8_torch(x: torch.Tensor) -> torch.Tensor:
     block_max = blocked.abs().amax(dim=-1, keepdim=True)
     rounded, byte = pow2_ceil_ue8m0_torch(block_max * _INV_FLOAT8_E4M3_MAX)
     inv = _ue8m0_output_scale_torch(byte)
+    payload = (
+        (blocked * inv)
+        .clamp(-FLOAT8_E4M3_MAX, FLOAT8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
+    return (payload * rounded).reshape(orig_shape)
+
+
+def quant_dequant_mxfp8_scaled_torch(
+    x: torch.Tensor,
+    global_scale: torch.Tensor | float,
+) -> torch.Tensor:
+    """Per-32-block MXFP8 quantize-dequantize WITH a global scale (oracle).
+
+    Bit-for-bit replica of the fused-MoE route-pack / FC2-requant container
+    quantizer ``b12x._lib.fp6.quantize_block_fp8_e4m3_containers``, i.e.
+    ``fp6_block_ue8m0_exact`` (IEEE exponent-field + nonzero-mantissa ceil of
+    ``(block_amax * global_scale) / 448``) then ``ue8m0_output_scale_exact``
+    (``global_scale * 2**(127 - byte)``) then E4M3 round-to-nearest-saturating.
+    The dequantized value is ``payload * 2**(byte - 127)``.
+
+    Not interchangeable with ``quantize_mxfp8_rows_torch``: that dense-linear
+    helper derives its byte with ``ceil(log2(...))`` and maps an all-zero
+    block to byte 127, while the MoE container path uses exact bit extraction
+    and byte 0.
+
+    ``global_scale`` is broadcastable against the per-block amax grid: a
+    scalar, or one value per row (the per-expert activation global scale a
+    routed row was quantized with).
+    """
+    orig_shape = x.shape
+    cols = orig_shape[-1]
+    if cols % MX_SF_VEC_SIZE != 0:
+        raise ValueError(f"last dim must be divisible by {MX_SF_VEC_SIZE}, got {cols}")
+    blocked = x.to(torch.float32).reshape(-1, cols // MX_SF_VEC_SIZE, MX_SF_VEC_SIZE)
+    block_max = blocked.abs().amax(dim=-1, keepdim=True)
+    gs = torch.as_tensor(global_scale, dtype=torch.float32, device=x.device)
+    gs = gs.reshape(-1, 1, 1)
+    if gs.shape[0] not in (1, blocked.shape[0]):
+        raise ValueError(
+            f"global_scale has {gs.shape[0]} rows, expected 1 or {blocked.shape[0]}"
+        )
+    rounded, byte = pow2_ceil_ue8m0_torch((block_max * gs) / FLOAT8_E4M3_MAX)
+    inv = _ue8m0_output_scale_torch(byte) * gs
     payload = (
         (blocked * inv)
         .clamp(-FLOAT8_E4M3_MAX, FLOAT8_E4M3_MAX)

@@ -321,6 +321,7 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    """Reject a decode config the query's recipe cannot execute."""
     _validate_block_moe_launch(query, config)
     if query.source_format in BLOCK_CODECS:
         if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
@@ -394,8 +395,13 @@ def validate_moe_decode_config(
             raise ValueError("the W4A16 backend requires quant_mode='w4a16'")
         if config.w4a16_route_mode is not None:
             raise ValueError("w4a16_route_mode is only valid for W4A16")
-    if query.quant_mode == "w6a8_mx" and config.backend != "dynamic":
-        raise ValueError("W6A8-MX queries require the dynamic backend")
+    if (
+        query.quant_mode in {"w6a8_mx", "w8a8_mx"}
+        and config.backend != "dynamic"
+    ):
+        raise ValueError(
+            "MX byte-container queries require the dynamic backend"
+        )
     if config.route_planner not in {"internal", "triton"}:
         raise ValueError(f"unsupported MoE route planner {config.route_planner!r}")
     if config.route_planner == "triton" and config.backend != "dynamic":
@@ -445,6 +451,15 @@ def validate_moe_decode_config(
     if config.backend == "dynamic":
         if config.dynamic_tile_m not in {16, 32, 64, 128}:
             raise ValueError("dynamic_tile_m must be one of 16, 32, 64, 128")
+        if (
+            query.quant_mode in {"w6a8_mx", "w8a8_mx"}
+            and config.dynamic_tile_m != 128
+        ):
+            # The MX byte-container dynamic kernels build only the (128, 128)
+            # MMA tile; a smaller declared tile could not be materialized.
+            raise ValueError(
+                "MX byte-container recipes require the production M128 dynamic tile"
+            )
         if config.dynamic_route_mode not in {"direct", "grouped"}:
             raise ValueError("dynamic_route_mode must be 'direct' or 'grouped'")
     elif config.dynamic_tile_m is not None:
@@ -505,8 +520,13 @@ def _materialize_tuning(query, device, choice):
     if config.backend == "micro" and not _policy_micro_supported(effective_query):
         raise ValueError("micro MoE does not support this concrete query")
     if config.backend == "dynamic":
-        if effective_query.quant_mode == "w6a8_mx" and config.dynamic_tile_m != 128:
-            raise ValueError("W6A8-MX requires the production M128 dynamic tile")
+        if (
+            effective_query.quant_mode in {"w6a8_mx", "w8a8_mx"}
+            and config.dynamic_tile_m != 128
+        ):
+            raise ValueError(
+                "MX byte-container recipes require the production M128 dynamic tile"
+            )
         try:
             _dynamic_direct_routing_selected(
                 route_mode=config.dynamic_route_mode,
@@ -663,7 +683,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 
 TUNING = TuningContract(
     component_id="moe.decode",
-    query_schema_version=20,
+    query_schema_version=21,
     config_schema_version=9,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
@@ -673,7 +693,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=22,
+    candidate_contract_version=23,
     knobs=(
         # Enumeration order prefers A16 at equal measured latency on every rank.
         Knob(name="backend", values=("w4a16", "micro", "dynamic"), binding=ParameterBinding.COMPILE),

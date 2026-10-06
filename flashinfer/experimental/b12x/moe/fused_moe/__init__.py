@@ -126,6 +126,7 @@ META = OpMeta(
         "w4a8_mx",
         "w4a8_nvfp4",
         "w6a8_mx",
+        "w8a8_mx",
         "w4a16",
         "b12x_trellis",
     ),

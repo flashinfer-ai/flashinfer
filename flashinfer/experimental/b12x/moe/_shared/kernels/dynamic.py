@@ -829,6 +829,9 @@ class MoEDynamicKernelBackend:
         trellis_direct_lut: bool = False,
         w4a8_csf_inline: bool = False,
     ):
+        """Record the dynamic-kernel specialization and reject unsupported recipe
+        combinations.
+        """
         activation = normalize_moe_activation(activation)
         if quant_recipe not in {
             "nvfp4",
@@ -836,6 +839,7 @@ class MoEDynamicKernelBackend:
             "w4a8_nvfp4",
             "w4a8_trellis",
             "w6a8_mx",
+            "w8a8_mx",
         }:
             raise ValueError(f"unsupported quant_recipe {quant_recipe!r}")
         if work_source not in _WORK_SOURCES:
@@ -886,6 +890,16 @@ class MoEDynamicKernelBackend:
         # m16n8k32 MMA. It rides the nvfp4-shaped TMA route/pack/mainloop
         # machinery (NOT the raw w4a8 path), so is_w4a8 stays False for it.
         self.is_w6a8 = quant_recipe == "w6a8_mx"
+        # w8a8_mx: same m16n8k32 block-scaled atom geometry as w6a8_mx, but B
+        # carries real E4M3 codes (gmem K extent == logical K), so the MMA is
+        # the native MmaMXF8Op and there is no packed-B staging or expansion.
+        self.is_w8a8 = quant_recipe == "w8a8_mx"
+        # Shared byte-per-element operand geometry (tile_k, tiled MMA, SF
+        # atoms, activation scratch).  Packed-B staging stays is_w6a8-only.
+        self.is_mxf8 = self.is_w6a8 or self.is_w8a8
+        # Both recipes quantize activations and the FC2 intermediate to E4M3
+        # with UE8M0 K/32 scales; mxfp6_fmt_a/b select only the inline FP6 MMA.
+        self._act_container_fmt = "e4m3" if self.is_mxf8 else None
         if self.is_w6a8:
             if mxfp6_fmt_a is None:
                 mxfp6_fmt_a = "e4m3"
@@ -920,6 +934,34 @@ class MoEDynamicKernelBackend:
             if share_input_across_experts:
                 raise ValueError(
                     "w6a8_mx does not support share_input_across_experts yet"
+                )
+        elif self.is_w8a8:
+            if mxfp6_fmt_a is not None or mxfp6_fmt_b is not None:
+                raise ValueError(
+                    "mxfp6_fmt_a/mxfp6_fmt_b are only valid for w6a8_mx; "
+                    "w8a8_mx consumes E4M3 operands on the native MmaMXF8Op"
+                )
+            if sf_vec_size != 32:
+                raise ValueError(
+                    f"w8a8_mx requires sf_vec_size == 32 (MX K/32 blocks), got {sf_vec_size}"
+                )
+            if mma_tiler_mn != (128, 128):
+                raise ValueError(
+                    "w8a8_mx supports mma_tiler_mn == (128, 128) only"
+                )
+            if swap_ab:
+                raise ValueError("w8a8_mx does not support swap_ab")
+            if w4a8_repacked:
+                raise ValueError("w4a8_repacked does not apply to w8a8_mx")
+            if direct_routing:
+                raise ValueError("w8a8_mx does not support direct_routing yet")
+            if materialize_intermediate:
+                raise ValueError(
+                    "w8a8_mx does not support materialize_intermediate yet"
+                )
+            if share_input_across_experts:
+                raise ValueError(
+                    "w8a8_mx does not support share_input_across_experts yet"
                 )
         elif mxfp6_fmt_a is not None or mxfp6_fmt_b is not None:
             raise ValueError("mxfp6_fmt_a/mxfp6_fmt_b are only valid for w6a8_mx")
@@ -1256,7 +1298,7 @@ class MoEDynamicKernelBackend:
         # FP4 packs two elements per byte, so its K-tile is sf_vec_size*8 with
         # a 64-byte SW atom; the FP6/FP8 byte-container path carries one
         # element per byte, so the same 128-byte row is sf_vec_size*4 elements.
-        tile_k = sf_vec_size * 4 if self.is_w6a8 else sf_vec_size * 8
+        tile_k = sf_vec_size * 4 if self.is_mxf8 else sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
         # Scale-factor tiles are 128-row atoms in hardware.  Native NVFP4
         # consumes only the compact route tile in sA while retaining the
@@ -1423,13 +1465,15 @@ class MoEDynamicKernelBackend:
         )
 
     def _setup_attributes(self):
+        """Derive tile, shared-memory, and pipeline geometry for the selected recipe."""
         import cutlass.utils.blackwell_helpers as sm120_utils
 
-        if cutlass.const_expr(self.is_w6a8):
-            # FP6 codes live in Float8E4M3FN byte-containers; build tiled_mma
-            # with the MXFP8 op so smem/SF layouts match m16n8k32 geometry.
-            # The mainloop emits the inline ``mxf8f6f4`` MMA instead of this
-            # atom's instruction (see moe_emit_mma_k_block).
+        if cutlass.const_expr(self.is_mxf8):
+            # Both MX recipes take the m16n8k32 block-scaled atom geometry.
+            # w6a8_mx carries FP6 codes in Float8E4M3FN byte-containers and
+            # emits the inline ``mxf8f6f4`` MMA instead of this atom's
+            # instruction (see moe_emit_mma_k_block); w8a8_mx carries real
+            # E4M3 codes and runs the instruction this atom emits.
             mma_op = cute.nvgpu.warp.MmaMXF8Op(
                 cutlass.Float8E4M3FN,
                 self.acc_dtype,
@@ -2539,6 +2583,9 @@ class MoEDynamicKernelBackend:
         trellis_lut: cute.Tensor | None = None,  # 4 KiB lut_e4m3 value table (u8)
         trellis_rotations: cute.Tensor | None = None,  # [E*3I] fp16
     ):
+        """Build TMA descriptors for the bound tensors and launch the persistent
+        kernel.
+        """
         self.a_dtype = packed_a.element_type
         self.b_dtype = b_w13.element_type
         if cutlass.const_expr(self.is_w6a8):
@@ -2552,6 +2599,17 @@ class MoEDynamicKernelBackend:
             assert self.b_dtype == cutlass.Float8E4M3FN, (
                 "w6a8_mx requires b_w13/b_down as Float8E4M3FN views of the "
                 "3:4-packed FP6 bytes"
+            )
+        elif cutlass.const_expr(self.is_w8a8):
+            # w8a8_mx contract: packed_a is the MXFP8-E4M3 activation view
+            # [rows_padded, K, 1]; b_w13/b_down are the checkpoint's own E4M3
+            # bytes with K extent == logical K.
+            assert self.a_dtype == cutlass.Float8E4M3FN, (
+                "w8a8_mx requires packed_a as a Float8E4M3FN activation view"
+            )
+            assert self.b_dtype == cutlass.Float8E4M3FN, (
+                "w8a8_mx requires b_w13/b_down as Float8E4M3FN views of the "
+                "checkpoint E4M3 bytes"
             )
         self.sf_dtype = sfa_ptr.dtype
         self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
@@ -3330,11 +3388,13 @@ class MoEDynamicKernelBackend:
         sf_blocks_per_row = cols // Int32(16)
         quant_block_elems = Int32(16)
         packed_bytes_per_sf_block = Int32(8)
-        if cutlass.const_expr(self.is_w6a8):
+        if cutlass.const_expr(self.is_mxf8):
             # MXFP8-E4M3 byte-container scratch: one code per byte (32 bytes
             # per K/32 block, K bytes/row) so the Float8E4M3FN A TMA/ldmatrix
             # path consumes it; UE8M0 scales per 32 elements in the swizzled
             # 128-row SF atoms (one atom spans 4 blocks = 128 elements).
+            # Shared by w6a8_mx (FP6 codes in E4M3 containers) and w8a8_mx
+            # (real E4M3 codes).
             sf_blocks_per_row = cols // Int32(32)
             quant_block_elems = Int32(32)
             packed_bytes_per_sf_block = Int32(32)
@@ -3342,7 +3402,7 @@ class MoEDynamicKernelBackend:
             # E4M3 payload: one byte per element; UE8M0 scales per 32 elements.
             output_bytes_per_row = cols
             mx_blocks_per_row = cols // Int32(32)
-        elif cutlass.const_expr(self.is_w6a8):
+        elif cutlass.const_expr(self.is_mxf8):
             output_bytes_per_row = cols
             mx_blocks_per_row = sf_blocks_per_row  # unused placeholder
         else:
@@ -3356,7 +3416,7 @@ class MoEDynamicKernelBackend:
         flat_stride = Int32(gdim_z) * Int32(self.threads_per_cta)
         # SF-atom K-tile count for the swizzled scale layout: one 512-byte
         # atom spans 4 SF blocks = 64 elements at sf_vec 16, 128 at sf_vec 32.
-        if cutlass.const_expr(self.is_w6a8):
+        if cutlass.const_expr(self.is_mxf8):
             num_k_tiles = (cols + Int32(127)) // Int32(128)
         else:
             num_k_tiles = (cols + Int32(63)) // Int32(64)
@@ -4185,14 +4245,13 @@ class MoEDynamicKernelBackend:
                                             phys_row * mx_blocks_per_row + blk_idx
                                         ] = Uint8(mx_scale_byte & Uint32(0xFF))
                                         blk_idx += Int32(32)
-                                elif cutlass.const_expr(self.is_w6a8):
-                                    # w6a8_mx: MXFP8-E4M3 K/32 byte-container
-                                    # payload (same encoding as w4a8's activation
-                                    # side, but WITH the calibrated per-expert
-                                    # global scale folded in at quantize time),
-                                    # stored row-major for the A TMA; scale bytes
-                                    # go to the swizzled 128-row SF atoms exactly
-                                    # like nvfp4 (sf_idx now indexes K/32 blocks).
+                                elif cutlass.const_expr(self.is_mxf8):
+                                    # w6a8_mx / w8a8_mx: MXFP8-E4M3 K/32
+                                    # byte-container payload, with the
+                                    # calibrated per-expert global scale folded
+                                    # in at quantize time.  Stored row-major
+                                    # for the A TMA; scale bytes go to the
+                                    # swizzled 128-row SF atoms like nvfp4.
                                     sf_idx = lane_id
                                     while sf_idx < sf_blocks_per_row:
                                         block_start = sf_idx * quant_block_elems
@@ -4213,7 +4272,7 @@ class MoEDynamicKernelBackend:
                                                 values,
                                                 block_max,
                                                 gs_value,
-                                                self.mxfp6_fmt_a,
+                                                self._act_container_fmt,
                                             )
                                         )
                                         output_offset = (
@@ -7505,9 +7564,10 @@ class MoEDynamicKernelBackend:
                                             )
                         # Activation + quant into sA
                         sA_u8 = cute.recast_tensor(sA[None, None, 0], cutlass.Uint8)
-                        if cutlass.const_expr(self.is_w6a8):
-                            # Byte-container intermediate: one code per byte,
-                            # tile_k bytes per row; K/32 UE8M0 blocks.
+                        if cutlass.const_expr(self.is_mxf8):
+                            # Byte-container intermediate (w6a8_mx / w8a8_mx):
+                            # one code per byte, tile_k bytes per row; K/32
+                            # UE8M0 blocks.
                             packed_cols = Int32(self.tile_shape_mnk[2])
                             sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // 32)
                             fc2_quant_block_elems = Int32(32)
@@ -7572,7 +7632,7 @@ class MoEDynamicKernelBackend:
                                 epi_rows = Int32(self.epi_tile[0])
                             if epi_rows < Int32(0):
                                 epi_rows = Int32(0)
-                            if cutlass.const_expr(self.is_w6a8):
+                            if cutlass.const_expr(self.is_mxf8):
                                 # Zero the FP6/FP8 intermediate SFA + A-code
                                 # smem before the FC2 requant store. The store
                                 # only covers epi_rows*sf_blocks; any padding-
@@ -7617,7 +7677,7 @@ class MoEDynamicKernelBackend:
                                 sf_block = quant_idx - local_row * sf_blocks_per_row
                                 block_start = sf_block * fc2_quant_block_elems
 
-                                if cutlass.const_expr(self.is_w6a8):
+                                if cutlass.const_expr(self.is_mxf8):
                                     values = cute.make_rmem_tensor(
                                         (32,), cutlass.Float32
                                     )
@@ -7637,7 +7697,7 @@ class MoEDynamicKernelBackend:
                                             values,
                                             block_max,
                                             quant_gs_value,
-                                            self.mxfp6_fmt_a,
+                                            self._act_container_fmt,
                                         )
                                     )
                                     # Byte-container swizzled store into the

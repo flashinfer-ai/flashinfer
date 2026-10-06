@@ -163,6 +163,7 @@ def make_tp_moe_fp4_binding(
     swiglu_limit: float | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    deterministic_output: bool | None = None,
 ) -> Iterator[object]:
     """Prepare one exact-M execution and yield its real caller-owned binding."""
     from b12x.moe import fused_moe
@@ -176,10 +177,12 @@ def make_tp_moe_fp4_binding(
     expected_mode = {
         fused_moe.ActivationMode.A4: "nvfp4",
         fused_moe.ActivationMode.A16: "w4a16",
-        fused_moe.ActivationMode.A8: (
-            "w4a8_mx"
-            if experts.plan.source.format is fused_moe.PackedSourceFormat.MXFP4_E8M0_K32
-            else "w4a8_nvfp4"
+        fused_moe.ActivationMode.A8: {
+            fused_moe.PackedSourceFormat.MXFP4_E8M0_K32: "w4a8_mx",
+            fused_moe.PackedSourceFormat.MXFP6_E8M0_K32: "w6a8_mx",
+            fused_moe.PackedSourceFormat.MXFP8_E8M0_K32: "w8a8_mx",
+        }.get(
+            experts.plan.source.format, "w4a8_nvfp4"
         ),
     }.get(activation.mode)
     if requested_mode is not None and requested_mode != expected_mode:
@@ -202,6 +205,7 @@ def make_tp_moe_fp4_binding(
         ),
         routing=fused_moe.RoutingSpec(
             apply_router_weight_on_input=apply_router_weight_on_input,
+            deterministic_output=deterministic_output,
         ),
         invocation=FrozenMapping({
             "fast_math": True if fast_math is None else bool(fast_math),
@@ -302,7 +306,7 @@ def ref_fp4_quant(
     x: torch.Tensor,
     global_scale: torch.Tensor | float,
     block_size: int = NVFP4_BLOCK_SIZE,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     sliced_shape = x.shape[:-1] + (x.shape[-1] // block_size, block_size)
     sliced_x = x.reshape(sliced_shape)
     vec_max = torch.max(torch.abs(sliced_x), dim=-1, keepdim=True)[0].to(torch.float32)
@@ -320,7 +324,7 @@ def ref_grouped_fp4_quantize(
     input_tensor: torch.Tensor,
     row_counts: torch.Tensor,
     global_scale: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     num_groups, rows, cols = input_tensor.shape
     quantized = torch.zeros(
         (num_groups, rows, cols), dtype=torch.float32, device=input_tensor.device
@@ -348,7 +352,7 @@ def ref_grouped_silu_mul_quantize(
     input_tensor: torch.Tensor,
     row_counts: torch.Tensor,
     global_scale: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     cols = input_tensor.shape[-1] // 2
     left = input_tensor[..., :cols].float()
     right = input_tensor[..., cols:].float()

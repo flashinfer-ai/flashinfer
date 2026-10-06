@@ -121,10 +121,13 @@ class WeightPlan:
 
 
 def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
+    """Map a packed source format and activation mode to its quant recipe."""
     source_format = source.format.value
     if mode is ActivationMode.A16:
-        if source_format == "mxfp6_e2m3":
-            raise ValueError("MXFP6 weights require A8 activations")
+        if source_format in ("mxfp6_e2m3", "mxfp8_e8m0_k32"):
+            raise ValueError(
+                f"{source_format} weights require A8 activations"
+            )
         return "w4a16"
     if mode is ActivationMode.A4:
         if source_format != "modelopt_nvfp4":
@@ -135,6 +138,7 @@ def _packed_recipe(source: PackedSource, mode: ActivationMode) -> str:
             "fp4_e8m0_k32": "w4a8_mx",
             "modelopt_nvfp4": "w4a8_nvfp4",
             "mxfp6_e2m3": "w6a8_mx",
+            "mxfp8_e8m0_k32": "w8a8_mx",
         }[source_format]
     except KeyError as exc:
         raise ValueError(
@@ -185,6 +189,7 @@ def _prepared_format(
     recipe: str,
     constraints: WeightPlanConstraints,
 ) -> PreparedWeightFormat:
+    """Resolve the prepared weight format for a recipe from the preparation plan."""
     available = frozenset(WeightPacking(layout.value) for layout in plan.weight_layouts)
     required = plan.required_weight_layout(recipe)
     default_packing = (
@@ -207,6 +212,8 @@ def _prepared_format(
             if source.format.value in BLOCK_CODECS
             else WeightEncoding.FP6_E2M3
             if source.format.value == "mxfp6_e2m3"
+            else WeightEncoding.FP8_E4M3
+            if source.format.value == "mxfp8_e8m0_k32"
             else WeightEncoding.FP4_E2M1
         )
         scales = ScaleEncoding(plan.specs[0].weight_scale.value)

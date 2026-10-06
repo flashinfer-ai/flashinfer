@@ -17,6 +17,7 @@ class PackedSourceFormat(str, Enum):
     MODELOPT_NVFP4 = "modelopt_nvfp4"
     COMPRESSED_TENSORS_FP4 = "compressed_tensors"
     MXFP6_E8M0_K32 = "mxfp6_e2m3"
+    MXFP8_E8M0_K32 = "mxfp8_e8m0_k32"
     IQ2_XS = "iq2_xs"
     IQ2_XXS = "iq2_xxs"
     Q8_0 = "q8_0"

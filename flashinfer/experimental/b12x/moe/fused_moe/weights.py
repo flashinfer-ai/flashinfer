@@ -23,6 +23,7 @@ class WeightEncoding(str, Enum):
 
     FP4_E2M1 = "fp4_e2m1"
     FP6_E2M3 = "fp6_e2m3"
+    FP8_E4M3 = "fp8_e4m3"
     TRELLIS = "trellis"
     IQ2_XS = "iq2_xs"
     IQ2_XXS = "iq2_xxs"

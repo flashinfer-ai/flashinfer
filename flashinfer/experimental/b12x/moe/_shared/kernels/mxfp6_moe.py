@@ -1,4 +1,9 @@
-"""Shared MX-FP6 helpers for the fused MoE dynamic kernels (w6a8_mx recipe)."""
+"""Shared MX byte-container helpers for the fused MoE dynamic kernels.
+
+Used by ``w6a8_mx`` (FP6 codes in E4M3 containers, inline ``mxf8f6f4`` MMA) and
+``w8a8_mx`` (real E4M3 codes on the native ``MmaMXF8Op``); the container
+quantizer and the byte-container stores are common to both.
+"""
 
 from __future__ import annotations
 

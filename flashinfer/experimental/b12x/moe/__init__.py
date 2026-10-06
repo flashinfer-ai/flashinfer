@@ -2,8 +2,8 @@
 
 - ``fused_moe``: fused tensor-parallel routed-expert FFN (route -> FC1 ->
   activation -> FC2 -> scatter); recipes nvfp4/w4a8_mx/w4a8_nvfp4/w6a8_mx/
-  w4a16, including the canonical TP-independent ``b12x_trellis`` checkpoint
-  encoding.
+  w8a8_mx/w4a16, including the canonical TP-independent ``b12x_trellis``
+  checkpoint encoding.
 - ``ep_moe``: expert-parallel MoE (replicated input -> local partial;
   cross-rank reduction is the caller's job, typically ``comm.pcie``).
 """

@@ -4,9 +4,10 @@ from dataclasses import dataclass
 
 import torch
 
-# The flashinfer-TRTLLM cross-kernel oracle helpers live alongside in
-# reference_flashinfer.py, kept separate so this module stays pure-torch.
-from b12x._lib.intrinsics import fp4_quantize_values_torch
+from b12x._lib.intrinsics import (
+    fp4_quantize_values_torch,
+    quant_dequant_mxfp8_scaled_torch,
+)
 from b12x.moe._shared.kernels.activations import (
     SITU,
     SITU_DEFAULT_BETA,
@@ -1295,6 +1296,116 @@ def moe_reference_w4a8_mx(
             fc1_out = (xs @ w13_eff.T) * alpha_fc1
             intermediate = torch.square(torch.relu(fc1_out))
         int_qd = _quant_dequant_mxfp8_rows(intermediate)
+        down_out = (int_qd @ w2_eff.T) * alpha_fc2
+        route_weight = (topk_weights.float() * route_mask.float()).sum(dim=1)[
+            token_mask
+        ]
+        output[token_mask] += route_weight.unsqueeze(1) * down_out
+
+    return output
+
+
+def _dequant_w8a8_weight_e8m0_k32(
+    w_e4m3: torch.Tensor,
+    scale_bytes: torch.Tensor,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    """Effective w8a8 weight values: exact E4M3 payload x UE8M0 K/32 scale.
+
+    The kernel consumes the checkpoint's E4M3 bytes directly, so the payload
+    decode is a dtype widening with no lookup table and no requantization.
+    """
+    raw = w_e4m3.view(torch.float8_e4m3fn)[:rows, :cols].to(torch.float32)
+    n_blocks = cols // 32
+    scale = torch.exp2(scale_bytes[:rows, :n_blocks].to(torch.float32) - 127.0)
+    return (raw.view(rows, n_blocks, 32) * scale.unsqueeze(-1)).reshape(rows, cols)
+
+
+def moe_reference_w8a8_mx(
+    x: torch.Tensor,
+    w1_e4m3: torch.Tensor,
+    w1_mx_scales: torch.Tensor,
+    w1_alphas: torch.Tensor,
+    w2_e4m3: torch.Tensor,
+    w2_mx_scales: torch.Tensor,
+    w2_alphas: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    E: int,
+    K: int,
+    I_tp: int,
+    *,
+    a1_gscale: torch.Tensor,
+    a2_gscale: torch.Tensor,
+    activation: str = "silu",
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
+    w13_layout: str = "w13",
+) -> torch.Tensor:
+    """W8A8-MX MoE oracle: MXFP8 activations x MXFP8 (E4M3/UE8M0-K32) weights.
+
+    Consumes the checkpoint-native tensors only — no prepared/swizzled
+    representation participates.  Both GEMM operand boundaries reproduce the
+    fused kernel's numeric contract: the routed activation row and the FC2
+    intermediate are quantized per 32 elements to E4M3 with a UE8M0 block
+    scale that is the power-of-two ceiling of ``amax * gscale / 448`` (see
+    :func:`b12x._lib.intrinsics.quant_dequant_mxfp8_scaled_torch`), and each
+    projection is scaled by its per-expert runtime alpha
+    (``weight_scale_2 / a_gscale``), which is what cancels the folded
+    activation global scale.
+    """
+    activation, swiglu_limit, swiglu_alpha, swiglu_beta = (
+        _normalize_reference_swiglu_params(
+            activation,
+            swiglu_limit,
+            swiglu_alpha,
+            swiglu_beta,
+        )
+    )
+    if activation != "silu":
+        raise NotImplementedError(
+            "the W8A8-MXFP8 recipe is qualified for silu only"
+        )
+    _validate_reference_inputs(w1_e4m3, I_tp, activation)
+    if K % 128 != 0 or I_tp % 32 != 0:
+        raise ValueError("w8a8_mx requires K % 128 == 0 and I_tp % 32 == 0")
+    w13_layout = _normalize_w13_layout(w13_layout)
+    device = x.device
+    m = x.shape[0]
+
+    output = torch.zeros(m, K, dtype=torch.float32, device=device)
+    for eid in range(E):
+        route_mask = topk_ids == eid
+        token_mask = route_mask.any(dim=1)
+        if not bool(token_mask.any().item()):
+            continue
+        gs_fc1 = float(a1_gscale[eid].item())
+        gs_fc2 = float(a2_gscale[eid].item())
+        alpha_fc1 = float(w1_alphas[eid].item())
+        alpha_fc2 = float(w2_alphas[eid].item())
+        w13_eff = _dequant_w8a8_weight_e8m0_k32(
+            w1_e4m3[eid], w1_mx_scales[eid], 2 * I_tp, K
+        )
+        w2_eff = _dequant_w8a8_weight_e8m0_k32(
+            w2_e4m3[eid], w2_mx_scales[eid], K, I_tp
+        )
+        xs = quant_dequant_mxfp8_scaled_torch(x[token_mask].float(), gs_fc1)
+        gate_rows, up_rows = _gated_row_slices(
+            activation, I_tp, w13_layout=w13_layout
+        )
+        up_out = (xs @ w13_eff[up_rows].T) * alpha_fc1
+        gate_out = (xs @ w13_eff[gate_rows].T) * alpha_fc1
+        intermediate = _apply_gated_activation(
+            gate_out,
+            up_out,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+        int_qd = quant_dequant_mxfp8_scaled_torch(intermediate, gs_fc2)
         down_out = (int_qd @ w2_eff.T) * alpha_fc2
         route_weight = (topk_weights.float() * route_mask.float()).sum(dim=1)[
             token_mask
