@@ -1095,7 +1095,7 @@
   "extra_candidates_per_chunk": 64,
   "extra_data_bytes": 256,
   "extra_scale_bytes": 32,
-  "generated_at": "2026-10-06T01:18:02Z",
+  "generated_at": "2026-10-06T06:32:27Z",
   "generator": "sm120-dsv41-mixed-sparse-mla-flashinfer-export",
   "head_counts": [
     8,
@@ -1110,7 +1110,7 @@
   ],
   "head_dim": 512,
   "heads_per_block": 16,
-  "identity": "7c7caa2c3571806e6d116c0ca5f5013c6576bc923047344425d81c4e8d0a5604",
+  "identity": "6068eeda992eda7c40d9e2e98e08b3fa0efd58fea794d0d10f4f3c82318f0bbb",
   "kernel_commit": "cf9aa7cac3630bf088a58dd41620f166dd79ea47",
   "main_bytes_per_token": 528,
   "main_data_bytes": 512,
@@ -1252,7 +1252,7 @@
     "cake_sparse_mla_dsv41_mixed_single_lq_t1_pw_h64_fold.cu",
     "cake_sparse_mla_dsv41_mixed_single_sa_lq_t1_pw_h64_fold.cu"
   ],
-  "tree_commit": "c854788fb8dae6413e429adc5fb1ad5d4b5d6df9",
+  "tree_commit": "36469765801271d729d8c1c309ff9b840129c653",
   "two_tile_head_counts": [
     32,
     48,
