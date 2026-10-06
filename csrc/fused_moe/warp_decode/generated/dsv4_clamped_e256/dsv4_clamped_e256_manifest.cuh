@@ -186,6 +186,10 @@ inline ManifestStatus EnsureDeviceReady(int32_t device, bool allow_initializatio
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe_loader_bypass_v23), cudaFuncAttributeMaxDynamicSharedMemorySize, 81536);
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
+  error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready), cudaFuncAttributeMaxDynamicSharedMemorySize, 199040);
+  if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
+  error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready_expert_order), cudaFuncAttributeMaxDynamicSharedMemorySize, 199040);
+  if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   state.ready = true;
   return ManifestStatus::Success();
 }
@@ -485,6 +489,65 @@ inline cudaError_t Submit_device_12(const cudaLaunchConfig_t* config, const void
   const auto& args = *static_cast<const Args_device_12*>(opaque);
   return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe_loader_bypass_v23,
       args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles);
+}
+
+struct Args_device_13 {
+  CUtensorMap A;
+  uint8_t* B;
+  CUtensorMap SFA;
+  uint8_t* SFB;
+  CUtensorMap C;
+  uint8_t* SFC;
+  int* route_map;
+  int* tile_expert;
+  int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
+  float* scale_c;
+  float* scale_gate;
+  float* clamp_limit;
+  float* act_alpha;
+  float* act_beta;
+  int M_out;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
+};
+inline cudaError_t Submit_device_13(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const Args_device_13*>(opaque);
+  return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready,
+      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+}
+
+struct Args_device_14 {
+  CUtensorMap A;
+  uint8_t* B;
+  CUtensorMap SFA;
+  uint8_t* SFB;
+  CUtensorMap C;
+  uint8_t* SFC;
+  int* route_map;
+  int* tile_expert;
+  int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
+  float* scale_c;
+  float* scale_gate;
+  float* clamp_limit;
+  float* act_alpha;
+  float* act_beta;
+  int M_out;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
+  int* route_order;
+};
+inline cudaError_t Submit_device_14(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const Args_device_14*>(opaque);
+  return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready_expert_order,
+      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.route_order);
 }
 
 inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, LaunchVisitor visitor, void* context) {
@@ -973,7 +1036,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 4: {
-    Args_device_06 args_0{};
+    Args_device_13 args_0{};
     {
       CUtensorMap encoded{};
       const uint64_t map_24_dims[] = {128ull, 4096ull, 16ull, 256ull};
@@ -1116,9 +1179,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 24, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready", dim3(32, 24, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_06, &args_0, -1};
+      &Submit_device_13, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 24, 1), dim3(512, 1, 1), dim3(1, 1, 1),
@@ -1133,7 +1196,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 5: {
-    Args_device_06 args_0{};
+    Args_device_13 args_0{};
     {
       CUtensorMap encoded{};
       const uint64_t map_32_dims[] = {128ull, 4096ull, 16ull, 256ull};
@@ -1276,9 +1339,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 30, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready", dim3(32, 30, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_06, &args_0, -1};
+      &Submit_device_13, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 30, 1), dim3(512, 1, 1), dim3(1, 1, 1),
@@ -1293,7 +1356,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     return;
   }
   case 6: {
-    Args_device_06 args_0{};
+    Args_device_13 args_0{};
     {
       CUtensorMap encoded{};
       const uint64_t map_40_dims[] = {128ull, 4096ull, 16ull, 256ull};
@@ -1436,9 +1499,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
     KernelLaunch launch_0{
-      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 36, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready", dim3(32, 36, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_06, &args_0, -1};
+      &Submit_device_13, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 36, 1), dim3(512, 1, 1), dim3(1, 1, 1),
@@ -1627,7 +1690,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
     args_0.route_order = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
     args_0.route_count = static_cast<int>(48);
-    Args_device_02 args_1{};
+    Args_device_14 args_1{};
     {
       CUtensorMap encoded{};
       const uint64_t map_56_dims[] = {128ull, 4096ull, 16ull, 256ull};
@@ -1776,9 +1839,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_08, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready_expert_order", dim3(32, 48, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready_expert_order", dim3(32, 48, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false, false,
-      &Submit_device_02, &args_1, -1};
+      &Submit_device_14, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 48, 1), dim3(512, 1, 1), dim3(1, 1, 1),

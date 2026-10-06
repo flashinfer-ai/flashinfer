@@ -1,3 +1,64 @@
+# B200 routed NVFP4 decode: cooperative FC1 full32 results
+
+The current public candidate beats `flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe` at every integer T=1..32: **1.025160423562× geometric-mean speedup**, **32/32 shapes faster**. The minimum is **1.006047396915× at T14**, with public **161.422111112 µs** and baseline **162.398294689 µs**. The matched source implementation measures **1.025096697119×**. Hardware-limit evidence and broader promotion remain incomplete.
+
+NVIDIA B200 (sm_100a), H=4096, I=2048, 256 routed experts, top-k=6, clamped SwiGLU limit 10.0. The measured routed-expert call includes FC1 gate/up, clamped activation and activation quantization, FC2, and routing-weighted finalization. The shared expert is outside this kernel. The established NVFP4 shuffled MajorK / R128c4 weight-and-scale ABI and matched NVFP4 activations produce BF16 output.
+
+This update selects cooperative barrier initialization for FC1 at T4, T5, T6 and T8. Two generated device units are added to the public JIT build (15 units total). The existing 13 device units and other 28 route records remain unchanged. This does not enable CUDA cooperative-launch mode. Launch geometry, descriptors, PDL, workspace layout, clamp placement, scaling, quantization, rounding and routing semantics are preserved.
+
+## Current synthetic-bank cohort
+
+Public, source and baseline arms consume identical physical NVFP4 weights, activations, routes and scales with equivalent clamped-SwiGLU parameters. Timing uses `loom.bench.bench_gpu_time` with CUPTI and cold L2, covering complete-call CUDA graph replay including all per-call planning, projection, activation/quantization and finalization work. Each latency is the equal-weight geometric mean of six balanced capture medians; there is no best-capture selection. The six fixed captures describe variation, not independent randomized trials or a confidence interval. The baseline uses the observed default-tactic fallback, not an explicitly autotuned optimum. All table times are microseconds.
+
+| T | Source µs | Public µs | FlashInfer µs | FI/source | FI/public | Public/source latency | Public slower than source |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| 1 | 24.964317 | 25.012866 | 29.438151 | 1.179209143× | 1.176920364× | 1.001944719 | yes |
+| 2 | 41.396821 | 41.295773 | 44.927279 | 1.085283334× | 1.087938950× | 0.997559039 | no |
+| 3 | 56.100586 | 55.940380 | 60.015029 | 1.069775424× | 1.072839136× | 0.997144295 | no |
+| 4 | 67.861119 | 67.679950 | 72.133200 | 1.062953286× | 1.065798666× | 0.997330283 | no |
+| 5 | 79.791611 | 79.738305 | 83.593960 | 1.047653488× | 1.048353866× | 0.999331926 | no |
+| 6 | 91.454816 | 91.630952 | 93.587816 | 1.023322992× | 1.021355932× | 1.001925930 | yes |
+| 7 | 100.671587 | 100.853115 | 103.177825 | 1.024895182× | 1.023050454× | 1.001803165 | yes |
+| 8 | 109.785791 | 109.844420 | 111.748154 | 1.017874474× | 1.017331184× | 1.000534034 | yes |
+| 9 | 122.020600 | 121.727065 | 123.380339 | 1.011143517× | 1.013581815× | 0.997594375 | no |
+| 10 | 128.085154 | 128.122485 | 129.167790 | 1.008452472× | 1.008158638× | 1.000291456 | yes |
+| 11 | 135.721283 | 135.572133 | 136.766529 | 1.007701413× | 1.008810039× | 0.998901055 | no |
+| 12 | 145.700487 | 145.540557 | 146.921969 | 1.008383517× | 1.009491596× | 0.998902340 | no |
+| 13 | 155.055793 | 154.660643 | 156.490409 | 1.009252255× | 1.011830842× | 0.997451564 | no |
+| 14 | 161.384607 | 161.422111 | 162.398295 | 1.006281193× | 1.006047397× | 1.000232391 | yes |
+| 15 | 169.124487 | 169.119138 | 170.644258 | 1.008986109× | 1.009018016× | 0.999968378 | no |
+| 16 | 179.096972 | 179.022307 | 180.494729 | 1.007804468× | 1.008224795× | 0.999583102 | no |
+| 17 | 184.878484 | 184.707815 | 188.147418 | 1.017681524× | 1.018621856× | 0.999076858 | no |
+| 18 | 189.001643 | 189.097653 | 192.196156 | 1.016902042× | 1.016385729× | 1.000507989 | yes |
+| 19 | 194.589654 | 194.264643 | 197.619127 | 1.015568521× | 1.017267594× | 0.998329767 | no |
+| 20 | 202.197113 | 202.026448 | 205.285046 | 1.015271893× | 1.016129560× | 0.999155947 | no |
+| 21 | 210.052489 | 210.223319 | 213.145866 | 1.014726683× | 1.013902105× | 1.000813272 | yes |
+| 22 | 221.149966 | 221.336639 | 225.288036 | 1.018711599× | 1.017852427× | 1.000844103 | yes |
+| 23 | 224.869489 | 224.555000 | 228.325280 | 1.015367986× | 1.016790011× | 0.998601457 | no |
+| 24 | 237.076154 | 237.177160 | 240.931738 | 1.016263061× | 1.015830268× | 1.000426049 | yes |
+| 25 | 244.857467 | 244.772164 | 248.403872 | 1.014483548× | 1.014837094× | 0.999651623 | no |
+| 26 | 249.922891 | 250.485769 | 253.069337 | 1.012589667× | 1.010314231× | 1.002252206 | yes |
+| 27 | 255.474813 | 256.109779 | 259.837874 | 1.017078241× | 1.014556627× | 1.002485435 | yes |
+| 28 | 263.439062 | 264.105640 | 267.257820 | 1.014495790× | 1.011935297× | 1.002530294 | yes |
+| 29 | 271.471959 | 271.493445 | 274.874627 | 1.012534142× | 1.012454011× | 1.000079145 | yes |
+| 30 | 280.983607 | 281.138160 | 284.082039 | 1.011027092× | 1.010471288× | 1.000550044 | yes |
+| 31 | 284.788148 | 285.417484 | 288.355395 | 1.012525970× | 1.010293383× | 1.002209840 | yes |
+| 32 | 289.490624 | 289.501645 | 293.821568 | 1.014960568× | 1.014921927× | 1.000038073 | yes |
+
+Public is slower than the matched source implementation at 17 aggregate shapes: T1, T6, T7, T8, T10, T14, T18, T21, T22, T24, T26, T27, T28, T29, T30, T31, T32. All differences are reported above. The source column is this candidate's source implementation, not the previous selected schedule. Comparisons across historical cohorts do not establish a controlled causal gain.
+
+All 32 strict BF16 correctness shapes pass using `torch.testing.assert_close(atol=1e-2, rtol=1e-2)` with stricter existing checks preserved, alongside 576 timing postchecks, 7 API/graph cases and 8 dynamic-route cases. The affected public CPU contracts passed 112 tests; the current 15-source JIT build and actual GPU library load passed. This current cohort uses the fixed synthetic physical bank and supplied activations/routes. It is not a fresh actual-checkpoint or native full-model/router/shared-expert qualification. Separate synccheck and racecheck checks each remain **SKIPPED: sanitizer timeout after 20 seconds**, with no reported errors; timeout is not a pass.
+
+The successful eight-shard cohort's physical turnaround was **2263.570230 s**, from earliest shard submission through latest completion, including queue and inter-batch gaps. Managed shard durations sum to 7076.503296 s, wrapper-worker durations to 6007.884210 s, and validation-worker durations to 5540.908868 s. Parallel sums are not elapsed time. Saved-result reduction is separate from GPU execution.
+
+## Prior packed-FC1/FC2 staging cohort
+
+The immediately preceding packed-FC1/FC2 staging public cohort measured 1.024821927359×, with 32/32 shape and 192/192 capture wins; minimum T14 was 161.502948222 µs versus 162.606988718 µs, 1.006836039267×. Its matched source measured 1.024913981537×. Public was slower than source at 15 aggregate shapes and 98 captures, faster in 89 captures, with 5 ties. Physical turnaround was 2372.639219 s and parallel wrapper-worker sum was 5553.121231 s. This remains a separate historical cohort.
+
+## Retained earlier reports
+
+The following reports are preserved verbatim. Their headings, present-tense statements, source identities, timings and limitations apply to their historical cohorts, not the cooperative-FC1 candidate above.
+
 # B200 routed NVFP4 decode: twelve-warp FC2 full32 results
 
 The current public candidate beats the named FlashInfer baseline at every integer T=1..32 and all 192 capture comparisons, with **1.024376430585× geometric-mean speedup**. The minimum is **1.006363903484× at T14**. The equivalent source implementation measures **1.024490735084×**, minimum **1.006266404635× at T14**. Hardware-limit evidence and broader promotion remain incomplete.
