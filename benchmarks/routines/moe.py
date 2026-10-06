@@ -48,7 +48,10 @@ from .moe_utils import (
     quantize_fp8,
     calculate_moe_tflops,
     calculate_moe_kernel_bandwidth,
+    check_moe_accuracy,
+    compute_reference_moe_nvfp4,
     compute_routing,
+    create_nvfp4_moe_activations,
     generate_moe_weights,
     add_common_moe_args,
     process_fp8_weight_layout,
@@ -3378,23 +3381,6 @@ def testUnifiedNvfp4Moe(args):
     )
 
     # ---- Activation pack --------------------------------------------------
-    # The activation (NVFP4-quantized hidden states + pre-routed indices) still
-    # comes from the canonical test data creator; only weight prep is
-    # first-class today (activation-prep promotion tracked under CR2).
-    import os
-    import sys
-
-    _repo_root = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
-    if _repo_root not in sys.path:
-        sys.path.insert(0, _repo_root)
-    from tests.moe.test_cute_dsl_fused_moe import (
-        check_accuracy,
-        compute_reference_moe_fp4,
-        create_moe_tensors,
-    )
-
     # Wide-EP (MVP): model a single rank as a complete MoE over its
     # local_num_experts experts — route the activation WITHIN the local experts
     # (selected ids in [0, local_num_experts)) so every token is computed
@@ -3404,18 +3390,13 @@ def testUnifiedNvfp4Moe(args):
     # experts <= local). For EP=1 (local == global) this is unchanged.
     routing_num_experts = local_num_experts
     routing_top_k = min(top_k, local_num_experts)
-    cute_dsl_data = create_moe_tensors(
+    cute_dsl_data = create_nvfp4_moe_activations(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
         num_experts=routing_num_experts,
-        num_local_experts=local_num_experts,
         top_k=routing_top_k,
         device=device,
     )
-    # cute_dsl_data["x_sf"] is already unsqueezed to [M, H//16, 1]; strip that
-    # for the Pack (runner re-applies unsqueeze in pack_inputs).
-    x_sf = cute_dsl_data["x_sf"].squeeze(-1)
     # The local-only proxy generates ids in [0, local_num_experts); the runners
     # expect GLOBAL ids (the kernel maps them to the local shard via the
     # separately passed local_expert_offset), so lift the pack ids to global.
@@ -3424,7 +3405,7 @@ def testUnifiedNvfp4Moe(args):
     local_topk_ids = cute_dsl_data["token_selected_experts"]
     act_pack = MoEActivationPack(
         hidden_states_q=cute_dsl_data["x"],
-        hidden_states_scale=x_sf,
+        hidden_states_scale=cute_dsl_data["x_sf"],
         topk_ids=local_topk_ids + local_expert_offset,
         topk_weights=cute_dsl_data["token_final_scales"],
     )
@@ -3476,7 +3457,7 @@ def testUnifiedNvfp4Moe(args):
     # cross-backend agreement would miss.
     ref_output = None
     if args.refcheck:
-        ref_output = compute_reference_moe_fp4(
+        ref_output = compute_reference_moe_nvfp4(
             hidden_states=cute_dsl_data["x_bf16"].float().to(device),
             gemm1_weights=w1_bf16.float().to(device),
             gemm2_weights=w2_bf16.float().to(device),
@@ -3560,7 +3541,7 @@ def testUnifiedNvfp4Moe(args):
         refcheck_passed = None
         if ref_output is not None:
             out = runner.forward(inputs, tactic=tactic, **launch_kwargs)
-            refcheck_passed, pct, atol = check_accuracy(out, ref_output)
+            refcheck_passed, pct, atol = check_moe_accuracy(out, ref_output)
             status = "PASS" if refcheck_passed else "FAIL"
             print(
                 f"[REFCHECK] {backend_label}: {status} "
