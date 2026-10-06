@@ -175,12 +175,21 @@ def test_fp8_groupwise_gemm(
 @pytest.mark.parametrize("n", [128, 256])
 @pytest.mark.parametrize("k", [256])
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
-def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode):
+@pytest.mark.parametrize("backend", ["cutlass", "cutile"])
+def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode, backend):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip(
             "Small-batch gemm_fp8_nt_groupwise dispatch is only relevant on SM100/103."
         )
+    if backend == "cutile":
+        # M below BLOCK_M: partial M tile and the BLOCK_M <= M config prune.
+        if scale_major_mode != "K":
+            pytest.skip("cuTile supports scale_major_mode='K' only.")
+        if not is_cuda_tile_available():
+            pytest.skip(
+                "cuda-tile / tileiras compiler not available in this environment."
+            )
     torch.random.manual_seed(0)
     tile_size = 128
     out_dtype = torch.bfloat16
@@ -211,7 +220,7 @@ def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode):
         b_scale,
         scale_major_mode,
         out_dtype=out_dtype,
-        backend="cutlass",
+        backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
@@ -401,6 +410,7 @@ def test_fp8_groupwise_group_gemm_cutile_tma_fast_path(
         (128, 0, 4, 256),  # zero-length group in the middle
         (0, 256, 128, 4),  # zero-length leading group
         (4, 128, 256, 0),  # zero-length trailing group
+        (300, 0, 260, 500),  # avg >= 256: cuTile BLOCK_M=128 partial tiles spill
     ],
 )
 @pytest.mark.parametrize("n", [256])
