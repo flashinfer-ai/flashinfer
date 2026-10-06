@@ -72,9 +72,13 @@ from ..experimental.cake_nvfp4_per_token.support import cake_mm_fp4_requirement
 from .kernels.utils import (
     _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
     _SM100_MMA_TILER_MN_CANDIDATES,
+    _SM107_MMA_TILER_MN_CANDIDATES,
+    _SM107_MXF8_MMA_INST_SHAPE_K,
+    _SM107_MXF8_MMA_TILER_K,
     _rank_mm_fp4_autotune_tactics,
     _select_sm100_mm_fp4_cute_dsl_tactic,
     _select_sm107_mm_fp4_cute_dsl_tactic,
+    _select_sm107_mm_mxfp8_cute_dsl_tactic,
 )
 from ..utils import (
     get_device_index,
@@ -6379,21 +6383,6 @@ def _check_cute_dsl_availability():
         raise ValueError("CuTe DSL is not available.")
 
 
-_SM107_MMA_TILER_MN_CANDIDATES = [
-    (128, 64),
-    (256, 64),
-    (128, 128),
-    (256, 128),
-    (128, 192),
-    (256, 192),
-    (128, 256),
-    (256, 256),
-]
-# SM107 MXF8 block-scaled MMA: instruction K 64, K tile 128.
-_SM107_MXF8_MMA_INST_K = 64
-_SM107_MXF8_MMA_TILER_K = 128
-
-
 def _cute_dsl_gemm_mxfp8_runner(
     sm_major: int,
     sm_minor: int,
@@ -6458,6 +6447,54 @@ def _cute_dsl_gemm_mxfp8_runner(
             n = b.shape[1]
             real_k = a.shape[1]
             ab_dtype = cutlass.Float8E4M3FN
+            if Sm107Kernel is not None and out.is_contiguous():
+                sm107_tactics = []
+                for mma_tiler_mn in _SM107_MMA_TILER_MN_CANDIDATES:
+                    for mma_inst_shape_m in (128, 256):
+                        mma_inst_shape = (
+                            mma_inst_shape_m,
+                            mma_tiler_mn[1],
+                            _SM107_MXF8_MMA_INST_SHAPE_K,
+                        )
+                        for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+                            for swap_ab in (False, True):
+                                if swap_ab and m % 8 != 0:
+                                    continue
+                                if not swap_ab and n % 8 != 0:
+                                    continue
+                                kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
+                                if not Sm107Kernel.can_implement(
+                                    ab_dtype,
+                                    cutlass.Float8E8M0FNU,
+                                    32,
+                                    c_cutlass_dtype,
+                                    mma_tiler_mn,
+                                    mma_inst_shape,
+                                    cluster_shape_mn,
+                                    kernel_m,
+                                    kernel_n,
+                                    real_k,
+                                    1,
+                                    "k",
+                                    "k",
+                                    "m" if swap_ab else "n",
+                                    mma_tiler_k=_SM107_MXF8_MMA_TILER_K,
+                                ):
+                                    continue
+                                sm107_tactics.append(
+                                    (
+                                        mma_tiler_mn,
+                                        cluster_shape_mn,
+                                        swap_ab,
+                                        False,
+                                        (mma_inst_shape_m,),
+                                    )
+                                )
+                # On SM107 the SM100 kernels only serve what the SM107 kernel
+                # cannot run: a non-contiguous out, or neither N nor M % 8 == 0.
+                if sm107_tactics:
+                    return sm107_tactics
+
             base_tactics = _get_sm100_block_scaled_tactics(
                 m=m,
                 n=n,
@@ -6489,48 +6526,6 @@ def _cute_dsl_gemm_mxfp8_runner(
                         )
                     )
 
-            if Sm107Kernel is not None:
-                for mma_tiler_mn in _SM107_MMA_TILER_MN_CANDIDATES:
-                    for mma_inst_shape_m in (128, 256):
-                        mma_inst_shape = (
-                            mma_inst_shape_m,
-                            mma_tiler_mn[1],
-                            _SM107_MXF8_MMA_INST_K,
-                        )
-                        for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
-                            for swap_ab in (False, True):
-                                if swap_ab and m % 8 != 0:
-                                    continue
-                                if not swap_ab and n % 8 != 0:
-                                    continue
-                                kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
-                                if not Sm107Kernel.can_implement(
-                                    ab_dtype,
-                                    cutlass.Float8E8M0FNU,
-                                    32,
-                                    c_cutlass_dtype,
-                                    mma_tiler_mn,
-                                    mma_inst_shape,
-                                    cluster_shape_mn,
-                                    kernel_m,
-                                    kernel_n,
-                                    real_k,
-                                    1,
-                                    "k",
-                                    "k",
-                                    "m" if swap_ab else "n",
-                                    mma_tiler_k=_SM107_MXF8_MMA_TILER_K,
-                                ):
-                                    continue
-                                valid_tactics.append(
-                                    (
-                                        mma_tiler_mn,
-                                        cluster_shape_mn,
-                                        swap_ab,
-                                        False,
-                                        (mma_inst_shape_m,),
-                                    )
-                                )
             return valid_tactics
 
         def forward(
@@ -6567,8 +6562,21 @@ def _cute_dsl_gemm_mxfp8_runner(
                     1,
                 )
 
+            def default_tactic():
+                if Sm107Kernel is not None and out.is_contiguous():
+                    sm107_tactic = _select_sm107_mm_mxfp8_cute_dsl_tactic(
+                        m, n, real_k, get_device_sm_count(a.device)
+                    )
+                    if sm107_tactic is not None:
+                        return sm107_tactic
+                return fallback_tactic
+
             if tactic is None or tactic == -1:
-                tactic = fallback_tactic
+                tactic = default_tactic()
+            # The SM107 kernel's swap-AB path needs the runtime M (its N) to be a
+            # multiple of 8; a tactic tuned for another M bucket may not be.
+            if isinstance(tactic[4], tuple) and tactic[2] and m % 8 != 0:
+                tactic = default_tactic()
 
             (
                 mma_tiler_mn,
@@ -6583,20 +6591,8 @@ def _cute_dsl_gemm_mxfp8_runner(
                     raise ValueError(
                         f"SM107 MXFP8 tactic needs the SM107 kernel: {tactic}"
                     )
-                # The SM107 kernel's swap-AB path needs the runtime M (its N) to be
-                # a multiple of 8; a tactic tuned for another M bucket may not be.
-                if swap_ab and m % 8 != 0:
-                    tactic = fallback_tactic
-                    (
-                        mma_tiler_mn,
-                        cluster_shape_mn,
-                        swap_ab,
-                        use_prefetch,
-                        split_k_slices,
-                    ) = tactic
-                else:
-                    sm107_params = split_k_slices
-                    split_k_slices = 1
+                sm107_params = split_k_slices
+                split_k_slices = 1
             if split_k_slices < 1:
                 raise ValueError(f"Invalid MXFP8 split-K tactic: {tactic}")
             is_split_k = split_k_slices > 1
@@ -6693,7 +6689,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                 (mma_inst_shape_m,) = sm107_params
                 make_kernel = lambda: Sm107Kernel(
                     sf_vec_size,
-                    (mma_inst_shape_m, mma_tiler_mn[1], _SM107_MXF8_MMA_INST_K),
+                    (mma_inst_shape_m, mma_tiler_mn[1], _SM107_MXF8_MMA_INST_SHAPE_K),
                     (mma_tiler_mn[0], mma_tiler_mn[1], _SM107_MXF8_MMA_TILER_K),
                     cluster_shape_mn,
                 )

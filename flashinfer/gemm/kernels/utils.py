@@ -266,6 +266,13 @@ _SM107_MMA_TILER_MN_CANDIDATES = [
 # (n, real_k, sm_count, sf_vec_size) -> dict[m_bucket -> tactic_tuple]
 _SM107_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
+# (n, real_k, sm_count, allow_swap_ab) -> dict[m_bucket -> tactic_tuple | None]
+_SM107_MM_MXFP8_TACTIC_CACHE: dict[tuple, dict] = {}
+
+# SM107 MXF8 block-scaled MMA: instruction K 64, K tile 128.
+_SM107_MXF8_MMA_INST_SHAPE_K = 64
+_SM107_MXF8_MMA_TILER_K = 128
+
 # Fixed for FP4, matching the tactic enumeration in gemm_base.py.
 _SM107_MMA_INST_SHAPE_K = 128
 _SM107_MMA_TILER_K = 256
@@ -419,6 +426,73 @@ def _select_sm107_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
                 rep_m, n, real_k, sm_count, sf_vec_size
             )
         _SM107_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
+
+    bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
+    return bucket_tactics[bucket]
+
+
+def _compute_sm107_mxfp8_tactic_for_m(rep_m, n, real_k, sm_count, allow_swap_ab):
+    """Best SM107-kernel mm_mxfp8 tactic for one (M, N, K), or None if none fits.
+
+    Ranked by the mm_fp4 scorer, which reads only tile, cluster and swap_ab.
+    """
+    import cutlass
+
+    from .dense_blockscaled_gemm_sm107 import (
+        Sm107BlockScaledPersistentDenseGemmKernel,
+    )
+
+    best_tactic = None
+    best_score = -1.0
+    for tile in _SM107_MMA_TILER_MN_CANDIDATES:
+        inst_shape = (tile[0], tile[1], _SM107_MXF8_MMA_INST_SHAPE_K)
+        for cluster in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
+            if tile[0] == 256 and cluster[0] < 2:
+                continue  # 2-CTA MMA (tile_m == 256) requires cluster_m >= 2
+            for swap_ab in (False, True) if allow_swap_ab else (False,):
+                score = _score_mm_fp4_tactic(
+                    rep_m, n, real_k, sm_count, tile, cluster, swap_ab
+                )
+                if score <= best_score:
+                    continue
+                kernel_m, kernel_n = (n, rep_m) if swap_ab else (rep_m, n)
+                if Sm107BlockScaledPersistentDenseGemmKernel.can_implement(
+                    cutlass.Float8E4M3FN,
+                    cutlass.Float8E8M0FNU,
+                    32,
+                    cutlass.BFloat16,
+                    tile,
+                    inst_shape,
+                    cluster,
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    1,
+                    "k",
+                    "k",
+                    "m" if swap_ab else "n",
+                    mma_tiler_k=_SM107_MXF8_MMA_TILER_K,
+                ):
+                    best_score = score
+                    best_tactic = (tile, cluster, swap_ab, False, (inst_shape[0],))
+    return best_tactic
+
+
+def _select_sm107_mm_mxfp8_cute_dsl_tactic(m, n, real_k, sm_count):
+    """Untuned mm_mxfp8(backend='cute-dsl') tactic on sm107, or None if the SM107
+    kernel cannot run the shape. Swap-AB is offered only when M % 8 == 0.
+    """
+    allow_swap_ab = m % 8 == 0
+    cache_key = (n, real_k, sm_count, allow_swap_ab)
+    bucket_tactics = _SM107_MM_MXFP8_TACTIC_CACHE.get(cache_key)
+    if bucket_tactics is None:
+        bucket_tactics = {
+            rep_m: _compute_sm107_mxfp8_tactic_for_m(
+                rep_m, n, real_k, sm_count, allow_swap_ab
+            )
+            for rep_m in _M_BUCKETS
+        }
+        _SM107_MM_MXFP8_TACTIC_CACHE[cache_key] = bucket_tactics
 
     bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
     return bucket_tactics[bucket]
