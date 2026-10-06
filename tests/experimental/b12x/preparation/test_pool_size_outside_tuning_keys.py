@@ -67,7 +67,7 @@ def test_pool_dependent_contracts_exclude_pool_size_fields():
     from b12x.sequence.ple._tuning import TUNING as PLE
 
     assert "max_state_slots" not in GDN_PREFILL.query_fields
-    assert "max_state_slots" not in GDN_DECODE.query_fields and GDN_DECODE.query_schema_version == 5
+    assert "max_state_slots" not in GDN_DECODE.query_fields and GDN_DECODE.query_schema_version == 6
     assert "max_state_slots" not in PLE.query_fields and PLE.query_schema_version == 4
     assert not {"num_main_cache_pages", "num_compressed_cache_pages"} & QSA.query_fields
     assert QSA.query_schema_version == 7

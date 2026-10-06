@@ -44,7 +44,6 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        integrity._validate_object.cache_clear()
         payload = ("test-compile-payload",)
         self.key = hashlib.sha256(repr(payload).encode()).hexdigest()
         self.obj = self.root / self.key[:2] / (self.key + ".o")
@@ -162,17 +161,34 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         self.manifest.write_text("[]")
         self.assertFalse(self.available(self.program))
 
-    def test_checksums_memoized_but_rewrites_rechecked(self):
+    def test_checksums_rechecked_after_same_size_rewrite(self):
         self.write_pair()
         with patch.object(integrity.hashlib, "sha256", wraps=hashlib.sha256) as sha:
             self.assertTrue(self.available(self.program))
             self.assertTrue(self.available(self.program))
-            self.assertEqual(sha.call_count, 1)
+            self.assertEqual(sha.call_count, 2)
             info = self.obj.stat()
             self.obj.write_bytes(b"x" * len(self.data))
             os.utime(self.obj, ns=(info.st_atime_ns, info.st_mtime_ns))
             self.assertFalse(self.available(self.program))
-            self.assertEqual(sha.call_count, 2)
+            self.assertEqual(sha.call_count, 3)
+
+    def test_rewrites_detected_when_stat_identity_is_unchanged(self):
+        for target in (self.obj, self.manifest):
+            with self.subTest(target=target.suffix):
+                self.write_pair()
+                identities = {
+                    path: integrity._file_identity(path)
+                    for path in (self.obj, self.manifest)
+                }
+                with patch.object(integrity, "_file_identity", side_effect=identities.__getitem__):
+                    self.assertTrue(self.available(self.program))
+                    if target == self.obj:
+                        target.write_bytes(b"x" * len(self.data))
+                    else:
+                        target.write_text(target.read_text().replace(self.key, "0" * len(self.key)))
+                    self.assertEqual(target.stat().st_size, identities[target][2])
+                    self.assertFalse(self.available(self.program))
 
     def test_staged_copy_is_validated_and_canonical_object_is_not_modified(self):
         self.write_pair()
@@ -195,11 +211,13 @@ class CompileCacheIntegrityTests(unittest.TestCase):
         neighbor = self.obj.parent / "other.o"
         neighbor.write_bytes(b"keep this")
         self.data = b"new object with a different checksum"
-        with patch.object(self.module, "_write_compile_manifest", side_effect=OSError("crash")):
-            with self.assertRaises(OSError):
-                self.module._store_cute_compile_to_disk(
-                    self.key, self.compiled, cache_payload=(1,), func=object(),
-                )
+        with (
+            patch.object(self.module, "_write_compile_manifest", side_effect=OSError("crash")),
+            self.assertRaises(OSError),
+        ):
+            self.module._store_cute_compile_to_disk(
+                self.key, self.compiled, cache_payload=(1,), func=object(),
+            )
         self.assertFalse(self.available(self.program))
         self.module.compile(object())
         self.assertTrue(self.available(self.program))
@@ -234,9 +252,11 @@ class CompileCacheIntegrityTests(unittest.TestCase):
 
     def test_failure_before_rename_preserves_previous_file_and_cleans_temporary(self):
         self.write_pair()
-        with patch.object(os, "fsync", side_effect=OSError("disk failure")):
-            with self.assertRaises(OSError):
-                integrity.atomic_write_bytes(self.obj, b"replacement")
+        with (
+            patch.object(os, "fsync", side_effect=OSError("disk failure")),
+            self.assertRaises(OSError),
+        ):
+            integrity.atomic_write_bytes(self.obj, b"replacement")
         self.assertEqual(self.obj.read_bytes(), self.data)
         self.assertEqual(list(self.obj.parent.glob("*.tmp")), [])
 

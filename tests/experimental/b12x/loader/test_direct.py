@@ -10,7 +10,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from b12x.loader._checkpoint import DirectWeightSession
+from b12x.loader import DirectWeightSession
 
 
 
@@ -73,7 +73,7 @@ def test_ring_reads_exact_bytes_with_large_file_offsets(
     with path.open("wb") as output:
         output.seek(offset)
         output.write(expected)
-    with DirectWeightSession() as session:
+    with DirectWeightSession(read_mode="bounce") as session:
         backing = torch.full(
             (len(expected) + 514,), 199, device="cuda", dtype=torch.uint8
         )
@@ -186,7 +186,7 @@ def test_bf16_expands_in_ring_without_extra_transform_scratch(
     bits = torch.arange(count, dtype=torch.int32).to(torch.int16)
     expected = bits.view(torch.bfloat16)
     save_file({"A_log": expected}, path)
-    with DirectWeightSession() as session:
+    with DirectWeightSession(read_mode="bounce") as session:
         source = dict(session.weights([path]))["A_log"]
         backing = torch.full((count + 130,), -17.0, device="cuda")
         target = backing[65 : 65 + count]
@@ -213,7 +213,7 @@ def test_batch_reorders_disjoint_destinations_and_retains_views_until_completion
     save_file({"weight": expected}, path)
     with (
 
-        DirectWeightSession(io_threads=4) as session,
+        DirectWeightSession(io_threads=4, read_mode="bounce") as session,
     ):
         source = dict(session.weights([path]))["weight"]
         target = torch.full_like(expected, -1, device="cuda")
@@ -296,7 +296,7 @@ def test_bounce_ring_recycles_slots_without_changing_final_weights(tmp_path, io_
     expected = torch.arange((18 << 20) + 129, dtype=torch.int32)
     save_file({"weight": expected}, path)
     with DirectWeightSession(
-        io_threads=io_threads
+        io_threads=io_threads, read_mode="bounce"
     ) as session:
         source = dict(session.weights([path]))["weight"]
         backing = torch.full((expected.numel() + 2,), -1, device="cuda", dtype=expected.dtype)

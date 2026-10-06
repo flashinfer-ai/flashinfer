@@ -8,7 +8,6 @@ import os
 import stat
 import tempfile
 from contextlib import suppress
-from functools import lru_cache
 from pathlib import Path
 
 
@@ -19,16 +18,12 @@ def _file_identity(path: Path) -> tuple[int, ...]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-@lru_cache(maxsize=8192)
 def _validate_object(
     object_path: Path,
     manifest_path: Path,
     cache_key: str,
     object_identity: tuple[int, ...],
-    manifest_identity: tuple[int, ...],
 ) -> bool:
-    # The identities participate in the memo key. Replacing or rewriting either
-    # file invalidates the result, including same-size edits and repaired files.
     manifest = json.loads(manifest_path.read_text())
     if not isinstance(manifest, dict) or manifest.get("cache_key") != cache_key:
         return False
@@ -48,7 +43,8 @@ def _validate_object(
 def valid_object(object_path: Path, manifest_path: Path, cache_key: str) -> bool:
     """Treat incomplete or corrupt object/manifest pairs as cache misses.
 
-    This checks stored bytes, not CUDA loadability or kernel correctness. A
+    Every call hashes the stored bytes: same-size rewrites can preserve stat
+    timestamps. This does not check CUDA loadability or kernel correctness. A
     concurrent publisher may cause a miss; the compiler rechecks under its
     existing per-key lock before rebuilding. No cache files are removed here.
     """
@@ -56,7 +52,7 @@ def valid_object(object_path: Path, manifest_path: Path, cache_key: str) -> bool
         object_identity = _file_identity(object_path)
         manifest_identity = _file_identity(manifest_path)
         valid = _validate_object(
-            object_path, manifest_path, cache_key, object_identity, manifest_identity,
+            object_path, manifest_path, cache_key, object_identity,
         )
         return (valid and object_identity == _file_identity(object_path)
                 and manifest_identity == _file_identity(manifest_path))

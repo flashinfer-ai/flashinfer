@@ -55,9 +55,6 @@ nvep = []
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
 
-[project.entry-points."vllm.general_plugins"]
-b12x_loader = "b12x._vllm_plugins:register_loader"
-
 [build-system]
 requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.11,<0.2"]
 build-backend = "build_backend"

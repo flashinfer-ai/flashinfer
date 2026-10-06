@@ -17,7 +17,7 @@ import torch.multiprocessing as mp
 
 @pytest.mark.parametrize("fails", [False, True])
 def test_reader_initialization_overlaps_routing_and_close_joins(fails):
-    from b12x.loader._shared_checkpoint import SharedReadGroup
+    from b12x.loader import SharedReadGroup
 
     entered, release, closed = Event(), Event(), Event()
     executor = object()
