@@ -24,7 +24,7 @@ from flashinfer.experimental.cake_kimi_k3_attn_res.cake_backend import (
     ARCHES,
     HIDDEN_SIZE,
     MAX_BLOCKS,
-    NATIVE_GRID,
+    NATIVE_SM_COUNTS,
     SUPPORTED_COMPUTE_CAPABILITIES,
     common_path_eligible,
     plan_route,
@@ -37,7 +37,15 @@ from flashinfer.kimi_k3_attn_res import kimi_k3_attn_res, prepare_kimi_k3_attn_r
 # of the independent FP32 reference; prefix / snapshot bank bit-exact.
 ATOL = 8e-2
 RTOL = 3e-2
+# Reference physical configuration of the measured policy (B200 / B300) and every SM count the
+# programs are qualified on (now including the 152-SM GB300 / GB200 parts).  All grids derive from
+# the count: the native ports launch one CTA per SM on NATIVE_SM_COUNTS, the K = 0 path 2x / 3x
+# the count at its promoted cells, the persistent programs min(M, SMs) (balanced 128 at M 256-512).
 SM_COUNT = 148
+SM_COUNTS = (148, 152)
+assert SM_COUNTS == NATIVE_SM_COUNTS
+#: POLICY_ROWS grid marker: the device's SM count.
+NATIVE = "sms"
 TOKEN_COUNTS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 PRIMARY_K = (0, 1, 4, 8)
 
@@ -52,7 +60,7 @@ POLICY_ROWS = [
     ("sm_100a", 256, 0, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 256),
     ("sm_100a", 1024, 0, False, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 444),
     ("sm_100a", 2048, 0, True, "k0_tma", "k0_tma_persistent_ws288_vec128_fp32x2", 148),
-    ("sm_100a", 256, 8, False, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
+    ("sm_100a", 256, 8, False, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE),
     ("sm_100a", 1, 5, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
     ("sm_100a", 64, 4, True, "small_m", "small_m_direct_cta256_regres_fp32x2", 64),
     ("sm_100a", 1, 7, False, "small_m", "small_m_cluster4_cta64_regres_fp32x2", 4),
@@ -94,7 +102,7 @@ POLICY_ROWS = [
         False,
         "native",
         "native_m128_nc3_d2_ws288_grid148",
-        NATIVE_GRID,
+        NATIVE,
     ),
     ("sm_103a", 4, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 4),
     ("sm_103a", 32, 0, False, "small_m", "small_m_direct_cta256_regres_fp32x2", 32),
@@ -107,7 +115,7 @@ POLICY_ROWS = [
         False,
         "k0_tma",
         "k0_tma_persistent_ws288_vec128_fp32x2",
-        3 * SM_COUNT,
+        444,
     ),
     ("sm_103a", 1, 7, False, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 2),
     ("sm_103a", 8, 8, True, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 16),
@@ -127,9 +135,9 @@ POLICY_ROWS = [
         False,
         "native",
         "native_m128_nc3_d2_ws288_grid148",
-        NATIVE_GRID,
+        NATIVE,
     ),
-    ("sm_103a", 256, 8, True, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE_GRID),
+    ("sm_103a", 256, 8, True, "native", "native_k8_nc3_d2_ws288_grid148", NATIVE),
     ("sm_103a", 1, 7, True, "small_m", "small_m_cluster2_cta128_regres_fp32x2", 2),
     (
         "sm_103a",
@@ -164,9 +172,22 @@ POLICY_ROWS = [
 ]
 
 
+def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
+    """The (grid, schedule id) a POLICY_ROWS cell takes on ``sm_count`` SMs: the native ports and the
+    SM-count-multiple grids scale with the count (148 -> sm_count, 444 -> 3 x sm_count); the token-bound,
+    balanced-128 and cluster grids do not."""
+    if grid_x == NATIVE:
+        return sm_count, schedule_id.replace("grid148", f"grid{sm_count}")
+    if grid_x % SM_COUNT == 0:
+        return grid_x // SM_COUNT * sm_count, schedule_id
+    return grid_x, schedule_id
+
+
+@pytest.mark.parametrize("sm_count", SM_COUNTS)
 @pytest.mark.parametrize("arch,M,K,pdl,kind,schedule_id,grid_x", POLICY_ROWS)
-def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x):
-    plan = plan_route(arch, SM_COUNT, M, K, pdl)
+def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count):
+    grid_x, schedule_id = _expected_at(sm_count, grid_x, schedule_id)
+    plan = plan_route(arch, sm_count, M, K, pdl)
     assert plan.kind == kind
     assert plan.schedule_id == schedule_id
     assert plan.grid_x == grid_x
@@ -329,9 +350,18 @@ def test_plan_route_rejects_bad_shapes():
         plan_route("sm_90a", SM_COUNT, 1, 4, False)
 
 
-def test_native_ports_require_148_sms():
-    # M = 256 / K = 8 is a native_k8 cell on 148 SMs (M = 1 belongs to the small-M direct kernel)
-    assert plan_route("sm_100a", SM_COUNT, 256, 8, False).kind == "native"
+def test_native_ports_route_on_the_qualified_sm_counts():
+    # M = 256 / K = 8 is a native_k8 cell (M = 1 belongs to the small-M direct kernel); the port launches one
+    # CTA per SM on every qualified count and keeps its kernel key (one registered program)
+    keys = set()
+    for sm_count in SM_COUNTS:
+        plan = plan_route("sm_100a", sm_count, 256, 8, False)
+        assert plan.kind == "native"
+        assert plan.grid_x == sm_count
+        assert plan.schedule_id == f"native_k8_nc3_d2_ws288_grid{sm_count}"
+        keys.add(plan.kernel_key)
+    assert keys == {"native_k8"}
+    # any other count takes the persistent family with a grid derived from the actual count
     plan = plan_route("sm_100a", 132, 256, 8, False)
     assert plan.kind == "persistent"
     assert plan.grid_x <= 132
@@ -390,16 +420,18 @@ def test_persistent_key_is_the_complete_flag_tuple():
     assert a.route_id != b.route_id
 
 
+@pytest.mark.parametrize("sm_count", SM_COUNTS)
 @pytest.mark.parametrize("arch", ARCHES)
-def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch):
+def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch, sm_count):
     if not MODULES:
         pytest.skip("no generated programs registered in this checkout")
     for pdl in (False, True):
         for M in TOKEN_COUNTS:
             for K in PRIMARY_K:
-                plan = plan_route(arch, SM_COUNT, M, K, pdl)
+                plan = plan_route(arch, sm_count, M, K, pdl)
                 assert plan.kernel_key in KERNELS[arch], (
                     arch,
+                    sm_count,
                     M,
                     K,
                     pdl,
@@ -407,9 +439,10 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch):
                 )
         for M in (1, 4096):
             for K in range(MAX_BLOCKS + 1):
-                plan = plan_route(arch, SM_COUNT, M, K, pdl)
+                plan = plan_route(arch, sm_count, M, K, pdl)
                 assert plan.kernel_key in KERNELS[arch], (
                     arch,
+                    sm_count,
                     M,
                     K,
                     pdl,
@@ -436,17 +469,18 @@ DENSE_TOKEN_COUNTS = (
 )
 
 
+@pytest.mark.parametrize("sm_count", SM_COUNTS)
 @pytest.mark.parametrize("arch", ARCHES)
-def test_every_common_path_route_resolves_to_a_registered_program(arch):
+def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count):
     if not MODULES:
         pytest.skip("no generated programs registered in this checkout")
     registered = KERNELS[arch]
     for pdl in (False, True):
         for K in range(MAX_BLOCKS + 1):
             for M in DENSE_TOKEN_COUNTS:
-                exact = cb._plan_route_exact(arch, SM_COUNT, M, K, pdl)
-                plan = plan_route(arch, SM_COUNT, M, K, pdl)
-                cell = (arch, M, K, pdl, exact.kernel_key, plan.kernel_key)
+                exact = cb._plan_route_exact(arch, sm_count, M, K, pdl)
+                plan = plan_route(arch, sm_count, M, K, pdl)
+                cell = (arch, sm_count, M, K, pdl, exact.kernel_key, plan.kernel_key)
                 assert plan.kernel_key in registered, cell
                 assert plan.kind in ("small_m", "native", "k0_tma", "persistent"), cell
                 if exact.kernel_key in registered:
@@ -480,7 +514,8 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch):
     # The measured cells never substitute.
     for row_arch, M, K, pdl, _kind, _schedule_id, _grid_x in POLICY_ROWS:
         if row_arch == arch:
-            assert plan_route(arch, SM_COUNT, M, K, pdl).fallback_from is None, (
+            assert plan_route(arch, sm_count, M, K, pdl).fallback_from is None, (
+                sm_count,
                 M,
                 K,
                 pdl,
@@ -575,14 +610,15 @@ def _route_band_start_rows(m_max: int = 16384):
     program is exercised at the edge of the band that selects it."""
     rows = set()
     for arch in ARCHES:
-        for K in range(MAX_BLOCKS + 1):
-            for pdl in (False, True):
-                previous = None
-                for M in range(1, m_max + 1):
-                    key = plan_route(arch, SM_COUNT, M, K, pdl).kernel_key
-                    if key != previous:
-                        rows.add((M, K))
-                        previous = key
+        for sm_count in SM_COUNTS:
+            for K in range(MAX_BLOCKS + 1):
+                for pdl in (False, True):
+                    previous = None
+                    for M in range(1, m_max + 1):
+                        key = plan_route(arch, sm_count, M, K, pdl).kernel_key
+                        if key != previous:
+                            rows.add((M, K))
+                            previous = key
     return rows
 
 

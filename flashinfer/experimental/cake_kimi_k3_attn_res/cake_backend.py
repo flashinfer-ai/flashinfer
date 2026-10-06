@@ -64,7 +64,10 @@ HIDDEN_SIZE = 7168
 MAX_BLOCKS = 8
 DIRECT_THREADS = 256
 PERSISTENT_THREADS = 288
-NATIVE_GRID = 148
+#: Physical SM counts the native ports are qualified on: 148 (B200 / B300) and 152 (GB300).  The ports
+#: launch one CTA per SM and grid-stride over the tokens, so their grid is the device's SM count; any
+#: other count keeps the persistent / small-M families, whose grids derive from ``num_sms`` as well.
+NATIVE_SM_COUNTS = (148, 152)
 PERSISTENT_BALANCED_GRID = 128
 PERSISTENT_BALANCED_GRID_MAX_M = 512
 PERSISTENT_CHUNK_DEPTH = 2
@@ -354,7 +357,7 @@ def _producer_wait_acquire(arch: str, M: int, K: int) -> bool:
 
 
 def _native_route(arch: str, num_sms: int, M: int, K: int, use_pdl: bool):
-    if num_sms != NATIVE_GRID:
+    if num_sms not in NATIVE_SM_COUNTS:
         return None
     for name, routed, k, pdl_modes, release in _NATIVE_ROUTES:
         if k != K or use_pdl not in pdl_modes:
@@ -681,12 +684,12 @@ def _plan_route_exact(
     native = _native_route(arch, num_sms, M, K, use_pdl)
     if native is not None:
         name, _release = native
-        schedule_id = f"native_{name}_nc3_d2_ws288_grid148"
+        schedule_id = f"native_{name}_nc3_d2_ws288_grid{num_sms}"
         route_id = f"{schedule_id}.{arch}.native_no_hint.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.native_full_sm"
         return RoutePlan(
             "native",
             f"native_{name}",
-            NATIVE_GRID,
+            num_sms,
             PERSISTENT_THREADS,
             schedule_id,
             route_id,
@@ -981,6 +984,9 @@ class KimiK3AttnResRunner:
 
     plan: RoutePlan
     module_name: str
+    #: SM count of the device the plan was resolved for (the grids of the persistent, K = 0 and native
+    #: programs derive from it).
+    sm_count: int
     prefix: torch.Tensor
     blocks: torch.Tensor
     out: torch.Tensor
@@ -1076,9 +1082,10 @@ def prepare_kimi_k3_attn_res(
         num_blocks=num_blocks,
         block_write_idx=block_write_idx,
     )
+    sm_count = sm_count_for(device)
     plan = plan_route(
         arch,
-        sm_count_for(device),
+        sm_count,
         M,
         num_blocks,
         enable_pdl,
@@ -1118,7 +1125,7 @@ def prepare_kimi_k3_attn_res(
         M=M,
     )
     return KimiK3AttnResRunner(
-        plan, module_name, prefix, blocks, out, (_bind(module_name, kwargs),)
+        plan, module_name, sm_count, prefix, blocks, out, (_bind(module_name, kwargs),)
     )
 
 
