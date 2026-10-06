@@ -79,7 +79,7 @@ class _Program:
 # the single place the Cake export refreshes; every program binding below
 # derives from it.  One kernel family ships: the exact scan x {bf16, f16, f32
 # state} x {batched, varlen}, plus one preprocess.
-_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_bca791ba55"
+_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_06a21fddb2"
 _SCAN_MODULES = {
     "exact_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_f6e14be186",
     "exact_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_132f3e9876",
