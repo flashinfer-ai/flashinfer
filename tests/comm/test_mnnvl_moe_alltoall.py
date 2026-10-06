@@ -19,11 +19,11 @@ import pytest
 import torch
 from mpi4py import MPI
 
-from flashinfer.comm import MoeAlltoAll
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
 
 from .conftest import mnnvl_available
+from .moe_a2a_driver import MoeA2ADriver, metainfo_index, workspace_bytes_per_rank
 
 
 class MPIExit(Exception):
@@ -327,19 +327,19 @@ def run_moe_a2a_dispatch_single_rank(
         cp_size=1,
     )
 
-    # Create MoeAlltoAll manager
+    # Create the all-to-all driver
     max_num_tokens = max(all_num_tokens)
 
     # When use_lora is True, account for the extra int32 LoRA ID payload (4 bytes/token).
     extra_payload_bytes = 4 if use_lora else 0
-    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
+    workspace_size_per_rank = workspace_bytes_per_rank(
         ep_size,
         top_k,
         max_num_tokens,
         hidden_size,
         extra_payload_bytes_per_token=extra_payload_bytes,
     )
-    moe_a2a = MoeAlltoAll(
+    moe_a2a = MoeA2ADriver(
         mapping,
         max_num_tokens,
         top_k,
@@ -384,16 +384,16 @@ def run_moe_a2a_dispatch_single_rank(
 
     # Read counters and compact routing tensors from workspace
     send_counters_offset = moe_a2a.metainfo[
-        MoeAlltoAll._METAINFO_INDEX["SEND_COUNTERS_OFFSET_INDEX"]
+        metainfo_index()["SEND_COUNTERS_OFFSET_INDEX"]
     ].item()
     recv_counters_offset = moe_a2a.metainfo[
-        MoeAlltoAll._METAINFO_INDEX["RECV_COUNTERS_OFFSET_INDEX"]
+        metainfo_index()["RECV_COUNTERS_OFFSET_INDEX"]
     ].item()
     topk_target_ranks_offset = moe_a2a.metainfo[
-        MoeAlltoAll._METAINFO_INDEX["TOPK_TARGET_RANKS_OFFSET_INDEX"]
+        metainfo_index()["TOPK_TARGET_RANKS_OFFSET_INDEX"]
     ].item()
     topk_send_indices_offset = moe_a2a.metainfo[
-        MoeAlltoAll._METAINFO_INDEX["TOPK_SEND_INDICES_OFFSET_INDEX"]
+        metainfo_index()["TOPK_SEND_INDICES_OFFSET_INDEX"]
     ].item()
 
     send_counters = (
@@ -843,16 +843,16 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k, use_lora=False):
         lora_weights=lora_weights,
     )
 
-    # Initialize MoeAlltoAll — extra_payload_bytes_per_token accounts for LoRA ID
+    # Initialize the all-to-all driver — extra_payload_bytes_per_token accounts for LoRA ID
     extra_payload_bytes = 4 if use_lora else 0
-    workspace_size_per_rank = MoeAlltoAll.get_moe_workspace_size_per_rank(
+    workspace_size_per_rank = workspace_bytes_per_rank(
         ep_size,
         top_k,
         max_num_tokens,
         hidden_size,
         extra_payload_bytes_per_token=extra_payload_bytes,
     )
-    moe_a2a = MoeAlltoAll(
+    moe_a2a = MoeA2ADriver(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,

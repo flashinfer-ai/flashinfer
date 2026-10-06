@@ -111,7 +111,6 @@ from .allreduce import (
 )
 
 # MNNVL A2A (Throughput Backend)
-from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll
 from .trtllm_moe_alltoall import moe_a2a_active_rank_mask as moe_a2a_active_rank_mask
 from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
 from .trtllm_moe_alltoall import moe_a2a_dispatch as moe_a2a_dispatch
@@ -140,8 +139,6 @@ from .dcp_lse_reduce import (
 from .dcp_lse_reduce import (
     decode_cp_a2a_lse_reduce_workspace_size as decode_cp_a2a_lse_reduce_workspace_size,
 )
-
-# from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 
 from .all_gather_matmul import all_gather_matmul as all_gather_matmul
 from .all_gather_matmul import (

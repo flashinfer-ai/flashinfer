@@ -554,13 +554,11 @@ MNNVL A2A (Throughput Backend)
 -------------------------------
 
 These are the kernel-level primitives of the NVLink one-sided MoE all-to-all.
-``MoeAlltoAll`` is deprecated in favor of
-:class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll` (and
-:class:`flashinfer.moe_ep.CakeAlltoAll` for ``backend="cake"``),
-which expose the dispatch/combine interface shared by all expert-parallel
-communication backends. ``NVLinkOneSidedAlltoAll`` runs its own, newer
-one-sided kernels (CFT counted writes, up to 256 ranks); ``CakeAlltoAll``
-runs the functional ops below with ``backend="cake"``.
+For the dispatch/combine interface shared by all expert-parallel communication
+backends, use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`, which runs
+newer one-sided kernels (CFT counted writes, up to 256 ranks), or
+:class:`flashinfer.moe_ep.CakeAlltoAll`, which runs these ops with
+``backend="cake"``.
 
 .. currentmodule:: flashinfer.comm
 
@@ -574,35 +572,23 @@ runs the functional ops below with ``backend="cake"``.
     moe_a2a_get_workspace_size_per_rank
     moe_a2a_wrap_payload_tensor_in_workspace
 
-.. autoclass:: MoeAlltoAll
-    :members:
-    :inherited-members:
-    :show-inheritance:
-
-    .. automethod:: __init__
-
-``MoeAlltoAll`` preserves its CUDA virtual addresses across process
-checkpoint/restore.  After quiescing all work, call ``checkpoint_prepare`` to
-release the non-checkpointable physical MNNVL handles.  Then call
-``checkpoint_restore`` with a fresh communication backend before replaying a
-captured CUDA graph:
+``NVLinkOneSidedAlltoAll`` and ``CakeAlltoAll`` preserve their workspace's CUDA
+virtual addresses across process checkpoint/restore.  After quiescing all work,
+call ``checkpoint_prepare`` to release the non-checkpointable physical MNNVL
+handles, and for ``NVLinkOneSidedAlltoAll`` its CFT logical endpoints.  Then
+call ``checkpoint_restore`` with a fresh communication backend before replaying
+a captured CUDA graph:
 
 .. code-block:: python
 
-    moe_alltoall.checkpoint_prepare()
-    moe_alltoall.checkpoint_restore(comm_backend)
+    communication.checkpoint_prepare()
+    communication.checkpoint_restore(comm_backend)
 
 Both methods are collective.  Every rank must call them in the same order, and
 ``comm_backend`` must reproduce the original rank and world size.
 Repeated calls are no-ops after the workspace reaches the requested state.
 If an exception occurs after physical handle unmapping or remapping begins,
 do not retry or reuse the workspace; restart the affected rank.
-
-.. autosummary::
-    :toctree: ../generated
-
-    MoeAlltoAll.checkpoint_prepare
-    MoeAlltoAll.checkpoint_restore
 
 DCP All-to-All (Context-Parallel Attention Reduction)
 -----------------------------------------------------
