@@ -2818,6 +2818,8 @@ def _source_cake_varlen_arguments(runner, tensors):
         ("d_dtype", "D must have shape"),
         ("z_shape", "z must have the same shape and dtype as x"),
         ("z_dtype", "z must have the same shape and dtype as x"),
+        ("d_alignment", "D must be 16-byte aligned"),
+        ("z_alignment", "z must be 16-byte aligned"),
         ("initial_shape", "initial_states must have shape"),
         ("seq_idx_shape", "seq_idx shape or dtype"),
         ("seq_idx_dtype", "seq_idx shape or dtype"),
@@ -2924,6 +2926,15 @@ def test_source_public_cake_domain_validation_without_gpu(invalid, match):
         )
         if invalid == "d_dtype":
             kwargs["D"] = torch.empty(2, dtype=torch.float16)
+    elif invalid in {"d_alignment", "z_alignment"}:
+        # Contiguous, but 8 bytes past a 16-byte boundary (CAKE-991 reads
+        # z and D in 16-byte groups).
+        if invalid == "d_alignment":
+            cake_runner.has_d = True
+            kwargs["D"] = torch.empty(cake_runner.nheads + 4, dtype=torch.bfloat16)[4:]
+        else:
+            cake_runner.has_z = True
+            kwargs["z"] = torch.empty(tensors[0].numel() + 4, dtype=torch.bfloat16)[4:].view(tensors[0].shape)
     elif invalid in {"z_shape", "z_dtype"}:
         cake_runner.has_z = True
         kwargs["z"] = torch.empty(
