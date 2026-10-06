@@ -1248,7 +1248,8 @@ def test_sk_exact_plan_mirrors_cake():
 
 def test_round13_knob_normalisation():
     # the 20-field key carries park / ovl / htail at fields 15 / 16 / 17; ovl is a 256-row x 256-column tall-tile
-    # knob (narrower or shorter tiles raise), htail needs the 256-row family, park only the bf16 row-major tall store
+    # knob (narrower or shorter tiles raise), htail needs the 256-row family or (round 16, Cake W2) the 128-row standard
+    # family with the 256-column row-major tile and the plain drain, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
     assert len(key) == 25 and key[15] is False and key[16] is True and key[17] is True
     assert (
@@ -1257,8 +1258,16 @@ def test_round13_knob_normalisation():
     )
     with pytest.raises(ValueError):
         instance_key(a_mn=False, b_mn=False, cta_rows=256, block_n=192, ovl=True)
+    key128 = instance_key(a_mn=False, b_mn=True, cta_rows=128, htail=True)
+    assert key128[17] is True and instance_symbol(key128).endswith("_ht")
     with pytest.raises(ValueError):
-        instance_key(a_mn=False, b_mn=False, cta_rows=128, htail=True)
+        instance_key(a_mn=False, b_mn=True, cta_rows=128, block_n=192, htail=True)
+    with pytest.raises(ValueError):
+        instance_key(a_mn=False, b_mn=True, cta_rows=128, htail=True, pd=1)
+    with pytest.raises(ValueError):
+        instance_key(a_mn=True, b_mn=True, out_t=True, cta_rows=128, htail=True)
+    with pytest.raises(ValueError):
+        instance_key(a_mn=False, b_mn=False, cta_rows=64, htail=True)
     with pytest.raises(ValueError):
         instance_key(a_mn=False, b_mn=False, cta_rows=256, park=True, ovl=True)
 
@@ -1842,7 +1851,16 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 )
                 htail = (
                     bool(rule.get("htail"))
-                    and plan.cta_rows == 256
+                    and (
+                        plan.cta_rows == 256
+                        or (
+                            plan.cta_rows == 128
+                            and plan.block_n == 256
+                            and not plan.transposed_out
+                            and int(rule.get("pd", 0)) == 0
+                            and not int(rule.get("pf", 0))
+                        )
+                    )
                     and exact_plan is None
                     and 0 < 2 * tail <= plan.sm_pairs
                 )

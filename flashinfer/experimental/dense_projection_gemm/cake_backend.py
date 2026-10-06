@@ -549,10 +549,17 @@ def instance_key(
             f"ovl owns the 256-column B load coordinates and needs the 128-byte B swizzle (got b_swz={b_swz})"
         )
     htail = bool(htail)
-    if htail and (cta_rows != 256 or pf or box_rows):
+    if htail and (cta_rows not in (128, 256) or pf or box_rows or "a_mcast" in diag):
         raise ValueError(
-            f"htail (half-height tail wave) needs cta_rows=256 and no pf / box_rows (got cta_rows={cta_rows}, "
+            f"htail (half-height tail wave) needs cta_rows=256 or 128 and no pf / box_rows / a_mcast (got cta_rows={cta_rows}, "
             f"pf={pf}, box_rows={box_rows})"
+        )
+    if htail and cta_rows == 128 and (block_n != 256 or out_t or int(pd) or "no_tmem" in diag):
+        # round 16 (Cake W2): the half-height tail wave on the standard family (M=128 cta_group::2 half items, TMEM Layout B)
+        # needs the 256-column row-major tile with the plain drain  [Cake instance_key]
+        raise ValueError(
+            f"htail on the 128-row family needs BLOCK_N=256, a row-major output and pd=0 without the no_tmem probe "
+            f"(got block_n={block_n}, out_t={out_t}, pd={pd}, diag={diag})"
         )
     if htail and sk_exact:
         raise ValueError(
@@ -740,8 +747,9 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, True, True, False, False, 12288, 6144, None): {"epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 16384, 6144, None): {"epi": 'reg', "f32_v8": True},
     ('sm_100a', True, True, False, False, False, 2048, None, 4096): {"cta_rows": 256},
-    ('sm_100a', True, True, False, False, False, 2048, None, 6144): {"group_m": 4},
-    ('sm_100a', True, True, False, False, False, 6144, None, 2048): {"block_n": 192, "sk_parts": 2},
+    ('sm_100a', True, True, False, False, False, 2048, None, 6144): {"group_m": 4, "sk_exact": 3},
+    ('sm_100a', True, True, False, False, False, 2048, None, 16384): {"cta_rows": 256, "ovl": True, "htail": True},
+    ('sm_100a', True, True, False, False, False, 6144, None, 2048): {"sk_exact": 3},
     ('sm_100a', True, True, False, False, False, 6144, None, 12288): {"cta_rows": 256, "group_m": 8},
     ('sm_100a', True, True, False, False, False, 12288, None, 6144): {"cta_rows": 256, "group_m": 8},
     ('sm_100a', True, True, False, False, False, 16384, None, 6144): {"cta_rows": 256, "group_m": 8, "htail": True},
@@ -751,9 +759,9 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "epi": 'tma'},
     ('sm_100a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "epi": 'tma'},
     ('sm_100a', True, True, True, False, False, 2048, None, 4096): {"cta_rows": 256},
-    ('sm_100a', True, True, True, False, False, 2048, None, 6144): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
+    ('sm_100a', True, True, True, False, False, 2048, None, 6144): {"group_m": 8, "epi": 'reg', "sk_exact": 3, "f32_v8": True, "store_ef": True},
     ('sm_100a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
-    ('sm_100a', True, True, True, False, False, 6144, None, 2048): {"group_m": 32, "epi": 'reg', "f32_v8": True, "store_ef": True},
+    ('sm_100a', True, True, True, False, False, 6144, None, 2048): {"group_m": 32, "epi": 'reg', "sk_exact": 3, "f32_v8": True, "store_ef": True},
     ('sm_100a', True, True, True, False, False, 6144, None, 12288): {"cta_rows": 256},
     ('sm_100a', True, True, True, False, False, 12288, None, 6144): {"cta_rows": 256},
     ('sm_100a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256, "htail": True},
@@ -762,6 +770,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', True, True, True, True, False, 576, None, 6144): {"hints": ('evict_first', 'evict_first'), "epi": 'tma'},
     ('sm_107a', False, False, False, False, False, 32, 6144, None): {"promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, False, 576, 6144, None): {"cta_rows": 256, "hints": ('evict_first', 'none'), "stages": 5},
+    ('sm_107a', False, False, False, False, False, 6144, 2048, None): {"htail": True},
     ('sm_107a', False, False, False, False, False, 6144, 12288, None): {"cta_rows": 256, "sk_parts": 3},
     ('sm_107a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256, "ovl": True, "htail": True},
     ('sm_107a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
@@ -771,6 +780,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 128, "slots": 2, "pd": 2},
     ('sm_107a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 128, "slots": 2, "pd": 2},
     ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "quad_store": True, "pd": 1},
+    ('sm_107a', False, True, False, False, False, 6144, 2048, None): {"htail": True},
     ('sm_107a', False, True, False, False, False, 6144, 12288, None): {"sk_parts": 2},
     ('sm_107a', False, True, False, False, False, 12288, 6144, None): {"hints": ('none', 'evict_first')},
     ('sm_107a', False, True, False, False, False, 16384, 6144, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
@@ -778,13 +788,13 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, False, False, True, 256, 512, None): {"promo": 'l2_256b'},
     ('sm_107a', False, True, False, False, True, 512, 192, None): {"batch_group": 8, "store_hint": "evict_last"},
     ('sm_107a', False, True, False, False, True, 512, 256, None): {"promo": 'l2_256b', "batch_group": 8},
-    ('sm_107a', False, True, True, False, False, 2048, 4096, None): {"epi": 'reg', "f32_v8": True},
+    ('sm_107a', False, True, True, False, False, 2048, 4096, None): {"epi": 'reg', "stages": 9, "f32_v8": True, "store_ef": True},
     ('sm_107a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', False, True, True, False, False, 2048, 16384, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
-    ('sm_107a', False, True, True, False, False, 6144, 32, None): {"block_n": 128},
+    ('sm_107a', False, True, True, False, False, 6144, 32, None): {"block_n": 128, "slots": 2},
     ('sm_107a', False, True, True, False, False, 6144, 128, None): {"block_n": 128},
     ('sm_107a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b'},
-    ('sm_107a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_107a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "htail": True},
     ('sm_107a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256, "sk_parts": 3},
     ('sm_107a', False, True, True, False, False, 12288, 6144, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 16384, 6144, None): {"cta_rows": 256},
@@ -795,8 +805,8 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "sk_exact": 3},
     ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "cta_rows": 64, "sk_exact": 2},
     ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64},
-    ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "b_swz": 64},
-    ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma'},
+    ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "stages": 6, "b_swz": 64},
+    ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first'), "epi": 'tma', "stages": 6},
     ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 160, "cta_rows": 256, "sk_parts": 3, "b_swz": 64},
     ('sm_107a', True, True, True, False, False, 2048, None, 6144): {"cta_rows": 256},
     ('sm_107a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
@@ -1365,7 +1375,13 @@ def plan_dense_projection_gemm(
     # Round 13 (Cake W1): deterministic half-height tail wave of the tall family - the tail tiles become 2 x tail
     # standard-geometry items of full K (no partial slabs, no fixup), only when there is a tail and its half items fit
     # the CTA pairs; otherwise the plain plan / stream-K policy of the row applies.  [Cake launcher]
-    htail = bool(htail) and int(cta_rows) == 256 and exact_plan is None
+    htail = bool(htail) and int(cta_rows) in (128, 256) and exact_plan is None
+    if htail and int(cta_rows) == 128:
+        # round 16 (Cake W2): the half-height tail wave on the standard family needs the 256-column row-major tile without the
+        # pipelined drain / prefetch; the planner never emits box_rows or diag probes, so the launcher's remaining conditions
+        # hold by construction  [Cake launcher]
+        pf_eff = pf if pf is not None else rule.get("pf", default_pf(M, N, K))
+        htail = int(block_n) == 256 and not transposed_out and int(pd) == 0 and not int(pf_eff)
     if htail:
         tail_h = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
         htail = bool(tail_h) and 2 * tail_h <= pairs
