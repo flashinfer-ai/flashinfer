@@ -723,7 +723,11 @@ class MoERunner(TunableRunner):
 
         ``MoELayer`` already filters runners by routing mode, so this guards
         the direct-runner path. The per-token check is here rather than in
-        ``check_support`` because it is a per-call tensor.
+        ``check_support`` because it is a per-call tensor: a pack scale is
+        accepted only when the runner was built with
+        ``QuantConfig(per_token_scale=True)``, since the TRT-LLM and Prims-TS
+        launchers switch kernels on the tensor's presence while tactics were
+        enumerated for the configured mode.
         """
         if act.routing_input_mode not in self.supported_routing_modes:
             names = ", ".join(mode.name for mode in self.supported_routing_modes)
@@ -731,8 +735,12 @@ class MoERunner(TunableRunner):
                 f"{type(self).__name__} does not support "
                 f"routing_input_mode={act.routing_input_mode!r}; supported: {names}."
             )
-        if act.per_token_scale is not None and not self.supports_per_token_scale:
-            raise ValueError(f"{type(self).__name__} does not consume per_token_scale.")
+        if act.per_token_scale is not None and not self.config.quant.per_token_scale:
+            raise ValueError(
+                f"{type(self).__name__} was configured without "
+                "QuantConfig(per_token_scale=True) and does not consume "
+                "MoEActivationPack.per_token_scale."
+            )
 
     def _assert_expert_parallelism_supported(self) -> None:
         """Reject EP shards for backends that cannot compute a local expert subset."""
@@ -6996,14 +7004,6 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     ) -> List[torch.Tensor]:
         self._require_built()
         self._validate_pack_contract(act)
-        # The class-level opt-in covers NVFP4×NVFP4 only; BF16×BF16 and an
-        # NVFP4 runner built without per_token_scale=True would drop the scale.
-        if act.per_token_scale is not None and not self._per_token:
-            raise ValueError(
-                f"{type(self).__name__} was configured without "
-                "QuantConfig(per_token_scale=True) and does not consume "
-                "MoEActivationPack.per_token_scale."
-            )
         from flashinfer.prims_ts.moe.support import (
             is_prims_ts_bf16_supported,
             is_prims_ts_nvfp4_supported,

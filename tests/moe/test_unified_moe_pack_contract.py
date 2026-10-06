@@ -104,12 +104,9 @@ def test_declared_per_token_scale_is_rejected(runner_cls):
         MoERunner._check_support(runner)
 
 
-@pytest.mark.parametrize(
-    "runner_cls",
-    [r for r in _RUNNERS if not r.supports_per_token_scale],
-    ids=lambda c: c.__name__,
-)
-def test_pack_per_token_scale_is_rejected(runner_cls):
+@pytest.mark.parametrize("runner_cls", _RUNNERS, ids=lambda c: c.__name__)
+def test_pack_per_token_scale_is_rejected_unless_configured(runner_cls):
+    """A pack scale needs QuantConfig(per_token_scale=True), on every runner."""
     runner = _bare_runner(runner_cls, _config_for(runner_cls))
     mode = runner_cls.supported_routing_modes[0]
     with pytest.raises(ValueError, match="per_token_scale"):
@@ -117,6 +114,19 @@ def test_pack_per_token_scale_is_rejected(runner_cls):
             _pack(mode, per_token_scale=torch.ones(4, dtype=torch.float32))
         )
     runner._validate_pack_contract(_pack(mode))
+
+
+@pytest.mark.parametrize(
+    "runner_cls",
+    sorted(_PER_TOKEN_RUNNERS, key=lambda c: c.__name__),
+    ids=lambda c: c.__name__,
+)
+def test_pack_per_token_scale_is_accepted_when_configured(runner_cls):
+    runner = _bare_runner(runner_cls, _config_for(runner_cls, per_token_scale=True))
+    mode = runner_cls.supported_routing_modes[0]
+    runner._validate_pack_contract(
+        _pack(mode, per_token_scale=torch.ones(4, dtype=torch.float32))
+    )
 
 
 @pytest.mark.parametrize("runner_cls", _RUNNERS, ids=lambda c: c.__name__)
