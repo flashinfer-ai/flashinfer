@@ -14,8 +14,10 @@ SM-count-derived worker stride and the physical-map / logical-output flags are
 kernel arguments, and the DeepGEMM configuration for `M` is snapped onto the
 exported schedule templates (`mega_gate.TEMPLATES`, one compiled program each:
 block tokens, MMA CTA pair, split-K, expert groups, pipeline stages, gate
-warpgroups, K-block merge, the single-token cluster-reduction route and the
-small-M idle L2 touch). One source per program serves both architectures.
+warpgroups, K-block merge, the single-token cluster-reduction route, the
+2..4-token cluster-reduction route of SM100a and the small-M idle L2 touch; the
+single-tile routes of 1..4 tokens run 16 K-splits over a 16-CTA cluster and
+combine the FP32 partials with a compensated pairwise sum). One source per program serves both architectures.
 The small physical-map production token counts (1, 3, 16, 128, 512) and the
 2..16-token logical-output route keep an exact-shape program of their schedule
 (tile geometry, route and worker stride compiled in; one 16-token tile serves

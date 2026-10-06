@@ -23,32 +23,33 @@
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 32
 #define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 12
+#define NUM_TMA_PIPE_STAGES 11
 #define NUM_EPI_PIPE_STAGES 2
 #define SMEM_SX_OFF 1024
 #define SMEM_SX_STAGE_BYTES 2048
 #define SMEM_SX_STRIDE 2048
-#define SMEM_SW_OFF 25600
+#define SMEM_SW_OFF 23552
 #define SMEM_SW_STAGE_BYTES 16384
 #define SMEM_SW_STRIDE 16384
-#define SMEM_METADATA_OFF 222208
+#define SMEM_METADATA_OFF 203776
 #define SMEM_METADATA_STAGE_BYTES 3072
 #define SMEM_METADATA_STRIDE 3072
-#define SMEM_REDUCE_PARTIALS_OFF 225280
-#define SMEM_REDUCE_PARTIALS_STAGE_BYTES 4096
-#define SMEM_REDUCE_PARTIALS_STRIDE 4096
-#define SMEM_CACHED_COUNTS_OFF 223744
+#define SMEM_REDUCE_PARTIALS_OFF 206848
+#define SMEM_REDUCE_PARTIALS_STAGE_BYTES 8192
+#define SMEM_REDUCE_PARTIALS_STRIDE 8192
+#define SMEM_CACHED_COUNTS_OFF 205312
 #define SMEM_CACHED_COUNTS_STAGE_BYTES 1536
 #define SMEM_CACHED_COUNTS_STRIDE 1536
-#define SMEM_TOUCH_SINK_OFF 229376
+#define SMEM_TOUCH_SINK_OFF 215040
 #define SMEM_TOUCH_SINK_STAGE_BYTES 128
 #define SMEM_TOUCH_SINK_STRIDE 128
-#define SMEM_TOTAL 229504
+#define SMEM_TOTAL 215168
+#define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 1) __cluster_dims__(8,1,1) void
-kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride, int num_workers, int route_flags, int num_split_k)
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) __cluster_dims__(16,1,1) void
+kernel_cake_deepgemm_mega_gate_8be2bbbc2c42bd4ebb76(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride, int num_workers, int route_flags, int num_split_k)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -65,16 +66,16 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
 
     const int mbar_base = smem;
     #define full_addr (mbar_base + 0)
-    #define empty_addr (mbar_base + 96)
-    #define tmem_full_addr (mbar_base + 192)
-    #define tmem_empty_addr (mbar_base + 208)
-    #define metadata_ready_addr (mbar_base + 224)
-    #define reduce_full_addr (mbar_base + 232)
+    #define empty_addr (mbar_base + 88)
+    #define tmem_full_addr (mbar_base + 176)
+    #define tmem_empty_addr (mbar_base + 192)
+    #define metadata_ready_addr (mbar_base + 208)
+    #define reduce_full_addr (mbar_base + 216)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    const unsigned int clusters_x = gridDim.x / 8;
-    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 8;
+    const unsigned int clusters_x = gridDim.x / 16;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 16;
     const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
 
     int cta_rank;
@@ -83,23 +84,23 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
     // Kernel setup ops
     __nv_bfloat16* sx = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int sx_addr = smem + 1024;
-    __nv_bfloat16* sw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 25600);
-    const int sw_addr = smem + 25600;
-    float* metadata = reinterpret_cast<float*>(smem_raw + 222208);
-    const int metadata_addr = smem + 222208;
-    float* reduce_partials = reinterpret_cast<float*>(smem_raw + 225280);
-    const int reduce_partials_addr = smem + 225280;
-    int* cached_counts = reinterpret_cast<int*>(smem_raw + 223744);
-    const int cached_counts_addr = smem + 223744;
-    int* touch_sink = reinterpret_cast<int*>(smem_raw + 229376);
-    const int touch_sink_addr = smem + 229376;
+    __nv_bfloat16* sw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 23552);
+    const int sw_addr = smem + 23552;
+    float* metadata = reinterpret_cast<float*>(smem_raw + 203776);
+    const int metadata_addr = smem + 203776;
+    float* reduce_partials = reinterpret_cast<float*>(smem_raw + 206848);
+    const int reduce_partials_addr = smem + 206848;
+    int* cached_counts = reinterpret_cast<int*>(smem_raw + 205312);
+    const int cached_counts_addr = smem + 205312;
+    int* touch_sink = reinterpret_cast<int*>(smem_raw + 215040);
+    const int touch_sink_addr = smem + 215040;
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 30 barriers)
-    // Mbarriers at smem_raw[0..240)
+    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 28 barriers)
+    // Mbarriers at smem_raw[0..224)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -110,20 +111,20 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 64, 1);
             // empty: stages (0, 4, 8), init_count=1
-            mbarrier_init(smem + 96, 1);
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 160, 1);
+            mbarrier_init(smem + 88, 1);
+            mbarrier_init(smem + 120, 1);
+            mbarrier_init(smem + 152, 1);
             // --- pipeline 'epi_pipe' ---
             // tmem_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 176, 1);
+            mbarrier_init(smem + 184, 1);
+            // tmem_empty: 2 barriers, init_count=1
             mbarrier_init(smem + 192, 1);
             mbarrier_init(smem + 200, 1);
-            // tmem_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 208, 1);
-            mbarrier_init(smem + 216, 1);
             // metadata_ready: 1 barriers, init_count=32
-            mbarrier_init(smem + 224, 32);
+            mbarrier_init(smem + 208, 32);
             // reduce_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 232, 1);
+            mbarrier_init(smem + 216, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -136,9 +137,9 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
             mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 72, 1);
             // empty: stages (1, 5, 9), init_count=1
-            mbarrier_init(smem + 104, 1);
-            mbarrier_init(smem + 136, 1);
-            mbarrier_init(smem + 168, 1);
+            mbarrier_init(smem + 96, 1);
+            mbarrier_init(smem + 128, 1);
+            mbarrier_init(smem + 160, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -151,9 +152,9 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
             mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 80, 1);
             // empty: stages (2, 6, 10), init_count=1
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 144, 1);
-            mbarrier_init(smem + 176, 1);
+            mbarrier_init(smem + 104, 1);
+            mbarrier_init(smem + 136, 1);
+            mbarrier_init(smem + 168, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -161,14 +162,12 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // full: stages (3, 7, 11), init_count=1
+            // full: stages (3, 7), init_count=1
             mbarrier_init(smem + 24, 1);
             mbarrier_init(smem + 56, 1);
-            mbarrier_init(smem + 88, 1);
-            // empty: stages (3, 7, 11), init_count=1
-            mbarrier_init(smem + 120, 1);
-            mbarrier_init(smem + 152, 1);
-            mbarrier_init(smem + 184, 1);
+            // empty: stages (3, 7), init_count=1
+            mbarrier_init(smem + 112, 1);
+            mbarrier_init(smem + 144, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -176,9 +175,9 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 240);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 224);
     if (warp == 2) {
-        int _tmem_hold = smem + 240;
+        int _tmem_hold = smem + 224;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
         __syncwarp();
     }
@@ -198,23 +197,23 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
     if (warp == 0) {
         { // load_main
             unsigned int ls = 0;
-            int logical = bid % 24;
+            int logical = bid % 48;
             int expert_group = logical % 3;
             int split = logical / 3;
-            split = logical % 8;
-            expert_group = logical / 8;
+            split = logical % 16;
+            expert_group = logical / 16;
             int num_blocks = (num_tokens + 15) / 16;
             int tail_n = (num_tokens - (num_blocks - 1) * 16 + 15) / 16 * 16;
             unsigned int _phase_empty = 1;
             if (elect_sync()) {
                 #pragma unroll 1
-                for (int tile = bid / 24; tile < num_blocks; tile += num_workers) {
+                for (int tile = bid / 48; tile < num_blocks; tile += num_workers) {
                     int _max_0 = ((tail_n) > (16) ? (tail_n) : (16));
                     int effective_n = ((num_blocks == tile + 1) ? _max_0 : 16);
                     #pragma unroll 4
-                    for (int kb = 0; kb < 10; kb++) {
+                    for (int kb = 0; kb < 5; kb++) {
                         mbarrier_wait(empty_addr + (ls) * 8, _phase_empty);
-                        int ko = split * 10 * 64 + kb * 64;
+                        int ko = split * 5 * 64 + kb * 64;
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
@@ -223,7 +222,7 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
                         tma_3d_gmem2smem(sw_addr + ls * 16384, (&W), 0, expert_group * 128, ko / 64, full_addr + (ls) * 8);
                         mbarrier_arrive_expect_tx(full_addr + (ls) * 8, 18432);
                         ls += 1;
-                        if (ls == 12) { ls = 0; _phase_empty ^= 1; }
+                        if (ls == 11) { ls = 0; _phase_empty ^= 1; }
                     }
                 }
             }
@@ -239,13 +238,13 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
             unsigned int _phase_tmem_empty = 1;
             unsigned int _phase_full = 0;
             #pragma unroll 1
-            for (int tile_1 = bid / 24; tile_1 < num_blocks_1; tile_1 += num_workers) {
+            for (int tile_1 = bid / 48; tile_1 < num_blocks_1; tile_1 += num_workers) {
                 int _max_1 = ((tail_n_1) > (16) ? (tail_n_1) : (16));
                 int effective_n_1 = ((num_blocks_1 == tile_1 + 1) ? _max_1 : 16);
                 mbarrier_wait(tmem_empty_addr + (me) * 8, _phase_tmem_empty);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 #pragma unroll 1
-                for (int kb_1 = 0; kb_1 < 10; kb_1++) {
+                for (int kb_1 = 0; kb_1 < 5; kb_1++) {
                     mbarrier_wait(full_addr + (ms) * 8, _phase_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int init = ((kb_1 == 0) ? 1 : 0);
@@ -275,13 +274,13 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
                         }
                     }
                     __syncwarp();
-                    if (kb_1 + 1 == 10) {
+                    if (kb_1 + 1 == 5) {
                         elect_commit(tmem_full_addr + (me) * 8);
                     }
                     __syncwarp();
                     elect_commit(empty_addr + (ms) * 8);
                     ms += 1;
-                    if (ms == 12) { ms = 0; _phase_full ^= 1; }
+                    if (ms == 11) { ms = 0; _phase_full ^= 1; }
                 }
                 me += 1;
                 if (me == 2) { me = 0; _phase_tmem_empty ^= 1; }
@@ -320,18 +319,18 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
         { // gate_main
             unsigned int ge = 0;
             int gw = warp - 4;
-            int logical_1 = bid % 24;
+            int logical_1 = bid % 48;
             int expert_group_1 = logical_1 % 3;
             int split_1 = logical_1 / 3;
-            split_1 = logical_1 % 8;
-            expert_group_1 = logical_1 / 8;
+            split_1 = logical_1 % 16;
+            expert_group_1 = logical_1 / 16;
             uint64_t _grid_id_0;
             asm volatile("mov.u64 %0, %%gridid;" : "=l"(_grid_id_0));
             unsigned long long epoch = (_grid_id_0 + 1) * 64;
             mbarrier_wait(metadata_ready_addr, 0);
             if (split_1 == 0) {
                 if (gw == 0 && lane == 0) {
-                    mbarrier_arrive_expect_tx(reduce_full_addr, 3584);
+                    mbarrier_arrive_expect_tx(reduce_full_addr, 7680);
                 }
             }
             uint32_t _mapa_0;
@@ -348,7 +347,7 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
             int tail_n_2 = (num_tokens - (num_blocks_2 - 1) * 16 + 15) / 16 * 16;
             unsigned int _phase_tmem_full = 0;
             #pragma unroll 1
-            for (int tile_2 = bid / 24; tile_2 < num_blocks_2; tile_2 += num_workers) {
+            for (int tile_2 = bid / 48; tile_2 < num_blocks_2; tile_2 += num_workers) {
                 int _max_2 = ((tail_n_2) > (16) ? (tail_n_2) : (16));
                 int effective_n_2 = ((num_blocks_2 == tile_2 + 1) ? _max_2 : 16);
                 int _min_0 = ((num_tokens - tile_2 * 16) < (16) ? (num_tokens - tile_2 * 16) : (16));
@@ -398,11 +397,46 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
                 if (split_1 == 0) {
                     mbarrier_wait(reduce_full_addr, 0);
                     if (gw < 4) {
-                        float leader_total = reduce_partials[expert_local];
+                        float lp[16];
                         #pragma unroll
-                        for (int sp = 1; sp < 8; sp++) {
-                            leader_total = leader_total + reduce_partials[sp * 128 + expert_local];
+                        for (int sp = 0; sp < 16; sp++) {
+                            lp[sp] = reduce_partials[sp * 128 + expert_local];
                         }
+                        float ls1[8];
+                        float lb1[8];
+                        float le1[8];
+                        #pragma unroll
+                        for (int i = 0; i < 8; i++) {
+                            ls1[i] = lp[2 * i] + lp[2 * i + 1];
+                            lb1[i] = ls1[i] - lp[2 * i];
+                            le1[i] = lp[2 * i] - (ls1[i] - lb1[i]) + (lp[2 * i + 1] - lb1[i]);
+                        }
+                        float ls2[4];
+                        float lb2[4];
+                        float le2[4];
+                        #pragma unroll
+                        for (int i_1 = 0; i_1 < 4; i_1++) {
+                            ls2[i_1] = ls1[2 * i_1] + ls1[2 * i_1 + 1];
+                            lb2[i_1] = ls2[i_1] - ls1[2 * i_1];
+                            le2[i_1] = ls1[2 * i_1] - (ls2[i_1] - lb2[i_1]) + (ls1[2 * i_1 + 1] - lb2[i_1]);
+                            le1[i_1] = le1[2 * i_1] + le1[2 * i_1 + 1];
+                        }
+                        float ls3[2];
+                        float lb3[2];
+                        float le3[2];
+                        #pragma unroll
+                        for (int i_2 = 0; i_2 < 2; i_2++) {
+                            ls3[i_2] = ls2[2 * i_2] + ls2[2 * i_2 + 1];
+                            lb3[i_2] = ls3[i_2] - ls2[2 * i_2];
+                            le3[i_2] = ls2[2 * i_2] - (ls3[i_2] - lb3[i_2]) + (ls2[2 * i_2 + 1] - lb3[i_2]);
+                            le1[i_2] = le1[2 * i_2] + le1[2 * i_2 + 1];
+                            le2[i_2] = le2[2 * i_2] + le2[2 * i_2 + 1];
+                        }
+                        float leader_sum4 = ls3[0] + ls3[1];
+                        float leader_bp4 = leader_sum4 - ls3[0];
+                        float leader_err4 = ls3[0] - (leader_sum4 - leader_bp4) + (ls3[1] - leader_bp4);
+                        float leader_err = le1[0] + le1[1] + (le2[0] + le2[1]) + (le3[0] + le3[1] + leader_err4);
+                        float leader_total = leader_sum4 + leader_err;
                         float leader_unbiased = leader_total;
                         float result = leader_total;
                         float _exp_0 = expf(leader_total);
@@ -436,14 +470,14 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
                                 if (lane == oi) {
                                     {
                                         float4 _v4 = make_float4(pad_record[0 + 0], pad_record[0 + 1], pad_record[0 + 2], pad_record[0 + 3]);
-                                        *reinterpret_cast<float4*>(scratch + (tile_2 * 8 * 16 * 384 + expert_group_1 * 128 + (gw * 6 + oi) * 4) + 0) = _v4;
+                                        *reinterpret_cast<float4*>((scratch + (tile_2 * 16 * 16 * 384 + expert_group_1 * 128 + (gw * 6 + oi) * 4)) + 0) = _v4;
                                     }
                                 }
                             } else if (leader_tied == _warp_redux_u32_0) {
                                 leader_record[0] = leader_ranking;
                                 {
                                     float4 _v4 = make_float4(leader_record[0 + 0], leader_record[0 + 1], leader_record[0 + 2], leader_record[0 + 3]);
-                                    *reinterpret_cast<float4*>(scratch + (tile_2 * 8 * 16 * 384 + expert_group_1 * 128 + (gw * 6 + oi) * 4) + 0) = _v4;
+                                    *reinterpret_cast<float4*>((scratch + (tile_2 * 16 * 16 * 384 + expert_group_1 * 128 + (gw * 6 + oi) * 4)) + 0) = _v4;
                                 }
                                 leader_ranking = -CUDART_INF_F;
                             }
@@ -474,7 +508,7 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
                 }
                 asm volatile("bar.sync 8, 256;" ::: "memory");
                 #pragma unroll 1
-                for (int token_local = gw * 24 + logical_1; token_local < valid_tokens; token_local += 192) {
+                for (int token_local = gw * 48 + logical_1; token_local < valid_tokens; token_local += 384) {
                     int token = tile_2 * 16 + token_local;
                     int handled = 0;
                     if (handled == 0) {
@@ -490,7 +524,7 @@ kernel_cake_deepgemm_mega_gate_bbf3dd7af63a05d6c24a(const __grid_constant__ CUte
                             if (cand_index < 72) {
                                 float _vec_load_0[4];
                                 {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(scratch + ((tile_2 * 8 * 16 + token_local) * 384 + cand_index / 24 * 128 + cand_index % 24 * 4) + 0);
+                                    float4 _v4 = *reinterpret_cast<const float4*>(scratch + ((tile_2 * 16 * 16 + token_local) * 384 + cand_index / 24 * 128 + cand_index % 24 * 4) + 0);
                                     _vec_load_0[0 + 0] = _v4.x;
                                     _vec_load_0[0 + 1] = _v4.y;
                                     _vec_load_0[0 + 2] = _v4.z;
