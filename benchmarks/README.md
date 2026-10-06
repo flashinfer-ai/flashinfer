@@ -572,77 +572,77 @@ Legend:
 - trtllm-native: TensorRT-LLM (native API)
 - prims-ts: Experimental task-scheduled attention (SM100/SM103)
 -->
-| Routine | 7.5 | 8.0 | 8.6 | 8.9 | 9.0 | 10.0 | 10.3 | 12.0 |
-|---------|-----|-----|-----|-----|-----|-------|-------|-------|
-| **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn |
-| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
-| **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
-| **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2 |
-| **trtllm_batch_decode_sparse_mla_dsv4** |  |  |  |  |  | trtllm-gen | trtllm-gen |  |
-| **fp8_paged_mqa_logits** |  |  |  |  |  | cute-dsl | cute-dsl |  |
-| **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
-| **gemm_fp8_nt_blockscaled** |  |  |  |  |  | cutlass | cutlass |  |
-| **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
-| **group_deepgemm_fp8_nt_groupwise** |  |  |  |  |  | deepgemm | deepgemm |  |
-| **batch_deepgemm_fp8_nt_groupwise** |  |  |  |  |  | deepgemm, cake | deepgemm, cake |  |
-| **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass | cudnn, cublas, cutlass | cudnn, cublas |
-| **mm_fp8** |  |  |  |  |  | trtllm_low_latency | trtllm_low_latency |  |
-| **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass | cudnn, trtllm, cutlass | cudnn |
-| **mm_bf16** |  |  |  |  |  | cudnn, cutlass, tgv | cudnn, cutlass, tgv |  |
-| **bmm_bf16** |  |  |  |  |  | cudnn, cutlass | cudnn, cutlass |  |
-| **router_gemm** |  |  |  |  | auto | auto | auto |  |
-| **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
-| **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
-| **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
-| **trtllm_fp4_block_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm |  |
-| **trtllm_fp8_block_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm |  |
-| **trtllm_fp8_per_tensor_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm |  |
-| **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
-| **cute_dsl_bf16_moe** |  |  |  |  | cute-dsl |  |  |  |
-| **unified_moe** |  |  |  | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass | cutlass | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16) |
-| **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
-| **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
-| **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
-| **fused_add_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
-| **gemma_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
-| **gemma_fused_add_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
-| **rmsnorm_quant** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
-| **fused_add_rmsnorm_quant** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
-| **rmsnorm_fp4quant** |  |  |  |  |  | cute-dsl | cute-dsl |  |
-| **add_rmsnorm_fp4quant** |  |  |  |  |  | cute-dsl | cute-dsl |  |
-| **mxfp8_quantize** |  |  |  |  |  | cuda | cuda |  |
-| **mxfp4_quantize** |  |  |  |  |  | cuda | cuda |  |
-| **nvfp4_quantize** |  |  |  |  |  | cuda | cuda |  |
-| **nvfp4_batched_quantize** |  |  |  |  |  | cuda | cuda |  |
-| **softmax** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **sampling_from_logits** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_k_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_p_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_k_top_p_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_k_top_p_sampling_from_logits** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **min_p_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_k_renorm_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_p_renorm_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_k_mask_logits** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **chain_speculative_sampling** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_k** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_k_page_table_transform** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **top_k_ragged_transform** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **apply_rope** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **apply_rope_pos_ids** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **apply_llama31_rope** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **apply_llama31_rope_pos_ids** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **apply_rope_with_cos_sin_cache** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
-| **mla_rope_quantize_fp8** |  |  |  | cuda | cuda | cuda | cuda | cuda |
-| **rope_quantize_fp8** |  |  |  | cuda | cuda | cuda | cuda | cuda |
-| **rope_quantize_fp8_append_paged_kv_cache** |  |  |  | cuda | cuda | cuda | cuda | cuda |
-| **selective_state_update** | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton |
-| **gated_delta_rule_decode** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
-| **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
-| **chunk_gated_delta_rule** |  |  |  |  | flashinfer, auto, fla | flashinfer, auto, cake_gdn, cudnn, fla | flashinfer, auto, cake_gdn, cudnn, fla |  |
-| **recurrent_kda_prefill** |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
-| **fused_kda_decode** |  |  |  |  |  | cute-dsl, cake, auto | cute-dsl, cake, auto |  |
+| Routine | 7.5 | 8.0 | 8.6 | 8.9 | 9.0 | 10.0 | 10.3 | 10.7 | 12.0 |
+|---------|-----|-----|-----|-----|-----|-------|-------|-------|-------|
+| **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native | fa2, fa2_tc, cudnn |
+| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
+| **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
+| **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2, cutlass, trtllm-native | fa2 |
+| **trtllm_batch_decode_sparse_mla_dsv4** |  |  |  |  |  | trtllm-gen | trtllm-gen |  |  |
+| **fp8_paged_mqa_logits** |  |  |  |  |  | cute-dsl | cute-dsl | cute-dsl |  |
+| **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass | cutlass |  |
+| **gemm_fp8_nt_blockscaled** |  |  |  |  |  | cutlass | cutlass | cutlass |  |
+| **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass | cutlass |  |
+| **group_deepgemm_fp8_nt_groupwise** |  |  |  |  |  | deepgemm | deepgemm | deepgemm |  |
+| **batch_deepgemm_fp8_nt_groupwise** |  |  |  |  |  | deepgemm, cake | deepgemm, cake | deepgemm |  |
+| **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass | cudnn, cublas, cutlass | cudnn, cublas, cutlass | cudnn, cublas |
+| **mm_fp8** |  |  |  |  |  | trtllm_low_latency | trtllm_low_latency | trtllm_low_latency |  |
+| **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass | cudnn, trtllm, cutlass | cudnn, trtllm, cutlass | cudnn |
+| **mm_bf16** |  |  |  |  |  | cudnn, cutlass, tgv | cudnn, cutlass, tgv | cudnn, cutlass, tgv |  |
+| **bmm_bf16** |  |  |  |  |  | cudnn, cutlass | cudnn, cutlass | cudnn, cutlass |  |
+| **router_gemm** |  |  |  |  | auto | auto | auto | auto |  |
+| **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm | trtllm |  |
+| **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm | trtllm |  |
+| **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm | trtllm |  |
+| **trtllm_fp4_block_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm | trtllm |  |
+| **trtllm_fp8_block_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm | trtllm |  |
+| **trtllm_fp8_per_tensor_scale_routed_moe** |  |  |  |  |  | trtllm | trtllm | trtllm |  |
+| **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass | cutlass |  |
+| **cute_dsl_bf16_moe** |  |  |  |  | cute-dsl |  |  |  |  |
+| **unified_moe** |  |  |  | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass, trtllm (MXFP4 W4A8), cute_dsl (MXFP4 W4A8) | cutlass, trtllm (MXFP4 W4A8), cute_dsl (MXFP4 W4A8) | cutlass, trtllm (MXFP4 W4A8), cute_dsl (MXFP4 W4A8) | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16) |
+| **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a | moe_a2a |  |
+| **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce | allreduce |  |
+| **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **fused_add_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **gemma_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **gemma_fused_add_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **rmsnorm_quant** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **fused_add_rmsnorm_quant** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
+| **rmsnorm_fp4quant** |  |  |  |  |  | cute-dsl | cute-dsl | cute-dsl |  |
+| **add_rmsnorm_fp4quant** |  |  |  |  |  | cute-dsl | cute-dsl | cute-dsl |  |
+| **mxfp8_quantize** |  |  |  |  |  | cuda | cuda | cuda |  |
+| **mxfp4_quantize** |  |  |  |  |  | cuda | cuda | cuda |  |
+| **nvfp4_quantize** |  |  |  |  |  | cuda | cuda | cuda |  |
+| **nvfp4_batched_quantize** |  |  |  |  |  | cuda | cuda | cuda |  |
+| **softmax** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **sampling_from_logits** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_p_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_top_p_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_top_p_sampling_from_logits** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **min_p_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_renorm_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_p_renorm_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_mask_logits** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **chain_speculative_sampling** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_page_table_transform** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_ragged_transform** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **apply_rope** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **apply_rope_pos_ids** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **apply_llama31_rope** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **apply_llama31_rope_pos_ids** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **apply_rope_with_cos_sin_cache** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **mla_rope_quantize_fp8** |  |  |  | cuda | cuda | cuda | cuda | cuda | cuda |
+| **rope_quantize_fp8** |  |  |  | cuda | cuda | cuda | cuda | cuda | cuda |
+| **rope_quantize_fp8_append_paged_kv_cache** |  |  |  | cuda | cuda | cuda | cuda | cuda | cuda |
+| **selective_state_update** | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton |
+| **gated_delta_rule_decode** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
+| **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
+| **chunk_gated_delta_rule** |  |  |  |  | flashinfer, auto, fla | flashinfer, auto, cake_gdn, cudnn, fla | flashinfer, auto, cake_gdn, cudnn, fla | flashinfer, auto, cudnn |  |
+| **recurrent_kda_prefill** |  |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
+| **fused_kda_decode** |  |  |  |  |  | cute-dsl, cake, auto | cute-dsl, cake, auto | cute-dsl, auto |  |
 
 Backend Legend:
 - fa2: FlashAttention2
