@@ -362,6 +362,7 @@ inline Call resolve_call(const TensorView& inp, const TensorView& scratch, const
   check_contiguous(scratch, "A_scratch");
   check_cuda_tensor(weight, "B");
   check_dtype(weight, DLDataType{kDLFloat, 16, 1}, "B");
+  check_contiguous(weight, "B");
   check_cuda_tensor(out, "C");
   check_dtype(out, DLDataType{kDLFloat, 16, 1}, "C");
   check_contiguous(out, "C");
@@ -492,4 +493,3 @@ void Run(TensorView inp, TensorView scratch, TensorView weight, TensorView out, 
 }  // namespace cake_host_shim_seq_2bf1da83f19d9287
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_seq_2bf1da83f19d9287::Run);
-

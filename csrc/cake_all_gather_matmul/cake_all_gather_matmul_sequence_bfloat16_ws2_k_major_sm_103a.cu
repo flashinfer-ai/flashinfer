@@ -368,6 +368,7 @@ inline Call resolve_call(const TensorView& inp, const TensorView& scratch, const
   check_contiguous(scratch, "A_scratch");
   check_cuda_tensor(weight, "B");
   check_dtype(weight, DLDataType{kDLBfloat, 16, 1}, "B");
+  // K-major weight: the TMA encoder validates its dense leading dims and row stride.
   check_cuda_tensor(out, "C");
   check_dtype(out, DLDataType{kDLBfloat, 16, 1}, "C");
   check_contiguous(out, "C");
@@ -498,4 +499,3 @@ void Run(TensorView inp, TensorView scratch, TensorView weight, TensorView out, 
 }  // namespace cake_host_shim_seq_e68ff7dc1d24a48a
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_seq_e68ff7dc1d24a48a::Run);
-

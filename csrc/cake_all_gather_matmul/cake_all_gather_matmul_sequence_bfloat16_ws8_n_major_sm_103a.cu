@@ -363,6 +363,7 @@ inline Call resolve_call(const TensorView& inp, const TensorView& scratch, const
   check_contiguous(scratch, "A_scratch");
   check_cuda_tensor(weight, "B");
   check_dtype(weight, DLDataType{kDLBfloat, 16, 1}, "B");
+  check_contiguous(weight, "B");
   check_cuda_tensor(out, "C");
   check_dtype(out, DLDataType{kDLBfloat, 16, 1}, "C");
   check_contiguous(out, "C");
@@ -492,6 +493,7 @@ void Run(TensorView inp, TensorView scratch, TensorView weight, TensorView out, 
 
 constexpr unsigned kFusedThreads = 128u;
 constexpr unsigned kFusedCtasPerPeer = 32u;
+constexpr int64_t kFusedRows = 512;
 
 // Fused SM copy route (the exact SM103 TP8 bfloat16 M=512 N=1280 call):
 // barrier(phase); the fused copy kernel pushes every peer's payload and
@@ -521,6 +523,8 @@ void RunFused(TensorView inp, TensorView scratch, TensorView weight, TensorView 
                     counters.numel() == kWorldSize - 1,
                 ValueError)
       << "fused copy tables need exactly " << (kWorldSize - 1) << " entries";
+  TVM_FFI_CHECK(rows == kFusedRows, ValueError)
+      << "the fused peer copy is compiled for " << kFusedRows << " rows, got " << rows;
   BridgeEvents& events = bridge_events(call.comm_stream);
 
   launch_barrier(phase, static_cast<int32_t>(kWorldSize), call.rank, call.flags, call.main_stream);

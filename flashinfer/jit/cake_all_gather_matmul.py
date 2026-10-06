@@ -712,7 +712,7 @@ def spec(sequence: str, arch: str) -> JitSpec:
             f"sequence {sequence!r} is delivered for {row['arches']}, not {arch!r}"
         )
     return gen_jit_spec(
-        name=f"{sequence}",
+        name=f"{SOURCE_PACKAGE}_sequence_{sequence}",
         sources=[_source_path(relative) for relative in row["sources"]],
         extra_cuda_cflags=[*ARCH_FLAGS[arch], *COMPILE_FLAGS],
         extra_include_paths=[_source_dir().parent],

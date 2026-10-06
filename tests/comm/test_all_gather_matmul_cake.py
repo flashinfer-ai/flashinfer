@@ -285,7 +285,8 @@ def test_spec_names_carry_the_exact_architecture(monkeypatch):
         for arch in ("sm_100a", "sm_103a"):
             sequence = loader.sequence_name(2, "bfloat16", "n_major", arch)
             spec = loader.spec(sequence, arch)
-            assert spec.name == sequence and sequence.endswith(arch)
+            assert spec.name == f"{loader.SOURCE_PACKAGE}_sequence_{sequence}"
+            assert sequence.endswith(arch)
             assert loader.ARCH_FLAGS[arch][0] in spec.extra_cuda_cflags
             assert [str(path).split("/")[-1] for path in spec.sources] == [
                 source.split("/")[-1]
