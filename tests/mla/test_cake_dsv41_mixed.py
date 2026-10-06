@@ -58,10 +58,10 @@ from flashinfer.mla import (
 from flashinfer.mla._sparse_mla_sm120 import cake_dsv41_mixed as route
 from flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed import (
     BINDING_PARAMS,
+    CakeDsv41MixedGeometry,
     DEFAULT_VARIANT,
     EXTRA_BYTES_PER_TOKEN,
     MAIN_BYTES_PER_TOKEN,
-    PROVISIONAL_GEOMETRY,
     cache_page_geometry,
     cake_sparse_mla_sm120_dsv41_mixed_decode,
     cake_sparse_mla_sm120_dsv41_mixed_format_info,
@@ -73,7 +73,6 @@ from flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed import (
     cake_sparse_mla_sm120_dsv41_mixed_supported_heads,
     cake_sparse_mla_sm120_dsv41_mixed_token_bucket,
     dispatch_from_manifest,
-    get_cake_sparse_mla_sm120_dsv41_mixed_module,
     kernel_dispatch,
     kernel_geometry,
     normalize_compute_precision,
@@ -90,14 +89,8 @@ _SM_SCALE = _D**-0.5
 _CPU = torch.device("cpu")
 # Wrapper keywords of the mixed cache; ``backend`` and ``compute_precision`` vary per test.
 _MIXED = dict(kv_cache_format="fp8", kv_scale_format="ue8m0_g32", extra_kv_fp4=True)
-_TOL = {
-    "bf16": dict(atol=1e-2, rtol=1e-2),
-    "fp8": dict(atol=1e-1, rtol=1e-1),
-}
-_LSE_TOL = {
-    "bf16": dict(atol=1e-2, rtol=1e-2),
-    "fp8": dict(atol=1e-1, rtol=1e-1),
-}
+_TOL = {"bf16": dict(atol=1e-2, rtol=1e-2)}
+_LSE_TOL = {"bf16": dict(atol=1e-2, rtol=1e-2)}
 _LAZY_EXPORTS = (
     "cake_sparse_mla_sm120_dsv41_mixed_decode",
     "cake_sparse_mla_sm120_dsv41_mixed_format_info",
@@ -108,11 +101,20 @@ _LAZY_EXPORTS = (
     "cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes",
     "cake_sparse_mla_sm120_dsv41_mixed_supported_heads",
 )
-# Geometry with two-tile instances, to exercise the head-tile rules the provisional geometry disables.
-_TWO_TILE_GEOMETRY = dataclasses.replace(
-    PROVISIONAL_GEOMETRY,
+# Planner fixtures: 16-head CTA tiles, 64-candidate chunks for both caches, a 16-chunk index table and head counts 8
+# and every multiple of 16 up to 128, without and with the two-tile instances.
+_ONE_TILE_GEOMETRY = CakeDsv41MixedGeometry(
+    heads_per_block=16,
+    candidates_per_chunk=64,
+    extra_candidates_per_chunk=64,
+    max_chunks_per_block=16,
     head_counts=(8, 16, 32, 48, 64, 80, 96, 112, 128),
-    two_tile_head_counts=(32, 64, 96, 128),
+    two_tile_head_counts=(),
+    precisions=("bf16",),
+    kernel_commit=None,
+)
+_TWO_TILE_GEOMETRY = dataclasses.replace(
+    _ONE_TILE_GEOMETRY, two_tile_head_counts=(32, 64, 96, 128)
 )
 
 
@@ -137,16 +139,14 @@ def test_format_info() -> None:
     assert cake_sparse_mla_sm120_dsv41_mixed_supported_heads() == info["heads"]
     assert set(info["two_tile_heads"]) <= set(info["heads"])
     assert info["default_compute_precision"] == "bf16"
-    assert "bf16" in info["compute_precisions"]
-    assert set(info["compute_precisions"]) <= {"bf16", "fp8"}
-    assert info["kernels_available"] == cake_sparse_mla_sm120_dsv41_mixed_available()
+    assert info["compute_precisions"] == ("bf16",)
     assert info["heads_per_block"] >= 1 and info["max_chunks_per_block"] >= 1
     assert info["chunk_width"] >= 1 and info["extra_chunk_width"] >= 1
 
 
 def test_num_chunks_counts_both_caches() -> None:
     chunks = functools.partial(
-        cake_sparse_mla_sm120_dsv41_mixed_num_chunks, geometry=PROVISIONAL_GEOMETRY
+        cake_sparse_mla_sm120_dsv41_mixed_num_chunks, geometry=_ONE_TILE_GEOMETRY
     )
     assert chunks(128) == 2
     assert chunks(1) == 1
@@ -155,7 +155,7 @@ def test_num_chunks_counts_both_caches() -> None:
     assert chunks(0, 512) == 8
     assert chunks(512, 1024) == 24
     narrow = dataclasses.replace(
-        PROVISIONAL_GEOMETRY, candidates_per_chunk=32, extra_candidates_per_chunk=128
+        _ONE_TILE_GEOMETRY, candidates_per_chunk=32, extra_candidates_per_chunk=128
     )
     assert cake_sparse_mla_sm120_dsv41_mixed_num_chunks(128, 512, geometry=narrow) == 8
     assert cake_sparse_mla_sm120_dsv41_mixed_num_chunks(130, 129, geometry=narrow) == 7
@@ -164,8 +164,7 @@ def test_num_chunks_counts_both_caches() -> None:
 def test_normalize_compute_precision() -> None:
     assert normalize_compute_precision("default") == "bf16"
     assert normalize_compute_precision("bf16") == "bf16"
-    assert normalize_compute_precision("fp8") == "fp8"
-    for bad in ("nvfp4", "auto", "fp16", ""):
+    for bad in ("fp8", "nvfp4", "auto", "fp16", ""):
         with pytest.raises(ValueError, match="compute_precision"):
             normalize_compute_precision(bad)
 
@@ -264,7 +263,7 @@ def test_plan_head_tiles_rules() -> None:
             (16, 64, 128),
         ):
             assert plan(num_tokens=tokens, num_heads=heads, topk=topk, num_sms=sms) == 2
-    # The provisional geometry exports no two-tile instance at all.
+    # A geometry without two-tile instances plans one tile everywhere.
     for heads in (32, 64, 128):
         assert (
             cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles(
@@ -273,7 +272,7 @@ def test_plan_head_tiles_rules() -> None:
                 topk=512,
                 extra_topk=512,
                 num_sms=188,
-                geometry=PROVISIONAL_GEOMETRY,
+                geometry=_ONE_TILE_GEOMETRY,
             )
             == 1
         )
@@ -543,7 +542,7 @@ def test_plan_splits_rules() -> None:
 def test_planners_are_pure_and_bounded() -> None:
     """Same inputs, same plan; every plan honours the index table and covers every chunk."""
 
-    g = PROVISIONAL_GEOMETRY
+    g = _ONE_TILE_GEOMETRY
     grid = itertools.product(
         (1, 5, 8, 32, 128),
         g.head_counts,
@@ -597,7 +596,7 @@ def test_scratch_bytes_formula() -> None:
 
 
 def test_wrapper_accepts_cake_mixed_cache() -> None:
-    for word, expect in (("default", "bf16"), ("bf16", "bf16"), ("fp8", "fp8")):
+    for word, expect in (("default", "bf16"), ("bf16", "bf16")):
         wrapper = SparseMLASm120Wrapper(
             backend="cake", compute_precision=word, device=_CPU, **_MIXED
         )
@@ -629,10 +628,11 @@ def test_wrapper_rejects_incomplete_cake_mixed_cache() -> None:
         )
     with pytest.raises(ValueError, match="d_v"):
         SparseMLASm120Wrapper(backend="cake", d_v=1024, device=_CPU, **_MIXED)
-    with pytest.raises(ValueError, match="nvfp4"):
-        SparseMLASm120Wrapper(
-            backend="cake", compute_precision="nvfp4", device=_CPU, **_MIXED
-        )
+    for word in ("nvfp4", "fp8"):
+        with pytest.raises(ValueError, match=word):
+            SparseMLASm120Wrapper(
+                backend="cake", compute_precision=word, device=_CPU, **_MIXED
+            )
 
 
 def test_wrapper_run_checks_call_shape_before_planning() -> None:
@@ -781,23 +781,6 @@ def test_lazy_exports() -> None:
         getattr(flashinfer.mla, missing)
 
 
-def test_binding_params_are_a_well_formed_contract() -> None:
-    assert len(set(BINDING_PARAMS)) == len(BINDING_PARAMS)
-    assert BINDING_PARAMS[:3] == ("q", "kv_cache", "indices")
-    for name in ("extra_kv_cache", "extra_indices", "mid_out", "mid_lse", "precision"):
-        assert name in BINDING_PARAMS
-    assert (
-        "head_tiles" not in BINDING_PARAMS
-    )  # the tile count is a property of the exact variant's decode body
-    assert BINDING_PARAMS.index("page_size") < BINDING_PARAMS.index("extra_page_size")
-    # The exact-variant code follows the split plan and precedes the compute route.
-    assert BINDING_PARAMS.index("chunks_per_block") + 1 == BINDING_PARAMS.index(
-        "variant"
-    )
-    assert BINDING_PARAMS.index("variant") + 1 == BINDING_PARAMS.index("precision")
-    assert BINDING_PARAMS[-1] == "enable_pdl"  # launch attribute of the split merge
-
-
 # A small manifest with the real tables' shape: two cards, ragged cells, a pre-13.2 fallback, one-tile bodies.
 _SYNTHETIC_MANIFEST = {
     "dispatch": {
@@ -843,49 +826,93 @@ _SYNTHETIC_MANIFEST = {
         "pow2_page_only_parts": ["pw"],
     },
     "variants": [
-        {"name": "default", "code": 0, "decode": "default", "merge": "default"},
-        {"name": "ip+mo2", "code": 1, "decode": "ip", "merge": "mo2"},
-        {"name": "ip+pw", "code": 2, "decode": "ip+pw", "merge": "default"},
-        {"name": "ip+pw+el", "code": 3, "decode": "ip+pw+el", "merge": "default"},
-        {"name": "t1", "code": 4, "decode": "t1", "merge": "default"},
-        {"name": "tl+e2f", "code": 5, "decode": "tl+e2f", "merge": "default"},
-        {"name": "tl+ip", "code": 6, "decode": "tl+ip", "merge": "default"},
+        {"name": "default", "decode": "default", "merge": "default"},
+        {"name": "ip+mo2", "decode": "ip", "merge": "mo2"},
+        {"name": "ip+pw", "decode": "ip+pw", "merge": "default"},
+        {"name": "ip+pw+el", "decode": "ip+pw+el", "merge": "default"},
+        {"name": "t1", "decode": "t1", "merge": "default"},
+        {"name": "tl+e2f", "decode": "tl+e2f", "merge": "default"},
+        {"name": "tl+ip", "decode": "tl+ip", "merge": "default"},
         # non-power-of-two page fallbacks of the `pw` cells
-        {"name": "ip", "code": 7, "decode": "ip", "merge": "default"},
-        {"name": "ip+el", "code": 8, "decode": "ip+el", "merge": "default"},
+        {"name": "ip", "decode": "ip", "merge": "default"},
+        {"name": "ip+el", "decode": "ip+el", "merge": "default"},
     ],
     "decode_kernels": [
-        {"heads": 8, "dual": True, "variant": "default", "tiles": 1},
-        {"heads": 8, "dual": True, "variant": "ip", "tiles": 1},
-        {"heads": 64, "dual": True, "variant": "default", "tiles": 2},
-        {"heads": 64, "dual": True, "variant": "t1", "tiles": 1},
-        {"heads": 64, "dual": True, "variant": "tl+ip", "tiles": 2},
-        {"heads": 64, "dual": True, "variant": "ip+pw", "tiles": 2},
-        {"heads": 64, "dual": True, "variant": "ip+pw+el", "tiles": 2},
-        {"heads": 64, "dual": True, "variant": "ip", "tiles": 2},
-        {"heads": 64, "dual": True, "variant": "ip+el", "tiles": 2},
-        {"heads": 64, "dual": True, "variant": "tl+e2f", "tiles": 2},
-        {"heads": 64, "dual": False, "variant": "default", "tiles": 2},
+        {
+            "heads": 8,
+            "dual": True,
+            "variant": "default",
+            "tiles": 1,
+            "smem_bytes": 96384,
+        },
+        {"heads": 8, "dual": True, "variant": "ip", "tiles": 1, "smem_bytes": 96384},
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "default",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {"heads": 64, "dual": True, "variant": "t1", "tiles": 1, "smem_bytes": 96384},
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "tl+ip",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "ip+pw",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "ip+pw+el",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {"heads": 64, "dual": True, "variant": "ip", "tiles": 2, "smem_bytes": 96384},
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "ip+el",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {
+            "heads": 64,
+            "dual": True,
+            "variant": "tl+e2f",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
+        {
+            "heads": 64,
+            "dual": False,
+            "variant": "default",
+            "tiles": 2,
+            "smem_bytes": 96384,
+        },
     ],
     "merge_kernels": [
-        {"heads": 8, "variant": "default", "heads_per_cta": 1},
-        {"heads": 8, "variant": "mo2", "heads_per_cta": 1},
-        {"heads": 64, "variant": "default", "heads_per_cta": 1},
+        {"heads": 8, "variant": "default"},
+        {"heads": 8, "variant": "mo2"},
+        {"heads": 64, "variant": "default"},
     ],
 }
 
 
 def test_plan_variant_rules() -> None:
     d = dispatch_from_manifest(_SYNTHETIC_MANIFEST)
-    assert (
-        not d.provisional
-        and d.variants["ip+mo2"].code == 1
-        and d.variants["ip+mo2"].decode == "ip"
-    )
-    assert (
-        d.decode_tiles[(64, True, "t1")] == 1
-        and d.decode_tiles[(64, True, "default")] == 2
-    )
+    assert d.variants["ip+mo2"].decode == "ip" and d.variants["ip+mo2"].merge == "mo2"
+    # Bodies are addressed by their manifest position (the binding's decode_body / merge_body index).
+    assert d.decode_bodies[(64, True, "t1")] == (3, 1, 96384)
+    assert d.decode_bodies[(64, True, "default")] == (2, 2, 96384)
+    assert d.merge_bodies[(8, "mo2")] == 1
     pick = functools.partial(
         cake_sparse_mla_sm120_dsv41_mixed_plan_variant,
         dispatch=d,
@@ -1078,10 +1105,10 @@ def test_dispatch_from_manifest_rejects_inconsistent_tables() -> None:
     )
     with pytest.raises(ValueError, match="no exported body"):
         dispatch_from_manifest(broken)
-    sparse_codes = copy.deepcopy(_SYNTHETIC_MANIFEST)
-    sparse_codes["variants"][-1]["code"] = 9
-    with pytest.raises(ValueError, match="dense"):
-        dispatch_from_manifest(sparse_codes)
+    reordered = copy.deepcopy(_SYNTHETIC_MANIFEST)
+    reordered["variants"].append(reordered["variants"].pop(0))
+    with pytest.raises(ValueError, match="plain render first"):
+        dispatch_from_manifest(reordered)
     duplicate = copy.deepcopy(_SYNTHETIC_MANIFEST)
     duplicate["dispatch"]["rules"].append(duplicate["dispatch"]["rules"][0])
     with pytest.raises(ValueError, match="duplicate"):
@@ -1095,94 +1122,28 @@ def test_dispatch_from_manifest_rejects_inconsistent_tables() -> None:
     ]
     with pytest.raises(ValueError, match="non-power-of-two page fallback"):
         dispatch_from_manifest(no_fallback)
-    predates = copy.deepcopy(_SYNTHETIC_MANIFEST)
-    del predates["dispatch"]["pow2_page_only_parts"]
-    with pytest.raises(ValueError, match="predates"):
-        dispatch_from_manifest(predates)
-    # Before the export the host carries only the plain render and never dispatches.
-    provisional = kernel_dispatch() if kernel_geometry().provisional else None
-    if provisional is not None:
-        assert provisional.provisional and list(provisional.variants) == [
-            DEFAULT_VARIANT
-        ]
-        assert (
-            cake_sparse_mla_sm120_dsv41_mixed_plan_variant(
-                num_tokens=32,
-                num_heads=64,
-                dual=True,
-                num_sms=188,
-                unified_memory=False,
-                ragged=False,
-                dispatch=provisional,
-            )
-            == DEFAULT_VARIANT
-        )
 
 
-def test_generated_family_manifest_or_absence() -> None:
-    """Before the export the family is reported absent with a precise error; after it, manifest and host agree."""
+def test_generated_family_manifest_matches_the_host() -> None:
+    """The exported manifest and the host agree on the binding ABI, the head counts and the body sources."""
 
-    if not cake_sparse_mla_sm120_dsv41_mixed_available():
-        with pytest.raises(
-            FileNotFoundError, match="cake_sparse_mla_dsv41_mixed_manifest.json"
-        ):
-            cake_sparse_mla_sm120_dsv41_mixed_manifest()
-        with pytest.raises(FileNotFoundError):
-            get_cake_sparse_mla_sm120_dsv41_mixed_module()
-        assert kernel_geometry().provisional
-        assert not cake_sparse_mla_sm120_dsv41_mixed_format_info()["kernels_available"]
-        return
     manifest = cake_sparse_mla_sm120_dsv41_mixed_manifest()
     geometry = kernel_geometry()
-    assert not geometry.provisional
     assert tuple(int(h) for h in manifest["head_counts"]) == geometry.head_counts
-    assert tuple(manifest.get("binding_params", BINDING_PARAMS)) == BINDING_PARAMS
-    assert int(manifest["main_bytes_per_token"]) == MAIN_BYTES_PER_TOKEN
-    assert int(manifest["extra_bytes_per_token"]) == EXTRA_BYTES_PER_TOKEN
-    assert "bf16" in manifest["precisions"]
+    assert tuple(manifest["binding_params"]) == BINDING_PARAMS
     assert manifest["entry"] and "nvfp4" not in manifest["entry"]
-    assert manifest["sources"], "the manifest must list the translation units"
-    for name in manifest["sources"]:
-        assert name.endswith((".cu", ".h")) and "nvfp4" not in name, name
-    # Exact variants: dense codes with the plain render first, one body per dispatch cell, every body a source.
-    dispatch = kernel_dispatch()
-    assert not dispatch.provisional
-    assert "variant" in manifest["binding_params"]
-    codes = sorted(v.code for v in dispatch.variants.values())
-    assert (
-        codes == list(range(len(codes)))
-        and dispatch.variants[DEFAULT_VARIANT].code == 0
-    )
     sources = set(manifest["sources"])
+    for name in sources:
+        assert name.endswith(".cu") and "nvfp4" not in name, name
     for kernel in manifest["decode_kernels"] + manifest["merge_kernels"]:
         assert kernel["source"] in sources, kernel
-    assert (
-        tuple(manifest["dispatch"]["pow2_page_only_parts"])
-        == dispatch.pow2_page_only_parts
-        == ("pw",)
-    )
-    for (_sms, dual, heads, _ragged), buckets in dispatch.rules.items():
-        assert heads in geometry.head_counts
-        for cell in buckets.values():
-            kept = [
-                p for p in cell.split("+") if p not in dispatch.pow2_page_only_parts
-            ]
-            for label in {
-                cell,
-                "+".join(kept) or DEFAULT_VARIANT,
-            }:  # the cell and its non-power-of-two page fallback
-                v = dispatch.variants[label]
-                assert (heads, dual, v.decode) in dispatch.decode_tiles
-                assert (heads, v.merge) in dispatch.merge_heads_per_cta
+    # Every head count carries the plain render for both cache layouts (what any unmeasured card runs).
+    dispatch = kernel_dispatch()
     for heads in geometry.head_counts:
         for dual in (False, True):
-            assert dispatch.decode_tiles[(heads, dual, DEFAULT_VARIANT)] == (
-                2 if heads in geometry.two_tile_head_counts else 1
-            )
-    assert (
-        tuple(cake_sparse_mla_sm120_dsv41_mixed_format_info()["variants"])[0]
-        == DEFAULT_VARIANT
-    )
+            _, tiles, _ = dispatch.decode_bodies[(heads, dual, DEFAULT_VARIANT)]
+            assert tiles == (2 if heads in geometry.two_tile_head_counts else 1)
+        assert (heads, DEFAULT_VARIANT) in dispatch.merge_bodies
 
 
 # ---------------------------------------------------------------------------
@@ -1437,81 +1398,90 @@ def test_gpu_dual_cache_matches_reference(
 
 
 def _exported_variants(dispatch, num_heads: int, *, dual: bool) -> list:
-    """The variants whose decode and merge bodies the export carries for a head count, in binding-code order."""
+    """The variants whose decode and merge bodies the export carries for a head count, in manifest order."""
 
-    return sorted(
-        (
-            name
-            for name, v in dispatch.variants.items()
-            if (num_heads, dual, v.decode) in dispatch.decode_tiles
-            and (num_heads, v.merge) in dispatch.merge_heads_per_cta
-        ),
-        key=lambda name: dispatch.variants[name].code,
-    )
+    return [
+        name
+        for name, v in dispatch.variants.items()
+        if (num_heads, dual, v.decode) in dispatch.decode_bodies
+        and (num_heads, v.merge) in dispatch.merge_bodies
+    ]
 
 
-@pytest.mark.parametrize("num_heads", [8, 64])
-def test_gpu_every_exported_variant_matches_reference(num_heads: int) -> None:
-    """Every exact variant the export carries for a head count computes the same attention (the dispatch is a
-    pure performance choice); the resolved plan reports the pinned variant."""
+@pytest.mark.parametrize("dual", [False, True])
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 48, 64, 80, 96, 112, 128])
+def test_gpu_every_exported_variant_matches_reference(
+    num_heads: int, dual: bool
+) -> None:
+    """Every exact variant the export carries for a head count and cache layout computes the same attention (the
+    dispatch is a pure performance choice), through the direct epilogue and through the split merge; together the
+    parametrizations run every exported decode and merge body."""
 
     _require_family()
     dispatch = kernel_dispatch()
-    torch.manual_seed(20261104 + num_heads)
-    num_tokens, topk, extra_topk = 8, 128, 512
+    torch.manual_seed(20261104 + 2 * num_heads + dual)
+    num_tokens, topk = 8, 128
     q = _query(num_tokens, num_heads)
     cache = _main_pool(16, 64)
-    extra = _extra_pool(64, 64)
     indices = _indices(num_tokens, topk, 16 * 64)
-    extra_indices = _indices(num_tokens, extra_topk, 64 * 64)
     lengths = _lengths(num_tokens, topk)
-    extra_lengths = _lengths(num_tokens, extra_topk)
     sink = torch.randn(num_heads, device="cuda")
-    expected = _reference(
-        q,
-        cache,
-        indices,
-        main_lengths=lengths,
-        extra_cache=extra,
-        extra_indices=extra_indices,
-        extra_lengths=extra_lengths,
-        attn_sink=sink,
-    )
-    exported = _exported_variants(dispatch, num_heads, dual=True)
-    assert exported[0] == DEFAULT_VARIANT
-    chunks = cake_sparse_mla_sm120_dsv41_mixed_num_chunks(topk, extra_topk)
-    mid_out = torch.empty(
-        (num_tokens, num_heads, chunks, _D), dtype=torch.bfloat16, device="cuda"
-    )
-    mid_lse = torch.empty(
-        (num_tokens, num_heads, chunks), dtype=torch.float32, device="cuda"
-    )
-    for name in exported:
-        output = torch.empty_like(q)
-        lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device="cuda")
-        plan = cake_sparse_mla_sm120_dsv41_mixed_decode(
-            q,
-            cache,
-            indices,
-            output,
-            lse,
-            _SM_SCALE,
-            topk_length=lengths,
-            attn_sink=sink,
+    extra_kwargs: dict = {}
+    reference_kwargs: dict = {}
+    if dual:
+        extra_topk = 512
+        extra = _extra_pool(64, 64)
+        extra_indices = _indices(num_tokens, extra_topk, 64 * 64)
+        extra_lengths = _lengths(num_tokens, extra_topk)
+        extra_kwargs = dict(
             extra_kv_cache=extra,
             extra_indices=extra_indices,
             extra_topk_length=extra_lengths,
-            mid_out=mid_out,
-            mid_lse=mid_lse,
-            variant=name,
         )
-        assert plan["variant"] == name
-        assert (
-            plan["head_tiles"]
-            == dispatch.decode_tiles[(num_heads, True, dispatch.variants[name].decode)]
+        reference_kwargs = dict(
+            extra_cache=extra, extra_indices=extra_indices, extra_lengths=extra_lengths
         )
-        _check("bf16", (output, lse), expected)
-    unexported = sorted(set(dispatch.variants) - set(exported))
+    expected = _reference(
+        q, cache, indices, main_lengths=lengths, attn_sink=sink, **reference_kwargs
+    )
+    exported = _exported_variants(dispatch, num_heads, dual=dual)
+    assert exported[0] == DEFAULT_VARIANT
+    mid_out = torch.empty(
+        (num_tokens, num_heads, 2, _D), dtype=torch.bfloat16, device="cuda"
+    )
+    mid_lse = torch.empty(
+        (num_tokens, num_heads, 2), dtype=torch.float32, device="cuda"
+    )
+    for name in exported:
+        for splits in (1, 2):
+            output = torch.empty_like(q)
+            lse = torch.empty(
+                (num_tokens, num_heads), dtype=torch.float32, device="cuda"
+            )
+            plan = cake_sparse_mla_sm120_dsv41_mixed_decode(
+                q,
+                cache,
+                indices,
+                output,
+                lse,
+                _SM_SCALE,
+                topk_length=lengths,
+                attn_sink=sink,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+                num_splits=splits,
+                variant=name,
+                **extra_kwargs,
+            )
+            assert plan["variant"] == name and plan["num_splits"] == splits
+            assert (
+                plan["head_tiles"]
+                == dispatch.decode_bodies[
+                    (num_heads, dual, dispatch.variants[name].decode)
+                ][1]
+            )
+            _check("bf16", (output, lse), expected)
+    unexported = [name for name in dispatch.variants if name not in exported]
     if unexported:
         with pytest.raises(ValueError, match="not exported"):
             cake_sparse_mla_sm120_dsv41_mixed_decode(
@@ -1523,11 +1493,10 @@ def test_gpu_every_exported_variant_matches_reference(num_heads: int) -> None:
                     (num_tokens, num_heads), dtype=torch.float32, device="cuda"
                 ),
                 _SM_SCALE,
-                extra_kv_cache=extra,
-                extra_indices=extra_indices,
                 mid_out=mid_out,
                 mid_lse=mid_lse,
                 variant=unexported[0],
+                **extra_kwargs,
             )
     with pytest.raises(ValueError, match="unknown exact variant"):
         cake_sparse_mla_sm120_dsv41_mixed_decode(
@@ -1537,11 +1506,10 @@ def test_gpu_every_exported_variant_matches_reference(num_heads: int) -> None:
             torch.empty_like(q),
             torch.empty((num_tokens, num_heads), dtype=torch.float32, device="cuda"),
             _SM_SCALE,
-            extra_kv_cache=extra,
-            extra_indices=extra_indices,
             mid_out=mid_out,
             mid_lse=mid_lse,
             variant="no-such-variant",
+            **extra_kwargs,
         )
 
 
