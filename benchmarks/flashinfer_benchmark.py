@@ -7,6 +7,7 @@ import sys
 from routines.flashinfer_benchmark_utils import (
     benchmark_apis,
     full_output_columns,
+    warn_if_outer_tuning_context,
 )
 
 
@@ -17,6 +18,8 @@ def run_test(args):
     Args:
         args: Parsed command line arguments containing test configuration
     """
+
+    warn_if_outer_tuning_context()
 
     ## Depending on routine type, route to corresponding test routine
     ## Imports are done lazily to avoid loading unnecessary dependencies
@@ -93,6 +96,9 @@ def run_test(args):
         with open(args.output_path, "a", newline="") as fout:
             writer = csv.writer(fout)
             for cur_res in res:
+                # Rows from routines that never open a tuning context.
+                if cur_res.get("autotuned", "") == "":
+                    cur_res["autotuned"] = False
                 for key in full_output_columns:
                     # Backfill every output column the routine didn't set: from
                     # args when available, else "".  Covers columns belonging to

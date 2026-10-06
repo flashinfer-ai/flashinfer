@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import importlib
 
 import torch
@@ -16,6 +17,9 @@ output_column_dict = {
         "tb_per_sec",
         "backend",
         "resolved_backend",
+        "autotuned",
+        "autotune_winner",
+        "autotune_tactic",
     ],
     "attention": [
         "s_qo",
@@ -369,6 +373,158 @@ def warn_if_pdl_unsupported(args, routine_name):
     if getattr(args, "enable_pdl", False):
         print(
             f"[WARNING] --enable_pdl provided but routine {routine_name} does not support PDL; flag is ignored."
+        )
+
+
+def warn_if_autotune_unsupported(args, routine_name):
+    """Emit a one-shot warning if --autotune is set but the routine's library
+    API has no autotuner. Call from the top of test functions whose underlying
+    flashinfer API never consults the AutoTuner, so the flag is a no-op.
+    """
+    if getattr(args, "autotune", False):
+        print(
+            f"[WARNING] --autotune has no effect for routine {routine_name}: the library API has no autotuner; flag is ignored."
+        )
+
+
+def warn_if_outer_tuning_context():
+    """Warn when an enclosing ``autotune(True)`` context is already open.
+
+    The harness times outside its own tuning contexts. An outer tuning context
+    (e.g. a process-wide ``autotune_v2(mode="tune")``) keeps the AutoTuner in
+    tuning mode during CUDA-graph capture, so any op whose cache lookup misses
+    for the timed call tries to profile inside the capture and raises.
+    """
+    try:
+        from flashinfer.autotuner import AutoTuner
+
+        tuning = AutoTuner.get().is_tuning_mode
+    except Exception:
+        return
+    if tuning:
+        print(
+            "[WARNING] An enclosing autotune(True) context is active; timed runs execute in tuning mode, and CUDA-graph capture fails for any op whose tuned cache entries do not cover the timed call."
+        )
+
+
+@contextlib.contextmanager
+def record_autotune_choices():
+    """Record the (runner, tactic) pairs ``AutoTuner.choose_one`` returns.
+
+    Yields a dict mapping each ``custom_op`` seen inside the block to the last
+    ``(runner_class_name, tactic)`` returned for it. The dict stays empty when
+    the autotuner cannot be instrumented.
+    """
+    choices = {}
+    try:
+        from flashinfer.autotuner import AutoTuner
+
+        tuner = AutoTuner.get()
+        original = tuner.choose_one
+    except Exception:
+        yield choices
+        return
+
+    def choose_one(custom_op, runners, *args, **kwargs):
+        result = original(custom_op, runners, *args, **kwargs)
+        try:
+            runner, tactic = result
+            choices[custom_op] = (type(runner).__name__, tactic)
+        except Exception:
+            pass
+        return result
+
+    previous = tuner.__dict__.get("choose_one")
+    tuner.choose_one = choose_one
+    try:
+        yield choices
+    finally:
+        if previous is None:
+            tuner.__dict__.pop("choose_one", None)
+        else:
+            tuner.choose_one = previous
+
+
+def probe_autotune_choices(fn, *args, **kwargs):
+    """Run ``fn`` once eagerly and return the autotuner choices it made.
+
+    Call under the same autotune context as the timed run so the recorded
+    choices are the ones the timed run uses. Returns an empty dict if ``fn``
+    raises; the timed run surfaces the error.
+    """
+    with record_autotune_choices() as choices:
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            return {}
+    return dict(choices)
+
+
+def _format_tactic(tactic):
+    return repr(tactic).replace(" ", "")
+
+
+def format_autotune_choices(choices):
+    """Return ``(autotune_winner, autotune_tactic)`` column strings.
+
+    ``autotune_winner`` is ``op:RunnerClass`` and ``autotune_tactic`` is
+    ``op:tactic``, one entry per op, ``;``-separated.
+    """
+    ops = sorted(choices)
+    winner = ";".join(f"{op}:{choices[op][0]}" for op in ops)
+    tactic = ";".join(f"{op}:{_format_tactic(choices[op][1])}" for op in ops)
+    return winner, tactic
+
+
+_RUNNER_BACKEND_KEYWORDS = (
+    ("cutedsl", "cute-dsl"),
+    ("cute_dsl", "cute-dsl"),
+    ("cublaslt", "cublaslt"),
+    ("cublas", "cublas"),
+    ("cudnn", "cudnn"),
+    ("cutlass", "cutlass"),
+    ("tgv", "tgv"),
+    ("tinygemm", "tinygemm"),
+    ("trtllm", "trtllm"),
+    ("b12x", "b12x"),
+    ("cutile", "cutile"),
+)
+
+
+def backend_from_runner_name(runner_name):
+    """Map an AutoTuner runner class name to a harness backend label, or ""."""
+    lowered = runner_name.lower()
+    for keyword, backend in _RUNNER_BACKEND_KEYWORDS:
+        if keyword in lowered:
+            return backend
+    return ""
+
+
+def resolve_backend_from_choices(choices):
+    """Return the single backend all recorded runners map to, or ""."""
+    backends = {backend_from_runner_name(runner) for runner, _ in choices.values()}
+    if len(backends) == 1:
+        return backends.pop()
+    return ""
+
+
+def set_autotune_columns(cur_res, autotuned, choices=None):
+    """Fill the ``autotuned`` / ``autotune_winner`` / ``autotune_tactic`` columns.
+
+    Winner and tactic are only reported for tuned rows.
+    """
+    cur_res["autotuned"] = bool(autotuned)
+    if autotuned and choices:
+        cur_res["autotune_winner"], cur_res["autotune_tactic"] = (
+            format_autotune_choices(choices)
+        )
+
+
+def print_autotune_choices(backend, choices):
+    for op in sorted(choices):
+        runner, tactic = choices[op]
+        print(
+            f"[INFO] {backend} autotune choice: {op}:{runner}:tactic={_format_tactic(tactic)}"
         )
 
 
