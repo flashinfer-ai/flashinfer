@@ -82,7 +82,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "5cf64aa0f7606babe4d0322777cdcf5f70e8dae5756d3c8a8f746cf747549d55",
+        "closure_sha256": "683d4e7c6d67654dd3370ad7aadcec4906ec125c107997530a5acf9849d3e583",
     },
     "cake_dense_projection_gemm_08480308e98b37b178b5": {
         "template": "dense_proj_gemm_nn_n128_hen_f32_t_skx",
@@ -123,7 +123,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "e7e82cd98c378f787062adf253792c93a4f178290dcdeb4faef2f339a89b5e62",
+        "closure_sha256": "17117857f49610deac3ffa38a329b74832a210cf05063e4caeeba7f25eed217d",
     },
     "cake_dense_projection_gemm_0c307f7fe0bc6e89e974": {
         "template": "router_fp32_gemm_kn",
@@ -153,7 +153,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [448, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "f21c6cd7c0fe6c91be2c97e2fa19f1326164d20e369fb9e590aec64e6a76da21",
+        "closure_sha256": "e34410ef26b357def23e68eb9d80cddc0e415e1e25283b9c4a5b792d42d5e35c",
     },
     "cake_dense_projection_gemm_0dd9a6a839a5f44b685d": {
         "template": "dense_proj_gemm_nn_n256_m256_ht_tma1",
@@ -194,7 +194,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "a946ea26264339c2367b9c123ad610acce4335eac521106546d31d52b5c78b0d",
+        "closure_sha256": "7f3f8e8c13065e0c85c34d753c5942815e5aaee6cc7839404c8a88754a7ba59b",
     },
     "cake_dense_projection_gemm_130b0679d2f65ed4f671": {
         "template": "dense_proj_gemm_nk_n256_t",
@@ -235,7 +235,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "01a201a452ae97eb94b03e4ec9cafa0e5bf86990207581901e87afb950acfead",
+        "closure_sha256": "3d8e16c1f40f1d22f388b5fae9b45fed76db8e4b299b78500a7e6520a5244a88",
     },
     "cake_dense_projection_gemm_1351ff2f9c67ba7cc278": {
         "template": "dense_proj_gemm_kn_n256_ht",
@@ -276,7 +276,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "1fc408ade04e009c24219a4cd37e48c8556e13fbfee628b79af9b9d405b81ae8",
+        "closure_sha256": "4b74789bfc30e5e804f45940d918b1cff77df3a206a297182eac2f0fc1b8526f",
     },
     "cake_dense_projection_gemm_13ece66245dab2f6abb0": {
         "template": "dense_proj_gemm_kk_n192_m256_hen_s5",
@@ -317,7 +317,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "5034b8a75872f4bf5ea22e334aa6c41bb77a53309dc615acf5af68ce59a7cbe6",
+        "closure_sha256": "41660d8ec6f961719d9b9558f5fe9b1dfe546734cda8731382c3eb11e7157788",
     },
     "cake_dense_projection_gemm_1637440790e5f752b97d": {
         "template": "dense_proj_gemm_kn_n256_tma2_pd2",
@@ -358,7 +358,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "2c28a7e0d695acecb92e58eb44bbd11fad138f2e6de9b84a77c3c79f5d6904ad",
+        "closure_sha256": "41945f2f9fc9c63620178adde2052fe433d83ee0a7bd335f0043fe386a37505b",
     },
     "cake_dense_projection_gemm_1a2780384e249958311d": {
         "template": "dense_proj_gemm_kk_n256_ht",
@@ -399,7 +399,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "74263d8ae70c2764516d685ca5e406f746383678140571d35bd37940fa7adaf9",
+        "closure_sha256": "29565473814e8efc0f22d44e3cf4c6ddf0c00edef44a8486d42a1435463f3316",
     },
     "cake_dense_projection_gemm_1b067bd6c7fd1fe4bcf0": {
         "template": "dense_proj_gemm_nn_n256_m256_f32_tma1",
@@ -440,7 +440,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "8bfd08989694e6dd29435f20ab950aec181088b9c877b1a15dad5ffa9833056d",
+        "closure_sha256": "b652a0edf383bed56cc4dd0d13874e33b20039be2e281d422e243ca17f047d80",
     },
     "cake_dense_projection_gemm_226f4bdd97910598e4d2": {
         "template": "dense_proj_gemm_kk_n192",
@@ -481,7 +481,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "94146fb94c8bc5dc78b145d03ceeb8c5462a43dbda14c7cd9b7fe6c02952db61",
+        "closure_sha256": "d224dbc5b997d8cf22dbdc20090a09efa8606a8e2d92f388b5f56a4cef180210",
     },
     "cake_dense_projection_gemm_2a33c9e227452efe7dd6": {
         "template": "dense_proj_gemm_kn_n256_m256_ov_ht",
@@ -522,48 +522,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "55f2f674394a301e53a34a393809f33ff67c3def50a092b7e0f3de79b4102d19",
-    },
-    "cake_dense_projection_gemm_2d1685dc33ee2f3d5895": {
-        "template": "dense_proj_gemm_nn_n160_m256_bz64_f32",
-        "kernel": "kernel_cake_dense_projection_gemm_2d1685dc33ee2f3d5895",
-        "cache_name": "cake_dense_projection_gemm_2d1685dc33ee2f3d5895",
-        "sources": [
-            "cake_dense_projection_gemm/cake_dense_projection_gemm_2d1685dc33ee2f3d5895_kernel.cu",
-            "cake_dense_projection_gemm/cake_dense_projection_gemm_2d1685dc33ee2f3d5895_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["tma_buffer", "OUT32"],
-            ["tma_buffer", "OUT16"],
-            ["buffer", "out"],
-            ["buffer", "out32"],
-            ["buffer", "ws"],
-            ["buffer", "counters"],
-            ["parameter", "M"],
-            ["parameter", "N"],
-            ["parameter", "m_tiles"],
-            ["parameter", "n_tiles"],
-            ["parameter", "group_m"],
-            ["parameter", "promo_code"],
-            ["parameter", "k_iters"],
-            ["parameter", "ldo"],
-            ["parameter", "out_l"],
-            ["parameter", "num_cluster_tiles"],
-            ["parameter", "num_l"],
-            ["parameter", "num_full"],
-            ["parameter", "iters_per_unit"],
-            ["parameter", "sk_iters"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
-        "arches": ["sm_107a"],
-        "closure_sha256": "774728261e1d0d02d287a5f6b4c041cad7595eeea1e9bb42bb27802a6c2543a8",
+        "closure_sha256": "c8a3e2dbaf7ea6531073f548188c1c975c5d8ba82341ce9c4931e869b25498c3",
     },
     "cake_dense_projection_gemm_312b71fa57e2179190d7": {
         "template": "dense_proj_gemm_nn_n256",
@@ -604,7 +563,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "06f1aa9b76a433d4ef1185e4df4f70aeefb64ea3edb1f7af62072033145b87fa",
+        "closure_sha256": "d5ff424166ee69909393b746ed0a28ac6608c7116fc632b20d9c948d956e1df8",
     },
     "cake_dense_projection_gemm_3b9af4a07222da8480d3": {
         "template": "dense_proj_gemm_nn_n128_f32_t",
@@ -645,7 +604,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "9737d53dce4d7a7e13cff7189cfe027e560c15e6c2acb290491af0075432989e",
+        "closure_sha256": "e153d5def7315fae86c06974e5bdc4ec0983369a56e6ec6c145730974209b58a",
     },
     "cake_dense_projection_gemm_3fc7eee9dd5b7c0900c3": {
         "template": "dense_proj_gemm_kn_n128_f32_tma2",
@@ -686,7 +645,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "4733e8f45a55575bc970d8adb5304db438a3edd1857be53a889f8f6534b904a0",
+        "closure_sha256": "32148417071b9f4ab3ee68be2a4b50754c086d9794aa0709d6b56d7b7770bbb9",
     },
     "cake_dense_projection_gemm_40a23518037ee291e8e0": {
         "template": "dense_proj_gemm_kn_n256",
@@ -727,7 +686,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "667600959ae480c4e78316750da6f09fb4ab1dad76a6c44d12370a0c827e53a8",
+        "closure_sha256": "aa6536479d4622219ab3699d9d07f9b9a559f29eefc3e5575dd6d7f1f465212c",
     },
     "cake_dense_projection_gemm_40de502b4390d333f884": {
         "template": "dense_proj_gemm_kn_n256_f32_v8_ht",
@@ -768,7 +727,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "cf22ab96fc28bc24b608fed51ef0613fa3178577afa4795640b86358a28c26cc",
+        "closure_sha256": "721e79e7862bc72080cae7e1bc8866431c49f0dffa84821a431ee60b966f1dc7",
     },
     "cake_dense_projection_gemm_42da542b7d0a556e5b69": {
         "template": "dense_proj_gemm_kk_n256",
@@ -809,7 +768,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "d8af0e608376bd98cecd6f28a49492b44662b6026856c31110c50aa4f6ae0304",
+        "closure_sha256": "624251d94cd60c1a669a133d413daa1aafbd449ad640cbfacb30b04277096d84",
     },
     "cake_dense_projection_gemm_4666747461f384c054b1": {
         "template": "dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6",
@@ -850,7 +809,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "d00f15ab006efe81e699722f4ae2eb2ef60c005a6d3533ea97d3b1801a6c66dd",
+        "closure_sha256": "54f4b1a922867fcd7c5cd9924cc59f071011bf1e24ebb0be5341fb27a1fe0d3c",
     },
     "cake_dense_projection_gemm_48ccc3cdfddb515d61f9": {
         "template": "router_fp32_gemm_nn_t",
@@ -880,7 +839,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [448, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "6624be3a72a181283da90ce5402b079489f22beef29214f3203b459348990969",
+        "closure_sha256": "54cfc1315f8bd2bb327704df502c159451017bccfa97f3d910a5b6105df1b13e",
     },
     "cake_dense_projection_gemm_48dfda73f9f82e9cbef3": {
         "template": "dense_proj_gemm_kn_n256_f32_v8",
@@ -921,7 +880,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "37a5f7d5212083024f812c0a3c87f80ddcd6bad3155a53ea0a8b23d53e96ea06",
+        "closure_sha256": "9591f23e5c492cb5126d12b5b9c0d61a1b830f22aa4585780e836bd1983e87c3",
     },
     "cake_dense_projection_gemm_49eb4e75008b9176c81f": {
         "template": "dense_proj_gemm_nn_n128_m64_f32_t",
@@ -962,7 +921,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "7748cfd9c0223e1f457c1abcefeed3067db7a4447d71355f2c890f28128d2464",
+        "closure_sha256": "f73729a0c1795965634399f161dd5cff89f2e0ccd6005a3e3c799e6c627dff91",
     },
     "cake_dense_projection_gemm_4acf3f20dda42381941f": {
         "template": "dense_proj_gemm_nn_n128_m64_hen_t",
@@ -1003,7 +962,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "100c9d0e10c7c533483f7ba7fe7471b49cba655b8ed07d40801fe84922cb5e6a",
+        "closure_sha256": "96786c6ae3b0a52eb5f54c051282f4be4ee1c88fc7951ce8a22bc38dcf368b87",
     },
     "cake_dense_projection_gemm_4b23fa7a7598004fca45": {
         "template": "dense_proj_gemm_kn_n256_m256_f32_v8_ef_ov_ht",
@@ -1044,7 +1003,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "c83f5ff8280a0fc2f8efbab0b913a65e7a70369c40ee6c6ec59bd749d8a357f5",
+        "closure_sha256": "ef4a83d26f8bf9384ea7388f17b7b0d3d2885f139de54f3c556cebfcd878871d",
     },
     "cake_dense_projection_gemm_51de59b7ab032ee1c2a3": {
         "template": "dense_proj_gemm_kk_n256_q",
@@ -1085,7 +1044,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "97cb81d428904630fcc29c1d3d438ca70eded0720db692186899bf14eb013afb",
+        "closure_sha256": "47b57d222bb92838ead2d3f158ab3c264d755b38021a581f3c4772af46dc807d",
     },
     "cake_dense_projection_gemm_57f5774e7a0ae1cbb1f4": {
         "template": "dense_proj_gemm_nn_n160_m256_bz64",
@@ -1126,7 +1085,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "294a221b173586a6b6a146c1ea68cd04507c727cd435e46b72f0e1a1eb76faf4",
+        "closure_sha256": "8bb205828f6057eb3142fbce8fdb3d2d65f4b844533bfefde0ecfdef2d512824",
     },
     "cake_dense_projection_gemm_59ff12ca95854de5d4ef": {
         "template": "dense_proj_gemm_nn_n256_m256_t_tma1",
@@ -1167,7 +1126,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "d09bf177f6043bf45c5af9222e7c97204aec5b53257f48349a84f4b853096334",
+        "closure_sha256": "cb5166ab915f315280edf3278e3bf1521f7965fcf6c8bc7ea3ea8ee867b2d180",
     },
     "cake_dense_projection_gemm_5ae5313586c090e20d62": {
         "template": "dense_proj_gemm_kn_n256_hne",
@@ -1208,7 +1167,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "280a8b118fa546435b9a9a5d596b253bb56c312a1b55ed9cc90a6fa3c06d8936",
+        "closure_sha256": "61484a8609ad6f19034da14db6053b6093dfd1ceba6688bada83bb49d7cbb37d",
     },
     "cake_dense_projection_gemm_5d1101abdc1f537a0838": {
         "template": "dense_proj_gemm_kn_n256_q_s6",
@@ -1249,7 +1208,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "8d06abbb8b9e94dcca0181a86040110c4be371e1cf7e2453c8953c4b971988b4",
+        "closure_sha256": "4d025e17b5eefacd2005fa4557ad3c6e4bba8d672786ba0f4ac4b337429b42ef",
     },
     "cake_dense_projection_gemm_632792076a862636c1b5": {
         "template": "dense_proj_gemm_nn_n128_m64_hen_t_skx",
@@ -1290,7 +1249,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "8d6dad91f29955d4f6f6ff283692ca315c503c6f697bcf1842d71295823945d1",
+        "closure_sha256": "4dbdd5ded5d72d230f3b787863967af02c1f45086229c28f69bc220b2c717e9f",
     },
     "cake_dense_projection_gemm_685df36547bc9ca152e1": {
         "template": "router_fp32_gemm_kk",
@@ -1320,7 +1279,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [448, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "300c5e913a82fe66b3656df35ed6ed6c0a12bf8b9d9c070805bb7fe89d7e7d9a",
+        "closure_sha256": "03b9444b1cec953786c656a583fb1c3b37a1eb7ec911888c66e975f63dfb0013",
     },
     "cake_dense_projection_gemm_719c5a256b35593d1279": {
         "template": "dense_proj_gemm_kn_n128_f32_tma1",
@@ -1361,7 +1320,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "6b12deea8cabf7837aa7345c5094d9980d78b63f22d801a66ceff5021096ab0b",
+        "closure_sha256": "d6190ff33980ce0a5b37badce0b56dc3e9c295b23bd324c8e35dc702f9ba75a4",
     },
     "cake_dense_projection_gemm_7311c37565461ec2c9f9": {
         "template": "dense_proj_gemm_kk_n256_m256",
@@ -1402,7 +1361,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "1d5dbf77f772356f934200e3cde7eccf748eca33f1fb5d921f7e872e7386099f",
+        "closure_sha256": "edf9fbc53b3b359f8eaaee95bb4d1f97d08c10c3e332922c84e9db1291c72b87",
     },
     "cake_dense_projection_gemm_78835953a0a403fa7ab8": {
         "template": "dense_proj_gemm_kn_n256_f32_tma1",
@@ -1443,7 +1402,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "0bb393d562d34ac36bdb174829c09a1e3b3ef19595012c0d35571abf9dc32087",
+        "closure_sha256": "54bc6b45b6f46dd5464acb396f747e75e50ad451eb6fda6406a22bde27f7acbd",
     },
     "cake_dense_projection_gemm_7be35c7ed354eaca505c": {
         "template": "dense_proj_gemm_nn_n256_skx",
@@ -1484,7 +1443,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "137dd181b59ac19ef10548e433b4d094a07deff891cc13ab091749727964d55a",
+        "closure_sha256": "76bf697d394df15ead122541a24ba79628312113402d94edf0439616dcb51b11",
     },
     "cake_dense_projection_gemm_7d7174846dea13f10ffc": {
         "template": "dense_proj_gemm_nn_n256_f32_v8_ef_skx",
@@ -1525,7 +1484,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "b13f84fb67db7bcfe0ec4121ec9964cd59dfdc37906d412ad6e9f6f40f0f558b",
+        "closure_sha256": "960c63ffa51f5b59ab7056bf489798b6fdaee32d10f33010b39a2fee96cffc85",
     },
     "cake_dense_projection_gemm_80c542a0247aa0d077a4": {
         "template": "dense_proj_gemm_kn_n256_tma1",
@@ -1566,7 +1525,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "07b3caddb1c027cf5538601137842837e581d607476238d8915892a93acd960b",
+        "closure_sha256": "efcea25692e84d724dd2605d59ad12c52435b8ec0fa7c7493c9aedf6d086982f",
     },
     "cake_dense_projection_gemm_82140a46c9319104ef76": {
         "template": "dense_proj_gemm_nn_n192_bz64_hee_f32_t",
@@ -1607,7 +1566,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "4fb3e68157822bc38af2c5229782f98498f84e9d86ec249b291c0e9916f95377",
+        "closure_sha256": "f6cdd02fe1324da17175afa32bd44f5b711b1a776ae108dc12557ee87b63f4a6",
     },
     "cake_dense_projection_gemm_86f706b0acc22d678691": {
         "template": "dense_proj_gemm_kn_n256_tma1_bg8_sol",
@@ -1648,7 +1607,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "d89d07916de887c041950dddc69ee8e73bb1bd15433d1b13d0a73244904c2171",
+        "closure_sha256": "cbf512a6ef5942b14d00193809fc039ba01a7423812c717763f946f98a15bdff",
     },
     "cake_dense_projection_gemm_8b68067978a9b347948f": {
         "template": "dense_proj_gemm_kn_n256_m256_tma1_bg4",
@@ -1689,7 +1648,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "0601fe33b41d3d384b2e0ad8d74c4bfe6c5d56c5f78df7bd012fa9b0ff628ae2",
+        "closure_sha256": "987f32b7be727a10fcc60f7b337494c8b92ad1316ef8e7bd7adc1a3bfe9a7ed9",
     },
     "cake_dense_projection_gemm_8df77cb6d480577c192d": {
         "template": "dense_proj_gemm_nn_n192_hee_f32_t_tma1",
@@ -1730,7 +1689,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "28571545ba262a66f0203c87b624952d671b84bd3b3eb12ad5c558c0ca3862ca",
+        "closure_sha256": "9abffeae7c9d5642fc3203dbe22c6068823c323d1d946e3822a532e58d15f5d4",
     },
     "cake_dense_projection_gemm_8ffdb17a5f74bf109798": {
         "template": "dense_proj_gemm_nn_n128_hen_t_skx",
@@ -1771,7 +1730,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "aa487de61fea5cbbd7f43fa5dc5aaeeb761b5c7823769eb5c3510c89939e59dc",
+        "closure_sha256": "d6f6b5c28bd68377be0ff86184c32ca93a5b152507735685b059faaed7a18c05",
     },
     "cake_dense_projection_gemm_904dfa13db71cad4f6b7": {
         "template": "dense_proj_gemm_nn_n256_m256_tma1",
@@ -1812,7 +1771,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "934a657657eddd7a0d9e2b1585c8c393d882c0ff47e80eea3e3aaf42d37d7755",
+        "closure_sha256": "1804117066b90aeff7078d3993534fca91af50ddff6b64c691bc15406aa6c89b",
     },
     "cake_dense_projection_gemm_930f7f5cabd91c7e54e4": {
         "template": "dense_proj_gemm_nn_n256_m256",
@@ -1853,7 +1812,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "446263a2eafd671e006e447e8be3920afb48f976ebf4777a39d03803ed023136",
+        "closure_sha256": "f69e1e1a7cb9aea07ea408cb536750a2de7fb5ee86b9720d2f79fdf70db126dd",
     },
     "cake_dense_projection_gemm_949a74e5a8467cd64b49": {
         "template": "dense_proj_gemm_nn_n128_m64_hen_f32_t_skx",
@@ -1894,7 +1853,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "04b4df08a00fa3e061e0e28dd83584cdea1f06fbb632cf68ed28b0ccebd66696",
+        "closure_sha256": "7c4c35537765a2b27ac22cc1254f35c4dcffff91d7109be40d6c147fe4aecdc3",
     },
     "cake_dense_projection_gemm_99f29ed34631ea72a2c1": {
         "template": "dense_proj_gemm_nn_n128_m64_t",
@@ -1935,7 +1894,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "30cee2f0f06b24110a1f5b71329231ea44fe21687befc3f5928b7878a07021b2",
+        "closure_sha256": "9941f080362d6175e0a6c8664a2dd09681fa4bfaeaf712530c4e23d36fbd3511",
     },
     "cake_dense_projection_gemm_9bcca0aa174da55afbbc": {
         "template": "dense_proj_gemm_nn_n256_m256_ht",
@@ -1976,7 +1935,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "b6df5978eaaf11ba58d55dba9aae0b35f3686b3e1f93cad8af78e2b2f08c6fd9",
+        "closure_sha256": "334f5288ac12839570308db23cc4a6ab462a9d7819802104242d7f3431a02491",
     },
     "cake_dense_projection_gemm_a4f44951d7a9bb6c5279": {
         "template": "dense_proj_gemm_nn_n192_hee_t_tma1",
@@ -2017,7 +1976,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "09eaafc4045c0aea0044c8edb332595ac0a0d3a9c68b6d3da392d0bc355fba75",
+        "closure_sha256": "a8229d9d187a85c25c6b62ab5bbdd456513b0c2530591998424a970d34623c9e",
     },
     "cake_dense_projection_gemm_aa391530d00d0c0b57fd": {
         "template": "dense_proj_gemm_nn_n256_m256_hee_t_tma1_s6",
@@ -2058,7 +2017,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "776975235fca9aa48df2b3d16c07d07a9cdf217c445e5857056ae308dd0901e7",
+        "closure_sha256": "2426e2fab89da7fc0253cc418497a9e5800dbef9ac51aa88378814e87614671c",
     },
     "cake_dense_projection_gemm_ae0bde4615f588ea6a26": {
         "template": "dense_proj_gemm_kn_n256_q_pd1",
@@ -2099,7 +2058,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "ed6180e66b198829d80b1177802b7d81416aec1a14250be13b911ecd6245e36a",
+        "closure_sha256": "5236714b773055ab243e864904c38737e2ed3068e05eb91d01417fd78edce456",
     },
     "cake_dense_projection_gemm_ba45cdcfb445ba3a4584": {
         "template": "dense_proj_gemm_kn_n256_tma1_bg8",
@@ -2140,7 +2099,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "c442761408c70aae57e8dfdd5aad21938c13d809167ad7a55767739147df5221",
+        "closure_sha256": "2931c9b07575081a6c24424fe382171ead2a8df30d1431100ff19b8a64e5f915",
     },
     "cake_dense_projection_gemm_bb0c12a9c440371d78ce": {
         "template": "dense_proj_gemm_kk_n256_m256_ov_ht",
@@ -2181,7 +2140,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "9064b6a26aa6359542a7344882493c64a696dbd8639050a9e06d0d2316a33bd2",
+        "closure_sha256": "4f0c68548b75b9b816775bc0d6a0ff6240f0e3ad6bc2f5fc94d851ca264f7c21",
     },
     "cake_dense_projection_gemm_bd592b22be34dbd76ec9": {
         "template": "dense_proj_gemm_nn_n192_m256_t_tma1",
@@ -2222,7 +2181,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "1f36795952b9e8c011bfac468ace32cb6c1b524950c8225ee321a6fe02e67638",
+        "closure_sha256": "9f97643ecb73c63b1e3f45c4c29a37cf95ead4ac1162058a23b395cba02aa37c",
     },
     "cake_dense_projection_gemm_c976ca38a036457eba22": {
         "template": "dense_proj_gemm_nn_n128_m64_hen_f32_t",
@@ -2263,7 +2222,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "e929fa007d9d9cb2c9378af137d86f8a9391fb18ea3c0463489ab2bc8b156f74",
+        "closure_sha256": "2e2b339903658a958cfe73e54ced667c29e3967c0241ddef7aa67e8d28bac057",
     },
     "cake_dense_projection_gemm_cdaa3f96d6e619488a46": {
         "template": "dense_proj_gemm_nn_n256_f32_tma1",
@@ -2304,7 +2263,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "33c63a45af77bffe4991974a5f92219bb3bbb9694be3de7a6da0ebf0cf04f373",
+        "closure_sha256": "5a46b19df15206afc881c76d64ffe522a7ab53b2a5bd23f471403f9ad1df0bba",
     },
     "cake_dense_projection_gemm_d1e62b2f5d7fdacce448": {
         "template": "dense_proj_gemm_kk_n192_hee_s8",
@@ -2345,7 +2304,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "04b5c06a2be081865384146265f2f61e9ee98b3ddb9ad5be6a9bfa334107174c",
+        "closure_sha256": "ab6f38d855baec1ca382c9362b4de4814534c51b13b2854317664c5aaa593c0d",
     },
     "cake_dense_projection_gemm_db775feed419eb9f0e07": {
         "template": "dense_proj_gemm_kn_n256_f32_v8_ef",
@@ -2386,7 +2345,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "db50647d546e3ba5e4483f5459b59ff28d80726fc0959f03c549a23dd37b5d14",
+        "closure_sha256": "091bc0a61ea4b57dc65dc2c0885a3455eac6bf2389d3f8b22116f7596c367ca1",
     },
     "cake_dense_projection_gemm_de217fc576e07ac6c858": {
         "template": "dense_proj_gemm_nn_n128_t",
@@ -2427,7 +2386,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "1f77ce4283454d5267aebc597413021117c73b2c0be0e73a816e843fdb2201f1",
+        "closure_sha256": "894f070eed164fe0b10188b690ce00525c51a3c51b10c3c29afb31840202f7b8",
     },
     "cake_dense_projection_gemm_e0fbb4b663be47b85318": {
         "template": "dense_proj_gemm_nn_n256_f32_v8",
@@ -2468,7 +2427,48 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "a92fb9ab40d6bd1c1fbfaa2325f74cda915effc5de3fdc0d64970b2d8c1f4f87",
+        "closure_sha256": "07fe1c6e659b3242ec338d80ab06d8b0f367b7332c4d0c069718b763bae3f84f",
+    },
+    "cake_dense_projection_gemm_e32e2bcae301662e3c37": {
+        "template": "dense_proj_gemm_nn_n160_m256_bz64_f32_v8_ef",
+        "kernel": "kernel_cake_dense_projection_gemm_e32e2bcae301662e3c37",
+        "cache_name": "cake_dense_projection_gemm_e32e2bcae301662e3c37",
+        "sources": [
+            "cake_dense_projection_gemm/cake_dense_projection_gemm_e32e2bcae301662e3c37_kernel.cu",
+            "cake_dense_projection_gemm/cake_dense_projection_gemm_e32e2bcae301662e3c37_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "OUT32"],
+            ["tma_buffer", "OUT16"],
+            ["buffer", "out"],
+            ["buffer", "out32"],
+            ["buffer", "ws"],
+            ["buffer", "counters"],
+            ["parameter", "M"],
+            ["parameter", "N"],
+            ["parameter", "m_tiles"],
+            ["parameter", "n_tiles"],
+            ["parameter", "group_m"],
+            ["parameter", "promo_code"],
+            ["parameter", "k_iters"],
+            ["parameter", "ldo"],
+            ["parameter", "out_l"],
+            ["parameter", "num_cluster_tiles"],
+            ["parameter", "num_l"],
+            ["parameter", "num_full"],
+            ["parameter", "iters_per_unit"],
+            ["parameter", "sk_iters"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
+        "closure_sha256": "cd83a2647135c5b6164f290fb97794c6d3c61ac0f88de2ac2f3f4861c2f50303",
     },
     "cake_dense_projection_gemm_e810841d5afe0f7fbbc7": {
         "template": "dense_proj_gemm_kn_n256_m256_f32_tma1",
@@ -2509,7 +2509,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "009bb193c496e20be4b4721a636d9ed7046e5962bc26710eb90f121b114459d3",
+        "closure_sha256": "7cd266cf210be96c39c7ff04b7baa68d33016c0bfc98955451b3d05d966fa807",
     },
     "cake_dense_projection_gemm_f59a405adb1e1a65fc57": {
         "template": "dense_proj_gemm_nn_n192_bz64_hee_t",
@@ -2550,7 +2550,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "4a7ef5dcb868ba954db34e77481a593dea9faed268f9b183d7098cce8320dfd6",
+        "closure_sha256": "4c6cacc28c65470a89048aceb710e687719359163e1ae858bb90ff982679a8f8",
     },
     "cake_dense_projection_gemm_f5c8a8143658988444ae": {
         "template": "dense_proj_gemm_nn_n256_m256_ov_ht",
@@ -2591,7 +2591,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "b68760c72a00679f18e1f83efb810891838ba405bcedabdc6463e7ccd8d0aafd",
+        "closure_sha256": "971b48ee95e4602077066519cdf7297e51e43c60dada460004d2a7207eb925f3",
     },
     "cake_dense_projection_gemm_fb6b0561a7cf71840c22": {
         "template": "dense_proj_gemm_nn_n256_m256_f32_ht_tma1",
@@ -2632,7 +2632,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a"],
-        "closure_sha256": "ba8920e758275b100c68afe703e1bf9bc71130279677f1071758a601b57c4206",
+        "closure_sha256": "d14ecc7d011c3b0bf0c49ba92ca7bc0d526d2cf664da07c1d7144382da8b4e97",
     },
     "cake_dense_projection_gemm_fc25319e20e7eab4ae81": {
         "template": "dense_proj_gemm_kk_n128",
@@ -2673,7 +2673,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_107a"],
-        "closure_sha256": "86f8315672798aef6d24a75ba5676c0834e30c9d6886ca51184deb68c30633a5",
+        "closure_sha256": "ae6e069f2bcd23f45ecd4cecdb391a307f2727eeea92871946b42678052777f5",
     },
     "cake_dense_projection_gemm_ffb67138c19332fcc903": {
         "template": "dense_proj_gemm_kn_n256_f32_v8_ef_s9",
@@ -2714,7 +2714,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-        "closure_sha256": "61d58474941920374cd22ec5420bc1c6aee2b9f3e99164c0bf0b69208fe1431a",
+        "closure_sha256": "5ea0da98b45f2bbaaa63c163d884df6ef5dbe87e5998ceed0b8fb7aea100eed1",
     },
 }
 
@@ -2797,7 +2797,7 @@ KERNELS: dict[str, dict[str, str]] = {
         "dense_proj_gemm_nn_n128_m64_hen_t_skx": "cake_dense_projection_gemm_632792076a862636c1b5",
         "dense_proj_gemm_nn_n128_t": "cake_dense_projection_gemm_de217fc576e07ac6c858",
         "dense_proj_gemm_nn_n160_m256_bz64": "cake_dense_projection_gemm_57f5774e7a0ae1cbb1f4",
-        "dense_proj_gemm_nn_n160_m256_bz64_f32": "cake_dense_projection_gemm_2d1685dc33ee2f3d5895",
+        "dense_proj_gemm_nn_n160_m256_bz64_f32_v8_ef": "cake_dense_projection_gemm_e32e2bcae301662e3c37",
         "dense_proj_gemm_nn_n192_bz64_hee_f32_t": "cake_dense_projection_gemm_82140a46c9319104ef76",
         "dense_proj_gemm_nn_n192_bz64_hee_t": "cake_dense_projection_gemm_f59a405adb1e1a65fc57",
         "dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6": "cake_dense_projection_gemm_4666747461f384c054b1",
