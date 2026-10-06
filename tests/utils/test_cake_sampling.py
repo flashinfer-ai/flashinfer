@@ -3596,7 +3596,13 @@ def test_local_select_build_matches_leader_push_build():
             assert plan.stream and plan.cluster > 1
             assert flags & cs._FLAG_FUSE_TAIL and flags & cs._FLAG_LEADER_PUSH
             assert flags & (cs._FLAG_SPEC_SAMPLE | cs._FLAG_COARSE_SAMPLE)
-            assert k <= cs._LOCAL_SELECT_MAX_K_BY_CAPABILITY[cap]
+            k_cap = cs._LOCAL_SELECT_MAX_K_BY_CAPABILITY[cap]
+            chunks = -(-vocab // (cs._THREADS * plan.ept * plan.cluster))
+            if chunks == 1:  # round 11: one-chunk rows take the one-chunk cap
+                k_cap = max(
+                    k_cap, cs._LOCAL_SELECT_ONE_CHUNK_MAX_K_BY_CAPABILITY.get(cap, 0)
+                )
+            assert k <= k_cap
         elif (
             flags & cs._FLAG_FUSE_TAIL
             and flags & cs._FLAG_LEADER_PUSH
